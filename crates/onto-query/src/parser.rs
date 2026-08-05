@@ -21,10 +21,12 @@ pub enum QueryAst {
         values: Vec<LiteralValue>,
     },
 
-    /// SELECT ... FROM <class> [WHERE ...] [ORDER BY ...] [LIMIT ...]
+    /// SELECT ... FROM <class> [JOIN ...] [WHERE ...] [ORDER BY ...] [LIMIT ...]
     Select {
         columns: SelectColumns,
         from: String,
+        from_alias: Option<String>,
+        joins: Vec<JoinClause>,
         filter: Option<FilterExpr>,
         order_by: Option<OrderBy>,
         limit: Option<usize>,
@@ -83,6 +85,21 @@ pub enum FilterExpr {
 pub struct OrderBy {
     pub column: String,
     pub ascending: bool,
+}
+
+/// A JOIN clause: JOIN <table> [AS <alias>] ON <left_col> = <right_col>
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinClause {
+    pub table: String,
+    pub alias: Option<String>,
+    pub on: JoinOn,
+}
+
+/// The ON condition of a JOIN: <left> = <right>
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinOn {
+    pub left: String,
+    pub right: String,
 }
 
 /// Parses SQL and OntoDB semantic queries into AST.
@@ -188,8 +205,11 @@ impl QueryParser {
             )
         };
 
-        // Parse FROM clause
-        let (from, rest) = Self::parse_word(rest)?;
+        // Parse FROM clause: <table> [AS <alias>]
+        let (from, from_alias, rest) = Self::parse_from_clause(rest)?;
+
+        // Parse optional JOIN clauses
+        let (joins, rest) = Self::parse_joins(&rest)?;
 
         // Parse optional WHERE
         let (filter, rest) = if rest.to_uppercase().starts_with("WHERE") {
@@ -236,10 +256,103 @@ impl QueryParser {
         Ok(QueryAst::Select {
             columns,
             from,
+            from_alias,
+            joins,
             filter,
             order_by,
             limit,
         })
+    }
+
+    /// Parses `FROM <table> [AS <alias>]` and returns (table, alias, rest).
+    fn parse_from_clause(input: &str) -> Result<(String, Option<String>, String)> {
+        let (table, rest) = Self::parse_word(input)?;
+        let rest_upper = rest.to_uppercase();
+
+        if rest_upper.starts_with("AS") {
+            let rest = rest[2..].trim();
+            let (alias, rest) = Self::parse_word(rest)?;
+            Ok((table, Some(alias), rest))
+        } else if !rest.is_empty()
+            && !rest_upper.starts_with("WHERE")
+            && !rest_upper.starts_with("JOIN")
+            && !rest_upper.starts_with("ORDER")
+            && !rest_upper.starts_with("LIMIT")
+        {
+            // Implicit alias: FROM Product p
+            let (alias, rest) = Self::parse_word(&rest)?;
+            Ok((table, Some(alias), rest))
+        } else {
+            Ok((table, None, rest))
+        }
+    }
+
+    /// Parses zero or more `JOIN <table> [AS <alias>] ON <left> = <right>` clauses.
+    fn parse_joins(input: &str) -> Result<(Vec<JoinClause>, String)> {
+        let mut joins = Vec::new();
+        let mut rest = input.to_string();
+
+        loop {
+            let upper = rest.to_uppercase().trim().to_string();
+            if !upper.starts_with("JOIN") {
+                break;
+            }
+
+            // Skip "JOIN"
+            let after_join = rest[4..].trim();
+
+            // Parse table name and optional alias
+            let (table, alias, after_table) = Self::parse_from_clause(after_join)?;
+
+            // Parse ON
+            let upper_after = after_table.to_uppercase();
+            if !upper_after.starts_with("ON") {
+                return Err(CoreError::InvalidArgument(
+                    "expected 'ON' after JOIN table".to_string(),
+                ));
+            }
+            let on_input = after_table[2..].trim();
+
+            // Parse <left> = <right>
+            let eq_pos = Self::find_unquoted(on_input, "=")
+                .ok_or_else(|| CoreError::InvalidArgument("expected '=' in ON clause".to_string()))?;
+            let left = on_input[..eq_pos].trim().to_string();
+            let right_on = on_input[eq_pos + 1..].trim();
+
+            // Right side ends at WHERE/JOIN/ORDER/LIMIT or end of string
+            let (right, rest_after_on) = Self::consume_until_keywords(
+                right_on,
+                &["WHERE", "JOIN", "ORDER BY", "LIMIT"],
+            );
+
+            joins.push(JoinClause {
+                table,
+                alias,
+                on: JoinOn { left, right },
+            });
+
+            rest = rest_after_on.to_string();
+        }
+
+        Ok((joins, rest))
+    }
+
+    /// Consumes input until a keyword is found. Returns (consumed, remaining).
+    fn consume_until_keywords<'a>(input: &'a str, keywords: &[&str]) -> (String, &'a str) {
+        let upper = input.to_uppercase();
+        let mut earliest = input.len();
+
+        for kw in keywords {
+            if let Some(pos) = Self::find_unquoted(&upper, kw) {
+                if pos < earliest {
+                    earliest = pos;
+                }
+            }
+        }
+
+        let consumed = input[..earliest].trim().to_string();
+        let remaining = &input[earliest..];
+        (consumed, remaining)
     }
 
     fn parse_update(input: &str) -> Result<QueryAst> {

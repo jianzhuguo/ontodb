@@ -33,10 +33,12 @@ impl QueryExecutor {
             QueryAst::Select {
                 columns,
                 from,
+                from_alias,
+                joins,
                 filter,
                 limit,
                 ..
-            } => self.execute_select(columns, from, filter, *limit),
+            } => self.execute_select(columns, from, from_alias.as_deref(), joins, filter, *limit),
             QueryAst::Delete { class, filter } => self.execute_delete(class, filter),
             QueryAst::Update {
                 class,
@@ -95,27 +97,116 @@ impl QueryExecutor {
         &self,
         columns: &SelectColumns,
         from: &str,
+        from_alias: Option<&str>,
+        joins: &[crate::parser::JoinClause],
         filter: &Option<FilterExpr>,
         limit: Option<usize>,
     ) -> Result<QueryResult> {
         let mut engine = self.engine.write().unwrap();
 
-        // Use prefix scan: all entries with key starting with "{class}::"
+        // Scan the left (FROM) table
         let prefix = format!("{}::", from);
-        let entries = engine.scan_prefix(prefix.as_bytes())?;
+        let left_entries = engine.scan_prefix(prefix.as_bytes())?;
 
-        let mut rows: Vec<Map<String, Value>> = Vec::new();
-
-        for (_key, val_bytes) in entries {
-            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&val_bytes) {
-                // Verify class (should always match due to prefix, but be safe)
+        // Parse left rows
+        let mut left_rows: Vec<Map<String, Value>> = Vec::new();
+        for (_key, val_bytes) in &left_entries {
+            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
                 if doc.get("__class__").and_then(|v| v.as_str()) == Some(from) {
-                    if self.matches_filter(&doc, filter) {
-                        rows.push(self.project_columns(&doc, columns));
+                    left_rows.push(doc);
+                }
+            }
+        }
+
+        // If no JOINs, simple single-table query
+        if joins.is_empty() {
+            let mut rows: Vec<Map<String, Value>> = Vec::new();
+            for doc in left_rows {
+                if self.matches_filter(&doc, filter) {
+                    rows.push(self.project_columns(&doc, columns));
+                }
+                if let Some(limit) = limit {
+                    if rows.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            return Ok(QueryResult::Rows(rows));
+        }
+
+        // JOIN: nested-loop join
+        // For each join, expand the current result set
+        let mut joined_rows: Vec<Map<String, Value>> = left_rows;
+
+        for join in joins {
+            let join_prefix = format!("{}::", join.table);
+            let right_entries = engine.scan_prefix(join_prefix.as_bytes())?;
+
+            // Parse right rows
+            let mut right_rows: Vec<Map<String, Value>> = Vec::new();
+            for (_key, val_bytes) in &right_entries {
+                if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
+                    if doc.get("__class__").and_then(|v| v.as_str()) == Some(&join.table) {
+                        right_rows.push(doc);
                     }
                 }
             }
 
+            // Resolve join alias
+            let right_alias = join.alias.as_deref().unwrap_or(&join.table);
+
+            // Parse ON condition: left.col = right.col
+            let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+
+            // Nested-loop join
+            let mut new_rows: Vec<Map<String, Value>> = Vec::new();
+            for left_row in &joined_rows {
+                let left_val = Self::resolve_column_value(left_row, &left_col);
+                for right_row in &right_rows {
+                    let right_val = Self::resolve_column_value(right_row, &right_col);
+
+                    // Match on string representation
+                    if left_val.is_some() && right_val.is_some() && left_val == right_val {
+                        // Merge rows: left columns + right columns (with alias prefix)
+                        let mut merged = Map::new();
+
+                        // Add left columns (prefixed with from_alias if present)
+                        for (k, v) in left_row {
+                            let key = match from_alias {
+                                Some(alias) => format!("{}.{}", alias, k),
+                                None => k.clone(),
+                            };
+                            merged.insert(key, v.clone());
+                            // Also keep unaliased version for backward compat
+                            if from_alias.is_some() && !merged.contains_key(k) {
+                                merged.insert(k.clone(), v.clone());
+                            }
+                        }
+
+                        // Add right columns (prefixed with join alias)
+                        for (k, v) in right_row {
+                            let key = format!("{}.{}", right_alias, k);
+                            merged.insert(key, v.clone());
+                            // Also keep unaliased version for backward compat
+                            if !merged.contains_key(k) {
+                                merged.insert(k.clone(), v.clone());
+                            }
+                        }
+
+                        new_rows.push(merged);
+                    }
+                }
+            }
+
+            joined_rows = new_rows;
+        }
+
+        // Apply WHERE filter and project columns
+        let mut rows: Vec<Map<String, Value>> = Vec::new();
+        for doc in joined_rows {
+            if self.matches_filter(&doc, filter) {
+                rows.push(self.project_columns(&doc, columns));
+            }
             if let Some(limit) = limit {
                 if rows.len() >= limit {
                     break;
@@ -124,6 +215,40 @@ impl QueryExecutor {
         }
 
         Ok(QueryResult::Rows(rows))
+    }
+
+    /// Resolves join column references from the ON condition.
+    /// Returns (left_column_name, right_column_name) without alias prefixes.
+    fn resolve_join_columns(on: &crate::parser::JoinOn) -> Result<(String, String)> {
+        let left = on.left.split('.').last().unwrap_or(&on.left).to_string();
+        let right = on.right.split('.').last().unwrap_or(&on.right).to_string();
+        Ok((left, right))
+    }
+
+    /// Gets a value from a row, trying both aliased and unaliased column names.
+    fn resolve_column_value(row: &Map<String, Value>, col: &str) -> Option<String> {
+        // Try exact match first
+        if let Some(v) = row.get(col) {
+            return Some(Self::value_to_sort_key(v));
+        }
+        // Try matching by suffix (strip alias prefix)
+        for (k, v) in row {
+            if k.ends_with(&format!(".{}", col)) || k == col {
+                return Some(Self::value_to_sort_key(v));
+            }
+        }
+        None
+    }
+
+    /// Converts a JSON value to a string key for comparison.
+    fn value_to_sort_key(v: &Value) -> String {
+        match v {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Null => "NULL".to_string(),
+            _ => v.to_string(),
+        }
     }
 
     fn execute_delete(&self, class: &str, filter: &Option<FilterExpr>) -> Result<QueryResult> {
@@ -193,7 +318,7 @@ impl QueryExecutor {
             SelectColumns::Columns(returns.to_vec())
         };
 
-        self.execute_select(&columns, class, filter, None)
+        self.execute_select(&columns, class, None, &[], filter, None)
     }
 
     fn generate_doc_key(&self, class: &str) -> Vec<u8> {
@@ -818,6 +943,147 @@ mod tests {
                 assert_eq!(rows[0].get("price").unwrap().as_i64().unwrap(), 899);
             }
             _ => panic!("expected updated price after flush"),
+        }
+    }
+
+    // ── JOIN tests ────────────────────────────────────────────────
+
+    fn insert_order(executor: &QueryExecutor, product_id: &str, quantity: i64) {
+        let ast = QueryAst::Insert {
+            class: "Order".to_string(),
+            columns: vec!["product_id".to_string(), "quantity".to_string()],
+            values: vec![
+                LiteralValue::String(product_id.to_string()),
+                LiteralValue::Int(quantity),
+            ],
+        };
+        executor.execute(&ast).unwrap();
+    }
+
+    #[test]
+    fn test_join_basic() {
+        let (executor, _dir) = setup();
+
+        // Insert products
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+
+        // Insert orders referencing products
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPad", 5);
+        insert_order(&executor, "iPhone", 1);
+
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // JOIN: Product p JOIN Order o ON p.name = o.product_id
+        let ast = QueryParser::parse(
+            "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3); // 2 iPhone orders + 1 iPad order
+            }
+            _ => panic!("expected 3 rows from JOIN"),
+        }
+    }
+
+    #[test]
+    fn test_join_with_where() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPad", 5);
+        insert_order(&executor, "iPhone", 1);
+
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // JOIN with WHERE filter on right table
+        let ast = QueryParser::parse(
+            "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id WHERE o.quantity > 2"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // iPhone qty=3, iPad qty=5
+            }
+            _ => panic!("expected 2 rows from JOIN with WHERE"),
+        }
+    }
+
+    #[test]
+    fn test_join_with_limit() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPad", 5);
+        insert_order(&executor, "iPhone", 1);
+
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse(
+            "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id LIMIT 2"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("expected 2 rows from JOIN with LIMIT"),
+        }
+    }
+
+    #[test]
+    fn test_join_no_match() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+
+        // Order references non-existent product
+        insert_order(&executor, "Galaxy", 1);
+
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse(
+            "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 0); // No match
+            }
+            _ => panic!("expected 0 rows from JOIN with no match"),
+        }
+    }
+
+    #[test]
+    fn test_join_select_star() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_order(&executor, "iPhone", 3);
+
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // SELECT * with JOIN should return all columns from both tables
+        let ast = QueryParser::parse(
+            "SELECT * FROM Product p JOIN Order o ON p.name = o.product_id"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                // Should have columns from both tables
+                assert!(rows[0].contains_key("p.name") || rows[0].contains_key("name"));
+                assert!(rows[0].contains_key("o.quantity") || rows[0].contains_key("quantity"));
+            }
+            _ => panic!("expected 1 row from SELECT * JOIN"),
         }
     }
 }
