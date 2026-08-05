@@ -43,8 +43,8 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | `onto-storage` | LSM-Tree 存储引擎（WAL + MemTable + SSTable + Leveled Compaction） | **已完成核心实现** |
 | `onto-ontology` | 本体模型（Ontology/Class/Property）、继承推理 | 已完成基础模型 |
 | `onto-query` | SQL 解析器（SELECT/INSERT/UPDATE/DELETE/MATCH/CREATE ONTOLOGY） | **已完成基础实现** |
-| `onto-server` | 服务端入口 | 骨架 |
-| `onto-cli` | 命令行工具 | 骨架 |
+| `onto-server` | 服务端入口（TCP 多客户端 + REPL） | **已完成** |
+| `onto-cli` | 命令行客户端（交互式 + 单次查询 + 脚本执行） | **已完成** |
 
 ### 存储引擎详情
 
