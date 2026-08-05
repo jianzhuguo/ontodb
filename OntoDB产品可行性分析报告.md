@@ -40,7 +40,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | Crate | 职责 | 状态 |
 |-------|------|------|
 | `onto-core` | 核心类型（Entry/Key/Value/SeqNo）、错误定义 | 已完成 |
-| `onto-storage` | LSM-Tree 存储引擎（WAL + MemTable + SSTable） | 已完成骨架，compaction 待实现 |
+| `onto-storage` | LSM-Tree 存储引擎（WAL + MemTable + SSTable + Leveled Compaction） | **已完成核心实现** |
 | `onto-ontology` | 本体模型（Ontology/Class/Property）、继承推理 | 已完成基础模型 |
 | `onto-query` | SQL 解析器（SELECT/INSERT/UPDATE/DELETE/MATCH/CREATE ONTOLOGY） | 已完成基础解析 |
 | `onto-server` | 服务端入口 | 骨架 |
@@ -50,10 +50,12 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 已实现的 LSM-Tree 引擎核心路径：
 - **写入路径**：WAL → MemTable →（满时）flush 到 SSTable
-- **读取路径**：MemTable → immutable MemTable → SSTables（从新到旧）
-- **删除**：写入 tombstone 标记
+- **读取路径**：MemTable → immutable MemTable → SSTables（从新到旧），tombstone 感知
+- **删除**：写入 tombstone 标记，tombstone 在读取时正确拦截旧值
 - **恢复**：启动时从 WAL 重放恢复 MemTable 状态
 - **WAL 格式**：`[length: u32][crc32: u32][payload: bytes]`，支持 CRC 校验跳过损坏条目
+- **Leveled Compaction**：L0 全量合并 → L1+ 逐级合并，去重保留最新版本，最底层 tombstone 可清理
+- **全局 seq_no**：引擎级序列号确保跨 MemTable flush 的版本顺序正确
 
 ### 本体引擎详情
 
@@ -82,7 +84,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 | 模块 | 评估 | 依据 |
 |------|------|------|
-| LSM-Tree 存储引擎 | **可行，已实现骨架** | WAL + MemTable + SSTable 路径已通，有单元测试验证 |
+| LSM-Tree 存储引擎 | **可行，已实现完整** | WAL + MemTable + SSTable + Leveled Compaction + tombstone 感知读取，29 个单元测试验证 |
 | MVCC 事务 | **可行** | TiKV（Rust）已在生产验证 |
 | Raft 共识 | **可行** | `tikv/raft-rs` 是工业级 Rust Raft 实现 |
 | 本体模型 | **可行，已实现基础** | 类/属性/继承/约束模型已通 |
@@ -98,7 +100,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | **语义查询优化** | 高 | SPARQL 查询下推到多模存储层，本体推理在查询计划阶段完成，利用本体约束做查询剪枝 |
 | **语义向量检索** | 中 | HNSW 向量索引 + 本体过滤联合查询，先用本体约束缩小候选集再做向量排序 |
 | **推理性能** | 中高 | 预计算推理结果（物化视图）+ 增量推理 + 分级推理（快速规则推理内联，完整 DL 推理异步） |
-| **Compaction 策略** | 中 | Leveled compaction，当前仅有框架，需实现实际合并逻辑 |
+| **Compaction 策略** | 低 | **已完成** Leveled Compaction 实现，含合并去重和 tombstone 清理 |
 | **Bloom Filter** | 低 | 当前框架已预留配置，实现相对直接 |
 
 ### 3.3 应该砍掉或延后的方向
