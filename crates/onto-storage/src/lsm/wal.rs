@@ -36,6 +36,8 @@ impl Wal {
 
     /// Appends an entry to the WAL.
     ///
+    /// Writes to the OS buffer (flush) but does NOT fsync for performance.
+    /// Call `sync()` if you need durability guarantees beyond OS buffering.
     /// Returns the byte offset where the entry was written.
     pub fn append(&mut self, entry: &Entry) -> Result<u64> {
         let payload = Self::serialize_entry(entry);
@@ -48,6 +50,10 @@ impl Wal {
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&crc.to_le_bytes())?;
         self.writer.write_all(&payload)?;
+
+        // Flush BufWriter to OS file cache (not fsync, just ensures data
+        // leaves the process buffer). Survives process crash on most OSes.
+        self.writer.flush()?;
 
         self.offset += 4 + 4 + payload.len() as u64;
 
