@@ -9,8 +9,10 @@
 pub mod engine;
 pub mod iterator;
 pub mod lsm;
+pub mod mvcc;
 pub mod options;
 
 pub use engine::LsmEngine;
 pub use iterator::StorageIterator;
+pub use mvcc::{TxnManager, Transaction, TxnStatus, WriteOp};
 pub use options::StorageOptions;

@@ -56,6 +56,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - **WAL 格式**：`[length: u32][crc32: u32][payload: bytes]`，支持 CRC 校验跳过损坏条目
 - **WAL 持久化**：每次 append 后 flush 到 OS 缓存，进程 crash 不丢数据
 - **Leveled Compaction**：L0 全量合并 → L1+ 逐级合并，去重保留最新版本，最底层 tombstone 可清理
+- **MVCC 事务**：快照隔离，写不阻塞读，事务写缓冲 + 提交时批量刷入 WAL
 - **全局 seq_no**：引擎级序列号确保跨 MemTable flush 的版本顺序正确
 
 ### 本体引擎详情
@@ -91,7 +92,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | 模块 | 评估 | 依据 |
 |------|------|------|
 | LSM-Tree 存储引擎 | **可行，已实现完整** | WAL + MemTable + SSTable + Leveled Compaction + tombstone 感知读取，29 个单元测试验证 |
-| MVCC 事务 | **可行** | TiKV（Rust）已在生产验证 |
+| MVCC 事务 | **可行，已实现** | 快照隔离、事务写缓冲、提交/回滚、可见性过滤，91 个测试验证 |
 | Raft 共识 | **可行** | `tikv/raft-rs` 是工业级 Rust Raft 实现 |
 | 本体模型 | **可行，已实现基础** | 类/属性/继承/约束模型已通 |
 | SQL 解析 | **可行，已实现基础** | 6 种语句的基础解析已通 |

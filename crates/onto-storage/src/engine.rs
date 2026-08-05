@@ -7,13 +7,15 @@
 use crate::lsm::memtable::MemTable;
 use crate::lsm::sstable::{SsTable, SsTableBuilder};
 use crate::lsm::wal::{self, Wal};
+use crate::mvcc::{TxnManager, WriteOp};
 use crate::options::StorageOptions;
 use onto_core::{Entry, EntryKind, Key, Result, SeqNo, Value};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The main LSM-Tree storage engine.
+/// The main LSM-Tree storage engine with MVCC support.
 pub struct LsmEngine {
     /// Active MemTable for writes.
     memtable: MemTable,
@@ -35,6 +37,9 @@ pub struct LsmEngine {
 
     /// SSTable file ID counter.
     sst_counter: AtomicU64,
+
+    /// MVCC transaction manager.
+    txn_manager: TxnManager,
 }
 
 /// Metadata about an SSTable file, kept in memory.
@@ -66,6 +71,7 @@ impl LsmEngine {
             options,
             seq_counter: AtomicU64::new(0),
             sst_counter: AtomicU64::new(0),
+            txn_manager: TxnManager::new(),
         };
 
         // Recover from WAL
@@ -670,6 +676,312 @@ impl LsmEngine {
         self.seq_counter.fetch_add(1, Ordering::Relaxed)
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  MVCC Transaction API
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Begins a new transaction. Returns the transaction ID.
+    /// Snapshot is taken at the last committed data point.
+    pub fn begin_txn(&mut self) -> SeqNo {
+        // seq_counter is the NEXT value to assign, so last committed = seq_counter - 1
+        let last_seq = self.seq_counter.load(Ordering::Relaxed).saturating_sub(1);
+        self.txn_manager.begin(last_seq)
+    }
+
+    /// Commits a transaction. Flushes its write buffer to WAL + MemTable.
+    pub fn commit_txn(&mut self, txn_id: SeqNo) -> Result<()> {
+        let writes = self.txn_manager.commit(txn_id)?;
+
+        for (key, op) in writes {
+            let seq = self.next_seq();
+            match op {
+                WriteOp::Put(value) => {
+                    let entry = Entry::put(key.clone(), value.clone(), seq);
+                    self.wal.append(&entry)?;
+                    self.memtable.put_with_seq(key, value, seq);
+                }
+                WriteOp::Delete => {
+                    let entry = Entry::delete(key.clone(), seq);
+                    self.wal.append(&entry)?;
+                    self.memtable.delete_with_seq(key, seq);
+                }
+            }
+        }
+
+        // Check if we need to flush
+        if self.memtable.size() >= self.options.memtable_size_limit {
+            self.flush_memtable()?;
+        }
+
+        Ok(())
+    }
+
+    /// Aborts a transaction. Discards all pending writes.
+    pub fn abort_txn(&mut self, txn_id: SeqNo) -> Result<()> {
+        self.txn_manager.abort(txn_id)
+    }
+
+    /// Buffers a put operation in a transaction.
+    pub fn txn_put(&mut self, txn_id: SeqNo, key: Key, value: Value) -> Result<()> {
+        self.txn_manager
+            .get_mut(txn_id)
+            .ok_or_else(|| onto_core::CoreError::InvalidArgument(
+                format!("transaction {} not found or not active", txn_id),
+            ))?
+            .put(key, value);
+        Ok(())
+    }
+
+    /// Buffers a delete operation in a transaction.
+    pub fn txn_delete(&mut self, txn_id: SeqNo, key: Key) -> Result<()> {
+        self.txn_manager
+            .get_mut(txn_id)
+            .ok_or_else(|| onto_core::CoreError::InvalidArgument(
+                format!("transaction {} not found or not active", txn_id),
+            ))?
+            .delete(key);
+        Ok(())
+    }
+
+    /// Reads a key within a transaction context.
+    ///
+    /// Read path:
+    /// 1. Check the transaction's own write buffer (uncommitted writes)
+    /// 2. Check MemTable (with snapshot visibility)
+    /// 3. Check SSTables (with snapshot visibility)
+    pub fn txn_get(&mut self, txn_id: SeqNo, key: &[u8]) -> Result<Option<Value>> {
+        // 1. Check transaction's own write buffer
+        if let Some(txn) = self.txn_manager.get(txn_id) {
+            match txn.snapshot_ts {
+                _ => {} // We need to check write buffer first
+            }
+        }
+        if let Some(txn) = self.txn_manager.get(txn_id) {
+            if let Some(op) = txn.write_buffer_get(key) {
+                return match op {
+                    WriteOp::Put(v) => Ok(Some(v.clone())),
+                    WriteOp::Delete => Ok(None),
+                };
+            }
+        }
+
+        // 2-3. Read from storage with snapshot visibility
+        let vis = self.txn_manager.visibility_for(txn_id);
+        self.get_with_visibility(key, &vis)
+    }
+
+    /// Scans all entries with the given prefix, respecting snapshot visibility.
+    pub fn txn_scan_prefix(
+        &mut self,
+        txn_id: SeqNo,
+        prefix: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let vis = self.txn_manager.visibility_for(txn_id);
+
+        // Get base results from storage with visibility filtering
+        let mut results = self.scan_prefix_with_visibility(prefix, &vis)?;
+
+        // Overlay the transaction's own write buffer
+        if let Some(txn) = self.txn_manager.get(txn_id) {
+            for (key, op) in txn.write_buffer_iter() {
+                if key.starts_with(prefix) {
+                    match op {
+                        WriteOp::Put(value) => {
+                            // Insert or update in results
+                            if let Some(existing) = results.iter_mut().find(|(k, _)| k == key) {
+                                existing.1 = value.clone();
+                            } else {
+                                results.push((key.clone(), value.clone()));
+                            }
+                        }
+                        WriteOp::Delete => {
+                            // Remove from results
+                            results.retain(|(k, _)| k != key);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by key
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(results)
+    }
+
+    /// Gets a value by key with snapshot visibility filtering.
+    fn get_with_visibility(
+        &mut self,
+        key: &[u8],
+        vis: &crate::mvcc::Visibility,
+    ) -> Result<Option<Value>> {
+        // Check active MemTable — find latest visible version
+        for entry in self.memtable.entries() {
+            if entry.key != key {
+                if entry.key.as_slice() > key {
+                    break; // Past this key in sorted order
+                }
+                continue;
+            }
+            if vis.is_visible(entry.seq_no) {
+                if entry.is_tombstone() {
+                    return Ok(None);
+                }
+                return Ok(Some(entry.value.to_vec()));
+            }
+            // If not visible, keep looking for older visible versions
+        }
+
+        // Check immutable MemTable
+        if let Some(ref imm) = self.immutable_memtable {
+            for entry in imm.entries() {
+                if entry.key != key {
+                    if entry.key.as_slice() > key {
+                        break;
+                    }
+                    continue;
+                }
+                if vis.is_visible(entry.seq_no) {
+                    if entry.is_tombstone() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(entry.value.to_vec()));
+                }
+            }
+        }
+
+        // Check SSTables (newest to oldest)
+        for level in &self.levels {
+            for sst_info in level.iter().rev() {
+                if key < sst_info.min_key.as_slice() || key > sst_info.max_key.as_slice() {
+                    continue;
+                }
+                let mut sst = SsTable::open(&sst_info.path)?;
+                match sst.get_full(key)? {
+                    Some((value, seq, kind)) if vis.is_visible(seq) => {
+                        if kind == EntryKind::Delete {
+                            return Ok(None);
+                        }
+                        return Ok(Some(value));
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Scans entries with prefix, filtering by snapshot visibility.
+    fn scan_prefix_with_visibility(
+        &mut self,
+        prefix: &[u8],
+        vis: &crate::mvcc::Visibility,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        use std::collections::BTreeMap;
+
+        let mut seen: BTreeMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = BTreeMap::new();
+
+        // Scan SSTables (oldest to newest)
+        for level in self.levels.iter().rev() {
+            for sst_info in level.iter() {
+                if !prefix.is_empty() {
+                    let sst_max = sst_info.max_key.as_slice();
+                    if sst_max < prefix {
+                        continue;
+                    }
+                    if !Self::prefix_may_overlap(prefix, sst_info.min_key.as_slice(), sst_max) {
+                        continue;
+                    }
+                }
+
+                let mut sst = SsTable::open(&sst_info.path)?;
+                let mut iter = sst.iter()?;
+
+                while iter.is_valid() && iter.key() < prefix {
+                    iter.next();
+                }
+
+                while iter.is_valid() {
+                    if !iter.key().starts_with(prefix) {
+                        break;
+                    }
+
+                    let key = iter.key().to_vec();
+                    let value = iter.value().to_vec();
+                    let seq = iter.seq_no();
+                    let kind = iter.kind();
+
+                    // Only keep if visible and newer than existing
+                    if vis.is_visible(seq) {
+                        let should_update = match seen.get(&key) {
+                            Some((_, existing_seq, _)) => seq > *existing_seq,
+                            None => true,
+                        };
+                        if should_update {
+                            seen.insert(key, (value, seq, kind));
+                        }
+                    }
+
+                    iter.next();
+                }
+            }
+        }
+
+        // Scan immutable MemTable
+        if let Some(ref imm) = self.immutable_memtable {
+            for entry in imm.entries() {
+                if !entry.key.starts_with(prefix) {
+                    continue;
+                }
+                if vis.is_visible(entry.seq_no) {
+                    let should_update = match seen.get(&entry.key) {
+                        Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
+                        None => true,
+                    };
+                    if should_update {
+                        seen.insert(
+                            entry.key.clone(),
+                            (entry.value.clone(), entry.seq_no, entry.kind),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Scan active MemTable
+        for entry in self.memtable.entries() {
+            if !entry.key.starts_with(prefix) {
+                continue;
+            }
+            if vis.is_visible(entry.seq_no) {
+                let should_update = match seen.get(&entry.key) {
+                    Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
+                    None => true,
+                };
+                if should_update {
+                    seen.insert(
+                        entry.key.clone(),
+                        (entry.value.clone(), entry.seq_no, entry.kind),
+                    );
+                }
+            }
+        }
+
+        // Filter out tombstones and collect
+        let result: Vec<(Vec<u8>, Vec<u8>)> = seen
+            .into_iter()
+            .filter(|(_, (_, _, kind))| *kind == EntryKind::Put)
+            .map(|(key, (value, _, _))| (key, value))
+            .collect();
+
+        Ok(result)
+    }
+
+    /// Returns the number of active transactions.
+    pub fn active_txn_count(&self) -> usize {
+        self.txn_manager.active_count()
+    }
+
     /// Returns engine statistics.
     pub fn stats(&self) -> EngineStats {
         let total_sstables: usize = self.levels.iter().map(|l| l.len()).sum();
@@ -957,5 +1269,193 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  MVCC Transaction Tests
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_txn_basic_commit() {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut engine = LsmEngine::open(options).unwrap();
+
+        let txn = engine.begin_txn();
+        engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).unwrap();
+        engine.txn_put(txn, b"age".to_vec(), b"30".to_vec()).unwrap();
+        engine.commit_txn(txn).unwrap();
+
+        assert_eq!(engine.get(b"name").unwrap(), Some(b"alice".to_vec()));
+        assert_eq!(engine.get(b"age").unwrap(), Some(b"30".to_vec()));
+    }
+
+    #[test]
+    fn test_txn_abort() {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut engine = LsmEngine::open(options).unwrap();
+
+        let txn = engine.begin_txn();
+        engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).unwrap();
+        engine.abort_txn(txn).unwrap();
+
+        assert_eq!(engine.get(b"name").unwrap(), None);
+    }
+
+    #[test]
+    fn test_txn_read_own_writes() {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut engine = LsmEngine::open(options).unwrap();
+
+        let txn = engine.begin_txn();
+        engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).unwrap();
+        engine.txn_put(txn, b"age".to_vec(), b"30".to_vec()).unwrap();
+
+        assert_eq!(engine.txn_get(txn, b"name").unwrap(), Some(b"alice".to_vec()));
+        assert_eq!(engine.txn_get(txn, b"age").unwrap(), Some(b"30".to_vec()));
+
+        engine.commit_txn(txn).unwrap();
+    }
+
+    #[test]
+    fn test_txn_snapshot_isolation() {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut engine = LsmEngine::open(options).unwrap();
+
+        engine.put(b"key".to_vec(), b"v1".to_vec()).unwrap();
+
+        let txn1 = engine.begin_txn();
+
+        engine.put(b"key".to_vec(), b"v2".to_vec()).unwrap();
+
+        // txn1 still sees v1 (snapshot isolation)
+        assert_eq!(engine.txn_get(txn1, b"key").unwrap(), Some(b"v1".to_vec()));
+
+        let txn2 = engine.begin_txn();
+        assert_eq!(engine.txn_get(txn2, b"key").unwrap(), Some(b"v2".to_vec()));
+
+        engine.commit_txn(txn1).unwrap();
+        engine.commit_txn(txn2).unwrap();
+    }
+
+    #[test]
+    fn test_txn_write_conflict_independence() {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut engine = LsmEngine::open(options).unwrap();
+
+        let txn1 = engine.begin_txn();
+        let txn2 = engine.begin_txn();
+
+        engine.txn_put(txn1, b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine.txn_put(txn2, b"b".to_vec(), b"2".to_vec()).unwrap();
+
+        engine.commit_txn(txn1).unwrap();
+        engine.commit_txn(txn2).unwrap();
+
+        assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn test_txn_delete_in_transaction() {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut engine = LsmEngine::open(options).unwrap();
+
+        engine.put(b"key".to_vec(), b"value".to_vec()).unwrap();
+
+        let txn = engine.begin_txn();
+        engine.txn_delete(txn, b"key".to_vec()).unwrap();
+        assert_eq!(engine.txn_get(txn, b"key").unwrap(), None);
+
+        engine.commit_txn(txn).unwrap();
+        assert_eq!(engine.get(b"key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_txn_scan_prefix() {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut engine = LsmEngine::open(options).unwrap();
+
+        engine.put(b"user:1".to_vec(), b"alice".to_vec()).unwrap();
+        engine.put(b"user:2".to_vec(), b"bob".to_vec()).unwrap();
+        engine.put(b"item:1".to_vec(), b"widget".to_vec()).unwrap();
+
+        let txn = engine.begin_txn();
+        engine.txn_put(txn, b"user:3".to_vec(), b"charlie".to_vec()).unwrap();
+
+        let results = engine.txn_scan_prefix(txn, b"user:").unwrap();
+        assert_eq!(results.len(), 3);
+
+        engine.commit_txn(txn).unwrap();
+    }
+
+    #[test]
+    fn test_txn_overwrite_in_buffer() {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut engine = LsmEngine::open(options).unwrap();
+
+        let txn = engine.begin_txn();
+        engine.txn_put(txn, b"key".to_vec(), b"v1".to_vec()).unwrap();
+        engine.txn_put(txn, b"key".to_vec(), b"v2".to_vec()).unwrap();
+
+        assert_eq!(engine.txn_get(txn, b"key").unwrap(), Some(b"v2".to_vec()));
+
+        engine.commit_txn(txn).unwrap();
+        assert_eq!(engine.get(b"key").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn test_txn_active_count() {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut engine = LsmEngine::open(options).unwrap();
+
+        assert_eq!(engine.active_txn_count(), 0);
+
+        let t1 = engine.begin_txn();
+        assert_eq!(engine.active_txn_count(), 1);
+
+        let t2 = engine.begin_txn();
+        assert_eq!(engine.active_txn_count(), 2);
+
+        engine.commit_txn(t1).unwrap();
+        assert_eq!(engine.active_txn_count(), 1);
+
+        engine.abort_txn(t2).unwrap();
+        assert_eq!(engine.active_txn_count(), 0);
     }
 }
