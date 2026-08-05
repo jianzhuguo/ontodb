@@ -12,6 +12,9 @@
 /// Maximum number of keys per node. Branching factor = MAX_KEYS + 1.
 const MAX_KEYS: usize = 128;
 
+/// Minimum number of keys per non-root node. Nodes below this threshold need rebalancing.
+const MIN_KEYS: usize = MAX_KEYS / 2;
+
 /// Internal node: keys separating child subtrees, child node IDs.
 struct InternalNode {
     keys: Vec<Vec<u8>>,
@@ -303,9 +306,12 @@ impl BPlusTree {
 
     /// Removes a primary_key from the set for the given value.
     /// If the set becomes empty, the key entry is removed.
+    /// Handles underflow by redistributing or merging with siblings.
     pub fn remove(&mut self, value: &[u8], primary_key: &[u8]) {
         let leaf_id = self.find_leaf(value);
+        let mut key_removed = false;
 
+        // Remove the primary key from the leaf
         if let Node::Leaf(n) = self.get_node_mut(leaf_id).unwrap() {
             if let Ok(i) = n.keys.binary_search_by(|k| k.as_slice().cmp(value)) {
                 let was_present = n.values[i].iter().any(|pk| pk.as_slice() == primary_key);
@@ -314,9 +320,370 @@ impl BPlusTree {
                     if n.values[i].is_empty() {
                         n.keys.remove(i);
                         n.values.remove(i);
+                        key_removed = true;
                     }
                     self.len -= 1;
                 }
+            }
+        }
+
+        // If a key was removed from the leaf, check for underflow
+        if key_removed && leaf_id != self.root {
+            let key_count = self.get_node(leaf_id).unwrap().key_count();
+            if key_count < MIN_KEYS {
+                self.handle_leaf_underflow(leaf_id);
+            }
+        }
+
+        // If root is an internal node with no keys, make its only child the new root
+        if !self.get_node(self.root).unwrap().is_leaf() {
+            if let Node::Internal(n) = self.get_node(self.root).unwrap() {
+                if n.keys.is_empty() && !n.children.is_empty() {
+                    self.root = n.children[0];
+                }
+            }
+        }
+    }
+
+    /// Handles underflow in a leaf node by borrowing from siblings or merging.
+    fn handle_leaf_underflow(&mut self, leaf_id: u64) {
+        // Find parent and sibling information
+        let (parent_id, child_idx) = match self.find_parent(self.root, leaf_id) {
+            Some(info) => info,
+            None => return, // No parent (shouldn't happen if leaf_id != root)
+        };
+
+        let num_children = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children.len(),
+            _ => return,
+        };
+
+        // Try to borrow from left sibling
+        if child_idx > 0 {
+            let left_sibling_id = match self.get_node(parent_id).unwrap() {
+                Node::Internal(n) => n.children[child_idx - 1],
+                _ => return,
+            };
+            let left_key_count = self.get_node(left_sibling_id).unwrap().key_count();
+            if left_key_count > MIN_KEYS {
+                self.redistribute_leaf_from_left(parent_id, child_idx);
+                return;
+            }
+        }
+
+        // Try to borrow from right sibling
+        if child_idx < num_children - 1 {
+            let right_sibling_id = match self.get_node(parent_id).unwrap() {
+                Node::Internal(n) => n.children[child_idx + 1],
+                _ => return,
+            };
+            let right_key_count = self.get_node(right_sibling_id).unwrap().key_count();
+            if right_key_count > MIN_KEYS {
+                self.redistribute_leaf_from_right(parent_id, child_idx);
+                return;
+            }
+        }
+
+        // Merge with a sibling
+        if child_idx > 0 {
+            // Merge with left sibling
+            self.merge_leaves(parent_id, child_idx - 1, child_idx);
+        } else if num_children > 1 {
+            // Merge with right sibling
+            self.merge_leaves(parent_id, child_idx, child_idx + 1);
+        }
+    }
+
+    /// Redistributes keys from left sibling to the underflowing leaf.
+    fn redistribute_leaf_from_left(&mut self, parent_id: u64, child_idx: usize) {
+        let left_sibling_id = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children[child_idx - 1],
+            _ => return,
+        };
+        let leaf_id = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children[child_idx],
+            _ => return,
+        };
+
+        // Move last key from left sibling to front of current leaf
+        if let Node::Leaf(left) = self.get_node_mut(left_sibling_id).unwrap() {
+            let moved_key = left.keys.pop().unwrap();
+            let moved_values = left.values.pop().unwrap();
+
+            if let Node::Leaf(leaf) = self.get_node_mut(leaf_id).unwrap() {
+                leaf.keys.insert(0, moved_key);
+                leaf.values.insert(0, moved_values);
+            }
+        }
+
+        // Update parent separator key to the new first key of the current leaf
+        if let Node::Leaf(leaf) = self.get_node(leaf_id).unwrap() {
+            let new_separator = leaf.keys.first().cloned().unwrap_or_default();
+            if let Node::Internal(parent) = self.get_node_mut(parent_id).unwrap() {
+                parent.keys[child_idx - 1] = new_separator;
+            }
+        }
+    }
+
+    /// Redistributes keys from right sibling to the underflowing leaf.
+    fn redistribute_leaf_from_right(&mut self, parent_id: u64, child_idx: usize) {
+        let leaf_id = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children[child_idx],
+            _ => return,
+        };
+        let right_sibling_id = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children[child_idx + 1],
+            _ => return,
+        };
+
+        // Move first key from right sibling to end of current leaf
+        if let Node::Leaf(right) = self.get_node_mut(right_sibling_id).unwrap() {
+            let moved_key = right.keys.remove(0);
+            let moved_values = right.values.remove(0);
+
+            if let Node::Leaf(leaf) = self.get_node_mut(leaf_id).unwrap() {
+                leaf.keys.push(moved_key);
+                leaf.values.push(moved_values);
+            }
+        }
+
+        // Update parent separator key to the new first key of right sibling
+        if let Node::Leaf(right) = self.get_node(right_sibling_id).unwrap() {
+            let new_separator = right.keys.first().cloned().unwrap_or_default();
+            if let Node::Internal(parent) = self.get_node_mut(parent_id).unwrap() {
+                parent.keys[child_idx] = new_separator;
+            }
+        }
+    }
+
+    /// Merges two adjacent leaf nodes. The left leaf absorbs the right leaf.
+    fn merge_leaves(&mut self, parent_id: u64, left_idx: usize, right_idx: usize) {
+        let left_id = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children[left_idx],
+            _ => return,
+        };
+        let right_id = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children[right_idx],
+            _ => return,
+        };
+
+        // Transfer all keys from right to left
+        let right_keys: Vec<Vec<u8>>;
+        let right_values: Vec<Vec<Vec<u8>>>;
+        let right_next: Option<u64>;
+
+        if let Node::Leaf(right) = self.get_node(right_id).unwrap() {
+            right_keys = right.keys.clone();
+            right_values = right.values.clone();
+            right_next = right.next;
+        } else {
+            return;
+        }
+
+        if let Node::Leaf(left) = self.get_node_mut(left_id).unwrap() {
+            left.keys.extend(right_keys);
+            left.values.extend(right_values);
+            left.next = right_next;
+        }
+
+        // Remove right sibling from parent
+        if let Node::Internal(parent) = self.get_node_mut(parent_id).unwrap() {
+            parent.keys.remove(left_idx);
+            parent.children.remove(right_idx);
+        }
+
+        // Remove the right leaf node from storage
+        self.nodes.retain(|(nid, _)| *nid != right_id);
+
+        // Check if parent now underflows
+        if parent_id != self.root {
+            let parent_key_count = self.get_node(parent_id).unwrap().key_count();
+            if parent_key_count < MIN_KEYS {
+                self.handle_internal_underflow(parent_id);
+            }
+        }
+    }
+
+    /// Handles underflow in an internal node.
+    fn handle_internal_underflow(&mut self, node_id: u64) {
+        let (parent_id, child_idx) = match self.find_parent(self.root, node_id) {
+            Some(info) => info,
+            None => return,
+        };
+
+        let num_children = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children.len(),
+            _ => return,
+        };
+
+        // Try to borrow from left sibling
+        if child_idx > 0 {
+            let left_sibling_id = match self.get_node(parent_id).unwrap() {
+                Node::Internal(n) => n.children[child_idx - 1],
+                _ => return,
+            };
+            let left_key_count = self.get_node(left_sibling_id).unwrap().key_count();
+            if left_key_count > MIN_KEYS {
+                self.redistribute_internal_from_left(parent_id, child_idx);
+                return;
+            }
+        }
+
+        // Try to borrow from right sibling
+        if child_idx < num_children - 1 {
+            let right_sibling_id = match self.get_node(parent_id).unwrap() {
+                Node::Internal(n) => n.children[child_idx + 1],
+                _ => return,
+            };
+            let right_key_count = self.get_node(right_sibling_id).unwrap().key_count();
+            if right_key_count > MIN_KEYS {
+                self.redistribute_internal_from_right(parent_id, child_idx);
+                return;
+            }
+        }
+
+        // Merge with a sibling
+        if child_idx > 0 {
+            self.merge_internals(parent_id, child_idx - 1, child_idx);
+        } else if num_children > 1 {
+            self.merge_internals(parent_id, child_idx, child_idx + 1);
+        }
+    }
+
+    /// Redistributes keys from left internal sibling.
+    fn redistribute_internal_from_left(&mut self, parent_id: u64, child_idx: usize) {
+        let left_id = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children[child_idx - 1],
+            _ => return,
+        };
+        let node_id = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children[child_idx],
+            _ => return,
+        };
+
+        // Get separator from parent
+        let separator = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.keys[child_idx - 1].clone(),
+            _ => return,
+        };
+
+        // Move last child and key from left sibling
+        if let Node::Internal(left) = self.get_node_mut(left_id).unwrap() {
+            let moved_key = left.keys.pop().unwrap();
+            let moved_child = left.children.pop().unwrap();
+
+            if let Node::Internal(node) = self.get_node_mut(node_id).unwrap() {
+                node.keys.insert(0, separator);
+                node.children.insert(0, moved_child);
+            }
+
+            // Update parent separator
+            if let Node::Internal(parent) = self.get_node_mut(parent_id).unwrap() {
+                parent.keys[child_idx - 1] = moved_key;
+            }
+        }
+    }
+
+    /// Redistributes keys from right internal sibling.
+    fn redistribute_internal_from_right(&mut self, parent_id: u64, child_idx: usize) {
+        let node_id = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children[child_idx],
+            _ => return,
+        };
+        let right_id = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children[child_idx + 1],
+            _ => return,
+        };
+
+        // Get separator from parent
+        let separator = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.keys[child_idx].clone(),
+            _ => return,
+        };
+
+        // Move first child and key from right sibling
+        if let Node::Internal(right) = self.get_node_mut(right_id).unwrap() {
+            let moved_key = right.keys.remove(0);
+            let moved_child = right.children.remove(0);
+
+            if let Node::Internal(node) = self.get_node_mut(node_id).unwrap() {
+                node.keys.push(separator);
+                node.children.push(moved_child);
+            }
+
+            // Update parent separator
+            if let Node::Internal(parent) = self.get_node_mut(parent_id).unwrap() {
+                parent.keys[child_idx] = moved_key;
+            }
+        }
+    }
+
+    /// Merges two adjacent internal nodes. The left node absorbs the right node.
+    fn merge_internals(&mut self, parent_id: u64, left_idx: usize, right_idx: usize) {
+        let left_id = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children[left_idx],
+            _ => return,
+        };
+        let right_id = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.children[right_idx],
+            _ => return,
+        };
+
+        // Get separator from parent
+        let separator = match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => n.keys[left_idx].clone(),
+            _ => return,
+        };
+
+        // Transfer keys and children from right to left
+        let right_keys: Vec<Vec<u8>>;
+        let right_children: Vec<u64>;
+
+        if let Node::Internal(right) = self.get_node(right_id).unwrap() {
+            right_keys = right.keys.clone();
+            right_children = right.children.clone();
+        } else {
+            return;
+        }
+
+        if let Node::Internal(left) = self.get_node_mut(left_id).unwrap() {
+            left.keys.push(separator);
+            left.keys.extend(right_keys);
+            left.children.extend(right_children);
+        }
+
+        // Remove right node from parent
+        if let Node::Internal(parent) = self.get_node_mut(parent_id).unwrap() {
+            parent.keys.remove(left_idx);
+            parent.children.remove(right_idx);
+        }
+
+        // Remove the right internal node from storage
+        self.nodes.retain(|(nid, _)| *nid != right_id);
+
+        // Check if parent now underflows
+        if parent_id != self.root {
+            let parent_key_count = self.get_node(parent_id).unwrap().key_count();
+            if parent_key_count < MIN_KEYS {
+                self.handle_internal_underflow(parent_id);
+            }
+        }
+    }
+
+    /// Finds the parent of a node and returns (parent_id, child_index).
+    fn find_parent(&self, current: u64, target: u64) -> Option<(u64, usize)> {
+        match self.get_node(current)? {
+            Node::Leaf(_) => None,
+            Node::Internal(n) => {
+                for (i, &child_id) in n.children.iter().enumerate() {
+                    if child_id == target {
+                        return Some((current, i));
+                    }
+                    if let Some(result) = self.find_parent(child_id, target) {
+                        return Some(result);
+                    }
+                }
+                None
             }
         }
     }
@@ -749,6 +1116,241 @@ mod tests {
         let pending = tree.lookup(b"pending");
         assert_eq!(pending.len(), 2);
         assert!(!pending.contains(&b"order_2".to_vec()));
+    }
+
+    #[test]
+    fn test_remove_nonexistent_key() {
+        let mut tree = BPlusTree::new("Product", "price");
+        tree.insert(b"100".to_vec(), b"pk1".to_vec());
+        tree.remove(b"999", b"pk999"); // does not exist
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree.lookup(b"100").len(), 1);
+    }
+
+    #[test]
+    fn test_remove_leaf_underflow_merge() {
+        // Use small MAX_KEYS to trigger underflow easily.
+        // We insert keys that create multiple leaves, then delete to force merges.
+        let mut tree = BPlusTree::new("Product", "price");
+
+        // Insert enough unique keys to create multiple leaf nodes
+        let n = 400u32;
+        for i in 0..n {
+            let key = format!("{:010}", i);
+            tree.insert(key.into_bytes(), format!("pk_{}", i).into_bytes());
+        }
+        assert_eq!(tree.len(), n as usize);
+
+        // Remove most entries to trigger underflow and merges
+        for i in 0..(n - 5) {
+            let key = format!("{:010}", i);
+            tree.remove(key.as_bytes(), format!("pk_{}", i).as_bytes());
+        }
+        assert_eq!(tree.len(), 5);
+
+        // Verify remaining entries
+        for i in (n - 5)..n {
+            let key = format!("{:010}", i);
+            let keys = tree.lookup(key.as_bytes());
+            assert_eq!(keys.len(), 1, "key {} should still exist", key);
+        }
+
+        // Verify leaf chain integrity after merges
+        let mut cursor = tree.cursor_first();
+        let mut prev_key: Vec<u8> = Vec::new();
+        let mut count = 0usize;
+        while cursor.is_valid(&tree) {
+            if let Node::Leaf(leaf) = tree.get_node(cursor.leaf_id).unwrap() {
+                if cursor.idx >= leaf.keys.len() {
+                    cursor.advance(&tree);
+                    continue;
+                }
+                let k = &leaf.keys[cursor.idx];
+                assert!(k.as_slice() > prev_key.as_slice(), "keys must be sorted after merge");
+                prev_key = k.clone();
+                count += 1;
+                cursor.idx += 1;
+            }
+        }
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_remove_triggers_redistribution() {
+        let mut tree = BPlusTree::new("Product", "price");
+
+        // Create a tree with enough entries for multi-level structure
+        let n = 500u32;
+        for i in 0..n {
+            let key = format!("{:010}", i);
+            tree.insert(key.into_bytes(), format!("pk_{}", i).into_bytes());
+        }
+
+        // Remove a subset that triggers redistribution rather than merge
+        // Remove from a contiguous range to underflow one leaf
+        for i in 100..150 {
+            let key = format!("{:010}", i);
+            tree.remove(key.as_bytes(), format!("pk_{}", i).as_bytes());
+        }
+
+        // Verify remaining entries
+        for i in 0..100u32 {
+            let key = format!("{:010}", i);
+            assert_eq!(tree.lookup(key.as_bytes()).len(), 1, "key {} missing", key);
+        }
+        for i in 150..n {
+            let key = format!("{:010}", i);
+            assert_eq!(tree.lookup(key.as_bytes()).len(), 1, "key {} missing", key);
+        }
+        assert_eq!(tree.len(), 450);
+    }
+
+    #[test]
+    fn test_remove_root_collapse() {
+        let mut tree = BPlusTree::new("Product", "price");
+
+        // Build a multi-level tree
+        let n = 600u32;
+        for i in 0..n {
+            let key = format!("{:010}", i);
+            tree.insert(key.into_bytes(), format!("pk_{}", i).into_bytes());
+        }
+
+        // Root should be internal
+        assert!(!tree.get_node(tree.root).unwrap().is_leaf());
+
+        // Remove all but a few entries — root should collapse back to leaf
+        for i in 0..(n - 3) {
+            let key = format!("{:010}", i);
+            tree.remove(key.as_bytes(), format!("pk_{}", i).as_bytes());
+        }
+
+        assert_eq!(tree.len(), 3);
+        // Root should now be a leaf after collapse
+        assert!(tree.get_node(tree.root).unwrap().is_leaf());
+
+        // Verify remaining
+        for i in (n - 3)..n {
+            let key = format!("{:010}", i);
+            assert_eq!(tree.lookup(key.as_bytes()).len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_remove_all_entries() {
+        let mut tree = BPlusTree::new("Product", "price");
+
+        for i in 0..300u32 {
+            let key = format!("{:010}", i);
+            tree.insert(key.into_bytes(), format!("pk_{}", i).into_bytes());
+        }
+
+        // Remove everything
+        for i in 0..300u32 {
+            let key = format!("{:010}", i);
+            tree.remove(key.as_bytes(), format!("pk_{}", i).as_bytes());
+        }
+
+        assert_eq!(tree.len(), 0);
+        assert!(tree.is_empty());
+        // Root should be a leaf (empty tree)
+        assert!(tree.get_node(tree.root).unwrap().is_leaf());
+    }
+
+    #[test]
+    fn test_remove_cascading_underflow() {
+        let mut tree = BPlusTree::new("Product", "price");
+
+        // Insert enough to create a deep tree
+        let n = 1000u32;
+        for i in 0..n {
+            let key = format!("{:010}", i);
+            tree.insert(key.into_bytes(), format!("pk_{}", i).into_bytes());
+        }
+
+        // Remove a large contiguous block to trigger cascading underflows
+        // (leaf merge -> internal underflow -> internal merge -> possible root collapse)
+        for i in 200..800 {
+            let key = format!("{:010}", i);
+            tree.remove(key.as_bytes(), format!("pk_{}", i).as_bytes());
+        }
+
+        assert_eq!(tree.len(), 400);
+
+        // Verify all remaining entries via point lookup
+        for i in 0..200u32 {
+            let key = format!("{:010}", i);
+            assert_eq!(tree.lookup(key.as_bytes()).len(), 1, "key {} missing", key);
+        }
+        for i in 800..n {
+            let key = format!("{:010}", i);
+            assert_eq!(tree.lookup(key.as_bytes()).len(), 1, "key {} missing", key);
+        }
+
+        // Range scan should still work (use 10-byte keys matching {:010}, inclusive on both ends)
+        let keys = tree.range_scan(Some(b"0000000050"), Some(b"0000000149"));
+        assert_eq!(keys.len(), 100, "range [50,149] failed, got {}", keys.len());
+
+        let keys = tree.range_scan(Some(b"0000000850"), Some(b"0000000949"));
+        assert_eq!(keys.len(), 100, "range [850,949] failed, got {}", keys.len());
+    }
+
+    #[test]
+    fn test_remove_interleaved_insert_delete() {
+        let mut tree = BPlusTree::new("Product", "price");
+
+        // Insert, delete, re-insert pattern
+        for i in 0..200u32 {
+            let key = format!("{:010}", i);
+            tree.insert(key.into_bytes(), format!("pk_{}", i).into_bytes());
+        }
+
+        // Remove even keys
+        for i in (0..200u32).step_by(2) {
+            let key = format!("{:010}", i);
+            tree.remove(key.as_bytes(), format!("pk_{}", i).as_bytes());
+        }
+        assert_eq!(tree.len(), 100);
+
+        // Re-insert them with different pks
+        for i in (0..200u32).step_by(2) {
+            let key = format!("{:010}", i);
+            tree.insert(key.into_bytes(), format!("new_pk_{}", i).into_bytes());
+        }
+        assert_eq!(tree.len(), 200);
+
+        // Verify all entries
+        for i in 0..200u32 {
+            let key = format!("{:010}", i);
+            let pks = tree.lookup(key.as_bytes());
+            assert_eq!(pks.len(), 1, "key {} should have 1 pk", key);
+            if i % 2 == 0 {
+                assert_eq!(pks[0], format!("new_pk_{}", i).as_bytes());
+            } else {
+                assert_eq!(pks[0], format!("pk_{}", i).as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn test_remove_multiple_pks_then_key() {
+        let mut tree = BPlusTree::new("Order", "status");
+        tree.insert(b"active".to_vec(), b"order_1".to_vec());
+        tree.insert(b"active".to_vec(), b"order_2".to_vec());
+        tree.insert(b"active".to_vec(), b"order_3".to_vec());
+
+        // Remove one pk — key still present
+        tree.remove(b"active", b"order_2");
+        assert_eq!(tree.lookup(b"active").len(), 2);
+
+        // Remove another — key still present
+        tree.remove(b"active", b"order_1");
+        assert_eq!(tree.lookup(b"active").len(), 1);
+
+        // Remove last pk — key entry should be removed
+        tree.remove(b"active", b"order_3");
+        assert_eq!(tree.lookup(b"active").len(), 0);
+        assert_eq!(tree.len(), 0);
     }
 
     #[test]

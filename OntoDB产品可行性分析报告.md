@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.3 | 更新日期：2026-08-06
+> 版本：v1.4 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -58,7 +58,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - **Leveled Compaction**：L0 全量合并 → L1+ 逐级合并，去重保留最新版本，最底层 tombstone 可清理
 - **MVCC 事务**：快照隔离，写不阻塞读，事务写缓冲 + 提交时批量刷入 WAL，所有 SQL 操作自动走事务
 - **B+Tree 二级索引（内存版）**：内存 B+Tree + LSM 持久化，支持等值/范围查询，自动回填/维护/去索引
-- **B+Tree 磁盘索引（Disk-based）**：4KB 页式存储，Slotted Page 布局，LRU Buffer Pool，支持点查找 O(log n)、范围扫描（leaf chain）、节点分裂自动传播，独立 `.idx` 文件持久化
+- **B+Tree 磁盘索引（Disk-based）**：4KB 页式存储，Slotted Page 布局，LRU Buffer Pool，支持点查找 O(log n)、范围扫描（leaf chain）、节点分裂/合并自动传播、下溢重平衡（redistribute + merge）、根节点收缩，独立 `.idx` 文件持久化
 - **全局 seq_no**：引擎级序列号确保跨 MemTable flush 的版本顺序正确
 
 ### 本体引擎详情
@@ -97,7 +97,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 |------|------|------|
 | LSM-Tree 存储引擎 | **可行，已实现完整** | WAL + MemTable + SSTable + Leveled Compaction + tombstone 感知读取 + WAL fsync 持久化，73 个存储引擎测试 + 25 个集成测试验证 |
 | MVCC 事务 | **可行，已实现** | 快照隔离、事务写缓冲、提交/回滚、可见性过滤，已集成到查询层 |
-| B+Tree 磁盘索引 | **可行，已实现** | 4KB 页式存储、Slotted Page、LRU Buffer Pool、节点分裂、leaf chain 范围扫描，21 个专项测试验证（含500条目分裂、2000条目大数据集、持久化重开） |
+| B+Tree 磁盘索引 | **可行，已实现** | 4KB 页式存储、Slotted Page、LRU Buffer Pool、节点分裂/合并、下溢重平衡（redistribute + merge）、根节点收缩、leaf chain 范围扫描，26 个专项测试验证（含500条目分裂、2000条目大数据集、持久化重开、1000条目级联下溢合并、交错插入删除） |
 | Raft 共识 | **可行** | `tikv/raft-rs` 是工业级 Rust Raft 实现 |
 | 本体模型 | **可行，已实现基础** | 类/属性/继承/约束模型已通 |
 | SQL 解析 | **可行，已实现基础** | 8 种语句（含 JOIN/UNION/子查询）已通 |
@@ -113,7 +113,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | **语义向量检索** | 中 | HNSW 向量索引 + 本体过滤联合查询，先用本体约束缩小候选集再做向量排序 |
 | **推理性能** | 中高 | 预计算推理结果（物化视图）+ 增量推理 + 分级推理（快速规则推理内联，完整 DL 推理异步） |
 | **Compaction 策略** | 低 | **已完成** Leveled Compaction 实现，含合并去重和 tombstone 清理 |
-| **B+Tree 磁盘索引** | 低 | **已完成** 页式 B+Tree 实现，含 insert/lookup/range_scan/split/persistence |
+| **B+Tree 磁盘索引** | 低 | **已完成** 页式 B+Tree 实现，含 insert/lookup/range_scan/split/delete/merge/rebalance/persistence |
 | **Bloom Filter** | 低 | 当前框架已预留配置，实现相对直接 |
 
 ### 3.3 应该砍掉或延后的方向
@@ -367,12 +367,12 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 | 测试类型 | 数量 | 覆盖范围 |
 |----------|------|----------|
-| 存储引擎单元测试 | 73 | WAL、MemTable、SSTable、Compaction、MVCC、B+Tree、索引 |
+| 存储引擎单元测试 | 81 | WAL、MemTable、SSTable、Compaction、MVCC、B+Tree（含 insert/delete/merge/rebalance）、索引 |
 | 查询引擎单元测试 | 54 | SQL 解析、执行、JOIN、GROUP BY、ORDER BY、聚合、索引加速 |
 | 查询-存储集成测试 | 25 | 跨组件场景：flush 后查询、compaction、恢复、多类隔离、事务 |
 | 本体引擎测试 | 7 | 本体模型、解析、存储 |
 | 端到端测试 | 3 | TCP 客户端-服务器完整生命周期 |
-| **总计** | **162** | **全部通过，0 个警告** |
+| **总计** | **170** | **全部通过，0 个警告** |
 
 ### 10.2 代码质量改进（v1.3）
 
@@ -405,7 +405,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 3. **100% 自研核心引擎是正确策略**：存储引擎、本体引擎、查询引擎、事务引擎必须自主掌控，基础设施（Raft、序列化、压缩）选择性复用
 4. **跨平台无实质风险**：当前 Rust 代码天然跨平台，Windows 开发 → Linux 生产完全可行，CI 双平台构建是最低成本保障
 5. **范围是最大风险**：必须砍掉 80% 的外围功能，聚焦核心
-6. **代码质量持续提升**：162 个测试全部通过，0 个编译警告，生产代码错误处理规范化，WAL 持久化保障已完善
+6. **代码质量持续提升**：170 个测试全部通过，0 个编译警告，生产代码错误处理规范化，WAL 持久化保障已完善
 
 ### 行动建议
 
