@@ -74,6 +74,8 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - `INSERT INTO <class> (...) VALUES (...)` — 数据插入
 - `SELECT [DISTINCT] ... FROM <class> [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ASC/DESC ...] [LIMIT ...]` — 数据查询
 - `SELECT ... FROM A JOIN B ON A.x = B.y ...` — 多表 JOIN 查询（nested-loop join）
+- `SELECT ... UNION [ALL] SELECT ...` — 合并查询
+- `SELECT ... WHERE col IN (SELECT ...)` — 子查询
 - `SELECT COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col) ...` — 聚合函数
 - WHERE 条件：`=`, `!=`, `<>`, `>`, `<`, `>=`, `<=`, `LIKE`, `BETWEEN`, `IN`, `AND`, `OR`
 - `UPDATE <class> SET ... WHERE ...` — 数据更新（扫描+修改+重写，支持多字段多行）

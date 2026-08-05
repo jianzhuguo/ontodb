@@ -23,13 +23,30 @@ impl QueryExecutor {
 
     /// Executes a query and returns results as JSON.
     pub fn execute(&self, ast: &QueryAst) -> Result<QueryResult> {
+        // Acquire engine lock once at the top level to avoid deadlocks
+        // when subqueries re-enter execute().
+        let mut engine = self.engine.write().unwrap();
+        self.execute_with_engine(ast, &mut engine)
+    }
+
+    /// Internal execution with engine reference passed through.
+    fn execute_with_engine(&self, ast: &QueryAst, engine: &mut LsmEngine) -> Result<QueryResult> {
         match ast {
-            QueryAst::CreateOntology { sql } => self.execute_create_ontology(sql),
+            QueryAst::CreateOntology { sql } => {
+                let ontology = onto_ontology::OntologyParser::parse(sql)?;
+                self.ontology_store.save_with_engine(engine, &ontology)?;
+                Ok(QueryResult::Success(format!(
+                    "Ontology '{}' created with {} classes and {} properties",
+                    ontology.name,
+                    ontology.classes.len(),
+                    ontology.properties.len()
+                )))
+            }
             QueryAst::Insert {
                 class,
                 columns,
                 values,
-            } => self.execute_insert(class, columns, values),
+            } => self.execute_insert(engine, class, columns, values),
             QueryAst::Select {
                 distinct,
                 columns,
@@ -43,47 +60,66 @@ impl QueryExecutor {
                 limit,
                 ..
             } => self.execute_select(
-                *distinct, columns, from, from_alias.as_deref(), joins, filter,
+                engine, *distinct, columns, from, from_alias.as_deref(), joins, filter,
                 group_by.as_ref(), having, order_by.as_ref(), *limit,
             ),
-            QueryAst::Delete { class, filter } => self.execute_delete(class, filter),
+            QueryAst::Delete { class, filter } => self.execute_delete(engine, class, filter),
             QueryAst::Update {
                 class,
                 assignments,
                 filter,
-            } => self.execute_update(class, assignments, filter),
+            } => self.execute_update(engine, class, assignments, filter),
             QueryAst::Match {
                 variable,
                 class,
                 filter,
                 returns,
-            } => self.execute_match(variable, class, filter, returns),
+            } => self.execute_match(engine, variable, class, filter, returns),
+            QueryAst::Union { left, right, all } => self.execute_union(engine, left, right, *all),
         }
     }
 
-    fn execute_create_ontology(&self, sql: &str) -> Result<QueryResult> {
-        let ontology = onto_ontology::OntologyParser::parse(sql)?;
-        self.ontology_store.save(&ontology)?;
+    /// Executes UNION [ALL] by running both queries and merging results.
+    fn execute_union(&self, engine: &mut LsmEngine, left: &QueryAst, right: &QueryAst, all: bool) -> Result<QueryResult> {
+        let left_result = self.execute_with_engine(left, engine)?;
+        let right_result = self.execute_with_engine(right, engine)?;
 
-        Ok(QueryResult::Success(format!(
-            "Ontology '{}' created with {} classes and {} properties",
-            ontology.name,
-            ontology.classes.len(),
-            ontology.properties.len()
-        )))
+        let mut rows = match left_result {
+            QueryResult::Rows(r) => r,
+            _ => vec![],
+        };
+
+        let right_rows = match right_result {
+            QueryResult::Rows(r) => r,
+            _ => vec![],
+        };
+
+        rows.extend(right_rows);
+
+        if !all {
+            let mut seen = std::collections::HashSet::new();
+            rows.retain(|row| {
+                let key: String = row
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join("\x00");
+                seen.insert(key)
+            });
+        }
+
+        Ok(QueryResult::Rows(rows))
     }
 
     fn execute_insert(
         &self,
+        engine: &mut LsmEngine,
         class: &str,
         columns: &[String],
         values: &[LiteralValue],
     ) -> Result<QueryResult> {
-        // Build document key: <class>::<id>
-        // For now, use a simple auto-increment approach
         let key = self.generate_doc_key(class);
 
-        // Build JSON document
         let mut doc = Map::new();
         doc.insert("__class__".to_string(), json!(class));
 
@@ -94,7 +130,6 @@ impl QueryExecutor {
         let value = serde_json::to_vec(&Value::Object(doc))
             .map_err(|e| CoreError::Serialization(e.to_string()))?;
 
-        let mut engine = self.engine.write().unwrap();
         engine.put(key, value)?;
 
         Ok(QueryResult::Success("1 row inserted".to_string()))
@@ -102,6 +137,7 @@ impl QueryExecutor {
 
     fn execute_select(
         &self,
+        engine: &mut LsmEngine,
         distinct: bool,
         columns: &SelectColumns,
         from: &str,
@@ -113,7 +149,6 @@ impl QueryExecutor {
         order_by: Option<&crate::parser::OrderBy>,
         limit: Option<usize>,
     ) -> Result<QueryResult> {
-        let mut engine = self.engine.write().unwrap();
 
         // ── Step 1: Scan and join rows ────────────────────────────────
         let prefix = format!("{}::", from);
@@ -178,7 +213,7 @@ impl QueryExecutor {
         // ── Step 2: Apply WHERE filter ────────────────────────────────
         let filtered: Vec<Map<String, Value>> = all_rows
             .into_iter()
-            .filter(|doc| self.matches_filter(doc, filter))
+            .filter(|doc| self.matches_filter(engine, doc, filter))
             .collect();
 
         // ── Step 3: Check if aggregation is needed ────────────────────
@@ -187,7 +222,7 @@ impl QueryExecutor {
         if group_by.is_some() || has_aggregates {
             // Aggregate query
             let result = self.execute_aggregation(
-                columns, &filtered, group_by, having, order_by, limit,
+                engine, columns, &filtered, group_by, having, order_by, limit,
             );
             return result;
         }
@@ -249,6 +284,7 @@ impl QueryExecutor {
     /// Executes aggregation: GROUP BY + aggregate functions + HAVING.
     fn execute_aggregation(
         &self,
+        engine: &mut LsmEngine,
         columns: &SelectColumns,
         rows: &[Map<String, Value>],
         group_by: Option<&crate::parser::GroupByClause>,
@@ -322,7 +358,7 @@ impl QueryExecutor {
             }
 
             // Apply HAVING filter
-            if self.matches_filter(&result_row, having) {
+            if self.matches_filter(engine, &result_row, having) {
                 result_rows.push(result_row);
             }
         }
@@ -461,9 +497,7 @@ impl QueryExecutor {
         a.cmp(b)
     }
 
-    fn execute_delete(&self, class: &str, filter: &Option<FilterExpr>) -> Result<QueryResult> {
-        let mut engine = self.engine.write().unwrap();
-
+    fn execute_delete(&self, engine: &mut LsmEngine, class: &str, filter: &Option<FilterExpr>) -> Result<QueryResult> {
         let prefix = format!("{}::", class);
         let entries = engine.scan_prefix(prefix.as_bytes())?;
 
@@ -471,7 +505,7 @@ impl QueryExecutor {
         for (key, val_bytes) in entries {
             if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&val_bytes) {
                 if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
-                    if self.matches_filter(&doc, filter) {
+                    if self.matches_filter(engine, &doc, filter) {
                         engine.delete(key)?;
                         deleted += 1;
                     }
@@ -484,12 +518,11 @@ impl QueryExecutor {
 
     fn execute_update(
         &self,
+        engine: &mut LsmEngine,
         class: &str,
         assignments: &[(String, LiteralValue)],
         filter: &Option<FilterExpr>,
     ) -> Result<QueryResult> {
-        let mut engine = self.engine.write().unwrap();
-
         let prefix = format!("{}::", class);
         let entries = engine.scan_prefix(prefix.as_bytes())?;
 
@@ -497,8 +530,7 @@ impl QueryExecutor {
         for (key, val_bytes) in entries {
             if let Ok(Value::Object(mut doc)) = serde_json::from_slice::<Value>(&val_bytes) {
                 if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
-                    if self.matches_filter(&doc, filter) {
-                        // Apply assignments
+                    if self.matches_filter(engine, &doc, filter) {
                         for (col, val) in assignments {
                             doc.insert(col.clone(), self.literal_to_json(val));
                         }
@@ -516,6 +548,7 @@ impl QueryExecutor {
 
     fn execute_match(
         &self,
+        engine: &mut LsmEngine,
         _variable: &str,
         class: &str,
         filter: &Option<FilterExpr>,
@@ -532,7 +565,7 @@ impl QueryExecutor {
             )
         };
 
-        self.execute_select(false, &columns, class, None, &[], filter, None, &None, None, None)
+        self.execute_select(engine, false, &columns, class, None, &[], filter, None, &None, None, None)
     }
 
     fn generate_doc_key(&self, class: &str) -> Vec<u8> {
@@ -545,14 +578,14 @@ impl QueryExecutor {
         format!("{}::{:020}", class, now).into_bytes()
     }
 
-    fn matches_filter(&self, doc: &Map<String, Value>, filter: &Option<FilterExpr>) -> bool {
+    fn matches_filter(&self, engine: &mut LsmEngine, doc: &Map<String, Value>, filter: &Option<FilterExpr>) -> bool {
         match filter {
             None => true,
-            Some(expr) => self.eval_filter(doc, expr),
+            Some(expr) => self.eval_filter(engine, doc, expr),
         }
     }
 
-    fn eval_filter(&self, doc: &Map<String, Value>, expr: &FilterExpr) -> bool {
+    fn eval_filter(&self, engine: &mut LsmEngine, doc: &Map<String, Value>, expr: &FilterExpr) -> bool {
         match expr {
             FilterExpr::Eq(col, val) => {
                 doc.get(col)
@@ -597,11 +630,30 @@ impl QueryExecutor {
                     values.iter().any(|val| self.value_matches(v, val))
                 })
             }
+            FilterExpr::InSubquery(col, subquery) => {
+                let sub_result = self.execute_with_engine(subquery, engine);
+                match sub_result {
+                    Ok(QueryResult::Rows(rows)) => {
+                        doc.get(col).map_or(false, |v| {
+                            rows.iter().any(|row| {
+                                row.values().any(|sv| {
+                                    match (v, sv) {
+                                        (Value::String(a), Value::String(b)) => a == b,
+                                        (Value::Number(a), Value::Number(b)) => a == b,
+                                        _ => v.to_string() == sv.to_string(),
+                                    }
+                                })
+                            })
+                        })
+                    }
+                    _ => false,
+                }
+            }
             FilterExpr::And(left, right) => {
-                self.eval_filter(doc, left) && self.eval_filter(doc, right)
+                self.eval_filter(engine, doc, left) && self.eval_filter(engine, doc, right)
             }
             FilterExpr::Or(left, right) => {
-                self.eval_filter(doc, left) || self.eval_filter(doc, right)
+                self.eval_filter(engine, doc, left) || self.eval_filter(engine, doc, right)
             }
         }
     }
@@ -1840,6 +1892,115 @@ mod tests {
                 assert_eq!(rows.len(), 2); // iPad, MacBook
             }
             _ => panic!("expected 2 rows with IN on numbers"),
+        }
+    }
+
+    // ── UNION tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_union_basic() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+
+        // Insert into a different class
+        let ast = QueryAst::Insert {
+            class: "Item".to_string(),
+            columns: vec!["name".to_string(), "price".to_string()],
+            values: vec![LiteralValue::String("Widget".to_string()), LiteralValue::Int(49)],
+        };
+        executor.execute(&ast).unwrap();
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse(
+            "SELECT name FROM Product UNION SELECT name FROM Item"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3); // iPhone, iPad, Widget
+            }
+            _ => panic!("expected 3 rows from UNION"),
+        }
+    }
+
+    #[test]
+    fn test_union_all() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+
+        let ast = QueryAst::Insert {
+            class: "Item".to_string(),
+            columns: vec!["name".to_string(), "price".to_string()],
+            values: vec![LiteralValue::String("iPhone".to_string()), LiteralValue::Int(999)],
+        };
+        executor.execute(&ast).unwrap();
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // UNION ALL keeps duplicates
+        let ast = QueryParser::parse(
+            "SELECT name FROM Product UNION ALL SELECT name FROM Item"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // iPhone from Product + iPhone from Item
+            }
+            _ => panic!("expected 2 rows from UNION ALL"),
+        }
+
+        // UNION (without ALL) removes duplicates
+        let ast = QueryParser::parse(
+            "SELECT name FROM Product UNION SELECT name FROM Item"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1); // deduplicated
+            }
+            _ => panic!("expected 1 row from UNION (dedup)"),
+        }
+    }
+
+    // ── Subquery tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_subquery_in_where() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Subquery: select names where price > 900
+        let ast = QueryParser::parse(
+            "SELECT name FROM Product WHERE name IN (SELECT name FROM Product WHERE price > 900)"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // iPhone, MacBook
+            }
+            _ => panic!("expected 2 rows from subquery IN"),
+        }
+    }
+
+    #[test]
+    fn test_subquery_no_match() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Subquery returns empty set
+        let ast = QueryParser::parse(
+            "SELECT name FROM Product WHERE name IN (SELECT name FROM Product WHERE price > 9999)"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 0);
+            }
+            _ => panic!("expected 0 rows from empty subquery"),
         }
     }
 }

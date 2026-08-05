@@ -55,6 +55,13 @@ pub enum QueryAst {
         filter: Option<FilterExpr>,
         returns: Vec<String>,
     },
+
+    /// <query1> UNION [ALL] <query2>
+    Union {
+        left: Box<QueryAst>,
+        right: Box<QueryAst>,
+        all: bool, // true = UNION ALL (keep duplicates), false = UNION (distinct)
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +122,7 @@ pub enum FilterExpr {
     Like(String, String),                          // column LIKE 'pattern'
     Between(String, LiteralValue, LiteralValue),    // column BETWEEN low AND high
     In(String, Vec<LiteralValue>),                  // column IN (val1, val2, ...)
+    InSubquery(String, Box<QueryAst>),              // column IN (SELECT ...)
     And(Box<FilterExpr>, Box<FilterExpr>),
     Or(Box<FilterExpr>, Box<FilterExpr>),
 }
@@ -159,7 +167,8 @@ impl QueryParser {
         } else if upper.starts_with("INSERT") {
             Self::parse_insert(input)
         } else if upper.starts_with("SELECT") {
-            Self::parse_select(input)
+            let ast = Self::parse_select(input)?;
+            Self::try_wrap_union(input, ast)
         } else if upper.starts_with("UPDATE") {
             Self::parse_update(input)
         } else if upper.starts_with("DELETE") {
@@ -172,6 +181,76 @@ impl QueryParser {
                 input
             )))
         }
+    }
+
+    /// Checks for UNION [ALL] in the input and wraps the first SELECT in a Union node.
+    /// Returns the original AST if no UNION is found.
+    fn try_wrap_union(input: &str, left: QueryAst) -> Result<QueryAst> {
+        let upper = input.to_uppercase();
+        // Find UNION that's not inside parentheses
+        let mut depth = 0i32;
+        let mut in_quote: Option<char> = None;
+        let bytes = upper.as_bytes();
+        let mut i = 0;
+
+        while i + 5 <= bytes.len() {
+            let c = bytes[i] as char;
+            if let Some(q) = in_quote {
+                if c == q { in_quote = None; }
+            } else if c == '\'' || c == '"' {
+                in_quote = Some(c);
+            } else if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+            } else if depth == 0 && bytes[i..].starts_with(b"UNION") {
+                let after = &input[i + 5..].trim_start();
+                let (all, rest) = if after.to_uppercase().starts_with("ALL") {
+                    (true, after[3..].trim())
+                } else {
+                    (false, after.trim())
+                };
+                let right = Self::parse(rest)?;
+                return Ok(QueryAst::Union {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    all,
+                });
+            }
+            i += 1;
+        }
+        Ok(left)
+    }
+
+    /// Parses a subquery from parenthesized input: (SELECT ...)
+    pub fn parse_subquery(input: &str) -> Result<QueryAst> {
+        let input = input.trim();
+        if !input.starts_with('(') {
+            return Err(CoreError::InvalidArgument(
+                "expected '(' for subquery".to_string(),
+            ));
+        }
+        // Find matching closing paren
+        let mut depth = 0;
+        let mut in_quote: Option<char> = None;
+        for (i, c) in input.char_indices() {
+            if let Some(q) = in_quote {
+                if c == q { in_quote = None; }
+            } else if c == '\'' || c == '"' {
+                in_quote = Some(c);
+            } else if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    let inner = &input[1..i].trim();
+                    return Self::parse(inner);
+                }
+            }
+        }
+        Err(CoreError::InvalidArgument(
+            "unmatched '(' in subquery".to_string(),
+        ))
     }
 
     fn parse_insert(input: &str) -> Result<QueryAst> {
@@ -698,18 +777,39 @@ impl QueryParser {
             }
         }
 
-        // Check for IN: column IN (val1, val2, ...)
+        // Check for IN: column IN (val1, val2, ...) or column IN (SELECT ...)
         if let Some(in_pos) = Self::find_unquoted(&upper, " IN ") {
             let col = input[..in_pos].trim().to_string();
             let rest = input[in_pos + 4..].trim();
             if rest.starts_with('(') {
-                if let Some(close) = rest.find(')') {
-                    let inner = &rest[1..close];
+                // Find matching closing paren
+                let mut depth = 0i32;
+                let mut close_pos = None;
+                for (i, c) in rest.char_indices() {
+                    if c == '(' { depth += 1; }
+                    if c == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            close_pos = Some(i);
+                            break;
+                        }
+                    }
+                }
+                if let Some(close) = close_pos {
+                    let inner = rest[1..close].trim();
+                    let remaining = rest[close + 1..].trim().to_string();
+
+                    // Check if it's a subquery
+                    if inner.to_uppercase().starts_with("SELECT") {
+                        let subquery = Self::parse(inner)?;
+                        return Ok((Some(FilterExpr::InSubquery(col, Box::new(subquery))), remaining));
+                    }
+
+                    // Otherwise, parse as value list
                     let values: Vec<LiteralValue> = inner
                         .split(',')
                         .map(|s| Self::parse_literal(s.trim()))
                         .collect::<Result<Vec<_>>>()?;
-                    let remaining = rest[close + 1..].trim().to_string();
                     return Ok((Some(FilterExpr::In(col, values)), remaining));
                 }
             }

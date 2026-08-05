@@ -30,11 +30,32 @@ impl OntologyStore {
         engine.put(key, value)
     }
 
+    /// Saves an ontology using an already-acquired engine reference.
+    pub fn save_with_engine(&self, engine: &mut LsmEngine, ontology: &Ontology) -> Result<()> {
+        let key = Self::make_key(&ontology.name);
+        let value = serde_json::to_vec(ontology)
+            .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
+        engine.put(key, value)
+    }
+
     /// Loads an ontology by name.
     pub fn load(&self, name: &str) -> Result<Option<Ontology>> {
         let key = Self::make_key(name);
 
         let mut engine = self.engine.write().unwrap();
+        match engine.get(&key)? {
+            Some(bytes) => {
+                let ontology: Ontology = serde_json::from_slice(&bytes)
+                    .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
+                Ok(Some(ontology))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Loads an ontology using an already-acquired engine reference.
+    pub fn load_with_engine(&self, engine: &mut LsmEngine, name: &str) -> Result<Option<Ontology>> {
+        let key = Self::make_key(name);
         match engine.get(&key)? {
             Some(bytes) => {
                 let ontology: Ontology = serde_json::from_slice(&bytes)
