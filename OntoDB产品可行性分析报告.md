@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.5 | 更新日期：2026-08-06
+> 版本：v1.6 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -374,14 +374,17 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | 端到端测试 | 3 | TCP 客户端-服务器完整生命周期 |
 | **总计** | **184** | **全部通过，0 个警告** |
 
-### 10.2 代码质量改进（v1.3）
+### 10.2 代码质量改进（v1.3 - v1.6）
 
 | 改进项 | 说明 |
 |--------|------|
 | 生产代码 unwrap 消除 | RwLock、解析器关键路径改用 `map_err` + `?` 返回错误 |
 | 死代码清理 | 移除 5 个未使用的 executor 方法、未使用的 IndexMeta、未使用的 tokio 依赖 |
-| 编译警告清零 | 从 16 个警告降至 0 个 |
+| 编译警告清零 | 从 16 个警告降至 0 个（含 v1.6 清理 manager.rs/mvcc/disk.rs 最后 4 个警告） |
 | 文档键唯一性 | 使用 AtomicU64 计数器 + 时间戳组合，消除碰撞风险 |
+| MemTable 查询优化（v1.5） | `get()` 从 O(n) 线性扫描改为 O(log n) BTreeMap range 查询 |
+| prefix_may_overlap 修复（v1.5） | 修复前缀重叠检测逻辑错误，消除无效 SSTable 扫描 |
+| BufferPool LRU 优化（v1.6） | `touch()` 从 O(n) Vec retain+insert 改为 O(1) HashMap + 单调计数器 |
 | MVCC 可见性修复 | 重启后 seq_counter 正确同步 SSTable 最大序列号 |
 | ORDER BY 修复 | 排序移到列投影之前，确保 ORDER BY 列可用 |
 | AND/OR 解析修复 | WHERE 子句支持递归 AND/OR 组合条件 |
