@@ -153,17 +153,45 @@ impl MemTable {
     }
 
     /// Gets the latest value for a key.
+    /// Uses BTreeMap range query for O(log n) lookup instead of linear scan.
     pub fn get(&self, key: &[u8]) -> Option<(&[u8], SeqNo)> {
-        // Iterate all entries and find the latest version of this key
-        for (_composite, entry) in &self.data {
-            if entry.key == key {
-                if entry.is_tombstone() {
-                    return None;
-                }
-                return Some((&entry.value, entry.seq_no));
+        // Composite key format: user_key ++ (!seq_no).to_be_bytes()
+        // Since !seq_no inverts bits, higher seq_no → smaller composite.
+        // All versions of a key K are in range [K++0x00*8, K++0xFF*8].
+        let mut lower = Vec::with_capacity(key.len() + 8);
+        lower.extend_from_slice(key);
+        lower.extend_from_slice(&0u64.to_be_bytes()); // smallest seq part
+
+        let mut upper = Vec::with_capacity(key.len() + 8);
+        upper.extend_from_slice(key);
+        upper.extend_from_slice(&u64::MAX.to_be_bytes()); // largest seq part
+
+        // Iterate versions of this key, newest first (highest seq_no = smallest composite).
+        for (_composite, entry) in self.data.range(lower..=upper) {
+            if entry.key != key {
+                continue; // Skip entries with different user keys (e.g., "key\x00")
             }
+            if entry.is_tombstone() {
+                return None;
+            }
+            return Some((&entry.value, entry.seq_no));
         }
         None
+    }
+
+    /// Returns an iterator over all versions of a given key, newest first.
+    pub fn get_versions<'a>(&'a self, key: &'a [u8]) -> impl Iterator<Item = &'a MemTableEntry> + 'a {
+        let mut lower = Vec::with_capacity(key.len() + 8);
+        lower.extend_from_slice(key);
+        lower.extend_from_slice(&0u64.to_be_bytes());
+
+        let mut upper = Vec::with_capacity(key.len() + 8);
+        upper.extend_from_slice(key);
+        upper.extend_from_slice(&u64::MAX.to_be_bytes());
+
+        self.data.range(lower..=upper)
+            .filter(move |(_, e)| e.key.as_slice() == key)
+            .map(|(_, e)| e)
     }
 
     /// Returns an iterator over all entries in sorted order.
@@ -242,5 +270,46 @@ mod tests {
 
         let keys: Vec<&[u8]> = mt.entries().map(|e| e.key.as_slice()).collect();
         assert_eq!(keys, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+    }
+
+    #[test]
+    fn test_get_versions() {
+        let mut mt = MemTable::new();
+        mt.put(b"key".to_vec(), b"v1".to_vec());
+        mt.put(b"key".to_vec(), b"v2".to_vec());
+        mt.put(b"key".to_vec(), b"v3".to_vec());
+        mt.put(b"other".to_vec(), b"x".to_vec());
+
+        let versions: Vec<&[u8]> = mt.get_versions(b"key").map(|e| e.value.as_slice()).collect();
+        assert_eq!(versions, vec![b"v3".as_slice(), b"v2".as_slice(), b"v1".as_slice()]);
+    }
+
+    #[test]
+    fn test_get_prefix_key_no_false_match() {
+        // Ensure "key" doesn't accidentally match "key1" or "key\x00"
+        let mut mt = MemTable::new();
+        mt.put(b"key".to_vec(), b"exact".to_vec());
+        mt.put(b"key1".to_vec(), b"longer".to_vec());
+        mt.put(b"key\x00".to_vec(), b"nullbyte".to_vec());
+
+        let (val, _) = mt.get(b"key").unwrap();
+        assert_eq!(val, b"exact");
+
+        let (val, _) = mt.get(b"key1").unwrap();
+        assert_eq!(val, b"longer");
+
+        let (val, _) = mt.get(b"key\x00").unwrap();
+        assert_eq!(val, b"nullbyte");
+    }
+
+    #[test]
+    fn test_get_after_delete_and_reinsert() {
+        let mut mt = MemTable::new();
+        mt.put(b"k".to_vec(), b"v1".to_vec());
+        mt.delete(b"k".to_vec());
+        mt.put(b"k".to_vec(), b"v2".to_vec());
+
+        let (val, _) = mt.get(b"k").unwrap();
+        assert_eq!(val, b"v2");
     }
 }

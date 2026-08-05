@@ -265,17 +265,16 @@ impl LsmEngine {
     }
 
     /// Checks if a prefix could match any key in the range [min_key, max_key].
+    ///
+    /// A key starting with `prefix` exists in [min_key, max_key] iff:
+    /// 1. prefix <= max_key (some prefixed key is not past the end), AND
+    /// 2. min_key starts with prefix (min_key itself has this prefix), OR
+    ///    min_key < prefix (the smallest prefixed key is after min_key).
     fn prefix_may_overlap(prefix: &[u8], min_key: &[u8], max_key: &[u8]) -> bool {
-        if prefix <= min_key {
-            // prefix could match min_key or keys after it
-            return true;
-        }
         if prefix > max_key {
-            // prefix is beyond the max key
             return false;
         }
-        // prefix is within the range
-        true
+        min_key.starts_with(prefix) || min_key < prefix
     }
 
     /// Deletes a key (writes a tombstone).
@@ -924,14 +923,8 @@ impl LsmEngine {
         key: &[u8],
         vis: &crate::mvcc::Visibility,
     ) -> Result<Option<Value>> {
-        // Check active MemTable — find latest visible version
-        for entry in self.memtable.entries() {
-            if entry.key != key {
-                if entry.key.as_slice() > key {
-                    break; // Past this key in sorted order
-                }
-                continue;
-            }
+        // Check active MemTable — use range query to find visible version
+        for entry in self.memtable.get_versions(key) {
             if vis.is_visible(entry.seq_no) {
                 if entry.is_tombstone() {
                     return Ok(None);
@@ -943,13 +936,7 @@ impl LsmEngine {
 
         // Check immutable MemTable
         if let Some(ref imm) = self.immutable_memtable {
-            for entry in imm.entries() {
-                if entry.key != key {
-                    if entry.key.as_slice() > key {
-                        break;
-                    }
-                    continue;
-                }
+            for entry in imm.get_versions(key) {
                 if vis.is_visible(entry.seq_no) {
                     if entry.is_tombstone() {
                         return Ok(None);
@@ -1082,6 +1069,26 @@ pub struct EngineStats {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_prefix_may_overlap() {
+        // prefix == min_key → true
+        assert!(LsmEngine::prefix_may_overlap(b"002", b"002", b"005"));
+        // prefix < min_key, but min_key starts with prefix → true
+        assert!(LsmEngine::prefix_may_overlap(b"00", b"002", b"005"));
+        // prefix < min_key, min_key does NOT start with prefix → false
+        assert!(!LsmEngine::prefix_may_overlap(b"001", b"002", b"005"));
+        // prefix in range → true
+        assert!(LsmEngine::prefix_may_overlap(b"003", b"002", b"005"));
+        // prefix == max_key → true
+        assert!(LsmEngine::prefix_may_overlap(b"005", b"002", b"005"));
+        // prefix > max_key → false
+        assert!(!LsmEngine::prefix_may_overlap(b"006", b"002", b"005"));
+        // prefix much larger → false
+        assert!(!LsmEngine::prefix_may_overlap(b"Z", b"A", b"B"));
+        // empty prefix matches everything → true
+        assert!(LsmEngine::prefix_may_overlap(b"", b"A", b"Z"));
+    }
 
     #[test]
     fn test_engine_basic_put_get() {
