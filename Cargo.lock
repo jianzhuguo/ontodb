@@ -525,6 +525,7 @@ dependencies = [
  "onto-storage",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tracing",
 ]

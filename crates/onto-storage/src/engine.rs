@@ -111,31 +111,142 @@ impl LsmEngine {
         }
 
         // 3. Check SSTables (newest to oldest)
-        for (level_idx, level) in self.levels.iter().enumerate() {
-            for (sst_idx, sst_info) in level.iter().rev().enumerate() {
-                // Quick range check
+        for level in &self.levels {
+            for sst_info in level.iter().rev() {
                 if key < sst_info.min_key.as_slice() || key > sst_info.max_key.as_slice() {
                     continue;
                 }
 
                 let mut sst = SsTable::open(&sst_info.path)?;
                 match sst.get_full(key)? {
-                    Some((value, seq, EntryKind::Put)) => {
-                        eprintln!("[GET] key={:?} found in L{}_{} (seq={})", 
-                            String::from_utf8_lossy(key), level_idx, sst_idx, seq);
-                        return Ok(Some(value));
-                    }
-                    Some((_, seq, EntryKind::Delete)) => {
-                        eprintln!("[GET] key={:?} TOMBSTONE in L{}_{} (seq={})", 
-                            String::from_utf8_lossy(key), level_idx, sst_idx, seq);
-                        return Ok(None); // Tombstone: stop searching
-                    }
-                    None => continue, // Not found in this SSTable, try next
+                    Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
+                    Some((_, _, EntryKind::Delete)) => return Ok(None),
+                    None => continue,
                 }
             }
         }
 
         Ok(None)
+    }
+
+    /// Scans all entries whose key starts with the given prefix.
+    /// Returns a sorted Vec of (key, value) pairs.
+    ///
+    /// This leverages the LSM-Tree's sorted key structure:
+    /// entries with `{class}::` prefix are contiguous in sorted order.
+    pub fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        use std::collections::BTreeMap;
+
+        // Collect latest version of each key from all sources
+        // BTreeMap ensures sorted order and automatic dedup
+        let mut seen: BTreeMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = BTreeMap::new();
+
+        // 1. Scan SSTables (oldest to newest, so newer entries overwrite older)
+        for level in self.levels.iter().rev() {
+            for sst_info in level.iter() {
+                // Quick range check: skip SSTable if prefix can't overlap
+                if !prefix.is_empty() {
+                    let sst_max = sst_info.max_key.as_slice();
+                    if sst_max < prefix {
+                        continue; // SSTable's max key is before our prefix
+                    }
+                    // Check if prefix could match: the SSTable's min_key must be <= some key with prefix
+                    let sst_min = sst_info.min_key.as_slice();
+                    if !Self::prefix_may_overlap(prefix, sst_min, sst_max) {
+                        continue;
+                    }
+                }
+
+                let mut sst = SsTable::open(&sst_info.path)?;
+                let mut iter = sst.iter()?;
+
+                // Seek to first key >= prefix
+                while iter.is_valid() && iter.key() < prefix {
+                    iter.next();
+                }
+
+                // Scan entries with matching prefix
+                while iter.is_valid() {
+                    if !iter.key().starts_with(prefix) {
+                        break; // Past the prefix range
+                    }
+                    let key = iter.key().to_vec();
+                    let value = iter.value().to_vec();
+                    let seq = iter.seq_no();
+                    let kind = iter.kind();
+
+                    // Only update if this is a newer version
+                    let should_update = match seen.get(&key) {
+                        Some((_, existing_seq, _)) => seq > *existing_seq,
+                        None => true,
+                    };
+                    if should_update {
+                        seen.insert(key, (value, seq, kind));
+                    }
+
+                    iter.next();
+                }
+            }
+        }
+
+        // 2. Scan immutable MemTable (overrides SSTables)
+        if let Some(ref imm) = self.immutable_memtable {
+            for entry in imm.entries() {
+                if !entry.key.starts_with(prefix) {
+                    continue;
+                }
+                let should_update = match seen.get(&entry.key) {
+                    Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
+                    None => true,
+                };
+                if should_update {
+                    seen.insert(
+                        entry.key.clone(),
+                        (entry.value.clone(), entry.seq_no, entry.kind),
+                    );
+                }
+            }
+        }
+
+        // 3. Scan active MemTable (overrides everything)
+        for entry in self.memtable.entries() {
+            if !entry.key.starts_with(prefix) {
+                continue;
+            }
+            let should_update = match seen.get(&entry.key) {
+                Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
+                None => true,
+            };
+            if should_update {
+                seen.insert(
+                    entry.key.clone(),
+                    (entry.value.clone(), entry.seq_no, entry.kind),
+                );
+            }
+        }
+
+        // Filter out tombstones and collect
+        let result: Vec<(Vec<u8>, Vec<u8>)> = seen
+            .into_iter()
+            .filter(|(_, (_, _, kind))| *kind == EntryKind::Put)
+            .map(|(key, (value, _, _))| (key, value))
+            .collect();
+
+        Ok(result)
+    }
+
+    /// Checks if a prefix could match any key in the range [min_key, max_key].
+    fn prefix_may_overlap(prefix: &[u8], min_key: &[u8], max_key: &[u8]) -> bool {
+        if prefix <= min_key {
+            // prefix could match min_key or keys after it
+            return true;
+        }
+        if prefix > max_key {
+            // prefix is beyond the max key
+            return false;
+        }
+        // prefix is within the range
+        true
     }
 
     /// Deletes a key (writes a tombstone).
@@ -359,13 +470,6 @@ impl LsmEngine {
             return Ok(());
         }
 
-        // Debug: print L0 SSTable ranges
-        for (i, sst_info) in ssts_to_compact.iter().enumerate() {
-            eprintln!("[COMPACT L{} SSTable {}: range {:?} - {:?}]", level, i, 
-                String::from_utf8_lossy(&sst_info.min_key), 
-                String::from_utf8_lossy(&sst_info.max_key));
-        }
-
         // Compute the combined key range of the SSTables being compacted
         let compact_min = ssts_to_compact
             .iter()
@@ -380,11 +484,6 @@ impl LsmEngine {
             .unwrap_or(b"")
             .to_vec();
 
-        eprintln!("[COMPACTION] L{}→L{}: compact range {:?} - {:?}, {} L0 SSTables, {} L1 SSTables",
-            level, level + 1, 
-            String::from_utf8_lossy(&compact_min), String::from_utf8_lossy(&compact_max),
-            ssts_to_compact.len(), self.levels[level + 1].len());
-
         // Step 2: Find overlapping SSTables in level N+1
         let next_level = level + 1;
         let mut overlapping_indices = Vec::new();
@@ -397,13 +496,6 @@ impl LsmEngine {
             ) {
                 overlapping_indices.push(i);
             }
-        }
-
-        // Debug: print L0 SSTable ranges
-        for (i, sst_info) in self.levels[0].iter().enumerate() {
-            eprintln!("[L0 SSTable {}: range {:?} - {:?}]", i, 
-                String::from_utf8_lossy(&sst_info.min_key), 
-                String::from_utf8_lossy(&sst_info.max_key));
         }
 
         // Collect overlapping SSTables (remove from level in reverse order to preserve indices)
@@ -420,13 +512,12 @@ impl LsmEngine {
             let mut sst = SsTable::open(&sst_info.path)?;
             let mut iter = sst.iter()?;
             while iter.is_valid() {
-                let k = iter.key().to_vec();
-                let kind = iter.kind();
-                if k == b"key_0042" {
-                    eprintln!("[L0 READ] key_0042: seq={}, kind={:?}, val={:?}", 
-                        iter.seq_no(), kind, String::from_utf8_lossy(iter.value()));
-                }
-                all_entries.push((k, iter.value().to_vec(), iter.seq_no(), kind));
+                all_entries.push((
+                    iter.key().to_vec(),
+                    iter.value().to_vec(),
+                    iter.seq_no(),
+                    iter.kind(),
+                ));
                 iter.next();
             }
         }
@@ -436,13 +527,12 @@ impl LsmEngine {
             let mut sst = SsTable::open(&sst_info.path)?;
             let mut iter = sst.iter()?;
             while iter.is_valid() {
-                let k = iter.key().to_vec();
-                let kind = iter.kind();
-                if k == b"key_0042" {
-                    eprintln!("[L1 READ] key_0042: seq={}, kind={:?}, val={:?}", 
-                        iter.seq_no(), kind, String::from_utf8_lossy(iter.value()));
-                }
-                all_entries.push((k, iter.value().to_vec(), iter.seq_no(), kind));
+                all_entries.push((
+                    iter.key().to_vec(),
+                    iter.value().to_vec(),
+                    iter.seq_no(),
+                    iter.kind(),
+                ));
                 iter.next();
             }
         }
@@ -472,13 +562,6 @@ impl LsmEngine {
 
             last_key = Some(key.clone());
             merged.push((key.clone(), value.clone(), *seq_no, *kind));
-        }
-
-        // Debug: print merged entries for key_0042
-        for (k, v, seq, kind) in &merged {
-            if k == b"key_0042" {
-                eprintln!("[MERGED] key_0042: seq={}, kind={:?}, val={:?}", seq, kind, String::from_utf8_lossy(v));
-            }
         }
 
         // Step 6: Write merged entries to new SSTables in level N+1
@@ -811,22 +894,12 @@ mod tests {
             engine.put(key.into_bytes(), value.into_bytes()).unwrap();
         }
 
-        let stats1 = engine.stats();
-        eprintln!("After first batch: {} SSTables, {} levels", stats1.total_sstables, stats1.num_levels);
-
         // Overwrite all keys with new values
         for i in 0..50u32 {
             let key = format!("key_{:04}", i);
             let value = format!("v2_{:06}", i);
             engine.put(key.into_bytes(), value.into_bytes()).unwrap();
         }
-
-        let stats2 = engine.stats();
-        eprintln!("After second batch: {} SSTables, {} levels", stats2.total_sstables, stats2.num_levels);
-
-        // Debug: check a specific key
-        let val = engine.get(b"key_0026").unwrap();
-        eprintln!("key_0026 = {:?}", val.as_ref().map(|v| String::from_utf8_lossy(v)));
 
         // Verify the latest values are returned
         for i in 0..50u32 {
@@ -861,9 +934,6 @@ mod tests {
             engine.put(key.into_bytes(), value.into_bytes()).unwrap();
         }
 
-        let stats1 = engine.stats();
-        eprintln!("After writes: {} SSTables, {} levels", stats1.total_sstables, stats1.num_levels);
-
         // Delete even-numbered keys
         for i in (0..50u32).step_by(2) {
             let key = format!("key_{:04}", i);
@@ -872,15 +942,6 @@ mod tests {
 
         // Flush remaining entries in memtable
         engine.flush().unwrap();
-
-        let stats2 = engine.stats();
-        eprintln!("After deletes: {} SSTables, {} levels", stats2.total_sstables, stats2.num_levels);
-
-        // Debug: check key_0000
-        let val = engine.get(b"key_0000").unwrap();
-        eprintln!("key_0000 after delete: {:?}", val);
-        let val = engine.get(b"key_0001").unwrap();
-        eprintln!("key_0001 (should exist): {:?}", val);
 
         // Verify: odd keys exist, even keys are deleted
         for i in 0..50u32 {

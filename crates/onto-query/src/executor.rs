@@ -100,29 +100,20 @@ impl QueryExecutor {
     ) -> Result<QueryResult> {
         let mut engine = self.engine.write().unwrap();
 
-        // For now, scan all entries and filter by class
-        // TODO: Use index for class-based lookups
+        // Use prefix scan: all entries with key starting with "{class}::"
+        let prefix = format!("{}::", from);
+        let entries = engine.scan_prefix(prefix.as_bytes())?;
+
         let mut rows: Vec<Map<String, Value>> = Vec::new();
 
-        // This is a simplified implementation that reads from the MemTable only
-        // A full implementation would also scan SSTables
-        let _prefix = format!("{}::", from);
-
-        // Get all entries (simplified - just check MemTable for now)
-        // In a real implementation, we'd iterate over MemTable + SSTables
-        for i in 0..10000u64 {
-            let key = format!("{}::{}", from, i);
-            if let Some(val_bytes) = engine.get(key.as_bytes())? {
-                if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&val_bytes) {
-                    // Check class filter
-                    if doc.get("__class__").and_then(|v| v.as_str()) == Some(from) {
-                        if self.matches_filter(&doc, filter) {
-                            rows.push(self.project_columns(&doc, columns));
-                        }
+        for (_key, val_bytes) in entries {
+            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&val_bytes) {
+                // Verify class (should always match due to prefix, but be safe)
+                if doc.get("__class__").and_then(|v| v.as_str()) == Some(from) {
+                    if self.matches_filter(&doc, filter) {
+                        rows.push(self.project_columns(&doc, columns));
                     }
                 }
-            } else {
-                break;
             }
 
             if let Some(limit) = limit {
@@ -135,25 +126,57 @@ impl QueryExecutor {
         Ok(QueryResult::Rows(rows))
     }
 
-    fn execute_delete(&self, class: &str, _filter: &Option<FilterExpr>) -> Result<QueryResult> {
-        // Simplified: delete matching documents
-        // A full implementation would mark entries as tombstones
-        Ok(QueryResult::Success(format!(
-            "DELETE from {} (not yet fully implemented)",
-            class
-        )))
+    fn execute_delete(&self, class: &str, filter: &Option<FilterExpr>) -> Result<QueryResult> {
+        let mut engine = self.engine.write().unwrap();
+
+        let prefix = format!("{}::", class);
+        let entries = engine.scan_prefix(prefix.as_bytes())?;
+
+        let mut deleted = 0usize;
+        for (key, val_bytes) in entries {
+            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&val_bytes) {
+                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
+                    if self.matches_filter(&doc, filter) {
+                        engine.delete(key)?;
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(QueryResult::Success(format!("{} row(s) deleted", deleted)))
     }
 
     fn execute_update(
         &self,
         class: &str,
-        _assignments: &[(String, LiteralValue)],
-        _filter: &Option<FilterExpr>,
+        assignments: &[(String, LiteralValue)],
+        filter: &Option<FilterExpr>,
     ) -> Result<QueryResult> {
-        Ok(QueryResult::Success(format!(
-            "UPDATE {} (not yet fully implemented)",
-            class
-        )))
+        let mut engine = self.engine.write().unwrap();
+
+        let prefix = format!("{}::", class);
+        let entries = engine.scan_prefix(prefix.as_bytes())?;
+
+        let mut updated = 0usize;
+        for (key, val_bytes) in entries {
+            if let Ok(Value::Object(mut doc)) = serde_json::from_slice::<Value>(&val_bytes) {
+                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
+                    if self.matches_filter(&doc, filter) {
+                        // Apply assignments
+                        for (col, val) in assignments {
+                            doc.insert(col.clone(), self.literal_to_json(val));
+                        }
+                        let new_value = serde_json::to_vec(&Value::Object(doc))
+                            .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                        engine.put(key, new_value)?;
+                        updated += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(QueryResult::Success(format!("{} row(s) updated", updated)))
     }
 
     fn execute_match(
@@ -329,6 +352,202 @@ impl QueryResult {
                 output.push_str(&format!("({} rows)", rows.len()));
                 output
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::QueryParser;
+    use onto_storage::StorageOptions;
+    use tempfile::tempdir;
+
+    fn setup() -> (QueryExecutor, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let ontology_store = OntologyStore::new(engine.clone());
+        let executor = QueryExecutor::new(engine, ontology_store);
+        (executor, dir)
+    }
+
+    fn insert_row(executor: &QueryExecutor, class: &str, name: &str, price: i64) {
+        let ast = QueryAst::Insert {
+            class: class.to_string(),
+            columns: vec!["name".to_string(), "price".to_string()],
+            values: vec![
+                LiteralValue::String(name.to_string()),
+                LiteralValue::Int(price),
+            ],
+        };
+        executor.execute(&ast).unwrap();
+    }
+
+    #[test]
+    fn test_select_all() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+
+        // Flush to ensure data is in SSTables
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 3),
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_select_with_filter() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price > 900").unwrap();
+        let result = executor.execute(&ast).unwrap();
+
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // iPhone and MacBook
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_select_with_limit() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT * FROM Product LIMIT 2").unwrap();
+        let result = executor.execute(&ast).unwrap();
+
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 2),
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_select_different_classes() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Customer", "Alice", 0);
+        insert_row(&executor, "Product", "iPad", 799);
+
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Should only return Products
+        let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 2),
+            _ => panic!("expected Rows"),
+        }
+
+        // Should only return Customers
+        let ast = QueryParser::parse("SELECT * FROM Customer").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_update() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'iPhone'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("1 row(s) updated")),
+            _ => panic!("expected Success"),
+        }
+
+        // Verify the update
+        let ast = QueryParser::parse("SELECT * FROM Product WHERE name = 'iPhone'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("price").unwrap().as_i64().unwrap(), 899);
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_delete() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("DELETE FROM Product WHERE name = 'iPhone'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("1 row(s) deleted")),
+            _ => panic!("expected Success"),
+        }
+
+        // Verify only iPad remains
+        let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "iPad");
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_match_semantic_query() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("MATCH (p: Product) WHERE price > 900 RETURN name, price").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "iPhone");
+            }
+            _ => panic!("expected Rows"),
         }
     }
 }
