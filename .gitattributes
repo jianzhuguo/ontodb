@@ -1,0 +1,18 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Rust
+*.rs text diff=rust
+*.toml text
+*.md text
+*.txt text
+
+# Ensure these stay LF
+*.sh text eol=lf
+
+# Binary files
+*.sst binary
+*.wal binary
+*.png binary
+*.jpg binary
+*.pdf binary

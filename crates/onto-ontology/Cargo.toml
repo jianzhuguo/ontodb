@@ -1,0 +1,15 @@
+[package]
+name = "onto-ontology"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ontology engine - model, parser, store, and inference for OntoDB"
+
+[dependencies]
+onto-core = { workspace = true }
+onto-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

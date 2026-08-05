@@ -1,0 +1,44 @@
+//! Core error types for OntoDB.
+
+use thiserror::Error;
+
+/// Core error type used across all OntoDB components.
+#[derive(Error, Debug)]
+pub enum CoreError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
+    #[error("corruption detected: {0}")]
+    Corruption(String),
+
+    #[error("key not found: {key:?}")]
+    KeyNotFound { key: Vec<u8> },
+
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
+    #[error("storage full")]
+    StorageFull,
+
+    #[error("checksum mismatch: expected {expected:#010x}, got {actual:#010x}")]
+    ChecksumMismatch { expected: u32, actual: u32 },
+
+    #[error("{0}")]
+    Custom(String),
+}
+
+impl CoreError {
+    pub fn custom(msg: impl Into<String>) -> Self {
+        CoreError::Custom(msg.into())
+    }
+
+    pub fn corruption(msg: impl Into<String>) -> Self {
+        CoreError::Corruption(msg.into())
+    }
+}
+
+/// Result type alias for OntoDB operations.
+pub type Result<T> = std::result::Result<T, CoreError>;

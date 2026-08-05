@@ -1,0 +1,56 @@
+//! Core types used throughout OntoDB.
+
+/// Byte vector type used for keys and values.
+pub type Bytes = Vec<u8>;
+
+/// A key in the storage engine.
+pub type Key = Vec<u8>;
+
+/// A value in the storage engine.
+pub type Value = Vec<u8>;
+
+/// Sequence number for MVCC / WAL ordering.
+pub type SeqNo = u64;
+
+/// Microsecond timestamp.
+pub type Timestamp = u64;
+
+/// Internal entry type used by the storage engine.
+/// A key-value pair with an associated sequence number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub key: Key,
+    pub value: Value,
+    pub seq_no: SeqNo,
+    pub kind: EntryKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Put,
+    Delete,
+}
+
+impl Entry {
+    pub fn put(key: Key, value: Value, seq_no: SeqNo) -> Self {
+        Self {
+            key,
+            value,
+            seq_no,
+            kind: EntryKind::Put,
+        }
+    }
+
+    pub fn delete(key: Key, seq_no: SeqNo) -> Self {
+        Self {
+            key,
+            value: Vec::new(),
+            seq_no,
+            kind: EntryKind::Delete,
+        }
+    }
+
+    pub fn is_tombstone(&self) -> bool {
+        self.kind == EntryKind::Delete
+    }
+}

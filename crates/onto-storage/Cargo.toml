@@ -1,0 +1,23 @@
+[package]
+name = "onto-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LSM-Tree storage engine for OntoDB"
+
+[dependencies]
+onto-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+crc32fast = { workspace = true }
+tracing = { workspace = true }
+parking_lot = "0.12"
+bytes = "1"
+crossbeam-skiplist = "0.1"
+
+[dev-dependencies]
+criterion = { workspace = true }
+tempfile = "3"

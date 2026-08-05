@@ -1,0 +1,16 @@
+[package]
+name = "onto-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Query engine - SQL parser, semantic extensions, optimizer, and executor for OntoDB"
+
+[dependencies]
+onto-core = { workspace = true }
+onto-storage = { workspace = true }
+onto-ontology = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

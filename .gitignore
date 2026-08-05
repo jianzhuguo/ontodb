@@ -1,0 +1,6 @@
+/target
+ontodb_data/
+*.swp
+*.swo
+*~
+.DS_Store

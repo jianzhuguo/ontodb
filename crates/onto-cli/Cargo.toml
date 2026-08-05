@@ -1,0 +1,16 @@
+[package]
+name = "onto-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OntoDB command-line interface"
+
+[[bin]]
+name = "ontodb-cli"
+path = "src/main.rs"
+
+[dependencies]
+onto-core = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
