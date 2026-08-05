@@ -262,7 +262,14 @@ impl SsTable {
         })
     }
 
-    /// Gets a value by key. Returns None if not found.
+    /// Gets a value by key. Returns:
+    /// - `Ok(Some((value, seq_no)))` if found
+    /// - `Ok(None)` if not found in this SSTable
+    /// - `Err` on corruption
+    ///
+    /// Note: tombstones (deleted entries) are returned as `Ok(None)` to signal
+    /// "key was deleted here, stop searching older SSTables". The engine should
+    /// use `get_full` if it needs to distinguish "not found" from "deleted".
     pub fn get(&mut self, key: &[u8]) -> Result<Option<(Vec<u8>, SeqNo)>> {
         // Check bloom filter first
         if let Some(ref bloom) = self.bloom {
@@ -283,6 +290,55 @@ impl SsTable {
 
         // Search within the block
         self.search_block(&block_data, key)
+    }
+
+    /// Gets a value by key with full tombstone awareness.
+    /// Returns `Ok(Some((value, seq_no, kind)))` for both Put and Delete entries.
+    /// Returns `Ok(None)` only if the key truly doesn't exist in this SSTable.
+    pub fn get_full(&mut self, key: &[u8]) -> Result<Option<(Vec<u8>, SeqNo, EntryKind)>> {
+        if let Some(ref bloom) = self.bloom {
+            if !bloom.might_contain(key) {
+                return Ok(None);
+            }
+        }
+
+        let block_idx = self.find_block(key)?;
+        let block_offset = self.index[block_idx].offset;
+        let block_size = self.index[block_idx].size;
+        let block_data = self.read_block_at(block_offset, block_size)?;
+        self.search_block_full(&block_data, key)
+    }
+
+    /// Returns the maximum (last) key in the SSTable, from the index.
+    pub fn max_key(&self) -> &[u8] {
+        self.index
+            .last()
+            .map(|e| e.last_key.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Returns the minimum (first) key in the SSTable by reading the first entry.
+    pub fn first_key(&mut self) -> Result<Vec<u8>> {
+        if self.index.is_empty() {
+            return Ok(Vec::new());
+        }
+        let offset = self.index[0].offset;
+        let size = self.index[0].size;
+        let block = self.read_block_at(offset, size)?;
+        // Decode the first entry's key from the block
+        if block.len() < 4 {
+            return Ok(Vec::new());
+        }
+        let key_len = u32::from_le_bytes(block[0..4].try_into().unwrap()) as usize;
+        if block.len() < 4 + key_len {
+            return Ok(Vec::new());
+        }
+        Ok(block[4..4 + key_len].to_vec())
+    }
+
+    /// Returns the number of data blocks.
+    pub fn num_blocks(&self) -> usize {
+        self.index.len()
     }
 
     /// Returns an iterator over all entries in the SSTable.
@@ -323,6 +379,14 @@ impl SsTable {
     }
 
     fn search_block(&self, block: &[u8], key: &[u8]) -> Result<Option<(Vec<u8>, SeqNo)>> {
+        match self.search_block_full(block, key)? {
+            Some((v, seq, EntryKind::Put)) => Ok(Some((v, seq))),
+            Some((_, _, EntryKind::Delete)) => Ok(None), // Tombstone
+            None => Ok(None),
+        }
+    }
+
+    fn search_block_full(&self, block: &[u8], key: &[u8]) -> Result<Option<(Vec<u8>, SeqNo, EntryKind)>> {
         // Read restart points
         if block.len() < 4 {
             return Ok(None);
@@ -349,7 +413,7 @@ impl SsTable {
             let mid = lo + (hi - lo) / 2;
             let entry = self.decode_entry_at(block, restarts[mid]);
             match entry {
-                Some((k, _, _)) if k.as_slice() <= key => lo = mid + 1,
+                Some((k, _, _, _)) if k.as_slice() <= key => lo = mid + 1,
                 _ => hi = mid,
             }
         }
@@ -359,14 +423,14 @@ impl SsTable {
 
         let mut pos = start;
         while pos < restart_start {
-            if let Some((k, v, seq)) = self.decode_entry_at(block, pos) {
+            if let Some((k, v, seq, kind)) = self.decode_entry_at(block, pos) {
                 if k.as_slice() == key {
-                    return Ok(Some((v, seq)));
+                    return Ok(Some((v, seq, kind)));
                 }
                 if k.as_slice() > key {
                     break;
                 }
-                pos += 4 + k.len() + 4 + v.len() + 8 + 1; // Approximate
+                pos += 4 + k.len() + 4 + v.len() + 8 + 1;
             } else {
                 break;
             }
@@ -375,7 +439,7 @@ impl SsTable {
         Ok(None)
     }
 
-    fn decode_entry_at(&self, data: &[u8], offset: usize) -> Option<(Vec<u8>, Vec<u8>, SeqNo)> {
+    fn decode_entry_at(&self, data: &[u8], offset: usize) -> Option<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> {
         let mut pos = offset;
 
         // key_len
@@ -411,8 +475,18 @@ impl SsTable {
             return None;
         }
         let seq_no = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
 
-        Some((key, value, seq_no))
+        // kind
+        if pos >= data.len() {
+            return None;
+        }
+        let kind = match data[pos] {
+            0 => EntryKind::Put,
+            _ => EntryKind::Delete,
+        };
+
+        Some((key, value, seq_no, kind))
     }
 
     fn decode_index(data: &[u8]) -> Vec<BlockIndexEntry> {
@@ -466,6 +540,7 @@ pub struct SsTableIterator<'a> {
     current_key: Vec<u8>,
     current_value: Vec<u8>,
     current_seq: SeqNo,
+    current_kind: EntryKind,
     valid: bool,
 }
 
@@ -481,6 +556,7 @@ impl<'a> SsTableIterator<'a> {
             current_key: Vec::new(),
             current_value: Vec::new(),
             current_seq: 0,
+            current_kind: EntryKind::Put,
             valid: false,
         };
 
@@ -537,13 +613,10 @@ impl<'a> SsTableIterator<'a> {
             }
         }
 
-        if let Some((key, value, seq)) =
+        if let Some((key, value, seq, kind)) =
             self.table.decode_entry_at(&self.block_data, self.pos)
         {
-            // Read kind byte (for future tombstone filtering)
-            let _kind_byte = self.block_data
-                [self.pos + 4 + key.len() + 4 + value.len() + 8];
-
+            self.current_kind = kind;
             self.current_key = key;
             self.current_value = value;
             self.current_seq = seq;
@@ -570,6 +643,10 @@ impl<'a> SsTableIterator<'a> {
 
     pub fn seq_no(&self) -> SeqNo {
         self.current_seq
+    }
+
+    pub fn kind(&self) -> EntryKind {
+        self.current_kind
     }
 
     pub fn next(&mut self) {

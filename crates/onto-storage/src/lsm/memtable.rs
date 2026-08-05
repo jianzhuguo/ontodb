@@ -73,7 +73,7 @@ impl MemTable {
         seq
     }
 
-    /// Puts a key-value pair into the MemTable.
+    /// Puts a key-value pair into the MemTable with an externally provided sequence number.
     pub fn put(&mut self, key: Key, value: Value) -> SeqNo {
         let seq_no = self.next_seq_no();
         let entry = MemTableEntry {
@@ -90,6 +90,47 @@ impl MemTable {
         self.data.insert(composite, entry);
 
         seq_no
+    }
+
+    /// Puts a key-value pair with a specific sequence number (from the engine).
+    pub fn put_with_seq(&mut self, key: Key, value: Value, seq_no: SeqNo) {
+        let entry = MemTableEntry {
+            key: key.clone(),
+            value: value.clone(),
+            seq_no,
+            kind: EntryKind::Put,
+        };
+
+        let size_delta = key.len() + value.len() + 16;
+        self.size += size_delta;
+
+        let composite = entry.composite_key();
+        self.data.insert(composite, entry);
+
+        // Keep next_seq_no in sync
+        if seq_no >= self.next_seq_no {
+            self.next_seq_no = seq_no + 1;
+        }
+    }
+
+    /// Marks a key as deleted (tombstone) with a specific sequence number.
+    pub fn delete_with_seq(&mut self, key: Key, seq_no: SeqNo) {
+        let entry = MemTableEntry {
+            key: key.clone(),
+            value: Vec::new(),
+            seq_no,
+            kind: EntryKind::Delete,
+        };
+
+        let size_delta = key.len() + 16;
+        self.size += size_delta;
+
+        let composite = entry.composite_key();
+        self.data.insert(composite, entry);
+
+        if seq_no >= self.next_seq_no {
+            self.next_seq_no = seq_no + 1;
+        }
     }
 
     /// Marks a key as deleted (tombstone).

@@ -79,13 +79,14 @@ impl LsmEngine {
 
     /// Puts a key-value pair.
     pub fn put(&mut self, key: Key, value: Value) -> Result<()> {
-        let entry = Entry::put(key, value, self.next_seq());
+        let seq = self.next_seq();
+        let entry = Entry::put(key.clone(), value.clone(), seq);
 
         // Write to WAL first (durability)
         self.wal.append(&entry)?;
 
-        // Write to MemTable
-        self.memtable.put(entry.key.clone(), entry.value.clone());
+        // Write to MemTable with engine's global seq_no
+        self.memtable.put_with_seq(key, value, seq);
 
         // Check if we need to flush
         if self.memtable.size() >= self.options.memtable_size_limit {
@@ -110,16 +111,26 @@ impl LsmEngine {
         }
 
         // 3. Check SSTables (newest to oldest)
-        for level in &self.levels {
-            for sst_info in level.iter().rev() {
+        for (level_idx, level) in self.levels.iter().enumerate() {
+            for (sst_idx, sst_info) in level.iter().rev().enumerate() {
                 // Quick range check
                 if key < sst_info.min_key.as_slice() || key > sst_info.max_key.as_slice() {
                     continue;
                 }
 
                 let mut sst = SsTable::open(&sst_info.path)?;
-                if let Some((value, _)) = sst.get(key)? {
-                    return Ok(Some(value));
+                match sst.get_full(key)? {
+                    Some((value, seq, EntryKind::Put)) => {
+                        eprintln!("[GET] key={:?} found in L{}_{} (seq={})", 
+                            String::from_utf8_lossy(key), level_idx, sst_idx, seq);
+                        return Ok(Some(value));
+                    }
+                    Some((_, seq, EntryKind::Delete)) => {
+                        eprintln!("[GET] key={:?} TOMBSTONE in L{}_{} (seq={})", 
+                            String::from_utf8_lossy(key), level_idx, sst_idx, seq);
+                        return Ok(None); // Tombstone: stop searching
+                    }
+                    None => continue, // Not found in this SSTable, try next
                 }
             }
         }
@@ -129,15 +140,25 @@ impl LsmEngine {
 
     /// Deletes a key (writes a tombstone).
     pub fn delete(&mut self, key: Key) -> Result<()> {
-        let entry = Entry::delete(key, self.next_seq());
+        let seq = self.next_seq();
+        let entry = Entry::delete(key.clone(), seq);
 
         self.wal.append(&entry)?;
-        self.memtable.delete(entry.key);
+        self.memtable.delete_with_seq(key, seq);
 
         if self.memtable.size() >= self.options.memtable_size_limit {
             self.flush_memtable()?;
         }
 
+        Ok(())
+    }
+
+    /// Manually flushes the current MemTable to an SSTable.
+    /// Call this after a batch of writes to ensure all data is persisted.
+    pub fn flush(&mut self) -> Result<()> {
+        if !self.memtable.is_empty() {
+            self.flush_memtable()?;
+        }
         Ok(())
     }
 
@@ -211,10 +232,10 @@ impl LsmEngine {
         for entry in entries {
             match entry.kind {
                 EntryKind::Put => {
-                    self.memtable.put(entry.key, entry.value);
+                    self.memtable.put_with_seq(entry.key, entry.value, entry.seq_no);
                 }
                 EntryKind::Delete => {
-                    self.memtable.delete(entry.key);
+                    self.memtable.delete_with_seq(entry.key, entry.seq_no);
                 }
             }
             max_seq = max_seq.max(entry.seq_no);
@@ -258,22 +279,33 @@ impl LsmEngine {
                 continue;
             }
 
-            let _sst = SsTable::open(&path)?;
-            // TODO: extract min/max key from SSTable index
+            let mut sst = SsTable::open(&path)?;
+            let min_key = sst.first_key().unwrap_or_default();
+            let max_key = sst.max_key().to_vec();
             let metadata = fs::metadata(&path)?;
+
+            // Update sst_counter if needed
+            if let Some(id_str) = fname.split('_').nth(1) {
+                if let Ok(id) = id_str.parse::<u64>() {
+                    let current = self.sst_counter.load(Ordering::Relaxed);
+                    if id >= current {
+                        self.sst_counter.store(id + 1, Ordering::Relaxed);
+                    }
+                }
+            }
 
             self.levels[level].push(SsTableInfo {
                 path,
                 size: metadata.len(),
-                min_key: Vec::new(), // TODO: populate from SST
-                max_key: Vec::new(), // TODO: populate from SST
+                min_key,
+                max_key,
             });
         }
 
         Ok(())
     }
 
-    /// Simple leveled compaction: if level N is too big, merge into level N+1.
+    /// Checks if compaction is needed and triggers it.
     fn maybe_compact(&mut self, level: usize) -> Result<()> {
         if level >= self.levels.len() - 1 {
             return Ok(());
@@ -284,16 +316,263 @@ impl LsmEngine {
             return Ok(());
         }
 
-        // TODO: Implement actual compaction logic
-        // For now, just log that compaction is needed
         tracing::info!(
-            "Level {} has {} SSTables (max {}), compaction needed",
+            "Level {} has {} SSTables (max {}), triggering compaction",
             level,
             self.levels[level].len(),
             max_ssts
         );
 
+        self.compact_level(level)
+    }
+
+    /// Performs leveled compaction: merges SSTables from level N into level N+1.
+    ///
+    /// Algorithm:
+    /// 1. Pick SSTables from level N (sorted by key range)
+    /// 2. Find overlapping SSTables in level N+1
+    /// 3. Merge-sort all entries from both levels
+    /// 4. Deduplicate: keep only the latest version of each key
+    /// 5. Drop tombstones if they don't exist in deeper levels
+    /// 6. Write new SSTables to level N+1
+    /// 7. Delete old SSTable files from both levels
+    fn compact_level(&mut self, level: usize) -> Result<()> {
+        if level >= self.levels.len() - 1 {
+            return Ok(());
+        }
+
+        // Step 1: Pick SSTables from level N to compact.
+        // For L0, compact all (they may overlap). For L1+, pick the oldest.
+        let ssts_to_compact = if level == 0 {
+            // L0: compact all SSTables (they can have overlapping key ranges)
+            let all: Vec<SsTableInfo> = self.levels[level].drain(..).collect();
+            all
+        } else {
+            // L1+: pick the first (oldest) SSTable
+            if self.levels[level].is_empty() {
+                return Ok(());
+            }
+            vec![self.levels[level].remove(0)]
+        };
+
+        if ssts_to_compact.is_empty() {
+            return Ok(());
+        }
+
+        // Debug: print L0 SSTable ranges
+        for (i, sst_info) in ssts_to_compact.iter().enumerate() {
+            eprintln!("[COMPACT L{} SSTable {}: range {:?} - {:?}]", level, i, 
+                String::from_utf8_lossy(&sst_info.min_key), 
+                String::from_utf8_lossy(&sst_info.max_key));
+        }
+
+        // Compute the combined key range of the SSTables being compacted
+        let compact_min = ssts_to_compact
+            .iter()
+            .map(|s| s.min_key.as_slice())
+            .min()
+            .unwrap_or(b"")
+            .to_vec();
+        let compact_max = ssts_to_compact
+            .iter()
+            .map(|s| s.max_key.as_slice())
+            .max()
+            .unwrap_or(b"")
+            .to_vec();
+
+        eprintln!("[COMPACTION] L{}→L{}: compact range {:?} - {:?}, {} L0 SSTables, {} L1 SSTables",
+            level, level + 1, 
+            String::from_utf8_lossy(&compact_min), String::from_utf8_lossy(&compact_max),
+            ssts_to_compact.len(), self.levels[level + 1].len());
+
+        // Step 2: Find overlapping SSTables in level N+1
+        let next_level = level + 1;
+        let mut overlapping_indices = Vec::new();
+        for (i, sst_info) in self.levels[next_level].iter().enumerate() {
+            if Self::ranges_overlap(
+                &compact_min,
+                &compact_max,
+                &sst_info.min_key,
+                &sst_info.max_key,
+            ) {
+                overlapping_indices.push(i);
+            }
+        }
+
+        // Debug: print L0 SSTable ranges
+        for (i, sst_info) in self.levels[0].iter().enumerate() {
+            eprintln!("[L0 SSTable {}: range {:?} - {:?}]", i, 
+                String::from_utf8_lossy(&sst_info.min_key), 
+                String::from_utf8_lossy(&sst_info.max_key));
+        }
+
+        // Collect overlapping SSTables (remove from level in reverse order to preserve indices)
+        let mut next_level_ssts = Vec::new();
+        for &i in overlapping_indices.iter().rev() {
+            next_level_ssts.push(self.levels[next_level].remove(i));
+        }
+
+        // Step 3: Collect all entries from both sets of SSTables
+        let mut all_entries: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
+
+        // Read entries from level N SSTables
+        for sst_info in &ssts_to_compact {
+            let mut sst = SsTable::open(&sst_info.path)?;
+            let mut iter = sst.iter()?;
+            while iter.is_valid() {
+                let k = iter.key().to_vec();
+                let kind = iter.kind();
+                if k == b"key_0042" {
+                    eprintln!("[L0 READ] key_0042: seq={}, kind={:?}, val={:?}", 
+                        iter.seq_no(), kind, String::from_utf8_lossy(iter.value()));
+                }
+                all_entries.push((k, iter.value().to_vec(), iter.seq_no(), kind));
+                iter.next();
+            }
+        }
+
+        // Read entries from level N+1 SSTables
+        for sst_info in &next_level_ssts {
+            let mut sst = SsTable::open(&sst_info.path)?;
+            let mut iter = sst.iter()?;
+            while iter.is_valid() {
+                let k = iter.key().to_vec();
+                let kind = iter.kind();
+                if k == b"key_0042" {
+                    eprintln!("[L1 READ] key_0042: seq={}, kind={:?}, val={:?}", 
+                        iter.seq_no(), kind, String::from_utf8_lossy(iter.value()));
+                }
+                all_entries.push((k, iter.value().to_vec(), iter.seq_no(), kind));
+                iter.next();
+            }
+        }
+
+        // Step 4: Sort by key, then by seq_no descending (keep latest version)
+        all_entries.sort_by(|a, b| {
+            a.0.cmp(&b.0) // key ascending
+                .then(b.2.cmp(&a.2)) // seq_no descending
+        });
+
+        // Step 5: Deduplicate — keep only the latest version of each key
+        // Drop tombstones at the deepest level (they can't shadow anything deeper)
+        let is_deepest_level = next_level == self.levels.len() - 1;
+        let mut merged: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
+        let mut last_key: Option<Vec<u8>> = None;
+
+        for (key, value, seq_no, kind) in &all_entries {
+            if last_key.as_ref() == Some(key) {
+                continue; // Skip older versions of the same key
+            }
+
+            // Drop tombstones at the deepest level
+            if is_deepest_level && *kind == EntryKind::Delete {
+                last_key = Some(key.clone());
+                continue;
+            }
+
+            last_key = Some(key.clone());
+            merged.push((key.clone(), value.clone(), *seq_no, *kind));
+        }
+
+        // Debug: print merged entries for key_0042
+        for (k, v, seq, kind) in &merged {
+            if k == b"key_0042" {
+                eprintln!("[MERGED] key_0042: seq={}, kind={:?}, val={:?}", seq, kind, String::from_utf8_lossy(v));
+            }
+        }
+
+        // Step 6: Write merged entries to new SSTables in level N+1
+        let target_sst_size = self.options.block_size * 16; // ~64KB per SSTable
+        let mut builder = SsTableBuilder::new();
+        let mut new_ssts = Vec::new();
+        let mut current_size = 0usize;
+        let mut batch_start_idx = 0usize;
+
+        for (i, (key, value, seq_no, kind)) in merged.iter().enumerate() {
+            builder.add(&Entry {
+                key: key.clone(),
+                value: value.clone(),
+                seq_no: *seq_no,
+                kind: *kind,
+            });
+            current_size += key.len() + value.len() + 16;
+
+            if current_size >= target_sst_size {
+                let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
+                let sst_path = self
+                    .options
+                    .data_dir
+                    .join(format!("L{}_{}.sst", next_level, sst_id));
+                let sst = builder.build(&sst_path)?;
+
+                let metadata = fs::metadata(&sst_path)?;
+                new_ssts.push(SsTableInfo {
+                    path: sst_path,
+                    size: metadata.len(),
+                    min_key: merged[batch_start_idx].0.clone(),
+                    max_key: sst.max_key().to_vec(),
+                });
+
+                builder = SsTableBuilder::new();
+                current_size = 0;
+                batch_start_idx = i + 1;
+            }
+        }
+
+        // Flush remaining entries
+        if current_size > 0 {
+            let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
+            let sst_path = self
+                .options
+                .data_dir
+                .join(format!("L{}_{}.sst", next_level, sst_id));
+            let sst = builder.build(&sst_path)?;
+
+            let metadata = fs::metadata(&sst_path)?;
+            new_ssts.push(SsTableInfo {
+                path: sst_path,
+                size: metadata.len(),
+                min_key: merged[batch_start_idx].0.clone(),
+                max_key: sst.max_key().to_vec(),
+            });
+        }
+
+        // Step 7: Delete old SSTable files
+        for sst_info in &ssts_to_compact {
+            let _ = fs::remove_file(&sst_info.path);
+        }
+        for sst_info in &next_level_ssts {
+            let _ = fs::remove_file(&sst_info.path);
+        }
+
+        // Add new SSTables to level N+1
+        self.levels[next_level].extend(new_ssts);
+
+        // Sort level N+1 by min_key to maintain non-overlapping order
+        self.levels[next_level].sort_by(|a, b| a.min_key.cmp(&b.min_key));
+
+        tracing::info!(
+            "Compaction L{}→L{}: merged {} + {} entries into {} SSTables",
+            level,
+            next_level,
+            ssts_to_compact.len(),
+            next_level_ssts.len(),
+            self.levels[next_level].len()
+        );
+
+        // Recursively check if next level needs compaction
+        self.maybe_compact(next_level)?;
+
         Ok(())
+    }
+
+    /// Checks if two key ranges overlap.
+    fn ranges_overlap(min_a: &[u8], max_a: &[u8], min_b: &[u8], max_b: &[u8]) -> bool {
+        // Empty ranges don't overlap
+        if min_a.is_empty() || max_a.is_empty() || min_b.is_empty() || max_b.is_empty() {
+            return true; // Conservative: assume overlap if range is unknown
+        }
+        min_a <= max_b && min_b <= max_a
     }
 
     /// Resets the WAL file after a successful flush.
@@ -463,6 +742,159 @@ mod tests {
 
             let val = engine.get(b"key2").unwrap();
             assert_eq!(val, Some(b"value2".to_vec()));
+        }
+    }
+
+    #[test]
+    fn test_engine_compaction() {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 128, // Very small to trigger frequent flushes
+            size_ratio: 2,            // Compact when level has > 2 SSTables
+            ..Default::default()
+        };
+
+        let mut engine = LsmEngine::open(options).unwrap();
+
+        // Write enough data to trigger multiple flushes and compaction
+        let num_keys = 100u32;
+        for i in 0..num_keys {
+            let key = format!("key_{:04}", i);
+            let value = format!("value_{:06}", i); // Larger values to fill memtable faster
+            engine.put(key.into_bytes(), value.into_bytes()).unwrap();
+        }
+
+        let stats = engine.stats();
+        println!(
+            "After writing {} keys: {} SSTables across {} levels, total size {} bytes",
+            num_keys, stats.total_sstables, stats.num_levels, stats.total_sst_size
+        );
+
+        // Verify all data is still readable after compaction
+        for i in 0..num_keys {
+            let key = format!("key_{:04}", i);
+            let expected = format!("value_{:06}", i);
+            let val = engine.get(key.as_bytes()).unwrap();
+            assert_eq!(
+                val,
+                Some(expected.into_bytes()),
+                "key {} should be readable after compaction",
+                key
+            );
+        }
+
+        // Verify compaction actually happened (L0 should be smaller than without compaction)
+        // With size_ratio=2 and 100 keys, we should have multiple levels
+        assert!(
+            stats.num_levels > 1 || stats.total_sstables <= 2,
+            "compaction should have merged SSTables into deeper levels"
+        );
+    }
+
+    #[test]
+    fn test_engine_compaction_with_overwrites() {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 128,
+            size_ratio: 2,
+            ..Default::default()
+        };
+
+        let mut engine = LsmEngine::open(options).unwrap();
+
+        // Write initial data
+        for i in 0..50u32 {
+            let key = format!("key_{:04}", i);
+            let value = format!("v1_{:06}", i);
+            engine.put(key.into_bytes(), value.into_bytes()).unwrap();
+        }
+
+        let stats1 = engine.stats();
+        eprintln!("After first batch: {} SSTables, {} levels", stats1.total_sstables, stats1.num_levels);
+
+        // Overwrite all keys with new values
+        for i in 0..50u32 {
+            let key = format!("key_{:04}", i);
+            let value = format!("v2_{:06}", i);
+            engine.put(key.into_bytes(), value.into_bytes()).unwrap();
+        }
+
+        let stats2 = engine.stats();
+        eprintln!("After second batch: {} SSTables, {} levels", stats2.total_sstables, stats2.num_levels);
+
+        // Debug: check a specific key
+        let val = engine.get(b"key_0026").unwrap();
+        eprintln!("key_0026 = {:?}", val.as_ref().map(|v| String::from_utf8_lossy(v)));
+
+        // Verify the latest values are returned
+        for i in 0..50u32 {
+            let key = format!("key_{:04}", i);
+            let expected = format!("v2_{:06}", i);
+            let val = engine.get(key.as_bytes()).unwrap();
+            assert_eq!(
+                val,
+                Some(expected.into_bytes()),
+                "overwritten key {} should return latest value",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn test_engine_compaction_with_deletes() {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 128,
+            size_ratio: 2,
+            ..Default::default()
+        };
+
+        let mut engine = LsmEngine::open(options).unwrap();
+
+        // Write data
+        for i in 0..50u32 {
+            let key = format!("key_{:04}", i);
+            let value = format!("value_{:06}", i);
+            engine.put(key.into_bytes(), value.into_bytes()).unwrap();
+        }
+
+        let stats1 = engine.stats();
+        eprintln!("After writes: {} SSTables, {} levels", stats1.total_sstables, stats1.num_levels);
+
+        // Delete even-numbered keys
+        for i in (0..50u32).step_by(2) {
+            let key = format!("key_{:04}", i);
+            engine.delete(key.into_bytes()).unwrap();
+        }
+
+        // Flush remaining entries in memtable
+        engine.flush().unwrap();
+
+        let stats2 = engine.stats();
+        eprintln!("After deletes: {} SSTables, {} levels", stats2.total_sstables, stats2.num_levels);
+
+        // Debug: check key_0000
+        let val = engine.get(b"key_0000").unwrap();
+        eprintln!("key_0000 after delete: {:?}", val);
+        let val = engine.get(b"key_0001").unwrap();
+        eprintln!("key_0001 (should exist): {:?}", val);
+
+        // Verify: odd keys exist, even keys are deleted
+        for i in 0..50u32 {
+            let key = format!("key_{:04}", i);
+            let val = engine.get(key.as_bytes()).unwrap();
+            if i % 2 == 0 {
+                assert!(val.is_none(), "deleted key {} should not exist, got {:?}", key, val);
+            } else {
+                assert!(
+                    val.is_some(),
+                    "non-deleted key {} should still exist",
+                    key
+                );
+            }
         }
     }
 }
