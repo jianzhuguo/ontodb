@@ -10,7 +10,4 @@ name = "ontodb-cli"
 path = "src/main.rs"
 
 [dependencies]
-onto-core = { workspace = true }
-tokio = { workspace = true }
 clap = { workspace = true }
-anyhow = { workspace = true }
