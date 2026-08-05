@@ -1,17 +1,27 @@
-//! OntoDB CLI - Command-line client for connecting to OntoDB server.
+//! OntoDB CLI - Interactive command-line client for OntoDB server.
 //!
-//! Connects to a running ontodb-server via TCP and sends SQL queries.
-//! Supports interactive REPL mode and single-query mode.
+//! Features:
+//! - Interactive REPL with multi-line input (end statements with `;`)
+//! - Special commands: \help, \d, \q, \c
+//! - Query timing
+//! - Aligned column output with borders
+//! - Single-query mode (-q) and file mode (-f)
 
 use clap::Parser;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "ontodb-cli",
-    about = "OntoDB command-line client",
-    long_about = "Connect to an OntoDB server and execute queries.\n\nExamples:\n  ontodb-cli                          # connect to localhost:6500\n  ontodb-cli 192.168.1.100:6500       # connect to remote server\n  ontodb-cli -q \"SELECT * FROM Product\" # execute single query\n  ontodb-cli -f script.sql            # execute queries from file"
+    about = "OntoDB interactive command-line client",
+    long_about = "Connect to an OntoDB server and execute queries interactively.\n\n\
+        Examples:\n  \
+          ontodb-cli                              # connect to localhost:6500\n  \
+          ontodb-cli 192.168.1.100:6500           # connect to remote server\n  \
+          ontodb-cli -q \"SELECT * FROM Product\"   # single query, then exit\n  \
+          ontodb-cli -f init.sql                  # execute SQL file"
 )]
 struct Args {
     /// Server address (host:port)
@@ -22,7 +32,7 @@ struct Args {
     #[arg(short, long)]
     query: Option<String>,
 
-    /// Execute queries from a file
+    /// Execute queries from a SQL file
     #[arg(short, long)]
     file: Option<String>,
 }
@@ -30,107 +40,127 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    println!("OntoDB CLI v{}", env!("CARGO_PKG_VERSION"));
-
     // Connect to server
     let stream = match TcpStream::connect(&args.address) {
         Ok(stream) => {
-            println!("Connected to {}", args.address);
             stream
         }
         Err(e) => {
-            eprintln!("Error: Could not connect to {}: {}", args.address, e);
-            eprintln!("Make sure ontodb-server is running on that address.");
+            eprintln!("Could not connect to {}: {}", args.address, e);
+            eprintln!("Make sure ontodb-server is running.");
             std::process::exit(1);
         }
     };
 
     if let Some(query) = args.query {
-        // Single query mode
         run_single_query(stream, &query);
     } else if let Some(file_path) = args.file {
-        // File execution mode
         run_file(stream, &file_path);
     } else {
-        // Interactive REPL mode
-        run_repl(stream);
+        run_repl(stream, &args.address);
     }
 }
 
-/// Executes a single query and prints the result.
-fn run_single_query(mut stream: TcpStream, query: &str) {
+// ═══════════════════════════════════════════════════════════════════
+//  Single query mode
+// ═══════════════════════════════════════════════════════════════════
+
+fn run_single_query(stream: TcpStream, query: &str) {
     let query = query.trim().trim_end_matches(';').trim();
-    if let Err(e) = send_query(&mut stream, query) {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
+    if query.is_empty() {
+        return;
     }
-    match read_response(&stream) {
-        Ok(response) => println!("{}", response),
+    let resp = send_query(&stream, query);
+    match resp {
+        Ok(r) => {
+            if r.starts_with("ERR:") {
+                eprintln!("{}", r);
+                std::process::exit(1);
+            }
+            println!("{}", r);
+        }
         Err(e) => {
-            eprintln!("Error reading response: {}", e);
+            eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     }
 }
 
-/// Executes queries from a SQL file.
-fn run_file(mut stream: TcpStream, file_path: &str) {
+// ═══════════════════════════════════════════════════════════════════
+//  File execution mode
+// ═══════════════════════════════════════════════════════════════════
+
+fn run_file(stream: TcpStream, file_path: &str) {
     let content = match std::fs::read_to_string(file_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Error reading file '{}': {}", file_path, e);
+            eprintln!("Error reading '{}': {}", file_path, e);
             std::process::exit(1);
         }
     };
+
+    let mut ok = 0u32;
+    let mut err = 0u32;
 
     for (i, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with("--") {
             continue;
         }
-
         let query = line.trim_end_matches(';').trim();
         if query.is_empty() {
             continue;
         }
-
-        if let Err(e) = send_query(&mut stream, query) {
-            eprintln!("Error on line {}: {}", i + 1, e);
-            continue;
-        }
-
-        match read_response(&stream) {
-            Ok(response) => {
-                if !response.is_empty() {
-                    println!("{}", response);
+        match send_query(&stream, query) {
+            Ok(resp) => {
+                if resp.starts_with("ERR:") {
+                    eprintln!("Line {}: {}", i + 1, resp);
+                    err += 1;
+                } else {
+                    if !resp.is_empty() {
+                        println!("{}", resp);
+                    }
+                    ok += 1;
                 }
             }
             Err(e) => {
-                eprintln!("Error reading response on line {}: {}", i + 1, e);
-                break;
+                eprintln!("Line {}: Connection error: {}", i + 1, e);
+                err += 1;
             }
         }
     }
+
+    eprintln!("{} succeeded, {} failed", ok, err);
 }
 
-/// Runs the interactive REPL.
-fn run_repl(mut stream: TcpStream) {
-    println!("Type 'quit' or 'exit' to disconnect. End statements with ';'.");
-    println!();
+// ═══════════════════════════════════════════════════════════════════
+//  Interactive REPL
+// ═══════════════════════════════════════════════════════════════════
+
+fn run_repl(stream: TcpStream, addr: &str) {
+    print_banner(addr);
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    let mut buffer = String::new();
+    let mut line_buf = String::new();
+    let mut query_buf = String::new(); // accumulates multi-line input
+    let mut in_query = false; // true when accumulating a multi-line statement
 
     loop {
-        print!("ontodb> ");
+        let prompt = if in_query {
+            "    -> " // continuation prompt
+        } else {
+            "ontodb> "
+        };
+
+        print!("{}", prompt);
         if stdout.flush().is_err() {
             break;
         }
 
-        buffer.clear();
-        match stdin.lock().read_line(&mut buffer) {
-            Ok(0) => break, // EOF
+        line_buf.clear();
+        match stdin.lock().read_line(&mut line_buf) {
+            Ok(0) => break,
             Ok(_) => {}
             Err(e) => {
                 eprintln!("Read error: {}", e);
@@ -138,52 +168,279 @@ fn run_repl(mut stream: TcpStream) {
             }
         }
 
-        let input = buffer.trim();
-        if input.is_empty() {
-            continue;
-        }
-        if input.eq_ignore_ascii_case("quit") || input.eq_ignore_ascii_case("exit") {
-            break;
-        }
+        let trimmed = line_buf.trim();
 
-        let query = input.trim_end_matches(';').trim();
-        if query.is_empty() {
+        // Handle special commands (only at start of input, not inside multi-line)
+        if !in_query && trimmed.starts_with('\\') {
+            handle_meta_command(trimmed, &stream);
             continue;
         }
 
-        if let Err(e) = send_query(&mut stream, query) {
-            eprintln!("Error: {}", e);
-            break;
+        // Accumulate input
+        if in_query {
+            if !query_buf.is_empty() {
+                query_buf.push(' ');
+            }
+            query_buf.push_str(trimmed);
+        } else {
+            query_buf.clear();
+            query_buf.push_str(trimmed);
         }
 
-        match read_response(&stream) {
-            Ok(response) => {
-                if !response.is_empty() {
+        // Check if statement is complete (ends with ';')
+        let complete = find_statement_end(&query_buf);
+        if let Some(pos) = complete {
+            let statement = query_buf[..pos].trim().to_string();
+            query_buf.clear();
+            in_query = false;
+
+            if statement.is_empty() {
+                continue;
+            }
+
+            // Handle quit/exit
+            if statement.eq_ignore_ascii_case("quit") || statement.eq_ignore_ascii_case("exit") {
+                break;
+            }
+
+            // Execute
+            execute_with_timing(&stream, &statement);
+        } else {
+            // Statement not complete, continue accumulating
+            in_query = true;
+        }
+    }
+
+    // Clean disconnect
+    let _ = send_query(&stream, "quit");
+    println!();
+    eprintln!("Bye!");
+}
+
+/// Finds the position of the statement terminator (`;`), skipping quoted content.
+/// Returns the index of the `;` that ends the statement, or None if not found.
+fn find_statement_end(input: &str) -> Option<usize> {
+    let mut in_quote: Option<char> = None;
+    for (i, c) in input.char_indices() {
+        match in_quote {
+            Some(q) if c == q => in_quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => in_quote = Some(c),
+            None if c == ';' => return Some(i),
+            None => {}
+        }
+    }
+    None
+}
+
+/// Executes a query with timing and formatted output.
+fn execute_with_timing(stream: &TcpStream, query: &str) {
+    let start = Instant::now();
+
+    match send_query(stream, query) {
+        Ok(response) => {
+            let elapsed = start.elapsed();
+
+            if response.starts_with("ERR:") {
+                eprintln!("{}", response);
+            } else if response.is_empty() {
+                // Empty response (e.g., for empty input)
+            } else {
+                // Check if it's a row result (contains "|" or "(N rows)")
+                if response.contains("(0 rows)") {
                     println!("{}", response);
-                    println!();
+                } else if response.contains("rows)") {
+                    // It's a SELECT result — format with borders
+                    print_table(&response);
+                } else {
+                    // It's a success message (INSERT, UPDATE, DELETE, CREATE)
+                    println!("{}", response);
                 }
             }
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                break;
+
+            // Show timing for non-trivial operations
+            if elapsed.as_millis() > 0 {
+                eprintln!("({:.3}s)", elapsed.as_secs_f64());
+            }
+        }
+        Err(e) => {
+            eprintln!("Connection error: {}", e);
+        }
+    }
+}
+
+/// Prints a table with proper column alignment and borders.
+fn print_table(raw: &str) {
+    let lines: Vec<&str> = raw.lines().collect();
+    if lines.is_empty() {
+        return;
+    }
+
+    // Parse header (first line, pipe-separated)
+    let header = lines[0];
+    let header_cols: Vec<&str> = header.split(" | ").map(|s| s.trim()).collect();
+    let num_cols = header_cols.len();
+
+    // Parse data rows (between header and separator/count line)
+    let mut data_rows: Vec<Vec<String>> = Vec::new();
+    let mut count_line = "";
+
+    for line in &lines[1..] {
+        if line.starts_with('-') {
+            continue; // separator line
+        }
+        if line.contains("rows)") {
+            count_line = line;
+            continue;
+        }
+        let cols: Vec<String> = line.split(" | ").map(|s| s.trim().to_string()).collect();
+        if cols.len() == num_cols {
+            data_rows.push(cols);
+        }
+    }
+
+    // Calculate column widths
+    let mut widths: Vec<usize> = header_cols.iter().map(|c| c.len()).collect();
+    for row in &data_rows {
+        for (i, col) in row.iter().enumerate() {
+            if i < widths.len() {
+                widths[i] = widths[i].max(col.len());
             }
         }
     }
 
-    // Send quit to server
-    let _ = send_query(&mut stream, "quit");
-    println!("Disconnected.");
+    // Build separator line
+    let sep: String = widths
+        .iter()
+        .map(|w| "-".repeat(*w + 2))
+        .collect::<Vec<_>>()
+        .join("-+-");
+
+    // Print header
+    let header_line: String = header_cols
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!(" {:<width$} ", c, width = widths[i]))
+        .collect::<Vec<_>>()
+        .join("|");
+    println!("{}", header_line);
+    println!("{}", sep);
+
+    // Print rows
+    for row in &data_rows {
+        let row_line: String = row
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i < widths.len() {
+                    format!(" {:<width$} ", c, width = widths[i])
+                } else {
+                    format!(" {} ", c)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        println!("{}", row_line);
+    }
+
+    // Print count
+    if !count_line.is_empty() {
+        println!("{}", count_line);
+    }
 }
 
-/// Sends a query to the server (newline-terminated).
-fn send_query(stream: &mut TcpStream, query: &str) -> io::Result<()> {
+/// Handles backslash meta-commands.
+fn handle_meta_command(cmd: &str, stream: &TcpStream) {
+    let stream = stream.try_clone().unwrap();
+    match cmd {
+        "\\?" | "\\help" => {
+            print_help();
+        }
+        "\\q" | "\\quit" | "\\exit" => {
+            let _ = send_query(&stream, "quit");
+            println!();
+            eprintln!("Bye!");
+            std::process::exit(0);
+        }
+        "\\d" | "\\dt" => {
+            // List all ontologies/classes by querying the ontology store
+            // We do this by trying to SELECT from __ontology__ keys
+            let resp = send_query(&stream, "SELECT * FROM __ontology__").unwrap_or_default();
+            if resp.contains("(0 rows)") || resp.starts_with("ERR:") {
+                println!("No ontologies found.");
+            } else {
+                println!("{}", resp);
+            }
+        }
+        "\\version" => {
+            println!("OntoDB CLI v{}", env!("CARGO_PKG_VERSION"));
+        }
+        "\\clear" | "\\cls" => {
+            // ANSI clear screen
+            print!("\x1B[2J\x1B[H");
+        }
+        _ if cmd.starts_with("\\c ") => {
+            // Connect to a different server (future feature)
+            eprintln!("Reconnect not yet supported. Restart the CLI with a new address.");
+        }
+        _ => {
+            eprintln!("Unknown command: {}", cmd);
+            eprintln!("Type \\help for available commands.");
+        }
+    }
+}
+
+fn print_banner(addr: &str) {
+    println!("OntoDB CLI v{}", env!("CARGO_PKG_VERSION"));
+    println!("Connected to {}", addr);
+    println!();
+    println!("Type SQL queries ending with ';' to execute.");
+    println!("Use \\help for available commands, \\q to quit.");
+    println!();
+}
+
+fn print_help() {
+    println!("Available commands:");
+    println!();
+    println!("  SQL statements (end with ';'):");
+    println!("    CREATE ONTOLOGY <name> (...)    Create an ontology");
+    println!("    INSERT INTO <class> ...         Insert data");
+    println!("    SELECT ... FROM <class> ...     Query data");
+    println!("    UPDATE <class> SET ...          Update data");
+    println!("    DELETE FROM <class> ...         Delete data");
+    println!("    MATCH (v: <class>) ...          Semantic query");
+    println!();
+    println!("  Special commands:");
+    println!("    \\help  \\?     Show this help");
+    println!("    \\d  \\dt       List ontologies/classes");
+    println!("    \\version      Show CLI version");
+    println!("    \\clear        Clear screen");
+    println!("    \\q            Quit");
+    println!();
+    println!("  Multi-line input:");
+    println!("    Statements can span multiple lines.");
+    println!("    End with ';' to execute.");
+    println!();
+    println!("  Examples:");
+    println!("    CREATE ONTOLOGY shop (");
+    println!("      CLASS Product,");
+    println!("      PROPERTY name DOMAIN Product RANGE STRING");
+    println!("    );");
+    println!();
+    println!("    SELECT * FROM Product WHERE price > 100;");
+    println!();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Protocol helpers
+// ═══════════════════════════════════════════════════════════════════
+
+fn send_query(stream: &TcpStream, query: &str) -> io::Result<String> {
+    let mut stream = stream.try_clone()?;
     stream.write_all(query.as_bytes())?;
     stream.write_all(b"\n")?;
-    stream.flush()
-}
+    stream.flush()?;
 
-/// Reads a response from the server (null-byte terminated).
-fn read_response(stream: &TcpStream) -> io::Result<String> {
     let mut reader = BufReader::new(stream);
     let mut response = Vec::new();
     let mut byte = [0u8; 1];
@@ -192,7 +449,7 @@ fn read_response(stream: &TcpStream) -> io::Result<String> {
         match reader.read_exact(&mut byte) {
             Ok(()) => {
                 if byte[0] == 0 {
-                    break; // End of message
+                    break;
                 }
                 response.push(byte[0]);
             }
