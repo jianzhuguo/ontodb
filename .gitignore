@@ -4,3 +4,21 @@ ontodb_data/
 *.swo
 *~
 .DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Build artifacts
+*.dll
+*.exe
+*.pdb
+
+# Test data
+*.sst
+*.wal
