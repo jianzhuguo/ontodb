@@ -21,13 +21,15 @@ pub enum QueryAst {
         values: Vec<LiteralValue>,
     },
 
-    /// SELECT ... FROM <class> [JOIN ...] [WHERE ...] [ORDER BY ...] [LIMIT ...]
+    /// SELECT ... FROM <class> [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]
     Select {
         columns: SelectColumns,
         from: String,
         from_alias: Option<String>,
         joins: Vec<JoinClause>,
         filter: Option<FilterExpr>,
+        group_by: Option<GroupByClause>,
+        having: Option<FilterExpr>,
         order_by: Option<OrderBy>,
         limit: Option<usize>,
     },
@@ -57,7 +59,39 @@ pub enum QueryAst {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SelectColumns {
     All,
-    Columns(Vec<String>),
+    Columns(Vec<SelectItem>),
+}
+
+/// A single item in SELECT: either a column reference or an aggregate function.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SelectItem {
+    /// A regular column: `name` or `p.name`
+    Column(String),
+    /// An aggregate: `COUNT(*)`, `SUM(price) as total`
+    Aggregate(AggregateExpr),
+}
+
+/// An aggregate function in SELECT: COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregateExpr {
+    pub func: AggregateFunc,
+    pub arg: String, // column name or "*" for COUNT(*)
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AggregateFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// GROUP BY clause
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupByClause {
+    pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,12 +231,7 @@ impl QueryParser {
         let columns = if cols_str == "*" {
             SelectColumns::All
         } else {
-            SelectColumns::Columns(
-                cols_str
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .collect(),
-            )
+            SelectColumns::Columns(Self::parse_select_items(cols_str)?)
         };
 
         // Parse FROM clause: <table> [AS <alias>]
@@ -219,8 +248,33 @@ impl QueryParser {
             (None, rest.to_string())
         };
 
+        // Parse optional GROUP BY
+        let rest_upper = rest.to_uppercase();
+        let (group_by, rest) = if rest_upper.trim_start().starts_with("GROUP BY") {
+            let rest = rest[Self::find_unquoted(&rest_upper, "GROUP BY").unwrap() + 8..].trim();
+            let (cols_str, rest) = Self::consume_until_keywords(rest, &["HAVING", "ORDER BY", "LIMIT"]);
+            let columns: Vec<String> = cols_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            (Some(GroupByClause { columns }), rest.to_string())
+        } else {
+            (None, rest)
+        };
+
+        // Parse optional HAVING
+        let rest_upper = rest.to_uppercase();
+        let (having, rest) = if rest_upper.trim_start().starts_with("HAVING") {
+            let rest = rest[Self::find_unquoted(&rest_upper, "HAVING").unwrap() + 6..].trim();
+            Self::parse_where(rest)?
+        } else {
+            (None, rest)
+        };
+
         // Parse optional ORDER BY
         let rest_upper = rest.to_uppercase();
+        let rest = rest; // reborrow
         let (order_by, rest) = if rest_upper.starts_with("ORDER BY") {
             let rest = rest[8..].trim();
             let (col, rest) = Self::parse_word(rest)?;
@@ -259,6 +313,8 @@ impl QueryParser {
             from_alias,
             joins,
             filter,
+            group_by,
+            having,
             order_by,
             limit,
         })
@@ -276,6 +332,8 @@ impl QueryParser {
         } else if !rest.is_empty()
             && !rest_upper.starts_with("WHERE")
             && !rest_upper.starts_with("JOIN")
+            && !rest_upper.starts_with("GROUP")
+            && !rest_upper.starts_with("HAVING")
             && !rest_upper.starts_with("ORDER")
             && !rest_upper.starts_with("LIMIT")
         {
@@ -335,6 +393,71 @@ impl QueryParser {
         }
 
         Ok((joins, rest))
+    }
+
+    /// Parses SELECT column list into SelectItems (columns and aggregates).
+    fn parse_select_items(cols_str: &str) -> Result<Vec<SelectItem>> {
+        let mut items = Vec::new();
+        for part in Self::split_quoted(cols_str, ',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let upper = part.to_uppercase();
+
+            // Check for aggregate functions: COUNT, SUM, AVG, MIN, MAX
+            let func = if upper.starts_with("COUNT(") {
+                Some(AggregateFunc::Count)
+            } else if upper.starts_with("SUM(") {
+                Some(AggregateFunc::Sum)
+            } else if upper.starts_with("AVG(") {
+                Some(AggregateFunc::Avg)
+            } else if upper.starts_with("MIN(") {
+                Some(AggregateFunc::Min)
+            } else if upper.starts_with("MAX(") {
+                Some(AggregateFunc::Max)
+            } else {
+                None
+            };
+
+            if let Some(func) = func {
+                // Extract argument: FUNC(arg)
+                let open = part.find('(').unwrap();
+                let close = part.rfind(')').unwrap();
+                let arg = part[open + 1..close].trim().to_string();
+
+                // Check for alias: ... AS alias
+                let after = part[close + 1..].trim();
+                let alias = if after.to_uppercase().starts_with("AS") {
+                    Some(after[2..].trim().to_string())
+                } else if !after.is_empty() {
+                    Some(after.to_string())
+                } else {
+                    None
+                };
+
+                items.push(SelectItem::Aggregate(AggregateExpr { func, arg, alias }));
+            } else {
+                // Regular column, possibly with alias
+                // Handle: `name`, `p.name`, `name as n`
+                let (col, alias_part) = if let Some(as_pos) =
+                    Self::find_unquoted(&upper, " AS ")
+                {
+                    (part[..as_pos].trim(), Some(part[as_pos + 4..].trim()))
+                } else {
+                    (part, None)
+                };
+
+                let col_str = col.to_string();
+                if let Some(alias) = alias_part {
+                    // Store as "col as alias" — executor will parse
+                    items.push(SelectItem::Column(format!("{} as {}", col_str, alias)));
+                } else {
+                    items.push(SelectItem::Column(col_str));
+                }
+            }
+        }
+        Ok(items)
     }
 
     /// Consumes input until a keyword is found. Returns (consumed, remaining).
