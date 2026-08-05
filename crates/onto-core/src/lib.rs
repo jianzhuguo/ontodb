@@ -9,6 +9,6 @@ pub mod error;
 pub mod types;
 pub mod value;
 
-pub use error::CoreError;
-pub use types::{Bytes, Key, SeqNo, Timestamp, Value};
+pub use error::{CoreError, Result};
+pub use types::{Bytes, Entry, EntryKind, Key, SeqNo, Timestamp, Value};
 pub use value::OntoValue;

@@ -383,6 +383,7 @@ impl QueryParser {
                 let remaining = rest[val_end..].to_string();
 
                 let val = Self::parse_literal(val_str)?;
+                let remaining = remaining.trim().to_string();
                 return Ok((Some(op_fn(col, val)), remaining));
             }
         }
@@ -429,7 +430,7 @@ impl QueryParser {
         let end = input
             .find(|c: char| c.is_whitespace() || c == ';' || c == ',')
             .unwrap_or(input.len());
-        Ok((input[..end].to_string(), input[end..].to_string()))
+        Ok((input[..end].to_string(), input[end..].trim_start().to_string()))
     }
 }
 

@@ -45,9 +45,9 @@ impl OntologyParser {
 
         let body = rest[paren_pos + 1..].trim();
         let body = body
+            .strip_suffix(';')
+            .unwrap_or(body)
             .strip_suffix(')')
-            .and_then(|s| s.strip_suffix(';'))
-            .or_else(|| body.strip_suffix(')'))
             .ok_or_else(|| {
                 CoreError::InvalidArgument("expected ')' at end of ontology definition".to_string())
             })?;

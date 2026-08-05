@@ -239,7 +239,6 @@ impl SsTable {
         }
 
         // Read bloom filter
-        let bloom_size = (bloom_offset - index_offset) as usize; // Approximate
         file.seek(SeekFrom::Start(bloom_offset))?;
         let file_len = file.metadata()?.len();
         let bloom_data_len = (file_len - FOOTER_SIZE - bloom_offset) as usize;
@@ -274,17 +273,20 @@ impl SsTable {
 
         // Find the block that might contain this key
         let block_idx = self.find_block(key)?;
-        let block_entry = &self.index[block_idx];
+
+        // Copy offset/size to avoid holding borrow on self.index
+        let block_offset = self.index[block_idx].offset;
+        let block_size = self.index[block_idx].size;
 
         // Read the block
-        let block_data = self.read_block(block_entry)?;
+        let block_data = self.read_block_at(block_offset, block_size)?;
 
         // Search within the block
         self.search_block(&block_data, key)
     }
 
     /// Returns an iterator over all entries in the SSTable.
-    pub fn iter(&mut self) -> Result<SsTableIterator> {
+    pub fn iter(&mut self) -> Result<SsTableIterator<'_>> {
         SsTableIterator::new(self)
     }
 
@@ -310,8 +312,12 @@ impl SsTable {
     }
 
     fn read_block(&mut self, entry: &BlockIndexEntry) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; entry.size as usize];
-        self.file.seek(SeekFrom::Start(entry.offset))?;
+        self.read_block_at(entry.offset, entry.size)
+    }
+
+    fn read_block_at(&mut self, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; size as usize];
+        self.file.seek(SeekFrom::Start(offset))?;
         self.file.read_exact(&mut buf)?;
         Ok(buf)
     }
@@ -487,8 +493,10 @@ impl<'a> SsTableIterator<'a> {
     }
 
     fn load_block(&mut self, idx: usize) -> Result<()> {
-        let entry = &self.table.index[idx];
-        self.block_data = self.table.read_block(entry)?;
+        // Copy offset/size to avoid holding borrow on table.index
+        let block_offset = self.table.index[idx].offset;
+        let block_size = self.table.index[idx].size;
+        self.block_data = self.table.read_block_at(block_offset, block_size)?;
         self.block_idx = idx;
 
         // Parse restart points
@@ -532,8 +540,8 @@ impl<'a> SsTableIterator<'a> {
         if let Some((key, value, seq)) =
             self.table.decode_entry_at(&self.block_data, self.pos)
         {
-            // Skip tombstones during iteration
-            let kind_byte = self.block_data
+            // Read kind byte (for future tombstone filtering)
+            let _kind_byte = self.block_data
                 [self.pos + 4 + key.len() + 4 + value.len() + 8];
 
             self.current_key = key;

@@ -45,6 +45,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Testing
 criterion = "0.5"
+tempfile = "3"
 
 # CRC
 crc32fast = "1"

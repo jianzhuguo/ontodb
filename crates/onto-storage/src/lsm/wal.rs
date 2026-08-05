@@ -5,9 +5,9 @@
 //! All writes are appended sequentially. On recovery, we replay the log
 //! to reconstruct the MemTable state.
 
-use onto_core::{CoreError, Entry, EntryKind, Result, SeqNo};
+use onto_core::{CoreError, Entry, EntryKind, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Write-Ahead Log for durability.

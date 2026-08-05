@@ -1,6 +1,6 @@
 //! Storage iterator trait - unified interface for traversing key-value pairs.
 
-use onto_core::{Key, SeqNo, Value};
+use onto_core::SeqNo;
 
 /// Trait for iterating over sorted key-value entries in the storage engine.
 pub trait StorageIterator {

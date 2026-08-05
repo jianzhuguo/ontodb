@@ -5,8 +5,7 @@
 //!
 //! We use `crossbeam-skiplist` for a concurrent-friendly skip list.
 
-use onto_core::{Entry, EntryKind, Key, Result, SeqNo, Value};
-use std::ops::Bound;
+use onto_core::{EntryKind, Key, SeqNo, Value};
 
 /// An entry in the MemTable, sorted by (key, seq_no DESC).
 #[derive(Debug, Clone)]
@@ -114,23 +113,15 @@ impl MemTable {
 
     /// Gets the latest value for a key.
     pub fn get(&self, key: &[u8]) -> Option<(&[u8], SeqNo)> {
-        // Search for the first entry with this key (highest seq_no due to ordering)
-        let mut search_key = Vec::with_capacity(key.len() + 8);
-        search_key.extend_from_slice(key);
-        search_key.extend_from_slice(&(!0u64).to_be_bytes()); // Start from highest seq_no
-
-        let range = (Bound::Included(search_key), Bound::Unbounded);
-
-        for (_composite, entry) in self.data.range(range) {
-            if entry.key != key {
-                break; // Different key, stop
+        // Iterate all entries and find the latest version of this key
+        for (_composite, entry) in &self.data {
+            if entry.key == key {
+                if entry.is_tombstone() {
+                    return None;
+                }
+                return Some((&entry.value, entry.seq_no));
             }
-            if entry.is_tombstone() {
-                return None; // Latest version is a deletion
-            }
-            return Some((&entry.value, entry.seq_no));
         }
-
         None
     }
 

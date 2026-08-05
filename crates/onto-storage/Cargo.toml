@@ -20,4 +20,4 @@ crossbeam-skiplist = "0.1"
 
 [dev-dependencies]
 criterion = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }

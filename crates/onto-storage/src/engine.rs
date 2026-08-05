@@ -4,9 +4,9 @@
 //! Read path:   MemTable → SSTables (newest to oldest)
 //! Delete:      Write tombstone entry
 
-use super::memtable::MemTable;
-use super::sstable::{SsTable, SsTableBuilder};
-use super::wal::Wal;
+use crate::lsm::memtable::MemTable;
+use crate::lsm::sstable::{SsTable, SsTableBuilder};
+use crate::lsm::wal::{self, Wal};
 use crate::options::StorageOptions;
 use onto_core::{Entry, EntryKind, Key, Result, SeqNo, Value};
 use std::fs;
@@ -38,6 +38,7 @@ pub struct LsmEngine {
 }
 
 /// Metadata about an SSTable file, kept in memory.
+#[derive(Clone)]
 struct SsTableInfo {
     /// File path.
     path: PathBuf,
@@ -204,7 +205,7 @@ impl LsmEngine {
             return Ok(());
         }
 
-        let entries = super::wal::replay_wal(&wal_path)?;
+        let entries = wal::replay_wal(&wal_path)?;
         let mut max_seq = 0u64;
 
         for entry in entries {
@@ -257,7 +258,7 @@ impl LsmEngine {
                 continue;
             }
 
-            let sst = SsTable::open(&path)?;
+            let _sst = SsTable::open(&path)?;
             // TODO: extract min/max key from SSTable index
             let metadata = fs::metadata(&path)?;
 

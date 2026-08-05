@@ -1,7 +1,7 @@
 //! Query executor: runs parsed queries against the storage and ontology engines.
 
 use crate::parser::{FilterExpr, LiteralValue, QueryAst, SelectColumns};
-use onto_core::{CoreError, OntoValue, Result};
+use onto_core::{CoreError, Result};
 use onto_ontology::OntologyStore;
 use onto_storage::LsmEngine;
 use serde_json::{json, Map, Value};
@@ -106,7 +106,7 @@ impl QueryExecutor {
 
         // This is a simplified implementation that reads from the MemTable only
         // A full implementation would also scan SSTables
-        let prefix = format!("{}::", from);
+        let _prefix = format!("{}::", from);
 
         // Get all entries (simplified - just check MemTable for now)
         // In a real implementation, we'd iterate over MemTable + SSTables
@@ -135,7 +135,7 @@ impl QueryExecutor {
         Ok(QueryResult::Rows(rows))
     }
 
-    fn execute_delete(&self, class: &str, filter: &Option<FilterExpr>) -> Result<QueryResult> {
+    fn execute_delete(&self, class: &str, _filter: &Option<FilterExpr>) -> Result<QueryResult> {
         // Simplified: delete matching documents
         // A full implementation would mark entries as tombstones
         Ok(QueryResult::Success(format!(
