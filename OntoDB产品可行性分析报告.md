@@ -54,6 +54,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - **删除**：写入 tombstone 标记，tombstone 在读取时正确拦截旧值
 - **恢复**：启动时从 WAL 重放恢复 MemTable 状态
 - **WAL 格式**：`[length: u32][crc32: u32][payload: bytes]`，支持 CRC 校验跳过损坏条目
+- **WAL 持久化**：每次 append 后 flush 到 OS 缓存，进程 crash 不丢数据
 - **Leveled Compaction**：L0 全量合并 → L1+ 逐级合并，去重保留最新版本，最底层 tombstone 可清理
 - **全局 seq_no**：引擎级序列号确保跨 MemTable flush 的版本顺序正确
 
@@ -71,7 +72,9 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 已支持的 SQL 语句：
 - `CREATE ONTOLOGY <name> (...)` — 本体定义
 - `INSERT INTO <class> (...) VALUES (...)` — 数据插入
-- `SELECT ... FROM <class> WHERE ... ORDER BY ... LIMIT ...` — 数据查询（基于 class 前缀索引扫描）
+- `SELECT ... FROM <class> [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]` — 数据查询
+- `SELECT ... FROM A JOIN B ON A.x = B.y ...` — 多表 JOIN 查询（nested-loop join）
+- `SELECT COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col) ...` — 聚合函数
 - `UPDATE <class> SET ... WHERE ...` — 数据更新（扫描+修改+重写，支持多字段多行）
 - `DELETE FROM <class> WHERE ...` — 数据删除（扫描+tombstone，支持条件删除和全表删除）
 - `MATCH (<var>: <Class>) WHERE ... RETURN ...` — 语义匹配查询

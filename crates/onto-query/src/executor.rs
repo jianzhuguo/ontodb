@@ -38,11 +38,12 @@ impl QueryExecutor {
                 filter,
                 group_by,
                 having,
+                order_by,
                 limit,
                 ..
             } => self.execute_select(
                 columns, from, from_alias.as_deref(), joins, filter,
-                group_by.as_ref(), having, *limit,
+                group_by.as_ref(), having, order_by.as_ref(), *limit,
             ),
             QueryAst::Delete { class, filter } => self.execute_delete(class, filter),
             QueryAst::Update {
@@ -107,6 +108,7 @@ impl QueryExecutor {
         filter: &Option<FilterExpr>,
         group_by: Option<&crate::parser::GroupByClause>,
         having: &Option<FilterExpr>,
+        order_by: Option<&crate::parser::OrderBy>,
         limit: Option<usize>,
     ) -> Result<QueryResult> {
         let mut engine = self.engine.write().unwrap();
@@ -183,7 +185,7 @@ impl QueryExecutor {
         if group_by.is_some() || has_aggregates {
             // Aggregate query
             let result = self.execute_aggregation(
-                columns, &filtered, group_by, having, limit,
+                columns, &filtered, group_by, having, order_by, limit,
             );
             return result;
         }
@@ -192,14 +194,29 @@ impl QueryExecutor {
         let mut rows: Vec<Map<String, Value>> = Vec::new();
         for doc in filtered {
             rows.push(self.project_columns(&doc, columns));
-            if let Some(limit) = limit {
-                if rows.len() >= limit {
-                    break;
-                }
-            }
+        }
+
+        // Sort if ORDER BY specified
+        if let Some(ob) = order_by {
+            Self::sort_rows(&mut rows, &ob.column, ob.ascending);
+        }
+
+        // Apply LIMIT
+        if let Some(limit) = limit {
+            rows.truncate(limit);
         }
 
         Ok(QueryResult::Rows(rows))
+    }
+
+    /// Sorts rows by a column. Tries numeric comparison first, falls back to string.
+    fn sort_rows(rows: &mut Vec<Map<String, Value>>, col: &str, ascending: bool) {
+        rows.sort_by(|a, b| {
+            let a_val = Self::resolve_column_value(a, col).unwrap_or_default();
+            let b_val = Self::resolve_column_value(b, col).unwrap_or_default();
+            let ord = Self::compare_values(&a_val, &b_val);
+            if ascending { ord } else { ord.reverse() }
+        });
     }
 
     /// Checks if the SELECT columns contain any aggregate functions.
@@ -217,6 +234,7 @@ impl QueryExecutor {
         rows: &[Map<String, Value>],
         group_by: Option<&crate::parser::GroupByClause>,
         having: &Option<FilterExpr>,
+        order_by: Option<&crate::parser::OrderBy>,
         limit: Option<usize>,
     ) -> Result<QueryResult> {
         // Group rows by GROUP BY columns (or single group if no GROUP BY)
@@ -288,12 +306,16 @@ impl QueryExecutor {
             if self.matches_filter(&result_row, having) {
                 result_rows.push(result_row);
             }
+        }
 
-            if let Some(limit) = limit {
-                if result_rows.len() >= limit {
-                    break;
-                }
-            }
+        // Sort if ORDER BY specified
+        if let Some(ob) = order_by {
+            Self::sort_rows(&mut result_rows, &ob.column, ob.ascending);
+        }
+
+        // Apply LIMIT
+        if let Some(limit) = limit {
+            result_rows.truncate(limit);
         }
 
         Ok(QueryResult::Rows(result_rows))
@@ -491,7 +513,7 @@ impl QueryExecutor {
             )
         };
 
-        self.execute_select(&columns, class, None, &[], filter, None, &None, None)
+        self.execute_select(&columns, class, None, &[], filter, None, &None, None, None)
     }
 
     fn generate_doc_key(&self, class: &str) -> Vec<u8> {
@@ -1497,6 +1519,110 @@ mod tests {
                 assert_eq!(rows.len(), 2);
             }
             _ => panic!("expected 2 rows with LIMIT"),
+        }
+    }
+
+    // ── ORDER BY tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_order_by_asc() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "MacBook", 1999);
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT name, price FROM Product ORDER BY price").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "iPad");
+                assert_eq!(rows[1].get("name").unwrap().as_str().unwrap(), "iPhone");
+                assert_eq!(rows[2].get("name").unwrap().as_str().unwrap(), "MacBook");
+            }
+            _ => panic!("expected sorted rows"),
+        }
+    }
+
+    #[test]
+    fn test_order_by_desc() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "MacBook", 1999);
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT name, price FROM Product ORDER BY price DESC").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "MacBook");
+                assert_eq!(rows[1].get("name").unwrap().as_str().unwrap(), "iPhone");
+                assert_eq!(rows[2].get("name").unwrap().as_str().unwrap(), "iPad");
+            }
+            _ => panic!("expected reverse sorted rows"),
+        }
+    }
+
+    #[test]
+    fn test_order_by_with_limit() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "MacBook", 1999);
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT name FROM Product ORDER BY price DESC LIMIT 2").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "MacBook");
+                assert_eq!(rows[1].get("name").unwrap().as_str().unwrap(), "iPhone");
+            }
+            _ => panic!("expected top 2 by price desc"),
+        }
+    }
+
+    #[test]
+    fn test_order_by_group_by() {
+        let (executor, _dir) = setup();
+
+        for (name, cat, price) in [
+            ("iPhone", "phone", 999),
+            ("Galaxy", "phone", 899),
+            ("iPad", "tablet", 799),
+            ("MacBook", "laptop", 1999),
+        ] {
+            let ast = QueryAst::Insert {
+                class: "Item".to_string(),
+                columns: vec!["name".to_string(), "category".to_string(), "price".to_string()],
+                values: vec![
+                    LiteralValue::String(name.to_string()),
+                    LiteralValue::String(cat.to_string()),
+                    LiteralValue::Int(price),
+                ],
+            };
+            executor.execute(&ast).unwrap();
+        }
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // GROUP BY + ORDER BY total DESC
+        let ast = QueryParser::parse(
+            "SELECT category, SUM(price) as total FROM Item GROUP BY category ORDER BY total DESC"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3);
+                // DESC: laptop(1999) > phone(1898) > tablet(799)
+                assert_eq!(rows[0].get("category").unwrap().as_str().unwrap(), "laptop");
+                assert_eq!(rows[1].get("category").unwrap().as_str().unwrap(), "phone");
+                assert_eq!(rows[2].get("category").unwrap().as_str().unwrap(), "tablet");
+            }
+            _ => panic!("expected sorted grouped rows"),
         }
     }
 }

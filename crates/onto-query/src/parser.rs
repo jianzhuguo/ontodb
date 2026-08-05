@@ -275,20 +275,26 @@ impl QueryParser {
         // Parse optional ORDER BY
         let rest_upper = rest.to_uppercase();
         let rest = rest; // reborrow
-        let (order_by, rest) = if rest_upper.starts_with("ORDER BY") {
-            let rest = rest[8..].trim();
+        let (order_by, rest) = if rest_upper.trim_start().starts_with("ORDER BY") {
+            let start = Self::find_unquoted(&rest_upper, "ORDER BY").unwrap();
+            let rest = rest[start + 8..].trim();
             let (col, rest) = Self::parse_word(rest)?;
-            let ascending = if rest.to_uppercase().starts_with("DESC") {
-                false
+            let rest_upper = rest.to_uppercase();
+            let ascending = if rest_upper.trim_start().starts_with("DESC") {
+                let rest = rest[Self::find_unquoted(&rest_upper, "DESC").unwrap() + 4..].trim();
+                (false, rest.to_string())
+            } else if rest_upper.trim_start().starts_with("ASC") {
+                let rest = rest[Self::find_unquoted(&rest_upper, "ASC").unwrap() + 3..].trim();
+                (true, rest.to_string())
             } else {
-                true
+                (true, rest.to_string())
             };
             (
                 Some(OrderBy {
                     column: col,
-                    ascending,
+                    ascending: ascending.0,
                 }),
-                rest.to_string(),
+                ascending.1,
             )
         } else {
             (None, rest)
@@ -296,8 +302,9 @@ impl QueryParser {
 
         // Parse optional LIMIT
         let rest_upper = rest.to_uppercase();
-        let limit = if rest_upper.starts_with("LIMIT") {
-            let num_str = rest[5..].trim();
+        let limit = if rest_upper.trim_start().starts_with("LIMIT") {
+            let start = Self::find_unquoted(&rest_upper, "LIMIT").unwrap();
+            let num_str = rest[start + 5..].trim();
             Some(
                 num_str
                     .parse::<usize>()
