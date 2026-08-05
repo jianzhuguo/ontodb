@@ -382,7 +382,7 @@ impl DiskPage {
         }
 
         // Read the entry from the slot
-        let (entry_offset, _key_len) = self.read_slot(slot_pos).unwrap();
+        let (_entry_offset, _key_len) = self.read_slot(slot_pos).unwrap();
 
         // Shift slots left
         let num = header.num_entries;
@@ -709,10 +709,15 @@ pub struct CachedPage {
 ///
 /// Caches frequently accessed pages in memory.
 /// Pages are evicted in LRU order when the pool is full.
+///
+/// Uses a monotonic counter for O(1) access tracking instead of
+/// maintaining an ordered Vec (which was O(n) per touch).
 pub struct BufferPool {
     cache: HashMap<u32, CachedPage>,
-    /// LRU order: front = most recently used, back = least recently used.
-    lru: Vec<u32>,
+    /// Monotonic access counter per page. Higher value = more recently used.
+    access_order: HashMap<u32, u64>,
+    /// Monotonically increasing counter for access ordering.
+    counter: u64,
     capacity: usize,
 }
 
@@ -721,7 +726,8 @@ impl BufferPool {
     pub fn new(capacity: usize) -> Self {
         Self {
             cache: HashMap::with_capacity(capacity),
-            lru: Vec::with_capacity(capacity),
+            access_order: HashMap::with_capacity(capacity),
+            counter: 0,
             capacity,
         }
     }
@@ -752,11 +758,9 @@ impl BufferPool {
             }
 
             self.cache.insert(page_id, CachedPage { data, dirty: false });
-            self.touch(page_id);
-        } else {
-            self.touch(page_id);
         }
 
+        self.touch(page_id);
         Ok(self.cache.get(&page_id).unwrap())
     }
 
@@ -785,13 +789,11 @@ impl BufferPool {
 
     /// Flushes all dirty pages to disk.
     pub fn flush(&mut self, file: &mut File) -> Result<()> {
-        for page_id in &self.lru {
-            if let Some(page) = self.cache.get(page_id) {
-                if page.dirty {
-                    let offset = (*page_id as u64) * (PAGE_SIZE as u64);
-                    file.seek(SeekFrom::Start(offset))?;
-                    file.write_all(&page.data)?;
-                }
+        for (page_id, page) in &self.cache {
+            if page.dirty {
+                let offset = (*page_id as u64) * (PAGE_SIZE as u64);
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(&page.data)?;
             }
         }
         // Clear dirty flags
@@ -803,7 +805,14 @@ impl BufferPool {
 
     /// Evicts the least recently used page. Flushes it if dirty.
     fn evict(&mut self, file: &mut File) -> Result<()> {
-        if let Some(victim_id) = self.lru.pop() {
+        // Find the page with the lowest access counter
+        let victim_id = self.access_order
+            .iter()
+            .min_by_key(|(_, &counter)| counter)
+            .map(|(&id, _)| id);
+
+        if let Some(victim_id) = victim_id {
+            self.access_order.remove(&victim_id);
             if let Some(page) = self.cache.remove(&victim_id) {
                 if page.dirty {
                     let offset = (victim_id as u64) * (PAGE_SIZE as u64);
@@ -815,10 +824,10 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Moves a page to the front of the LRU list.
+    /// Records a page access. O(1) operation.
     fn touch(&mut self, page_id: u32) {
-        self.lru.retain(|&id| id != page_id);
-        self.lru.insert(0, page_id);
+        self.counter += 1;
+        self.access_order.insert(page_id, self.counter);
     }
 }
 

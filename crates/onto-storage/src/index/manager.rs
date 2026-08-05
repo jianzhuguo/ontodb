@@ -7,8 +7,6 @@
 //! On write operations, the manager updates both the in-memory tree and the LSM engine.
 
 use crate::index::btree::BPlusTree;
-use onto_core::Result;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Prefix for index keys in the LSM-Tree.

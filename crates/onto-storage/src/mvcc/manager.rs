@@ -2,7 +2,7 @@
 
 use crate::mvcc::transaction::{Transaction, TxnStatus, WriteOp};
 use crate::mvcc::visibility::Visibility;
-use onto_core::{Key, Result, SeqNo, Value};
+use onto_core::{Key, Result, SeqNo};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Manages all transactions and their lifecycle.
