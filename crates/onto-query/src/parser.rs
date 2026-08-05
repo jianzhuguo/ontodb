@@ -21,8 +21,9 @@ pub enum QueryAst {
         values: Vec<LiteralValue>,
     },
 
-    /// SELECT ... FROM <class> [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]
+    /// SELECT [DISTINCT] ... FROM <class> [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]
     Select {
+        distinct: bool,
         columns: SelectColumns,
         from: String,
         from_alias: Option<String>,
@@ -111,6 +112,9 @@ pub enum FilterExpr {
     Lt(String, LiteralValue),
     Gte(String, LiteralValue),
     Lte(String, LiteralValue),
+    Like(String, String),                          // column LIKE 'pattern'
+    Between(String, LiteralValue, LiteralValue),    // column BETWEEN low AND high
+    In(String, Vec<LiteralValue>),                  // column IN (val1, val2, ...)
     And(Box<FilterExpr>, Box<FilterExpr>),
     Or(Box<FilterExpr>, Box<FilterExpr>),
 }
@@ -225,7 +229,15 @@ impl QueryParser {
             .find(" FROM ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'FROM'".to_string()))?;
 
-        let cols_str = input[6..from_pos].trim(); // After "SELECT"
+        let after_select = input[6..from_pos].trim(); // After "SELECT"
+
+        // Check for DISTINCT keyword
+        let (distinct, cols_str) = if after_select.to_uppercase().starts_with("DISTINCT") {
+            (true, after_select[8..].trim())
+        } else {
+            (false, after_select)
+        };
+
         let rest = input[from_pos + 6..].trim();
 
         let columns = if cols_str == "*" {
@@ -315,6 +327,7 @@ impl QueryParser {
         };
 
         Ok(QueryAst::Select {
+            distinct,
             columns,
             from,
             from_alias,
@@ -656,10 +669,53 @@ impl QueryParser {
     }
 
     fn parse_where(input: &str) -> Result<(Option<FilterExpr>, String)> {
-        // Simple single-condition parser: column op value
         let input = input.trim();
 
-        // Find operator (skip quoted strings)
+        // Try keyword operators first: LIKE, BETWEEN, IN
+        let upper = input.to_uppercase();
+
+        // Check for LIKE: column LIKE 'pattern'
+        if let Some(like_pos) = Self::find_unquoted(&upper, " LIKE ") {
+            let col = input[..like_pos].trim().to_string();
+            let rest = input[like_pos + 6..].trim();
+            let (pattern, remaining) = Self::extract_quoted_or_word(rest);
+            return Ok((Some(FilterExpr::Like(col, pattern)), remaining));
+        }
+
+        // Check for BETWEEN: column BETWEEN low AND high
+        if let Some(between_pos) = Self::find_unquoted(&upper, " BETWEEN ") {
+            let col = input[..between_pos].trim().to_string();
+            let rest = input[between_pos + 9..].trim();
+            let rest_upper = rest.to_uppercase();
+
+            if let Some(and_pos) = Self::find_unquoted(&rest_upper, " AND ") {
+                let low_str = rest[..and_pos].trim();
+                let high_rest = rest[and_pos + 5..].trim();
+                let (high_str, remaining) = Self::extract_quoted_or_word(high_rest);
+                let low = Self::parse_literal(low_str)?;
+                let high = Self::parse_literal(&high_str)?;
+                return Ok((Some(FilterExpr::Between(col, low, high)), remaining));
+            }
+        }
+
+        // Check for IN: column IN (val1, val2, ...)
+        if let Some(in_pos) = Self::find_unquoted(&upper, " IN ") {
+            let col = input[..in_pos].trim().to_string();
+            let rest = input[in_pos + 4..].trim();
+            if rest.starts_with('(') {
+                if let Some(close) = rest.find(')') {
+                    let inner = &rest[1..close];
+                    let values: Vec<LiteralValue> = inner
+                        .split(',')
+                        .map(|s| Self::parse_literal(s.trim()))
+                        .collect::<Result<Vec<_>>>()?;
+                    let remaining = rest[close + 1..].trim().to_string();
+                    return Ok((Some(FilterExpr::In(col, values)), remaining));
+                }
+            }
+        }
+
+        // Symbol operators: >=, <=, !=, <>, >, <, =
         for (op_str, op_fn) in &[
             (">=", FilterExpr::Gte as fn(String, LiteralValue) -> FilterExpr),
             ("<=", FilterExpr::Lte),
@@ -673,27 +729,8 @@ impl QueryParser {
                 let col = input[..pos].trim().to_string();
                 let rest = input[pos + op_str.len()..].trim();
 
-                // Find the end of the value, handling quoted strings
-                let val_str;
-                let remaining;
-                if rest.starts_with('\'') || rest.starts_with('"') {
-                    let quote = rest.as_bytes()[0] as char;
-                    if let Some(end_quote) = rest[1..].find(quote) {
-                        val_str = &rest[1..1 + end_quote];
-                        remaining = rest[1 + end_quote + 1..].trim().to_string();
-                    } else {
-                        val_str = rest;
-                        remaining = String::new();
-                    }
-                } else {
-                    let val_end = rest
-                        .find(|c: char| c.is_whitespace() || c == ';' || c == ',')
-                        .unwrap_or(rest.len());
-                    val_str = &rest[..val_end];
-                    remaining = rest[val_end..].trim().to_string();
-                }
-
-                let val = Self::parse_literal(val_str)?;
+                let (val_str, remaining) = Self::extract_quoted_or_word(rest);
+                let val = Self::parse_literal(&val_str)?;
                 return Ok((Some(op_fn(col, val)), remaining));
             }
         }
@@ -702,6 +739,25 @@ impl QueryParser {
             "invalid WHERE clause: {}",
             input
         )))
+    }
+
+    /// Extracts a value from the start of input. Handles quoted strings and bare words.
+    /// Returns (value_string, remaining_input).
+    fn extract_quoted_or_word(input: &str) -> (String, String) {
+        let input = input.trim();
+        if input.starts_with('\'') || input.starts_with('"') {
+            let quote = input.as_bytes()[0] as char;
+            if let Some(end) = input[1..].find(quote) {
+                return (
+                    input[1..1 + end].to_string(),
+                    input[1 + end + 1..].trim().to_string(),
+                );
+            }
+        }
+        let end = input
+            .find(|c: char| c.is_whitespace() || c == ';' || c == ',')
+            .unwrap_or(input.len());
+        (input[..end].to_string(), input[end..].trim().to_string())
     }
 
     fn parse_literal(s: &str) -> Result<LiteralValue> {

@@ -31,6 +31,7 @@ impl QueryExecutor {
                 values,
             } => self.execute_insert(class, columns, values),
             QueryAst::Select {
+                distinct,
                 columns,
                 from,
                 from_alias,
@@ -42,7 +43,7 @@ impl QueryExecutor {
                 limit,
                 ..
             } => self.execute_select(
-                columns, from, from_alias.as_deref(), joins, filter,
+                *distinct, columns, from, from_alias.as_deref(), joins, filter,
                 group_by.as_ref(), having, order_by.as_ref(), *limit,
             ),
             QueryAst::Delete { class, filter } => self.execute_delete(class, filter),
@@ -101,6 +102,7 @@ impl QueryExecutor {
 
     fn execute_select(
         &self,
+        distinct: bool,
         columns: &SelectColumns,
         from: &str,
         from_alias: Option<&str>,
@@ -201,12 +203,29 @@ impl QueryExecutor {
             Self::sort_rows(&mut rows, &ob.column, ob.ascending);
         }
 
+        // Apply DISTINCT
+        if distinct {
+            Self::dedup_rows(&mut rows);
+        }
+
         // Apply LIMIT
         if let Some(limit) = limit {
             rows.truncate(limit);
         }
 
         Ok(QueryResult::Rows(rows))
+    }
+
+    /// Removes duplicate rows based on all column values.
+    fn dedup_rows(rows: &mut Vec<Map<String, Value>>) {
+        let mut seen = std::collections::HashSet::new();
+        rows.retain(|row| {
+            let key: Vec<String> = row
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            seen.insert(key.join("\x00"))
+        });
     }
 
     /// Sorts rows by a column. Tries numeric comparison first, falls back to string.
@@ -513,7 +532,7 @@ impl QueryExecutor {
             )
         };
 
-        self.execute_select(&columns, class, None, &[], filter, None, &None, None, None)
+        self.execute_select(false, &columns, class, None, &[], filter, None, &None, None, None)
     }
 
     fn generate_doc_key(&self, class: &str) -> Vec<u8> {
@@ -559,6 +578,25 @@ impl QueryExecutor {
                 doc.get(col)
                     .map_or(false, |v| self.value_lt(v, val) || self.value_matches(v, val))
             }
+            FilterExpr::Like(col, pattern) => {
+                doc.get(col).map_or(false, |v| {
+                    let s = match v {
+                        Value::String(s) => s.clone(),
+                        _ => v.to_string(),
+                    };
+                    Self::like_match(&s, pattern)
+                })
+            }
+            FilterExpr::Between(col, low, high) => {
+                doc.get(col).map_or(false, |v| {
+                    self.value_gte(v, low) && self.value_lte(v, high)
+                })
+            }
+            FilterExpr::In(col, values) => {
+                doc.get(col).map_or(false, |v| {
+                    values.iter().any(|val| self.value_matches(v, val))
+                })
+            }
             FilterExpr::And(left, right) => {
                 self.eval_filter(doc, left) && self.eval_filter(doc, right)
             }
@@ -595,6 +633,45 @@ impl QueryExecutor {
             (Value::String(s), LiteralValue::String(l)) => s.as_str() < l.as_str(),
             _ => false,
         }
+    }
+
+    fn value_gte(&self, v: &Value, lit: &LiteralValue) -> bool {
+        self.value_gt(v, lit) || self.value_matches(v, lit)
+    }
+
+    fn value_lte(&self, v: &Value, lit: &LiteralValue) -> bool {
+        self.value_lt(v, lit) || self.value_matches(v, lit)
+    }
+
+    /// SQL LIKE pattern matching. Supports % (zero or more chars) and _ (exactly one char).
+    fn like_match(text: &str, pattern: &str) -> bool {
+        let mut ti = 0;
+        let mut pi = 0;
+        let mut star_pi = usize::MAX;
+        let mut star_ti = 0;
+        let t_bytes = text.as_bytes();
+        let p_bytes = pattern.as_bytes();
+
+        while ti < t_bytes.len() {
+            if pi < p_bytes.len() && (p_bytes[pi] == b'_' || p_bytes[pi] == t_bytes[ti]) {
+                ti += 1;
+                pi += 1;
+            } else if pi < p_bytes.len() && p_bytes[pi] == b'%' {
+                star_pi = pi;
+                star_ti = ti;
+                pi += 1;
+            } else if star_pi != usize::MAX {
+                pi = star_pi + 1;
+                star_ti += 1;
+                ti = star_ti;
+            } else {
+                return false;
+            }
+        }
+        while pi < p_bytes.len() && p_bytes[pi] == b'%' {
+            pi += 1;
+        }
+        pi == p_bytes.len()
     }
 
     fn project_columns(&self, doc: &Map<String, Value>, columns: &SelectColumns) -> Map<String, Value> {
@@ -1623,6 +1700,146 @@ mod tests {
                 assert_eq!(rows[2].get("category").unwrap().as_str().unwrap(), "tablet");
             }
             _ => panic!("expected sorted grouped rows"),
+        }
+    }
+
+    // ── DISTINCT tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_distinct() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPhone", 999); // duplicate
+        insert_row(&executor, "Product", "iPad", 799);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT DISTINCT name, price FROM Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // iPhone and iPad only
+            }
+            _ => panic!("expected 2 distinct rows"),
+        }
+    }
+
+    // ── LIKE tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_like_prefix() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "iMac", 1299);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE name LIKE 'i%'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3); // iPhone, iPad, iMac
+            }
+            _ => panic!("expected 3 rows with 'i%' prefix"),
+        }
+    }
+
+    #[test]
+    fn test_like_suffix() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook Pro", 1999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE name LIKE '%Pro'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "MacBook Pro");
+            }
+            _ => panic!("expected 1 row with '%Pro' suffix"),
+        }
+    }
+
+    #[test]
+    fn test_like_single_char() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "iMac", 1299);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // i_ade should NOT match (underscore is exactly one char)
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE name LIKE 'iP_d'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1); // iPad
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "iPad");
+            }
+            _ => panic!("expected 1 row for 'iP_d'"),
+        }
+    }
+
+    // ── BETWEEN tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_between() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        insert_row(&executor, "Product", "AirPods", 249);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price BETWEEN 500 AND 1500").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // iPad(799), iPhone(999)
+            }
+            _ => panic!("expected 2 rows between 500 and 1500"),
+        }
+    }
+
+    // ── IN tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_in() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        insert_row(&executor, "Product", "AirPods", 249);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE name IN ('iPhone', 'MacBook', 'AirPods')").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("expected 3 rows with IN"),
+        }
+    }
+
+    #[test]
+    fn test_in_with_numbers() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE price IN (799, 1999)").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // iPad, MacBook
+            }
+            _ => panic!("expected 2 rows with IN on numbers"),
         }
     }
 }
