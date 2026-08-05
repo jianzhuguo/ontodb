@@ -72,8 +72,8 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - `CREATE ONTOLOGY <name> (...)` — 本体定义
 - `INSERT INTO <class> (...) VALUES (...)` — 数据插入
 - `SELECT ... FROM <class> WHERE ... ORDER BY ... LIMIT ...` — 数据查询（基于 class 前缀索引扫描）
-- `UPDATE <class> SET ... WHERE ...` — 数据更新（扫描+修改+重写）
-- `DELETE FROM <class> WHERE ...` — 数据删除（扫描+tombstone）
+- `UPDATE <class> SET ... WHERE ...` — 数据更新（扫描+修改+重写，支持多字段多行）
+- `DELETE FROM <class> WHERE ...` — 数据删除（扫描+tombstone，支持条件删除和全表删除）
 - `MATCH (<var>: <Class>) WHERE ... RETURN ...` — 语义匹配查询
 
 ---
