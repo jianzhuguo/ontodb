@@ -99,3 +99,87 @@ impl From<serde_json::Value> for OntoValue {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_type_name() {
+        assert_eq!(OntoValue::Null.type_name(), "null");
+        assert_eq!(OntoValue::Bool(true).type_name(), "bool");
+        assert_eq!(OntoValue::Int64(42).type_name(), "int64");
+        assert_eq!(OntoValue::Float64(3.14).type_name(), "float64");
+        assert_eq!(OntoValue::String("hello".into()).type_name(), "string");
+        assert_eq!(OntoValue::Bytes(vec![1, 2]).type_name(), "bytes");
+        assert_eq!(OntoValue::Array(vec![]).type_name(), "array");
+        assert_eq!(OntoValue::Object(vec![]).type_name(), "object");
+    }
+
+    #[test]
+    fn test_from_conversions() {
+        assert_eq!(OntoValue::from(true), OntoValue::Bool(true));
+        assert_eq!(OntoValue::from(42i64), OntoValue::Int64(42));
+        assert_eq!(OntoValue::from(3.14f64), OntoValue::Float64(3.14));
+        assert_eq!(OntoValue::from("hello"), OntoValue::String("hello".into()));
+        assert_eq!(OntoValue::from(String::from("hello")), OntoValue::String("hello".into()));
+    }
+
+    #[test]
+    fn test_from_json() {
+        assert_eq!(OntoValue::from(serde_json::Value::Null), OntoValue::Null);
+        assert_eq!(OntoValue::from(serde_json::json!(true)), OntoValue::Bool(true));
+        assert_eq!(OntoValue::from(serde_json::json!(42)), OntoValue::Int64(42));
+        assert_eq!(OntoValue::from(serde_json::json!("hello")), OntoValue::String("hello".into()));
+    }
+
+    #[test]
+    fn test_bytes_roundtrip() {
+        let values = vec![
+            OntoValue::Null,
+            OntoValue::Bool(true),
+            OntoValue::Int64(-42),
+            OntoValue::Float64(3.14),
+            OntoValue::String("hello world".into()),
+            OntoValue::Bytes(vec![0, 1, 2, 255]),
+            OntoValue::Array(vec![OntoValue::Int64(1), OntoValue::String("two".into())]),
+        ];
+
+        for val in values {
+            let bytes = val.to_bytes();
+            let restored = OntoValue::from_bytes(&bytes).unwrap();
+            assert_eq!(val, restored);
+        }
+    }
+
+    #[test]
+    fn test_from_json_array() {
+        let json = serde_json::json!([1, "two", true]);
+        let val = OntoValue::from(json);
+        match val {
+            OntoValue::Array(arr) => {
+                assert_eq!(arr.len(), 3);
+                assert_eq!(arr[0], OntoValue::Int64(1));
+                assert_eq!(arr[1], OntoValue::String("two".into()));
+                assert_eq!(arr[2], OntoValue::Bool(true));
+            }
+            _ => panic!("expected Array"),
+        }
+    }
+
+    #[test]
+    fn test_from_json_object() {
+        let json = serde_json::json!({"name": "Alice", "age": 30});
+        let val = OntoValue::from(json);
+        match val {
+            OntoValue::Object(obj) => {
+                assert_eq!(obj.len(), 2);
+                let name = obj.iter().find(|(k, _)| k == "name").unwrap();
+                assert_eq!(name.1, OntoValue::String("Alice".into()));
+                let age = obj.iter().find(|(k, _)| k == "age").unwrap();
+                assert_eq!(age.1, OntoValue::Int64(30));
+            }
+            _ => panic!("expected Object"),
+        }
+    }
+}

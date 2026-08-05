@@ -54,3 +54,42 @@ impl Entry {
         self.kind == EntryKind::Delete
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_entry_put() {
+        let entry = Entry::put(b"key".to_vec(), b"value".to_vec(), 42);
+        assert_eq!(entry.key, b"key");
+        assert_eq!(entry.value, b"value");
+        assert_eq!(entry.seq_no, 42);
+        assert_eq!(entry.kind, EntryKind::Put);
+        assert!(!entry.is_tombstone());
+    }
+
+    #[test]
+    fn test_entry_delete() {
+        let entry = Entry::delete(b"key".to_vec(), 100);
+        assert_eq!(entry.key, b"key");
+        assert!(entry.value.is_empty());
+        assert_eq!(entry.seq_no, 100);
+        assert_eq!(entry.kind, EntryKind::Delete);
+        assert!(entry.is_tombstone());
+    }
+
+    #[test]
+    fn test_entry_clone() {
+        let entry = Entry::put(b"key".to_vec(), b"value".to_vec(), 1);
+        let cloned = entry.clone();
+        assert_eq!(entry, cloned);
+    }
+
+    #[test]
+    fn test_entry_kind_eq() {
+        assert_eq!(EntryKind::Put, EntryKind::Put);
+        assert_eq!(EntryKind::Delete, EntryKind::Delete);
+        assert_ne!(EntryKind::Put, EntryKind::Delete);
+    }
+}

@@ -149,20 +149,34 @@ impl LsmEngine {
     /// This leverages the LSM-Tree's sorted key structure:
     /// entries with `{class}::` prefix are contiguous in sorted order.
     pub fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        // Collect latest version of each key from all sources
-        // BTreeMap ensures sorted order and automatic dedup
+        self.scan_prefix_internal(prefix, None)
+    }
+
+    /// Internal scan implementation shared by scan_prefix and scan_prefix_with_visibility.
+    /// When `vis` is Some, only entries visible to the snapshot are included.
+    fn scan_prefix_internal(
+        &mut self,
+        prefix: &[u8],
+        vis: Option<&crate::mvcc::Visibility>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut seen: BTreeMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = BTreeMap::new();
+
+        // Helper: should we include this entry?
+        let is_visible = |seq: SeqNo| -> bool {
+            match vis {
+                Some(v) => v.is_visible(seq),
+                None => true,
+            }
+        };
 
         // 1. Scan SSTables (oldest to newest, so newer entries overwrite older)
         for level in self.levels.iter().rev() {
             for sst_info in level.iter() {
-                // Quick range check: skip SSTable if prefix can't overlap
                 if !prefix.is_empty() {
                     let sst_max = sst_info.max_key.as_slice();
                     if sst_max < prefix {
-                        continue; // SSTable's max key is before our prefix
+                        continue;
                     }
-                    // Check if prefix could match: the SSTable's min_key must be <= some key with prefix
                     let sst_min = sst_info.min_key.as_slice();
                     if !Self::prefix_may_overlap(prefix, sst_min, sst_max) {
                         continue;
@@ -172,28 +186,27 @@ impl LsmEngine {
                 let mut sst = SsTable::open(&sst_info.path)?;
                 let mut iter = sst.iter()?;
 
-                // Seek to first key >= prefix
                 while iter.is_valid() && iter.key() < prefix {
                     iter.next();
                 }
 
-                // Scan entries with matching prefix
                 while iter.is_valid() {
                     if !iter.key().starts_with(prefix) {
-                        break; // Past the prefix range
+                        break;
                     }
                     let key = iter.key().to_vec();
                     let value = iter.value().to_vec();
                     let seq = iter.seq_no();
                     let kind = iter.kind();
 
-                    // Only update if this is a newer version
-                    let should_update = match seen.get(&key) {
-                        Some((_, existing_seq, _)) => seq > *existing_seq,
-                        None => true,
-                    };
-                    if should_update {
-                        seen.insert(key, (value, seq, kind));
+                    if is_visible(seq) {
+                        let should_update = match seen.get(&key) {
+                            Some((_, existing_seq, _)) => seq > *existing_seq,
+                            None => true,
+                        };
+                        if should_update {
+                            seen.insert(key, (value, seq, kind));
+                        }
                     }
 
                     iter.next();
@@ -207,6 +220,27 @@ impl LsmEngine {
                 if !entry.key.starts_with(prefix) {
                     continue;
                 }
+                if is_visible(entry.seq_no) {
+                    let should_update = match seen.get(&entry.key) {
+                        Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
+                        None => true,
+                    };
+                    if should_update {
+                        seen.insert(
+                            entry.key.clone(),
+                            (entry.value.clone(), entry.seq_no, entry.kind),
+                        );
+                    }
+                }
+            }
+        }
+
+        // 3. Scan active MemTable (overrides everything)
+        for entry in self.memtable.entries() {
+            if !entry.key.starts_with(prefix) {
+                continue;
+            }
+            if is_visible(entry.seq_no) {
                 let should_update = match seen.get(&entry.key) {
                     Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
                     None => true,
@@ -217,23 +251,6 @@ impl LsmEngine {
                         (entry.value.clone(), entry.seq_no, entry.kind),
                     );
                 }
-            }
-        }
-
-        // 3. Scan active MemTable (overrides everything)
-        for entry in self.memtable.entries() {
-            if !entry.key.starts_with(prefix) {
-                continue;
-            }
-            let should_update = match seen.get(&entry.key) {
-                Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
-                None => true,
-            };
-            if should_update {
-                seen.insert(
-                    entry.key.clone(),
-                    (entry.value.clone(), entry.seq_no, entry.kind),
-                );
             }
         }
 
@@ -970,103 +987,7 @@ impl LsmEngine {
         prefix: &[u8],
         vis: &crate::mvcc::Visibility,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-
-        let mut seen: BTreeMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = BTreeMap::new();
-
-        // Scan SSTables (oldest to newest)
-        for level in self.levels.iter().rev() {
-            for sst_info in level.iter() {
-                if !prefix.is_empty() {
-                    let sst_max = sst_info.max_key.as_slice();
-                    if sst_max < prefix {
-                        continue;
-                    }
-                    if !Self::prefix_may_overlap(prefix, sst_info.min_key.as_slice(), sst_max) {
-                        continue;
-                    }
-                }
-
-                let mut sst = SsTable::open(&sst_info.path)?;
-                let mut iter = sst.iter()?;
-
-                while iter.is_valid() && iter.key() < prefix {
-                    iter.next();
-                }
-
-                while iter.is_valid() {
-                    if !iter.key().starts_with(prefix) {
-                        break;
-                    }
-
-                    let key = iter.key().to_vec();
-                    let value = iter.value().to_vec();
-                    let seq = iter.seq_no();
-                    let kind = iter.kind();
-
-                    // Only keep if visible and newer than existing
-                    if vis.is_visible(seq) {
-                        let should_update = match seen.get(&key) {
-                            Some((_, existing_seq, _)) => seq > *existing_seq,
-                            None => true,
-                        };
-                        if should_update {
-                            seen.insert(key, (value, seq, kind));
-                        }
-                    }
-
-                    iter.next();
-                }
-            }
-        }
-
-        // Scan immutable MemTable
-        if let Some(ref imm) = self.immutable_memtable {
-            for entry in imm.entries() {
-                if !entry.key.starts_with(prefix) {
-                    continue;
-                }
-                if vis.is_visible(entry.seq_no) {
-                    let should_update = match seen.get(&entry.key) {
-                        Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
-                        None => true,
-                    };
-                    if should_update {
-                        seen.insert(
-                            entry.key.clone(),
-                            (entry.value.clone(), entry.seq_no, entry.kind),
-                        );
-                    }
-                }
-            }
-        }
-
-        // Scan active MemTable
-        for entry in self.memtable.entries() {
-            if !entry.key.starts_with(prefix) {
-                continue;
-            }
-            if vis.is_visible(entry.seq_no) {
-                let should_update = match seen.get(&entry.key) {
-                    Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
-                    None => true,
-                };
-                if should_update {
-                    seen.insert(
-                        entry.key.clone(),
-                        (entry.value.clone(), entry.seq_no, entry.kind),
-                    );
-                }
-            }
-        }
-
-        // Filter out tombstones and collect
-        let result: Vec<(Vec<u8>, Vec<u8>)> = seen
-            .into_iter()
-            .filter(|(_, (_, _, kind))| *kind == EntryKind::Put)
-            .map(|(key, (value, _, _))| (key, value))
-            .collect();
-
-        Ok(result)
+        self.scan_prefix_internal(prefix, Some(vis))
     }
 
     /// Returns the number of active transactions.

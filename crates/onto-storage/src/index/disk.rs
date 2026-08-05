@@ -783,17 +783,6 @@ impl BufferPool {
         Ok(page)
     }
 
-    /// Writes a new page to the pool (and marks dirty for later flush).
-    pub fn insert(&mut self, page_id: u32, data: [u8; PAGE_SIZE]) {
-        if self.cache.len() >= self.capacity {
-            // We need to evict, but we don't have a file reference here.
-            // The caller should ensure capacity or call flush first.
-            // For now, just insert — the evict will happen on next fetch.
-        }
-        self.cache.insert(page_id, CachedPage { data, dirty: true });
-        self.touch(page_id);
-    }
-
     /// Flushes all dirty pages to disk.
     pub fn flush(&mut self, file: &mut File) -> Result<()> {
         for page_id in &self.lru {
