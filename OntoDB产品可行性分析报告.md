@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.1 | 更新日期：2026-08-06
+> 版本：v1.2 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -57,7 +57,8 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - **WAL 持久化**：每次 append 后 flush 到 OS 缓存，进程 crash 不丢数据
 - **Leveled Compaction**：L0 全量合并 → L1+ 逐级合并，去重保留最新版本，最底层 tombstone 可清理
 - **MVCC 事务**：快照隔离，写不阻塞读，事务写缓冲 + 提交时批量刷入 WAL，所有 SQL 操作自动走事务
-- **B+Tree 二级索引**：内存 B+Tree + LSM 持久化，支持等值/范围查询，自动回填/维护/去索引
+- **B+Tree 二级索引（内存版）**：内存 B+Tree + LSM 持久化，支持等值/范围查询，自动回填/维护/去索引
+- **B+Tree 磁盘索引（Disk-based）**：4KB 页式存储，Slotted Page 布局，LRU Buffer Pool，支持点查找 O(log n)、范围扫描（leaf chain）、节点分裂自动传播，独立 `.idx` 文件持久化
 - **全局 seq_no**：引擎级序列号确保跨 MemTable flush 的版本顺序正确
 
 ### 本体引擎详情
@@ -94,11 +95,12 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 | 模块 | 评估 | 依据 |
 |------|------|------|
-| LSM-Tree 存储引擎 | **可行，已实现完整** | WAL + MemTable + SSTable + Leveled Compaction + tombstone 感知读取，29 个单元测试验证 |
-| MVCC 事务 | **可行，已实现** | 快照隔离、事务写缓冲、提交/回滚、可见性过滤，91 个测试验证 |
+| LSM-Tree 存储引擎 | **可行，已实现完整** | WAL + MemTable + SSTable + Leveled Compaction + tombstone 感知读取，73 个存储引擎测试验证 |
+| MVCC 事务 | **可行，已实现** | 快照隔离、事务写缓冲、提交/回滚、可见性过滤，已集成到查询层 |
+| B+Tree 磁盘索引 | **可行，已实现** | 4KB 页式存储、Slotted Page、LRU Buffer Pool、节点分裂、leaf chain 范围扫描，21 个专项测试验证（含500条目分裂、2000条目大数据集、持久化重开） |
 | Raft 共识 | **可行** | `tikv/raft-rs` 是工业级 Rust Raft 实现 |
 | 本体模型 | **可行，已实现基础** | 类/属性/继承/约束模型已通 |
-| SQL 解析 | **可行，已实现基础** | 6 种语句的基础解析已通 |
+| SQL 解析 | **可行，已实现基础** | 8 种语句（含 JOIN/UNION/子查询）已通 |
 | 序列化 | **可行** | serde + serde_json + bincode 生态成熟 |
 | CRC 数据校验 | **可行，已实现** | WAL 条目 CRC32 校验已通 |
 
@@ -111,6 +113,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | **语义向量检索** | 中 | HNSW 向量索引 + 本体过滤联合查询，先用本体约束缩小候选集再做向量排序 |
 | **推理性能** | 中高 | 预计算推理结果（物化视图）+ 增量推理 + 分级推理（快速规则推理内联，完整 DL 推理异步） |
 | **Compaction 策略** | 低 | **已完成** Leveled Compaction 实现，含合并去重和 tombstone 清理 |
+| **B+Tree 磁盘索引** | 低 | **已完成** 页式 B+Tree 实现，含 insert/lookup/range_scan/split/persistence |
 | **Bloom Filter** | 低 | 当前框架已预留配置，实现相对直接 |
 
 ### 3.3 应该砍掉或延后的方向
@@ -195,7 +198,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 | 层次 | 自研范围 | 说明 |
 |------|---------|------|
-| **存储引擎** | 100% 自研 | LSM-Tree（WAL + MemTable + SSTable + Compaction）全部从零实现，不依赖 RocksDB/sled 等 |
+| **存储引擎** | 100% 自研 | LSM-Tree（WAL + MemTable + SSTable + Compaction）+ B+Tree 磁盘索引，全部从零实现，不依赖 RocksDB/sled 等 |
 | **本体引擎** | 100% 自研 | 类/属性/继承/约束/推理，市场上无现成 Rust 实现 |
 | **查询引擎** | 100% 自研 | SQL 解析器 + 语义查询优化器 + 执行器，支持自定义语法 |
 | **事务引擎** | 100% 自研 | MVCC + 并发控制，不依赖外部事务库 |
