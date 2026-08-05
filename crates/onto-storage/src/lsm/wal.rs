@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 /// Write-Ahead Log for durability.
 pub struct Wal {
-    path: PathBuf,
+    _path: PathBuf,
     writer: BufWriter<File>,
     offset: u64,
 }
@@ -28,7 +28,7 @@ impl Wal {
         let offset = file.metadata()?.len();
 
         Ok(Self {
-            path: path.as_ref().to_path_buf(),
+            _path: path.as_ref().to_path_buf(),
             writer: BufWriter::new(file),
             offset,
         })

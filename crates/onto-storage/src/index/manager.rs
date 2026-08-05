@@ -7,22 +7,12 @@
 //! On write operations, the manager updates both the in-memory tree and the LSM engine.
 
 use crate::index::btree::BPlusTree;
-use crate::lsm::memtable::MemTable;
-use crate::lsm::sstable::SsTable;
-use crate::LsmEngine;
-use onto_core::{Entry, EntryKind, Result, SeqNo};
+use onto_core::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Prefix for index keys in the LSM-Tree.
 const INDEX_PREFIX: &[u8] = b"__idx__";
-
-/// Metadata about a registered index.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexMeta {
-    pub class: String,
-    pub column: String,
-}
 
 /// Manages all secondary indexes.
 pub struct IndexManager {

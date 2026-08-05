@@ -25,10 +25,10 @@ const RESTART_INTERVAL: usize = 16;
 
 /// An SSTable file on disk.
 pub struct SsTable {
-    path: PathBuf,
+    _path: PathBuf,
     file: File,
     /// Size of the data section.
-    data_size: u64,
+    _data_size: u64,
     /// Index: last_key -> (offset, size) of each data block.
     index: Vec<BlockIndexEntry>,
     /// Bloom filter for point lookups.
@@ -175,9 +175,9 @@ impl SsTableBuilder {
         let read_file = File::open(path.as_ref())?;
 
         Ok(SsTable {
-            path: path.as_ref().to_path_buf(),
+            _path: path.as_ref().to_path_buf(),
             file: read_file,
-            data_size,
+            _data_size: data_size,
             index: self.block_entries,
             bloom: Some(bloom),
         })
@@ -254,9 +254,9 @@ impl SsTable {
         let index = Self::decode_index(&index_data);
 
         Ok(SsTable {
-            path: path.as_ref().to_path_buf(),
+            _path: path.as_ref().to_path_buf(),
             file,
-            data_size: index_offset,
+            _data_size: index_offset,
             index,
             bloom,
         })
@@ -367,7 +367,7 @@ impl SsTable {
         Ok(lo)
     }
 
-    fn read_block(&mut self, entry: &BlockIndexEntry) -> Result<Vec<u8>> {
+    fn _read_block(&mut self, entry: &BlockIndexEntry) -> Result<Vec<u8>> {
         self.read_block_at(entry.offset, entry.size)
     }
 

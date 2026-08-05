@@ -26,7 +26,9 @@ impl OntologyStore {
         let value = serde_json::to_vec(ontology)
             .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
 
-        let mut engine = self.engine.write().unwrap();
+        let mut engine = self.engine.write().map_err(|e| {
+            onto_core::CoreError::Custom(format!("engine lock poisoned: {}", e))
+        })?;
         engine.put(key, value)
     }
 
@@ -42,7 +44,9 @@ impl OntologyStore {
     pub fn load(&self, name: &str) -> Result<Option<Ontology>> {
         let key = Self::make_key(name);
 
-        let mut engine = self.engine.write().unwrap();
+        let mut engine = self.engine.write().map_err(|e| {
+            onto_core::CoreError::Custom(format!("engine lock poisoned: {}", e))
+        })?;
         match engine.get(&key)? {
             Some(bytes) => {
                 let ontology: Ontology = serde_json::from_slice(&bytes)
@@ -69,7 +73,9 @@ impl OntologyStore {
     /// Deletes an ontology by name.
     pub fn delete(&self, name: &str) -> Result<()> {
         let key = Self::make_key(name);
-        let mut engine = self.engine.write().unwrap();
+        let mut engine = self.engine.write().map_err(|e| {
+            onto_core::CoreError::Custom(format!("engine lock poisoned: {}", e))
+        })?;
         engine.delete(key)
     }
 

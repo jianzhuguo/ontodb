@@ -5,5 +5,5 @@
 pub mod executor;
 pub mod parser;
 
-pub use executor::QueryExecutor;
+pub use executor::{QueryExecutor, QueryResult};
 pub use parser::{QueryAst, QueryParser};

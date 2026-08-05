@@ -14,7 +14,6 @@ onto-core = { workspace = true }
 onto-storage = { workspace = true }
 onto-ontology = { workspace = true }
 onto-query = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }

@@ -381,12 +381,8 @@ impl DiskPage {
             return Err(onto_core::CoreError::InvalidArgument("slot out of bounds".into()));
         }
 
-        // Read the entry size from the slot
-        let (entry_offset, key_len) = self.read_slot(slot_pos).unwrap();
-        let entry_size = self.data[entry_offset as usize..].len().min(
-            // Estimate: we can't know exact size without parsing, so leave space as-is
-            PAGE_SIZE,
-        );
+        // Read the entry from the slot
+        let (entry_offset, _key_len) = self.read_slot(slot_pos).unwrap();
 
         // Shift slots left
         let num = header.num_entries;
@@ -704,7 +700,7 @@ impl IndexMeta {
 // ═══════════════════════════════════════════════════════════════════
 
 /// A cached page in the buffer pool.
-struct CachedPage {
+pub struct CachedPage {
     data: [u8; PAGE_SIZE],
     dirty: bool,
 }
@@ -849,7 +845,7 @@ pub struct BTreeIndex {
     file: File,
     pool: BufferPool,
     meta: IndexMeta,
-    path: PathBuf,
+    _path: PathBuf,
 }
 
 impl BTreeIndex {
@@ -892,7 +888,7 @@ impl BTreeIndex {
             file,
             pool,
             meta,
-            path: path.to_path_buf(),
+            _path: path.to_path_buf(),
         })
     }
 
@@ -910,7 +906,7 @@ impl BTreeIndex {
             file,
             pool,
             meta,
-            path: path.to_path_buf(),
+            _path: path.to_path_buf(),
         })
     }
 
@@ -933,7 +929,7 @@ impl BTreeIndex {
     }
 
     /// Reads a page for writing (marks dirty).
-    fn write_page(&mut self, page_id: u32) -> Result<()> {
+    fn _write_page(&mut self, page_id: u32) -> Result<()> {
         self.pool.fetch_mut(page_id, &mut self.file)?;
         Ok(())
     }

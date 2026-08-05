@@ -5,12 +5,15 @@ use onto_core::{CoreError, Result};
 use onto_ontology::OntologyStore;
 use onto_storage::LsmEngine;
 use serde_json::{json, Map, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Executes parsed queries.
 pub struct QueryExecutor {
     engine: Arc<RwLock<LsmEngine>>,
     ontology_store: OntologyStore,
+    /// Monotonic counter for generating unique document keys.
+    doc_counter: AtomicU64,
 }
 
 impl QueryExecutor {
@@ -18,6 +21,7 @@ impl QueryExecutor {
         Self {
             engine,
             ontology_store,
+            doc_counter: AtomicU64::new(0),
         }
     }
 
@@ -25,7 +29,9 @@ impl QueryExecutor {
     pub fn execute(&self, ast: &QueryAst) -> Result<QueryResult> {
         // Acquire engine lock once at the top level to avoid deadlocks
         // when subqueries re-enter execute().
-        let mut engine = self.engine.write().unwrap();
+        let mut engine = self.engine.write().map_err(|e| {
+            CoreError::Custom(format!("engine lock poisoned: {}", e))
+        })?;
         self.execute_with_engine(ast, &mut engine)
     }
 
@@ -148,146 +154,6 @@ impl QueryExecutor {
                     .join("\x00");
                 seen.insert(key)
             });
-        }
-
-        Ok(QueryResult::Rows(rows))
-    }
-
-    fn execute_insert(
-        &self,
-        engine: &mut LsmEngine,
-        class: &str,
-        columns: &[String],
-        values: &[LiteralValue],
-    ) -> Result<QueryResult> {
-        let key = self.generate_doc_key(class);
-
-        let mut doc = Map::new();
-        doc.insert("__class__".to_string(), json!(class));
-
-        for (col, val) in columns.iter().zip(values.iter()) {
-            doc.insert(col.clone(), self.literal_to_json(val));
-        }
-
-        let value = serde_json::to_vec(&Value::Object(doc))
-            .map_err(|e| CoreError::Serialization(e.to_string()))?;
-
-        engine.put(key, value)?;
-
-        Ok(QueryResult::Success("1 row inserted".to_string()))
-    }
-
-    fn execute_select(
-        &self,
-        engine: &mut LsmEngine,
-        distinct: bool,
-        columns: &SelectColumns,
-        from: &str,
-        from_alias: Option<&str>,
-        joins: &[crate::parser::JoinClause],
-        filter: &Option<FilterExpr>,
-        group_by: Option<&crate::parser::GroupByClause>,
-        having: &Option<FilterExpr>,
-        order_by: Option<&crate::parser::OrderBy>,
-        limit: Option<usize>,
-    ) -> Result<QueryResult> {
-
-        // ── Step 1: Scan and join rows ────────────────────────────────
-        let prefix = format!("{}::", from);
-        let left_entries = engine.scan_prefix(prefix.as_bytes())?;
-
-        let mut all_rows: Vec<Map<String, Value>> = Vec::new();
-        for (_key, val_bytes) in &left_entries {
-            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
-                if doc.get("__class__").and_then(|v| v.as_str()) == Some(from) {
-                    all_rows.push(doc);
-                }
-            }
-        }
-
-        // JOIN expansion
-        for join in joins {
-            let join_prefix = format!("{}::", join.table);
-            let right_entries = engine.scan_prefix(join_prefix.as_bytes())?;
-            let right_alias = join.alias.as_deref().unwrap_or(&join.table);
-            let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
-
-            let mut right_rows: Vec<Map<String, Value>> = Vec::new();
-            for (_key, val_bytes) in &right_entries {
-                if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
-                    if doc.get("__class__").and_then(|v| v.as_str()) == Some(&join.table) {
-                        right_rows.push(doc);
-                    }
-                }
-            }
-
-            let mut new_rows: Vec<Map<String, Value>> = Vec::new();
-            for left_row in &all_rows {
-                let left_val = Self::resolve_column_value(left_row, &left_col);
-                for right_row in &right_rows {
-                    let right_val = Self::resolve_column_value(right_row, &right_col);
-                    if left_val.is_some() && right_val.is_some() && left_val == right_val {
-                        let mut merged = Map::new();
-                        for (k, v) in left_row {
-                            let key = match from_alias {
-                                Some(alias) => format!("{}.{}", alias, k),
-                                None => k.clone(),
-                            };
-                            merged.insert(key, v.clone());
-                            if from_alias.is_some() && !merged.contains_key(k) {
-                                merged.insert(k.clone(), v.clone());
-                            }
-                        }
-                        for (k, v) in right_row {
-                            let key = format!("{}.{}", right_alias, k);
-                            merged.insert(key, v.clone());
-                            if !merged.contains_key(k) {
-                                merged.insert(k.clone(), v.clone());
-                            }
-                        }
-                        new_rows.push(merged);
-                    }
-                }
-            }
-            all_rows = new_rows;
-        }
-
-        // ── Step 2: Apply WHERE filter ────────────────────────────────
-        let filtered: Vec<Map<String, Value>> = all_rows
-            .into_iter()
-            .filter(|doc| self.matches_filter(engine, doc, filter))
-            .collect();
-
-        // ── Step 3: Check if aggregation is needed ────────────────────
-        let has_aggregates = Self::columns_have_aggregates(columns);
-
-        if group_by.is_some() || has_aggregates {
-            // Aggregate query
-            let result = self.execute_aggregation(
-                engine, columns, &filtered, group_by, having, order_by, limit,
-            );
-            return result;
-        }
-
-        // ── Step 4: Non-aggregate query (existing logic) ──────────────
-        let mut rows: Vec<Map<String, Value>> = Vec::new();
-        for doc in filtered {
-            rows.push(self.project_columns(&doc, columns));
-        }
-
-        // Sort if ORDER BY specified
-        if let Some(ob) = order_by {
-            Self::sort_rows(&mut rows, &ob.column, ob.ascending);
-        }
-
-        // Apply DISTINCT
-        if distinct {
-            Self::dedup_rows(&mut rows);
-        }
-
-        // Apply LIMIT
-        if let Some(limit) = limit {
-            rows.truncate(limit);
         }
 
         Ok(QueryResult::Rows(rows))
@@ -539,77 +405,6 @@ impl QueryExecutor {
         a.cmp(b)
     }
 
-    fn execute_delete(&self, engine: &mut LsmEngine, class: &str, filter: &Option<FilterExpr>) -> Result<QueryResult> {
-        let prefix = format!("{}::", class);
-        let entries = engine.scan_prefix(prefix.as_bytes())?;
-
-        let mut deleted = 0usize;
-        for (key, val_bytes) in entries {
-            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&val_bytes) {
-                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
-                    if self.matches_filter(engine, &doc, filter) {
-                        engine.delete(key)?;
-                        deleted += 1;
-                    }
-                }
-            }
-        }
-
-        Ok(QueryResult::Success(format!("{} row(s) deleted", deleted)))
-    }
-
-    fn execute_update(
-        &self,
-        engine: &mut LsmEngine,
-        class: &str,
-        assignments: &[(String, LiteralValue)],
-        filter: &Option<FilterExpr>,
-    ) -> Result<QueryResult> {
-        let prefix = format!("{}::", class);
-        let entries = engine.scan_prefix(prefix.as_bytes())?;
-
-        let mut updated = 0usize;
-        for (key, val_bytes) in entries {
-            if let Ok(Value::Object(mut doc)) = serde_json::from_slice::<Value>(&val_bytes) {
-                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
-                    if self.matches_filter(engine, &doc, filter) {
-                        for (col, val) in assignments {
-                            doc.insert(col.clone(), self.literal_to_json(val));
-                        }
-                        let new_value = serde_json::to_vec(&Value::Object(doc))
-                            .map_err(|e| CoreError::Serialization(e.to_string()))?;
-                        engine.put(key, new_value)?;
-                        updated += 1;
-                    }
-                }
-            }
-        }
-
-        Ok(QueryResult::Success(format!("{} row(s) updated", updated)))
-    }
-
-    fn execute_match(
-        &self,
-        engine: &mut LsmEngine,
-        _variable: &str,
-        class: &str,
-        filter: &Option<FilterExpr>,
-        returns: &[String],
-    ) -> Result<QueryResult> {
-        let columns = if returns.is_empty() {
-            SelectColumns::All
-        } else {
-            SelectColumns::Columns(
-                returns
-                    .iter()
-                    .map(|r| SelectItem::Column(r.clone()))
-                    .collect(),
-            )
-        };
-
-        self.execute_select(engine, false, &columns, class, None, &[], filter, None, &None, None, None)
-    }
-
     // ═══════════════════════════════════════════════════════════════
     //  Transactional versions (use txn_* API)
     // ═══════════════════════════════════════════════════════════════
@@ -727,13 +522,15 @@ impl QueryExecutor {
             return Ok(result);
         }
 
-        // Normal query
-        let mut rows: Vec<Map<String, Value>> = Vec::new();
-        for doc in filtered {
-            rows.push(self.project_columns(&doc, columns));
-        }
+        // Sort before projection so ORDER BY columns are available
+        let mut sorted = filtered;
         if let Some(ob) = order_by {
-            Self::sort_rows(&mut rows, &ob.column, ob.ascending);
+            Self::sort_rows(&mut sorted, &ob.column, ob.ascending);
+        }
+
+        let mut rows: Vec<Map<String, Value>> = Vec::new();
+        for doc in sorted {
+            rows.push(self.project_columns(&doc, columns));
         }
         if distinct {
             Self::dedup_rows(&mut rows);
@@ -818,11 +615,14 @@ impl QueryExecutor {
     }
 
     fn generate_doc_key(&self, class: &str) -> Vec<u8> {
-        let now = std::time::SystemTime::now()
+        let seq = self.doc_counter.fetch_add(1, Ordering::Relaxed);
+        let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos();
-        format!("{}::{:020}", class, now).into_bytes()
+        // Combine timestamp + counter for collision-free uniqueness
+        let unique = (ts as u128) << 64 | seq as u128;
+        format!("{}::{:040}", class, unique).into_bytes()
     }
 
     /// Tries to use a secondary index for the given filter.
@@ -939,17 +739,6 @@ impl QueryExecutor {
             LiteralValue::Int(i) => serde_json::json!(i),
             LiteralValue::Float(f) => serde_json::json!(f),
             LiteralValue::String(s) => serde_json::json!(s),
-        }
-    }
-
-    /// Extracts a simple equality condition from a WHERE filter.
-    /// Returns (column, value) if the filter is `col = value`.
-    fn extract_eq_filter(filter: &Option<FilterExpr>) -> Option<(String, serde_json::Value)> {
-        match filter {
-            Some(FilterExpr::Eq(col, val)) => {
-                Some((col.clone(), Self::literal_to_json_static(val)))
-            }
-            _ => None,
         }
     }
 

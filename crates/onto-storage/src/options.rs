@@ -25,6 +25,11 @@ pub struct StorageOptions {
 
     /// False positive rate for bloom filters.
     pub bloom_filter_fp_rate: f64,
+
+    /// Whether to fsync WAL after each transaction commit.
+    /// When true, committed data survives OS crashes (strongest durability).
+    /// When false, only process crashes are survived (better performance).
+    pub sync_wal_on_commit: bool,
 }
 
 impl Default for StorageOptions {
@@ -37,6 +42,7 @@ impl Default for StorageOptions {
             size_ratio: 10,
             use_bloom_filter: true,
             bloom_filter_fp_rate: 0.01,
+            sync_wal_on_commit: true, // Strong durability by default
         }
     }
 }

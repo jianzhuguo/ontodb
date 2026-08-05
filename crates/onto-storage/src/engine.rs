@@ -149,8 +149,6 @@ impl LsmEngine {
     /// This leverages the LSM-Tree's sorted key structure:
     /// entries with `{class}::` prefix are contiguous in sorted order.
     pub fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        use std::collections::BTreeMap;
-
         // Collect latest version of each key from all sources
         // BTreeMap ensures sorted order and automatic dedup
         let mut seen: BTreeMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = BTreeMap::new();
@@ -387,6 +385,8 @@ impl LsmEngine {
         // Sort by filename (which includes level and ID)
         sst_files.sort();
 
+        let mut max_seq = self.seq_counter.load(Ordering::Relaxed);
+
         for path in sst_files {
             let fname = path
                 .file_stem()
@@ -409,6 +409,16 @@ impl LsmEngine {
             let max_key = sst.max_key().to_vec();
             let metadata = fs::metadata(&path)?;
 
+            // Scan SSTable for max seq_no to keep seq_counter consistent
+            let mut iter = sst.iter()?;
+            while iter.is_valid() {
+                let seq = iter.seq_no();
+                if seq >= max_seq {
+                    max_seq = seq + 1;
+                }
+                iter.next();
+            }
+
             // Update sst_counter if needed
             if let Some(id_str) = fname.split('_').nth(1) {
                 if let Ok(id) = id_str.parse::<u64>() {
@@ -426,6 +436,9 @@ impl LsmEngine {
                 max_key,
             });
         }
+
+        // Update seq_counter to be past all SSTable sequence numbers
+        self.seq_counter.store(max_seq, Ordering::Relaxed);
 
         Ok(())
     }
@@ -777,6 +790,11 @@ impl LsmEngine {
             }
         }
 
+        // Sync WAL for durability if configured
+        if self.options.sync_wal_on_commit {
+            self.wal.sync()?;
+        }
+
         // Check if we need to flush
         if self.memtable.size() >= self.options.memtable_size_limit {
             self.flush_memtable()?;
@@ -831,11 +849,6 @@ impl LsmEngine {
     /// 3. Check SSTables (with snapshot visibility)
     pub fn txn_get(&mut self, txn_id: SeqNo, key: &[u8]) -> Result<Option<Value>> {
         // 1. Check transaction's own write buffer
-        if let Some(txn) = self.txn_manager.get(txn_id) {
-            match txn.snapshot_ts {
-                _ => {} // We need to check write buffer first
-            }
-        }
         if let Some(txn) = self.txn_manager.get(txn_id) {
             if let Some(op) = txn.write_buffer_get(key) {
                 return match op {
@@ -957,7 +970,6 @@ impl LsmEngine {
         prefix: &[u8],
         vis: &crate::mvcc::Visibility,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        use std::collections::BTreeMap;
 
         let mut seen: BTreeMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = BTreeMap::new();
 

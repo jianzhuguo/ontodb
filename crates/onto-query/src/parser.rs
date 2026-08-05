@@ -358,7 +358,9 @@ impl QueryParser {
         // Parse optional GROUP BY
         let rest_upper = rest.to_uppercase();
         let (group_by, rest) = if rest_upper.trim_start().starts_with("GROUP BY") {
-            let rest = rest[Self::find_unquoted(&rest_upper, "GROUP BY").unwrap() + 8..].trim();
+            let pos = Self::find_unquoted(&rest_upper, "GROUP BY")
+                .ok_or_else(|| CoreError::InvalidArgument("expected 'GROUP BY'".to_string()))?;
+            let rest = rest[pos + 8..].trim();
             let (cols_str, rest) = Self::consume_until_keywords(rest, &["HAVING", "ORDER BY", "LIMIT"]);
             let columns: Vec<String> = cols_str
                 .split(',')
@@ -373,7 +375,9 @@ impl QueryParser {
         // Parse optional HAVING
         let rest_upper = rest.to_uppercase();
         let (having, rest) = if rest_upper.trim_start().starts_with("HAVING") {
-            let rest = rest[Self::find_unquoted(&rest_upper, "HAVING").unwrap() + 6..].trim();
+            let pos = Self::find_unquoted(&rest_upper, "HAVING")
+                .ok_or_else(|| CoreError::InvalidArgument("expected 'HAVING'".to_string()))?;
+            let rest = rest[pos + 6..].trim();
             Self::parse_where(rest)?
         } else {
             (None, rest)
@@ -383,15 +387,20 @@ impl QueryParser {
         let rest_upper = rest.to_uppercase();
         let rest = rest; // reborrow
         let (order_by, rest) = if rest_upper.trim_start().starts_with("ORDER BY") {
-            let start = Self::find_unquoted(&rest_upper, "ORDER BY").unwrap();
+            let start = Self::find_unquoted(&rest_upper, "ORDER BY")
+                .ok_or_else(|| CoreError::InvalidArgument("expected 'ORDER BY'".to_string()))?;
             let rest = rest[start + 8..].trim();
             let (col, rest) = Self::parse_word(rest)?;
             let rest_upper = rest.to_uppercase();
             let ascending = if rest_upper.trim_start().starts_with("DESC") {
-                let rest = rest[Self::find_unquoted(&rest_upper, "DESC").unwrap() + 4..].trim();
+                let pos = Self::find_unquoted(&rest_upper, "DESC")
+                    .ok_or_else(|| CoreError::InvalidArgument("expected 'DESC'".to_string()))?;
+                let rest = rest[pos + 4..].trim();
                 (false, rest.to_string())
             } else if rest_upper.trim_start().starts_with("ASC") {
-                let rest = rest[Self::find_unquoted(&rest_upper, "ASC").unwrap() + 3..].trim();
+                let pos = Self::find_unquoted(&rest_upper, "ASC")
+                    .ok_or_else(|| CoreError::InvalidArgument("expected 'ASC'".to_string()))?;
+                let rest = rest[pos + 3..].trim();
                 (true, rest.to_string())
             } else {
                 (true, rest.to_string())
@@ -410,7 +419,8 @@ impl QueryParser {
         // Parse optional LIMIT
         let rest_upper = rest.to_uppercase();
         let limit = if rest_upper.trim_start().starts_with("LIMIT") {
-            let start = Self::find_unquoted(&rest_upper, "LIMIT").unwrap();
+            let start = Self::find_unquoted(&rest_upper, "LIMIT")
+                .ok_or_else(|| CoreError::InvalidArgument("expected 'LIMIT'".to_string()))?;
             let num_str = rest[start + 5..].trim();
             Some(
                 num_str
@@ -537,8 +547,10 @@ impl QueryParser {
 
             if let Some(func) = func {
                 // Extract argument: FUNC(arg)
-                let open = part.find('(').unwrap();
-                let close = part.rfind(')').unwrap();
+                let open = part.find('(')
+                    .ok_or_else(|| CoreError::InvalidArgument("expected '(' in aggregate".to_string()))?;
+                let close = part.rfind(')')
+                    .ok_or_else(|| CoreError::InvalidArgument("expected ')' in aggregate".to_string()))?;
                 let arg = part[open + 1..close].trim().to_string();
 
                 // Check for alias: ... AS alias
@@ -828,7 +840,8 @@ impl QueryParser {
             let col = input[..like_pos].trim().to_string();
             let rest = input[like_pos + 6..].trim();
             let (pattern, remaining) = Self::extract_quoted_or_word(rest);
-            return Ok((Some(FilterExpr::Like(col, pattern)), remaining));
+            let expr = FilterExpr::Like(col, pattern);
+            return Self::wrap_chain(expr, &remaining);
         }
 
         // Check for BETWEEN: column BETWEEN low AND high
@@ -843,7 +856,8 @@ impl QueryParser {
                 let (high_str, remaining) = Self::extract_quoted_or_word(high_rest);
                 let low = Self::parse_literal(low_str)?;
                 let high = Self::parse_literal(&high_str)?;
-                return Ok((Some(FilterExpr::Between(col, low, high)), remaining));
+                let expr = FilterExpr::Between(col, low, high);
+                return Self::wrap_chain(expr, &remaining);
             }
         }
 
@@ -867,12 +881,13 @@ impl QueryParser {
                 }
                 if let Some(close) = close_pos {
                     let inner = rest[1..close].trim();
-                    let remaining = rest[close + 1..].trim().to_string();
+                    let remaining = rest[close + 1..].trim();
 
                     // Check if it's a subquery
                     if inner.to_uppercase().starts_with("SELECT") {
                         let subquery = Self::parse(inner)?;
-                        return Ok((Some(FilterExpr::InSubquery(col, Box::new(subquery))), remaining));
+                        let expr = FilterExpr::InSubquery(col, Box::new(subquery));
+                        return Self::wrap_chain(expr, remaining);
                     }
 
                     // Otherwise, parse as value list
@@ -880,7 +895,8 @@ impl QueryParser {
                         .split(',')
                         .map(|s| Self::parse_literal(s.trim()))
                         .collect::<Result<Vec<_>>>()?;
-                    return Ok((Some(FilterExpr::In(col, values)), remaining));
+                    let expr = FilterExpr::In(col, values);
+                    return Self::wrap_chain(expr, remaining);
                 }
             }
         }
@@ -901,7 +917,8 @@ impl QueryParser {
 
                 let (val_str, remaining) = Self::extract_quoted_or_word(rest);
                 let val = Self::parse_literal(&val_str)?;
-                return Ok((Some(op_fn(col, val)), remaining));
+                let expr = op_fn(col, val);
+                return Self::wrap_chain(expr, &remaining);
             }
         }
 
@@ -909,6 +926,28 @@ impl QueryParser {
             "invalid WHERE clause: {}",
             input
         )))
+    }
+
+    /// Wraps an expression with AND/OR if the remaining text starts with AND/OR.
+    fn wrap_chain(expr: FilterExpr, remaining: &str) -> Result<(Option<FilterExpr>, String)> {
+        let remaining = remaining.trim();
+        let rem_upper = remaining.to_uppercase();
+        if rem_upper.starts_with("AND ") {
+            let rest_after = &remaining[4..];
+            let (right, final_rest) = Self::parse_where(rest_after)?;
+            if let Some(right_expr) = right {
+                return Ok((Some(FilterExpr::And(Box::new(expr), Box::new(right_expr))), final_rest));
+            }
+            return Ok((Some(expr), final_rest));
+        } else if rem_upper.starts_with("OR ") {
+            let rest_after = &remaining[3..];
+            let (right, final_rest) = Self::parse_where(rest_after)?;
+            if let Some(right_expr) = right {
+                return Ok((Some(FilterExpr::Or(Box::new(expr), Box::new(right_expr))), final_rest));
+            }
+            return Ok((Some(expr), final_rest));
+        }
+        Ok((Some(expr), remaining.to_string()))
     }
 
     /// Extracts a value from the start of input. Handles quoted strings and bare words.
