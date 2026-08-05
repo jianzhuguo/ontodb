@@ -30,9 +30,11 @@ impl QueryExecutor {
     }
 
     /// Internal execution with engine reference passed through.
+    /// Each statement runs in its own auto-committed transaction.
     fn execute_with_engine(&self, ast: &QueryAst, engine: &mut LsmEngine) -> Result<QueryResult> {
         match ast {
             QueryAst::CreateOntology { sql } => {
+                // DDL doesn't need MVCC transaction
                 let ontology = onto_ontology::OntologyParser::parse(sql)?;
                 self.ontology_store.save_with_engine(engine, &ontology)?;
                 Ok(QueryResult::Success(format!(
@@ -42,11 +44,32 @@ impl QueryExecutor {
                     ontology.properties.len()
                 )))
             }
+            QueryAst::Union { left, right, all } => {
+                // UNION runs each sub-query in its own transaction
+                self.execute_union(engine, left, right, *all)
+            }
+            _ => {
+                // All other statements run in an auto-committed transaction
+                let txn_id = engine.begin_txn();
+                let result = self.execute_in_txn(ast, engine, txn_id);
+                // Commit on success, abort on error
+                match &result {
+                    Ok(_) => { engine.commit_txn(txn_id)?; }
+                    Err(_) => { let _ = engine.abort_txn(txn_id); }
+                }
+                result
+            }
+        }
+    }
+
+    /// Executes a statement within an existing transaction.
+    fn execute_in_txn(&self, ast: &QueryAst, engine: &mut LsmEngine, txn_id: u64) -> Result<QueryResult> {
+        match ast {
             QueryAst::Insert {
                 class,
                 columns,
                 values,
-            } => self.execute_insert(engine, class, columns, values),
+            } => self.execute_insert_txn(engine, txn_id, class, columns, values),
             QueryAst::Select {
                 distinct,
                 columns,
@@ -59,23 +82,25 @@ impl QueryExecutor {
                 order_by,
                 limit,
                 ..
-            } => self.execute_select(
-                engine, *distinct, columns, from, from_alias.as_deref(), joins, filter,
+            } => self.execute_select_txn(
+                engine, txn_id, *distinct, columns, from, from_alias.as_deref(), joins, filter,
                 group_by.as_ref(), having, order_by.as_ref(), *limit,
             ),
-            QueryAst::Delete { class, filter } => self.execute_delete(engine, class, filter),
+            QueryAst::Delete { class, filter } => self.execute_delete_txn(engine, txn_id, class, filter),
             QueryAst::Update {
                 class,
                 assignments,
                 filter,
-            } => self.execute_update(engine, class, assignments, filter),
+            } => self.execute_update_txn(engine, txn_id, class, assignments, filter),
             QueryAst::Match {
                 variable,
                 class,
                 filter,
                 returns,
-            } => self.execute_match(engine, variable, class, filter, returns),
-            QueryAst::Union { left, right, all } => self.execute_union(engine, left, right, *all),
+            } => self.execute_match_txn(engine, txn_id, variable, class, filter, returns),
+            _ => Err(onto_core::CoreError::InvalidArgument(
+                "unsupported statement type in transaction".to_string(),
+            )),
         }
     }
 
@@ -566,6 +591,220 @@ impl QueryExecutor {
         };
 
         self.execute_select(engine, false, &columns, class, None, &[], filter, None, &None, None, None)
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Transactional versions (use txn_* API)
+    // ═══════════════════════════════════════════════════════════════
+
+    fn execute_insert_txn(
+        &self,
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        class: &str,
+        columns: &[String],
+        values: &[LiteralValue],
+    ) -> Result<QueryResult> {
+        let key = self.generate_doc_key(class);
+
+        let mut doc = Map::new();
+        doc.insert("__class__".to_string(), json!(class));
+        for (col, val) in columns.iter().zip(values.iter()) {
+            doc.insert(col.clone(), self.literal_to_json(val));
+        }
+
+        let value = serde_json::to_vec(&Value::Object(doc))
+            .map_err(|e| CoreError::Serialization(e.to_string()))?;
+
+        engine.txn_put(txn_id, key, value)?;
+        Ok(QueryResult::Success("1 row inserted".to_string()))
+    }
+
+    fn execute_select_txn(
+        &self,
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        distinct: bool,
+        columns: &SelectColumns,
+        from: &str,
+        from_alias: Option<&str>,
+        joins: &[crate::parser::JoinClause],
+        filter: &Option<FilterExpr>,
+        group_by: Option<&crate::parser::GroupByClause>,
+        having: &Option<FilterExpr>,
+        order_by: Option<&crate::parser::OrderBy>,
+        limit: Option<usize>,
+    ) -> Result<QueryResult> {
+        // Use transactional scan_prefix for snapshot reads
+        let prefix = format!("{}::", from);
+        let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
+
+        let mut left_rows: Vec<Map<String, Value>> = Vec::new();
+        for (_key, val_bytes) in &entries {
+            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
+                if doc.get("__class__").and_then(|v| v.as_str()) == Some(from) {
+                    left_rows.push(doc);
+                }
+            }
+        }
+
+        // JOIN expansion (same logic as non-txn version)
+        if !joins.is_empty() {
+            for join in joins {
+                let join_prefix = format!("{}::", join.table);
+                let right_entries = engine.txn_scan_prefix(txn_id, join_prefix.as_bytes())?;
+                let right_alias = join.alias.as_deref().unwrap_or(&join.table);
+                let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+
+                let mut right_rows: Vec<Map<String, Value>> = Vec::new();
+                for (_key, val_bytes) in &right_entries {
+                    if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
+                        if doc.get("__class__").and_then(|v| v.as_str()) == Some(&join.table) {
+                            right_rows.push(doc);
+                        }
+                    }
+                }
+
+                let mut new_rows: Vec<Map<String, Value>> = Vec::new();
+                for left_row in &left_rows {
+                    let left_val = Self::resolve_column_value(left_row, &left_col);
+                    for right_row in &right_rows {
+                        let right_val = Self::resolve_column_value(right_row, &right_col);
+                        if left_val.is_some() && right_val.is_some() && left_val == right_val {
+                            let mut merged = Map::new();
+                            for (k, v) in left_row {
+                                let key = match from_alias {
+                                    Some(alias) => format!("{}.{}", alias, k),
+                                    None => k.clone(),
+                                };
+                                merged.insert(key, v.clone());
+                                if from_alias.is_some() && !merged.contains_key(k) {
+                                    merged.insert(k.clone(), v.clone());
+                                }
+                            }
+                            for (k, v) in right_row {
+                                let key = format!("{}.{}", right_alias, k);
+                                merged.insert(key, v.clone());
+                                if !merged.contains_key(k) {
+                                    merged.insert(k.clone(), v.clone());
+                                }
+                            }
+                            new_rows.push(merged);
+                        }
+                    }
+                }
+                left_rows = new_rows;
+            }
+        }
+
+        // Apply WHERE filter
+        let mut filtered: Vec<Map<String, Value>> = Vec::new();
+        for doc in left_rows {
+            if self.matches_filter(engine, &doc, filter) {
+                filtered.push(doc);
+            }
+        }
+
+        // Aggregate or normal query
+        let has_aggregates = Self::columns_have_aggregates(columns);
+        if group_by.is_some() || has_aggregates {
+            let mut result = self.execute_aggregation(engine, columns, &filtered, group_by, having, order_by, limit)?;
+            if let QueryResult::Rows(ref mut rows) = result {
+                if distinct {
+                    Self::dedup_rows(rows);
+                }
+            }
+            return Ok(result);
+        }
+
+        // Normal query
+        let mut rows: Vec<Map<String, Value>> = Vec::new();
+        for doc in filtered {
+            rows.push(self.project_columns(&doc, columns));
+        }
+        if let Some(ob) = order_by {
+            Self::sort_rows(&mut rows, &ob.column, ob.ascending);
+        }
+        if distinct {
+            Self::dedup_rows(&mut rows);
+        }
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+        Ok(QueryResult::Rows(rows))
+    }
+
+    fn execute_delete_txn(
+        &self,
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        class: &str,
+        filter: &Option<FilterExpr>,
+    ) -> Result<QueryResult> {
+        let prefix = format!("{}::", class);
+        let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
+
+        let mut deleted = 0usize;
+        for (key, val_bytes) in entries {
+            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&val_bytes) {
+                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
+                    if self.matches_filter(engine, &doc, filter) {
+                        engine.txn_delete(txn_id, key)?;
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+        Ok(QueryResult::Success(format!("{} row(s) deleted", deleted)))
+    }
+
+    fn execute_update_txn(
+        &self,
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        class: &str,
+        assignments: &[(String, LiteralValue)],
+        filter: &Option<FilterExpr>,
+    ) -> Result<QueryResult> {
+        let prefix = format!("{}::", class);
+        let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
+
+        let mut updated = 0usize;
+        for (key, val_bytes) in entries {
+            if let Ok(Value::Object(mut doc)) = serde_json::from_slice::<Value>(&val_bytes) {
+                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
+                    if self.matches_filter(engine, &doc, filter) {
+                        for (col, val) in assignments {
+                            doc.insert(col.clone(), self.literal_to_json(val));
+                        }
+                        let new_value = serde_json::to_vec(&Value::Object(doc))
+                            .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                        engine.txn_put(txn_id, key, new_value)?;
+                        updated += 1;
+                    }
+                }
+            }
+        }
+        Ok(QueryResult::Success(format!("{} row(s) updated", updated)))
+    }
+
+    fn execute_match_txn(
+        &self,
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        _variable: &str,
+        class: &str,
+        filter: &Option<FilterExpr>,
+        returns: &[String],
+    ) -> Result<QueryResult> {
+        let columns = if returns.is_empty() {
+            SelectColumns::All
+        } else {
+            SelectColumns::Columns(
+                returns.iter().map(|r| SelectItem::Column(r.clone())).collect(),
+            )
+        };
+        self.execute_select_txn(engine, txn_id, false, &columns, class, None, &[], filter, None, &None, None, None)
     }
 
     fn generate_doc_key(&self, class: &str) -> Vec<u8> {
