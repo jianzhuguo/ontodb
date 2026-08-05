@@ -9,23 +9,27 @@
 //! The B+Tree provides O(log n) point lookups, efficient range scans,
 //! and handles node splitting on overflow.
 
+use std::collections::HashMap;
+
 /// Maximum number of keys per node. Branching factor = MAX_KEYS + 1.
 const MAX_KEYS: usize = 128;
 
 /// Minimum number of keys per non-root node. Nodes below this threshold need rebalancing.
 const MIN_KEYS: usize = MAX_KEYS / 2;
 
-/// Internal node: keys separating child subtrees, child node IDs.
+/// Internal node: keys separating child subtrees, child node IDs, parent pointer.
 struct InternalNode {
     keys: Vec<Vec<u8>>,
     children: Vec<u64>,
+    parent: Option<u64>,
 }
 
-/// Leaf node: indexed values mapped to primary keys, with next-leaf pointer.
+/// Leaf node: indexed values mapped to primary keys, with next-leaf pointer and parent pointer.
 struct LeafNode {
     keys: Vec<Vec<u8>>,
     values: Vec<Vec<Vec<u8>>>,
     next: Option<u64>,
+    parent: Option<u64>,
 }
 
 /// A node in the B+Tree, either internal or leaf.
@@ -49,6 +53,20 @@ impl Node {
     fn is_full(&self) -> bool {
         self.key_count() >= MAX_KEYS
     }
+
+    fn parent_id(&self) -> Option<u64> {
+        match self {
+            Node::Internal(n) => n.parent,
+            Node::Leaf(n) => n.parent,
+        }
+    }
+
+    fn set_parent(&mut self, pid: Option<u64>) {
+        match self {
+            Node::Internal(n) => n.parent = pid,
+            Node::Leaf(n) => n.parent = pid,
+        }
+    }
 }
 
 /// A cursor pointing to a position in the leaf chain for iteration.
@@ -63,10 +81,12 @@ struct Cursor {
 /// - O(log n) point lookups via root-to-leaf traversal
 /// - Efficient range scans via leaf chain traversal
 /// - Insert/delete with automatic node splitting
+/// - O(1) node access via HashMap storage
+/// - O(1) parent lookup via parent pointers
 pub struct BPlusTree {
     pub class: String,
     pub column: String,
-    nodes: Vec<(u64, Node)>,
+    nodes: HashMap<u64, Node>,
     root: u64,
     next_id: u64,
     len: usize,
@@ -80,11 +100,14 @@ impl BPlusTree {
             keys: Vec::new(),
             values: Vec::new(),
             next: None,
+            parent: None,
         });
+        let mut nodes = HashMap::new();
+        nodes.insert(root_id, root_node);
         Self {
             class: class.to_string(),
             column: column.to_string(),
-            nodes: vec![(root_id, root_node)],
+            nodes,
             root: root_id,
             next_id: 1,
             len: 0,
@@ -108,11 +131,11 @@ impl BPlusTree {
     }
 
     fn get_node(&self, id: u64) -> Option<&Node> {
-        self.nodes.iter().find(|(nid, _)| *nid == id).map(|(_, n)| n)
+        self.nodes.get(&id)
     }
 
     fn get_node_mut(&mut self, id: u64) -> Option<&mut Node> {
-        self.nodes.iter_mut().find(|(nid, _)| *nid == id).map(|(_, n)| n)
+        self.nodes.get_mut(&id)
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -126,11 +149,15 @@ impl BPlusTree {
         if let Some((promoted_key, new_sibling_id)) = result {
             let new_root_id = self.alloc_id();
             let old_root = self.root;
+            // Update children's parent pointers
+            self.get_node_mut(old_root).unwrap().set_parent(Some(new_root_id));
+            self.get_node_mut(new_sibling_id).unwrap().set_parent(Some(new_root_id));
             let new_root = Node::Internal(InternalNode {
                 keys: vec![promoted_key],
                 children: vec![old_root, new_sibling_id],
+                parent: None,
             });
-            self.nodes.push((new_root_id, new_root));
+            self.nodes.insert(new_root_id, new_root);
             self.root = new_root_id;
         }
         self.len += 1;
@@ -228,6 +255,9 @@ impl BPlusTree {
                 n.children.insert(insert_pos + 1, new_child_id);
             }
 
+            // Set parent pointer for new child
+            self.get_node_mut(new_child_id).unwrap().set_parent(Some(node_id));
+
             // Split if over capacity
             if self.get_node(node_id).unwrap().is_full() {
                 Some(self.split_internal(node_id))
@@ -247,6 +277,7 @@ impl BPlusTree {
     fn split_leaf(&mut self, leaf_id: u64) -> (Vec<u8>, u64) {
         let mid = MAX_KEYS / 2;
         let new_id = self.alloc_id();
+        let parent = self.get_node(leaf_id).unwrap().parent_id();
 
         let (promoted_key, new_leaf) = match self.get_node_mut(leaf_id).unwrap() {
             Node::Leaf(n) => {
@@ -263,13 +294,14 @@ impl BPlusTree {
                         keys: new_keys,
                         values: new_values,
                         next: old_next,
+                        parent,
                     }),
                 )
             }
             _ => unreachable!(),
         };
 
-        self.nodes.push((new_id, new_leaf));
+        self.nodes.insert(new_id, new_leaf);
         (promoted_key, new_id)
     }
 
@@ -277,6 +309,7 @@ impl BPlusTree {
     fn split_internal(&mut self, node_id: u64) -> (Vec<u8>, u64) {
         let mid = MAX_KEYS / 2;
         let new_id = self.alloc_id();
+        let parent = self.get_node(node_id).unwrap().parent_id();
 
         let (promoted_key, new_internal) = match self.get_node_mut(node_id).unwrap() {
             Node::Internal(n) => {
@@ -290,13 +323,23 @@ impl BPlusTree {
                     Node::Internal(InternalNode {
                         keys: new_keys,
                         children: new_children,
+                        parent,
                     }),
                 )
             }
             _ => unreachable!(),
         };
 
-        self.nodes.push((new_id, new_internal));
+        // Update parent pointers for children of the new internal node
+        let new_children: Vec<u64> = match self.nodes.get(&new_id).unwrap() {
+            Node::Internal(n) => n.children.clone(),
+            _ => unreachable!(),
+        };
+        for &child_id in &new_children {
+            self.get_node_mut(child_id).unwrap().set_parent(Some(new_id));
+        }
+
+        self.nodes.insert(new_id, new_internal);
         (promoted_key, new_id)
     }
 
@@ -339,7 +382,9 @@ impl BPlusTree {
         if !self.get_node(self.root).unwrap().is_leaf() {
             if let Node::Internal(n) = self.get_node(self.root).unwrap() {
                 if n.keys.is_empty() && !n.children.is_empty() {
-                    self.root = n.children[0];
+                    let new_root = n.children[0];
+                    self.root = new_root;
+                    self.get_node_mut(self.root).unwrap().set_parent(None);
                 }
             }
         }
@@ -347,10 +392,16 @@ impl BPlusTree {
 
     /// Handles underflow in a leaf node by borrowing from siblings or merging.
     fn handle_leaf_underflow(&mut self, leaf_id: u64) {
-        // Find parent and sibling information
-        let (parent_id, child_idx) = match self.find_parent(self.root, leaf_id) {
-            Some(info) => info,
-            None => return, // No parent (shouldn't happen if leaf_id != root)
+        // O(1) parent lookup via parent pointer
+        let (parent_id, child_idx) = match self.get_node(leaf_id).unwrap().parent_id() {
+            Some(pid) => {
+                let idx = match self.get_node(pid).unwrap() {
+                    Node::Internal(n) => n.children.iter().position(|&c| c == leaf_id).unwrap_or(0),
+                    _ => return,
+                };
+                (pid, idx)
+            }
+            None => return,
         };
 
         let num_children = match self.get_node(parent_id).unwrap() {
@@ -396,14 +447,15 @@ impl BPlusTree {
 
     /// Redistributes keys from left sibling to the underflowing leaf.
     fn redistribute_leaf_from_left(&mut self, parent_id: u64, child_idx: usize) {
-        let left_sibling_id = match self.get_node(parent_id).unwrap() {
-            Node::Internal(n) => n.children[child_idx - 1],
+        let left_sibling_id;
+        let leaf_id;
+        match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => {
+                left_sibling_id = n.children[child_idx - 1];
+                leaf_id = n.children[child_idx];
+            }
             _ => return,
-        };
-        let leaf_id = match self.get_node(parent_id).unwrap() {
-            Node::Internal(n) => n.children[child_idx],
-            _ => return,
-        };
+        }
 
         // Move last key from left sibling to front of current leaf
         if let Node::Leaf(left) = self.get_node_mut(left_sibling_id).unwrap() {
@@ -427,14 +479,15 @@ impl BPlusTree {
 
     /// Redistributes keys from right sibling to the underflowing leaf.
     fn redistribute_leaf_from_right(&mut self, parent_id: u64, child_idx: usize) {
-        let leaf_id = match self.get_node(parent_id).unwrap() {
-            Node::Internal(n) => n.children[child_idx],
+        let leaf_id;
+        let right_sibling_id;
+        match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => {
+                leaf_id = n.children[child_idx];
+                right_sibling_id = n.children[child_idx + 1];
+            }
             _ => return,
-        };
-        let right_sibling_id = match self.get_node(parent_id).unwrap() {
-            Node::Internal(n) => n.children[child_idx + 1],
-            _ => return,
-        };
+        }
 
         // Move first key from right sibling to end of current leaf
         if let Node::Leaf(right) = self.get_node_mut(right_sibling_id).unwrap() {
@@ -458,32 +511,25 @@ impl BPlusTree {
 
     /// Merges two adjacent leaf nodes. The left leaf absorbs the right leaf.
     fn merge_leaves(&mut self, parent_id: u64, left_idx: usize, right_idx: usize) {
-        let left_id = match self.get_node(parent_id).unwrap() {
-            Node::Internal(n) => n.children[left_idx],
+        let left_id;
+        let right_id;
+        match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => {
+                left_id = n.children[left_idx];
+                right_id = n.children[right_idx];
+            }
             _ => return,
-        };
-        let right_id = match self.get_node(parent_id).unwrap() {
-            Node::Internal(n) => n.children[right_idx],
-            _ => return,
-        };
-
-        // Transfer all keys from right to left
-        let right_keys: Vec<Vec<u8>>;
-        let right_values: Vec<Vec<Vec<u8>>>;
-        let right_next: Option<u64>;
-
-        if let Node::Leaf(right) = self.get_node(right_id).unwrap() {
-            right_keys = right.keys.clone();
-            right_values = right.values.clone();
-            right_next = right.next;
-        } else {
-            return;
         }
 
-        if let Node::Leaf(left) = self.get_node_mut(left_id).unwrap() {
-            left.keys.extend(right_keys);
-            left.values.extend(right_values);
-            left.next = right_next;
+        // Remove right node from storage and take its data (no clone needed)
+        if let Some(Node::Leaf(right)) = self.nodes.remove(&right_id) {
+            if let Node::Leaf(left) = self.get_node_mut(left_id).unwrap() {
+                left.keys.extend(right.keys);
+                left.values.extend(right.values);
+                left.next = right.next;
+            }
+        } else {
+            return;
         }
 
         // Remove right sibling from parent
@@ -491,9 +537,6 @@ impl BPlusTree {
             parent.keys.remove(left_idx);
             parent.children.remove(right_idx);
         }
-
-        // Remove the right leaf node from storage
-        self.nodes.retain(|(nid, _)| *nid != right_id);
 
         // Check if parent now underflows
         if parent_id != self.root {
@@ -506,8 +549,15 @@ impl BPlusTree {
 
     /// Handles underflow in an internal node.
     fn handle_internal_underflow(&mut self, node_id: u64) {
-        let (parent_id, child_idx) = match self.find_parent(self.root, node_id) {
-            Some(info) => info,
+        // O(1) parent lookup via parent pointer
+        let (parent_id, child_idx) = match self.get_node(node_id).unwrap().parent_id() {
+            Some(pid) => {
+                let idx = match self.get_node(pid).unwrap() {
+                    Node::Internal(n) => n.children.iter().position(|&c| c == node_id).unwrap_or(0),
+                    _ => return,
+                };
+                (pid, idx)
+            }
             None => return,
         };
 
@@ -552,14 +602,15 @@ impl BPlusTree {
 
     /// Redistributes keys from left internal sibling.
     fn redistribute_internal_from_left(&mut self, parent_id: u64, child_idx: usize) {
-        let left_id = match self.get_node(parent_id).unwrap() {
-            Node::Internal(n) => n.children[child_idx - 1],
+        let left_id;
+        let node_id;
+        match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => {
+                left_id = n.children[child_idx - 1];
+                node_id = n.children[child_idx];
+            }
             _ => return,
-        };
-        let node_id = match self.get_node(parent_id).unwrap() {
-            Node::Internal(n) => n.children[child_idx],
-            _ => return,
-        };
+        }
 
         // Get separator from parent
         let separator = match self.get_node(parent_id).unwrap() {
@@ -577,6 +628,9 @@ impl BPlusTree {
                 node.children.insert(0, moved_child);
             }
 
+            // Update moved child's parent pointer
+            self.get_node_mut(moved_child).unwrap().set_parent(Some(node_id));
+
             // Update parent separator
             if let Node::Internal(parent) = self.get_node_mut(parent_id).unwrap() {
                 parent.keys[child_idx - 1] = moved_key;
@@ -586,14 +640,15 @@ impl BPlusTree {
 
     /// Redistributes keys from right internal sibling.
     fn redistribute_internal_from_right(&mut self, parent_id: u64, child_idx: usize) {
-        let node_id = match self.get_node(parent_id).unwrap() {
-            Node::Internal(n) => n.children[child_idx],
+        let node_id;
+        let right_id;
+        match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => {
+                node_id = n.children[child_idx];
+                right_id = n.children[child_idx + 1];
+            }
             _ => return,
-        };
-        let right_id = match self.get_node(parent_id).unwrap() {
-            Node::Internal(n) => n.children[child_idx + 1],
-            _ => return,
-        };
+        }
 
         // Get separator from parent
         let separator = match self.get_node(parent_id).unwrap() {
@@ -611,6 +666,9 @@ impl BPlusTree {
                 node.children.push(moved_child);
             }
 
+            // Update moved child's parent pointer
+            self.get_node_mut(moved_child).unwrap().set_parent(Some(node_id));
+
             // Update parent separator
             if let Node::Internal(parent) = self.get_node_mut(parent_id).unwrap() {
                 parent.keys[child_idx] = moved_key;
@@ -620,14 +678,15 @@ impl BPlusTree {
 
     /// Merges two adjacent internal nodes. The left node absorbs the right node.
     fn merge_internals(&mut self, parent_id: u64, left_idx: usize, right_idx: usize) {
-        let left_id = match self.get_node(parent_id).unwrap() {
-            Node::Internal(n) => n.children[left_idx],
+        let left_id;
+        let right_id;
+        match self.get_node(parent_id).unwrap() {
+            Node::Internal(n) => {
+                left_id = n.children[left_idx];
+                right_id = n.children[right_idx];
+            }
             _ => return,
-        };
-        let right_id = match self.get_node(parent_id).unwrap() {
-            Node::Internal(n) => n.children[right_idx],
-            _ => return,
-        };
+        }
 
         // Get separator from parent
         let separator = match self.get_node(parent_id).unwrap() {
@@ -635,21 +694,20 @@ impl BPlusTree {
             _ => return,
         };
 
-        // Transfer keys and children from right to left
-        let right_keys: Vec<Vec<u8>>;
-        let right_children: Vec<u64>;
+        // Remove right node from storage and take its data (no clone needed)
+        if let Some(Node::Internal(right)) = self.nodes.remove(&right_id) {
+            // Update parent pointers for right's children to point to left
+            for &child_id in &right.children {
+                self.get_node_mut(child_id).unwrap().set_parent(Some(left_id));
+            }
 
-        if let Node::Internal(right) = self.get_node(right_id).unwrap() {
-            right_keys = right.keys.clone();
-            right_children = right.children.clone();
+            if let Node::Internal(left) = self.get_node_mut(left_id).unwrap() {
+                left.keys.push(separator);
+                left.keys.extend(right.keys);
+                left.children.extend(right.children);
+            }
         } else {
             return;
-        }
-
-        if let Node::Internal(left) = self.get_node_mut(left_id).unwrap() {
-            left.keys.push(separator);
-            left.keys.extend(right_keys);
-            left.children.extend(right_children);
         }
 
         // Remove right node from parent
@@ -658,32 +716,11 @@ impl BPlusTree {
             parent.children.remove(right_idx);
         }
 
-        // Remove the right internal node from storage
-        self.nodes.retain(|(nid, _)| *nid != right_id);
-
         // Check if parent now underflows
         if parent_id != self.root {
             let parent_key_count = self.get_node(parent_id).unwrap().key_count();
             if parent_key_count < MIN_KEYS {
                 self.handle_internal_underflow(parent_id);
-            }
-        }
-    }
-
-    /// Finds the parent of a node and returns (parent_id, child_index).
-    fn find_parent(&self, current: u64, target: u64) -> Option<(u64, usize)> {
-        match self.get_node(current)? {
-            Node::Leaf(_) => None,
-            Node::Internal(n) => {
-                for (i, &child_id) in n.children.iter().enumerate() {
-                    if child_id == target {
-                        return Some((current, i));
-                    }
-                    if let Some(result) = self.find_parent(child_id, target) {
-                        return Some(result);
-                    }
-                }
-                None
             }
         }
     }
@@ -1129,11 +1166,8 @@ mod tests {
 
     #[test]
     fn test_remove_leaf_underflow_merge() {
-        // Use small MAX_KEYS to trigger underflow easily.
-        // We insert keys that create multiple leaves, then delete to force merges.
         let mut tree = BPlusTree::new("Product", "price");
 
-        // Insert enough unique keys to create multiple leaf nodes
         let n = 400u32;
         for i in 0..n {
             let key = format!("{:010}", i);
@@ -1179,15 +1213,13 @@ mod tests {
     fn test_remove_triggers_redistribution() {
         let mut tree = BPlusTree::new("Product", "price");
 
-        // Create a tree with enough entries for multi-level structure
         let n = 500u32;
         for i in 0..n {
             let key = format!("{:010}", i);
             tree.insert(key.into_bytes(), format!("pk_{}", i).into_bytes());
         }
 
-        // Remove a subset that triggers redistribution rather than merge
-        // Remove from a contiguous range to underflow one leaf
+        // Remove a contiguous range to underflow one leaf
         for i in 100..150 {
             let key = format!("{:010}", i);
             tree.remove(key.as_bytes(), format!("pk_{}", i).as_bytes());
@@ -1209,7 +1241,6 @@ mod tests {
     fn test_remove_root_collapse() {
         let mut tree = BPlusTree::new("Product", "price");
 
-        // Build a multi-level tree
         let n = 600u32;
         for i in 0..n {
             let key = format!("{:010}", i);
@@ -1261,7 +1292,6 @@ mod tests {
     fn test_remove_cascading_underflow() {
         let mut tree = BPlusTree::new("Product", "price");
 
-        // Insert enough to create a deep tree
         let n = 1000u32;
         for i in 0..n {
             let key = format!("{:010}", i);
@@ -1269,7 +1299,6 @@ mod tests {
         }
 
         // Remove a large contiguous block to trigger cascading underflows
-        // (leaf merge -> internal underflow -> internal merge -> possible root collapse)
         for i in 200..800 {
             let key = format!("{:010}", i);
             tree.remove(key.as_bytes(), format!("pk_{}", i).as_bytes());
@@ -1287,7 +1316,7 @@ mod tests {
             assert_eq!(tree.lookup(key.as_bytes()).len(), 1, "key {} missing", key);
         }
 
-        // Range scan should still work (use 10-byte keys matching {:010}, inclusive on both ends)
+        // Range scan should still work
         let keys = tree.range_scan(Some(b"0000000050"), Some(b"0000000149"));
         assert_eq!(keys.len(), 100, "range [50,149] failed, got {}", keys.len());
 
@@ -1299,7 +1328,6 @@ mod tests {
     fn test_remove_interleaved_insert_delete() {
         let mut tree = BPlusTree::new("Product", "price");
 
-        // Insert, delete, re-insert pattern
         for i in 0..200u32 {
             let key = format!("{:010}", i);
             tree.insert(key.into_bytes(), format!("pk_{}", i).into_bytes());
@@ -1382,5 +1410,62 @@ mod tests {
         }
 
         assert_eq!(count, 500);
+    }
+
+    #[test]
+    fn test_parent_pointers_after_split() {
+        let mut tree = BPlusTree::new("Product", "price");
+
+        // Insert enough to trigger multiple splits
+        for i in 0..500u32 {
+            let key = format!("{:010}", i);
+            tree.insert(key.into_bytes(), format!("pk_{}", i).into_bytes());
+        }
+
+        // Verify root has no parent
+        assert_eq!(tree.get_node(tree.root).unwrap().parent_id(), None);
+
+        // Verify all non-root nodes have valid parent pointers
+        let root = tree.root;
+        fn verify_parents(tree: &BPlusTree, node_id: u64, expected_parent: Option<u64>) {
+            let node = tree.get_node(node_id).unwrap();
+            assert_eq!(node.parent_id(), expected_parent, "node {} has wrong parent", node_id);
+            if let Node::Internal(n) = node {
+                for &child_id in &n.children {
+                    verify_parents(tree, child_id, Some(node_id));
+                }
+            }
+        }
+        verify_parents(&tree, root, None);
+    }
+
+    #[test]
+    fn test_parent_pointers_after_merge() {
+        let mut tree = BPlusTree::new("Product", "price");
+
+        let n = 400u32;
+        for i in 0..n {
+            let key = format!("{:010}", i);
+            tree.insert(key.into_bytes(), format!("pk_{}", i).into_bytes());
+        }
+
+        // Remove most entries to trigger merges
+        for i in 0..(n - 5) {
+            let key = format!("{:010}", i);
+            tree.remove(key.as_bytes(), format!("pk_{}", i).as_bytes());
+        }
+
+        // Verify parent pointers still correct
+        let root = tree.root;
+        fn verify_parents(tree: &BPlusTree, node_id: u64, expected_parent: Option<u64>) {
+            let node = tree.get_node(node_id).unwrap();
+            assert_eq!(node.parent_id(), expected_parent, "node {} has wrong parent", node_id);
+            if let Node::Internal(n) = node {
+                for &child_id in &n.children {
+                    verify_parents(tree, child_id, Some(node_id));
+                }
+            }
+        }
+        verify_parents(&tree, root, None);
     }
 }
