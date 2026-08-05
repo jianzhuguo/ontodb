@@ -251,20 +251,19 @@ impl QueryParser {
         let class = input[6..set_pos].trim().to_string();
         let rest = &input[set_pos + 5..];
 
-        // Parse SET assignments
-        let where_upper = rest.to_uppercase();
-        let (set_part, filter_str) = if let Some(wp) = where_upper.find(" WHERE ") {
+        // Find WHERE position, respecting quotes
+        let (set_part, filter_str) = if let Some(wp) = Self::find_unquoted(rest, " WHERE ") {
             (&rest[..wp], Some(rest[wp + 7..].trim()))
         } else {
             (rest, None)
         };
 
-        let assignments: Vec<(String, LiteralValue)> = set_part
-            .split(',')
+        // Split assignments by comma, respecting quotes
+        let assignments: Vec<(String, LiteralValue)> = Self::split_quoted(set_part, ',')
+            .iter()
             .map(|s| {
                 let s = s.trim();
-                let eq_pos = s
-                    .find('=')
+                let eq_pos = Self::find_unquoted(s, "=")
                     .ok_or_else(|| CoreError::InvalidArgument("expected '=' in SET".to_string()))?;
                 let col = s[..eq_pos].trim().to_string();
                 let val = Self::parse_literal(s[eq_pos + 1..].trim())?;
@@ -283,6 +282,36 @@ impl QueryParser {
             assignments,
             filter,
         })
+    }
+
+    /// Splits a string by a delimiter character, skipping delimiters inside quotes.
+    fn split_quoted(input: &str, delim: char) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut in_quote: Option<char> = None;
+
+        for c in input.chars() {
+            if let Some(q) = in_quote {
+                current.push(c);
+                if c == q {
+                    in_quote = None;
+                }
+            } else if c == '\'' || c == '"' {
+                in_quote = Some(c);
+                current.push(c);
+            } else if c == delim {
+                parts.push(current.clone());
+                current.clear();
+            } else {
+                current.push(c);
+            }
+        }
+
+        if !current.is_empty() {
+            parts.push(current);
+        }
+
+        parts
     }
 
     fn parse_delete(input: &str) -> Result<QueryAst> {
@@ -357,11 +386,37 @@ impl QueryParser {
         })
     }
 
+    /// Finds a substring in the input, skipping over quoted sections.
+    /// Returns the position of the first occurrence that is NOT inside quotes.
+    fn find_unquoted(haystack: &str, needle: &str) -> Option<usize> {
+        let mut in_quote: Option<char> = None;
+        let bytes = haystack.as_bytes();
+        let needle_bytes = needle.as_bytes();
+
+        let mut i = 0;
+        while i + needle_bytes.len() <= bytes.len() {
+            let c = bytes[i] as char;
+
+            if let Some(q) = in_quote {
+                if c == q {
+                    in_quote = None;
+                }
+            } else if c == '\'' || c == '"' {
+                in_quote = Some(c);
+            } else if bytes[i..].starts_with(needle_bytes) {
+                return Some(i);
+            }
+
+            i += 1;
+        }
+        None
+    }
+
     fn parse_where(input: &str) -> Result<(Option<FilterExpr>, String)> {
         // Simple single-condition parser: column op value
         let input = input.trim();
 
-        // Find operator
+        // Find operator (skip quoted strings)
         for (op_str, op_fn) in &[
             (">=", FilterExpr::Gte as fn(String, LiteralValue) -> FilterExpr),
             ("<=", FilterExpr::Lte),
@@ -371,19 +426,31 @@ impl QueryParser {
             ("<", FilterExpr::Lt),
             ("=", FilterExpr::Eq),
         ] {
-            if let Some(pos) = input.find(op_str) {
+            if let Some(pos) = Self::find_unquoted(input, op_str) {
                 let col = input[..pos].trim().to_string();
                 let rest = input[pos + op_str.len()..].trim();
 
-                // Find the end of the value (space, semicolon, or end of string)
-                let val_end = rest
-                    .find(|c: char| c.is_whitespace() || c == ';' || c == ',')
-                    .unwrap_or(rest.len());
-                let val_str = &rest[..val_end];
-                let remaining = rest[val_end..].to_string();
+                // Find the end of the value, handling quoted strings
+                let val_str;
+                let remaining;
+                if rest.starts_with('\'') || rest.starts_with('"') {
+                    let quote = rest.as_bytes()[0] as char;
+                    if let Some(end_quote) = rest[1..].find(quote) {
+                        val_str = &rest[1..1 + end_quote];
+                        remaining = rest[1 + end_quote + 1..].trim().to_string();
+                    } else {
+                        val_str = rest;
+                        remaining = String::new();
+                    }
+                } else {
+                    let val_end = rest
+                        .find(|c: char| c.is_whitespace() || c == ';' || c == ',')
+                        .unwrap_or(rest.len());
+                    val_str = &rest[..val_end];
+                    remaining = rest[val_end..].trim().to_string();
+                }
 
                 let val = Self::parse_literal(val_str)?;
-                let remaining = remaining.trim().to_string();
                 return Ok((Some(op_fn(col, val)), remaining));
             }
         }

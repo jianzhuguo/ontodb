@@ -537,6 +537,7 @@ dependencies = [
  "onto-ontology",
  "onto-query",
  "onto-storage",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

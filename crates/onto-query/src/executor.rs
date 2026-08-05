@@ -550,4 +550,274 @@ mod tests {
             _ => panic!("expected Rows"),
         }
     }
+
+    // ── UPDATE edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn test_update_no_match() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'Galaxy'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("0 row(s) updated")),
+            _ => panic!("expected Success with 0 updated"),
+        }
+    }
+
+    #[test]
+    fn test_update_multiple_rows() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 999);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Update all rows with price 999
+        let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE price = 999").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("2 row(s) updated")),
+            _ => panic!("expected 2 updated"),
+        }
+
+        // Verify both are updated
+        let ast = QueryParser::parse("SELECT * FROM Product WHERE price = 899").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 2),
+            _ => panic!("expected 2 rows"),
+        }
+    }
+
+    #[test]
+    fn test_update_multiple_fields() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("UPDATE Product SET name = 'iPhone 15', price = 1099 WHERE name = 'iPhone'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("1 row(s) updated")),
+            _ => panic!("expected 1 updated"),
+        }
+
+        let ast = QueryParser::parse("SELECT * FROM Product WHERE name = 'iPhone 15'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("price").unwrap().as_i64().unwrap(), 1099);
+            }
+            _ => panic!("expected 1 row"),
+        }
+    }
+
+    // ── DELETE edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn test_delete_no_match() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("DELETE FROM Product WHERE name = 'Galaxy'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("0 row(s) deleted")),
+            _ => panic!("expected 0 deleted"),
+        }
+
+        // Original row still exists
+        let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            _ => panic!("expected 1 row"),
+        }
+    }
+
+    #[test]
+    fn test_delete_multiple_rows() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Delete all with price < 1000
+        let ast = QueryParser::parse("DELETE FROM Product WHERE price < 1000").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("2 row(s) deleted")),
+            _ => panic!("expected 2 deleted"),
+        }
+
+        // Only MacBook remains
+        let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "MacBook");
+            }
+            _ => panic!("expected 1 row"),
+        }
+    }
+
+    #[test]
+    fn test_delete_all() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Delete all (no WHERE)
+        let ast = QueryParser::parse("DELETE FROM Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("2 row(s) deleted")),
+            _ => panic!("expected 2 deleted"),
+        }
+
+        let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 0),
+            _ => panic!("expected 0 rows"),
+        }
+    }
+
+    // ── Full lifecycle ─────────────────────────────────────────────
+
+    #[test]
+    fn test_full_lifecycle() {
+        let (executor, _dir) = setup();
+
+        // 1. CREATE ONTOLOGY
+        let ast = QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("created")),
+            _ => panic!("expected Success"),
+        }
+
+        // 2. INSERT
+        for (name, price) in [("iPhone", 999), ("iPad", 799), ("MacBook", 1999), ("AirPods", 249)] {
+            let ast = QueryParser::parse(&format!(
+                "INSERT INTO Product (name, price) VALUES ('{}', {})", name, price
+            )).unwrap();
+            executor.execute(&ast).unwrap();
+        }
+
+        // 3. SELECT all
+        let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 4),
+            _ => panic!("expected 4 rows"),
+        }
+
+        // 4. SELECT with filter
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE price > 500").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 3),
+            _ => panic!("expected 3 rows"),
+        }
+
+        // 5. UPDATE
+        let ast = QueryParser::parse("UPDATE Product SET price = 1099 WHERE name = 'iPhone'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("1 row(s) updated")),
+            _ => panic!("expected 1 updated"),
+        }
+
+        // 6. Verify update
+        let ast = QueryParser::parse("SELECT price FROM Product WHERE name = 'iPhone'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("price").unwrap().as_i64().unwrap(), 1099);
+            }
+            _ => panic!("expected updated price"),
+        }
+
+        // 7. DELETE
+        let ast = QueryParser::parse("DELETE FROM Product WHERE price < 300").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("1 row(s) deleted")),
+            _ => panic!("expected 1 deleted"),
+        }
+
+        // 8. Verify delete
+        let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 3),
+            _ => panic!("expected 3 rows"),
+        }
+
+        // 9. MATCH
+        let ast = QueryParser::parse("MATCH (p: Product) WHERE price > 1000 RETURN name").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 2), // iPhone 1099, MacBook 1999
+            _ => panic!("expected 2 rows"),
+        }
+    }
+
+    // ── Data persistence across flush ──────────────────────────────
+
+    #[test]
+    fn test_data_persists_after_flush() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Insert more, flush again
+        insert_row(&executor, "Product", "iPad", 799);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Both should be visible
+        let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 2),
+            _ => panic!("expected 2 rows"),
+        }
+    }
+
+    #[test]
+    fn test_update_then_flush_then_select() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Update
+        let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'iPhone'").unwrap();
+        executor.execute(&ast).unwrap();
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Verify after flush
+        let ast = QueryParser::parse("SELECT price FROM Product WHERE name = 'iPhone'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("price").unwrap().as_i64().unwrap(), 899);
+            }
+            _ => panic!("expected updated price after flush"),
+        }
+    }
 }
