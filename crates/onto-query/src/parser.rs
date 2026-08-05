@@ -62,6 +62,18 @@ pub enum QueryAst {
         right: Box<QueryAst>,
         all: bool, // true = UNION ALL (keep duplicates), false = UNION (distinct)
     },
+
+    /// CREATE INDEX <name> ON <class> (<column>)
+    CreateIndex {
+        class: String,
+        column: String,
+    },
+
+    /// DROP INDEX <name> ON <class> (<column>)
+    DropIndex {
+        class: String,
+        column: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +176,10 @@ impl QueryParser {
             Ok(QueryAst::CreateOntology {
                 sql: input.to_string(),
             })
+        } else if upper.starts_with("CREATE INDEX") {
+            Self::parse_create_index(input)
+        } else if upper.starts_with("DROP INDEX") {
+            Self::parse_drop_index(input)
         } else if upper.starts_with("INSERT") {
             Self::parse_insert(input)
         } else if upper.starts_with("SELECT") {
@@ -575,6 +591,60 @@ impl QueryParser {
         let consumed = input[..earliest].trim().to_string();
         let remaining = &input[earliest..];
         (consumed, remaining)
+    }
+
+    /// Parses: CREATE INDEX ON <class> (<column>)
+    fn parse_create_index(input: &str) -> Result<QueryAst> {
+        // CREATE INDEX ON Product (price)
+        let upper = input.to_uppercase();
+        let on_pos = upper
+            .find(" ON ")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after CREATE INDEX".to_string()))?;
+        let rest = input[on_pos + 4..].trim();
+
+        // Find the parenthesized column
+        let paren_open = rest
+            .find('(')
+            .ok_or_else(|| CoreError::InvalidArgument("expected '(column)' in CREATE INDEX".to_string()))?;
+        let class = rest[..paren_open].trim().to_string();
+        let paren_close = rest
+            .find(')')
+            .ok_or_else(|| CoreError::InvalidArgument("expected ')' in CREATE INDEX".to_string()))?;
+        let column = rest[paren_open + 1..paren_close].trim().to_string();
+
+        if class.is_empty() || column.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "class and column cannot be empty in CREATE INDEX".to_string(),
+            ));
+        }
+
+        Ok(QueryAst::CreateIndex { class, column })
+    }
+
+    /// Parses: DROP INDEX ON <class> (<column>)
+    fn parse_drop_index(input: &str) -> Result<QueryAst> {
+        let upper = input.to_uppercase();
+        let on_pos = upper
+            .find(" ON ")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after DROP INDEX".to_string()))?;
+        let rest = input[on_pos + 4..].trim();
+
+        let paren_open = rest
+            .find('(')
+            .ok_or_else(|| CoreError::InvalidArgument("expected '(column)' in DROP INDEX".to_string()))?;
+        let class = rest[..paren_open].trim().to_string();
+        let paren_close = rest
+            .find(')')
+            .ok_or_else(|| CoreError::InvalidArgument("expected ')' in DROP INDEX".to_string()))?;
+        let column = rest[paren_open + 1..paren_close].trim().to_string();
+
+        if class.is_empty() || column.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "class and column cannot be empty in DROP INDEX".to_string(),
+            ));
+        }
+
+        Ok(QueryAst::DropIndex { class, column })
     }
 
     fn parse_update(input: &str) -> Result<QueryAst> {

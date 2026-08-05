@@ -48,6 +48,23 @@ impl QueryExecutor {
                 // UNION runs each sub-query in its own transaction
                 self.execute_union(engine, left, right, *all)
             }
+            QueryAst::CreateIndex { class, column } => {
+                engine.create_index(class, column)?;
+                Ok(QueryResult::Success(format!(
+                    "Index created on {}.{}", class, column
+                )))
+            }
+            QueryAst::DropIndex { class, column } => {
+                if engine.drop_index(class, column) {
+                    Ok(QueryResult::Success(format!(
+                        "Index dropped on {}.{}", class, column
+                    )))
+                } else {
+                    Ok(QueryResult::Success(format!(
+                        "No index found on {}.{}", class, column
+                    )))
+                }
+            }
             _ => {
                 // All other statements run in an auto-committed transaction
                 let txn_id = engine.begin_txn();
@@ -635,18 +652,11 @@ impl QueryExecutor {
         order_by: Option<&crate::parser::OrderBy>,
         limit: Option<usize>,
     ) -> Result<QueryResult> {
-        // Use transactional scan_prefix for snapshot reads
-        let prefix = format!("{}::", from);
-        let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
-
-        let mut left_rows: Vec<Map<String, Value>> = Vec::new();
-        for (_key, val_bytes) in &entries {
-            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
-                if doc.get("__class__").and_then(|v| v.as_str()) == Some(from) {
-                    left_rows.push(doc);
-                }
-            }
-        }
+        // Try index-accelerated scan for filters that can use an index
+        let mut left_rows = match Self::try_index_scan(engine, txn_id, from, filter)? {
+            Some(rows) => rows,
+            None => Self::full_scan(engine, txn_id, from)?,
+        };
 
         // JOIN expansion (same logic as non-txn version)
         if !joins.is_empty() {
@@ -808,13 +818,159 @@ impl QueryExecutor {
     }
 
     fn generate_doc_key(&self, class: &str) -> Vec<u8> {
-        // Simple key generation: use timestamp-based approach
-        // TODO: proper auto-increment or UUID
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         format!("{}::{:020}", class, now).into_bytes()
+    }
+
+    /// Tries to use a secondary index for the given filter.
+    /// Returns Some(rows) if an index was used, None if a full scan is needed.
+    fn try_index_scan(
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        class: &str,
+        filter: &Option<FilterExpr>,
+    ) -> Result<Option<Vec<Map<String, Value>>>> {
+        let filter = match filter {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+
+        // Extract the column name and check if an index exists
+        let col = match filter {
+            FilterExpr::Eq(c, _)
+            | FilterExpr::Ne(c, _)
+            | FilterExpr::Gt(c, _)
+            | FilterExpr::Lt(c, _)
+            | FilterExpr::Gte(c, _)
+            | FilterExpr::Lte(c, _)
+            | FilterExpr::Between(c, _, _)
+            | FilterExpr::In(c, _) => c.clone(),
+            _ => return Ok(None), // Complex filters can't use a single index
+        };
+
+        if !engine.has_index(class, &col) {
+            return Ok(None); // No index on this column
+        }
+
+        let index_mgr = engine.index_manager();
+
+        let pkeys: Vec<Vec<u8>> = match filter {
+            FilterExpr::Eq(_, val) => {
+                let json_val = Self::literal_to_json_static(val);
+                index_mgr.lookup_eq(class, &col, &json_val).unwrap_or_default()
+            }
+            FilterExpr::Gt(_, val) => {
+                let json_val = Self::literal_to_json_static(val);
+                index_mgr.lookup_gt(class, &col, &json_val).unwrap_or_default()
+            }
+            FilterExpr::Lt(_, val) => {
+                let json_val = Self::literal_to_json_static(val);
+                index_mgr.lookup_lt(class, &col, &json_val).unwrap_or_default()
+            }
+            FilterExpr::Gte(_, val) => {
+                // gte = gt + eq
+                let json_val = Self::literal_to_json_static(val);
+                let tree = match index_mgr.get_index(class, &col) {
+                    Some(t) => t,
+                    None => return Ok(None),
+                };
+                let encoded = onto_storage::IndexManager::encode_value(&json_val);
+                tree.gte_scan(&encoded)
+            }
+            FilterExpr::Lte(_, val) => {
+                let json_val = Self::literal_to_json_static(val);
+                let tree = match index_mgr.get_index(class, &col) {
+                    Some(t) => t,
+                    None => return Ok(None),
+                };
+                let encoded = onto_storage::IndexManager::encode_value(&json_val);
+                tree.lte_scan(&encoded)
+            }
+            FilterExpr::Between(_, low, high) => {
+                let low_json = Self::literal_to_json_static(low);
+                let high_json = Self::literal_to_json_static(high);
+                index_mgr
+                    .lookup_range(class, &col, Some(&low_json), Some(&high_json))
+                    .unwrap_or_default()
+            }
+            FilterExpr::In(_, values) => {
+                let mut all_pkeys = Vec::new();
+                for val in values {
+                    let json_val = Self::literal_to_json_static(val);
+                    if let Some(pks) = index_mgr.lookup_eq(class, &col, &json_val) {
+                        all_pkeys.extend(pks);
+                    }
+                }
+                all_pkeys
+            }
+            _ => return Ok(None),
+        };
+
+        // Fetch the actual rows by primary keys
+        let rows = Self::fetch_rows_by_pks(engine, txn_id, &pkeys)?;
+        Ok(Some(rows))
+    }
+
+    /// Fetches rows by their primary keys within a transaction.
+    fn fetch_rows_by_pks(
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        pkeys: &[Vec<u8>],
+    ) -> Result<Vec<Map<String, Value>>> {
+        let mut rows = Vec::new();
+        for pk in pkeys {
+            if let Ok(Some(val_bytes)) = engine.txn_get(txn_id, pk) {
+                if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&val_bytes) {
+                    rows.push(doc);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Converts a LiteralValue to a serde_json::Value (static helper).
+    fn literal_to_json_static(lit: &LiteralValue) -> serde_json::Value {
+        match lit {
+            LiteralValue::Null => serde_json::Value::Null,
+            LiteralValue::Bool(b) => serde_json::json!(b),
+            LiteralValue::Int(i) => serde_json::json!(i),
+            LiteralValue::Float(f) => serde_json::json!(f),
+            LiteralValue::String(s) => serde_json::json!(s),
+        }
+    }
+
+    /// Extracts a simple equality condition from a WHERE filter.
+    /// Returns (column, value) if the filter is `col = value`.
+    fn extract_eq_filter(filter: &Option<FilterExpr>) -> Option<(String, serde_json::Value)> {
+        match filter {
+            Some(FilterExpr::Eq(col, val)) => {
+                Some((col.clone(), Self::literal_to_json_static(val)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Performs a full prefix scan (non-indexed path).
+    fn full_scan(
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        class: &str,
+    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>> {
+        let prefix = format!("{}::", class);
+        let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
+
+        let mut rows = Vec::new();
+        for (_key, val_bytes) in &entries {
+            if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
+                    rows.push(doc);
+                }
+            }
+        }
+        Ok(rows)
     }
 
     fn matches_filter(&self, engine: &mut LsmEngine, doc: &Map<String, Value>, filter: &Option<FilterExpr>) -> bool {
@@ -2240,6 +2396,250 @@ mod tests {
                 assert_eq!(rows.len(), 0);
             }
             _ => panic!("expected 0 rows from empty subquery"),
+        }
+    }
+
+    // ── Index-accelerated range query tests ───────────────────────
+
+    #[test]
+    fn test_index_range_gt() {
+        let (executor, _dir) = setup();
+
+        // Create index on price
+        let ast = QueryParser::parse("CREATE INDEX ON Product (price)").unwrap();
+        executor.execute(&ast).unwrap();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        insert_row(&executor, "Product", "AirPods", 249);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Range query: price > 500 — should use index
+        let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price > 500").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3); // iPad(799), iPhone(999), MacBook(1999)
+            }
+            _ => panic!("expected 3 rows"),
+        }
+    }
+
+    #[test]
+    fn test_index_range_lt() {
+        let (executor, _dir) = setup();
+
+        let ast = QueryParser::parse("CREATE INDEX ON Product (price)").unwrap();
+        executor.execute(&ast).unwrap();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "AirPods", 249);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE price < 500").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1); // AirPods(249)
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "AirPods");
+            }
+            _ => panic!("expected 1 row"),
+        }
+    }
+
+    #[test]
+    fn test_index_range_between() {
+        let (executor, _dir) = setup();
+
+        let ast = QueryParser::parse("CREATE INDEX ON Product (price)").unwrap();
+        executor.execute(&ast).unwrap();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        insert_row(&executor, "Product", "AirPods", 249);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price BETWEEN 700 AND 1000").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // iPad(799), iPhone(999)
+            }
+            _ => panic!("expected 2 rows"),
+        }
+    }
+
+    #[test]
+    fn test_index_range_gte_lte() {
+        let (executor, _dir) = setup();
+
+        let ast = QueryParser::parse("CREATE INDEX ON Product (price)").unwrap();
+        executor.execute(&ast).unwrap();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // >=
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE price >= 999").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // iPhone(999), MacBook(1999)
+            }
+            _ => panic!("expected 2 rows for gte"),
+        }
+
+        // <=
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE price <= 999").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // iPad(799), iPhone(999)
+            }
+            _ => panic!("expected 2 rows for lte"),
+        }
+    }
+
+    #[test]
+    fn test_index_in_clause() {
+        let (executor, _dir) = setup();
+
+        let ast = QueryParser::parse("CREATE INDEX ON Product (price)").unwrap();
+        executor.execute(&ast).unwrap();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        insert_row(&executor, "Product", "AirPods", 249);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE price IN (249, 1999)").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // AirPods, MacBook
+            }
+            _ => panic!("expected 2 rows for IN"),
+        }
+    }
+
+    // ── Index consistency on UPDATE/DELETE ───────────────────────
+
+    #[test]
+    fn test_index_update_consistency() {
+        let (executor, _dir) = setup();
+
+        let ast = QueryParser::parse("CREATE INDEX ON Product (price)").unwrap();
+        executor.execute(&ast).unwrap();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Verify index works for original price
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE price = 999").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            _ => panic!("expected 1 row at price 999"),
+        }
+
+        // Update the price
+        let ast = QueryParser::parse("UPDATE Product SET price = 1099 WHERE name = 'iPhone'").unwrap();
+        executor.execute(&ast).unwrap();
+
+        // Old price should no longer be found via index
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE price = 999").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 0, "old price 999 should not be in index"),
+            _ => panic!("expected 0 rows"),
+        }
+
+        // New price should be found via index
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE price = 1099").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1, "new price 1099 should be in index");
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "iPhone");
+            }
+            _ => panic!("expected 1 row at price 1099"),
+        }
+    }
+
+    #[test]
+    fn test_index_delete_consistency() {
+        let (executor, _dir) = setup();
+
+        let ast = QueryParser::parse("CREATE INDEX ON Product (price)").unwrap();
+        executor.execute(&ast).unwrap();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Delete iPhone
+        let ast = QueryParser::parse("DELETE FROM Product WHERE name = 'iPhone'").unwrap();
+        executor.execute(&ast).unwrap();
+
+        // Price 999 should no longer be in index
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE price = 999").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 0, "deleted row should not be in index"),
+            _ => panic!("expected 0 rows"),
+        }
+
+        // iPad should still be indexed
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE price = 799").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            _ => panic!("expected 1 row"),
+        }
+    }
+
+    #[test]
+    fn test_index_range_after_update() {
+        let (executor, _dir) = setup();
+
+        let ast = QueryParser::parse("CREATE INDEX ON Product (price)").unwrap();
+        executor.execute(&ast).unwrap();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Move iPhone from 999 to 599
+        let ast = QueryParser::parse("UPDATE Product SET price = 599 WHERE name = 'iPhone'").unwrap();
+        executor.execute(&ast).unwrap();
+
+        // Range scan: price < 700 should now find iPhone(599) but not iPad(799)
+        let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price < 700").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "iPhone");
+                assert_eq!(rows[0].get("price").unwrap().as_i64().unwrap(), 599);
+            }
+            _ => panic!("expected 1 row after update"),
+        }
+
+        // Range scan: price > 600 should find iPad(799) but not iPhone(599)
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE price > 600").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "iPad");
+            }
+            _ => panic!("expected 1 row in range > 600"),
         }
     }
 }

@@ -4,6 +4,7 @@
 //! Read path:   MemTable → SSTables (newest to oldest)
 //! Delete:      Write tombstone entry
 
+use crate::index::IndexManager;
 use crate::lsm::memtable::MemTable;
 use crate::lsm::sstable::{SsTable, SsTableBuilder};
 use crate::lsm::wal::{self, Wal};
@@ -40,6 +41,9 @@ pub struct LsmEngine {
 
     /// MVCC transaction manager.
     txn_manager: TxnManager,
+
+    /// Secondary index manager.
+    index_manager: IndexManager,
 }
 
 /// Metadata about an SSTable file, kept in memory.
@@ -72,6 +76,7 @@ impl LsmEngine {
             seq_counter: AtomicU64::new(0),
             sst_counter: AtomicU64::new(0),
             txn_manager: TxnManager::new(),
+            index_manager: IndexManager::new(),
         };
 
         // Recover from WAL
@@ -79,6 +84,9 @@ impl LsmEngine {
 
         // Load existing SSTables
         engine.load_sstables()?;
+
+        // Rebuild secondary indexes from persisted index entries
+        engine.rebuild_indexes()?;
 
         Ok(engine)
     }
@@ -676,6 +684,20 @@ impl LsmEngine {
         self.seq_counter.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Rebuilds secondary indexes by scanning persisted index entries from SSTables.
+    fn rebuild_indexes(&mut self) -> Result<()> {
+        let index_entries = self.scan_prefix(b"__idx__")?;
+        if !index_entries.is_empty() {
+            self.index_manager.rebuild_from_entries(&index_entries);
+            tracing::info!(
+                "Rebuilt {} index entries across {} indexes",
+                index_entries.len(),
+                self.index_manager.index_count()
+            );
+        }
+        Ok(())
+    }
+
     // ═══════════════════════════════════════════════════════════════
     //  MVCC Transaction API
     // ═══════════════════════════════════════════════════════════════
@@ -694,13 +716,60 @@ impl LsmEngine {
 
         for (key, op) in writes {
             let seq = self.next_seq();
+
+            // Maintain indexes if any exist for this class
+            let class = Self::extract_class_from_key(&key);
+            let has_indexes = class.as_ref().map_or(false, |c| {
+                !self.index_manager.indexes_for_class(c).is_empty()
+            });
+
             match op {
                 WriteOp::Put(value) => {
+                    if has_indexes {
+                        // Deindex the old value first (handles UPDATE case)
+                        if let Some(old_val) = self.get(&key)? {
+                            if let Ok(serde_json::Value::Object(ref old_doc)) =
+                                serde_json::from_slice::<serde_json::Value>(&old_val)
+                            {
+                                if let Some(ref c) = class {
+                                    self.index_manager.deindex_document(c, &key, old_doc);
+                                }
+                            }
+                        }
+                        // Index the new value and persist index entries
+                        if let Ok(serde_json::Value::Object(ref doc)) =
+                            serde_json::from_slice::<serde_json::Value>(&value)
+                        {
+                            if let Some(ref c) = class {
+                                let index_entries = self.index_manager.index_document(c, &key, doc);
+                                for (idx_key, idx_val) in index_entries {
+                                    let idx_seq = self.next_seq();
+                                    let idx_entry = Entry::put(idx_key.clone(), idx_val.clone(), idx_seq);
+                                    self.wal.append(&idx_entry)?;
+                                    self.memtable.put_with_seq(idx_key, idx_val, idx_seq);
+                                }
+                            }
+                        }
+                    }
+
                     let entry = Entry::put(key.clone(), value.clone(), seq);
                     self.wal.append(&entry)?;
                     self.memtable.put_with_seq(key, value, seq);
                 }
                 WriteOp::Delete => {
+                    // For deletes, we need the old value to de-index
+                    if has_indexes {
+                        if let Some(old_val) = self.get(&key)? {
+                            if let Ok(serde_json::Value::Object(ref doc)) =
+                                serde_json::from_slice::<serde_json::Value>(&old_val)
+                            {
+                                if let Some(ref c) = class {
+                                    self.index_manager.deindex_document(c, &key, doc);
+                                }
+                            }
+                        }
+                    }
+
                     let entry = Entry::delete(key.clone(), seq);
                     self.wal.append(&entry)?;
                     self.memtable.delete_with_seq(key, seq);
@@ -714,6 +783,17 @@ impl LsmEngine {
         }
 
         Ok(())
+    }
+
+    /// Extracts the class name from a key like "Product::00000000000123456789".
+    fn extract_class_from_key(key: &[u8]) -> Option<String> {
+        let key_str = std::str::from_utf8(key).ok()?;
+        let parts: Vec<&str> = key_str.splitn(2, "::").collect();
+        if parts.len() == 2 && !parts[0].is_empty() {
+            Some(parts[0].to_string())
+        } else {
+            None
+        }
     }
 
     /// Aborts a transaction. Discards all pending writes.
@@ -980,6 +1060,59 @@ impl LsmEngine {
     /// Returns the number of active transactions.
     pub fn active_txn_count(&self) -> usize {
         self.txn_manager.active_count()
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Index API
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Creates a secondary index on a class.column.
+    /// Automatically backfills existing data for the class.
+    pub fn create_index(&mut self, class: &str, column: &str) -> Result<()> {
+        self.index_manager.create_index(class, column);
+
+        // Backfill: scan all existing entries for this class and index them
+        let prefix = format!("{}::", class);
+        let entries = self.scan_prefix(prefix.as_bytes())?;
+
+        for (pk, val_bytes) in entries {
+            if let Ok(serde_json::Value::Object(doc)) =
+                serde_json::from_slice::<serde_json::Value>(&val_bytes)
+            {
+                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
+                    let index_entries = self.index_manager.index_document(class, &pk, &doc);
+                    // Persist index entries to WAL + MemTable
+                    for (key, value) in index_entries {
+                        let seq = self.next_seq();
+                        let entry = Entry::put(key.clone(), value.clone(), seq);
+                        self.wal.append(&entry)?;
+                        self.memtable.put_with_seq(key, value, seq);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Drops a secondary index.
+    pub fn drop_index(&mut self, class: &str, column: &str) -> bool {
+        self.index_manager.drop_index(class, column)
+    }
+
+    /// Returns true if an index exists on the given class.column.
+    pub fn has_index(&self, class: &str, column: &str) -> bool {
+        self.index_manager.has_index(class, column)
+    }
+
+    /// Returns a reference to the index manager.
+    pub fn index_manager(&self) -> &IndexManager {
+        &self.index_manager
+    }
+
+    /// Returns a mutable reference to the index manager.
+    pub fn index_manager_mut(&mut self) -> &mut IndexManager {
+        &mut self.index_manager
     }
 
     /// Returns engine statistics.
@@ -1457,5 +1590,65 @@ mod tests {
 
         engine.abort_txn(t2).unwrap();
         assert_eq!(engine.active_txn_count(), 0);
+    }
+
+    #[test]
+    fn test_index_persistence_across_restart() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        // Phase 1: Create index, insert data, flush to SSTable
+        {
+            let options = StorageOptions {
+                data_dir: data_dir.clone(),
+                memtable_size_limit: 1024 * 1024,
+                ..Default::default()
+            };
+            let mut engine = LsmEngine::open(options).unwrap();
+
+            engine.create_index("Product", "price").unwrap();
+
+            // Insert via transaction so indexes are maintained
+            let txn = engine.begin_txn();
+            let doc1 = serde_json::json!({"__class__": "Product", "name": "iPhone", "price": 999});
+            let doc2 = serde_json::json!({"__class__": "Product", "name": "iPad", "price": 799});
+            engine.txn_put(txn, b"Product::001".to_vec(), serde_json::to_vec(&doc1).unwrap()).unwrap();
+            engine.txn_put(txn, b"Product::002".to_vec(), serde_json::to_vec(&doc2).unwrap()).unwrap();
+            engine.commit_txn(txn).unwrap();
+
+            engine.flush().unwrap();
+        }
+
+        // Phase 2: Reopen engine — indexes should be rebuilt automatically
+        {
+            let options = StorageOptions {
+                data_dir,
+                memtable_size_limit: 1024 * 1024,
+                ..Default::default()
+            };
+            let engine = LsmEngine::open(options).unwrap();
+
+            // Index should exist after restart
+            assert!(engine.has_index("Product", "price"), "index should persist across restart");
+
+            // Index should be functional: lookup by value
+            let pkeys = engine.index_manager().lookup_eq(
+                "Product",
+                "price",
+                &serde_json::json!(999),
+            );
+            assert!(pkeys.is_some(), "index lookup should work after restart");
+            assert_eq!(pkeys.unwrap().len(), 1);
+
+            // Range scan should also work
+            let pkeys = engine.index_manager().lookup_range(
+                "Product",
+                "price",
+                Some(&serde_json::json!(500)),
+                Some(&serde_json::json!(1000)),
+            );
+            assert!(pkeys.is_some());
+            assert_eq!(pkeys.unwrap().len(), 2); // both products
+        }
     }
 }

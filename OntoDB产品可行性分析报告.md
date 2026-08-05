@@ -57,6 +57,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - **WAL 持久化**：每次 append 后 flush 到 OS 缓存，进程 crash 不丢数据
 - **Leveled Compaction**：L0 全量合并 → L1+ 逐级合并，去重保留最新版本，最底层 tombstone 可清理
 - **MVCC 事务**：快照隔离，写不阻塞读，事务写缓冲 + 提交时批量刷入 WAL，所有 SQL 操作自动走事务
+- **B+Tree 二级索引**：内存 B+Tree + LSM 持久化，支持等值/范围查询，自动回填/维护/去索引
 - **全局 seq_no**：引擎级序列号确保跨 MemTable flush 的版本顺序正确
 
 ### 本体引擎详情
@@ -81,6 +82,8 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - WHERE 条件：`=`, `!=`, `<>`, `>`, `<`, `>=`, `<=`, `LIKE`, `BETWEEN`, `IN`, `AND`, `OR`
 - `UPDATE <class> SET ... WHERE ...` — 数据更新（扫描+修改+重写，支持多字段多行）
 - `DELETE FROM <class> WHERE ...` — 数据删除（扫描+tombstone，支持条件删除和全表删除）
+- `CREATE INDEX ON <class> (<column>)` — 创建二级索引（自动回填已有数据）
+- `DROP INDEX ON <class> (<column>)` — 删除二级索引
 - `MATCH (<var>: <Class>) WHERE ... RETURN ...` — 语义匹配查询
 
 ---
