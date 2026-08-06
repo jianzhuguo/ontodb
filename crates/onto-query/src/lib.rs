@@ -8,6 +8,11 @@ pub mod optimizer;
 pub mod parser;
 pub mod sparql;
 
+#[cfg(test)]
+mod concurrent_bench;
+#[cfg(test)]
+mod binary_row_bench;
+
 pub use cache::{PlanCache, QueryCache, CacheStats};
 pub use executor::{QueryExecutor, QueryResult};
 pub use optimizer::{CostEstimate, CostModel, ExecutionPlan, PlanNode, QueryPlanner};

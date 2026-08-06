@@ -5,6 +5,7 @@
 //! - Error types
 //! - Core traits for storage engines
 
+pub mod binary_row;
 pub mod error;
 pub mod types;
 pub mod value;

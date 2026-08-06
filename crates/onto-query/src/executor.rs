@@ -5,10 +5,228 @@ use crate::optimizer::QueryPlanner;
 use crate::parser::{AggregateFunc, ArithmeticOp, FilterExpr, LiteralValue, QueryAst, SelectColumns, SelectItem, ValueExpr, WindowExpr, WindowFunc};
 use crate::optimizer::{ExecutionPlan, PlanNode};
 use onto_core::{CoreError, Result};
+use onto_core::binary_row::BinaryRow;
 use onto_ontology::{DataType, OntologyStore, Reasoner};
 use onto_storage::LsmEngine;
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+
+/// Parse a storage row from bytes. Tries binary format first (fast), then falls back to JSON.
+/// Returns None if parsing fails or result is not a JSON object.
+#[inline]
+fn simd_parse_row(bytes: &[u8]) -> Option<Map<String, Value>> {
+    // Try binary format first (P2 optimization)
+    if let Some(row) = BinaryRow::parse(bytes) {
+        return row.to_map();
+    }
+    // Fall back to simd-json
+    let mut buf = bytes.to_vec();
+    match simd_json::to_owned_value(&mut buf) {
+        Ok(val) => owned_value_to_serde(val),
+        Err(_) => None,
+    }
+}
+
+/// Convert simd_json OwnedValue to serde_json Value.
+fn owned_value_to_serde(val: simd_json::OwnedValue) -> Option<Map<String, Value>> {
+    use simd_json::OwnedValue as SVal;
+    match val {
+        SVal::Object(map) => {
+            let mut out = Map::with_capacity(map.len());
+            for (k, v) in map.into_iter() {
+                out.insert(k.into(), simd_val_to_serde(v));
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn simd_val_to_serde(val: simd_json::OwnedValue) -> Value {
+    use simd_json::OwnedValue as SVal;
+    match val {
+        SVal::Static(s) => match s {
+            simd_json::StaticNode::Null => Value::Null,
+            simd_json::StaticNode::Bool(b) => Value::Bool(b),
+            simd_json::StaticNode::I64(n) => serde_json::json!(n),
+            simd_json::StaticNode::U64(n) => serde_json::json!(n),
+            simd_json::StaticNode::F64(n) => serde_json::json!(n),
+        },
+        SVal::String(s) => Value::String(s.into()),
+        SVal::Array(arr) => Value::Array(arr.into_iter().map(simd_val_to_serde).collect()),
+        SVal::Object(map) => {
+            let mut out = Map::with_capacity(map.len());
+            for (k, v) in map.into_iter() {
+                out.insert(k.into(), simd_val_to_serde(v));
+            }
+            Value::Object(out)
+        }
+    }
+}
+
+/// Evaluate a FilterExpr directly on a BinaryRow without creating a Map.
+/// Returns Some(true/false) if the filter could be fully evaluated,
+/// or None if it requires full deserialization (e.g., Like, subqueries).
+fn eval_binary_filter(row: &BinaryRow, expr: &FilterExpr) -> Option<bool> {
+    match expr {
+        FilterExpr::Eq(col, lit) => {
+            let idx = row.find_field(col)?;
+            let (tag, raw) = row.field_value_raw(idx);
+            Some(binary_lit_eq(tag, raw, lit))
+        }
+        FilterExpr::Ne(col, lit) => {
+            let idx = row.find_field(col)?;
+            let (tag, raw) = row.field_value_raw(idx);
+            Some(!binary_lit_eq(tag, raw, lit))
+        }
+        FilterExpr::Gt(col, lit) => {
+            let idx = row.find_field(col)?;
+            let (tag, raw) = row.field_value_raw(idx);
+            binary_lit_ord(tag, raw, lit).map(|ord| ord == std::cmp::Ordering::Greater)
+        }
+        FilterExpr::Lt(col, lit) => {
+            let idx = row.find_field(col)?;
+            let (tag, raw) = row.field_value_raw(idx);
+            binary_lit_ord(tag, raw, lit).map(|ord| ord == std::cmp::Ordering::Less)
+        }
+        FilterExpr::Gte(col, lit) => {
+            let idx = row.find_field(col)?;
+            let (tag, raw) = row.field_value_raw(idx);
+            binary_lit_ord(tag, raw, lit).map(|ord| ord != std::cmp::Ordering::Less)
+        }
+        FilterExpr::Lte(col, lit) => {
+            let idx = row.find_field(col)?;
+            let (tag, raw) = row.field_value_raw(idx);
+            binary_lit_ord(tag, raw, lit).map(|ord| ord != std::cmp::Ordering::Greater)
+        }
+        FilterExpr::IsNull(col) => {
+            let idx = row.find_field(col)?;
+            Some(row.field_type(idx) == onto_core::binary_row::TAG_NULL)
+        }
+        FilterExpr::IsNotNull(col) => {
+            let idx = row.find_field(col)?;
+            Some(row.field_type(idx) != onto_core::binary_row::TAG_NULL)
+        }
+        FilterExpr::In(col, values) => {
+            let idx = row.find_field(col)?;
+            let (tag, raw) = row.field_value_raw(idx);
+            Some(values.iter().any(|lit| binary_lit_eq(tag, raw, lit)))
+        }
+        FilterExpr::Between(col, low, high) => {
+            let idx = row.find_field(col)?;
+            let (tag, raw) = row.field_value_raw(idx);
+            let ge_low = binary_lit_ord(tag, raw, low)
+                .map(|ord| ord != std::cmp::Ordering::Less)
+                .unwrap_or(false);
+            let le_high = binary_lit_ord(tag, raw, high)
+                .map(|ord| ord != std::cmp::Ordering::Greater)
+                .unwrap_or(false);
+            Some(ge_low && le_high)
+        }
+        FilterExpr::And(l, r) => {
+            let lv = eval_binary_filter(row, l)?;
+            if !lv { return Some(false); }
+            eval_binary_filter(row, r)
+        }
+        FilterExpr::Or(l, r) => {
+            let lv = eval_binary_filter(row, l)?;
+            if lv { return Some(true); }
+            eval_binary_filter(row, r)
+        }
+        FilterExpr::Not(e) => {
+            let v = eval_binary_filter(row, e)?;
+            Some(!v)
+        }
+        // Like requires pattern matching on strings — extract and delegate
+        FilterExpr::Like(col, pattern) => {
+            let s = row.get_str(col)?;
+            Some(QueryExecutor::like_match(s, pattern))
+        }
+        // Subqueries need engine access — can't evaluate here
+        FilterExpr::InSubquery(..) | FilterExpr::Exists(..) | FilterExpr::NotExists(..) => None,
+    }
+}
+
+/// Compare binary field value with a LiteralValue for equality.
+fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
+    use onto_core::binary_row::{TAG_NULL, TAG_BOOL, TAG_INT, TAG_FLOAT, TAG_STRING, parse_string_value};
+    match (tag, lit) {
+        (TAG_NULL, LiteralValue::Null) => true,
+        (TAG_NULL, _) => false,
+        (_, LiteralValue::Null) => false,
+        (TAG_BOOL, LiteralValue::Bool(b)) => raw.first().map_or(false, |v| (*v != 0) == *b),
+        (TAG_INT, LiteralValue::Int(n)) => {
+            if let Ok(arr) = <[u8; 8]>::try_from(raw) {
+                i64::from_be_bytes(arr) == *n
+            } else { false }
+        }
+        (TAG_INT, LiteralValue::Float(n)) => {
+            if let Ok(arr) = <[u8; 8]>::try_from(raw) {
+                (i64::from_be_bytes(arr) as f64) == *n
+            } else { false }
+        }
+        (TAG_FLOAT, LiteralValue::Float(n)) => {
+            if let Ok(arr) = <[u8; 8]>::try_from(raw) {
+                f64::from_be_bytes(arr) == *n
+            } else { false }
+        }
+        (TAG_FLOAT, LiteralValue::Int(n)) => {
+            if let Ok(arr) = <[u8; 8]>::try_from(raw) {
+                f64::from_be_bytes(arr) == (*n as f64)
+            } else { false }
+        }
+        (TAG_STRING, LiteralValue::String(s)) => {
+            parse_string_value(raw).map_or(false, |v| v == s.as_str())
+        }
+        _ => false,
+    }
+}
+
+/// Compare binary field value with a LiteralValue for ordering.
+fn binary_lit_ord(tag: u8, raw: &[u8], lit: &LiteralValue) -> Option<std::cmp::Ordering> {
+    use onto_core::binary_row::{TAG_INT, TAG_FLOAT, TAG_STRING, parse_string_value};
+    match (tag, lit) {
+        (TAG_INT, LiteralValue::Int(n)) => {
+            let arr: [u8; 8] = raw.try_into().ok()?;
+            Some(i64::from_be_bytes(arr).cmp(n))
+        }
+        (TAG_INT, LiteralValue::Float(n)) => {
+            let arr: [u8; 8] = raw.try_into().ok()?;
+            (i64::from_be_bytes(arr) as f64).partial_cmp(n)
+        }
+        (TAG_FLOAT, LiteralValue::Float(n)) => {
+            let arr: [u8; 8] = raw.try_into().ok()?;
+            f64::from_be_bytes(arr).partial_cmp(n)
+        }
+        (TAG_FLOAT, LiteralValue::Int(n)) => {
+            let arr: [u8; 8] = raw.try_into().ok()?;
+            f64::from_be_bytes(arr).partial_cmp(&(*n as f64))
+        }
+        (TAG_STRING, LiteralValue::String(s)) => {
+            parse_string_value(raw).map(|v| v.cmp(s.as_str()))
+        }
+        _ => None,
+    }
+}
+
+/// Convert a document to storage bytes. Uses binary format for fast scan/filter.
+fn doc_to_storage_bytes(doc: &Map<String, Value>) -> Vec<u8> {
+    onto_core::binary_row::map_to_binary(doc)
+}
+
+/// Parse storage bytes back to a Map. Handles both binary and legacy JSON formats.
+fn storage_bytes_to_doc(bytes: &[u8]) -> Option<Map<String, Value>> {
+    // Try binary format first
+    if let Some(row) = BinaryRow::parse(bytes) {
+        return row.to_map();
+    }
+    // Fall back to JSON
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(Value::Object(doc)) => Some(doc),
+        _ => None,
+    }
+}
+
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Mutex};
 use std::time::Duration;
@@ -153,6 +371,12 @@ impl QueryExecutor {
         self.engine.read().ok().map(|e| e.stats())
     }
 
+    /// Access the engine for benchmarks (read lock).
+    #[cfg(test)]
+    pub(crate) fn engine(&self) -> std::sync::RwLockReadGuard<'_, onto_storage::LsmEngine> {
+        self.engine.read().unwrap()
+    }
+
     /// Get a reference to the query planner.
     pub fn planner(&self) -> std::sync::RwLockReadGuard<'_, QueryPlanner> {
         self.planner.read().unwrap()
@@ -181,7 +405,7 @@ impl QueryExecutor {
 
     /// Returns schema introspection data: all ontologies, classes, properties, and indexes.
     pub fn schema_info(&self) -> Result<serde_json::Value> {
-        let mut engine = self.engine.write().map_err(|e| {
+        let engine = self.engine.read().map_err(|e| {
             CoreError::Custom(format!("engine lock poisoned: {}", e))
         })?;
 
@@ -273,25 +497,45 @@ impl QueryExecutor {
         self.active_txn.lock().unwrap().is_some()
     }
 
-    /// Executes a query and returns results as JSON.
+    /// Classifies whether a query is read-only (can use a read lock).
+    /// Returns true for SELECT, EXPLAIN, ANALYZE, MATCH, VectorSearch.
+    pub fn is_read_only_query(ast: &QueryAst) -> bool {
+        matches!(ast,
+            QueryAst::Select { .. }
+            | QueryAst::Explain { .. }
+            | QueryAst::Analyze { .. }
+            | QueryAst::Match { .. }
+            | QueryAst::VectorSearch { .. }
+        )
+    }
+
+    /// Executes a query with a write lock (default path, full feature support).
+    /// Supports all query types including subqueries, CTEs, materialized views,
+    /// expressions, and transactions.
     pub fn execute(&self, ast: &QueryAst) -> Result<QueryResult> {
-        // Acquire engine lock once at the top level to avoid deadlocks
-        // when subqueries re-enter execute().
         let mut engine = self.engine.write().map_err(|e| {
             CoreError::Custom(format!("engine lock poisoned: {}", e))
         })?;
-        self.execute_with_engine(ast, &mut engine)
+        self.execute_write_with_engine(ast, &mut engine)
     }
 
-    /// Internal execution with engine reference passed through.
-    /// Each statement runs in its own auto-committed transaction.
-    /// For SELECT queries, checks plan cache first.
-    fn execute_with_engine(&self, ast: &QueryAst, engine: &mut LsmEngine) -> Result<QueryResult> {
+    /// Executes a read-only query with a read lock, allowing concurrent SELECT execution.
+    /// Use this for pure SELECT queries that don't need subqueries in WHERE,
+    /// materialized views, CTEs, or expression evaluation.
+    /// Multiple `execute_read` calls can run concurrently.
+    pub fn execute_read(&self, ast: &QueryAst) -> Result<QueryResult> {
+        let engine = self.engine.read().map_err(|e| {
+            CoreError::Custom(format!("engine lock poisoned: {}", e))
+        })?;
+        self.execute_select_read(ast, &engine)
+    }
+
+    /// Write-path execution: acquires write lock, handles timeout+stats+transactions.
+    fn execute_write_with_engine(&self, ast: &QueryAst, engine: &mut LsmEngine) -> Result<QueryResult> {
         let start_time = std::time::Instant::now();
 
         let result = self.execute_with_engine_inner(ast, engine);
 
-        // Check for timeout
         let elapsed = start_time.elapsed();
         if elapsed > self.config.query_timeout {
             return Err(CoreError::Custom(format!(
@@ -300,13 +544,11 @@ impl QueryExecutor {
             )));
         }
 
-        // Track runtime statistics
         let elapsed_us = elapsed.as_micros() as u64;
         {
             let mut stats = self.runtime_stats.lock().unwrap();
             stats.total_queries += 1;
             stats.total_time_us += elapsed_us;
-            // Track table access for SELECT queries
             if let QueryAst::Select { from, .. } = ast {
                 *stats.table_scan_counts.entry(from.clone()).or_insert(0) += 1;
             }
@@ -315,7 +557,121 @@ impl QueryExecutor {
         result
     }
 
-    /// Inner execution logic.
+    /// Read-path execution for SELECT queries: uses read lock, no transaction overhead.
+    /// Multiple SELECT queries can run concurrently.
+    fn execute_select_read(&self, ast: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
+        let start_time = std::time::Instant::now();
+
+        let result = match ast {
+            QueryAst::Select { .. } => {
+                // Check plan cache first
+                let cached_plan = {
+                    let ast_hash = Self::hash_ast(ast);
+                    let cached = self.plan_cache.lock().unwrap().get(ast_hash);
+                    if cached.is_some() {
+                        self.runtime_stats.lock().unwrap().plan_cache_hits += 1;
+                        cached
+                    } else {
+                        let plan = self.planner.read().unwrap().plan(ast);
+                        if let Ok(ref p) = plan {
+                            self.plan_cache.lock().unwrap().insert(ast_hash, p.clone());
+                        }
+                        self.runtime_stats.lock().unwrap().plan_cache_misses += 1;
+                        plan.ok()
+                    }
+                };
+
+                if let Some(plan) = cached_plan {
+                    let plan_result = self.execute_plan_read(&plan, engine)?;
+                    let mut rows = match plan_result {
+                        QueryResult::Rows(r) => r,
+                        other => return Ok(other),
+                    };
+
+                    // Post-processing
+                    if let QueryAst::Select {
+                        distinct, columns, group_by, having, order_by, limit, offset, ..
+                    } = ast {
+                        let has_aggregates = Self::columns_have_aggregates(columns);
+                        if group_by.is_some() || has_aggregates {
+                            let result = self.execute_aggregation_read(engine, columns, &rows, group_by.as_ref(), having, order_by, *limit)?;
+                            if let QueryResult::Rows(mut agg_rows) = result {
+                                if *distinct { Self::dedup_rows(&mut agg_rows); }
+                                return Ok(QueryResult::Rows(agg_rows));
+                            }
+                            return Ok(result);
+                        }
+
+                        if let SelectColumns::Columns(items) = columns {
+                            let window_exprs: Vec<&WindowExpr> = items.iter().filter_map(|item| {
+                                if let SelectItem::WindowFunction(w) = item { Some(w) } else { None }
+                            }).collect();
+                            if !window_exprs.is_empty() {
+                                Self::execute_window_functions(&mut rows, &window_exprs);
+                            }
+                        }
+
+                        if *distinct { Self::dedup_rows(&mut rows); }
+
+                        if let Some(off) = offset {
+                            if *off < rows.len() {
+                                rows = rows.split_off(*off);
+                            } else {
+                                rows.clear();
+                            }
+                        }
+                        if let Some(lim) = limit {
+                            rows.truncate(*lim);
+                        }
+                    }
+
+                    Ok(QueryResult::Rows(rows))
+                } else {
+                    // Plan generation failed, return error
+                    Err(CoreError::Custom("failed to generate execution plan".to_string()))
+                }
+            }
+            QueryAst::Explain { query } => {
+                self.execute_explain_read(query, engine)
+            }
+            QueryAst::Analyze { table } => {
+                self.execute_analyze_read(table, engine)
+            }
+            QueryAst::Match { variable, class, filter, returns } => {
+                self.execute_match_read(engine, variable, class, filter, returns)
+            }
+            QueryAst::VectorSearch { class, column, query_vector, top_k, filter } => {
+                self.execute_vector_search_read(engine, class, column, query_vector, *top_k, filter)
+            }
+            _ => Err(CoreError::Custom("unexpected query type in read path".to_string())),
+        };
+
+        let elapsed = start_time.elapsed();
+        if elapsed > self.config.query_timeout {
+            return Err(CoreError::Custom(format!(
+                "query timeout: exceeded {} seconds",
+                self.config.query_timeout.as_secs()
+            )));
+        }
+
+        let elapsed_us = elapsed.as_micros() as u64;
+        {
+            let mut stats = self.runtime_stats.lock().unwrap();
+            stats.total_queries += 1;
+            stats.total_time_us += elapsed_us;
+            if let QueryAst::Select { from, .. } = ast {
+                *stats.table_scan_counts.entry(from.clone()).or_insert(0) += 1;
+            }
+        }
+
+        result
+    }
+
+    /// Lock-free execution dispatch. Called by execute_write_with_engine and execute_select_read.
+    /// Does NOT acquire any engine lock — the caller must hold one.
+    /// Lock-free execution dispatch. Called by execute_write_with_engine and execute_select_read.
+    /// Does NOT acquire any engine lock — the caller must hold one.
+    /// Recursive callers (explain, CTE, union, filters) call this directly.
     fn execute_with_engine_inner(&self, ast: &QueryAst, engine: &mut LsmEngine) -> Result<QueryResult> {
         match ast {
             QueryAst::Explain { query } => {
@@ -349,6 +705,7 @@ impl QueryExecutor {
             }
             QueryAst::CreateIndex { class, column } => {
                 engine.create_index(class, column)?;
+                self.refresh_index_stats(engine, class);
                 Ok(QueryResult::Success(format!(
                     "Index created on {}.{}", class, column
                 )))
@@ -359,6 +716,7 @@ impl QueryExecutor {
                 for col in columns {
                     engine.create_index(class, col)?;
                 }
+                self.refresh_index_stats(engine, class);
                 Ok(QueryResult::Success(format!(
                     "Composite index created on {} ({})", class, columns.join(", ")
                 )))
@@ -410,14 +768,13 @@ impl QueryExecutor {
             }
             QueryAst::CreateMaterializedView { name, query } => {
                 // Execute the query and store results as a materialized view
-                let result = self.execute_with_engine(query, engine)?;
+                let result = self.execute_with_engine_inner(query, engine)?;
                 if let QueryResult::Rows(rows) = result {
                     let prefix = format!("__mv_{}::", name.to_lowercase());
                     let row_count = rows.len();
                     for (i, row) in rows.iter().enumerate() {
                         let key = format!("{}{:010}", prefix, i);
-                        let value = serde_json::to_vec(&serde_json::Value::Object(row.clone()))
-                            .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                        let value = doc_to_storage_bytes(&row);
                         engine.put(key.as_bytes().to_vec(), value)?;
                     }
                     // Store metadata with original query for incremental refresh
@@ -441,10 +798,9 @@ impl QueryExecutor {
                 let existing = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
                 let count = existing.len();
                 for (key, _) in existing {
-                    let _ = engine.put(key, b"__deleted__".to_vec());
+                    engine.delete(key)?;
                 }
-                // Also remove metadata
-                let _ = engine.put(meta_key.as_bytes().to_vec(), b"__deleted__".to_vec());
+                engine.delete(meta_key.as_bytes().to_vec())?;
                 if count > 0 {
                     Ok(QueryResult::Success(format!(
                         "Materialized view '{}' dropped ({} rows removed)", name, count
@@ -473,25 +829,27 @@ impl QueryExecutor {
                 // Deserialize the query AST from JSON
                 let query_ast: QueryAst = serde_json::from_str(&query_json)
                     .map_err(|e| CoreError::Serialization(format!("failed to deserialize query: {}", e)))?;
-                let result = self.execute_with_engine(&query_ast, engine)?;
+                let result = self.execute_with_engine_inner(&query_ast, engine)?;
 
                 if let QueryResult::Rows(new_rows) = result {
                     // Get existing rows for comparison
                     let existing = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
-                    let old_count = existing.len();
                     let new_count = new_rows.len();
 
-                    // Build a set of old row JSON strings for comparison
-                    let mut old_row_set: std::collections::HashMap<String, (Vec<u8>, Vec<u8>)> = std::collections::HashMap::new();
+                    // Build a set of old row JSON strings for comparison.
+                    // Strip internal fields (__pk__, __class__) before comparison
+                    // because __pk__ contains a sequence number that changes between queries.
+                    let mut old_row_set: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
                     for (key, val_bytes) in existing {
-                        // Use the JSON string as the comparison key
-                        if let Ok(json_str) = std::str::from_utf8(&val_bytes) {
-                            old_row_set.insert(json_str.to_string(), (key, val_bytes));
+                        if let Some(mut obj) = storage_bytes_to_doc(&val_bytes) {
+                            Self::strip_internal_fields(&mut obj);
+                            if let Ok(stripped_json) = serde_json::to_string(&serde_json::Value::Object(obj)) {
+                                old_row_set.insert(stripped_json, key);
+                            }
                         }
                     }
 
                     let mut added = 0;
-                    let mut updated = 0;
                     let mut unchanged = 0;
 
                     // Track which old rows are still present
@@ -499,37 +857,34 @@ impl QueryExecutor {
 
                     for (i, row) in new_rows.iter().enumerate() {
                         let key = format!("{}{:010}", prefix, i);
-                        let value = serde_json::to_vec(&serde_json::Value::Object(row.clone()))
-                            .map_err(|e| CoreError::Serialization(e.to_string()))?;
-                        let json_str = serde_json::to_string(&serde_json::Value::Object(row.clone()))
+                        let value = doc_to_storage_bytes(&row);
+                        // Strip internal fields for comparison (same as old rows)
+                        let mut stripped_row = row.clone();
+                        Self::strip_internal_fields(&mut stripped_row);
+                        let json_str = serde_json::to_string(&serde_json::Value::Object(stripped_row))
                             .map_err(|e| CoreError::Serialization(e.to_string()))?;
 
                         if old_row_set.contains_key(&json_str) {
                             seen_old_jsons.insert(json_str);
                             unchanged += 1;
                         } else {
-                            // Row is new or changed
-                            engine.put(key.as_bytes().to_vec(), value)?;
-                            if i < old_count {
-                                updated += 1;
-                            } else {
-                                added += 1;
-                            }
+                            added += 1;
                         }
+                        engine.put(key.as_bytes().to_vec(), value)?;
                     }
 
                     // Remove rows that no longer exist in the new result
                     let mut removed = 0;
-                    for (json_str, (old_key, _)) in old_row_set {
+                    for (json_str, old_key) in old_row_set {
                         if !seen_old_jsons.contains(&json_str) {
-                            engine.put(old_key, b"__deleted__".to_vec())?;
+                            engine.delete(old_key)?;
                             removed += 1;
                         }
                     }
 
                     Ok(QueryResult::Success(format!(
-                        "Materialized view '{}' refreshed: {} added, {} updated, {} removed, {} unchanged (total: {})",
-                        name, added, updated, removed, unchanged, new_count
+                        "Materialized view '{}' refreshed: {} added, {} removed, {} unchanged (total: {})",
+                        name, added, removed, unchanged, new_count
                     )))
                 } else {
                     Ok(QueryResult::Success(format!(
@@ -840,7 +1195,7 @@ impl QueryExecutor {
             let mut rows = Vec::new();
             for (_key, val_bytes) in &cte_entries {
                 if val_bytes == b"__deleted__" { continue; }
-                if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                if let Some(doc) = storage_bytes_to_doc(val_bytes) {
                     rows.push(doc);
                 }
             }
@@ -856,7 +1211,7 @@ impl QueryExecutor {
             let mut rows = Vec::new();
             for (_key, val_bytes) in &mv_entries {
                 if val_bytes == b"__deleted__" { continue; }
-                if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                if let Some(doc) = storage_bytes_to_doc(val_bytes) {
                     rows.push(doc);
                 }
             }
@@ -871,24 +1226,57 @@ impl QueryExecutor {
         // Semantic optimization: narrow scan scope using __class__ filter and disjoint constraints
         let scan_classes = self.narrow_scan_scope(engine, table, filter, &class_hierarchy);
 
+        // Pre-extract simple filter column names for fast byte-level rejection.
+        let fast_filter_cols = Self::extract_fast_filter_columns(filter);
+
         let mut rows = Vec::new();
         for scan_class in &scan_classes {
             let prefix = format!("{}::", scan_class);
             let entries = engine.scan_prefix(prefix.as_bytes())?;
             for (key, val_bytes) in &entries {
-                if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
-                    if scan_classes.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
-                        // Store primary key for DELETE/UPDATE operations
+                // Tier 1: fast byte-level rejection (definitely doesn't match → skip)
+                if !fast_filter_cols.is_empty() {
+                    if Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
+                        continue;
+                    }
+                }
+                // Tier 2: BinaryRow path (for binary-stored data) — no JSON parsing
+                if let Some(brow) = BinaryRow::parse(val_bytes) {
+                    if !brow.class_in_hierarchy(&scan_classes) {
+                        continue;
+                    }
+                    if let Some(f) = filter {
+                        match eval_binary_filter(&brow, f) {
+                            Some(true) => {}
+                            Some(false) => continue,
+                            None => {
+                                if let Some(mut doc) = brow.to_map() {
+                                    if !self.eval_filter(engine, &doc, f) { continue; }
+                                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                                    rows.push(doc);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(mut doc) = brow.to_map() {
                         doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
                         rows.push(doc);
                     }
+                    continue;
+                }
+                // Tier 3: JSON fallback (legacy data stored as JSON)
+                if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                    if !scan_classes.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                        continue;
+                    }
+                    if let Some(f) = filter {
+                        if !self.eval_filter(engine, &doc, f) { continue; }
+                    }
+                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                    rows.push(doc);
                 }
             }
-        }
-
-        // Apply filter if present (with class hierarchy and property inference)
-        if let Some(f) = filter {
-            rows.retain(|row| self.eval_filter(engine, row, f));
         }
 
         // Apply alias to column names if specified
@@ -993,7 +1381,7 @@ impl QueryExecutor {
                 let prefix = format!("{}::", scan_class);
                 let entries = engine.scan_prefix(prefix.as_bytes())?;
                 for (key, val_bytes) in &entries {
-                    if let Ok(serde_json::Value::Object(ref doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                    if let Some(ref doc) = storage_bytes_to_doc(val_bytes) {
                         if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
                             if self.eval_filter(engine, doc, f) {
                                 allowed_ids.insert(key.clone());
@@ -1010,7 +1398,7 @@ impl QueryExecutor {
         let mut rows = Vec::new();
         for result in &search_results {
             if let Ok(Some(val_bytes)) = engine.get(&result.entry.id) {
-                if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(&val_bytes) {
+                if let Some(mut doc) = storage_bytes_to_doc(&val_bytes) {
                     doc.insert("_distance".to_string(), serde_json::json!(result.distance));
                     rows.push(doc);
                 }
@@ -1477,7 +1865,7 @@ impl QueryExecutor {
 
         // Check if this is EXPLAIN ANALYZE (the query is the inner query)
         let start = std::time::Instant::now();
-        let actual_result = self.execute_with_engine(query, engine);
+        let actual_result = self.execute_with_engine_inner(query, engine);
         let elapsed = start.elapsed();
 
         let actual_rows = match &actual_result {
@@ -1518,7 +1906,7 @@ impl QueryExecutor {
             let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
 
             for (_key, val_bytes) in &entries {
-                if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                if let Some(doc) = simd_parse_row(val_bytes) {
                     if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
                         row_count += 1;
                         for (col_name, col_value) in &doc {
@@ -1597,6 +1985,1229 @@ impl QueryExecutor {
         Ok(QueryResult::Rows(result_rows))
     }
 
+    // ── Read-only variants for concurrent SELECT path (&LsmEngine) ──
+
+    /// Read-only EXPLAIN: generates execution plan, runs inner query via read path.
+    fn execute_explain_read(&self, query: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
+        let plan = self.planner.read().unwrap().plan(query)?;
+        let description = plan.describe();
+
+        let start = std::time::Instant::now();
+        let actual_result = self.execute_select_read(query, engine);
+        let elapsed = start.elapsed();
+
+        let actual_rows = match &actual_result {
+            Ok(QueryResult::Rows(rows)) => rows.len(),
+            _ => 0,
+        };
+
+        let plan_json = json!({
+            "plan": format_plan_node(&plan.root),
+            "cost": {
+                "total": plan.cost.total_cost,
+                "io": plan.cost.io_cost,
+                "cpu": plan.cost.cpu_cost,
+                "estimated_rows": plan.cost.rows,
+                "actual_rows": actual_rows,
+                "actual_time_ms": elapsed.as_secs_f64() * 1000.0,
+            },
+            "uses_index": plan.uses_index,
+            "is_sorted": plan.is_sorted,
+            "description": description,
+        });
+
+        Ok(QueryResult::Rows(vec![Map::from_iter(vec![
+            ("plan".to_string(), plan_json),
+        ])]))
+    }
+
+    /// Read-only ANALYZE: collects table statistics without engine mutation.
+    fn execute_analyze_read(&self, table: &str, engine: &LsmEngine) -> Result<QueryResult> {
+        let class_hierarchy = self.get_class_hierarchy_read(engine, table);
+        let mut row_count = 0u64;
+        let mut column_stats: std::collections::HashMap<String, ColumnStats> = std::collections::HashMap::new();
+
+        for scan_class in &class_hierarchy {
+            let prefix = format!("{}::", scan_class);
+            let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
+            for (_key, val_bytes) in &entries {
+                if let Some(doc) = simd_parse_row(val_bytes) {
+                    if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                        row_count += 1;
+                        for (col_name, col_value) in &doc {
+                            if col_name == "__class__" { continue; }
+                            let stats = column_stats.entry(col_name.clone()).or_default();
+                            stats.non_null_count += 1;
+                            if stats.distinct_values.len() < 1000 {
+                                let val_str = match col_value {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    serde_json::Value::Number(n) => n.to_string(),
+                                    serde_json::Value::Bool(b) => b.to_string(),
+                                    _ => col_value.to_string(),
+                                };
+                                stats.distinct_values.insert(val_str);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut planner_stats = crate::optimizer::cost::TableStats {
+            row_count,
+            avg_row_size: 100,
+            block_count: (row_count / 100).max(1),
+            has_primary_index: false,
+            secondary_indexes: Vec::new(),
+            vector_indexes: Vec::new(),
+        };
+
+        for (col_name, col_stats) in &column_stats {
+            if engine.has_index(table, col_name) {
+                planner_stats.secondary_indexes.push(crate::optimizer::cost::IndexStats {
+                    column: col_name.clone(),
+                    cardinality: col_stats.distinct_values.len() as u64,
+                    is_sorted: true,
+                    tree_height: 3,
+                });
+            }
+        }
+
+        {
+            let mut stats = self.runtime_stats.lock().unwrap();
+            stats.table_row_counts.insert(table.to_string(), row_count);
+        }
+        self.planner.write().unwrap().update_stats(table.to_string(), planner_stats.clone());
+
+        let mut result_rows = Vec::new();
+        let mut summary = Map::new();
+        summary.insert("table".to_string(), Value::String(table.to_string()));
+        summary.insert("row_count".to_string(), Value::Number(serde_json::Number::from(row_count)));
+        result_rows.push(summary);
+
+        for (col_name, col_stats) in &column_stats {
+            let mut col_row = Map::new();
+            col_row.insert("column".to_string(), Value::String(col_name.clone()));
+            col_row.insert("non_null_count".to_string(), Value::Number(serde_json::Number::from(col_stats.non_null_count)));
+            col_row.insert("distinct_count".to_string(), Value::Number(serde_json::Number::from(col_stats.distinct_values.len() as u64)));
+            let selectivity = if col_stats.non_null_count > 0 {
+                col_stats.distinct_values.len() as f64 / col_stats.non_null_count as f64
+            } else {
+                0.0
+            };
+            col_row.insert("selectivity".to_string(), Value::Number(
+                serde_json::Number::from_f64(selectivity).unwrap_or(serde_json::Number::from(0))
+            ));
+            result_rows.push(col_row);
+        }
+
+        Ok(QueryResult::Rows(result_rows))
+    }
+
+    /// Refreshes planner stats for a table after index creation/deletion.
+    /// Scans the table to collect row count and index info, then updates the planner.
+    fn refresh_index_stats(&self, engine: &mut LsmEngine, table: &str) {
+        let class_hierarchy = self.get_class_hierarchy(engine, table);
+        let mut row_count: u64 = 0;
+        let mut column_stats: HashMap<String, ColumnStats> = HashMap::new();
+
+        for class_name in &class_hierarchy {
+            let prefix = format!("{}::", class_name);
+            if let Ok(entries) = engine.scan_prefix(prefix.as_bytes()) {
+                for (_key, val_bytes) in &entries {
+                    row_count += 1;
+                    if let Some(doc) = simd_parse_row(val_bytes) {
+                        for (col_name, col_val) in &doc {
+                            if col_name.starts_with("__") { continue; }
+                            let stats = column_stats.entry(col_name.clone()).or_insert_with(|| ColumnStats {
+                                non_null_count: 0,
+                                distinct_values: HashSet::new(),
+                            });
+                            stats.non_null_count += 1;
+                            let val_str = match col_val {
+                                Value::String(s) => s.clone(),
+                                other => format!("{}", other),
+                            };
+                            stats.distinct_values.insert(val_str);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut planner_stats = crate::optimizer::cost::TableStats {
+            row_count,
+            avg_row_size: 100,
+            block_count: (row_count / 100).max(1),
+            has_primary_index: false,
+            secondary_indexes: Vec::new(),
+            vector_indexes: Vec::new(),
+        };
+
+        for (col_name, col_stats) in &column_stats {
+            if engine.has_index(table, col_name) {
+                planner_stats.secondary_indexes.push(crate::optimizer::cost::IndexStats {
+                    column: col_name.clone(),
+                    cardinality: col_stats.distinct_values.len() as u64,
+                    is_sorted: true,
+                    tree_height: 3,
+                });
+            }
+        }
+
+        self.planner.write().unwrap().update_stats(table.to_string(), planner_stats);
+    }
+
+    /// Read-only plan execution with &LsmEngine.
+    fn execute_plan_read(&self, plan: &ExecutionPlan, engine: &LsmEngine) -> Result<QueryResult> {
+        let rows = self.execute_plan_node_read(&plan.root, engine)?;
+        self.check_memory_budget(&rows)?;
+        Ok(QueryResult::Rows(rows))
+    }
+
+    /// Read-only plan node execution with &LsmEngine.
+    fn execute_plan_node_read(&self, node: &PlanNode, engine: &LsmEngine) -> Result<Vec<Map<String, Value>>> {
+        match node {
+            PlanNode::SeqScan { table, alias, filter, .. } => {
+                self.plan_seq_scan_read(engine, table, alias.as_deref(), filter)
+            }
+            PlanNode::IndexScan { table, alias, index_column, filter, .. } => {
+                self.plan_index_scan_read(engine, table, alias.as_deref(), index_column, filter)
+            }
+            PlanNode::IndexLookup { table, alias, index_column, key, .. } => {
+                self.plan_index_lookup_read(engine, table, alias.as_deref(), index_column, key)
+            }
+            PlanNode::VectorSearch { table, column, query_vector, top_k, filter, .. } => {
+                self.plan_vector_search_read(engine, table, column, query_vector, *top_k, filter)
+            }
+            PlanNode::Filter { input, predicate, .. } => {
+                let mut rows = self.execute_plan_node_read(input, engine)?;
+                rows.retain(|row| self.eval_filter_read(engine, row, predicate));
+                Ok(rows)
+            }
+            PlanNode::Projection { input, columns, .. } => {
+                let raw_rows = self.execute_plan_node_read(input, engine)?;
+                let has_aggregates = Self::columns_have_aggregates(columns);
+                let has_expr = match columns {
+                    SelectColumns::Columns(items) => items.iter().any(|item| matches!(item, SelectItem::Expression(_))),
+                    _ => false,
+                };
+                if has_aggregates {
+                    Ok(raw_rows)
+                } else if has_expr {
+                    // Skip expression evaluation in read path (requires engine access for subqueries)
+                    let mut result = Vec::new();
+                    for raw_row in &raw_rows {
+                        let mut projected = Map::new();
+                        if let SelectColumns::Columns(items) = columns {
+                            for item in items {
+                                if let SelectItem::Column(col) = item {
+                                    let (real_col, alias_part) = if let Some(as_pos) = col.find(" as ") {
+                                        (&col[..as_pos], Some(col[as_pos + 4..].trim()))
+                                    } else {
+                                        (col.as_str(), None)
+                                    };
+                                    if let Some(val) = raw_row.get(real_col) {
+                                        let name = alias_part.unwrap_or(real_col);
+                                        let name = name.split('.').last().unwrap_or(name);
+                                        projected.insert(name.to_string(), val.clone());
+                                    }
+                                }
+                            }
+                        }
+                        result.push(projected);
+                    }
+                    Ok(result)
+                } else {
+                    let projected: Vec<Map<String, Value>> = raw_rows.iter()
+                        .map(|row| self.project_columns(row, columns))
+                        .collect();
+                    Ok(projected)
+                }
+            }
+            PlanNode::NestedLoopJoin { left, right, join_clause, .. } => {
+                let left_rows = self.execute_plan_node_read(left, engine)?;
+                let right_rows = self.execute_plan_node_read(right, engine)?;
+                Self::execute_nested_loop_join(left_rows, right_rows, join_clause)
+            }
+            PlanNode::HashJoin { left, right, join_clause, .. } => {
+                let left_rows = self.execute_plan_node_read(left, engine)?;
+                let right_rows = self.execute_plan_node_read(right, engine)?;
+                Self::execute_hash_join_rows(left_rows, right_rows, join_clause)
+            }
+            PlanNode::SortMergeJoin { left, right, join_clause, .. } => {
+                let left_rows = self.execute_plan_node_read(left, engine)?;
+                let right_rows = self.execute_plan_node_read(right, engine)?;
+                Self::execute_sort_merge_join_rows(left_rows, right_rows, join_clause)
+            }
+            PlanNode::Sort { input, order_by, .. } => {
+                let mut rows = self.execute_plan_node_read(input, engine)?;
+                for ob in order_by.iter().rev() {
+                    Self::sort_rows(&mut rows, &ob.column, ob.ascending);
+                }
+                Ok(rows)
+            }
+            PlanNode::Aggregation { input, .. } => {
+                self.execute_plan_node_read(input, engine)
+            }
+            PlanNode::Limit { input, .. } => {
+                self.execute_plan_node_read(input, engine)
+            }
+            PlanNode::Union { left, right, all, .. } => {
+                let mut left_rows = self.execute_plan_node_read(left, engine)?;
+                let right_rows = self.execute_plan_node_read(right, engine)?;
+                left_rows.extend(right_rows);
+                if !all {
+                    Self::dedup_rows(&mut left_rows);
+                }
+                Ok(left_rows)
+            }
+            PlanNode::WindowFunction { input, windows, .. } => {
+                let mut rows = self.execute_plan_node_read(input, engine)?;
+                let parser_windows: Vec<crate::parser::WindowExpr> = windows.iter().map(|w| {
+                    crate::parser::WindowExpr {
+                        func: w.func.clone(),
+                        arg: w.arg.clone(),
+                        over: w.over.clone(),
+                        alias: w.alias.clone(),
+                    }
+                }).collect();
+                let window_refs: Vec<&crate::parser::WindowExpr> = parser_windows.iter().collect();
+                Self::execute_window_functions(&mut rows, &window_refs);
+                Ok(rows)
+            }
+        }
+    }
+
+    /// Read-only sequential scan with &LsmEngine.
+    fn plan_seq_scan_read(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        alias: Option<&str>,
+        filter: &Option<FilterExpr>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let class_hierarchy = self.get_class_hierarchy_read(engine, table);
+
+        // Pre-extract simple filter column names for fast byte-level rejection.
+        // For a filter like `price > 5000`, we can extract the "price" field from
+        // raw JSON bytes and compare without full deserialization.
+        let fast_filter_cols = Self::extract_fast_filter_columns(filter);
+
+        let mut rows = Vec::new();
+        for scan_class in &class_hierarchy {
+            let prefix = format!("{}::", scan_class);
+            let entries = engine.scan_prefix(prefix.as_bytes())?;
+            for (key, val_bytes) in &entries {
+                // Tier 1: fast byte-level rejection
+                if !fast_filter_cols.is_empty() {
+                    if Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
+                        continue;
+                    }
+                }
+                // Tier 2: BinaryRow path (for binary-stored data) — no JSON parsing
+                if let Some(brow) = BinaryRow::parse(val_bytes) {
+                    if !brow.class_in_hierarchy(&class_hierarchy) {
+                        continue;
+                    }
+                    if let Some(f) = filter {
+                        match eval_binary_filter(&brow, f) {
+                            Some(true) => {}
+                            Some(false) => continue,
+                            None => {
+                                if let Some(mut doc) = brow.to_map() {
+                                    if !self.eval_filter_read(engine, &doc, f) { continue; }
+                                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                                    rows.push(doc);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(mut doc) = brow.to_map() {
+                        doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                        rows.push(doc);
+                    }
+                    continue;
+                }
+                // Tier 3: JSON fallback (legacy data stored as JSON)
+                if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                    if !class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                        continue;
+                    }
+                    if let Some(f) = filter {
+                        if !self.eval_filter_read(engine, &doc, f) { continue; }
+                    }
+                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                    rows.push(doc);
+                }
+            }
+        }
+
+        if let Some(a) = alias {
+            for row in &mut rows {
+                let keys: Vec<String> = row.keys().cloned().collect();
+                for key in keys {
+                    if key != "__class__" {
+                        if let Some(val) = row.remove(&key) {
+                            row.insert(format!("{}.{}", a, key), val.clone());
+                            row.insert(key, val);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
+    /// Extracts column names from simple comparison filters for fast byte-level rejection.
+    /// Returns columns that can be checked without full JSON deserialization.
+    fn extract_fast_filter_columns(filter: &Option<FilterExpr>) -> Vec<String> {
+        let mut cols = Vec::new();
+        if let Some(f) = filter {
+            Self::collect_filter_columns(f, &mut cols);
+        }
+        // Only use fast filter for non-system columns
+        cols.retain(|c| c != "__class__" && !c.starts_with("__"));
+        cols.dedup();
+        cols
+    }
+
+    fn collect_filter_columns(expr: &FilterExpr, cols: &mut Vec<String>) {
+        match expr {
+            FilterExpr::Eq(c, _)
+            | FilterExpr::Ne(c, _)
+            | FilterExpr::Gt(c, _)
+            | FilterExpr::Lt(c, _)
+            | FilterExpr::Gte(c, _)
+            | FilterExpr::Lte(c, _)
+            | FilterExpr::Like(c, _)
+            | FilterExpr::IsNull(c)
+            | FilterExpr::IsNotNull(c) => cols.push(c.clone()),
+            FilterExpr::Between(c, _, _) => cols.push(c.clone()),
+            FilterExpr::In(c, _) => cols.push(c.clone()),
+            FilterExpr::And(l, r) | FilterExpr::Or(l, r) => {
+                Self::collect_filter_columns(l, cols);
+                Self::collect_filter_columns(r, cols);
+            }
+            FilterExpr::Not(e) => Self::collect_filter_columns(e, cols),
+            _ => {}
+        }
+    }
+
+    /// Fast byte-level filter rejection: extracts the filter column value from raw JSON
+    /// bytes and checks the predicate without full deserialization.
+    /// Returns true if the row should be REJECTED (definitely doesn't match).
+    fn fast_filter_reject(
+        val_bytes: &[u8],
+        filter: &Option<FilterExpr>,
+        _fast_cols: &[String],
+    ) -> bool {
+        let Some(f) = filter else { return false };
+        Self::fast_filter_reject_expr(val_bytes, f)
+    }
+
+    fn fast_filter_reject_expr(val_bytes: &[u8], expr: &FilterExpr) -> bool {
+        match expr {
+            FilterExpr::Gt(col, lit)
+            | FilterExpr::Gte(col, lit)
+            | FilterExpr::Lt(col, lit)
+            | FilterExpr::Lte(col, lit) => {
+                if let Some(raw) = Self::extract_json_field(val_bytes, col) {
+                    if let Some(field_num) = Self::parse_json_number(raw) {
+                        if let Some(lit_num) = Self::literal_to_f64(lit) {
+                            let reject = match expr {
+                                FilterExpr::Gt(..) => field_num <= lit_num,
+                                FilterExpr::Gte(..) => field_num < lit_num,
+                                FilterExpr::Lt(..) => field_num >= lit_num,
+                                FilterExpr::Lte(..) => field_num > lit_num,
+                                _ => false,
+                            };
+                            return reject;
+                        }
+                    }
+                }
+                false
+            }
+            FilterExpr::Eq(col, lit) => {
+                if let Some(raw) = Self::extract_json_field(val_bytes, col) {
+                    match lit {
+                        LiteralValue::Int(n) => {
+                            if let Some(field_num) = Self::parse_json_number(raw) {
+                                return field_num != (*n as f64);
+                            }
+                        }
+                        LiteralValue::Float(n) => {
+                            if let Some(field_num) = Self::parse_json_number(raw) {
+                                return field_num != *n;
+                            }
+                        }
+                        LiteralValue::String(s) => {
+                            if let Some(field_str) = Self::parse_json_string(raw) {
+                                return field_str != s.as_str();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                false
+            }
+            FilterExpr::And(l, r) => {
+                // For AND: reject if either side rejects
+                Self::fast_filter_reject_expr(val_bytes, l)
+                    || Self::fast_filter_reject_expr(val_bytes, r)
+            }
+            _ => false,
+        }
+    }
+
+    /// Fast byte-level filter acceptance: checks if a row DEFINITELY matches the filter
+    /// without creating a Map<String, Value>. Returns true if the filter is fully resolved
+    /// and the row matches. Returns false if the filter can't be resolved at byte level
+    /// (caller must fall back to full deserialization).
+    fn fast_filter_accept(val_bytes: &[u8], filter: &Option<FilterExpr>) -> bool {
+        let Some(f) = filter else { return false };
+        Self::fast_filter_accept_expr(val_bytes, f)
+    }
+
+    fn fast_filter_accept_expr(val_bytes: &[u8], expr: &FilterExpr) -> bool {
+        match expr {
+            FilterExpr::Gt(col, lit)
+            | FilterExpr::Gte(col, lit)
+            | FilterExpr::Lt(col, lit)
+            | FilterExpr::Lte(col, lit) => {
+                if let Some(raw) = Self::extract_json_field(val_bytes, col) {
+                    if let Some(field_num) = Self::parse_json_number(raw) {
+                        if let Some(lit_num) = Self::literal_to_f64(lit) {
+                            return match expr {
+                                FilterExpr::Gt(..) => field_num > lit_num,
+                                FilterExpr::Gte(..) => field_num >= lit_num,
+                                FilterExpr::Lt(..) => field_num < lit_num,
+                                FilterExpr::Lte(..) => field_num <= lit_num,
+                                _ => false,
+                            };
+                        }
+                    }
+                }
+                false
+            }
+            FilterExpr::Eq(col, lit) => {
+                if let Some(raw) = Self::extract_json_field(val_bytes, col) {
+                    match lit {
+                        LiteralValue::Int(n) => {
+                            if let Some(field_num) = Self::parse_json_number(raw) {
+                                return field_num == (*n as f64);
+                            }
+                        }
+                        LiteralValue::Float(n) => {
+                            if let Some(field_num) = Self::parse_json_number(raw) {
+                                return field_num == *n;
+                            }
+                        }
+                        LiteralValue::String(s) => {
+                            if let Some(field_str) = Self::parse_json_string(raw) {
+                                return field_str == s;
+                            }
+                        }
+                        LiteralValue::Bool(b) => {
+                            let trimmed = raw.trim_ascii();
+                            return if *b { trimmed == b"true" } else { trimmed == b"false" };
+                        }
+                        _ => {}
+                    }
+                }
+                false
+            }
+            FilterExpr::And(l, r) => {
+                Self::fast_filter_accept_expr(val_bytes, l)
+                    && Self::fast_filter_accept_expr(val_bytes, r)
+            }
+            _ => false,
+        }
+    }
+
+    /// Extracts a field's raw JSON value from serialized bytes.
+    /// Looks for "field_name": <value> pattern.
+    /// Returns the raw bytes of the value (number, string with quotes, etc.).
+    fn extract_json_field<'a>(json_bytes: &'a [u8], field: &str) -> Option<&'a [u8]> {
+        let json_str = std::str::from_utf8(json_bytes).ok()?;
+        // Build the search pattern: "field_name":
+        let pattern = format!("\"{}\":", field);
+        let start = json_str.find(&pattern)?;
+        let value_start = start + pattern.len();
+        // Skip whitespace
+        let value_start = value_start + json_str[value_start..].chars()
+            .take_while(|c| c.is_whitespace())
+            .map(|c| c.len_utf8())
+            .sum::<usize>();
+        if value_start >= json_str.len() {
+            return None;
+        }
+        let rest = &json_str[value_start..];
+        let value_end = if rest.starts_with('"') {
+            // String value: find closing quote (handle escaped quotes)
+            let mut end = 1;
+            let bytes = rest.as_bytes();
+            while end < bytes.len() {
+                if bytes[end] == b'\\' {
+                    end += 2;
+                } else if bytes[end] == b'"' {
+                    end += 1;
+                    break;
+                } else {
+                    end += 1;
+                }
+            }
+            end
+        } else if rest.starts_with('[') {
+            // Array: find matching bracket
+            let mut depth = 0i32;
+            let mut end = 0;
+            for b in rest.bytes() {
+                match b {
+                    b'[' => depth += 1,
+                    b']' => { depth -= 1; if depth == 0 { end += 1; break; } }
+                    _ => {}
+                }
+                end += 1;
+            }
+            end
+        } else if rest.starts_with('{') {
+            // Object: find matching brace
+            let mut depth = 0i32;
+            let mut end = 0;
+            for b in rest.bytes() {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => { depth -= 1; if depth == 0 { end += 1; break; } }
+                    _ => {}
+                }
+                end += 1;
+            }
+            end
+        } else {
+            // Number, bool, null: read until comma or closing brace
+            rest.find(|c: char| c == ',' || c == '}' || c == ']').unwrap_or(rest.len())
+        };
+        Some(&json_bytes[value_start..value_start + value_end])
+    }
+
+    /// Parses a raw JSON number from bytes (without quotes).
+    fn parse_json_number(raw: &[u8]) -> Option<f64> {
+        let s = std::str::from_utf8(raw).ok()?;
+        s.trim().parse::<f64>().ok()
+    }
+
+    /// Parses a raw JSON string value (with quotes) and returns the inner content.
+    fn parse_json_string<'a>(raw: &'a [u8]) -> Option<&'a str> {
+        let s = std::str::from_utf8(raw).ok()?;
+        let s = s.trim();
+        if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+            Some(&s[1..s.len()-1])
+        } else {
+            None
+        }
+    }
+
+    /// Converts a LiteralValue to f64 for numeric comparison.
+    fn literal_to_f64(lit: &LiteralValue) -> Option<f64> {
+        match lit {
+            LiteralValue::Int(n) => Some(*n as f64),
+            LiteralValue::Float(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Read-only index scan with &LsmEngine.
+    fn plan_index_scan_read(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        alias: Option<&str>,
+        index_column: &str,
+        filter: &Option<FilterExpr>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let class_hierarchy = self.get_class_hierarchy_read(engine, table);
+
+        if let Some(f) = filter {
+            let mut all_pkeys: Vec<Vec<u8>> = Vec::new();
+            for scan_class in &class_hierarchy {
+                if engine.has_index(scan_class, index_column) {
+                    if let Some(pkeys) = Self::try_index_scan_single_read(engine, scan_class, f) {
+                        all_pkeys.extend(pkeys);
+                    }
+                }
+            }
+            if !all_pkeys.is_empty() {
+                let mut rows = Self::fetch_rows_by_pks_read(engine, &all_pkeys)?;
+                rows.retain(|row| {
+                    row.get("__class__")
+                        .and_then(|v| v.as_str())
+                        .map(|c| class_hierarchy.contains(c))
+                        .unwrap_or(false)
+                });
+                if let Some(a) = alias {
+                    Self::apply_alias(&mut rows, a);
+                }
+                return Ok(rows);
+            }
+        }
+
+        self.plan_seq_scan_read(engine, table, alias, filter)
+    }
+
+    /// Read-only index lookup with &LsmEngine.
+    fn plan_index_lookup_read(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        alias: Option<&str>,
+        index_column: &str,
+        key: &LiteralValue,
+    ) -> Result<Vec<Map<String, Value>>> {
+        if engine.has_index(table, index_column) {
+            let index_mgr = engine.index_manager();
+            let json_val = Self::literal_to_json_static(key);
+            let pkeys = index_mgr.lookup_eq_read(table, index_column, &json_val).unwrap_or_default();
+            let mut rows = Self::fetch_rows_by_pks_read(engine, &pkeys)?;
+            if let Some(a) = alias {
+                Self::apply_alias(&mut rows, a);
+            }
+            return Ok(rows);
+        }
+        Ok(Vec::new())
+    }
+
+    /// Read-only index scan attempt using in-memory index only.
+    fn try_index_scan_single_read(
+        engine: &LsmEngine,
+        class: &str,
+        filter: &FilterExpr,
+    ) -> Option<Vec<Vec<u8>>> {
+        let col = match filter {
+            FilterExpr::Eq(c, _)
+            | FilterExpr::Ne(c, _)
+            | FilterExpr::Gt(c, _)
+            | FilterExpr::Lt(c, _)
+            | FilterExpr::Gte(c, _)
+            | FilterExpr::Lte(c, _)
+            | FilterExpr::Between(c, _, _)
+            | FilterExpr::In(c, _)
+            | FilterExpr::IsNull(c)
+            | FilterExpr::IsNotNull(c) => c.clone(),
+            _ => return None,
+        };
+
+        if !engine.has_index(class, &col) {
+            return None;
+        }
+
+        let index_mgr = engine.index_manager();
+
+        let pkeys: Vec<Vec<u8>> = match filter {
+            FilterExpr::Eq(_, val) => {
+                let json_val = Self::literal_to_json_static(val);
+                index_mgr.lookup_eq_read(class, &col, &json_val).unwrap_or_default()
+            }
+            FilterExpr::Gt(_, val) => {
+                let json_val = Self::literal_to_json_static(val);
+                index_mgr.lookup_gt_read(class, &col, &json_val).unwrap_or_default()
+            }
+            FilterExpr::Lt(_, val) => {
+                let json_val = Self::literal_to_json_static(val);
+                index_mgr.lookup_lt_read(class, &col, &json_val).unwrap_or_default()
+            }
+            FilterExpr::Gte(_, val) => {
+                let json_val = Self::literal_to_json_static(val);
+                let tree = index_mgr.get_index(class, &col)?;
+                let encoded = onto_storage::IndexManager::encode_value(&json_val);
+                tree.gte_scan(&encoded)
+            }
+            FilterExpr::Lte(_, val) => {
+                let json_val = Self::literal_to_json_static(val);
+                let tree = index_mgr.get_index(class, &col)?;
+                let encoded = onto_storage::IndexManager::encode_value(&json_val);
+                tree.lte_scan(&encoded)
+            }
+            FilterExpr::Between(_, low, high) => {
+                let low_json = Self::literal_to_json_static(low);
+                let high_json = Self::literal_to_json_static(high);
+                index_mgr.lookup_range_read(class, &col, Some(&low_json), Some(&high_json)).unwrap_or_default()
+            }
+            FilterExpr::In(_, values) => {
+                let mut all_pkeys = Vec::new();
+                for val in values {
+                    let json_val = Self::literal_to_json_static(val);
+                    if let Some(pks) = index_mgr.lookup_eq_read(class, &col, &json_val) {
+                        all_pkeys.extend(pks);
+                    }
+                }
+                all_pkeys
+            }
+            _ => return None,
+        };
+
+        Some(pkeys)
+    }
+
+    /// Fetches rows by primary keys using &LsmEngine (read-only).
+    fn fetch_rows_by_pks_read(
+        engine: &LsmEngine,
+        pkeys: &[Vec<u8>],
+    ) -> Result<Vec<Map<String, Value>>> {
+        let mut rows = Vec::new();
+        for pk in pkeys {
+            if let Ok(Some(val_bytes)) = engine.get(pk) {
+                if let Some(doc) = simd_parse_row(&val_bytes) {
+                    rows.push(doc);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Read-only vector search with &LsmEngine.
+    fn plan_vector_search_read(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        column: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        filter: &Option<FilterExpr>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        if !engine.has_vector_index(table, column) {
+            return Ok(Vec::new());
+        }
+
+        let search_results = if let Some(f) = filter {
+            let class_hierarchy = self.get_class_hierarchy_read(engine, table);
+            let mut allowed_ids = HashSet::new();
+            for scan_class in &class_hierarchy {
+                let prefix = format!("{}::", scan_class);
+                let entries = engine.scan_prefix(prefix.as_bytes())?;
+                for (key, val_bytes) in &entries {
+                    if let Some(ref doc) = storage_bytes_to_doc(val_bytes) {
+                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                            if self.eval_filter_read(engine, doc, f) {
+                                allowed_ids.insert(key.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            engine.vector_index_manager().search_filtered(table, column, query_vector, top_k, &allowed_ids)?
+        } else {
+            engine.vector_index_manager().search(table, column, query_vector, top_k)?
+        };
+
+        let mut rows = Vec::new();
+        for result in &search_results {
+            if let Ok(Some(val_bytes)) = engine.get(&result.entry.id) {
+                if let Some(mut doc) = storage_bytes_to_doc(&val_bytes) {
+                    doc.insert("_distance".to_string(), serde_json::json!(result.distance));
+                    rows.push(doc);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Read-only MATCH execution with &LsmEngine.
+    fn execute_match_read(
+        &self,
+        engine: &LsmEngine,
+        _variable: &str,
+        class: &str,
+        filter: &Option<FilterExpr>,
+        returns: &[String],
+    ) -> Result<QueryResult> {
+        let class_hierarchy = self.get_class_hierarchy_read(engine, class);
+        let mut rows = Vec::new();
+        for scan_class in &class_hierarchy {
+            let prefix = format!("{}::", scan_class);
+            let entries = engine.scan_prefix(prefix.as_bytes())?;
+            for (key, val_bytes) in &entries {
+                // Tier 1: BinaryRow path (binary-stored data) — no JSON parsing
+                if let Some(brow) = BinaryRow::parse(val_bytes) {
+                    if !brow.class_in_hierarchy(&class_hierarchy) {
+                        continue;
+                    }
+                    if let Some(mut doc) = brow.to_map() {
+                        doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                        rows.push(doc);
+                    }
+                    continue;
+                }
+                // Tier 2: JSON fallback (legacy data stored as JSON)
+                if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                    if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                        doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                        rows.push(doc);
+                    }
+                }
+            }
+        }
+
+        if let Some(f) = filter {
+            rows.retain(|row| Self::eval_filter_static_with_hierarchy(row, f, &class_hierarchy));
+        }
+
+        if returns.is_empty() {
+            let cleaned: Vec<Map<String, Value>> = rows.into_iter().map(|mut r| {
+                r.remove("__pk__");
+                r
+            }).collect();
+            Ok(QueryResult::Rows(cleaned))
+        } else {
+            let projected: Vec<Map<String, Value>> = rows.iter().map(|row| {
+                let mut result = Map::new();
+                for col in returns {
+                    if let Some(val) = Self::resolve_column_value(row, col) {
+                        result.insert(col.clone(), Value::String(val));
+                    }
+                }
+                result
+            }).collect();
+            Ok(QueryResult::Rows(projected))
+        }
+    }
+
+    /// Read-only VectorSearch execution with &LsmEngine.
+    fn execute_vector_search_read(
+        &self,
+        engine: &LsmEngine,
+        class: &str,
+        column: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        filter: &Option<FilterExpr>,
+    ) -> Result<QueryResult> {
+        if !engine.has_vector_index(class, column) {
+            return Err(CoreError::InvalidArgument(format!(
+                "no vector index on {}.{}", class, column
+            )));
+        }
+
+        let search_results = if let Some(filter_expr) = filter {
+            let class_hierarchy = self.get_class_hierarchy_read(engine, class);
+            let mut allowed_ids = HashSet::new();
+            for scan_class in &class_hierarchy {
+                let prefix = format!("{}::", scan_class);
+                let entries = engine.scan_prefix(prefix.as_bytes())?;
+                for (key, val_bytes) in &entries {
+                    if let Some(ref doc) = storage_bytes_to_doc(val_bytes) {
+                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                            if Self::eval_filter_static_with_hierarchy(doc, filter_expr, &class_hierarchy) {
+                                allowed_ids.insert(key.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            engine.vector_index_manager().search_filtered(class, column, query_vector, top_k, &allowed_ids)?
+        } else {
+            engine.vector_index_manager().search(class, column, query_vector, top_k)?
+        };
+
+        let mut rows = Vec::new();
+        for result in &search_results {
+            if let Ok(Some(val_bytes)) = engine.get(&result.entry.id) {
+                if let Some(mut doc) = storage_bytes_to_doc(&val_bytes) {
+                    doc.insert("_distance".to_string(), serde_json::json!(result.distance));
+                    rows.push(doc);
+                }
+            }
+        }
+        Ok(QueryResult::Rows(rows))
+    }
+
+    /// Read-only aggregation with &LsmEngine (uses static filter for HAVING).
+    fn execute_aggregation_read(
+        &self,
+        engine: &LsmEngine,
+        columns: &SelectColumns,
+        rows: &[Map<String, Value>],
+        group_by: Option<&crate::parser::GroupByClause>,
+        having: &Option<FilterExpr>,
+        order_by: &[crate::parser::OrderBy],
+        limit: Option<usize>,
+    ) -> Result<QueryResult> {
+        let groups: Vec<(String, Vec<&Map<String, Value>>)> = if let Some(gb) = group_by {
+            let mut group_map: std::collections::BTreeMap<String, Vec<&Map<String, Value>>> =
+                std::collections::BTreeMap::new();
+            for row in rows {
+                let key = gb.columns.iter()
+                    .map(|col| Self::resolve_column_value(row, col).unwrap_or_else(|| "NULL".to_string()))
+                    .collect::<Vec<_>>()
+                    .join("\x00");
+                group_map.entry(key).or_default().push(row);
+            }
+            group_map.into_iter().collect()
+        } else {
+            vec![("".to_string(), rows.iter().collect())]
+        };
+
+        let mut result_rows: Vec<Map<String, Value>> = Vec::new();
+
+        for (_group_key, group_rows) in &groups {
+            let mut result_row = Map::new();
+
+            if let Some(gb) = group_by {
+                for col in &gb.columns {
+                    if let Some(val) = Self::resolve_column_value(group_rows[0], col) {
+                        result_row.insert(col.clone(), Value::String(val));
+                    }
+                }
+            }
+
+            if let SelectColumns::Columns(items) = columns {
+                for item in items {
+                    match item {
+                        SelectItem::Aggregate(agg) => {
+                            let val = Self::compute_aggregate(agg, group_rows);
+                            let name = agg.alias.clone().unwrap_or_else(|| Self::default_agg_name(agg));
+                            result_row.insert(name, val);
+                        }
+                        SelectItem::Column(col) => {
+                            let col_name = col.split(" as ").last().unwrap_or(col);
+                            let col_name = col_name.split('.').last().unwrap_or(col_name);
+                            if !result_row.contains_key(col_name) {
+                                if let Some(val) = Self::resolve_column_value(group_rows[0], col) {
+                                    result_row.insert(col_name.to_string(), Value::String(val));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Use read-path filter for HAVING with ontology reasoning
+            if having.as_ref().map_or(true, |h| self.eval_filter_read(engine, &result_row, h)) {
+                result_rows.push(result_row);
+            }
+        }
+
+        for ob in order_by.iter().rev() {
+            Self::sort_rows(&mut result_rows, &ob.column, ob.ascending);
+        }
+
+        if let Some(limit) = limit {
+            result_rows.truncate(limit);
+        }
+
+        Ok(QueryResult::Rows(result_rows))
+    }
+
+    /// Read-only class hierarchy lookup (no mutation needed).
+    fn get_class_hierarchy_read(&self, engine: &LsmEngine, table: &str) -> HashSet<String> {
+        {
+            let cache = self.inference_cache.lock().unwrap();
+            if let Some(cached) = cache.class_hierarchy.get(table) {
+                return cached.clone();
+            }
+        }
+
+        let mut classes = HashSet::new();
+        classes.insert(table.to_string());
+
+        // Scan ontologies directly (read-only)
+        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+        for (_key, val_bytes) in entries {
+            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+                if ontology.classes.contains_key(table) {
+                    let reasoner = Reasoner::new(ontology.clone());
+                    let probe_triple = onto_ontology::Triple::type_of("__probe__", table);
+                    let result = reasoner.reason(&[probe_triple]);
+                    for triple in &result.all_facts {
+                        if triple.subject == "__probe__" && triple.predicate == "rdf:type" {
+                            classes.insert(triple.object.clone());
+                        }
+                    }
+                    let subclasses = ontology.get_all_subclasses(table);
+                    classes.extend(subclasses);
+                    break;
+                }
+            }
+        }
+
+        {
+            let mut cache = self.inference_cache.lock().unwrap();
+            cache.class_hierarchy.insert(table.to_string(), classes.clone());
+        }
+
+        classes
+    }
+
+    /// Read-only filter evaluation with ontology reasoning (no subquery support).
+    /// Supports: Eq, Ne, Gt, Lt, Gte, Lte, Like, Between, In, IsNull, IsNotNull, Not, And, Or.
+    /// Class hierarchy and property inference are applied via read-only engine access.
+    fn eval_filter_read(&self, engine: &LsmEngine, doc: &Map<String, Value>, expr: &FilterExpr) -> bool {
+        match expr {
+            FilterExpr::Eq(col, val) => {
+                doc.get(col).map_or(false, |v| {
+                    if col == "__class__" {
+                        self.class_value_matches_read(engine, v, val)
+                    } else {
+                        self.property_value_matches_read(engine, doc, col, val)
+                    }
+                })
+            }
+            FilterExpr::Ne(col, val) => {
+                !doc.get(col).map_or(false, |v| {
+                    if col == "__class__" {
+                        self.class_value_matches_read(engine, v, val)
+                    } else {
+                        self.property_value_matches_read(engine, doc, col, val)
+                    }
+                })
+            }
+            FilterExpr::Gt(col, val) => {
+                doc.get(col).map_or(false, |v| self.value_gt(v, val))
+            }
+            FilterExpr::Lt(col, val) => {
+                doc.get(col).map_or(false, |v| self.value_lt(v, val))
+            }
+            FilterExpr::Gte(col, val) => {
+                doc.get(col).map_or(false, |v| self.value_gt(v, val) || self.value_matches(v, val))
+            }
+            FilterExpr::Lte(col, val) => {
+                doc.get(col).map_or(false, |v| self.value_lt(v, val) || self.value_matches(v, val))
+            }
+            FilterExpr::Like(col, pattern) => {
+                doc.get(col).map_or(false, |v| {
+                    let s = match v {
+                        Value::String(s) => s.clone(),
+                        _ => v.to_string(),
+                    };
+                    Self::like_match(&s, pattern)
+                })
+            }
+            FilterExpr::Between(col, low, high) => {
+                doc.get(col).map_or(false, |v| {
+                    self.value_gte(v, low) && self.value_lte(v, high)
+                })
+            }
+            FilterExpr::In(col, values) => {
+                doc.get(col).map_or(false, |v| {
+                    if col == "__class__" {
+                        values.iter().any(|val| self.class_value_matches_read(engine, v, val))
+                    } else {
+                        values.iter().any(|val| self.property_value_matches_read(engine, doc, col, val))
+                    }
+                })
+            }
+            FilterExpr::IsNull(col) => {
+                doc.get(col).map_or(true, |v| matches!(v, Value::Null))
+            }
+            FilterExpr::IsNotNull(col) => {
+                doc.get(col).map_or(false, |v| !matches!(v, Value::Null))
+            }
+            FilterExpr::Not(expr) => {
+                !self.eval_filter_read(engine, doc, expr)
+            }
+            FilterExpr::And(left, right) => {
+                self.eval_filter_read(engine, doc, left) && self.eval_filter_read(engine, doc, right)
+            }
+            FilterExpr::Or(left, right) => {
+                self.eval_filter_read(engine, doc, left) || self.eval_filter_read(engine, doc, right)
+            }
+            _ => true, // Subquery filters (EXISTS, IN subquery) pass through in read path
+        }
+    }
+
+    /// Read-only class value matching with ontology hierarchy.
+    fn class_value_matches_read(&self, engine: &LsmEngine, v: &Value, lit: &LiteralValue) -> bool {
+        match (v, lit) {
+            (Value::String(doc_class), LiteralValue::String(target_class)) => {
+                if doc_class == target_class {
+                    return true;
+                }
+                let hierarchy = self.get_class_hierarchy_read(engine, target_class);
+                hierarchy.contains(doc_class.as_str())
+            }
+            _ => self.value_matches(v, lit),
+        }
+    }
+
+    /// Read-only property value matching with ontology inference (subproperty, inverse, symmetric).
+    fn property_value_matches_read(
+        &self,
+        engine: &LsmEngine,
+        doc: &Map<String, Value>,
+        col: &str,
+        val: &LiteralValue,
+    ) -> bool {
+        // 1. Direct match
+        if let Some(v) = doc.get(col) {
+            if self.value_matches(v, val) {
+                return true;
+            }
+        }
+
+        // 2. Equivalent/subproperty match
+        let aliases = self.get_property_aliases_read(engine, col);
+        for alias in &aliases {
+            if alias != col {
+                if let Some(v) = doc.get(alias) {
+                    if self.value_matches(v, val) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Read-only property aliases lookup (subproperty/equivalent property).
+    fn get_property_aliases_read(&self, engine: &LsmEngine, property: &str) -> HashSet<String> {
+        {
+            let cache = self.inference_cache.lock().unwrap();
+            if let Some(cached) = cache.property_aliases.get(property) {
+                return cached.clone();
+            }
+        }
+
+        let mut aliases = HashSet::new();
+        aliases.insert(property.to_string());
+
+        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+        for (_key, val_bytes) in entries {
+            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+                if let Some(prop_def) = ontology.properties.get(property) {
+                    for equiv in &prop_def.equivalent_properties {
+                        aliases.insert(equiv.clone());
+                    }
+                    for (name, other_prop) in &ontology.properties {
+                        if other_prop.subproperty_of.contains(&property.to_string()) {
+                            aliases.insert(name.clone());
+                        }
+                    }
+                }
+                if let Some(prop_def) = ontology.properties.get(property) {
+                    for parent in &prop_def.subproperty_of {
+                        aliases.insert(parent.clone());
+                        if let Some(parent_def) = ontology.properties.get(parent) {
+                            for equiv in &parent_def.equivalent_properties {
+                                aliases.insert(equiv.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        {
+            let mut cache = self.inference_cache.lock().unwrap();
+            cache.property_aliases.insert(property.to_string(), aliases.clone());
+        }
+
+        aliases
+    }
+
     /// Executes a WITH clause (Common Table Expression).
     /// CTEs are materialized into temporary storage, then the main query runs.
     fn execute_with_ctes(
@@ -1608,21 +3219,19 @@ impl QueryExecutor {
     ) -> Result<QueryResult> {
         // Materialize each CTE: execute the query and store results under a temp key
         for cte in ctes {
-            let cte_result = self.execute_with_engine(&cte.query, engine)?;
+            let cte_result = self.execute_with_engine_inner(&cte.query, engine)?;
             if let QueryResult::Rows(rows) = cte_result {
                 // Store CTE results as a temporary "table" using a special prefix
                 let prefix = format!("__cte_{}::", cte.name.to_lowercase());
                 // Clear any previous CTE with this name
                 let existing = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
                 for (key, _) in existing {
-                    // We can't easily delete without txn, so we overwrite
-                    let _ = engine.put(key, b"__deleted__".to_vec());
+                    engine.delete(key)?;
                 }
                 // Insert each row as a CTE entry
                 for (i, row) in rows.iter().enumerate() {
                     let key = format!("{}{:010}", prefix, i);
-                    let value = serde_json::to_vec(&serde_json::Value::Object(row.clone()))
-                        .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                    let value = doc_to_storage_bytes(&row);
                     engine.put(key.as_bytes().to_vec(), value)?;
                 }
             }
@@ -1630,14 +3239,14 @@ impl QueryExecutor {
 
         // Execute the main query 鈥?it will scan CTE tables via the prefix scan path
         // We need to handle CTE name resolution in the main query
-        let result = self.execute_with_engine(query, engine);
+        let result = self.execute_with_engine_inner(query, engine);
 
         // Clean up CTE temporary data
         for cte in ctes {
             let prefix = format!("__cte_{}::", cte.name.to_lowercase());
             let existing = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
             for (key, _) in existing {
-                let _ = engine.put(key, b"__deleted__".to_vec());
+                engine.delete(key)?;
             }
         }
 
@@ -1731,7 +3340,7 @@ impl QueryExecutor {
                 query,
             } => {
                 // Execute the SELECT query first
-                let select_result = self.execute_with_engine(query, engine)?;
+                let select_result = self.execute_with_engine_inner(query, engine)?;
                 if let QueryResult::Rows(rows) = select_result {
                     let count = rows.len();
                     for row in &rows {
@@ -1795,8 +3404,7 @@ impl QueryExecutor {
                                 for (col, assign_val) in assignments {
                                     doc.insert(col.clone(), self.literal_to_json(assign_val));
                                 }
-                                let new_value = serde_json::to_vec(&serde_json::Value::Object(doc))
-                                    .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                                let new_value = doc_to_storage_bytes(&doc);
                                 engine.txn_put(txn_id, key, new_value)?;
                                 return Ok(QueryResult::Success("1 row updated (upsert)".to_string()));
                             }
@@ -1913,8 +3521,7 @@ impl QueryExecutor {
                             doc.insert(col.clone(), json_val);
                         }
                         self.validate_document(engine, class, &doc)?;
-                        let new_value = serde_json::to_vec(&Value::Object(doc))
-                            .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                        let new_value = doc_to_storage_bytes(&doc);
                         engine.txn_put(txn_id, pk.as_bytes().to_vec(), new_value)?;
                         updated += 1;
                     }
@@ -1942,8 +3549,8 @@ impl QueryExecutor {
 
     /// Executes UNION [ALL] by running both queries and merging results.
     fn execute_union(&self, engine: &mut LsmEngine, left: &QueryAst, right: &QueryAst, all: bool) -> Result<QueryResult> {
-        let left_result = self.execute_with_engine(left, engine)?;
-        let right_result = self.execute_with_engine(right, engine)?;
+        let left_result = self.execute_with_engine_inner(left, engine)?;
+        let right_result = self.execute_with_engine_inner(right, engine)?;
 
         let mut rows = match left_result {
             QueryResult::Rows(r) => r,
@@ -2472,8 +4079,7 @@ impl QueryExecutor {
         // Validate against ontology schema
         self.validate_document(engine, class, &doc)?;
 
-        let value = serde_json::to_vec(&Value::Object(doc))
-            .map_err(|e| CoreError::Serialization(e.to_string()))?;
+        let value = doc_to_storage_bytes(&doc);
 
         engine.txn_put(txn_id, key, value)?;
         Ok(QueryResult::Success("1 row inserted".to_string()))
@@ -2802,6 +4408,25 @@ impl QueryExecutor {
                 let prefix = format!("{}::", scan_class);
                 let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
                 for (key, val_bytes) in &entries {
+                    // BinaryRow path: evaluate filter without full JSON deserialization
+                    if let Some(brow) = BinaryRow::parse(val_bytes) {
+                        if !brow.class_in_hierarchy(&class_hierarchy) {
+                            continue;
+                        }
+                        match eval_binary_filter(&brow, filter_expr) {
+                            Some(true) => { allowed_ids.insert(key.clone()); }
+                            Some(false) => {}
+                            None => {
+                                if let Some(ref doc) = brow.to_map() {
+                                    if self.matches_filter(engine, doc, &Some(filter_expr.clone())) {
+                                        allowed_ids.insert(key.clone());
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    // JSON fallback (legacy data)
                     if let Ok(serde_json::Value::Object(ref doc)) =
                         serde_json::from_slice::<serde_json::Value>(val_bytes)
                     {
@@ -2827,15 +4452,22 @@ impl QueryExecutor {
         let mut rows = Vec::new();
         for result in &search_results {
             if let Ok(Some(val_bytes)) = engine.txn_get(txn_id, &result.entry.id) {
-                if let Ok(serde_json::Value::Object(mut doc)) =
-                    serde_json::from_slice::<serde_json::Value>(&val_bytes)
-                {
+                // Try BinaryRow first, then JSON fallback
+                let doc = if let Some(brow) = BinaryRow::parse(&val_bytes) {
+                    brow.to_map()
+                } else {
+                    match serde_json::from_slice::<serde_json::Value>(&val_bytes) {
+                        Ok(serde_json::Value::Object(d)) => Some(d),
+                        _ => None,
+                    }
+                };
+                if let Some(mut d) = doc {
                     // Add the distance as a virtual column
-                    doc.insert(
+                    d.insert(
                         "_distance".to_string(),
                         serde_json::json!(result.distance),
                     );
-                    rows.push(doc);
+                    rows.push(d);
                 }
             }
         }
@@ -2851,6 +4483,15 @@ impl QueryExecutor {
         let serialized = serde_json::to_string(ast).unwrap_or_default();
         serialized.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// Strips internal fields (__pk__, __class__) from a row for comparison.
+    /// These fields are injected by the query executor and contain values
+    /// (like primary keys with sequence numbers) that change between query executions,
+    /// making direct JSON comparison unreliable.
+    fn strip_internal_fields(row: &mut Map<String, Value>) {
+        row.remove("__pk__");
+        row.remove("__class__");
     }
 
     fn generate_doc_key(&self, class: &str) -> Vec<u8> {
@@ -3102,7 +4743,7 @@ impl QueryExecutor {
         let mut rows = Vec::new();
         for pk in pkeys {
             if let Ok(Some(val_bytes)) = engine.get(pk) {
-                if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&val_bytes) {
+                if let Some(doc) = simd_parse_row(&val_bytes) {
                     rows.push(doc);
                 }
             }
@@ -3188,7 +4829,7 @@ impl QueryExecutor {
                 })
             }
             FilterExpr::InSubquery(col, subquery) => {
-                let sub_result = self.execute_with_engine(subquery, engine);
+                let sub_result = self.execute_with_engine_inner(subquery, engine);
                 match sub_result {
                     Ok(QueryResult::Rows(rows)) => {
                         doc.get(col).map_or(false, |v| {
@@ -3207,14 +4848,14 @@ impl QueryExecutor {
                 }
             }
             FilterExpr::Exists(subquery) => {
-                let sub_result = self.execute_with_engine(subquery, engine);
+                let sub_result = self.execute_with_engine_inner(subquery, engine);
                 match sub_result {
                     Ok(QueryResult::Rows(rows)) => !rows.is_empty(),
                     _ => false,
                 }
             }
             FilterExpr::NotExists(subquery) => {
-                let sub_result = self.execute_with_engine(subquery, engine);
+                let sub_result = self.execute_with_engine_inner(subquery, engine);
                 match sub_result {
                     Ok(QueryResult::Rows(rows)) => rows.is_empty(),
                     _ => false,
@@ -3623,7 +5264,7 @@ impl QueryExecutor {
                 Ok(Value::Null)
             }
             ValueExpr::ScalarSubquery(subquery) => {
-                let sub_result = self.execute_with_engine(subquery, engine)?;
+                let sub_result = self.execute_with_engine_inner(subquery, engine)?;
                 match sub_result {
                     QueryResult::Rows(rows) => {
                         if let Some(first_row) = rows.first() {
@@ -6142,13 +7783,12 @@ mod tests {
             _ => panic!("expected Success"),
         }
 
-        // Query should return empty
+        // Query should return empty after drop
         let ast = QueryParser::parse("SELECT * FROM mv_test").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
-            QueryResult::Rows(_rows) => {
-                // Should be empty since the MV was dropped
-                // (or it might fall through to regular table scan which returns nothing)
+            QueryResult::Rows(rows) => {
+                assert!(rows.is_empty(), "expected 0 rows after DROP MATERIALIZED VIEW, got {}", rows.len());
             }
             _ => panic!("expected Rows"),
         }
@@ -6185,9 +7825,8 @@ mod tests {
             QueryResult::Success(msg) => {
                 println!("Refresh result: {}", msg);
                 assert!(msg.contains("refreshed"));
-                // Should show 1 added (MacBook), 0 updated, 0 removed, 1 unchanged (iPhone)
+                // Should show 1 added (MacBook), 0 removed, 1 unchanged (iPhone)
                 assert!(msg.contains("1 added"));
-                assert!(msg.contains("0 updated"));
                 assert!(msg.contains("0 removed"));
                 assert!(msg.contains("1 unchanged"));
             }

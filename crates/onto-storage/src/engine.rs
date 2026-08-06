@@ -18,10 +18,22 @@ use crate::lsm::wal::{self, Wal};
 use crate::mvcc::{TxnManager, WriteOp};
 use crate::options::StorageOptions;
 use onto_core::{Entry, EntryKind, Key, Result, SeqNo, Value};
-use std::collections::{BTreeMap, HashMap};
+use onto_core::binary_row::BinaryRow;
+use std::collections::HashMap;
 use std::fs;
+
+/// Parse storage bytes to a serde_json::Map. Tries binary format first, then JSON.
+fn parse_doc_bytes(bytes: &[u8]) -> Option<serde_json::Map<String, serde_json::Value>> {
+    if let Some(row) = BinaryRow::parse(bytes) {
+        return row.to_map();
+    }
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(serde_json::Value::Object(doc)) => Some(doc),
+        _ => None,
+    }
+}
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 /// The main LSM-Tree storage engine with MVCC support.
@@ -39,7 +51,7 @@ pub struct LsmEngine {
     /// Cache of opened SSTable handles, keyed by file path.
     /// Avoids re-opening files and re-reading footer/bloom/index on every read.
     /// Entries are invalidated when compaction replaces SSTable files.
-    sst_cache: HashMap<PathBuf, SsTable>,
+    sst_cache: Mutex<HashMap<PathBuf, SsTable>>,
 
     /// Write-Ahead Log for durability.
     wal: Wal,
@@ -68,6 +80,11 @@ pub struct LsmEngine {
     /// Channel to receive compaction notifications (for cache invalidation).
     /// Wrapped in Mutex because mpsc::Receiver is not Sync.
     compaction_notif_receiver: std::sync::Mutex<mpsc::Receiver<CompactionNotification>>,
+
+    /// Fast flag: set by the notification drain when a compaction notification arrives.
+    /// Cleared after the sst_cache is invalidated.
+    /// Allows the common path (no compaction) to skip sst_cache lock acquisition.
+    compaction_pending: AtomicBool,
 }
 
 /// Temporary helper for loading WAL + SSTables before spawning the compaction worker.
@@ -207,7 +224,7 @@ impl LsmEngine {
             memtable: pre_engine.memtable,
             immutable_memtable: pre_engine.immutable_memtable,
             levels,
-            sst_cache: pre_engine.sst_cache,
+            sst_cache: Mutex::new(pre_engine.sst_cache),
             wal: pre_engine.wal,
             options,
             seq_counter: pre_engine.seq_counter,
@@ -217,6 +234,7 @@ impl LsmEngine {
             vector_index_manager: VectorIndexManager::new(),
             compaction_sender,
             compaction_notif_receiver: std::sync::Mutex::new(compaction_notif_receiver),
+            compaction_pending: AtomicBool::new(false),
         };
 
         // Rebuild secondary indexes from persisted index entries
@@ -248,7 +266,7 @@ impl LsmEngine {
     }
 
     /// Gets a value by key.
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<Value>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
         self.drain_compaction_notifications();
 
         // 1. Check active MemTable
@@ -278,8 +296,13 @@ impl LsmEngine {
             cands
         };
 
+        let mut cache = self.sst_cache.lock().unwrap();
         for path in &candidates {
-            let sst = self.get_sst(path)?;
+            if !cache.contains_key(path) {
+                let sst = SsTable::open(path)?;
+                cache.insert(path.to_path_buf(), sst);
+            }
+            let sst = cache.get(path).unwrap();
             match sst.get_full(key)? {
                 Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
                 Some((_, _, EntryKind::Delete)) => return Ok(None),
@@ -295,20 +318,23 @@ impl LsmEngine {
     ///
     /// This leverages the LSM-Tree's sorted key structure:
     /// entries with `{class}::` prefix are contiguous in sorted order.
-    pub fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.scan_prefix_internal(prefix, None)
     }
 
     /// Internal scan implementation shared by scan_prefix and scan_prefix_with_visibility.
     /// When `vis` is Some, only entries visible to the snapshot are included.
     fn scan_prefix_internal(
-        &mut self,
+        &self,
         prefix: &[u8],
         vis: Option<&crate::mvcc::Visibility>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.drain_compaction_notifications();
 
-        let mut seen: BTreeMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = BTreeMap::new();
+        // Use HashMap instead of BTreeMap — we don't need sorted iteration here;
+        // callers either iterate in insertion order or re-sort themselves.
+        // HashMap avoids O(log n) byte-vector comparisons per insert.
+        let mut seen: HashMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = HashMap::new();
 
         let is_visible = |seq: SeqNo| -> bool {
             match vis {
@@ -339,34 +365,42 @@ impl LsmEngine {
             paths
         };
 
-        for path in &sst_paths {
-            let sst = self.get_sst(path)?;
-            let mut iter = sst.iter()?;
-
-            while iter.is_valid() && iter.key() < prefix {
-                iter.next();
-            }
-
-            while iter.is_valid() {
-                if !iter.key().starts_with(prefix) {
-                    break;
+        // Scan SSTables (cache locked for entire SSTable scan phase)
+        {
+            let mut cache = self.sst_cache.lock().unwrap();
+            for path in &sst_paths {
+                if !cache.contains_key(path) {
+                    let sst = SsTable::open(path)?;
+                    cache.insert(path.to_path_buf(), sst);
                 }
-                let key = iter.key().to_vec();
-                let value = iter.value().to_vec();
-                let seq = iter.seq_no();
-                let kind = iter.kind();
+                let sst = cache.get(path).unwrap();
+                let mut iter = sst.iter()?;
 
-                if is_visible(seq) {
-                    let should_update = match seen.get(&key) {
-                        Some((_, existing_seq, _)) => seq > *existing_seq,
-                        None => true,
-                    };
-                    if should_update {
-                        seen.insert(key, (value, seq, kind));
+                while iter.is_valid() && iter.key() < prefix {
+                    iter.next();
+                }
+
+                while iter.is_valid() {
+                    if !iter.key().starts_with(prefix) {
+                        break;
                     }
-                }
+                    let key = iter.key().to_vec();
+                    let value = iter.value().to_vec();
+                    let seq = iter.seq_no();
+                    let kind = iter.kind();
 
-                iter.next();
+                    if is_visible(seq) {
+                        let should_update = match seen.get(&key) {
+                            Some((_, existing_seq, _)) => seq > *existing_seq,
+                            None => true,
+                        };
+                        if should_update {
+                            seen.insert(key, (value, seq, kind));
+                        }
+                    }
+
+                    iter.next();
+                }
             }
         }
 
@@ -523,27 +557,39 @@ impl LsmEngine {
 
     /// Drains compaction notifications from the background worker.
     /// Evicts stale SSTable cache entries when compaction replaces files.
-    fn drain_compaction_notifications(&mut self) {
-        let receiver = self.compaction_notif_receiver.lock().unwrap();
+    ///
+    /// Lock ordering: compaction_notif_receiver → sst_cache (never reversed).
+    /// The fast path (no compaction) only checks an atomic flag — no lock acquisition.
+    fn drain_compaction_notifications(&self) {
+        // Fast path: skip entirely if no compaction has occurred since last drain.
+        if !self.compaction_pending.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Drain notifications under the receiver lock only (NOT holding sst_cache).
         let mut had_compaction = false;
-        while let Ok(notif) = receiver.try_recv() {
-            match notif {
-                CompactionNotification::Compacted { evicted_paths } => {
-                    for path in &evicted_paths {
-                        self.sst_cache.remove(path);
+        {
+            let receiver = self.compaction_notif_receiver.lock().unwrap();
+            while let Ok(notif) = receiver.try_recv() {
+                match notif {
+                    CompactionNotification::Compacted { .. } => {
+                        had_compaction = true;
                     }
-                    had_compaction = true;
-                }
-                CompactionNotification::FlushDone => {
-                    // Ignore FlushDone in normal drain
+                    CompactionNotification::FlushDone => {}
                 }
             }
         }
-        drop(receiver);
-        // After any compaction, clear the entire cache to ensure no stale handles
+
+        // Only acquire sst_cache lock if we actually need to clear it.
+        // This keeps the common path (no compaction) lock-free on sst_cache.
         if had_compaction {
-            self.sst_cache.clear();
+            self.sst_cache.lock().unwrap().clear();
         }
+
+        // Clear the flag AFTER cache invalidation to ensure correctness:
+        // a concurrent reader that sees compaction_pending=false will see
+        // the cleared cache (both under Acquire/Release ordering).
+        self.compaction_pending.store(false, Ordering::Release);
     }
 
     /// Blocks until all pending background compaction work is complete.
@@ -558,10 +604,7 @@ impl LsmEngine {
         loop {
             match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(CompactionNotification::FlushDone) => break,
-                Ok(CompactionNotification::Compacted { ref evicted_paths }) => {
-                    for path in evicted_paths {
-                        self.sst_cache.remove(path);
-                    }
+                Ok(CompactionNotification::Compacted { .. }) => {
                     had_compaction = true;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -572,9 +615,11 @@ impl LsmEngine {
             }
         }
         drop(receiver);
-        // Clear the entire cache after compaction to ensure no stale handles
+        // Clear the entire cache after compaction to ensure no stale handles.
+        // Use the same lock acquisition pattern as drain_compaction_notifications
+        // to avoid double-locking.
         if had_compaction {
-            self.sst_cache.clear();
+            self.sst_cache.lock().unwrap().clear();
         }
         Ok(())
     }
@@ -609,16 +654,6 @@ impl LsmEngine {
 
     fn next_seq(&self) -> SeqNo {
         self.seq_counter.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Gets or opens a cached SSTable handle.
-    /// Opens the file and reads footer/bloom/index only on first access.
-    fn get_sst(&mut self, path: &Path) -> Result<&mut SsTable> {
-        if !self.sst_cache.contains_key(path) {
-            let sst = SsTable::open(path)?;
-            self.sst_cache.insert(path.to_path_buf(), sst);
-        }
-        Ok(self.sst_cache.get_mut(path).unwrap())
     }
 
     /// Rebuilds secondary indexes by scanning persisted index entries from SSTables.
@@ -678,9 +713,7 @@ impl LsmEngine {
             let entries = self.scan_prefix(prefix.as_bytes())?;
             let mut count = 0usize;
             for (pk, val_bytes) in entries {
-                if let Ok(serde_json::Value::Object(doc)) =
-                    serde_json::from_slice::<serde_json::Value>(&val_bytes)
-                {
+                if let Some(doc) = parse_doc_bytes(&val_bytes) {
                     if doc.get("__class__").and_then(|v| v.as_str()) == Some(class.as_str()) {
                         if let Some(serde_json::Value::Array(arr)) = doc.get(column.as_str()) {
                             let vec: Vec<f32> = arr
@@ -745,9 +778,7 @@ impl LsmEngine {
                     if has_indexes || has_vector_indexes {
                         // Deindex the old value first (handles UPDATE case)
                         if let Some(old_val) = self.get(&key)? {
-                            if let Ok(serde_json::Value::Object(ref old_doc)) =
-                                serde_json::from_slice::<serde_json::Value>(&old_val)
-                            {
+                            if let Some(ref old_doc) = parse_doc_bytes(&old_val) {
                                 if let Some(ref c) = class {
                                     if has_indexes {
                                         self.index_manager.deindex_document(c, &key, old_doc);
@@ -759,9 +790,7 @@ impl LsmEngine {
                             }
                         }
                         // Index the new value and persist index entries
-                        if let Ok(serde_json::Value::Object(ref doc)) =
-                            serde_json::from_slice::<serde_json::Value>(&value)
-                        {
+                        if let Some(ref doc) = parse_doc_bytes(&value) {
                             if let Some(ref c) = class {
                                 if has_indexes {
                                     let index_entries = self.index_manager.index_document(c, &key, doc);
@@ -789,9 +818,7 @@ impl LsmEngine {
                     // For deletes, we need the old value to de-index
                     if has_indexes || has_vector_indexes {
                         if let Some(old_val) = self.get(&key)? {
-                            if let Ok(serde_json::Value::Object(ref doc)) =
-                                serde_json::from_slice::<serde_json::Value>(&old_val)
-                            {
+                            if let Some(ref doc) = parse_doc_bytes(&old_val) {
                                 if let Some(ref c) = class {
                                     if has_indexes {
                                         self.index_manager.deindex_document(c, &key, doc);
@@ -868,7 +895,7 @@ impl LsmEngine {
     /// 1. Check the transaction's own write buffer (uncommitted writes)
     /// 2. Check MemTable (with snapshot visibility)
     /// 3. Check SSTables (with snapshot visibility)
-    pub fn txn_get(&mut self, txn_id: SeqNo, key: &[u8]) -> Result<Option<Value>> {
+    pub fn txn_get(&self, txn_id: SeqNo, key: &[u8]) -> Result<Option<Value>> {
         // 1. Check transaction's own write buffer
         if let Some(txn) = self.txn_manager.get(txn_id) {
             if let Some(op) = txn.write_buffer_get(key) {
@@ -886,7 +913,7 @@ impl LsmEngine {
 
     /// Scans all entries with the given prefix, respecting snapshot visibility.
     pub fn txn_scan_prefix(
-        &mut self,
+        &self,
         txn_id: SeqNo,
         prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -924,7 +951,7 @@ impl LsmEngine {
 
     /// Gets a value by key with snapshot visibility filtering.
     fn get_with_visibility(
-        &mut self,
+        &self,
         key: &[u8],
         vis: &crate::mvcc::Visibility,
     ) -> Result<Option<Value>> {
@@ -966,8 +993,13 @@ impl LsmEngine {
             cands
         };
 
+        let mut cache = self.sst_cache.lock().unwrap();
         for path in &candidates {
-            let sst = self.get_sst(path)?;
+            if !cache.contains_key(path) {
+                let sst = SsTable::open(path)?;
+                cache.insert(path.to_path_buf(), sst);
+            }
+            let sst = cache.get(path).unwrap();
             match sst.get_full(key)? {
                 Some((value, seq, kind)) if vis.is_visible(seq) => {
                     if kind == EntryKind::Delete {
@@ -984,7 +1016,7 @@ impl LsmEngine {
 
     /// Scans entries with prefix, filtering by snapshot visibility.
     fn scan_prefix_with_visibility(
-        &mut self,
+        &self,
         prefix: &[u8],
         vis: &crate::mvcc::Visibility,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -1009,9 +1041,7 @@ impl LsmEngine {
         let entries = self.scan_prefix(prefix.as_bytes())?;
 
         for (pk, val_bytes) in entries {
-            if let Ok(serde_json::Value::Object(doc)) =
-                serde_json::from_slice::<serde_json::Value>(&val_bytes)
-            {
+            if let Some(doc) = parse_doc_bytes(&val_bytes) {
                 if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
                     let index_entries = self.index_manager.index_document(class, &pk, &doc);
                     // Persist index entries to WAL + MemTable
@@ -1089,9 +1119,7 @@ impl LsmEngine {
         let entries = self.scan_prefix(prefix.as_bytes())?;
 
         for (pk, val_bytes) in entries {
-            if let Ok(serde_json::Value::Object(doc)) =
-                serde_json::from_slice::<serde_json::Value>(&val_bytes)
-            {
+            if let Some(doc) = parse_doc_bytes(&val_bytes) {
                 if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
                     if let Some(serde_json::Value::Array(arr)) = doc.get(column) {
                         let vec: Vec<f32> = arr
