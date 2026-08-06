@@ -15,14 +15,65 @@ use std::time::Duration;
 pub struct QueryExecutor {
     engine: Arc<RwLock<LsmEngine>>,
     ontology_store: OntologyStore,
-    /// Query planner for optimization.
-    planner: QueryPlanner,
+    /// Query planner for optimization (wrapped for interior mutability).
+    planner: std::sync::RwLock<QueryPlanner>,
     /// Query result cache.
     query_cache: Arc<Mutex<QueryCache>>,
     /// Execution plan cache.
     plan_cache: Arc<Mutex<PlanCache>>,
     /// Monotonic counter for generating unique document keys.
     doc_counter: AtomicU64,
+    /// Runtime execution statistics.
+    runtime_stats: Arc<Mutex<RuntimeStats>>,
+}
+
+/// Column-level statistics collected by ANALYZE.
+#[derive(Debug, Clone, Default)]
+struct ColumnStats {
+    non_null_count: u64,
+    distinct_values: std::collections::HashSet<String>,
+}
+
+/// Runtime execution statistics for adaptive optimization.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeStats {
+    /// Total queries executed.
+    pub total_queries: u64,
+    /// Total execution time in microseconds.
+    pub total_time_us: u64,
+    /// Per-table row counts observed during execution.
+    pub table_row_counts: std::collections::HashMap<String, u64>,
+    /// Per-table scan counts (how many times each table was scanned).
+    pub table_scan_counts: std::collections::HashMap<String, u64>,
+    /// Plan cache hit count.
+    pub plan_cache_hits: u64,
+    /// Plan cache miss count.
+    pub plan_cache_misses: u64,
+    /// Query cache hit count.
+    pub query_cache_hits: u64,
+    /// Query cache miss count.
+    pub query_cache_misses: u64,
+}
+
+impl RuntimeStats {
+    /// Average query execution time in microseconds.
+    pub fn avg_query_time_us(&self) -> u64 {
+        if self.total_queries == 0 {
+            0
+        } else {
+            self.total_time_us / self.total_queries
+        }
+    }
+
+    /// Plan cache hit rate as percentage.
+    pub fn plan_cache_hit_rate(&self) -> f64 {
+        let total = self.plan_cache_hits + self.plan_cache_misses;
+        if total == 0 {
+            0.0
+        } else {
+            (self.plan_cache_hits as f64 / total as f64) * 100.0
+        }
+    }
 }
 
 impl QueryExecutor {
@@ -30,21 +81,27 @@ impl QueryExecutor {
         Self {
             engine,
             ontology_store,
-            planner: QueryPlanner::new(),
+            planner: std::sync::RwLock::new(QueryPlanner::new()),
             query_cache: Arc::new(Mutex::new(QueryCache::new(1000, Duration::from_secs(60)))),
             plan_cache: Arc::new(Mutex::new(PlanCache::new(500))),
             doc_counter: AtomicU64::new(0),
+            runtime_stats: Arc::new(Mutex::new(RuntimeStats::default())),
         }
     }
 
+    /// Get runtime execution statistics.
+    pub fn runtime_stats(&self) -> RuntimeStats {
+        self.runtime_stats.lock().unwrap().clone()
+    }
+
     /// Get a reference to the query planner.
-    pub fn planner(&self) -> &QueryPlanner {
-        &self.planner
+    pub fn planner(&self) -> std::sync::RwLockReadGuard<'_, QueryPlanner> {
+        self.planner.read().unwrap()
     }
 
     /// Get a mutable reference to the query planner (for updating stats).
-    pub fn planner_mut(&mut self) -> &mut QueryPlanner {
-        &mut self.planner
+    pub fn planner_mut(&self) -> std::sync::RwLockWriteGuard<'_, QueryPlanner> {
+        self.planner.write().unwrap()
     }
 
     /// Get query cache statistics.
@@ -75,12 +132,37 @@ impl QueryExecutor {
 
     /// Internal execution with engine reference passed through.
     /// Each statement runs in its own auto-committed transaction.
+    /// For SELECT queries, checks plan cache first.
     fn execute_with_engine(&self, ast: &QueryAst, engine: &mut LsmEngine) -> Result<QueryResult> {
+        let start_time = std::time::Instant::now();
+
+        let result = self.execute_with_engine_inner(ast, engine);
+
+        // Track runtime statistics
+        let elapsed_us = start_time.elapsed().as_micros() as u64;
+        {
+            let mut stats = self.runtime_stats.lock().unwrap();
+            stats.total_queries += 1;
+            stats.total_time_us += elapsed_us;
+            // Track table access for SELECT queries
+            if let QueryAst::Select { from, .. } = ast {
+                *stats.table_scan_counts.entry(from.clone()).or_insert(0) += 1;
+            }
+        }
+
+        result
+    }
+
+    /// Inner execution logic.
+    fn execute_with_engine_inner(&self, ast: &QueryAst, engine: &mut LsmEngine) -> Result<QueryResult> {
         match ast {
             QueryAst::Explain { query } => {
                 // EXPLAIN: generate and return the execution plan
-                // If the inner query is wrapped in ANALYZE, execute it and measure
                 self.execute_explain(query, engine)
+            }
+            QueryAst::Analyze { table } => {
+                // ANALYZE: collect table statistics
+                self.execute_analyze(table, engine)
             }
             QueryAst::With { ctes, query } => {
                 // WITH clause: execute CTEs and substitute into main query
@@ -105,6 +187,16 @@ impl QueryExecutor {
                 engine.create_index(class, column)?;
                 Ok(QueryResult::Success(format!(
                     "Index created on {}.{}", class, column
+                )))
+            }
+            QueryAst::CreateCompositeIndex { class, columns } => {
+                // Create individual indexes for each column in the composite index
+                // This enables index intersection for multi-column queries
+                for col in columns {
+                    engine.create_index(class, col)?;
+                }
+                Ok(QueryResult::Success(format!(
+                    "Composite index created on {} ({})", class, columns.join(", ")
                 )))
             }
             QueryAst::DropIndex { class, column } => {
@@ -199,6 +291,23 @@ impl QueryExecutor {
                 )))
             }
             _ => {
+                // For SELECT queries, check plan cache first
+                if matches!(ast, QueryAst::Select { .. }) {
+                    let ast_hash = Self::hash_ast(ast);
+                    let cached_plan = self.plan_cache.lock().unwrap().get(ast_hash);
+                    if cached_plan.is_some() {
+                        // Plan cache hit - skip planning
+                        self.runtime_stats.lock().unwrap().plan_cache_hits += 1;
+                    } else {
+                        // Plan cache miss - generate and cache plan
+                        let plan = self.planner.read().unwrap().plan(ast);
+                        if let Ok(p) = plan {
+                            self.plan_cache.lock().unwrap().insert(ast_hash, p);
+                        }
+                        self.runtime_stats.lock().unwrap().plan_cache_misses += 1;
+                    }
+                }
+
                 // All other statements run in an auto-committed transaction
                 let txn_id = engine.begin_txn();
                 let result = self.execute_in_txn(ast, engine, txn_id);
@@ -215,7 +324,7 @@ impl QueryExecutor {
     /// Executes EXPLAIN: generates and returns the execution plan.
     /// If ANALYZE mode, also executes the query and measures actual time.
     fn execute_explain(&self, query: &QueryAst, engine: &mut LsmEngine) -> Result<QueryResult> {
-        let plan = self.planner.plan(query)?;
+        let plan = self.planner.read().unwrap().plan(query)?;
         let description = plan.describe();
 
         // Check if this is EXPLAIN ANALYZE (the query is the inner query)
@@ -246,6 +355,94 @@ impl QueryExecutor {
         Ok(QueryResult::Rows(vec![Map::from_iter(vec![
             ("plan".to_string(), plan_json),
         ])]))
+    }
+
+    /// Executes ANALYZE: collects table statistics for query optimization.
+    /// Scans the table, counts rows, and collects column-level statistics.
+    fn execute_analyze(&self, table: &str, engine: &mut LsmEngine) -> Result<QueryResult> {
+        let prefix = format!("{}::", table);
+        let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
+
+        let mut row_count = 0u64;
+        let mut column_stats: std::collections::HashMap<String, ColumnStats> = std::collections::HashMap::new();
+
+        for (_key, val_bytes) in &entries {
+            if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                if doc.get("__class__").and_then(|v| v.as_str()) == Some(table) {
+                    row_count += 1;
+                    for (col_name, col_value) in &doc {
+                        if col_name == "__class__" { continue; }
+                        let stats = column_stats.entry(col_name.clone()).or_default();
+                        stats.non_null_count += 1;
+                        // Track distinct values (sample up to 1000)
+                        if stats.distinct_values.len() < 1000 {
+                            let val_str = match col_value {
+                                serde_json::Value::String(s) => s.clone(),
+                                serde_json::Value::Number(n) => n.to_string(),
+                                serde_json::Value::Bool(b) => b.to_string(),
+                                _ => col_value.to_string(),
+                            };
+                            stats.distinct_values.insert(val_str);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update planner statistics
+        let mut planner_stats = crate::optimizer::cost::TableStats {
+            row_count,
+            avg_row_size: 100,
+            block_count: (row_count / 100).max(1),
+            has_primary_index: false,
+            secondary_indexes: Vec::new(),
+            vector_indexes: Vec::new(),
+        };
+
+        // Build secondary index stats for columns with indexes
+        for (col_name, col_stats) in &column_stats {
+            if engine.has_index(table, col_name) {
+                planner_stats.secondary_indexes.push(crate::optimizer::cost::IndexStats {
+                    column: col_name.clone(),
+                    cardinality: col_stats.distinct_values.len() as u64,
+                    is_sorted: true,
+                    tree_height: 3,
+                });
+            }
+        }
+
+        // Update runtime stats with table row counts
+        {
+            let mut stats = self.runtime_stats.lock().unwrap();
+            stats.table_row_counts.insert(table.to_string(), row_count);
+        }
+
+        // Update planner statistics for future query optimization
+        self.planner.write().unwrap().update_stats(table.to_string(), planner_stats.clone());
+
+        let mut result_rows = Vec::new();
+        let mut summary = Map::new();
+        summary.insert("table".to_string(), Value::String(table.to_string()));
+        summary.insert("row_count".to_string(), Value::Number(serde_json::Number::from(row_count)));
+        result_rows.push(summary);
+
+        for (col_name, col_stats) in &column_stats {
+            let mut col_row = Map::new();
+            col_row.insert("column".to_string(), Value::String(col_name.clone()));
+            col_row.insert("non_null_count".to_string(), Value::Number(serde_json::Number::from(col_stats.non_null_count)));
+            col_row.insert("distinct_count".to_string(), Value::Number(serde_json::Number::from(col_stats.distinct_values.len() as u64)));
+            let selectivity = if col_stats.non_null_count > 0 {
+                col_stats.distinct_values.len() as f64 / col_stats.non_null_count as f64
+            } else {
+                0.0
+            };
+            col_row.insert("selectivity".to_string(), Value::Number(
+                serde_json::Number::from_f64(selectivity).unwrap_or(serde_json::Number::from(0))
+            ));
+            result_rows.push(col_row);
+        }
+
+        Ok(QueryResult::Rows(result_rows))
     }
 
     /// Executes a WITH clause (Common Table Expression).
@@ -1379,6 +1576,16 @@ impl QueryExecutor {
         Ok(QueryResult::Rows(rows))
     }
 
+    /// Computes a hash for a QueryAst for plan cache lookup.
+    fn hash_ast(ast: &QueryAst) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // Serialize AST to string and hash it
+        let serialized = serde_json::to_string(ast).unwrap_or_default();
+        serialized.hash(&mut hasher);
+        hasher.finish()
+    }
+
     fn generate_doc_key(&self, class: &str) -> Vec<u8> {
         let seq = self.doc_counter.fetch_add(1, Ordering::Relaxed);
         let ts = std::time::SystemTime::now()
@@ -1391,6 +1598,9 @@ impl QueryExecutor {
     }
 
     /// Tries to use a secondary index for the given filter.
+    /// Supports Index Condition Pushdown (ICD): filters are applied during index scan.
+    /// Supports AND: uses index for one condition, post-filters the rest.
+    /// Supports OR: uses index for each OR branch.
     /// Returns Some(rows) if an index was used, None if a full scan is needed.
     fn try_index_scan(
         engine: &mut LsmEngine,
@@ -1403,7 +1613,64 @@ impl QueryExecutor {
             None => return Ok(None),
         };
 
-        // Extract the column name and check if an index exists
+        // Try to handle AND conditions with ICD
+        if let FilterExpr::And(left, right) = filter {
+            // Try to use index for the left side
+            let left_pkeys = Self::try_index_scan_single(engine, class, left)?;
+            if let Some(pkeys) = left_pkeys {
+                // Index scan on left side succeeded - fetch rows and apply right filter as post-filter
+                let rows = Self::fetch_rows_by_pks(engine, txn_id, &pkeys)?;
+                let filtered: Vec<Map<String, Value>> = rows
+                    .into_iter()
+                    .filter(|row| Self::eval_filter_static(row, right))
+                    .collect();
+                return Ok(Some(filtered));
+            }
+            // Try right side
+            let right_pkeys = Self::try_index_scan_single(engine, class, right)?;
+            if let Some(pkeys) = right_pkeys {
+                let rows = Self::fetch_rows_by_pks(engine, txn_id, &pkeys)?;
+                let filtered: Vec<Map<String, Value>> = rows
+                    .into_iter()
+                    .filter(|row| Self::eval_filter_static(row, left))
+                    .collect();
+                return Ok(Some(filtered));
+            }
+            return Ok(None);
+        }
+
+        // Try to handle OR conditions
+        if let FilterExpr::Or(left, right) = filter {
+            let left_pkeys = Self::try_index_scan_single(engine, class, left)?;
+            let right_pkeys = Self::try_index_scan_single(engine, class, right)?;
+            if let (Some(lp), Some(rp)) = (left_pkeys, right_pkeys) {
+                // Union the primary keys
+                let mut all_pkeys = lp;
+                let mut seen: std::collections::HashSet<Vec<u8>> = all_pkeys.iter().cloned().collect();
+                for pk in rp {
+                    if seen.insert(pk.clone()) {
+                        all_pkeys.push(pk);
+                    }
+                }
+                let rows = Self::fetch_rows_by_pks(engine, txn_id, &all_pkeys)?;
+                return Ok(Some(rows));
+            }
+            return Ok(None);
+        }
+
+        // Single predicate - try direct index scan
+        Self::try_index_scan_single(engine, class, filter)?
+            .map(|pkeys| Self::fetch_rows_by_pks(engine, txn_id, &pkeys))
+            .transpose()
+    }
+
+    /// Tries to use an index for a single (non-AND/OR) predicate.
+    /// Returns Some(primary_keys) if index was used, None otherwise.
+    fn try_index_scan_single(
+        engine: &mut LsmEngine,
+        class: &str,
+        filter: &FilterExpr,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
         let col = match filter {
             FilterExpr::Eq(c, _)
             | FilterExpr::Ne(c, _)
@@ -1413,11 +1680,11 @@ impl QueryExecutor {
             | FilterExpr::Lte(c, _)
             | FilterExpr::Between(c, _, _)
             | FilterExpr::In(c, _) => c.clone(),
-            _ => return Ok(None), // Complex filters can't use a single index
+            _ => return Ok(None),
         };
 
         if !engine.has_index(class, &col) {
-            return Ok(None); // No index on this column
+            return Ok(None);
         }
 
         let index_mgr = engine.index_manager();
@@ -1436,7 +1703,6 @@ impl QueryExecutor {
                 index_mgr.lookup_lt(class, &col, &json_val).unwrap_or_default()
             }
             FilterExpr::Gte(_, val) => {
-                // gte = gt + eq
                 let json_val = Self::literal_to_json_static(val);
                 let tree = match index_mgr.get_index(class, &col) {
                     Some(t) => t,
@@ -1474,9 +1740,67 @@ impl QueryExecutor {
             _ => return Ok(None),
         };
 
-        // Fetch the actual rows by primary keys
-        let rows = Self::fetch_rows_by_pks(engine, txn_id, &pkeys)?;
-        Ok(Some(rows))
+        Ok(Some(pkeys))
+    }
+
+    /// Static filter evaluation (no engine needed for simple predicates).
+    fn eval_filter_static(doc: &Map<String, Value>, filter: &FilterExpr) -> bool {
+        match filter {
+            FilterExpr::Eq(col, val) => {
+                doc.get(col).map_or(false, |v| Self::value_matches_static(v, val))
+            }
+            FilterExpr::Ne(col, val) => {
+                !doc.get(col).map_or(false, |v| Self::value_matches_static(v, val))
+            }
+            FilterExpr::Gt(col, val) => {
+                doc.get(col).map_or(false, |v| Self::value_gt_static(v, val))
+            }
+            FilterExpr::Lt(col, val) => {
+                doc.get(col).map_or(false, |v| Self::value_lt_static(v, val))
+            }
+            FilterExpr::Gte(col, val) => {
+                doc.get(col).map_or(false, |v| Self::value_gt_static(v, val) || Self::value_matches_static(v, val))
+            }
+            FilterExpr::Lte(col, val) => {
+                doc.get(col).map_or(false, |v| Self::value_lt_static(v, val) || Self::value_matches_static(v, val))
+            }
+            FilterExpr::And(left, right) => {
+                Self::eval_filter_static(doc, left) && Self::eval_filter_static(doc, right)
+            }
+            FilterExpr::Or(left, right) => {
+                Self::eval_filter_static(doc, left) || Self::eval_filter_static(doc, right)
+            }
+            _ => true, // Complex filters pass through
+        }
+    }
+
+    fn value_matches_static(v: &Value, lit: &LiteralValue) -> bool {
+        match (v, lit) {
+            (Value::String(s), LiteralValue::String(l)) => s == l,
+            (Value::Number(n), LiteralValue::Int(l)) => n.as_i64() == Some(*l),
+            (Value::Number(n), LiteralValue::Float(l)) => n.as_f64() == Some(*l),
+            (Value::Bool(b), LiteralValue::Bool(l)) => b == l,
+            (Value::Null, LiteralValue::Null) => true,
+            _ => false,
+        }
+    }
+
+    fn value_gt_static(v: &Value, lit: &LiteralValue) -> bool {
+        match (v, lit) {
+            (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().map_or(false, |n| n > *l),
+            (Value::Number(n), LiteralValue::Float(l)) => n.as_f64().map_or(false, |n| n > *l),
+            (Value::String(s), LiteralValue::String(l)) => s.as_str() > l.as_str(),
+            _ => false,
+        }
+    }
+
+    fn value_lt_static(v: &Value, lit: &LiteralValue) -> bool {
+        match (v, lit) {
+            (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().map_or(false, |n| n < *l),
+            (Value::Number(n), LiteralValue::Float(l)) => n.as_f64().map_or(false, |n| n < *l),
+            (Value::String(s), LiteralValue::String(l)) => s.as_str() < l.as_str(),
+            _ => false,
+        }
     }
 
     /// Fetches rows by their primary keys within a transaction.
@@ -3920,5 +4244,122 @@ mod tests {
             }
             _ => panic!("expected Rows"),
         }
+    }
+
+    // ── Phase 22: ANALYZE tests ───────────────────────────────────
+
+    #[test]
+    fn test_analyze_command() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("ANALYZE Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                // Should have at least 1 row (table summary)
+                assert!(rows.len() >= 1);
+                // First row should be table stats
+                assert_eq!(rows[0].get("table").unwrap().as_str().unwrap(), "Product");
+                assert_eq!(rows[0].get("row_count").unwrap().as_i64().unwrap(), 3);
+            }
+            _ => panic!("expected Rows from ANALYZE"),
+        }
+    }
+
+    // ── Phase 22: Plan Cache tests ────────────────────────────────
+
+    #[test]
+    fn test_plan_cache_integration() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // First query - plan cache miss
+        let ast = QueryParser::parse("SELECT * FROM Product WHERE price > 500").unwrap();
+        let _ = executor.execute(&ast).unwrap();
+
+        // Second query - plan cache hit (same AST)
+        let _ = executor.execute(&ast).unwrap();
+
+        let stats = executor.runtime_stats();
+        assert_eq!(stats.plan_cache_misses, 1, "should have 1 plan cache miss");
+        assert_eq!(stats.plan_cache_hits, 1, "should have 1 plan cache hit");
+    }
+
+    // ── Phase 22: Composite Index tests ───────────────────────────
+
+    #[test]
+    fn test_composite_index_create() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Create composite index
+        let ast = QueryParser::parse("CREATE INDEX ON Product (name, price)").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => {
+                assert!(msg.contains("Composite index"));
+                assert!(msg.contains("name"));
+                assert!(msg.contains("price"));
+            }
+            _ => panic!("expected Success"),
+        }
+    }
+
+    // ── Phase 22: Index Condition Pushdown tests ──────────────────
+
+    #[test]
+    fn test_index_condition_pushdown_and() {
+        let (executor, _dir) = setup();
+
+        // Create index on price
+        let ast = QueryParser::parse("CREATE INDEX ON Product (price)").unwrap();
+        executor.execute(&ast).unwrap();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // AND condition: price > 800 AND price < 1500
+        // Should use index for price > 800, then filter price < 1500
+        let ast = QueryParser::parse(
+            "SELECT name, price FROM Product WHERE price > 800 AND price < 1500"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1); // Only iPhone (999)
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "iPhone");
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    // ── Phase 22: Runtime stats tests ─────────────────────────────
+
+    #[test]
+    fn test_runtime_stats_tracking() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let before = executor.runtime_stats().total_queries;
+
+        // Execute a few queries
+        for _ in 0..3 {
+            let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
+            let _ = executor.execute(&ast).unwrap();
+        }
+
+        let stats = executor.runtime_stats();
+        assert_eq!(stats.total_queries - before, 3, "should have 3 more queries");
+        assert!(stats.total_time_us > 0);
+        assert!(stats.table_scan_counts.contains_key("Product"));
     }
 }

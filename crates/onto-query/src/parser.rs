@@ -69,6 +69,12 @@ pub enum QueryAst {
         column: String,
     },
 
+    /// CREATE INDEX ON <class> (<col1>, <col2>, ...) - Composite index
+    CreateCompositeIndex {
+        class: String,
+        columns: Vec<String>,
+    },
+
     /// DROP INDEX <name> ON <class> (<column>)
     DropIndex {
         class: String,
@@ -126,6 +132,11 @@ pub enum QueryAst {
     /// REFRESH MATERIALIZED VIEW <name>
     RefreshMaterializedView {
         name: String,
+    },
+
+    /// ANALYZE <table> - Collect table statistics for query optimization
+    Analyze {
+        table: String,
     },
 }
 
@@ -392,6 +403,8 @@ impl QueryParser {
             Self::parse_create_index(input)
         } else if upper.starts_with("DROP INDEX") {
             Self::parse_drop_index(input)
+        } else if upper.starts_with("ANALYZE") {
+            Self::parse_analyze(input)
         } else if upper.starts_with("INSERT") {
             Self::parse_insert(input)
         } else if upper.starts_with("SELECT") {
@@ -1172,16 +1185,15 @@ impl QueryParser {
         (consumed, remaining)
     }
 
-    /// Parses: CREATE INDEX ON <class> (<column>)
+    /// Parses: CREATE INDEX ON <class> (<column>) or CREATE INDEX ON <class> (<col1>, <col2>)
     fn parse_create_index(input: &str) -> Result<QueryAst> {
-        // CREATE INDEX ON Product (price)
         let upper = input.to_uppercase();
         let on_pos = upper
             .find(" ON ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after CREATE INDEX".to_string()))?;
         let rest = input[on_pos + 4..].trim();
 
-        // Find the parenthesized column
+        // Find the parenthesized column(s)
         let paren_open = rest
             .find('(')
             .ok_or_else(|| CoreError::InvalidArgument("expected '(column)' in CREATE INDEX".to_string()))?;
@@ -1189,15 +1201,26 @@ impl QueryParser {
         let paren_close = rest
             .find(')')
             .ok_or_else(|| CoreError::InvalidArgument("expected ')' in CREATE INDEX".to_string()))?;
-        let column = rest[paren_open + 1..paren_close].trim().to_string();
+        let columns_str = rest[paren_open + 1..paren_close].trim().to_string();
 
-        if class.is_empty() || column.is_empty() {
+        if class.is_empty() || columns_str.is_empty() {
             return Err(CoreError::InvalidArgument(
                 "class and column cannot be empty in CREATE INDEX".to_string(),
             ));
         }
 
-        Ok(QueryAst::CreateIndex { class, column })
+        // Check if multiple columns (composite index)
+        let columns: Vec<String> = columns_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if columns.len() > 1 {
+            Ok(QueryAst::CreateCompositeIndex { class, columns })
+        } else {
+            Ok(QueryAst::CreateIndex { class, column: columns.into_iter().next().unwrap() })
+        }
     }
 
     /// Parses: DROP INDEX ON <class> (<column>)
@@ -1930,6 +1953,19 @@ impl QueryParser {
             }
         }
         last_op
+    }
+
+    /// Parses ANALYZE <table>
+    fn parse_analyze(input: &str) -> Result<QueryAst> {
+        let upper = input.to_uppercase();
+        if !upper.starts_with("ANALYZE") {
+            return Err(CoreError::InvalidArgument("expected ANALYZE".to_string()));
+        }
+        let table = input[7..].trim().to_string();
+        if table.is_empty() {
+            return Err(CoreError::InvalidArgument("expected table name after ANALYZE".to_string()));
+        }
+        Ok(QueryAst::Analyze { table })
     }
 
     fn parse_literal(s: &str) -> Result<LiteralValue> {
