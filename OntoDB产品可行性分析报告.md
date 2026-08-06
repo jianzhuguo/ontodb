@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.13 | 更新日期：2026-08-06
+> 版本：v1.15 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -1168,16 +1168,149 @@ FROM StockPrices;
 
 ### 22.5 后续优化方向
 
-| 方向 | 说明 |
-|------|------|
-| 窗口函数执行器 | 实现完整的窗口函数计算逻辑 |
-| 物化视图增量刷新 | 只更新变化的数据 |
-| 窗口函数下推 | 将窗口函数下推到存储层 |
-| 并行窗口计算 | 多线程并行计算不同分区 |
+| 方向 | 说明 | 状态 |
+|------|------|------|
+| 窗口函数执行器 | 实现完整的窗口函数计算逻辑 | ✅ Phase 21 已实现 |
+| 物化视图增量刷新 | 只更新变化的数据 | 待实现 |
+| 窗口函数下推 | 将窗口函数下推到存储层 | 待实现 |
+| 并行窗口计算 | 多线程并行计算不同分区 | 待实现 |
 
 ---
 
-## 二十三、结论与建议
+## 二十三、高级 SQL 特性与执行引擎增强（Phase 21）
+
+### 23.1 CASE WHEN 条件表达式
+
+新增 `ValueExpr` 表达式体系，支持在 SELECT 中使用复杂表达式：
+
+| 表达式类型 | 语法 | 说明 |
+|-----------|------|------|
+| `CaseWhen` | `CASE WHEN cond THEN val ELSE default END` | 条件分支 |
+| `ScalarSubquery` | `(SELECT col FROM table WHERE ...)` | 标量子查询 |
+| `Arithmetic` | `col + 10`, `price * 0.8` | 算术运算 |
+| `Literal` | `42`, `'hello'`, `NULL` | 字面量 |
+| `Column` | `name`, `p.name` | 列引用 |
+
+**执行器**：`evaluate_value_expr()` 递归求值，支持嵌套 CASE WHEN。
+
+### 23.2 CTE 执行落地
+
+Phase 19 的 CTE 解析在 Phase 21 落地为完整执行：
+
+- **物化策略**：CTE 结果写入 LSM 引擎，前缀 `__cte_<name>::`
+- **表名解析**：`full_scan()` 自动识别 CTE 表名
+- **自动清理**：主查询完成后删除 CTE 临时数据
+- **多 CTE 支持**：`WITH cte1 AS (...), cte2 AS (...) SELECT ...`
+
+### 23.3 窗口函数执行引擎
+
+完整的窗口函数计算引擎，支持 13 种函数：
+
+| 类别 | 函数 | 说明 |
+|------|------|------|
+| 排名 | `ROW_NUMBER`, `RANK`, `DENSE_RANK` | 行号、排名 |
+| 偏移 | `LAG`, `LEAD` | 前/后行值 |
+| 首尾 | `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE` | 首/末/第N值 |
+| 聚合 | `SUM/AVG/MIN/MAX/COUNT OVER` | 运行聚合 |
+
+**执行流程**：
+1. `partition_rows()` 按 PARTITION BY 分区
+2. 分区内按 ORDER BY 排序
+3. `compute_window_values()` 逐行计算
+4. 运行聚合：`compute_running_sum/avg/min/max()`
+
+### 23.4 物化视图存储
+
+- `CREATE MATERIALIZED VIEW` 执行查询并持久化结果到 `__mv_<name>::` 前缀
+- `DROP MATERIALIZED VIEW` 清理存储数据
+- `SELECT * FROM mv_name` 自动识别物化视图
+
+### 23.5 EXPLAIN ANALYZE
+
+EXPLAIN 现在实际执行查询并返回真实执行统计：
+
+```json
+{
+  "cost": {
+    "estimated_rows": 1000,
+    "actual_rows": 3,
+    "actual_time_ms": 0.42
+  }
+}
+```
+
+---
+
+## 二十四、查询性能优化（Phase 22）
+
+### 24.1 Plan Cache 真正集成
+
+Phase 18 创建的 `PlanCache` 在 Phase 22 真正集成到执行流程：
+
+- SELECT 查询执行前检查计划缓存（AST hash 查找）
+- 缓存命中：跳过 `planner.plan()`，直接执行
+- 缓存未命中：生成计划、缓存、执行
+- LRU 淘汰策略，最大 500 条
+
+### 24.2 Index Condition Pushdown (ICD)
+
+改进索引扫描，支持在扫描过程中同时过滤：
+
+**AND 条件下推**：
+```sql
+-- price 使用索引，category 作为 post-filter
+SELECT * FROM Product WHERE price > 800 AND category = 'phone'
+```
+
+**OR 条件索引合并**：
+```sql
+-- 两个分支分别使用索引，结果取并集
+SELECT * FROM Product WHERE price < 500 OR price > 2000
+```
+
+**实现**：`try_index_scan()` 递归处理 AND/OR，`eval_filter_static()` 无锁静态过滤。
+
+### 24.3 ANALYZE 统计信息收集
+
+```sql
+ANALYZE Product;
+```
+
+收集的统计信息：
+| 统计项 | 说明 |
+|--------|------|
+| `row_count` | 表行数 |
+| `non_null_count` | 每列非空值数 |
+| `distinct_count` | 每列不同值数（采样上限 1000） |
+| `selectivity` | 选择率 = distinct / non_null |
+
+统计信息自动更新到查询优化器，用于更准确的代价估算。
+
+### 24.4 运行时统计反馈
+
+新增 `RuntimeStats` 结构体，追踪查询执行指标：
+
+| 指标 | 说明 |
+|------|------|
+| `total_queries` | 总查询数 |
+| `total_time_us` | 总执行时间（微秒） |
+| `table_scan_counts` | 每表扫描次数 |
+| `table_row_counts` | 每表行数（来自 ANALYZE） |
+| `plan_cache_hits/misses` | 计划缓存命中/未命中 |
+| `query_cache_hits/misses` | 查询缓存命中/未命中 |
+
+### 24.5 复合索引
+
+```sql
+-- 创建复合索引
+CREATE INDEX ON Product (name, price);
+```
+
+复合索引在底层创建多个单列索引，查询时通过**索引交集**（Index Intersection）使用多个索引。
+
+---
+
+## 二十五、结论与建议
 
 ### 核心结论
 
@@ -1186,7 +1319,8 @@ FROM StockPrices;
 3. **100% 自研核心引擎是正确策略**：存储引擎、本体引擎、查询引擎、事务引擎必须自主掌控，基础设施（Raft、序列化、压缩）选择性复用
 4. **跨平台无实质风险**：当前 Rust 代码天然跨平台，Windows 开发 → Linux 生产完全可行，CI 双平台构建是最低成本保障
 5. **范围是最大风险**：必须砍掉 80% 的外围功能，聚焦核心
-6. **代码质量持续提升**：189 个测试全部通过，0 个编译警告，核心热路径已全面优化至 O(1)/O(log n)，WAL 持久化保障已完善
+6. **代码质量持续提升**：113 个测试全部通过（72 lib + 41 integration），查询引擎覆盖 Phase 15-22 全部功能
+7. **查询引擎已具备完整 OLAP 能力**：窗口函数、CTE、CASE WHEN、子查询、JOIN（Hash/SortMerge/NestedLoop）、EXPLAIN ANALYZE、Plan Cache、ICD
 
 ### 性能基线（v1.8）
 
