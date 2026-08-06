@@ -764,9 +764,9 @@ impl QueryExecutor {
             }
         }
 
-        // Apply filter if present
+        // Apply filter if present (with class hierarchy for subclass-aware matching)
         if let Some(f) = filter {
-            rows.retain(|row| Self::eval_filter_static(row, f));
+            rows.retain(|row| Self::eval_filter_static_with_hierarchy(row, f, &class_hierarchy));
         }
 
         // Apply alias to column names if specified
@@ -873,7 +873,7 @@ impl QueryExecutor {
                 for (key, val_bytes) in &entries {
                     if let Ok(serde_json::Value::Object(ref doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
                         if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
-                            if Self::eval_filter_static(doc, f) {
+                            if Self::eval_filter_static_with_hierarchy(doc, f, &class_hierarchy) {
                                 allowed_ids.insert(key.clone());
                             }
                         }
@@ -2413,6 +2413,15 @@ impl QueryExecutor {
 
     /// Static filter evaluation (no engine needed for simple predicates).
     fn eval_filter_static(doc: &Map<String, Value>, filter: &FilterExpr) -> bool {
+        Self::eval_filter_static_with_hierarchy(doc, filter, &HashSet::new())
+    }
+
+    /// Evaluates a static filter expression with optional class hierarchy for subclass-aware matching.
+    ///
+    /// When `class_hierarchy` is non-empty, `__class__` column comparisons (Eq/In) use
+    /// subclass-aware matching: a document with `__class__ = "Employee"` matches a filter
+    /// on `__class__ = "Person"` if Employee is a subclass of Person.
+    fn eval_filter_static_with_hierarchy(doc: &Map<String, Value>, filter: &FilterExpr, class_hierarchy: &HashSet<String>) -> bool {
         // Helper to resolve column value (preserving original type) with alias support
         let resolve_val = |col: &str| -> Option<&Value> {
             // Try exact match first
@@ -2429,10 +2438,22 @@ impl QueryExecutor {
         };
         match filter {
             FilterExpr::Eq(col, val) => {
-                resolve_val(col).map_or(false, |v| Self::value_matches_static(v, val))
+                resolve_val(col).map_or(false, |v| {
+                    if col == "__class__" && !class_hierarchy.is_empty() {
+                        Self::class_value_matches_hierarchy(v, val, class_hierarchy)
+                    } else {
+                        Self::value_matches_static(v, val)
+                    }
+                })
             }
             FilterExpr::Ne(col, val) => {
-                !resolve_val(col).map_or(false, |v| Self::value_matches_static(v, val))
+                !resolve_val(col).map_or(false, |v| {
+                    if col == "__class__" && !class_hierarchy.is_empty() {
+                        Self::class_value_matches_hierarchy(v, val, class_hierarchy)
+                    } else {
+                        Self::value_matches_static(v, val)
+                    }
+                })
             }
             FilterExpr::Gt(col, val) => {
                 resolve_val(col).map_or(false, |v| Self::value_gt_static(v, val))
@@ -2462,16 +2483,34 @@ impl QueryExecutor {
             }
             FilterExpr::In(col, values) => {
                 resolve_val(col).map_or(false, |v| {
-                    values.iter().any(|lv| Self::value_matches_static(v, lv))
+                    if col == "__class__" && !class_hierarchy.is_empty() {
+                        values.iter().any(|lv| Self::class_value_matches_hierarchy(v, lv, class_hierarchy))
+                    } else {
+                        values.iter().any(|lv| Self::value_matches_static(v, lv))
+                    }
                 })
             }
             FilterExpr::And(left, right) => {
-                Self::eval_filter_static(doc, left) && Self::eval_filter_static(doc, right)
+                Self::eval_filter_static_with_hierarchy(doc, left, class_hierarchy)
+                    && Self::eval_filter_static_with_hierarchy(doc, right, class_hierarchy)
             }
             FilterExpr::Or(left, right) => {
-                Self::eval_filter_static(doc, left) || Self::eval_filter_static(doc, right)
+                Self::eval_filter_static_with_hierarchy(doc, left, class_hierarchy)
+                    || Self::eval_filter_static_with_hierarchy(doc, right, class_hierarchy)
             }
             _ => true, // Complex filters (EXISTS, subqueries) pass through
+        }
+    }
+
+    /// Checks if a document's __class__ value matches a target class via the hierarchy.
+    /// Returns true if the document's class equals the target or is a subclass of it.
+    fn class_value_matches_hierarchy(doc_val: &Value, target: &LiteralValue, class_hierarchy: &HashSet<String>) -> bool {
+        match (doc_val, target) {
+            (Value::String(doc_class), LiteralValue::String(target_class)) => {
+                // Direct match or document's class is in the hierarchy (i.e. a subclass of target)
+                doc_class == target_class || class_hierarchy.contains(doc_class.as_str())
+            }
+            _ => Self::value_matches_static(doc_val, target),
         }
     }
 
@@ -2549,12 +2588,22 @@ impl QueryExecutor {
     fn eval_filter(&self, engine: &mut LsmEngine, doc: &Map<String, Value>, expr: &FilterExpr) -> bool {
         match expr {
             FilterExpr::Eq(col, val) => {
-                doc.get(col)
-                    .map_or(false, |v| self.value_matches(v, val))
+                doc.get(col).map_or(false, |v| {
+                    if col == "__class__" {
+                        self.class_value_matches(engine, v, val)
+                    } else {
+                        self.value_matches(v, val)
+                    }
+                })
             }
             FilterExpr::Ne(col, val) => {
-                !doc.get(col)
-                    .map_or(false, |v| self.value_matches(v, val))
+                !doc.get(col).map_or(false, |v| {
+                    if col == "__class__" {
+                        self.class_value_matches(engine, v, val)
+                    } else {
+                        self.value_matches(v, val)
+                    }
+                })
             }
             FilterExpr::Gt(col, val) => {
                 doc.get(col)
@@ -2588,7 +2637,11 @@ impl QueryExecutor {
             }
             FilterExpr::In(col, values) => {
                 doc.get(col).map_or(false, |v| {
-                    values.iter().any(|val| self.value_matches(v, val))
+                    if col == "__class__" {
+                        values.iter().any(|val| self.class_value_matches(engine, v, val))
+                    } else {
+                        values.iter().any(|val| self.value_matches(v, val))
+                    }
                 })
             }
             FilterExpr::InSubquery(col, subquery) => {
@@ -2650,6 +2703,23 @@ impl QueryExecutor {
             (Value::Bool(b), LiteralValue::Bool(l)) => b == l,
             (Value::Null, LiteralValue::Null) => true,
             _ => false,
+        }
+    }
+
+    /// Checks if a document's __class__ value matches a target class using ontology reasoning.
+    /// Returns true if the document's class equals the target or is in the class hierarchy
+    /// (i.e., the document's class is a subclass of the target).
+    fn class_value_matches(&self, engine: &mut LsmEngine, v: &Value, lit: &LiteralValue) -> bool {
+        match (v, lit) {
+            (Value::String(doc_class), LiteralValue::String(target_class)) => {
+                if doc_class == target_class {
+                    return true;
+                }
+                // Use get_class_hierarchy to check if doc_class is a subclass of target_class
+                let hierarchy = self.get_class_hierarchy(engine, target_class);
+                hierarchy.contains(doc_class.as_str())
+            }
+            _ => self.value_matches(v, lit),
         }
     }
 
