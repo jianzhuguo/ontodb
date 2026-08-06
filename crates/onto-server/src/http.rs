@@ -202,6 +202,14 @@ async fn health_live() -> impl IntoResponse {
 /// GET /metrics - Prometheus metrics endpoint.
 /// Returns metrics in Prometheus exposition format.
 async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse {
+    // Refresh storage metrics from engine state
+    if let Some(stats) = state.executor.engine_stats() {
+        state.metrics.update_storage_stats(
+            stats.total_sstables,
+            stats.memtable_entries,
+            state.metrics.compactions_total.get(), // compactions tracked separately
+        );
+    }
     let metrics = state.metrics.to_prometheus();
     (
         StatusCode::OK,
@@ -213,6 +221,14 @@ async fn metrics_prometheus(State(state): State<AppState>) -> impl IntoResponse 
 /// GET /api/metrics - JSON metrics endpoint.
 /// Returns metrics in JSON format for programmatic access.
 async fn metrics_json(State(state): State<AppState>) -> impl IntoResponse {
+    // Refresh storage metrics from engine state
+    if let Some(stats) = state.executor.engine_stats() {
+        state.metrics.update_storage_stats(
+            stats.total_sstables,
+            stats.memtable_entries,
+            state.metrics.compactions_total.get(),
+        );
+    }
     let m = &state.metrics;
     Json(json!({
         "server": {

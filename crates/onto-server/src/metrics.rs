@@ -31,6 +31,10 @@ impl AtomicCounter {
         self.value.fetch_add(n, Ordering::Relaxed);
     }
 
+    pub fn set(&self, n: u64) {
+        self.value.store(n, Ordering::Relaxed);
+    }
+
     pub fn get(&self) -> u64 {
         self.value.load(Ordering::Relaxed)
     }
@@ -232,6 +236,14 @@ impl Metrics {
     /// Record a parse error.
     pub fn record_parse_error(&self) {
         self.parse_errors.inc();
+    }
+
+    /// Updates storage metrics from engine stats.
+    /// Call this before exporting metrics to get accurate storage numbers.
+    pub fn update_storage_stats(&self, sstables: usize, entries: usize, compactions: u64) {
+        self.sstable_count.set(sstables as u64);
+        self.storage_entries.set(entries as u64);
+        self.compactions_total.set(compactions);
     }
 
     /// Export all metrics in Prometheus exposition format.

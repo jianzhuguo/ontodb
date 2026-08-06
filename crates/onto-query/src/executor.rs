@@ -148,6 +148,11 @@ impl QueryExecutor {
         self.runtime_stats.lock().unwrap().clone()
     }
 
+    /// Get engine storage statistics (SSTable count, total entries, etc.).
+    pub fn engine_stats(&self) -> Option<onto_storage::engine::EngineStats> {
+        self.engine.read().ok().map(|e| e.stats())
+    }
+
     /// Get a reference to the query planner.
     pub fn planner(&self) -> std::sync::RwLockReadGuard<'_, QueryPlanner> {
         self.planner.read().unwrap()
