@@ -2,7 +2,7 @@
 
 use crate::parser::{AggregateFunc, FilterExpr, LiteralValue, QueryAst, SelectColumns, SelectItem};
 use onto_core::{CoreError, Result};
-use onto_ontology::OntologyStore;
+use onto_ontology::{DataType, OntologyStore};
 use onto_storage::LsmEngine;
 use serde_json::{json, Map, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -425,6 +425,9 @@ impl QueryExecutor {
             doc.insert(col.clone(), self.literal_to_json(val));
         }
 
+        // Validate against ontology schema
+        self.validate_document(engine, class, &doc)?;
+
         let value = serde_json::to_vec(&Value::Object(doc))
             .map_err(|e| CoreError::Serialization(e.to_string()))?;
 
@@ -584,6 +587,8 @@ impl QueryExecutor {
                         for (col, val) in assignments {
                             doc.insert(col.clone(), self.literal_to_json(val));
                         }
+                        // Validate the updated document against ontology schema
+                        self.validate_document(engine, class, &doc)?;
                         let new_value = serde_json::to_vec(&Value::Object(doc))
                             .map_err(|e| CoreError::Serialization(e.to_string()))?;
                         engine.txn_put(txn_id, key, new_value)?;
@@ -949,6 +954,96 @@ impl QueryExecutor {
                 }
                 result
             }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Schema Validation
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Validates a document against the ontology schema.
+    /// Checks: class exists, required fields present, type compatibility.
+    /// Returns Ok(()) if valid, Err with a descriptive message if not.
+    fn validate_document(
+        &self,
+        engine: &mut LsmEngine,
+        class: &str,
+        doc: &Map<String, Value>,
+    ) -> Result<()> {
+        // Find the ontology containing this class
+        let ontology = match self.ontology_store.find_ontology_for_class(engine, class)? {
+            Some(o) => o,
+            None => return Ok(()), // No ontology defined — skip validation
+        };
+
+        let class_def = match ontology.classes.get(class) {
+            Some(c) => c,
+            None => return Ok(()), // Class not in ontology (shouldn't happen since find succeeded)
+        };
+
+        // Collect all properties for this class (including inherited)
+        let props = ontology.get_class_properties(class);
+        let prop_map: std::collections::HashMap<&str, &onto_ontology::Property> =
+            props.iter().map(|p| (p.name.as_str(), *p)).collect();
+
+        // Check required fields
+        for prop in &props {
+            if prop.required && !doc.contains_key(&prop.name) {
+                return Err(CoreError::InvalidArgument(format!(
+                    "required property '{}' is missing for class '{}'",
+                    prop.name, class
+                )));
+            }
+        }
+
+        // Validate types of provided fields
+        for (field_name, field_value) in doc {
+            if field_name == "__class__" {
+                continue;
+            }
+            if let Some(prop) = prop_map.get(field_name.as_str()) {
+                Self::validate_value_type(field_name, field_value, prop.range)?;
+            }
+            // Fields not in the ontology are allowed (schema-on-read compatible)
+        }
+
+        Ok(())
+    }
+
+    /// Validates that a JSON value is compatible with the expected DataType.
+    fn validate_value_type(field_name: &str, value: &Value, expected: DataType) -> Result<()> {
+        let valid = match (expected, value) {
+            (_, Value::Null) => true, // Null is always acceptable
+            (DataType::String, Value::String(_)) => true,
+            (DataType::Int64, Value::Number(n)) => n.is_i64(),
+            (DataType::Float64, Value::Number(_)) => true, // int and float both ok
+            (DataType::Bool, Value::Bool(_)) => true,
+            (DataType::Array, Value::Array(_)) => true,
+            (DataType::Object, Value::Object(_)) => true,
+            (DataType::Bytes, Value::String(_)) => true, // bytes stored as base64 string
+            _ => false,
+        };
+        if !valid {
+            return Err(CoreError::InvalidArgument(format!(
+                "type mismatch for property '{}': expected {:?}, got {}",
+                field_name,
+                expected,
+                Self::json_type_name(value)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns a human-readable type name for a JSON value.
+    fn json_type_name(value: &Value) -> &'static str {
+        match value {
+            Value::Null => "null",
+            Value::Bool(_) => "bool",
+            Value::Number(n) if n.is_i64() => "int64",
+            Value::Number(_) => "float64",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
         }
     }
 

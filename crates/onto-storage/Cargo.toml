@@ -17,6 +17,7 @@ tracing = { workspace = true }
 parking_lot = "0.12"
 bytes = "1"
 crossbeam-skiplist = "0.1"
+zstd = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

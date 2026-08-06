@@ -10,15 +10,22 @@
 //! The bloom filter enables efficient "key not found" checks.
 //! The footer contains offsets of the index block and bloom filter.
 
+use super::block_cache::BlockCache;
 use super::bloom_filter::BloomFilter;
 use onto_core::{CoreError, Entry, EntryKind, Result, SeqNo};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Footer size: index_offset (8) + bloom_offset (8) + magic (8)
-const FOOTER_SIZE: u64 = 24;
+/// Default block cache capacity (number of blocks per SSTable).
+const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 64;
+
+/// Footer size: index_offset (8) + bloom_offset (8) + magic (8) + flags (1)
+const FOOTER_SIZE: u64 = 25;
 const MAGIC: u64 = 0x4F4E544F_44425353; // "ONTO_DBSS"
+
+/// Flag bit indicating data blocks are zstd-compressed.
+const FLAG_COMPRESSED: u8 = 0x01;
 
 /// Block format: [entries...][restart_points...][num_restarts: u32]
 const RESTART_INTERVAL: usize = 16;
@@ -33,6 +40,10 @@ pub struct SsTable {
     index: Vec<BlockIndexEntry>,
     /// Bloom filter for point lookups.
     bloom: Option<BloomFilter>,
+    /// Whether data blocks are zstd-compressed.
+    compressed: bool,
+    /// LRU block cache for decompressed data blocks.
+    block_cache: BlockCache,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +68,8 @@ pub struct SsTableBuilder {
     /// This is more memory-efficient than pre-allocating a large bloom filter
     /// for small SSTables.
     keys_for_bloom: Vec<Vec<u8>>,
+    /// zstd compression level (0 = disabled, 1-21 = enabled).
+    compression_level: i32,
 }
 
 impl SsTableBuilder {
@@ -72,7 +85,13 @@ impl SsTableBuilder {
             restart_points: Vec::new(),
             entry_count_in_block: 0,
             keys_for_bloom: Vec::new(),
+            compression_level: 0,
         }
+    }
+
+    /// Enables zstd compression on data blocks. Level 1-21 (higher = better ratio, slower).
+    pub fn set_compression_level(&mut self, level: i32) {
+        self.compression_level = level.clamp(0, 21);
     }
 
     /// Adds an entry to the SSTable. Entries MUST be added in sorted key order.
@@ -102,6 +121,7 @@ impl SsTableBuilder {
     }
 
     /// Flushes the current block to the main data buffer.
+    /// Compresses the block with zstd if compression_level > 0.
     fn flush_block(&mut self) {
         if self.current_block.is_empty() {
             return;
@@ -115,7 +135,17 @@ impl SsTableBuilder {
         self.current_block
             .extend_from_slice(&num_restarts.to_le_bytes());
 
-        let block_size = self.current_block.len() as u64;
+        // Compress block if enabled
+        let block_data = if self.compression_level > 0 {
+            match zstd::encode_all(self.current_block.as_slice(), self.compression_level) {
+                Ok(compressed) => compressed,
+                Err(_) => self.current_block.clone(), // Fallback to uncompressed
+            }
+        } else {
+            self.current_block.clone()
+        };
+
+        let block_size = block_data.len() as u64;
 
         // Record block index
         self.block_entries.push(BlockIndexEntry {
@@ -125,7 +155,7 @@ impl SsTableBuilder {
         });
 
         // Append to main data
-        self.data.extend_from_slice(&self.current_block);
+        self.data.extend_from_slice(&block_data);
         self.current_block_offset += block_size;
 
         // Reset
@@ -168,16 +198,19 @@ impl SsTableBuilder {
         let bloom_data = bloom.to_bytes();
         file.write_all(&bloom_data)?;
 
-        // Write footer
+        // Write footer: index_offset (8) + bloom_offset (8) + magic (8) + flags (1)
+        let flags: u8 = if self.compression_level > 0 { FLAG_COMPRESSED } else { 0 };
         file.write_all(&index_offset.to_le_bytes())?;
         file.write_all(&bloom_offset.to_le_bytes())?;
         file.write_all(&MAGIC.to_le_bytes())?;
+        file.write_all(&[flags])?;
 
         file.flush()?;
         file.get_ref().sync_all()?;
 
         // Reopen for reading
         let read_file = File::open(path.as_ref())?;
+        let compressed = self.compression_level > 0;
 
         Ok(SsTable {
             _path: path.as_ref().to_path_buf(),
@@ -185,6 +218,8 @@ impl SsTableBuilder {
             _data_size: data_size,
             index: self.block_entries,
             bloom: Some(bloom),
+            compressed,
+            block_cache: BlockCache::new(DEFAULT_BLOCK_CACHE_CAPACITY),
         })
     }
 
@@ -223,14 +258,16 @@ impl SsTable {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut file = File::open(path.as_ref())?;
 
-        // Read footer
+        // Read footer: index_offset (8) + bloom_offset (8) + magic (8) + flags (1)
         file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
-        let mut footer = [0u8; 24];
+        let mut footer = [0u8; 25];
         file.read_exact(&mut footer)?;
 
         let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
         let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
         let magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+        let flags = footer[24];
+        let compressed = flags & FLAG_COMPRESSED != 0;
 
         if magic != MAGIC {
             return Err(CoreError::corruption("invalid SSTable magic number"));
@@ -257,6 +294,8 @@ impl SsTable {
             _data_size: index_offset,
             index,
             bloom,
+            compressed,
+            block_cache: BlockCache::new(DEFAULT_BLOCK_CACHE_CAPACITY),
         })
     }
 
@@ -370,10 +409,28 @@ impl SsTable {
     }
 
     fn read_block_at(&mut self, offset: u64, size: u64) -> Result<Vec<u8>> {
+        // Check block cache first (returns decompressed data)
+        if let Some(cached) = self.block_cache.get(offset) {
+            return Ok(cached.to_vec());
+        }
+
+        // Cache miss: read from disk
         let mut buf = vec![0u8; size as usize];
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.read_exact(&mut buf)?;
-        Ok(buf)
+
+        // Decompress if the SSTable uses compression
+        let block_data = if self.compressed {
+            zstd::decode_all(buf.as_slice())
+                .map_err(|e| CoreError::corruption(&format!("zstd decompression failed: {}", e)))?
+        } else {
+            buf
+        };
+
+        // Cache the decompressed block
+        self.block_cache.put(offset, block_data.clone());
+
+        Ok(block_data)
     }
 
     fn search_block(&self, block: &[u8], key: &[u8]) -> Result<Option<(Vec<u8>, SeqNo)>> {
@@ -709,5 +766,139 @@ mod tests {
             iter.next();
         }
         assert_eq!(count, 50);
+    }
+
+    #[test]
+    fn test_sstable_compressed_write_and_read() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("compressed.sst");
+
+        let mut builder = SsTableBuilder::new();
+        builder.set_compression_level(3);
+        for i in 0..200u32 {
+            let key = format!("key_{:06}", i);
+            let value = format!("value_{:06}_padding_data_to_make_compression_worthwhile", i);
+            builder.add(&Entry::put(
+                key.into_bytes(),
+                value.into_bytes(),
+                i as u64,
+            ));
+        }
+        builder.build(&path).unwrap();
+
+        // Open and read
+        let mut sst = SsTable::open(&path).unwrap();
+        assert!(sst.compressed, "SSTable should be marked as compressed");
+
+        // Point lookups
+        let (val, _) = sst.get(b"key_000050").unwrap().unwrap();
+        assert_eq!(val, b"value_000050_padding_data_to_make_compression_worthwhile");
+
+        let (val, _) = sst.get(b"key_000001").unwrap().unwrap();
+        assert_eq!(val, b"value_000001_padding_data_to_make_compression_worthwhile");
+
+        // Missing key
+        assert!(sst.get(b"missing_key").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_sstable_compressed_iteration() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("compressed_iter.sst");
+
+        let mut builder = SsTableBuilder::new();
+        builder.set_compression_level(3);
+        for i in 0..100u32 {
+            let key = format!("k{:04}", i);
+            let value = format!("v{:04}_some_repetitive_value_for_compression", i);
+            builder.add(&Entry::put(key.into_bytes(), value.into_bytes(), i as u64));
+        }
+        builder.build(&path).unwrap();
+
+        let mut sst = SsTable::open(&path).unwrap();
+        let mut iter = sst.iter().unwrap();
+
+        let mut count = 0;
+        while iter.is_valid() {
+            let key = iter.key();
+            let expected_key = format!("k{:04}", count);
+            assert_eq!(key, expected_key.as_bytes());
+            count += 1;
+            iter.next();
+        }
+        assert_eq!(count, 100);
+    }
+
+    #[test]
+    fn test_sstable_compressed_smaller_size() {
+        let dir = tempdir().unwrap();
+        let path_uncompressed = dir.path().join("uncompressed.sst");
+        let path_compressed = dir.path().join("compressed.sst");
+
+        // Build uncompressed
+        let mut builder = SsTableBuilder::new();
+        for i in 0..500u32 {
+            let key = format!("key_{:06}", i);
+            let value = format!("value_with_repetitive_padding_data_for_compression_test_{:06}", i);
+            builder.add(&Entry::put(key.into_bytes(), value.into_bytes(), i as u64));
+        }
+        builder.build(&path_uncompressed).unwrap();
+
+        // Build compressed
+        let mut builder = SsTableBuilder::new();
+        builder.set_compression_level(3);
+        for i in 0..500u32 {
+            let key = format!("key_{:06}", i);
+            let value = format!("value_with_repetitive_padding_data_for_compression_test_{:06}", i);
+            builder.add(&Entry::put(key.into_bytes(), value.into_bytes(), i as u64));
+        }
+        builder.build(&path_compressed).unwrap();
+
+        let size_uncompressed = std::fs::metadata(&path_uncompressed).unwrap().len();
+        let size_compressed = std::fs::metadata(&path_compressed).unwrap().len();
+
+        println!("Uncompressed: {} bytes, Compressed: {} bytes, Ratio: {:.1}%",
+            size_uncompressed, size_compressed,
+            (size_compressed as f64 / size_uncompressed as f64) * 100.0);
+
+        assert!(
+            size_compressed < size_uncompressed,
+            "Compressed SSTable ({}) should be smaller than uncompressed ({})",
+            size_compressed, size_uncompressed
+        );
+    }
+
+    #[test]
+    fn test_sstable_compressed_with_tombstones() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("compressed_tomb.sst");
+
+        let mut builder = SsTableBuilder::new();
+        builder.set_compression_level(3);
+        // Mix Put and Delete entries
+        for i in 0..100u32 {
+            let key = format!("key_{:04}", i);
+            if i % 3 == 0 {
+                builder.add(&Entry::delete(key.into_bytes(), i as u64));
+            } else {
+                let value = format!("value_{:04}", i);
+                builder.add(&Entry::put(key.into_bytes(), value.into_bytes(), i as u64));
+            }
+        }
+        builder.build(&path).unwrap();
+
+        let mut sst = SsTable::open(&path).unwrap();
+
+        // Check put entries
+        let result = sst.get_full(b"key_0001").unwrap().unwrap();
+        assert_eq!(result.2, EntryKind::Put);
+        assert_eq!(result.0, b"value_0001");
+
+        // Check tombstone entries
+        let result = sst.get_full(b"key_0000").unwrap().unwrap();
+        assert_eq!(result.2, EntryKind::Delete);
+
+        // get() should return None for tombstones
+        assert!(sst.get(b"key_0000").unwrap().is_none());
     }
 }

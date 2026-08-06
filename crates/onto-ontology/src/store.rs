@@ -79,6 +79,24 @@ impl OntologyStore {
         engine.delete(key)
     }
 
+    /// Finds the ontology that contains the given class name.
+    /// Scans all stored ontologies and returns the first one containing the class.
+    pub fn find_ontology_for_class(
+        &self,
+        engine: &mut LsmEngine,
+        class_name: &str,
+    ) -> Result<Option<Ontology>> {
+        let entries = engine.scan_prefix(ONTOLOGY_PREFIX)?;
+        for (_key, val_bytes) in entries {
+            if let Ok(ontology) = serde_json::from_slice::<Ontology>(&val_bytes) {
+                if ontology.classes.contains_key(class_name) {
+                    return Ok(Some(ontology));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn make_key(name: &str) -> Vec<u8> {
         let mut key = Vec::with_capacity(ONTOLOGY_PREFIX.len() + name.len());
         key.extend_from_slice(ONTOLOGY_PREFIX);

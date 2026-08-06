@@ -1,10 +1,16 @@
 //! LSM Engine: The main storage engine that orchestrates WAL, MemTable, and SSTables.
 //!
-//! Write path:  WAL → MemTable → (when full) flush to SSTable
-//! Read path:   MemTable → SSTables (newest to oldest)
+//! Write path:  WAL -> MemTable -> (when full) flush to SSTable
+//! Read path:   MemTable -> SSTables (newest to oldest)
 //! Delete:      Write tombstone entry
+//!
+//! Compaction runs in a background thread to avoid blocking the write path.
+//! Level metadata is shared between the engine and the compaction worker via
+//! `Arc<Mutex>`. The engine drains compaction notifications before reads to
+//! invalidate stale SSTable cache entries.
 
 use crate::index::IndexManager;
+use crate::lsm::compaction_worker::{CompactionMsg, CompactionNotification, CompactionWorker, SsTableInfo};
 use crate::lsm::memtable::MemTable;
 use crate::lsm::sstable::{SsTable, SsTableBuilder};
 use crate::lsm::wal::{self, Wal};
@@ -15,6 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 /// The main LSM-Tree storage engine with MVCC support.
 pub struct LsmEngine {
@@ -25,10 +32,12 @@ pub struct LsmEngine {
     immutable_memtable: Option<MemTable>,
 
     /// SSTables organized by level. Level 0 is newest.
-    levels: Vec<Vec<SsTableInfo>>,
+    /// Shared with the background compaction worker via Arc<Mutex>.
+    levels: Arc<Mutex<Vec<Vec<SsTableInfo>>>>,
 
     /// Cache of opened SSTable handles, keyed by file path.
     /// Avoids re-opening files and re-reading footer/bloom/index on every read.
+    /// Entries are invalidated when compaction replaces SSTable files.
     sst_cache: HashMap<PathBuf, SsTable>,
 
     /// Write-Ahead Log for durability.
@@ -40,27 +49,108 @@ pub struct LsmEngine {
     /// Sequence number generator.
     seq_counter: AtomicU64,
 
-    /// SSTable file ID counter.
-    sst_counter: AtomicU64,
+    /// SSTable file ID counter (shared with compaction worker).
+    sst_counter: Arc<AtomicU64>,
 
     /// MVCC transaction manager.
     txn_manager: TxnManager,
 
     /// Secondary index manager.
     index_manager: IndexManager,
+
+    /// Channel to send flush notifications to the background compaction worker.
+    compaction_sender: mpsc::Sender<CompactionMsg>,
+
+    /// Channel to receive compaction notifications (for cache invalidation).
+    /// Wrapped in Mutex because mpsc::Receiver is not Sync.
+    compaction_notif_receiver: std::sync::Mutex<mpsc::Receiver<CompactionNotification>>,
 }
 
-/// Metadata about an SSTable file, kept in memory.
-#[derive(Clone)]
-struct SsTableInfo {
-    /// File path.
-    path: PathBuf,
-    /// Approximate size in bytes.
-    size: u64,
-    /// Min key in this SSTable.
-    min_key: Vec<u8>,
-    /// Max key in this SSTable.
-    max_key: Vec<u8>,
+/// Temporary helper for loading WAL + SSTables before spawning the compaction worker.
+struct PreLoadEngine {
+    memtable: MemTable,
+    immutable_memtable: Option<MemTable>,
+    levels: Vec<Vec<SsTableInfo>>,
+    sst_cache: HashMap<PathBuf, SsTable>,
+    wal: Wal,
+    options: StorageOptions,
+    seq_counter: AtomicU64,
+    sst_counter: Arc<AtomicU64>,
+}
+
+impl PreLoadEngine {
+    fn recover(&mut self) -> Result<()> {
+        let wal_path = self.options.data_dir.join("wal.log");
+        if !wal_path.exists() {
+            return Ok(());
+        }
+        let entries = wal::replay_wal(&wal_path)?;
+        let mut max_seq = 0u64;
+        for entry in entries {
+            match entry.kind {
+                EntryKind::Put => self.memtable.put_with_seq(entry.key, entry.value, entry.seq_no),
+                EntryKind::Delete => self.memtable.delete_with_seq(entry.key, entry.seq_no),
+            }
+            max_seq = max_seq.max(entry.seq_no);
+        }
+        self.seq_counter = AtomicU64::new(max_seq + 1);
+        Ok(())
+    }
+
+    fn load_sstables(&mut self) -> Result<()> {
+        let dir_entries = fs::read_dir(&self.options.data_dir)?;
+        let mut sst_files: Vec<PathBuf> = Vec::new();
+        for entry in dir_entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "sst") {
+                sst_files.push(path);
+            }
+        }
+        sst_files.sort();
+        let mut max_seq = self.seq_counter.load(Ordering::Relaxed);
+        for path in sst_files {
+            let fname = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let level = fname
+                .strip_prefix('L')
+                .and_then(|s| s.split('_').next())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            if level >= self.levels.len() {
+                continue;
+            }
+            let mut sst = SsTable::open(&path)?;
+            let min_key = sst.first_key().unwrap_or_default();
+            let max_key = sst.max_key().to_vec();
+            let metadata = fs::metadata(&path)?;
+            let mut iter = sst.iter()?;
+            while iter.is_valid() {
+                let seq = iter.seq_no();
+                if seq >= max_seq {
+                    max_seq = seq + 1;
+                }
+                iter.next();
+            }
+            drop(iter);
+            if let Some(id_str) = fname.split('_').nth(1) {
+                if let Ok(id) = id_str.parse::<u64>() {
+                    let current = self.sst_counter.load(Ordering::Relaxed);
+                    if id >= current {
+                        self.sst_counter.store(id + 1, Ordering::Relaxed);
+                    }
+                }
+            }
+            self.sst_cache.insert(path.clone(), sst);
+            self.levels[level].push(SsTableInfo {
+                path,
+                size: metadata.len(),
+                min_key,
+                max_key,
+            });
+        }
+        self.seq_counter.store(max_seq, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 impl LsmEngine {
@@ -71,24 +161,44 @@ impl LsmEngine {
         let wal_path = options.data_dir.join("wal.log");
         let wal = Wal::open(&wal_path)?;
 
-        let mut engine = Self {
+        let sst_counter = Arc::new(AtomicU64::new(0));
+
+        // Pre-load existing SSTables into a temporary Vec before spawning the worker
+        let mut pre_engine = PreLoadEngine {
             memtable: MemTable::new(),
             immutable_memtable: None,
             levels: vec![Vec::new(); options.num_levels],
             sst_cache: HashMap::new(),
             wal,
-            options,
+            options: options.clone(),
             seq_counter: AtomicU64::new(0),
-            sst_counter: AtomicU64::new(0),
+            sst_counter: sst_counter.clone(),
+        };
+        pre_engine.recover()?;
+        pre_engine.load_sstables()?;
+
+        // Spawn the background compaction worker with the loaded levels
+        let (levels, compaction_sender, compaction_notif_receiver, _worker_handle) =
+            CompactionWorker::spawn(
+                options.clone(),
+                pre_engine.levels,
+                sst_counter.clone(),
+            );
+
+        let mut engine = LsmEngine {
+            memtable: pre_engine.memtable,
+            immutable_memtable: pre_engine.immutable_memtable,
+            levels,
+            sst_cache: pre_engine.sst_cache,
+            wal: pre_engine.wal,
+            options,
+            seq_counter: pre_engine.seq_counter,
+            sst_counter,
             txn_manager: TxnManager::new(),
             index_manager: IndexManager::new(),
+            compaction_sender,
+            compaction_notif_receiver: std::sync::Mutex::new(compaction_notif_receiver),
         };
-
-        // Recover from WAL
-        engine.recover()?;
-
-        // Load existing SSTables
-        engine.load_sstables()?;
 
         // Rebuild secondary indexes from persisted index entries
         engine.rebuild_indexes()?;
@@ -117,6 +227,8 @@ impl LsmEngine {
 
     /// Gets a value by key.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Value>> {
+        self.drain_compaction_notifications();
+
         // 1. Check active MemTable
         if let Some((val, _)) = self.memtable.get(key) {
             return Ok(Some(val.to_vec()));
@@ -130,16 +242,19 @@ impl LsmEngine {
         }
 
         // 3. Check SSTables (newest to oldest)
-        // Collect paths to avoid borrow conflict with self.sst_cache
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        for level in &self.levels {
-            for sst_info in level.iter().rev() {
-                if key < sst_info.min_key.as_slice() || key > sst_info.max_key.as_slice() {
-                    continue;
+        let candidates = {
+            let levels = self.levels.lock().unwrap();
+            let mut cands = Vec::new();
+            for level in levels.iter() {
+                for sst_info in level.iter().rev() {
+                    if key < sst_info.min_key.as_slice() || key > sst_info.max_key.as_slice() {
+                        continue;
+                    }
+                    cands.push(sst_info.path.clone());
                 }
-                candidates.push(sst_info.path.clone());
             }
-        }
+            cands
+        };
 
         for path in &candidates {
             let sst = self.get_sst(path)?;
@@ -169,9 +284,10 @@ impl LsmEngine {
         prefix: &[u8],
         vis: Option<&crate::mvcc::Visibility>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.drain_compaction_notifications();
+
         let mut seen: BTreeMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = BTreeMap::new();
 
-        // Helper: should we include this entry?
         let is_visible = |seq: SeqNo| -> bool {
             match vis {
                 Some(v) => v.is_visible(seq),
@@ -179,24 +295,27 @@ impl LsmEngine {
             }
         };
 
-        // 1. Scan SSTables (oldest to newest, so newer entries overwrite older)
-        // Collect paths first to avoid borrow conflict with self.sst_cache
-        let mut sst_paths: Vec<PathBuf> = Vec::new();
-        for level in self.levels.iter().rev() {
-            for sst_info in level.iter() {
-                if !prefix.is_empty() {
-                    let sst_max = sst_info.max_key.as_slice();
-                    if sst_max < prefix {
-                        continue;
+        // Collect SSTable paths under lock, then release
+        let sst_paths: Vec<PathBuf> = {
+            let levels = self.levels.lock().unwrap();
+            let mut paths = Vec::new();
+            for level in levels.iter().rev() {
+                for sst_info in level.iter() {
+                    if !prefix.is_empty() {
+                        let sst_max = sst_info.max_key.as_slice();
+                        if sst_max < prefix {
+                            continue;
+                        }
+                        let sst_min = sst_info.min_key.as_slice();
+                        if !Self::prefix_may_overlap(prefix, sst_min, sst_max) {
+                            continue;
+                        }
                     }
-                    let sst_min = sst_info.min_key.as_slice();
-                    if !Self::prefix_may_overlap(prefix, sst_min, sst_max) {
-                        continue;
-                    }
+                    paths.push(sst_info.path.clone());
                 }
-                sst_paths.push(sst_info.path.clone());
             }
-        }
+            paths
+        };
 
         for path in &sst_paths {
             let sst = self.get_sst(path)?;
@@ -328,6 +447,7 @@ impl LsmEngine {
             let sst_path = self.options.data_dir.join(format!("L0_{}.sst", sst_id));
 
             let mut builder = SsTableBuilder::new();
+            builder.set_compression_level(self.options.compression_level);
             for entry in imm.entries() {
                 builder.add(&Entry {
                     key: entry.key.clone(),
@@ -339,7 +459,6 @@ impl LsmEngine {
 
             builder.build(&sst_path)?;
 
-            // Record SSTable metadata
             let min_key = imm
                 .entries()
                 .next()
@@ -353,12 +472,19 @@ impl LsmEngine {
 
             let metadata = fs::metadata(&sst_path)?;
 
-            self.levels[0].push(SsTableInfo {
-                path: sst_path,
-                size: metadata.len(),
-                min_key,
-                max_key,
-            });
+            // Add to shared levels under lock
+            {
+                let mut levels = self.levels.lock().unwrap();
+                levels[0].push(SsTableInfo {
+                    path: sst_path,
+                    size: metadata.len(),
+                    min_key,
+                    max_key,
+                });
+            }
+
+            // Notify the background compaction worker
+            let _ = self.compaction_sender.send(CompactionMsg::Flushed { level: 0 });
         }
 
         // Clear immutable MemTable
@@ -367,441 +493,75 @@ impl LsmEngine {
         // Reset WAL (we've persisted everything to SSTable)
         self.reset_wal()?;
 
-        // Trigger compaction if needed
-        self.maybe_compact(0)?;
+        // Compaction is handled by the background worker �?no synchronous call needed
 
         Ok(())
     }
 
-    /// Recovers MemTable state from WAL on startup.
-    fn recover(&mut self) -> Result<()> {
-        let wal_path = self.options.data_dir.join("wal.log");
-        if !wal_path.exists() {
-            return Ok(());
-        }
 
-        let entries = wal::replay_wal(&wal_path)?;
-        let mut max_seq = 0u64;
-
-        for entry in entries {
-            match entry.kind {
-                EntryKind::Put => {
-                    self.memtable.put_with_seq(entry.key, entry.value, entry.seq_no);
-                }
-                EntryKind::Delete => {
-                    self.memtable.delete_with_seq(entry.key, entry.seq_no);
-                }
-            }
-            max_seq = max_seq.max(entry.seq_no);
-        }
-
-        self.seq_counter = AtomicU64::new(max_seq + 1);
-
-        Ok(())
-    }
-
-    /// Loads existing SSTable files from the data directory.
-    fn load_sstables(&mut self) -> Result<()> {
-        let entries = fs::read_dir(&self.options.data_dir)?;
-
-        let mut sst_files: Vec<PathBuf> = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "sst") {
-                sst_files.push(path);
-            }
-        }
-
-        // Sort by filename (which includes level and ID)
-        sst_files.sort();
-
-        let mut max_seq = self.seq_counter.load(Ordering::Relaxed);
-
-        for path in sst_files {
-            let fname = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-
-            // Parse level from filename like "L0_123.sst" or "L10_456.sst"
-            let level = fname
-                .strip_prefix('L')
-                .and_then(|s| s.split('_').next())
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0);
-
-            if level >= self.levels.len() {
-                continue;
-            }
-
-            let mut sst = SsTable::open(&path)?;
-            let min_key = sst.first_key().unwrap_or_default();
-            let max_key = sst.max_key().to_vec();
-            let metadata = fs::metadata(&path)?;
-
-            // Scan SSTable for max seq_no to keep seq_counter consistent
-            let mut iter = sst.iter()?;
-            while iter.is_valid() {
-                let seq = iter.seq_no();
-                if seq >= max_seq {
-                    max_seq = seq + 1;
-                }
-                iter.next();
-            }
-            drop(iter);
-
-            // Update sst_counter if needed
-            if let Some(id_str) = fname.split('_').nth(1) {
-                if let Ok(id) = id_str.parse::<u64>() {
-                    let current = self.sst_counter.load(Ordering::Relaxed);
-                    if id >= current {
-                        self.sst_counter.store(id + 1, Ordering::Relaxed);
+    /// Drains compaction notifications from the background worker.
+    /// Evicts stale SSTable cache entries when compaction replaces files.
+    fn drain_compaction_notifications(&mut self) {
+        let receiver = self.compaction_notif_receiver.lock().unwrap();
+        let mut had_compaction = false;
+        while let Ok(notif) = receiver.try_recv() {
+            match notif {
+                CompactionNotification::Compacted { evicted_paths } => {
+                    for path in &evicted_paths {
+                        self.sst_cache.remove(path);
                     }
+                    had_compaction = true;
                 }
-            }
-
-            // Cache the opened SSTable handle for future reads
-            self.sst_cache.insert(path.clone(), sst);
-
-            self.levels[level].push(SsTableInfo {
-                path,
-                size: metadata.len(),
-                min_key,
-                max_key,
-            });
-        }
-
-        // Update seq_counter to be past all SSTable sequence numbers
-        self.seq_counter.store(max_seq, Ordering::Relaxed);
-
-        Ok(())
-    }
-
-    /// Checks if compaction is needed and triggers it.
-    /// Uses size-based scoring to prioritize which level to compact.
-    fn maybe_compact(&mut self, start_level: usize) -> Result<()> {
-        // Score each level: score = level_size / target_size.
-        // Score > 1.0 means the level is over target and needs compaction.
-        // Pick the level with the highest score.
-        let mut best_level = None;
-        let mut best_score = 0.0f64;
-
-        for level in start_level..self.levels.len() - 1 {
-            let score = self.compaction_score(level);
-            if score > best_score {
-                best_score = score;
-                best_level = Some(level);
-            }
-        }
-
-        if let Some(level) = best_level {
-            if best_score > 1.0 {
-                tracing::info!(
-                    "Compaction triggered: L{} score={:.2} (size={} target={})",
-                    level,
-                    best_score,
-                    self.level_size(level),
-                    self.target_level_size(level)
-                );
-                self.compact_level(level)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Computes a compaction urgency score for a level.
-    /// Score > 1.0 means the level is over its target size.
-    fn compaction_score(&self, level: usize) -> f64 {
-        let size = self.level_size(level);
-        let target = self.target_level_size(level);
-        if target == 0 {
-            return 0.0;
-        }
-        size as f64 / target as f64
-    }
-
-    /// Returns total size in bytes of all SSTables in a level.
-    fn level_size(&self, level: usize) -> u64 {
-        self.levels[level].iter().map(|s| s.size).sum()
-    }
-
-    /// Returns the target size for a level.
-    /// L0: memtable_size * 2 (buffer a few flushes before compacting).
-    /// L1+: L1_base * size_ratio^level.
-    fn target_level_size(&self, level: usize) -> u64 {
-        if level == 0 {
-            // L0 target: allow a few memtable flushes before triggering
-            (self.options.memtable_size_limit as u64) * 4
-        } else {
-            // L1 base = memtable_size * size_ratio (e.g., 4MB * 10 = 40MB)
-            let l1_base = (self.options.memtable_size_limit as u64)
-                * (self.options.size_ratio as u64);
-            // L_n target = l1_base * size_ratio^(n-1)
-            let mut target = l1_base;
-            for _ in 1..level {
-                target *= self.options.size_ratio as u64;
-            }
-            target
-        }
-    }
-
-    /// Performs leveled compaction: merges SSTables from level N into level N+1.
-    ///
-    /// Algorithm:
-    /// 1. Pick SSTables from level N (sorted by key range)
-    /// 2. Find overlapping SSTables in level N+1
-    /// 3. Merge-sort all entries from both levels
-    /// 4. Deduplicate: keep only the latest version of each key
-    /// 5. Drop tombstones safely (see `can_drop_tombstone`)
-    /// 6. Write new SSTables to level N+1
-    /// 7. Delete old SSTable files from both levels
-    fn compact_level(&mut self, level: usize) -> Result<()> {
-        if level >= self.levels.len() - 1 {
-            return Ok(());
-        }
-
-        // Step 1: Pick SSTables from level N to compact.
-        // For L0, pick the oldest N (not all) to limit write amplification.
-        // For L1+, pick enough to bring level under target.
-        let ssts_to_compact = if level == 0 {
-            // L0: pick oldest SSTables, up to half the level (at least 2)
-            let count = (self.levels[0].len() / 2).max(2).min(self.levels[0].len());
-            self.levels[0].drain(..count).collect::<Vec<_>>()
-        } else {
-            // L1+: pick the oldest SSTable
-            if self.levels[level].is_empty() {
-                return Ok(());
-            }
-            vec![self.levels[level].remove(0)]
-        };
-
-        if ssts_to_compact.is_empty() {
-            return Ok(());
-        }
-
-        // Compute the combined key range of the SSTables being compacted
-        let compact_min = ssts_to_compact
-            .iter()
-            .map(|s| s.min_key.as_slice())
-            .min()
-            .unwrap_or(b"")
-            .to_vec();
-        let compact_max = ssts_to_compact
-            .iter()
-            .map(|s| s.max_key.as_slice())
-            .max()
-            .unwrap_or(b"")
-            .to_vec();
-
-        // Step 2: Find overlapping SSTables in level N+1
-        let next_level = level + 1;
-        let mut overlapping_indices = Vec::new();
-        for (i, sst_info) in self.levels[next_level].iter().enumerate() {
-            if Self::ranges_overlap(
-                &compact_min,
-                &compact_max,
-                &sst_info.min_key,
-                &sst_info.max_key,
-            ) {
-                overlapping_indices.push(i);
-            }
-        }
-
-        // Collect overlapping SSTables (remove from level in reverse order to preserve indices)
-        let mut next_level_ssts = Vec::new();
-        for &i in overlapping_indices.iter().rev() {
-            next_level_ssts.push(self.levels[next_level].remove(i));
-        }
-
-        // Step 3: Collect all entries from both sets of SSTables
-        let mut all_entries: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
-
-        // Read entries from level N SSTables
-        for sst_info in &ssts_to_compact {
-            let mut sst = SsTable::open(&sst_info.path)?;
-            let mut iter = sst.iter()?;
-            while iter.is_valid() {
-                all_entries.push((
-                    iter.key().to_vec(),
-                    iter.value().to_vec(),
-                    iter.seq_no(),
-                    iter.kind(),
-                ));
-                iter.next();
-            }
-        }
-
-        // Read entries from level N+1 SSTables
-        for sst_info in &next_level_ssts {
-            let mut sst = SsTable::open(&sst_info.path)?;
-            let mut iter = sst.iter()?;
-            while iter.is_valid() {
-                all_entries.push((
-                    iter.key().to_vec(),
-                    iter.value().to_vec(),
-                    iter.seq_no(),
-                    iter.kind(),
-                ));
-                iter.next();
-            }
-        }
-
-        // Step 4: Sort by key, then by seq_no descending (keep latest version)
-        all_entries.sort_by(|a, b| {
-            a.0.cmp(&b.0) // key ascending
-                .then(b.2.cmp(&a.2)) // seq_no descending
-        });
-
-        // Step 5: Deduplicate — keep only the latest version of each key.
-        // Drop tombstones when safe (see `can_drop_tombstone`).
-        let mut merged: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
-        let mut last_key: Option<Vec<u8>> = None;
-
-        for (key, value, seq_no, kind) in &all_entries {
-            if last_key.as_ref() == Some(key) {
-                continue; // Skip older versions of the same key
-            }
-
-            // Drop tombstones when they can't shadow anything in deeper levels
-            if *kind == EntryKind::Delete && self.can_drop_tombstone(key, next_level) {
-                last_key = Some(key.clone());
-                continue;
-            }
-
-            last_key = Some(key.clone());
-            merged.push((key.clone(), value.clone(), *seq_no, *kind));
-        }
-
-        // Step 6: Write merged entries to new SSTables in level N+1
-        let target_sst_size = self.options.block_size * 16; // ~64KB per SSTable
-        let mut builder = SsTableBuilder::new();
-        let mut new_ssts = Vec::new();
-        let mut current_size = 0usize;
-        let mut batch_start_idx = 0usize;
-
-        for (i, (key, value, seq_no, kind)) in merged.iter().enumerate() {
-            builder.add(&Entry {
-                key: key.clone(),
-                value: value.clone(),
-                seq_no: *seq_no,
-                kind: *kind,
-            });
-            current_size += key.len() + value.len() + 16;
-
-            if current_size >= target_sst_size {
-                let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
-                let sst_path = self
-                    .options
-                    .data_dir
-                    .join(format!("L{}_{}.sst", next_level, sst_id));
-                let sst = builder.build(&sst_path)?;
-
-                let metadata = fs::metadata(&sst_path)?;
-                new_ssts.push(SsTableInfo {
-                    path: sst_path,
-                    size: metadata.len(),
-                    min_key: merged[batch_start_idx].0.clone(),
-                    max_key: sst.max_key().to_vec(),
-                });
-
-                builder = SsTableBuilder::new();
-                current_size = 0;
-                batch_start_idx = i + 1;
-            }
-        }
-
-        // Flush remaining entries
-        if current_size > 0 {
-            let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
-            let sst_path = self
-                .options
-                .data_dir
-                .join(format!("L{}_{}.sst", next_level, sst_id));
-            let sst = builder.build(&sst_path)?;
-
-            let metadata = fs::metadata(&sst_path)?;
-            new_ssts.push(SsTableInfo {
-                path: sst_path,
-                size: metadata.len(),
-                min_key: merged[batch_start_idx].0.clone(),
-                max_key: sst.max_key().to_vec(),
-            });
-        }
-
-        // Step 7: Delete old SSTable files and evict from cache
-        for sst_info in &ssts_to_compact {
-            self.evict_sst(&sst_info.path);
-            let _ = fs::remove_file(&sst_info.path);
-        }
-        for sst_info in &next_level_ssts {
-            self.evict_sst(&sst_info.path);
-            let _ = fs::remove_file(&sst_info.path);
-        }
-
-        // Add new SSTables to level N+1
-        self.levels[next_level].extend(new_ssts);
-
-        // Sort level N+1 by min_key to maintain non-overlapping order
-        self.levels[next_level].sort_by(|a, b| a.min_key.cmp(&b.min_key));
-
-        tracing::info!(
-            "Compaction L{}→L{}: merged {} + {} entries into {} SSTables",
-            level,
-            next_level,
-            ssts_to_compact.len(),
-            next_level_ssts.len(),
-            self.levels[next_level].len()
-        );
-
-        // Recursively check if next level needs compaction
-        self.maybe_compact(next_level)?;
-
-        Ok(())
-    }
-
-    /// Determines if a tombstone for the given key can be safely dropped.
-    ///
-    /// A tombstone can be dropped when:
-    /// 1. We're at the deepest level (nothing below to shadow), OR
-    /// 2. The key doesn't exist in any deeper level (no shadowed entries to resurrect)
-    ///
-    /// Condition 2 is checked by comparing the key against the min/max ranges
-    /// of all SSTables in deeper levels — if no SSTable's range includes the key,
-    /// the tombstone is safe to drop.
-    fn can_drop_tombstone(&self, key: &[u8], from_level: usize) -> bool {
-        // At the deepest level — always safe to drop
-        if from_level >= self.levels.len() - 1 {
-            return true;
-        }
-
-        // Check deeper levels: if no SSTable could contain this key, safe to drop
-        for level in (from_level + 1)..self.levels.len() {
-            for sst_info in &self.levels[level] {
-                if key >= sst_info.min_key.as_slice() && key <= sst_info.max_key.as_slice() {
-                    return false; // Key might exist deeper — keep tombstone
+                CompactionNotification::FlushDone => {
+                    // Ignore FlushDone in normal drain
                 }
             }
         }
-
-        true // Key doesn't exist in any deeper level — safe to drop
+        drop(receiver);
+        // After any compaction, clear the entire cache to ensure no stale handles
+        if had_compaction {
+            self.sst_cache.clear();
+        }
     }
 
-    /// Checks if two key ranges overlap.
-    fn ranges_overlap(min_a: &[u8], max_a: &[u8], min_b: &[u8], max_b: &[u8]) -> bool {
-        // Empty ranges don't overlap
-        if min_a.is_empty() || max_a.is_empty() || min_b.is_empty() || max_b.is_empty() {
-            return true; // Conservative: assume overlap if range is unknown
+    /// Blocks until all pending background compaction work is complete.
+    /// Useful for testing and graceful shutdown.
+    pub fn flush_compaction(&mut self) -> Result<()> {
+        // Drain any pending notifications first
+        self.drain_compaction_notifications();
+
+        let _ = self.compaction_sender.send(CompactionMsg::FlushAndNotify);
+        let receiver = self.compaction_notif_receiver.lock().unwrap();
+        let mut had_compaction = false;
+        loop {
+            match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(CompactionNotification::FlushDone) => break,
+                Ok(CompactionNotification::Compacted { ref evicted_paths }) => {
+                    for path in evicted_paths {
+                        self.sst_cache.remove(path);
+                    }
+                    had_compaction = true;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::warn!("flush_compaction timed out waiting for FlushDone");
+                    break;
+                }
+                Err(_) => break,
+            }
         }
-        min_a <= max_b && min_b <= max_a
+        drop(receiver);
+        // Clear the entire cache after compaction to ensure no stale handles
+        if had_compaction {
+            self.sst_cache.clear();
+        }
+        Ok(())
     }
 
     /// Resets the WAL file after a successful flush.
     ///
     /// Uses write-new-then-rename for atomicity:
     /// 1. Create a new WAL at a temp path
-    /// 2. Atomically rename temp → wal.log
+    /// 2. Atomically rename temp �?wal.log
     /// This ensures the WAL is never missing, even if the process crashes mid-reset.
     fn reset_wal(&mut self) -> Result<()> {
         let wal_path = self.options.data_dir.join("wal.log");
@@ -839,11 +599,6 @@ impl LsmEngine {
         Ok(self.sst_cache.get_mut(path).unwrap())
     }
 
-    /// Removes an SSTable from the cache (called during compaction when files are deleted).
-    fn evict_sst(&mut self, path: &Path) {
-        self.sst_cache.remove(path);
-    }
-
     /// Rebuilds secondary indexes by scanning persisted index entries from SSTables.
     fn rebuild_indexes(&mut self) -> Result<()> {
         let index_entries = self.scan_prefix(b"__idx__")?;
@@ -858,10 +613,8 @@ impl LsmEngine {
         Ok(())
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    //  MVCC Transaction API
-    // ═══════════════════════════════════════════════════════════════
-
+    // ══════════════════════════════════════════════════════════════�?    //  MVCC Transaction API
+    // ══════════════════════════════════════════════════════════════�?
     /// Begins a new transaction. Returns the transaction ID.
     /// Snapshot is taken at the last committed data point.
     pub fn begin_txn(&mut self) -> SeqNo {
@@ -1054,7 +807,7 @@ impl LsmEngine {
         key: &[u8],
         vis: &crate::mvcc::Visibility,
     ) -> Result<Option<Value>> {
-        // Check active MemTable — use range query to find visible version
+        // Check active MemTable �?use range query to find visible version
         for entry in self.memtable.get_versions(key) {
             if vis.is_visible(entry.seq_no) {
                 if entry.is_tombstone() {
@@ -1078,15 +831,19 @@ impl LsmEngine {
         }
 
         // Check SSTables (newest to oldest)
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        for level in &self.levels {
-            for sst_info in level.iter().rev() {
-                if key < sst_info.min_key.as_slice() || key > sst_info.max_key.as_slice() {
-                    continue;
+        let candidates: Vec<PathBuf> = {
+            let levels = self.levels.lock().unwrap();
+            let mut cands = Vec::new();
+            for level in levels.iter() {
+                for sst_info in level.iter().rev() {
+                    if key < sst_info.min_key.as_slice() || key > sst_info.max_key.as_slice() {
+                        continue;
+                    }
+                    cands.push(sst_info.path.clone());
                 }
-                candidates.push(sst_info.path.clone());
             }
-        }
+            cands
+        };
 
         for path in &candidates {
             let sst = self.get_sst(path)?;
@@ -1118,10 +875,9 @@ impl LsmEngine {
         self.txn_manager.active_count()
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // =================================================================
     //  Index API
-    // ═══════════════════════════════════════════════════════════════
-
+    // =================================================================
     /// Creates a secondary index on a class.column.
     /// Automatically backfills existing data for the class.
     pub fn create_index(&mut self, class: &str, column: &str) -> Result<()> {
@@ -1173,9 +929,9 @@ impl LsmEngine {
 
     /// Returns engine statistics.
     pub fn stats(&self) -> EngineStats {
-        let total_sstables: usize = self.levels.iter().map(|l| l.len()).sum();
-        let total_sst_size: u64 = self
-            .levels
+        let levels = self.levels.lock().unwrap();
+        let total_sstables: usize = levels.iter().map(|l| l.len()).sum();
+        let total_sst_size: u64 = levels
             .iter()
             .flat_map(|l| l.iter())
             .map(|s| s.size)
@@ -1184,7 +940,7 @@ impl LsmEngine {
         EngineStats {
             memtable_size: self.memtable.size(),
             memtable_entries: self.memtable.len(),
-            num_levels: self.levels.len(),
+            num_levels: levels.len(),
             total_sstables,
             total_sst_size,
         }
@@ -1208,21 +964,21 @@ mod tests {
 
     #[test]
     fn test_prefix_may_overlap() {
-        // prefix == min_key → true
+        // prefix == min_key �?true
         assert!(LsmEngine::prefix_may_overlap(b"002", b"002", b"005"));
-        // prefix < min_key, but min_key starts with prefix → true
+        // prefix < min_key, but min_key starts with prefix �?true
         assert!(LsmEngine::prefix_may_overlap(b"00", b"002", b"005"));
-        // prefix < min_key, min_key does NOT start with prefix → false
+        // prefix < min_key, min_key does NOT start with prefix �?false
         assert!(!LsmEngine::prefix_may_overlap(b"001", b"002", b"005"));
-        // prefix in range → true
+        // prefix in range �?true
         assert!(LsmEngine::prefix_may_overlap(b"003", b"002", b"005"));
-        // prefix == max_key → true
+        // prefix == max_key �?true
         assert!(LsmEngine::prefix_may_overlap(b"005", b"002", b"005"));
-        // prefix > max_key → false
+        // prefix > max_key �?false
         assert!(!LsmEngine::prefix_may_overlap(b"006", b"002", b"005"));
-        // prefix much larger → false
+        // prefix much larger �?false
         assert!(!LsmEngine::prefix_may_overlap(b"Z", b"A", b"B"));
-        // empty prefix matches everything → true
+        // empty prefix matches everything �?true
         assert!(LsmEngine::prefix_may_overlap(b"", b"A", b"Z"));
     }
 
@@ -1528,10 +1284,8 @@ mod tests {
         assert!(stats.total_sstables > 0, "should have SSTables");
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    //  MVCC Transaction Tests
-    // ═══════════════════════════════════════════════════════════════
-
+    // ══════════════════════════════════════════════════════════════�?    //  MVCC Transaction Tests
+    // ══════════════════════════════════════════════════════════════�?
     #[test]
     fn test_txn_basic_commit() {
         let dir = tempdir().unwrap();
@@ -1743,7 +1497,7 @@ mod tests {
             engine.flush().unwrap();
         }
 
-        // Phase 2: Reopen engine — indexes should be rebuilt automatically
+        // Phase 2: Reopen engine �?indexes should be rebuilt automatically
         {
             let options = StorageOptions {
                 data_dir,

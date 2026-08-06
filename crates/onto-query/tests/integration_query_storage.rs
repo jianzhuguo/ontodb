@@ -184,8 +184,9 @@ fn integration_query_after_compaction() {
         ));
     }
 
-    // Force final flush
+    // Force final flush and wait for compaction
     engine.write().unwrap().flush().unwrap();
+    engine.write().unwrap().flush_compaction().unwrap();
 
     let stats = engine.read().unwrap().stats();
     assert!(stats.total_sstables > 0, "should have created SSTables");
@@ -243,6 +244,7 @@ fn integration_overwrite_during_compaction() {
     }
 
     engine.write().unwrap().flush().unwrap();
+    engine.write().unwrap().flush_compaction().unwrap();
 
     // Verify latest values survived compaction
     for i in 0..20 {
@@ -292,6 +294,7 @@ fn integration_delete_during_compaction() {
     }
 
     engine.write().unwrap().flush().unwrap();
+    engine.write().unwrap().flush_compaction().unwrap();
 
     // Only odd items should remain
     let result = exec_ok(&executor, "SELECT * FROM Product");
@@ -514,6 +517,7 @@ fn integration_index_update_after_compaction() {
         ));
     }
     engine.write().unwrap().flush().unwrap();
+    engine.write().unwrap().flush_compaction().unwrap();
 
     // Update some items
     for i in 0..15 {
@@ -523,6 +527,7 @@ fn integration_index_update_after_compaction() {
         ));
     }
     engine.write().unwrap().flush().unwrap();
+    engine.write().unwrap().flush_compaction().unwrap();
 
     // Index should reflect updated prices
     let result = exec_ok(&executor, "SELECT name FROM Product WHERE price = 110");
@@ -894,7 +899,91 @@ fn integration_full_crud_lifecycle() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  12. Edge cases
+//  13. Ontology schema validation
+// ═══════════════════════════════════════════════════════════════════
+
+#[test]
+fn integration_ontology_required_field_validation() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    // Create ontology with a required field
+    exec_ok(&executor,
+        "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING REQUIRED, PROPERTY price DOMAIN Product RANGE INT64)"
+    );
+
+    // INSERT without required field should fail
+    let result = exec(&executor, "INSERT INTO Product (price) VALUES (100)");
+    assert!(result.is_err(), "INSERT without required 'name' should fail");
+
+    // INSERT with required field should succeed
+    let result = exec(&executor, "INSERT INTO Product (name, price) VALUES ('iPhone', 999)");
+    assert!(result.is_ok(), "INSERT with required 'name' should succeed");
+}
+
+#[test]
+fn integration_ontology_type_validation() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    // Create ontology with typed properties
+    exec_ok(&executor,
+        "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64, PROPERTY active DOMAIN Product RANGE BOOL)"
+    );
+
+    // INSERT with correct types should succeed
+    let result = exec(&executor, "INSERT INTO Product (name, price, active) VALUES ('iPhone', 999, true)");
+    assert!(result.is_ok(), "INSERT with correct types should succeed");
+
+    // INSERT with wrong type (string for int field) should fail
+    let result = exec(&executor, "INSERT INTO Product (name, price) VALUES ('iPhone', 'not_a_number')");
+    assert!(result.is_err(), "INSERT with wrong type for 'price' should fail");
+}
+
+#[test]
+fn integration_ontology_update_validation() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    // Create ontology
+    exec_ok(&executor,
+        "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
+    );
+
+    // Insert valid data
+    exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPhone', 999)");
+
+    // UPDATE with wrong type should fail
+    let result = exec(&executor, "UPDATE Product SET price = 'expensive' WHERE name = 'iPhone'");
+    assert!(result.is_err(), "UPDATE with wrong type for 'price' should fail");
+
+    // UPDATE with correct type should succeed
+    let result = exec(&executor, "UPDATE Product SET price = 1099 WHERE name = 'iPhone'");
+    assert!(result.is_ok(), "UPDATE with correct type should succeed");
+
+    // Verify the update
+    let result = exec_ok(&executor, "SELECT price FROM Product WHERE name = 'iPhone'");
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get("price").unwrap().as_i64().unwrap(), 1099);
+        }
+        _ => panic!("expected Rows"),
+    }
+}
+
+#[test]
+fn integration_ontology_no_schema_passes() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    // INSERT without any ontology should succeed (schema-on-read)
+    let result = exec(&executor, "INSERT INTO Product (name, price) VALUES ('iPhone', 999)");
+    assert!(result.is_ok(), "INSERT without ontology should succeed (schema-on-read)");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  14. Edge cases
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]

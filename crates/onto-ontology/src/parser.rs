@@ -160,7 +160,7 @@ impl OntologyParser {
 
         let prop_name = rest[..domain_pos].trim();
         let domain = rest[domain_pos + 6..range_pos].trim();
-        let range_str = rest[range_pos + 5..].trim();
+        let after_range = rest[range_pos + 5..].trim();
 
         if prop_name.is_empty() {
             return Err(CoreError::InvalidArgument(
@@ -168,11 +168,29 @@ impl OntologyParser {
             ));
         }
 
-        let data_type = DataType::from_str(range_str).ok_or_else(|| {
+        // Parse optional modifiers (REQUIRED, MULTI_VALUED) after the data type
+        let upper_after = after_range.to_uppercase();
+        let required = upper_after.contains("REQUIRED");
+        let multi_valued = upper_after.contains("MULTI_VALUED");
+
+        // Extract the data type (everything before any modifier keyword)
+        let range_str = after_range
+            .split_whitespace()
+            .take_while(|w| {
+                let u = w.to_uppercase();
+                u != "REQUIRED" && u != "MULTI_VALUED"
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let data_type = DataType::from_str(&range_str).ok_or_else(|| {
             CoreError::InvalidArgument(format!("unknown data type: {}", range_str))
         })?;
 
-        Ok(Property::new(prop_name, domain, data_type))
+        let mut prop = Property::new(prop_name, domain, data_type);
+        prop.required = required;
+        prop.multi_valued = multi_valued;
+        Ok(prop)
     }
 }
 
@@ -237,5 +255,20 @@ mod tests {
         assert_eq!(onto.properties["b"].range, DataType::Int64);
         assert_eq!(onto.properties["c"].range, DataType::Float64);
         assert_eq!(onto.properties["d"].range, DataType::Bool);
+    }
+
+    #[test]
+    fn test_parse_required_property() {
+        let input = r#"
+            CREATE ONTOLOGY shop (
+                CLASS Product,
+                PROPERTY name DOMAIN Product RANGE STRING REQUIRED,
+                PROPERTY price DOMAIN Product RANGE INT64
+            );
+        "#;
+
+        let onto = OntologyParser::parse(input).unwrap();
+        assert!(onto.properties["name"].required);
+        assert!(!onto.properties["price"].required);
     }
 }

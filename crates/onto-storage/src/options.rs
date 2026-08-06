@@ -30,6 +30,10 @@ pub struct StorageOptions {
     /// When true, committed data survives OS crashes (strongest durability).
     /// When false, only process crashes are survived (better performance).
     pub sync_wal_on_commit: bool,
+
+    /// zstd compression level for SSTable data blocks.
+    /// 0 = disabled, 1-21 = enabled (higher = better ratio, slower).
+    pub compression_level: i32,
 }
 
 impl Default for StorageOptions {
@@ -43,6 +47,7 @@ impl Default for StorageOptions {
             use_bloom_filter: true,
             bloom_filter_fp_rate: 0.01,
             sync_wal_on_commit: true, // Strong durability by default
+            compression_level: 3,    // zstd level 3 by default (good balance)
         }
     }
 }

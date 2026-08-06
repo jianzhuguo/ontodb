@@ -50,6 +50,9 @@ tempfile = "3"
 # CRC
 crc32fast = "1"
 
+# Compression
+zstd = "0.13"
+
 [profile.release]
 opt-level = 3
 lto = true
