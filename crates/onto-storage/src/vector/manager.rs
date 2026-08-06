@@ -162,6 +162,9 @@ impl VectorIndexManager {
             column: column.to_string(),
         };
 
+        // Remove from deleted_keys if re-indexing after update
+        self.deleted_keys.remove(doc_key);
+
         // Track the vector for this document
         self.doc_vectors
             .entry(doc_key.to_vec())

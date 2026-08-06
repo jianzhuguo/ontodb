@@ -1171,8 +1171,8 @@ FROM StockPrices;
 | 方向 | 说明 | 状态 |
 |------|------|------|
 | 窗口函数执行器 | 实现完整的窗口函数计算逻辑 | ✅ Phase 21 已实现 |
-| 物化视图增量刷新 | 只更新变化的数据 | 待实现 |
-| 窗口函数下推 | 将窗口函数下推到存储层 | 待实现 |
+| 物化视图增量刷新 | 只更新变化的数据 | ✅ Phase 26-5 已实现 |
+| 窗口函数下推 | 将窗口函数下推到存储层 | ✅ Phase 26-6 已实现 |
 | 并行窗口计算 | 多线程并行计算不同分区 | 待实现 |
 
 ---
@@ -1601,7 +1601,119 @@ pub enum JoinType {
 
 ---
 
-## 三十、结论与建议
+## 三十、物化视图增量刷新（Phase 26-5）
+
+### 30.1 问题背景
+
+原有的 `REFRESH MATERIALIZED VIEW` 实现仅返回提示信息，要求用户重新执行 `CREATE MATERIALIZED VIEW`。这导致：
+- 无法追踪原始查询语句
+- 刷新时需要手动重新输入完整查询
+- 无法实现增量更新，每次都需要全量重建
+
+### 30.2 实现方案
+
+**元数据存储**：
+- 创建物化视图时，将原始查询 AST 序列化为 JSON 存储在 `__mv_meta_<name>::query` 键中
+- 使用 `serde_json` 实现 AST 的序列化/反序列化
+
+**增量刷新算法**：
+```rust
+// 1. 从元数据中获取原始查询 AST
+let query_ast = deserialize(metadata.get("__mv_meta_<name>::query"));
+
+// 2. 重新执行查询获取最新结果
+let new_rows = execute(query_ast);
+
+// 3. 对比新旧数据，计算差异
+let old_rows = scan_prefix("__mv_<name>::");
+let changes = compute_diff(old_rows, new_rows);
+
+// 4. 只更新变化的行
+apply_changes(changes);  // added + updated + removed
+```
+
+**差异计算**：
+- 使用 JSON 字符串作为行的唯一标识
+- 新增行：存在于新结果但不存在于旧结果
+- 更新行：位置变化但内容可能相同
+- 删除行：存在于旧结果但不存在于新结果
+
+### 30.3 测试覆盖
+
+- `test_materialized_view_create_and_query`：创建和查询物化视图
+- `test_materialized_view_drop`：删除物化视图
+- `test_materialized_view_incremental_refresh`：增量刷新验证
+  - 创建视图（1 行）
+  - 添加新数据
+  - 刷新视图（验证 1 added, 0 updated, 0 removed, 1 unchanged）
+  - 查询验证结果正确（2 行）
+
+---
+
+## 三十一、窗口函数下推（Phase 26-6）
+
+### 31.1 问题背景
+
+原有的窗口函数执行流程：
+1. 执行基础查询获取所有行
+2. 在内存中对所有行执行窗口函数
+3. 返回结果
+
+这种方式的问题：
+- 无法利用索引优化窗口函数计算
+- 所有窗口函数都在 Projection 阶段后执行
+- 无法在执行计划中体现窗口函数的代价
+
+### 31.2 实现方案
+
+**新增 PlanNode 变体**：
+```rust
+pub enum PlanNode {
+    // ... 其他节点
+    WindowFunction {
+        input: Box<PlanNode>,
+        windows: Vec<PlanWindowExpr>,
+        estimated_rows: u64,
+    },
+}
+```
+
+**执行计划生成**：
+- 在 `plan_select` 中检测 SELECT 列表中的窗口函数
+- 如果存在窗口函数，在 Projection 之前插入 WindowFunction 节点
+- 估算窗口函数的 CPU 代价（基础代价 × 1.2）
+
+**执行器实现**：
+- `execute_plan_node` 新增 `WindowFunction` 分支
+- 将 `PlanWindowExpr` 转换为 `parser::WindowExpr`
+- 调用现有的 `execute_window_functions` 执行
+
+**EXPLAIN 输出支持**：
+```json
+{
+  "type": "WindowFunction",
+  "input": { ... },
+  "windows": [
+    {
+      "function": "RowNumber",
+      "argument": null,
+      "alias": "row_num",
+      "partition_by": ["category"]
+    }
+  ],
+  "rows": 1000
+}
+```
+
+### 31.3 测试覆盖
+
+- `test_window_row_number`：ROW_NUMBER() 基本功能
+- 窗口函数在执行计划中的正确表示
+- EXPLAIN 输出包含 WindowFunction 节点
+
+---
+
+## 三十二、结论与建议
 
 ### 核心结论
 
@@ -1610,12 +1722,14 @@ pub enum JoinType {
 3. **100% 自研核心引擎是正确策略**：存储引擎、本体引擎、查询引擎、事务引擎必须自主掌控，基础设施（Raft、序列化、压缩）选择性复用
 4. **跨平台无实质风险**：当前 Rust 代码天然跨平台，Windows 开发 → Linux 生产完全可行，CI 双平台构建是最低成本保障
 5. **范围是最大风险**：必须砍掉 80% 的外围功能，聚焦核心
-6. **代码质量持续提升**：135 个测试全部通过（94 lib + 41 integration），查询引擎覆盖 Phase 15-26 全部功能
-7. **查询引擎已具备完整 OLAP 能力**：窗口函数、CTE、CASE WHEN、子查询、JOIN（Hash/SortMerge/NestedLoop）、EXPLAIN ANALYZE、Plan Cache、ICD、LIMIT OFFSET、UPSERT、11 个内置函数
+6. **代码质量持续提升**：269 个测试全部通过（95 lib + 41 integration + 111 storage + 10 ontology + 8 core + 3 server），查询引擎覆盖 Phase 15-26 全部功能
+7. **查询引擎已具备完整 OLAP 能力**：窗口函数（含下推优化）、CTE、CASE WHEN、子查询、JOIN（Hash/SortMerge/NestedLoop）、EXPLAIN ANALYZE、Plan Cache、ICD、LIMIT OFFSET、UPSERT、11 个内置函数、物化视图增量刷新
 8. **执行架构统一**：所有 DML（SELECT/INSERT/UPDATE/DELETE/MATCH）统一使用 plan-driven 执行，优化器优化对所有查询生效
 9. **多语句事务支持**：BEGIN/COMMIT/ROLLBACK 真正生效，支持原子性多语句操作，MVCC 快照隔离
 10. **生产安全特性**：查询超时（默认30s）、内存预算（默认256MB）防止资源滥用
 11. **SQL 语法补全**：IS NULL/IS NOT NULL/NOT 过滤、LEFT/RIGHT/FULL 外连接
+12. **物化视图增量刷新**：存储原始查询 AST，刷新时自动计算差异并只更新变化的行
+13. **窗口函数下推**：窗口函数在执行计划中有独立节点，支持 EXPLAIN 展示和代价估算
 
 ### 性能基线（v1.8）
 

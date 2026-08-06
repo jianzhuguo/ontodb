@@ -3,7 +3,7 @@
 use crate::cache::{PlanCache, QueryCache};
 use crate::optimizer::QueryPlanner;
 use crate::parser::{AggregateFunc, ArithmeticOp, FilterExpr, LiteralValue, QueryAst, SelectColumns, SelectItem, ValueExpr, WindowExpr, WindowFunc};
-use crate::optimizer::{ExecutionPlan, PlanNode};
+use crate::optimizer::{ExecutionPlan, PlanNode, PlanWindowExpr};
 use onto_core::{CoreError, Result};
 use onto_ontology::{DataType, OntologyStore};
 use onto_storage::LsmEngine;
@@ -304,6 +304,11 @@ impl QueryExecutor {
                             .map_err(|e| CoreError::Serialization(e.to_string()))?;
                         engine.put(key.as_bytes().to_vec(), value)?;
                     }
+                    // Store metadata with original query for incremental refresh
+                    let meta_key = format!("__mv_meta_{}::query", name.to_lowercase());
+                    let query_json = serde_json::to_string(&query)
+                        .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                    engine.put(meta_key.as_bytes().to_vec(), query_json.as_bytes().to_vec())?;
                     Ok(QueryResult::Success(format!(
                         "Materialized view '{}' created with {} rows", name, row_count
                     )))
@@ -314,12 +319,16 @@ impl QueryExecutor {
                 }
             }
             QueryAst::DropMaterializedView { name } => {
-                let prefix = format!("__mv_{}::", name.to_lowercase());
+                let lower_name = name.to_lowercase();
+                let prefix = format!("__mv_{}::", lower_name);
+                let meta_key = format!("__mv_meta_{}::query", lower_name);
                 let existing = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
                 let count = existing.len();
                 for (key, _) in existing {
                     let _ = engine.put(key, b"__deleted__".to_vec());
                 }
+                // Also remove metadata
+                let _ = engine.put(meta_key.as_bytes().to_vec(), b"__deleted__".to_vec());
                 if count > 0 {
                     Ok(QueryResult::Success(format!(
                         "Materialized view '{}' dropped ({} rows removed)", name, count
@@ -331,9 +340,86 @@ impl QueryExecutor {
                 }
             }
             QueryAst::RefreshMaterializedView { name } => {
-                Ok(QueryResult::Success(format!(
-                    "Materialized view '{}' refreshed (re-run CREATE MATERIALIZED VIEW to update)", name
-                )))
+                let lower_name = name.to_lowercase();
+                let meta_key = format!("__mv_meta_{}::query", lower_name);
+                let prefix = format!("__mv_{}::", lower_name);
+
+                // Get the original query from metadata
+                let query_bytes = engine.get(meta_key.as_bytes())?;
+                let query_json = match query_bytes {
+                    Some(bytes) => String::from_utf8(bytes)
+                        .map_err(|_| CoreError::InvalidArgument("invalid query metadata".to_string()))?,
+                    None => return Ok(QueryResult::Success(format!(
+                        "No materialized view '{}' found (use CREATE MATERIALIZED VIEW first)", name
+                    ))),
+                };
+
+                // Deserialize the query AST from JSON
+                let query_ast: QueryAst = serde_json::from_str(&query_json)
+                    .map_err(|e| CoreError::Serialization(format!("failed to deserialize query: {}", e)))?;
+                let result = self.execute_with_engine(&query_ast, engine)?;
+
+                if let QueryResult::Rows(new_rows) = result {
+                    // Get existing rows for comparison
+                    let existing = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
+                    let old_count = existing.len();
+                    let new_count = new_rows.len();
+
+                    // Build a set of old row JSON strings for comparison
+                    let mut old_row_set: std::collections::HashMap<String, (Vec<u8>, Vec<u8>)> = std::collections::HashMap::new();
+                    for (key, val_bytes) in existing {
+                        // Use the JSON string as the comparison key
+                        if let Ok(json_str) = std::str::from_utf8(&val_bytes) {
+                            old_row_set.insert(json_str.to_string(), (key, val_bytes));
+                        }
+                    }
+
+                    let mut added = 0;
+                    let mut updated = 0;
+                    let mut unchanged = 0;
+
+                    // Track which old rows are still present
+                    let mut seen_old_jsons: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+                    for (i, row) in new_rows.iter().enumerate() {
+                        let key = format!("{}{:010}", prefix, i);
+                        let value = serde_json::to_vec(&serde_json::Value::Object(row.clone()))
+                            .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                        let json_str = serde_json::to_string(&serde_json::Value::Object(row.clone()))
+                            .map_err(|e| CoreError::Serialization(e.to_string()))?;
+
+                        if old_row_set.contains_key(&json_str) {
+                            seen_old_jsons.insert(json_str);
+                            unchanged += 1;
+                        } else {
+                            // Row is new or changed
+                            engine.put(key.as_bytes().to_vec(), value)?;
+                            if i < old_count {
+                                updated += 1;
+                            } else {
+                                added += 1;
+                            }
+                        }
+                    }
+
+                    // Remove rows that no longer exist in the new result
+                    let mut removed = 0;
+                    for (json_str, (old_key, _)) in old_row_set {
+                        if !seen_old_jsons.contains(&json_str) {
+                            engine.put(old_key, b"__deleted__".to_vec())?;
+                            removed += 1;
+                        }
+                    }
+
+                    Ok(QueryResult::Success(format!(
+                        "Materialized view '{}' refreshed: {} added, {} updated, {} removed, {} unchanged (total: {})",
+                        name, added, updated, removed, unchanged, new_count
+                    )))
+                } else {
+                    Ok(QueryResult::Success(format!(
+                        "Materialized view '{}' refreshed (query returned no rows)", name
+                    )))
+                }
             }
             QueryAst::Begin => {
                 let mut txn = self.active_txn.lock().unwrap();
@@ -601,6 +687,21 @@ impl QueryExecutor {
                     Self::dedup_rows(&mut left_rows);
                 }
                 Ok(left_rows)
+            }
+            PlanNode::WindowFunction { input, windows, .. } => {
+                let mut rows = self.execute_plan_node(input, engine)?;
+                // Convert PlanWindowExpr to parser::WindowExpr for execution
+                let parser_windows: Vec<crate::parser::WindowExpr> = windows.iter().map(|w| {
+                    crate::parser::WindowExpr {
+                        func: w.func.clone(),
+                        arg: w.arg.clone(),
+                        over: w.over.clone(),
+                        alias: w.alias.clone(),
+                    }
+                }).collect();
+                let window_refs: Vec<&crate::parser::WindowExpr> = parser_windows.iter().collect();
+                Self::execute_window_functions(&mut rows, &window_refs);
+                Ok(rows)
             }
         }
     }
@@ -3091,6 +3192,22 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
+        PlanNode::WindowFunction { input, windows, estimated_rows, .. } => {
+            let win_json: Vec<Value> = windows.iter().map(|w| {
+                json!({
+                    "function": format!("{:?}", w.func),
+                    "argument": w.arg,
+                    "alias": w.alias,
+                    "partition_by": w.over.partition_by,
+                })
+            }).collect();
+            json!({
+                "type": "WindowFunction",
+                "input": format_plan_node(input),
+                "windows": win_json,
+                "rows": estimated_rows,
+            })
+        }
     }
 }
 
@@ -4862,6 +4979,57 @@ mod tests {
             QueryResult::Rows(rows) => {
                 // Should be empty since the MV was dropped
                 // (or it might fall through to regular table scan which returns nothing)
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_materialized_view_incremental_refresh() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Create materialized view
+        let ast = QueryParser::parse(
+            "CREATE MATERIALIZED VIEW expensive_mv AS SELECT * FROM Product WHERE price > 900"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => {
+                println!("Create result: {}", msg);
+                assert!(msg.contains("1 rows"));
+            }
+            _ => panic!("expected Success with 1 row"),
+        }
+
+        // Add a new product
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Refresh the materialized view
+        let ast = QueryParser::parse("REFRESH MATERIALIZED VIEW expensive_mv").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => {
+                println!("Refresh result: {}", msg);
+                assert!(msg.contains("refreshed"));
+                // Should show 1 added (MacBook), 0 updated, 0 removed, 1 unchanged (iPhone)
+                assert!(msg.contains("1 added"));
+                assert!(msg.contains("0 updated"));
+                assert!(msg.contains("0 removed"));
+                assert!(msg.contains("1 unchanged"));
+            }
+            _ => panic!("expected Success, got: {:?}", result),
+        }
+
+        // Query the refreshed materialized view
+        let ast = QueryParser::parse("SELECT * FROM expensive_mv").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // iPhone and MacBook
             }
             _ => panic!("expected Rows"),
         }

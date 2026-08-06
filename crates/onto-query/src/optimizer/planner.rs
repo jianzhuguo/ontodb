@@ -3,7 +3,7 @@
 //! Generates multiple candidate plans and selects the lowest-cost one.
 
 use super::cost::{CostEstimate, CostModel, FilterSelectivity, IndexStats, TableStats};
-use crate::parser::{FilterExpr, JoinClause, OrderBy, QueryAst, SelectColumns};
+use crate::parser::{FilterExpr, JoinClause, OrderBy, QueryAst, SelectColumns, SelectItem};
 use onto_core::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -114,6 +114,26 @@ pub enum PlanNode {
         all: bool,
         estimated_rows: u64,
     },
+
+    /// Window function computation.
+    WindowFunction {
+        input: Box<PlanNode>,
+        windows: Vec<PlanWindowExpr>,
+        estimated_rows: u64,
+    },
+}
+
+/// Window function expression in execution plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanWindowExpr {
+    /// The window function type.
+    pub func: crate::parser::WindowFunc,
+    /// Function argument (column name or "*").
+    pub arg: Option<String>,
+    /// OVER clause specification.
+    pub over: crate::parser::WindowSpec,
+    /// Output column alias.
+    pub alias: Option<String>,
 }
 
 /// Aggregate function in execution plan.
@@ -249,6 +269,21 @@ impl ExecutionPlan {
                 ));
                 self.describe_node(left, depth + 1, output);
                 self.describe_node(right, depth + 1, output);
+            }
+            PlanNode::WindowFunction { input, windows, estimated_rows, .. } => {
+                let win_desc: Vec<String> = windows.iter()
+                    .map(|w| {
+                        let alias = w.alias.as_deref().unwrap_or("unnamed");
+                        format!("{:?}({}) as {}", w.func, w.arg.as_deref().unwrap_or("*"), alias)
+                    })
+                    .collect();
+                output.push_str(&format!(
+                    "{}WindowFunction [{}] (rows: {})\n",
+                    indent,
+                    win_desc.join(", "),
+                    estimated_rows
+                ));
+                self.describe_node(input, depth + 1, output);
             }
         }
     }
@@ -424,7 +459,43 @@ impl QueryPlanner {
             );
         }
 
-        // Add projection as the final step (after filter)
+        // Extract window functions from columns (if any)
+        let window_funcs = match columns {
+            SelectColumns::Columns(items) => {
+                items.iter().filter_map(|item| {
+                    if let SelectItem::WindowFunction(w) = item {
+                        Some(PlanWindowExpr {
+                            func: w.func.clone(),
+                            arg: w.arg.clone(),
+                            over: w.over.clone(),
+                            alias: w.alias.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                }).collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        };
+
+        // Add WindowFunction node if window functions are present
+        if !window_funcs.is_empty() {
+            let win_cost = CostEstimate::new(
+                best_plan.cost.rows,
+                best_plan.cost.io_cost,
+                best_plan.cost.cpu_cost * 1.2, // Window functions add CPU cost
+            );
+            best_plan = ExecutionPlan::new(
+                PlanNode::WindowFunction {
+                    input: Box::new(best_plan.root),
+                    windows: window_funcs,
+                    estimated_rows: best_plan.cost.rows,
+                },
+                win_cost,
+            );
+        }
+
+        // Add projection as the final step (after filter and window functions)
         best_plan = ExecutionPlan::new(
             PlanNode::Projection {
                 input: Box::new(best_plan.root),

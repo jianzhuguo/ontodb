@@ -2081,7 +2081,7 @@ impl QueryParser {
             return Err(CoreError::InvalidArgument("expected REFRESH MATERIALIZED VIEW".to_string()));
         }
 
-        let name = input[24..].trim().to_string();
+        let name = input[25..].trim().to_string();
         Ok(QueryAst::RefreshMaterializedView { name })
     }
 

@@ -6,4 +6,4 @@ pub mod cost;
 pub mod planner;
 
 pub use cost::{CostEstimate, CostModel};
-pub use planner::{ExecutionPlan, PlanNode, QueryPlanner};
+pub use planner::{ExecutionPlan, PlanNode, PlanWindowExpr, QueryPlanner};
