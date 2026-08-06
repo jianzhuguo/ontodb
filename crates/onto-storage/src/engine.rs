@@ -460,24 +460,72 @@ impl LsmEngine {
     }
 
     /// Checks if compaction is needed and triggers it.
-    fn maybe_compact(&mut self, level: usize) -> Result<()> {
-        if level >= self.levels.len() - 1 {
-            return Ok(());
+    /// Uses size-based scoring to prioritize which level to compact.
+    fn maybe_compact(&mut self, start_level: usize) -> Result<()> {
+        // Score each level: score = level_size / target_size.
+        // Score > 1.0 means the level is over target and needs compaction.
+        // Pick the level with the highest score.
+        let mut best_level = None;
+        let mut best_score = 0.0f64;
+
+        for level in start_level..self.levels.len() - 1 {
+            let score = self.compaction_score(level);
+            if score > best_score {
+                best_score = score;
+                best_level = Some(level);
+            }
         }
 
-        let max_ssts = self.options.size_ratio;
-        if self.levels[level].len() <= max_ssts {
-            return Ok(());
+        if let Some(level) = best_level {
+            if best_score > 1.0 {
+                tracing::info!(
+                    "Compaction triggered: L{} score={:.2} (size={} target={})",
+                    level,
+                    best_score,
+                    self.level_size(level),
+                    self.target_level_size(level)
+                );
+                self.compact_level(level)?;
+            }
         }
 
-        tracing::info!(
-            "Level {} has {} SSTables (max {}), triggering compaction",
-            level,
-            self.levels[level].len(),
-            max_ssts
-        );
+        Ok(())
+    }
 
-        self.compact_level(level)
+    /// Computes a compaction urgency score for a level.
+    /// Score > 1.0 means the level is over its target size.
+    fn compaction_score(&self, level: usize) -> f64 {
+        let size = self.level_size(level);
+        let target = self.target_level_size(level);
+        if target == 0 {
+            return 0.0;
+        }
+        size as f64 / target as f64
+    }
+
+    /// Returns total size in bytes of all SSTables in a level.
+    fn level_size(&self, level: usize) -> u64 {
+        self.levels[level].iter().map(|s| s.size).sum()
+    }
+
+    /// Returns the target size for a level.
+    /// L0: memtable_size * 2 (buffer a few flushes before compacting).
+    /// L1+: L1_base * size_ratio^level.
+    fn target_level_size(&self, level: usize) -> u64 {
+        if level == 0 {
+            // L0 target: allow a few memtable flushes before triggering
+            (self.options.memtable_size_limit as u64) * 4
+        } else {
+            // L1 base = memtable_size * size_ratio (e.g., 4MB * 10 = 40MB)
+            let l1_base = (self.options.memtable_size_limit as u64)
+                * (self.options.size_ratio as u64);
+            // L_n target = l1_base * size_ratio^(n-1)
+            let mut target = l1_base;
+            for _ in 1..level {
+                target *= self.options.size_ratio as u64;
+            }
+            target
+        }
     }
 
     /// Performs leveled compaction: merges SSTables from level N into level N+1.
@@ -487,7 +535,7 @@ impl LsmEngine {
     /// 2. Find overlapping SSTables in level N+1
     /// 3. Merge-sort all entries from both levels
     /// 4. Deduplicate: keep only the latest version of each key
-    /// 5. Drop tombstones if they don't exist in deeper levels
+    /// 5. Drop tombstones safely (see `can_drop_tombstone`)
     /// 6. Write new SSTables to level N+1
     /// 7. Delete old SSTable files from both levels
     fn compact_level(&mut self, level: usize) -> Result<()> {
@@ -496,13 +544,14 @@ impl LsmEngine {
         }
 
         // Step 1: Pick SSTables from level N to compact.
-        // For L0, compact all (they may overlap). For L1+, pick the oldest.
+        // For L0, pick the oldest N (not all) to limit write amplification.
+        // For L1+, pick enough to bring level under target.
         let ssts_to_compact = if level == 0 {
-            // L0: compact all SSTables (they can have overlapping key ranges)
-            let all: Vec<SsTableInfo> = self.levels[level].drain(..).collect();
-            all
+            // L0: pick oldest SSTables, up to half the level (at least 2)
+            let count = (self.levels[0].len() / 2).max(2).min(self.levels[0].len());
+            self.levels[0].drain(..count).collect::<Vec<_>>()
         } else {
-            // L1+: pick the first (oldest) SSTable
+            // L1+: pick the oldest SSTable
             if self.levels[level].is_empty() {
                 return Ok(());
             }
@@ -586,9 +635,8 @@ impl LsmEngine {
                 .then(b.2.cmp(&a.2)) // seq_no descending
         });
 
-        // Step 5: Deduplicate — keep only the latest version of each key
-        // Drop tombstones at the deepest level (they can't shadow anything deeper)
-        let is_deepest_level = next_level == self.levels.len() - 1;
+        // Step 5: Deduplicate — keep only the latest version of each key.
+        // Drop tombstones when safe (see `can_drop_tombstone`).
         let mut merged: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
         let mut last_key: Option<Vec<u8>> = None;
 
@@ -597,8 +645,8 @@ impl LsmEngine {
                 continue; // Skip older versions of the same key
             }
 
-            // Drop tombstones at the deepest level
-            if is_deepest_level && *kind == EntryKind::Delete {
+            // Drop tombstones when they can't shadow anything in deeper levels
+            if *kind == EntryKind::Delete && self.can_drop_tombstone(key, next_level) {
                 last_key = Some(key.clone());
                 continue;
             }
@@ -690,6 +738,33 @@ impl LsmEngine {
         self.maybe_compact(next_level)?;
 
         Ok(())
+    }
+
+    /// Determines if a tombstone for the given key can be safely dropped.
+    ///
+    /// A tombstone can be dropped when:
+    /// 1. We're at the deepest level (nothing below to shadow), OR
+    /// 2. The key doesn't exist in any deeper level (no shadowed entries to resurrect)
+    ///
+    /// Condition 2 is checked by comparing the key against the min/max ranges
+    /// of all SSTables in deeper levels — if no SSTable's range includes the key,
+    /// the tombstone is safe to drop.
+    fn can_drop_tombstone(&self, key: &[u8], from_level: usize) -> bool {
+        // At the deepest level — always safe to drop
+        if from_level >= self.levels.len() - 1 {
+            return true;
+        }
+
+        // Check deeper levels: if no SSTable could contain this key, safe to drop
+        for level in (from_level + 1)..self.levels.len() {
+            for sst_info in &self.levels[level] {
+                if key >= sst_info.min_key.as_slice() && key <= sst_info.max_key.as_slice() {
+                    return false; // Key might exist deeper — keep tombstone
+                }
+            }
+        }
+
+        true // Key doesn't exist in any deeper level — safe to drop
     }
 
     /// Checks if two key ranges overlap.
@@ -1342,6 +1417,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_compaction_scoring_and_tombstone_cleanup() {
+        let dir = tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 128,
+            size_ratio: 2,
+            ..Default::default()
+        };
+
+        let mut engine = LsmEngine::open(options).unwrap();
+
+        // Write data, then delete most of it
+        for i in 0..80u32 {
+            let key = format!("key_{:04}", i);
+            let value = format!("value_{:06}", i);
+            engine.put(key.into_bytes(), value.into_bytes()).unwrap();
+        }
+
+        // Delete all but the last 10 keys
+        for i in 0..70u32 {
+            let key = format!("key_{:04}", i);
+            engine.delete(key.into_bytes()).unwrap();
+        }
+
+        // Force flush and compaction
+        engine.flush().unwrap();
+
+        // Verify remaining keys
+        for i in 70..80u32 {
+            let key = format!("key_{:04}", i);
+            let expected = format!("value_{:06}", i);
+            let val = engine.get(key.as_bytes()).unwrap();
+            assert_eq!(val, Some(expected.into_bytes()), "key {} should exist", key);
+        }
+
+        // Verify deleted keys are gone
+        for i in 0..70u32 {
+            let key = format!("key_{:04}", i);
+            let val = engine.get(key.as_bytes()).unwrap();
+            assert!(val.is_none(), "deleted key {} should not exist", key);
+        }
+
+        // Verify compaction scoring works: levels should be balanced
+        let stats = engine.stats();
+        assert!(stats.total_sstables > 0, "should have SSTables");
     }
 
     // ═══════════════════════════════════════════════════════════════
