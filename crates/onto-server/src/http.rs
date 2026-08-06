@@ -52,6 +52,13 @@ pub struct VectorSearchRequest {
     pub filter: Option<String>,
 }
 
+/// SPARQL query request.
+#[derive(Debug, Deserialize)]
+pub struct SparqlRequest {
+    /// SPARQL query string.
+    pub query: String,
+}
+
 /// Hybrid query request: combines SQL filter with vector search.
 #[derive(Debug, Deserialize)]
 pub struct HybridQueryRequest {
@@ -111,6 +118,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/metrics", get(metrics_json))
         // SQL query execution
         .route("/api/query", post(execute_query))
+        // SPARQL query execution
+        .route("/sparql", post(sparql_query))
         // Vector search
         .route("/api/vector/search", post(vector_search))
         // Hybrid query: SQL + vector search
@@ -139,6 +148,7 @@ pub fn build_router_with_auth(
         .route("/api/metrics", get(metrics_json))
         // Protected routes
         .route("/api/query", post(execute_query))
+        .route("/sparql", post(sparql_query))
         .route("/api/vector/search", post(vector_search))
         .route("/api/hybrid/query", post(hybrid_query))
         .route("/api/schema", get(get_schema))
@@ -320,6 +330,83 @@ async fn execute_query(
             } else {
                 json!(rows)
             }
+        }
+    };
+
+    (StatusCode::OK, Json(ApiResponse::success(data, elapsed_ms)))
+}
+
+/// POST /sparql - Execute a SPARQL query.
+///
+/// Accepts a SPARQL query and translates it to SQL for execution.
+/// Returns results in W3C SPARQL Results JSON Format.
+async fn sparql_query(
+    State(state): State<AppState>,
+    Json(req): Json<SparqlRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    // Parse SPARQL query
+    let mut parser = onto_query::SparqlParser::new();
+    let sparql_query = match parser.parse(&req.query) {
+        Ok(q) => q,
+        Err(e) => {
+            state.metrics.record_parse_error();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!("SPARQL parse error: {}", e))),
+            );
+        }
+    };
+
+    // Translate to SQL
+    let sql = match parser.translate_to_sql(&sparql_query) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!("SPARQL translation error: {}", e))),
+            );
+        }
+    };
+
+    // Execute as SQL
+    let ast = match QueryParser::parse(&sql) {
+        Ok(ast) => ast,
+        Err(e) => {
+            state.metrics.record_parse_error();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!("Generated SQL parse error: {}", e))),
+            );
+        }
+    };
+
+    let result = match state.executor.execute(&ast) {
+        Ok(r) => r,
+        Err(e) => {
+            let elapsed = start.elapsed().as_secs_f64();
+            state.metrics.record_query("SPARQL", elapsed, false);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<Value>::error(format!("SPARQL execution error: {}", e))),
+            );
+        }
+    };
+
+    let elapsed = start.elapsed().as_secs_f64();
+    state.metrics.record_query("SPARQL", elapsed, true);
+
+    let elapsed_ms = elapsed * 1000.0;
+
+    let data = match result {
+        onto_query::QueryResult::Rows(rows) => {
+            // Format as SPARQL JSON results
+            let sparql_result = onto_query::sparql::format_sparql_json(&sparql_query, &rows);
+            json!(sparql_result)
+        }
+        onto_query::QueryResult::Success(msg) => {
+            json!({ "head": { "vars": [] }, "results": { "bindings": [] }, "message": msg })
         }
     };
 
