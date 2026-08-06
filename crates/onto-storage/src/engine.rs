@@ -1156,6 +1156,157 @@ impl LsmEngine {
             total_sst_size,
         }
     }
+
+    // =================================================================
+    //  Backup & Restore
+    // =================================================================
+
+    /// Creates a full snapshot backup of the database to `backup_dir`.
+    ///
+    /// Steps:
+    /// 1. Flush MemTable → SSTable (ensure all data persisted)
+    /// 2. Flush disk indexes
+    /// 3. Copy all `.sst` files, `wal.log`, and `indexes/*.idx`
+    /// 4. Write a manifest file listing all copied files
+    ///
+    /// The backup is a consistent snapshot that can be restored with `restore()`.
+    pub fn backup(&mut self, backup_dir: &Path) -> Result<BackupManifest> {
+        // Step 1: Flush MemTable to ensure all data is in SSTables
+        self.flush()?;
+
+        // Step 2: Flush disk indexes
+        // (access via index_manager_mut to flush)
+        // We need a helper to flush all disk indexes
+        self.flush_disk_indexes()?;
+
+        // Step 3: Create backup directory
+        fs::create_dir_all(backup_dir)?;
+        let idx_backup_dir = backup_dir.join("indexes");
+        fs::create_dir_all(&idx_backup_dir)?;
+
+        let mut manifest = BackupManifest {
+            timestamp: chrono_timestamp(),
+            files: Vec::new(),
+        };
+
+        // Step 4: Copy SSTable files
+        let levels = self.levels.lock().unwrap();
+        let mut sst_paths: Vec<PathBuf> = Vec::new();
+        for level in levels.iter() {
+            for info in level.iter() {
+                sst_paths.push(info.path.clone());
+            }
+        }
+        drop(levels);
+
+        for sst_path in &sst_paths {
+            let fname = sst_path.file_name().unwrap().to_str().unwrap();
+            let dest = backup_dir.join(fname);
+            fs::copy(sst_path, &dest)?;
+            let size = fs::metadata(&dest)?.len();
+            manifest.files.push(BackupFile {
+                name: fname.to_string(),
+                size,
+                file_type: BackupFileType::SSTable,
+            });
+        }
+
+        // Step 5: Copy WAL file
+        let wal_path = self.options.data_dir.join("wal.log");
+        if wal_path.exists() {
+            let dest = backup_dir.join("wal.log");
+            fs::copy(&wal_path, &dest)?;
+            let size = fs::metadata(&dest)?.len();
+            manifest.files.push(BackupFile {
+                name: "wal.log".to_string(),
+                size,
+                file_type: BackupFileType::Wal,
+            });
+        }
+
+        // Step 6: Copy index files
+        let idx_dir = self.options.data_dir.join("indexes");
+        if idx_dir.exists() {
+            for entry in fs::read_dir(&idx_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("idx") {
+                    let fname = path.file_name().unwrap().to_str().unwrap();
+                    let dest = idx_backup_dir.join(fname);
+                    fs::copy(&path, &dest)?;
+                    let size = fs::metadata(&dest)?.len();
+                    manifest.files.push(BackupFile {
+                        name: format!("indexes/{}", fname),
+                        size,
+                        file_type: BackupFileType::Index,
+                    });
+                }
+            }
+        }
+
+        // Step 7: Write manifest
+        let manifest_json = serde_json::to_string_pretty(&manifest)
+            .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
+        let manifest_path = backup_dir.join("manifest.json");
+        fs::write(&manifest_path, manifest_json)?;
+
+        tracing::info!(
+            "Backup completed: {} files, {} bytes total",
+            manifest.files.len(),
+            manifest.files.iter().map(|f| f.size).sum::<u64>()
+        );
+
+        Ok(manifest)
+    }
+
+    /// Restores the database from a backup created by `backup()`.
+    ///
+    /// This is a static method — call it before `LsmEngine::open()`.
+    /// It copies all backup files into `data_dir`, then the engine's
+    /// normal startup (WAL replay + index rebuild) handles recovery.
+    pub fn restore(backup_dir: &Path, data_dir: &Path) -> Result<BackupManifest> {
+        // Read manifest
+        let manifest_path = backup_dir.join("manifest.json");
+        let manifest_bytes = fs::read(&manifest_path)?;
+        let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
+
+        // Create data directory
+        fs::create_dir_all(data_dir)?;
+
+        // Copy all files from backup
+        for file in &manifest.files {
+            let src = backup_dir.join(&file.name);
+            let dest = data_dir.join(&file.name);
+
+            // Create parent directory if needed (for indexes/)
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            if !src.exists() {
+                return Err(onto_core::CoreError::Custom(format!(
+                    "Backup file missing: {}", file.name
+                )));
+            }
+
+            fs::copy(&src, &dest)?;
+        }
+
+        tracing::info!(
+            "Restore completed: {} files copied to {}",
+            manifest.files.len(),
+            data_dir.display()
+        );
+
+        Ok(manifest)
+    }
+
+    /// Flushes all disk-based indexes to disk (with fsync).
+    fn flush_disk_indexes(&mut self) -> Result<()> {
+        self.index_manager.flush_disk_indexes();
+        Ok(())
+    }
 }
 
 /// Engine statistics.
@@ -1166,6 +1317,71 @@ pub struct EngineStats {
     pub num_levels: usize,
     pub total_sstables: usize,
     pub total_sst_size: u64,
+}
+
+/// Backup manifest: lists all files in a backup snapshot.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BackupManifest {
+    /// ISO 8601 timestamp of when the backup was created.
+    pub timestamp: String,
+    /// List of files included in the backup.
+    pub files: Vec<BackupFile>,
+}
+
+/// A single file in a backup.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BackupFile {
+    /// Relative path within the backup (e.g., "L0_0.sst", "indexes/Product_price.idx").
+    pub name: String,
+    /// File size in bytes.
+    pub size: u64,
+    /// Type of file.
+    pub file_type: BackupFileType,
+}
+
+/// Type of backed-up file.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum BackupFileType {
+    SSTable,
+    Wal,
+    Index,
+}
+
+/// Returns a simple ISO 8601 timestamp string (no external dependency).
+fn chrono_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs();
+    // Convert to approximate date/time (UTC)
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Simplified date from days since epoch (good enough for timestamps)
+    let mut y = 1970;
+    let mut remaining = days;
+    loop {
+        let days_in_year = if is_leap_year(y) { 366 } else { 365 };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        y += 1;
+    }
+    let leap = is_leap_year(y);
+    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0;
+    while m < 12 && remaining >= month_days[m] {
+        remaining -= month_days[m];
+        m += 1;
+    }
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m + 1, remaining + 1, hours, minutes, seconds)
+}
+
+fn is_leap_year(y: u64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
 }
 
 #[cfg(test)]
@@ -1738,6 +1954,65 @@ mod tests {
             );
             assert!(pkeys.is_some());
             assert_eq!(pkeys.unwrap().len(), 2); // both products
+        }
+    }
+
+    #[test]
+    fn test_backup_and_restore() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let backup_dir = dir.path().join("backup");
+
+        // Phase 1: Create engine, insert data, flush, backup
+        {
+            let options = StorageOptions {
+                data_dir: data_dir.clone(),
+                memtable_size_limit: 1024 * 1024,
+                ..Default::default()
+            };
+            let mut engine = LsmEngine::open(options).unwrap();
+
+            engine.put(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+            engine.put(b"key2".to_vec(), b"value2".to_vec()).unwrap();
+            engine.put(b"key3".to_vec(), b"value3".to_vec()).unwrap();
+            engine.flush().unwrap();
+
+            // Create backup
+            let manifest = engine.backup(&backup_dir).unwrap();
+            assert!(!manifest.files.is_empty(), "backup should have files");
+            assert!(backup_dir.join("manifest.json").exists());
+            assert!(backup_dir.join("wal.log").exists());
+
+            // Verify at least one SSTable in backup
+            let sst_files: Vec<_> = manifest.files.iter()
+                .filter(|f| matches!(f.file_type, BackupFileType::SSTable))
+                .collect();
+            assert!(!sst_files.is_empty(), "backup should contain SSTable files");
+        }
+
+        // Phase 2: Restore to a new directory
+        let restore_dir = dir.path().join("restored");
+        {
+            let manifest = LsmEngine::restore(&backup_dir, &restore_dir).unwrap();
+            assert!(!manifest.files.is_empty());
+
+            // Verify files were copied
+            assert!(restore_dir.join("wal.log").exists());
+        }
+
+        // Phase 3: Open restored engine and verify data
+        {
+            let options = StorageOptions {
+                data_dir: restore_dir,
+                memtable_size_limit: 1024 * 1024,
+                ..Default::default()
+            };
+            let mut engine = LsmEngine::open(options).unwrap();
+
+            assert_eq!(engine.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+            assert_eq!(engine.get(b"key2").unwrap(), Some(b"value2".to_vec()));
+            assert_eq!(engine.get(b"key3").unwrap(), Some(b"value3".to_vec()));
+            assert_eq!(engine.get(b"missing").unwrap(), None);
         }
     }
 }

@@ -275,6 +275,13 @@ impl IndexManager {
         cols
     }
 
+    /// Flushes all disk-based indexes to disk (with fsync).
+    pub fn flush_disk_indexes(&mut self) {
+        for (_, disk_idx) in &mut self.disk_indexes {
+            let _ = disk_idx.flush();
+        }
+    }
+
     /// Returns the number of unique indexes (counting each class.column once).
     pub fn index_count(&self) -> usize {
         let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
