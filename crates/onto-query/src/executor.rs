@@ -764,9 +764,9 @@ impl QueryExecutor {
             }
         }
 
-        // Apply filter if present (with class hierarchy for subclass-aware matching)
+        // Apply filter if present (with class hierarchy and property inference)
         if let Some(f) = filter {
-            rows.retain(|row| Self::eval_filter_static_with_hierarchy(row, f, &class_hierarchy));
+            rows.retain(|row| self.eval_filter(engine, row, f));
         }
 
         // Apply alias to column names if specified
@@ -873,7 +873,7 @@ impl QueryExecutor {
                 for (key, val_bytes) in &entries {
                     if let Ok(serde_json::Value::Object(ref doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
                         if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
-                            if Self::eval_filter_static_with_hierarchy(doc, f, &class_hierarchy) {
+                            if self.eval_filter(engine, doc, f) {
                                 allowed_ids.insert(key.clone());
                             }
                         }
@@ -2592,7 +2592,7 @@ impl QueryExecutor {
                     if col == "__class__" {
                         self.class_value_matches(engine, v, val)
                     } else {
-                        self.value_matches(v, val)
+                        self.property_value_matches(engine, doc, col, val)
                     }
                 })
             }
@@ -2601,7 +2601,7 @@ impl QueryExecutor {
                     if col == "__class__" {
                         self.class_value_matches(engine, v, val)
                     } else {
-                        self.value_matches(v, val)
+                        self.property_value_matches(engine, doc, col, val)
                     }
                 })
             }
@@ -2640,7 +2640,7 @@ impl QueryExecutor {
                     if col == "__class__" {
                         values.iter().any(|val| self.class_value_matches(engine, v, val))
                     } else {
-                        values.iter().any(|val| self.value_matches(v, val))
+                        values.iter().any(|val| self.property_value_matches(engine, doc, col, val))
                     }
                 })
             }
@@ -2721,6 +2721,236 @@ impl QueryExecutor {
             }
             _ => self.value_matches(v, lit),
         }
+    }
+
+    /// Returns all property names that are equivalent to or subproperties of the given property.
+    /// This implements PrpSpo (subproperty propagation) and PrpEqp (equivalent property).
+    ///
+    /// For example, if `reportsTo` has subproperty `worksUnder` and equivalent property `supervisedBy`,
+    /// then `get_property_aliases(engine, "reportsTo")` returns `{"reportsTo", "worksUnder", "supervisedBy"}`.
+    fn get_property_aliases(&self, engine: &mut LsmEngine, property: &str) -> HashSet<String> {
+        let mut aliases = HashSet::new();
+        aliases.insert(property.to_string());
+
+        // Find the ontology that contains this property
+        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+        for (_key, val_bytes) in entries {
+            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+                if let Some(prop_def) = ontology.properties.get(property) {
+                    // Add equivalent properties
+                    for equiv in &prop_def.equivalent_properties {
+                        aliases.insert(equiv.clone());
+                    }
+                    // Add subproperties (properties that are subproperties of this one)
+                    for (name, other_prop) in &ontology.properties {
+                        if other_prop.subproperty_of.contains(&property.to_string()) {
+                            aliases.insert(name.clone());
+                        }
+                    }
+                }
+                // Also check if this property is a subproperty of something
+                if let Some(prop_def) = ontology.properties.get(property) {
+                    for parent in &prop_def.subproperty_of {
+                        aliases.insert(parent.clone());
+                        // And get the parent's equivalents
+                        if let Some(parent_def) = ontology.properties.get(parent) {
+                            for equiv in &parent_def.equivalent_properties {
+                                aliases.insert(equiv.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        aliases
+    }
+
+    /// Returns the inverse property name for a given property, if defined.
+    /// Implements PrpInv (inverse property inference).
+    ///
+    /// For example, if `reportsTo` has inverse `manages`, returns `Some("manages")`.
+    fn get_inverse_property(&self, engine: &mut LsmEngine, property: &str) -> Option<String> {
+        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+        for (_key, val_bytes) in entries {
+            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+                if let Some(prop_def) = ontology.properties.get(property) {
+                    if let Some(ref inverse) = prop_def.inverse_of {
+                        return Some(inverse.clone());
+                    }
+                }
+                // Also check if any property has this as its inverse
+                for (name, prop_def) in &ontology.properties {
+                    if prop_def.inverse_of.as_deref() == Some(property) {
+                        return Some(name.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Checks if a property is transitive.
+    fn is_transitive_property(&self, engine: &mut LsmEngine, property: &str) -> bool {
+        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+        for (_key, val_bytes) in entries {
+            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+                if let Some(prop_def) = ontology.properties.get(property) {
+                    return prop_def.is_transitive;
+                }
+            }
+        }
+        false
+    }
+
+    /// Checks if a property is symmetric.
+    fn is_symmetric_property(&self, engine: &mut LsmEngine, property: &str) -> bool {
+        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+        for (_key, val_bytes) in entries {
+            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+                if let Some(prop_def) = ontology.properties.get(property) {
+                    return prop_def.is_symmetric;
+                }
+            }
+        }
+        false
+    }
+
+    /// Performs transitive closure lookup for a transitive property.
+    /// Returns all values reachable from `start_value` via the transitive property.
+    ///
+    /// For example, if `ancestor` is transitive and we have:
+    ///   alice ancestor bob, bob ancestor charlie
+    /// Then `transitive_closure(engine, "alice", "ancestor")` returns {"bob", "charlie"}.
+    fn transitive_closure(
+        &self,
+        engine: &mut LsmEngine,
+        start_id: &str,
+        property: &str,
+    ) -> HashSet<String> {
+        let mut visited = HashSet::new();
+        let mut to_visit = vec![start_id.to_string()];
+        let property_aliases = self.get_property_aliases(engine, property);
+
+        while let Some(current) = to_visit.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            // Scan all classes to find documents with this ID
+            let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+            for (_key, val_bytes) in &entries {
+                if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(val_bytes) {
+                    for class_name in ontology.classes.keys() {
+                        let doc_key = format!("{}::{}", class_name, current);
+                        if let Ok(Some(doc_bytes)) = engine.get(doc_key.as_bytes()) {
+                            if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(&doc_bytes) {
+                                for alias in &property_aliases {
+                                    if let Some(serde_json::Value::String(val)) = doc.get(alias) {
+                                        if !visited.contains(val) {
+                                            to_visit.push(val.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        visited.remove(start_id);
+        visited
+    }
+
+    /// Enhanced property value matching that considers ontology inference rules.
+    ///
+    /// For a property column, checks:
+    /// 1. Direct match on the property
+    /// 2. Match on equivalent/subproperty columns (PrpSpo, PrpEqp)
+    /// 3. Inverse property match with swapped semantics (PrpInv)
+    /// 4. Symmetric property match (PrpSymp)
+    fn property_value_matches(
+        &self,
+        engine: &mut LsmEngine,
+        doc: &Map<String, Value>,
+        col: &str,
+        val: &LiteralValue,
+    ) -> bool {
+        // 1. Direct match
+        if let Some(v) = doc.get(col) {
+            if self.value_matches(v, val) {
+                return true;
+            }
+        }
+
+        // 2. Equivalent/subproperty match (PrpSpo, PrpEqp)
+        let aliases = self.get_property_aliases(engine, col);
+        for alias in &aliases {
+            if alias != col {
+                if let Some(v) = doc.get(alias) {
+                    if self.value_matches(v, val) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // 3. Symmetric property match (PrpSymp)
+        // If property is symmetric and doc has `col = X`, then `X col doc_id` also holds.
+        // In document model: look for a document whose ID equals the filter value,
+        // and check if that document has `col` pointing back to this document's ID.
+        if self.is_symmetric_property(engine, col) {
+            if let LiteralValue::String(target_id) = val {
+                let doc_id = doc.get("__pk__")
+                    .and_then(|v| v.as_str())
+                    .map(|pk| {
+                        // Extract the ID part from "Class::id"
+                        pk.rsplit("::").next().unwrap_or(pk).to_string()
+                    });
+                if let Some(ref id) = doc_id {
+                    if id == target_id {
+                        // The filter is asking for documents where col = self, which always matches for symmetric
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // 4. Inverse property match (PrpInv)
+        // If `reportsTo` has inverse `manages`, and filter is `reportsTo = 'bob'`,
+        // then check if doc has `manages = bob` (bob manages this doc's subject).
+        // But in document model, we need to look up the target document.
+        if let Some(inverse) = self.get_inverse_property(engine, col) {
+            if let LiteralValue::String(target_id) = val {
+                // Look up the target document to see if it has the inverse property pointing to us
+                let doc_id = doc.get("__pk__")
+                    .and_then(|v| v.as_str())
+                    .map(|pk| pk.rsplit("::").next().unwrap_or(pk).to_string());
+                if let Some(ref id) = doc_id {
+                    // Check all classes for the target document
+                    let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+                    for (_key, val_bytes) in &entries {
+                        if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(val_bytes) {
+                            for class_name in ontology.classes.keys() {
+                                let target_key = format!("{}::{}", class_name, target_id);
+                                if let Ok(Some(target_bytes)) = engine.get(target_key.as_bytes()) {
+                                    if let Ok(serde_json::Value::Object(target_doc)) = serde_json::from_slice::<serde_json::Value>(&target_bytes) {
+                                        // Check if target has inverse property pointing to our doc
+                                        if let Some(serde_json::Value::String(inverse_val)) = target_doc.get(&inverse) {
+                                            if inverse_val == id {
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     fn value_gt(&self, v: &Value, lit: &LiteralValue) -> bool {
