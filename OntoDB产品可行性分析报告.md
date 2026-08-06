@@ -955,7 +955,108 @@ if left_rows > 10000 || right_rows > 10000 {
 
 ---
 
-## 十九、结论与建议
+## 二十、谓词下推、子查询增强与 CTE 支持（Phase 19）
+
+### 20.1 谓词下推优化
+
+实现了谓词下推（Predicate Pushdown）优化，将 WHERE 条件下推到 Join 前执行：
+
+**优化前**：
+```
+Filter (price > 100)
+  HashJoin (A, B)
+    SeqScan A
+    SeqScan B
+```
+
+**优化后**：
+```
+HashJoin (A, B)
+  Filter (price > 100)  -- 下推到 A 扫描前
+    SeqScan A
+  SeqScan B
+```
+
+**实现逻辑**：
+1. 分析 WHERE 条件中的列引用
+2. 确定每个条件属于哪个表
+3. 将条件推送到对应的扫描节点
+4. 无法下推的条件保留在上层
+
+**示例**：
+```sql
+SELECT * FROM A JOIN B ON A.id = B.id 
+WHERE A.price > 100 AND B.status = 'active';
+```
+- `A.price > 100` 下推到 A 的扫描
+- `B.status = 'active'` 下推到 B 的扫描
+
+### 20.2 EXISTS 子查询支持
+
+新增 EXISTS 和 NOT EXISTS 子查询语法：
+
+```sql
+-- EXISTS: 子查询有结果时为 true
+SELECT * FROM Product p
+WHERE EXISTS (SELECT 1 FROM Order o WHERE o.product_id = p.id);
+
+-- NOT EXISTS: 子查询无结果时为 true
+SELECT * FROM Product p
+WHERE NOT EXISTS (SELECT 1 FROM Order o WHERE o.product_id = p.id);
+```
+
+**执行逻辑**：
+- `EXISTS (SELECT ...)`: 子查询返回非空结果集时为 true
+- `NOT EXISTS (SELECT ...)`: 子查询返回空结果集时为 true
+
+### 20.3 CTE（Common Table Expression）支持
+
+新增 WITH 子句语法：
+
+```sql
+-- 基本 CTE
+WITH active_products AS (
+    SELECT * FROM Product WHERE status = 'active'
+)
+SELECT * FROM active_products WHERE price > 100;
+
+-- 带列别名的 CTE
+WITH top_customers (id, name) AS (
+    SELECT id, name FROM Customer WHERE total_orders > 100
+)
+SELECT * FROM top_customers;
+```
+
+**执行策略**：
+- CTE 物化：先执行 CTE 查询，存储结果
+- 主查询引用：主查询中引用 CTE 名称
+- 临时表：CTE 结果存储为临时表
+
+### 20.4 优化效果
+
+**谓词下推收益**：
+| 场景 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| 10K 表 Join + Filter | 10K × 10K 次比较 | 1K × 10K 次比较 | 10x |
+| 选择率 10% | 扫描 10K 行 | 扫描 1K 行 | 10x |
+
+**EXISTS 子查询收益**：
+| 场景 | IN (SELECT ...) | EXISTS | 提升 |
+|------|-----------------|--------|------|
+| 大子查询 | 执行完整子查询 | 短路求值 | 2-10x |
+
+### 20.5 后续优化方向
+
+| 方向 | 说明 |
+|------|------|
+| 相关子查询展开 | 将相关子查询转换为 Join |
+| CTE 物化优化 | 按需物化（Lazy Materialization） |
+| 谓词合并 | 合并重复的谓词条件 |
+| 常量折叠 | 编译时计算常量表达式 |
+
+---
+
+## 二十一、结论与建议
 
 ### 核心结论
 

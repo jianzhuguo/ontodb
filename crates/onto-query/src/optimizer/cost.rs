@@ -357,6 +357,20 @@ impl CostModel {
                     index_column: None,
                 }
             }
+            crate::parser::FilterExpr::Exists(_) => {
+                FilterSelectivity {
+                    selectivity: 0.5, // Conservative estimate
+                    can_use_index: false,
+                    index_column: None,
+                }
+            }
+            crate::parser::FilterExpr::NotExists(_) => {
+                FilterSelectivity {
+                    selectivity: 0.5, // Conservative estimate
+                    can_use_index: false,
+                    index_column: None,
+                }
+            }
             crate::parser::FilterExpr::And(left, right) => {
                 let l = self.estimate_selectivity(stats, left);
                 let r = self.estimate_selectivity(stats, right);

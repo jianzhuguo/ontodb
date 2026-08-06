@@ -336,7 +336,7 @@ impl QueryPlanner {
         }
     }
 
-    /// Plan a SELECT query.
+    /// Plan a SELECT query with predicate pushdown optimization.
     fn plan_select(
         &self,
         columns: &SelectColumns,
@@ -358,15 +358,21 @@ impl QueryPlanner {
             vector_indexes: Vec::new(),
         });
 
+        // Apply predicate pushdown optimization
+        let (pushed_filters, remaining_filter) = self.pushdown_predicates(
+            from, from_alias, joins, filter,
+        );
+
         // Generate candidate plans
         let mut candidates = Vec::new();
 
-        // Candidate 1: Sequential scan
-        let seq_plan = self.plan_seq_scan(from, from_alias, &stats, filter, joins, group_by, having, order_by, limit, columns);
+        // Candidate 1: Sequential scan with pushed predicates
+        let main_filter = pushed_filters.get(from).cloned().flatten();
+        let seq_plan = self.plan_seq_scan(from, from_alias, &stats, &main_filter, joins, group_by, having, order_by, limit, columns);
         candidates.push(seq_plan);
 
         // Candidate 2: Index scan (if applicable)
-        if let Some(filter_expr) = filter {
+        if let Some(filter_expr) = &main_filter {
             let selectivity = self.cost_model.estimate_selectivity(&stats, filter_expr);
             if selectivity.can_use_index {
                 if let Some(index_col) = &selectivity.index_column {
@@ -376,7 +382,7 @@ impl QueryPlanner {
                             from_alias,
                             &stats,
                             index,
-                            filter,
+                            &main_filter,
                             joins,
                             group_by,
                             having,
@@ -392,7 +398,137 @@ impl QueryPlanner {
 
         // Select the best plan
         candidates.sort_by(|a, b| a.cost.total_cost.partial_cmp(&b.cost.total_cost).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(candidates.into_iter().next().unwrap())
+        let mut best_plan = candidates.into_iter().next().unwrap();
+
+        // Add remaining filter if any predicates couldn't be pushed down
+        if let Some(remaining) = remaining_filter {
+            let filter_cost = self.cost_model.filter_cost(best_plan.cost.rows, &FilterSelectivity {
+                selectivity: 0.5, // Conservative estimate
+                can_use_index: false,
+                index_column: None,
+            });
+            best_plan = ExecutionPlan::new(
+                PlanNode::Filter {
+                    input: Box::new(best_plan.root),
+                    predicate: remaining,
+                    estimated_rows: filter_cost.rows,
+                },
+                CostEstimate::new(
+                    filter_cost.rows,
+                    best_plan.cost.io_cost,
+                    best_plan.cost.cpu_cost + filter_cost.cpu_cost,
+                ),
+            );
+        }
+
+        Ok(best_plan)
+    }
+
+    /// Push predicates down to their respective tables.
+    /// Returns (pushed_filters_by_table, remaining_filter)
+    fn pushdown_predicates(
+        &self,
+        main_table: &str,
+        main_alias: Option<&str>,
+        joins: &[JoinClause],
+        filter: &Option<FilterExpr>,
+    ) -> (HashMap<String, Option<FilterExpr>>, Option<FilterExpr>) {
+        let mut pushed_filters: HashMap<String, Option<FilterExpr>> = HashMap::new();
+        pushed_filters.insert(main_table.to_string(), None);
+
+        // Initialize filters for join tables
+        for join in joins {
+            pushed_filters.entry(join.table.clone()).or_insert(None);
+        }
+
+        let filter = match filter {
+            Some(f) => f.clone(),
+            None => return (pushed_filters, None),
+        };
+
+        // Split AND conditions
+        let predicates = Self::split_and_predicates(&filter);
+
+        let mut remaining_predicates = Vec::new();
+
+        for pred in predicates {
+            let table = Self::determine_table_for_predicate(&pred, main_table, main_alias, joins);
+
+            if let Some(tbl) = table {
+                // Push predicate to the appropriate table
+                let existing = pushed_filters.get_mut(&tbl).unwrap();
+                *existing = Some(match existing.take() {
+                    Some(existing_filter) => FilterExpr::And(
+                        Box::new(existing_filter),
+                        Box::new(pred),
+                    ),
+                    None => pred,
+                });
+            } else {
+                // Can't determine table, keep as remaining
+                remaining_predicates.push(pred);
+            }
+        }
+
+        let remaining = if remaining_predicates.is_empty() {
+            None
+        } else {
+            Some(remaining_predicates.into_iter().reduce(|a, b| FilterExpr::And(Box::new(a), Box::new(b))).unwrap())
+        };
+
+        (pushed_filters, remaining)
+    }
+
+    /// Split AND predicates into individual predicates.
+    fn split_and_predicates(expr: &FilterExpr) -> Vec<FilterExpr> {
+        match expr {
+            FilterExpr::And(left, right) => {
+                let mut result = Self::split_and_predicates(left);
+                result.extend(Self::split_and_predicates(right));
+                result
+            }
+            _ => vec![expr.clone()],
+        }
+    }
+
+    /// Determine which table a predicate belongs to.
+    fn determine_table_for_predicate(
+        pred: &FilterExpr,
+        main_table: &str,
+        main_alias: Option<&str>,
+        joins: &[JoinClause],
+    ) -> Option<String> {
+        let col = match pred {
+            FilterExpr::Eq(col, _)
+            | FilterExpr::Ne(col, _)
+            | FilterExpr::Gt(col, _)
+            | FilterExpr::Lt(col, _)
+            | FilterExpr::Gte(col, _)
+            | FilterExpr::Lte(col, _) => col.clone(),
+            FilterExpr::Like(col, _) => col.clone(),
+            FilterExpr::Between(col, _, _) => col.clone(),
+            FilterExpr::In(col, _) => col.clone(),
+            FilterExpr::InSubquery(col, _) => col.clone(),
+            _ => return None, // Can't determine for complex predicates
+        };
+
+        // Check if column has table prefix
+        if let Some(dot_pos) = col.find('.') {
+            let table_prefix = &col[..dot_pos];
+            // Match against main table or alias
+            if table_prefix == main_table || Some(table_prefix) == main_alias.as_deref() {
+                return Some(main_table.to_string());
+            }
+            // Match against join tables
+            for join in joins {
+                if table_prefix == join.table || Some(table_prefix) == join.alias.as_deref() {
+                    return Some(join.table.clone());
+                }
+            }
+        }
+
+        // No prefix - assume main table
+        Some(main_table.to_string())
     }
 
     /// Create a sequential scan plan.

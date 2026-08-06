@@ -105,6 +105,23 @@ pub enum QueryAst {
     Explain {
         query: Box<QueryAst>,
     },
+
+    /// WITH <cte_name> AS (<query>) <main_query> - Common Table Expression
+    With {
+        ctes: Vec<CteDefinition>,
+        query: Box<QueryAst>,
+    },
+}
+
+/// A CTE (Common Table Expression) definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CteDefinition {
+    /// Name of the CTE.
+    pub name: String,
+    /// Column aliases (optional).
+    pub columns: Vec<String>,
+    /// The CTE query.
+    pub query: Box<QueryAst>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +183,8 @@ pub enum FilterExpr {
     Between(String, LiteralValue, LiteralValue),    // column BETWEEN low AND high
     In(String, Vec<LiteralValue>),                  // column IN (val1, val2, ...)
     InSubquery(String, Box<QueryAst>),              // column IN (SELECT ...)
+    Exists(Box<QueryAst>),                          // EXISTS (SELECT ...)
+    NotExists(Box<QueryAst>),                       // NOT EXISTS (SELECT ...)
     And(Box<FilterExpr>, Box<FilterExpr>),
     Or(Box<FilterExpr>, Box<FilterExpr>),
 }
@@ -205,6 +224,8 @@ impl QueryParser {
 
         if upper.starts_with("EXPLAIN") {
             Self::parse_explain(input)
+        } else if upper.starts_with("WITH") {
+            Self::parse_with(input)
         } else if upper.starts_with("CREATE ONTOLOGY") {
             Ok(QueryAst::CreateOntology {
                 sql: input.to_string(),
@@ -259,6 +280,94 @@ impl QueryParser {
         let inner_ast = Self::parse(inner_query)?;
         Ok(QueryAst::Explain {
             query: Box::new(inner_ast),
+        })
+    }
+
+    /// Parses WITH <cte_name> AS (<query>) <main_query>
+    fn parse_with(input: &str) -> Result<QueryAst> {
+        let upper = input.to_uppercase();
+        if !upper.starts_with("WITH") {
+            return Err(CoreError::InvalidArgument("expected WITH".to_string()));
+        }
+
+        let mut remaining = input[4..].trim();
+        let mut ctes = Vec::new();
+
+        loop {
+            let remaining_upper = remaining.to_uppercase();
+
+            // Parse CTE name
+            let as_pos = remaining_upper.find(" AS ")
+                .ok_or_else(|| CoreError::InvalidArgument("expected 'AS' after CTE name".to_string()))?;
+
+            let name_part = remaining[..as_pos].trim();
+            remaining = remaining[as_pos + 4..].trim();
+
+            // Parse optional column aliases
+            let (name, columns) = if name_part.starts_with('(') {
+                let close = name_part.find(')')
+                    .ok_or_else(|| CoreError::InvalidArgument("expected ')' in CTE column list".to_string()));
+                let close = close?;
+                let cte_name = name_part[1..close].trim().to_string();
+                let cols_str = &name_part[1..close];
+                let cols: Vec<String> = cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                (cte_name, cols)
+            } else {
+                (name_part.to_string(), Vec::new())
+            };
+
+            // Parse CTE query (parenthesized)
+            if !remaining.starts_with('(') {
+                return Err(CoreError::InvalidArgument("expected '(' for CTE query".to_string()));
+            }
+
+            // Find matching closing parenthesis
+            let mut depth = 0;
+            let mut in_quote: Option<char> = None;
+            let mut close_pos = None;
+            for (i, c) in remaining.char_indices() {
+                if let Some(q) = in_quote {
+                    if c == q { in_quote = None; }
+                } else if c == '\'' || c == '"' {
+                    in_quote = Some(c);
+                } else if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_pos = Some(i);
+                        break;
+                    }
+                }
+            }
+
+            let close = close_pos.ok_or_else(|| CoreError::InvalidArgument("unmatched '(' in CTE".to_string()))?;
+            let cte_query_str = &remaining[1..close].trim();
+            let cte_query = Self::parse(cte_query_str)?;
+
+            ctes.push(CteDefinition {
+                name,
+                columns,
+                query: Box::new(cte_query),
+            });
+
+            remaining = remaining[close + 1..].trim();
+
+            // Check for more CTEs (comma-separated)
+            if remaining.starts_with(',') {
+                remaining = remaining[1..].trim();
+                continue;
+            }
+
+            break;
+        }
+
+        // Parse the main query
+        let main_query = Self::parse(remaining)?;
+
+        Ok(QueryAst::With {
+            ctes,
+            query: Box::new(main_query),
         })
     }
 
@@ -1080,8 +1189,44 @@ impl QueryParser {
     fn parse_where(input: &str) -> Result<(Option<FilterExpr>, String)> {
         let input = input.trim();
 
-        // Try keyword operators first: LIKE, BETWEEN, IN
+        // Try keyword operators first: EXISTS, LIKE, BETWEEN, IN
         let upper = input.to_uppercase();
+
+        // Check for EXISTS (SELECT ...)
+        if upper.starts_with("EXISTS") || upper.starts_with("NOT EXISTS") {
+            let (exists_start, is_not) = if upper.starts_with("NOT EXISTS") {
+                (10, true)
+            } else {
+                (6, false)
+            };
+            let rest = input[exists_start..].trim();
+            if rest.starts_with('(') {
+                // Find matching closing paren
+                let mut depth = 0i32;
+                let mut close_pos = None;
+                for (i, c) in rest.char_indices() {
+                    if c == '(' { depth += 1; }
+                    if c == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            close_pos = Some(i);
+                            break;
+                        }
+                    }
+                }
+                if let Some(close) = close_pos {
+                    let inner = rest[1..close].trim();
+                    let remaining = rest[close + 1..].trim();
+                    let subquery = Self::parse(inner)?;
+                    let expr = if is_not {
+                        FilterExpr::NotExists(Box::new(subquery))
+                    } else {
+                        FilterExpr::Exists(Box::new(subquery))
+                    };
+                    return Self::wrap_chain(expr, remaining);
+                }
+            }
+        }
 
         // Check for LIKE: column LIKE 'pattern'
         if let Some(like_pos) = Self::find_unquoted(&upper, " LIKE ") {
