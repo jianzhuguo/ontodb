@@ -132,7 +132,12 @@ impl Wal {
 }
 
 /// Replays a WAL file, returning all entries in order.
-/// Skips entries with CRC mismatches (partial writes at end of file).
+///
+/// Stops parsing at the first CRC mismatch or malformed entry.
+/// This is critical because if a length field is corrupted, all subsequent
+/// entries would be misinterpreted — continuing would produce garbage data.
+/// Partial writes at the end of the file (from a crash during append) are
+/// detected by CRC mismatch and safely ignored.
 pub fn replay_wal(path: impl AsRef<Path>) -> Result<Vec<Entry>> {
     let mut file = File::open(path.as_ref())?;
     let mut entries = Vec::new();
@@ -146,6 +151,12 @@ pub fn replay_wal(path: impl AsRef<Path>) -> Result<Vec<Entry>> {
         let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
+        // Sanity check: length shouldn't be unreasonably large (max 100MB per entry)
+        if len > 100 * 1024 * 1024 {
+            tracing::warn!("WAL: unreasonable entry length {} at offset {}, stopping", len, pos - 4);
+            break;
+        }
+
         // Read CRC
         if pos + 4 > buf.len() {
             break; // Truncated CRC at end of file
@@ -155,21 +166,25 @@ pub fn replay_wal(path: impl AsRef<Path>) -> Result<Vec<Entry>> {
 
         // Read payload
         if pos + len > buf.len() {
+            tracing::warn!("WAL: truncated payload at offset {} (need {} bytes, have {}), stopping", pos, len, buf.len() - pos);
             break; // Truncated payload at end of file (partial write)
         }
         let payload = &buf[pos..pos + len];
         pos += len;
 
-        // Verify CRC
+        // Verify CRC — stop on mismatch (corrupted length would cascade errors)
         let actual_crc = crc32fast::hash(payload);
         if expected_crc != actual_crc {
-            // Skip corrupted entry but continue (could be partial write)
-            continue;
+            tracing::warn!("WAL: CRC mismatch at offset {}, stopping replay", pos - len - 8);
+            break;
         }
 
         match Wal::deserialize_entry(payload) {
             Ok(entry) => entries.push(entry),
-            Err(_) => continue, // Skip malformed entries
+            Err(e) => {
+                tracing::warn!("WAL: malformed entry at offset {}: {:?}, stopping", pos - len, e);
+                break;
+            }
         }
     }
 
@@ -211,5 +226,75 @@ mod tests {
         let payload = Wal::serialize_entry(&entry);
         let recovered = Wal::deserialize_entry(&payload).unwrap();
         assert_eq!(entry, recovered);
+    }
+
+    #[test]
+    fn test_wal_corruption_stops_replay() {
+        // Write 3 valid entries, then corrupt the 4th
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("corrupt.wal");
+
+        let mut wal = Wal::open(&wal_path).unwrap();
+
+        let e1 = Entry::put(b"key1".to_vec(), b"v1".to_vec(), 1);
+        let e2 = Entry::put(b"key2".to_vec(), b"v2".to_vec(), 2);
+        let e3 = Entry::put(b"key3".to_vec(), b"v3".to_vec(), 3);
+
+        wal.append(&e1).unwrap();
+        wal.append(&e2).unwrap();
+        wal.append(&e3).unwrap();
+        wal.sync().unwrap();
+
+        // Append a corrupted entry (bad CRC)
+        use std::io::Write;
+        let bad_payload = b"garbage_data";
+        let bad_len = bad_payload.len() as u32;
+        let bad_crc = 0xDEADBEEFu32; // Wrong CRC
+        let mut file = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
+        file.write_all(&bad_len.to_le_bytes()).unwrap();
+        file.write_all(&bad_crc.to_le_bytes()).unwrap();
+        file.write_all(bad_payload).unwrap();
+        file.sync_all().unwrap();
+
+        // Replay should return only the 3 valid entries, stopping at corruption
+        let entries = replay_wal(&wal_path).unwrap();
+        assert_eq!(entries.len(), 3, "should stop at corrupted entry");
+        assert_eq!(entries[0], e1);
+        assert_eq!(entries[1], e2);
+        assert_eq!(entries[2], e3);
+    }
+
+    #[test]
+    fn test_wal_truncated_payload_stops_replay() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("truncated.wal");
+
+        let mut wal = Wal::open(&wal_path).unwrap();
+
+        let e1 = Entry::put(b"key1".to_vec(), b"v1".to_vec(), 1);
+        let e2 = Entry::put(b"key2".to_vec(), b"v2".to_vec(), 2);
+        wal.append(&e1).unwrap();
+        wal.append(&e2).unwrap();
+        wal.sync().unwrap();
+
+        // Truncate the file mid-way through the second entry's payload
+        // Entry format: [len:4][crc:4][payload:N]. We want to keep all of
+        // entry 1, plus the len+crc of entry 2, but cut into entry 2's payload.
+        let payload2 = Wal::serialize_entry(&e2);
+        let entry2_total = 4 + 4 + payload2.len(); // len + crc + payload
+        let metadata = std::fs::metadata(&wal_path).unwrap();
+        // Keep entry 1 fully + 10 bytes of entry 2 (enough for len+crc but not full payload)
+        let truncate_to = metadata.len() - (entry2_total as u64) + 10;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap()
+            .set_len(truncate_to)
+            .unwrap();
+
+        // Should recover entry 1, stop at truncated entry 2
+        let entries = replay_wal(&wal_path).unwrap();
+        assert_eq!(entries.len(), 1, "should stop at truncated entry");
+        assert_eq!(entries[0], e1);
     }
 }

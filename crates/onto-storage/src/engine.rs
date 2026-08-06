@@ -777,10 +777,30 @@ impl LsmEngine {
     }
 
     /// Resets the WAL file after a successful flush.
+    ///
+    /// Uses write-new-then-rename for atomicity:
+    /// 1. Create a new WAL at a temp path
+    /// 2. Atomically rename temp → wal.log
+    /// This ensures the WAL is never missing, even if the process crashes mid-reset.
     fn reset_wal(&mut self) -> Result<()> {
         let wal_path = self.options.data_dir.join("wal.log");
-        fs::remove_file(&wal_path)?;
+        let tmp_path = self.options.data_dir.join("wal.log.tmp");
+
+        // If a stale temp file exists from a previous crash, remove it
+        if tmp_path.exists() {
+            fs::remove_file(&tmp_path)?;
+        }
+
+        // Create new WAL at temp path
+        let new_wal = Wal::open(&tmp_path)?;
+
+        // Atomically replace the old WAL
+        fs::rename(&tmp_path, &wal_path)?;
+
+        self.wal = new_wal;
+        // Re-open at the final path (rename doesn't update the file handle's path)
         self.wal = Wal::open(&wal_path)?;
+
         Ok(())
     }
 
