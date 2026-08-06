@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.20 | 更新日期：2026-08-06
+> 版本：v1.21 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -563,6 +563,8 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 | v1.20 | RDF 导入导出（P1.2） | TurtleParser + N-Triples + JSON-LD |
 | v1.20 | Schema Introspection（P1.0） | `schema_info()` + `GET /api/schema` |
 | v1.20 | SPARQL 端点（P1.3） | SPARQL 解析器 + SPARQL→SQL 翻译 + HTTP 端点 + W3C JSON 结果 |
+| v1.21 | TCP server 异步化 | tokio::spawn + tokio::io 异步 I/O + 共享 runtime + 连接追踪 metrics |
+| v1.21 | Bloom Filter 确认 | 已集成到 SSTable get()/get_full() 读取路径，1% 误报率 |
 
 ### 11.3 持久化保障
 
@@ -1901,7 +1903,40 @@ INSERT/UPDATE 时自动校验 OWL Restriction 约束：
 
 ---
 
-## 三十五、结论与建议
+## 三十五、TCP 异步化与连接管理
+
+### 35.1 TCP Server 异步化
+
+将 TCP server 从 `std::thread::spawn`（OS 线程模型）改为 `tokio::spawn`（异步任务模型）：
+
+| 对比项 | 改造前 | 改造后 |
+|--------|--------|--------|
+| 并发模型 | 每连接一个 OS 线程 | 每连接一个 tokio 异步任务 |
+| 连接上限 | 受 OS 线程数限制（~数千） | 受内存限制（~数十万） |
+| I/O 模型 | 同步阻塞 `std::io` | 异步非阻塞 `tokio::io` |
+| Runtime | TCP 和 HTTP 各自独立 | 共享同一个 tokio runtime |
+| 连接追踪 | 无 | `tcp_connections_total` / `tcp_connections_active` 原子计数 |
+| 查询 Metrics | 无 | 每次查询记录类型、耗时、成功/失败 |
+
+**实现细节**：
+- `tokio::net::TcpListener::bind()` + `listener.accept()` 异步接受连接
+- `tokio::spawn` 分发每个连接到独立异步任务
+- `stream.into_split()` 分离读写端，支持并发读写
+- `tokio::io::BufReader` + `read_line()` 异步逐行读取
+- `AtomicCounter::dec()` 新增递减方法用于活跃连接计数
+
+### 35.2 Bloom Filter 读取路径确认
+
+Bloom Filter 已完整集成到 SSTable 读取路径，无需额外工作：
+
+- **构建时**：`SsTableBuilder::add()` 收集所有 key，`build()` 时生成 BloomFilter 写入 SSTable 文件
+- **读取时**：`SsTable::get()` 和 `get_full()` 在任何磁盘 I/O 之前检查 `bloom.might_contain(key)`，不命中直接返回 `None`
+- **参数**：1% 误报率（`fp_rate = 0.01`），最优哈希函数数量自动计算
+- **存储**：与 index block 一起写入 SSTable 文件尾部，启动时一次性加载
+
+---
+
+## 三十六、结论与建议
 
 ### 核心结论
 
@@ -1923,6 +1958,7 @@ INSERT/UPDATE 时自动校验 OWL Restriction 约束：
 16. **RDF 互操作**：Turtle/N-Triples/JSON-LD 三种格式导入导出，与外部本体生态系统互通
 17. **SPARQL 端点**：完整的 SPARQL 1.1 查询支持（SELECT/CONSTRUCT/ASK），SPARQL→SQL 翻译器，W3C 标准结果格式，HTTP API 端点
 18. **Schema Introspection**：运行时查询完整 schema 信息（类/属性/索引），支持工具和 ORM 集成
+19. **TCP 异步并发**：TCP server 从 OS 线程改为 tokio 异步任务，连接追踪 + 查询 metrics，与 HTTP 共享 runtime
 
 ### 性能基线（v1.8）
 
