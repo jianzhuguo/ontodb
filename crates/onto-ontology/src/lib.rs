@@ -4,6 +4,7 @@
 
 pub mod model;
 pub mod parser;
+pub mod rdf;
 pub mod reasoner;
 pub mod rules;
 pub mod store;
@@ -13,6 +14,7 @@ pub use model::{
     PropertyAssertion, Restriction, Triple,
 };
 pub use parser::OntologyParser;
+pub use rdf::{RdfError, RdfTerm, RdfTriple, TurtleParser, to_jsonld, to_ntriples};
 pub use reasoner::{DerivationStep, InferenceError, Reasoner, ReasoningResult};
 pub use rules::{Rule, RuleId};
 pub use store::OntologyStore;

@@ -3438,7 +3438,7 @@ impl QueryExecutor {
         // Find the ontology containing this class
         let ontology = match self.ontology_store.find_ontology_for_class(engine, class)? {
             Some(o) => o,
-            None => return Ok(()), // No ontology defined 鈥?skip validation
+            None => return Ok(()), // No ontology defined — skip validation
         };
 
         let class_def = match ontology.classes.get(class) {
@@ -3472,7 +3472,214 @@ impl QueryExecutor {
             // Fields not in the ontology are allowed (schema-on-read compatible)
         }
 
+        // Validate OWL restrictions
+        self.validate_restrictions(engine, &ontology, class_def, doc)?;
+
+        // Validate class disjointness
+        self.validate_disjointness(engine, &ontology, class, doc)?;
+
         Ok(())
+    }
+
+    /// Validates OWL restrictions on a document during INSERT.
+    ///
+    /// Checks: hasValue, MinCardinality, MaxCardinality, ExactCardinality,
+    /// someValuesFrom, allValuesFrom.
+    fn validate_restrictions(
+        &self,
+        engine: &mut LsmEngine,
+        ontology: &onto_ontology::Ontology,
+        class_def: &onto_ontology::Class,
+        doc: &Map<String, Value>,
+    ) -> Result<()> {
+        // Collect restrictions from this class and all superclasses
+        let mut all_restrictions = Vec::new();
+        Self::collect_restrictions(ontology, &class_def.name, &mut all_restrictions, &mut std::collections::HashSet::new());
+
+        for restriction in &all_restrictions {
+            match restriction {
+                onto_ontology::Restriction::HasValue { property, value } => {
+                    // The property must have this specific value
+                    if let Some(doc_val) = doc.get(property) {
+                        let expected = Self::ontology_literal_to_json(value);
+                        if doc_val != &expected {
+                            return Err(CoreError::InvalidArgument(format!(
+                                "restriction violation: property '{}' must have value {:?}, got {}",
+                                property, value, doc_val
+                            )));
+                        }
+                    }
+                }
+                onto_ontology::Restriction::MinCardinality { property, min } => {
+                    // Check minimum number of values for the property
+                    let count = Self::count_property_values(doc, property);
+                    if count < *min {
+                        return Err(CoreError::InvalidArgument(format!(
+                            "restriction violation: property '{}' requires at least {} values, got {}",
+                            property, min, count
+                        )));
+                    }
+                }
+                onto_ontology::Restriction::MaxCardinality { property, max } => {
+                    let count = Self::count_property_values(doc, property);
+                    if count > *max {
+                        return Err(CoreError::InvalidArgument(format!(
+                            "restriction violation: property '{}' allows at most {} values, got {}",
+                            property, max, count
+                        )));
+                    }
+                }
+                onto_ontology::Restriction::ExactCardinality { property, count: expected } => {
+                    let count = Self::count_property_values(doc, property);
+                    if count != *expected {
+                        return Err(CoreError::InvalidArgument(format!(
+                            "restriction violation: property '{}' requires exactly {} values, got {}",
+                            property, expected, count
+                        )));
+                    }
+                }
+                onto_ontology::Restriction::SomeValuesFrom { property, class: required_class } => {
+                    // At least one value of the property must be an instance of the required class
+                    if let Some(val) = doc.get(property) {
+                        if let Value::String(ref_id) = val {
+                            if !self.is_instance_of_class(engine, ref_id, required_class)? {
+                                return Err(CoreError::InvalidArgument(format!(
+                                    "restriction violation: property '{}' must reference an instance of class '{}'",
+                                    property, required_class
+                                )));
+                            }
+                        }
+                    }
+                }
+                onto_ontology::Restriction::AllValuesFrom { property, class: required_class } => {
+                    // All values of the property must be instances of the required class
+                    if let Some(val) = doc.get(property) {
+                        match val {
+                            Value::String(ref_id) => {
+                                if !self.is_instance_of_class(engine, ref_id, required_class)? {
+                                    return Err(CoreError::InvalidArgument(format!(
+                                        "restriction violation: all values of property '{}' must be instances of class '{}'",
+                                        property, required_class
+                                    )));
+                                }
+                            }
+                            Value::Array(items) => {
+                                for item in items {
+                                    if let Value::String(ref_id) = item {
+                                        if !self.is_instance_of_class(engine, ref_id, required_class)? {
+                                            return Err(CoreError::InvalidArgument(format!(
+                                                "restriction violation: all values of property '{}' must be instances of class '{}'",
+                                                property, required_class
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Recursively collects restrictions from a class and its superclasses.
+    fn collect_restrictions(
+        ontology: &onto_ontology::Ontology,
+        class_name: &str,
+        restrictions: &mut Vec<onto_ontology::Restriction>,
+        visited: &mut std::collections::HashSet<String>,
+    ) {
+        if !visited.insert(class_name.to_string()) {
+            return;
+        }
+        if let Some(class) = ontology.classes.get(class_name) {
+            restrictions.extend(class.restrictions.clone());
+            for superclass in &class.superclasses {
+                Self::collect_restrictions(ontology, superclass, restrictions, visited);
+            }
+        }
+    }
+
+    /// Counts the number of values for a property in a document.
+    /// Returns 0 if the property is missing, 1 for scalar values, array length for arrays.
+    fn count_property_values(doc: &Map<String, Value>, property: &str) -> usize {
+        match doc.get(property) {
+            None => 0,
+            Some(Value::Null) => 0,
+            Some(Value::Array(arr)) => arr.len(),
+            Some(_) => 1,
+        }
+    }
+
+    /// Checks if a document with the given ID is an instance of the specified class.
+    fn is_instance_of_class(
+        &self,
+        engine: &mut LsmEngine,
+        doc_id: &str,
+        required_class: &str,
+    ) -> Result<bool> {
+        // Get the class hierarchy for the required class (includes subclasses)
+        let hierarchy = self.get_class_hierarchy(engine, required_class);
+
+        // Search all classes in the hierarchy for the document
+        for class_name in &hierarchy {
+            let key = format!("{}::{}", class_name, doc_id);
+            if let Ok(Some(val_bytes)) = engine.get(key.as_bytes()) {
+                if let Ok(serde_json::Value::Object(ref doc)) = serde_json::from_slice::<serde_json::Value>(&val_bytes) {
+                    if let Some(Value::String(doc_class)) = doc.get("__class__") {
+                        if hierarchy.contains(doc_class.as_str()) {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Validates class disjointness constraints during INSERT.
+    /// If class A is disjoint with class B, no instance can be of both types.
+    fn validate_disjointness(
+        &self,
+        engine: &mut LsmEngine,
+        ontology: &onto_ontology::Ontology,
+        class: &str,
+        doc: &Map<String, Value>,
+    ) -> Result<()> {
+        let class_def = match ontology.classes.get(class) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        for disjoint_class in &class_def.disjoint_with {
+            // Check if any existing instance with the same ID exists in the disjoint class
+            if let Some(Value::String(pk)) = doc.get("__pk__") {
+                let doc_id = pk.rsplit("::").next().unwrap_or(pk);
+                let disjoint_key = format!("{}::{}", disjoint_class, doc_id);
+                if let Ok(Some(_)) = engine.get(disjoint_key.as_bytes()) {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "disjoint constraint violation: instance '{}' cannot be both '{}' and '{}'",
+                        doc_id, class, disjoint_class
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Converts an ontology Literal to a JSON value for restriction validation.
+    fn ontology_literal_to_json(lit: &onto_ontology::Literal) -> Value {
+        match lit {
+            onto_ontology::Literal::String(s) => json!(s),
+            onto_ontology::Literal::Int(i) => json!(i),
+            onto_ontology::Literal::Float(f) => json!(f),
+            onto_ontology::Literal::Bool(b) => json!(b),
+        }
     }
 
     /// Validates that a JSON value is compatible with the expected DataType.
