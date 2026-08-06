@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.22 | 更新日期：2026-08-06
+> 版本：v1.23 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -566,6 +566,7 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 | v1.21 | TCP server 异步化 | tokio::spawn + tokio::io 异步 I/O + 共享 runtime + 连接追踪 metrics |
 | v1.21 | Bloom Filter 确认 | 已集成到 SSTable get()/get_full() 读取路径，1% 误报率 |
 | v1.22 | 推理结果物化缓存 | InferenceCache 缓存 class_hierarchy/property_aliases/inverse_property，CREATE ONTOLOGY 自动失效 |
+| v1.23 | 语义查询优化 | narrow_scan_scope 用 __class__ 过滤 + owl:disjointWith 约束缩小扫描范围 |
 
 ### 11.3 持久化保障
 
@@ -1974,7 +1975,39 @@ Bloom Filter 已完整集成到 SSTable 读取路径，无需额外工作：
 
 ---
 
-## 三十七、结论与建议
+## 三十七、语义查询优化 — 本体约束下推
+
+### 37.1 问题背景
+
+`plan_seq_scan` 对查询目标类展开完整继承链后逐一扫描。当 `Person` 有子类 `Employee`、`Manager`、`Student` 时，`SELECT * FROM Person` 会扫描所有 4 个类的数据。但如果查询有 `WHERE __class__ = 'Employee'`，扫描 `Student` 纯属浪费。
+
+### 37.2 优化方案
+
+新增 `narrow_scan_scope` 方法，在扫描前用本体约束缩小范围：
+
+| 优化手段 | 方法 | 效果 |
+|----------|------|------|
+| `__class__` 过滤下推 | `extract_class_filter` | 从 WHERE 提取 `__class__ = 'X'` 或 `IN ('X','Y')`，只扫描目标类 |
+| 子类扩展 | `get_class_hierarchy` | 目标类自动包含子类（`Employee` → `Employee`, `JuniorEngineer`） |
+| 不相交类排除 | `get_disjoint_classes` | 查询 `Employee` 时排除 `Student`（`owl:disjointWith`） |
+| 组合优化 | `narrow_scan_scope` | 交集 + 差集：只扫描 (目标类 ∩ 继承链) - 不相交类 |
+
+### 37.3 示例
+
+```sql
+-- 无优化: 扫描 Person + Employee + Manager + Student (4 个类)
+SELECT * FROM Person
+
+-- 有优化: 只扫描 Employee (1 个类，Student 被 disjointWith 排除)
+SELECT * FROM Person WHERE __class__ = 'Employee'
+
+-- IN 优化: 只扫描 Employee + Manager (2 个类)
+SELECT * FROM Person WHERE __class__ IN ('Employee', 'Manager')
+```
+
+---
+
+## 三十八、结论与建议
 
 ### 核心结论
 
@@ -1998,6 +2031,7 @@ Bloom Filter 已完整集成到 SSTable 读取路径，无需额外工作：
 18. **Schema Introspection**：运行时查询完整 schema 信息（类/属性/索引），支持工具和 ORM 集成
 19. **TCP 异步并发**：TCP server 从 OS 线程改为 tokio 异步任务，连接追踪 + 查询 metrics，与 HTTP 共享 runtime
 20. **推理结果物化缓存**：InferenceCache 缓存类层级/属性别名/逆属性，命中时跳过 Reasoner 不动点迭代，CREATE ONTOLOGY 自动失效
+21. **语义查询优化**：`narrow_scan_scope` 用 `__class__` 过滤下推 + `owl:disjointWith` 不相交类排除，减少无效扫描
 
 ### 性能基线（v1.8）
 
