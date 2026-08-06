@@ -116,6 +116,7 @@ impl AuthState {
     }
 
     /// Get the rate limit for a specific key, or None if not configured.
+    #[allow(dead_code)]
     pub fn get_rate_limit(&self, key: &str) -> Option<u32> {
         self.keys.get(key).and_then(|(_, _, limit)| *limit)
     }
@@ -232,6 +233,7 @@ fn extract_api_key(request: &Request) -> Option<String> {
 
 /// Information about the authenticated API key.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct KeyInfo {
     pub key: String,
     pub description: String,

@@ -189,6 +189,20 @@ impl LsmEngine {
                 sst_counter.clone(),
             );
 
+        // Create index manager with disk storage if configured
+        let index_manager = match &options.index_storage_mode {
+            None | Some(crate::index::IndexStorageMode::InMemory) => IndexManager::new(),
+            Some(mode) => {
+                let idx_dir = options.data_dir.join("indexes");
+                fs::create_dir_all(&idx_dir)?;
+                let mut mgr = IndexManager::with_disk_storage(&idx_dir, mode.clone());
+                if let Err(e) = mgr.open_disk_indexes() {
+                    tracing::warn!("Failed to open some disk indexes: {}", e);
+                }
+                mgr
+            }
+        };
+
         let mut engine = LsmEngine {
             memtable: pre_engine.memtable,
             immutable_memtable: pre_engine.immutable_memtable,
@@ -199,7 +213,7 @@ impl LsmEngine {
             seq_counter: pre_engine.seq_counter,
             sst_counter,
             txn_manager: TxnManager::new(),
-            index_manager: IndexManager::new(),
+            index_manager,
             vector_index_manager: VectorIndexManager::new(),
             compaction_sender,
             compaction_notif_receiver: std::sync::Mutex::new(compaction_notif_receiver),
@@ -1701,13 +1715,13 @@ mod tests {
                 memtable_size_limit: 1024 * 1024,
                 ..Default::default()
             };
-            let engine = LsmEngine::open(options).unwrap();
+            let mut engine = LsmEngine::open(options).unwrap();
 
             // Index should exist after restart
             assert!(engine.has_index("Product", "price"), "index should persist across restart");
 
             // Index should be functional: lookup by value
-            let pkeys = engine.index_manager().lookup_eq(
+            let pkeys = engine.index_manager_mut().lookup_eq(
                 "Product",
                 "price",
                 &serde_json::json!(999),
@@ -1716,7 +1730,7 @@ mod tests {
             assert_eq!(pkeys.unwrap().len(), 1);
 
             // Range scan should also work
-            let pkeys = engine.index_manager().lookup_range(
+            let pkeys = engine.index_manager_mut().lookup_range(
                 "Product",
                 "price",
                 Some(&serde_json::json!(500)),

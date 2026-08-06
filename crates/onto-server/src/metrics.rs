@@ -400,6 +400,7 @@ impl Metrics {
     }
 
     /// Export metrics as JSON (for /api/metrics endpoint).
+    #[allow(dead_code)]
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "server": {

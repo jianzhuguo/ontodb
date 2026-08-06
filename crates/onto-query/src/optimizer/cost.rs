@@ -165,7 +165,7 @@ impl CostModel {
     }
 
     /// Estimate the cost of an index-based lookup (point query).
-    pub fn index_lookup_cost(&self, stats: &TableStats, index: &IndexStats) -> CostEstimate {
+    pub fn index_lookup_cost(&self, _stats: &TableStats, index: &IndexStats) -> CostEstimate {
         let io_cost = index.tree_height as f64 * self.index_lookup_io;
         let cpu_cost = index.tree_height as f64 * self.compare_cpu;
         CostEstimate::new(1, io_cost, cpu_cost)
@@ -272,7 +272,7 @@ impl CostModel {
     /// Estimate the cost of a vector search.
     pub fn vector_search_cost(
         &self,
-        stats: &TableStats,
+        _stats: &TableStats,
         vector_stats: &VectorIndexStats,
         top_k: u64,
     ) -> CostEstimate {

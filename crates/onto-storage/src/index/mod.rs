@@ -12,4 +12,4 @@ pub mod disk;
 mod manager;
 
 pub use btree::BPlusTree;
-pub use manager::IndexManager;
+pub use manager::{IndexManager, IndexStorageMode};

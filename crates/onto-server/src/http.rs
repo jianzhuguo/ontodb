@@ -109,6 +109,7 @@ impl<T: Serialize> ApiResponse<T> {
 }
 
 /// Builds the HTTP router with all API endpoints (no auth).
+#[allow(dead_code)]
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Health check

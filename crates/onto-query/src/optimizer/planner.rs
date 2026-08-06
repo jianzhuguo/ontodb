@@ -628,7 +628,7 @@ impl QueryPlanner {
         filter: &Option<FilterExpr>,
         joins: &[JoinClause],
         group_by: Option<&crate::parser::GroupByClause>,
-        having: &Option<FilterExpr>,
+        _having: &Option<FilterExpr>,
         order_by: &[OrderBy],
         limit: Option<usize>,
         columns: &SelectColumns,
@@ -733,7 +733,7 @@ impl QueryPlanner {
             current_node = PlanNode::Aggregation {
                 input: Box::new(current_node),
                 group_by: gb.columns.clone(),
-                aggregates: Vec::new(), // TODO: extract from columns
+                aggregates: Self::extract_aggregates(columns),
                 estimated_rows: agg_cost.rows,
             };
             current_cost = agg_cost;
@@ -777,7 +777,7 @@ impl QueryPlanner {
         filter: &Option<FilterExpr>,
         joins: &[JoinClause],
         group_by: Option<&crate::parser::GroupByClause>,
-        having: &Option<FilterExpr>,
+        _having: &Option<FilterExpr>,
         order_by: &[OrderBy],
         limit: Option<usize>,
         columns: &SelectColumns,
@@ -858,7 +858,7 @@ impl QueryPlanner {
             current_node = PlanNode::Aggregation {
                 input: Box::new(current_node),
                 group_by: gb.columns.clone(),
-                aggregates: Vec::new(),
+                aggregates: Self::extract_aggregates(columns),
                 estimated_rows: agg_cost.rows,
             };
             current_cost = agg_cost;
@@ -987,6 +987,27 @@ impl QueryPlanner {
         };
 
         Ok(ExecutionPlan::new(node, total_cost))
+    }
+
+    /// Extract aggregate functions from SELECT columns.
+    fn extract_aggregates(columns: &SelectColumns) -> Vec<AggregateFunc> {
+        match columns {
+            SelectColumns::All => Vec::new(),
+            SelectColumns::Columns(items) => items
+                .iter()
+                .filter_map(|item| {
+                    if let SelectItem::Aggregate(agg) = item {
+                        Some(AggregateFunc {
+                            func: agg.func.clone(),
+                            arg: agg.arg.clone(),
+                            alias: agg.alias.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        }
     }
 }
 

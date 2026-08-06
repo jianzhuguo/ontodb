@@ -254,7 +254,7 @@ impl SparqlParser {
         let construct_patterns = self.parse_triple_patterns(construct_body)?;
 
         // Parse WHERE clause
-        let (patterns, filters, remaining) = self.parse_where_clause(where_part)?;
+        let (patterns, filters, _remaining) = self.parse_where_clause(where_part)?;
 
         Ok(SparqlQuery {
             select: SparqlSelect::All,
@@ -704,14 +704,14 @@ impl SparqlParser {
 
         // Find the main class from rdf:type patterns
         let mut main_class: Option<String> = None;
-        let mut main_var: Option<String> = None;
+        let mut _main_var: Option<String> = None;
         for pattern in &query.where_patterns {
             if let PatternTerm::Iri(pred) = &pattern.predicate {
                 if pred.ends_with("#type") || pred == "rdf:type" || pred == "type" {
                     if let PatternTerm::Iri(class_iri) = &pattern.object {
                         main_class = Some(class_iri.clone());
                         if let PatternTerm::Variable(var) = &pattern.subject {
-                            main_var = Some(var.clone());
+                            _main_var = Some(var.clone());
                         }
                     }
                 }

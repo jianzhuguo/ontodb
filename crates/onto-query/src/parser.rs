@@ -916,7 +916,7 @@ impl QueryParser {
 
         // Parse optional LIMIT
         let rest_upper = rest.to_uppercase();
-        let (limit, offset, rest) = if rest_upper.trim_start().starts_with("LIMIT") {
+        let (limit, offset, _rest) = if rest_upper.trim_start().starts_with("LIMIT") {
             let start = Self::find_unquoted(&rest_upper, "LIMIT")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'LIMIT'".to_string()))?;
             let after_limit = rest[start + 5..].trim();
@@ -1069,7 +1069,7 @@ impl QueryParser {
                 let end_pos = end_upper.find(" END").unwrap_or(part.len());
                 let after_end = part[end_pos + 4..].trim();
                 let expr = if after_end.to_uppercase().starts_with("AS ") {
-                    let alias = after_end[3..].trim().to_string();
+                    let _alias = after_end[3..].trim().to_string();
                     // Store with alias info — we'll wrap in a named expression
                     SelectItem::Expression(case_expr)
                 } else {

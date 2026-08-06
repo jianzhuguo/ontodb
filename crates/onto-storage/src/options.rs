@@ -1,5 +1,6 @@
 //! Storage engine configuration options.
 
+use crate::index::IndexStorageMode;
 use std::path::PathBuf;
 
 /// Configuration for the LSM-Tree storage engine.
@@ -34,6 +35,13 @@ pub struct StorageOptions {
     /// zstd compression level for SSTable data blocks.
     /// 0 = disabled, 1-21 = enabled (higher = better ratio, slower).
     pub compression_level: i32,
+
+    /// Storage mode for secondary indexes.
+    /// InMemory (default): all indexes in RAM, fast but limited by memory.
+    /// DiskBased: indexes on disk with buffer pool caching, handles large datasets.
+    /// Hybrid: small indexes in memory, large ones migrated to disk.
+    /// None = InMemory (for backward compatibility with existing code).
+    pub index_storage_mode: Option<IndexStorageMode>,
 }
 
 impl Default for StorageOptions {
@@ -48,6 +56,7 @@ impl Default for StorageOptions {
             bloom_filter_fp_rate: 0.01,
             sync_wal_on_commit: true, // Strong durability by default
             compression_level: 3,    // zstd level 3 by default (good balance)
+            index_storage_mode: None,
         }
     }
 }

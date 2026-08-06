@@ -16,7 +16,7 @@ pub mod options;
 pub mod vector;
 
 pub use engine::LsmEngine;
-pub use index::IndexManager;
+pub use index::{IndexManager, IndexStorageMode};
 pub use iterator::StorageIterator;
 pub use mvcc::{TxnManager, Transaction, TxnStatus, WriteOp};
 pub use options::StorageOptions;

@@ -149,6 +149,7 @@ impl RateLimiter {
 
 /// Rate limit information returned in response headers.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct RateLimitInfo {
     pub limit: u32,
     pub remaining: u32,

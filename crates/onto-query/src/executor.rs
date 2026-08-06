@@ -3,7 +3,7 @@
 use crate::cache::{PlanCache, QueryCache};
 use crate::optimizer::QueryPlanner;
 use crate::parser::{AggregateFunc, ArithmeticOp, FilterExpr, LiteralValue, QueryAst, SelectColumns, SelectItem, ValueExpr, WindowExpr, WindowFunc};
-use crate::optimizer::{ExecutionPlan, PlanNode, PlanWindowExpr};
+use crate::optimizer::{ExecutionPlan, PlanNode};
 use onto_core::{CoreError, Result};
 use onto_ontology::{DataType, OntologyStore, Reasoner};
 use onto_storage::LsmEngine;
@@ -756,7 +756,7 @@ impl QueryExecutor {
                 }
                 Ok(rows)
             }
-            PlanNode::Aggregation { input, group_by, .. } => {
+            PlanNode::Aggregation { input, group_by: _, .. } => {
                 let rows = self.execute_plan_node(input, engine)?;
                 // Basic aggregation: just return grouped rows
                 // Full aggregation is handled by execute_aggregation
@@ -925,7 +925,7 @@ impl QueryExecutor {
         key: &LiteralValue,
     ) -> Result<Vec<Map<String, Value>>> {
         if engine.has_index(table, index_column) {
-            let index_mgr = engine.index_manager();
+            let index_mgr = engine.index_manager_mut();
             let json_val = Self::literal_to_json_static(key);
             let pkeys = index_mgr.lookup_eq(table, index_column, &json_val).unwrap_or_default();
             let mut rows = Self::fetch_rows_by_pks(engine, &pkeys)?;
@@ -990,7 +990,7 @@ impl QueryExecutor {
         right_rows: Vec<Map<String, Value>>,
         join: &crate::parser::JoinClause,
     ) -> Result<Vec<Map<String, Value>>> {
-        let left_alias = None::<&str>;
+        let _left_alias = None::<&str>;
         let right_alias = join.alias.as_deref().unwrap_or(&join.table);
         let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
         let join_type = join.join_type;
@@ -1470,7 +1470,7 @@ impl QueryExecutor {
         ctes: &[crate::parser::CteDefinition],
         query: &QueryAst,
         engine: &mut LsmEngine,
-        recursive: bool,
+        _recursive: bool,
     ) -> Result<QueryResult> {
         // Materialize each CTE: execute the query and store results under a temp key
         for cte in ctes {
@@ -1675,10 +1675,10 @@ impl QueryExecutor {
             QueryAst::Select {
                 distinct,
                 columns,
-                from,
-                from_alias,
-                joins,
-                filter,
+                from: _,
+                from_alias: _,
+                joins: _,
+                filter: _,
                 group_by,
                 having,
                 order_by,
@@ -2101,7 +2101,7 @@ impl QueryExecutor {
         func: &WindowFunc,
         arg: Option<&str>,
         partition: &[(usize, Map<String, Value>)],
-        frame: &Option<crate::parser::WindowFrame>,
+        _frame: &Option<crate::parser::WindowFrame>,
     ) -> Vec<Value> {
         let n = partition.len();
         let mut values = Vec::with_capacity(n);
@@ -2111,8 +2111,8 @@ impl QueryExecutor {
                 WindowFunc::RowNumber => Value::Number(serde_json::Number::from(idx + 1)),
                 WindowFunc::Rank => {
                     // Rank: same value gets same rank, then skip
-                    let mut rank = 1;
-                    if let Some(ob) = partition.iter().find_map(|(_, row)| {
+                    let _rank = 1;
+                    if let Some(_ob) = partition.iter().find_map(|(_, row)| {
                         // Use the first ORDER BY column for ranking
                         Some(row)
                     }) {
@@ -2503,7 +2503,7 @@ impl QueryExecutor {
             return Ok(None);
         }
 
-        let index_mgr = engine.index_manager();
+        let index_mgr = engine.index_manager_mut();
 
         let pkeys: Vec<Vec<u8>> = match filter {
             FilterExpr::Eq(_, val) => {
@@ -2560,6 +2560,7 @@ impl QueryExecutor {
     }
 
     /// Static filter evaluation (no engine needed for simple predicates).
+    #[allow(dead_code)]
     fn eval_filter_static(doc: &Map<String, Value>, filter: &FilterExpr) -> bool {
         Self::eval_filter_static_with_hierarchy(doc, filter, &HashSet::new())
     }
@@ -2569,6 +2570,7 @@ impl QueryExecutor {
     /// When `class_hierarchy` is non-empty, `__class__` column comparisons (Eq/In) use
     /// subclass-aware matching: a document with `__class__ = "Employee"` matches a filter
     /// on `__class__ = "Person"` if Employee is a subclass of Person.
+    #[allow(dead_code)]
     fn eval_filter_static_with_hierarchy(doc: &Map<String, Value>, filter: &FilterExpr, class_hierarchy: &HashSet<String>) -> bool {
         // Helper to resolve column value (preserving original type) with alias support
         let resolve_val = |col: &str| -> Option<&Value> {
@@ -2652,6 +2654,7 @@ impl QueryExecutor {
 
     /// Checks if a document's __class__ value matches a target class via the hierarchy.
     /// Returns true if the document's class equals the target or is a subclass of it.
+    #[allow(dead_code)]
     fn class_value_matches_hierarchy(doc_val: &Value, target: &LiteralValue, class_hierarchy: &HashSet<String>) -> bool {
         match (doc_val, target) {
             (Value::String(doc_class), LiteralValue::String(target_class)) => {
@@ -2662,14 +2665,17 @@ impl QueryExecutor {
         }
     }
 
+    #[allow(dead_code)]
     fn value_gte_static(v: &Value, lit: &LiteralValue) -> bool {
         Self::value_gt_static(v, lit) || Self::value_matches_static(v, lit)
     }
 
+    #[allow(dead_code)]
     fn value_lte_static(v: &Value, lit: &LiteralValue) -> bool {
         Self::value_lt_static(v, lit) || Self::value_matches_static(v, lit)
     }
 
+    #[allow(dead_code)]
     fn value_matches_static(v: &Value, lit: &LiteralValue) -> bool {
         match (v, lit) {
             (Value::String(s), LiteralValue::String(l)) => s == l,
@@ -2681,6 +2687,7 @@ impl QueryExecutor {
         }
     }
 
+    #[allow(dead_code)]
     fn value_gt_static(v: &Value, lit: &LiteralValue) -> bool {
         match (v, lit) {
             (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().map_or(false, |n| n > *l),
@@ -2690,6 +2697,7 @@ impl QueryExecutor {
         }
     }
 
+    #[allow(dead_code)]
     fn value_lt_static(v: &Value, lit: &LiteralValue) -> bool {
         match (v, lit) {
             (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().map_or(false, |n| n < *l),
@@ -2939,6 +2947,7 @@ impl QueryExecutor {
     }
 
     /// Checks if a property is transitive.
+    #[allow(dead_code)]
     fn is_transitive_property(&self, engine: &mut LsmEngine, property: &str) -> bool {
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         for (_key, val_bytes) in entries {
@@ -2965,6 +2974,7 @@ impl QueryExecutor {
     }
 
     /// Performs transitive closure lookup for a transitive property.
+    #[allow(dead_code)]
     /// Returns all values reachable from `start_value` via the transitive property.
     ///
     /// For example, if `ancestor` is transitive and we have:
@@ -3410,7 +3420,7 @@ impl QueryExecutor {
                         SelectItem::WindowFunction(_) => {
                             // Window functions are handled separately
                         }
-                        SelectItem::Expression(expr) => {
+                        SelectItem::Expression(_expr) => {
                             // Evaluate the expression against the current row
                             // We need engine access, but project_columns doesn't have it
                             // This is handled in the Projection plan node before calling project_columns

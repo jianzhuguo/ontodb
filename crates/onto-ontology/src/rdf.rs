@@ -5,7 +5,7 @@
 //! - N-Triples export
 //! - JSON-LD export
 
-use crate::model::{Class, DataType, Literal, Ontology, Property, Restriction};
+use crate::model::{Class, DataType, Ontology, Property};
 use std::collections::HashMap;
 
 /// Errors that can occur during RDF parsing or export.

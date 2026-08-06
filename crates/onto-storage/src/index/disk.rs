@@ -1018,6 +1018,532 @@ impl BTreeIndex {
         Ok(result)
     }
 
+    // ── Remove ───────────────────────────────────────────────────
+
+    /// Removes a primary key from the entry for the given value.
+    /// If the entry becomes empty, the key is removed from the leaf.
+    /// Handles underflow by redistributing or merging with siblings.
+    pub fn remove(&mut self, key: &[u8], pk: &[u8]) -> Result<bool> {
+        let mut leaf = self.find_leaf(key)?;
+        let leaf_id = leaf.page_id;
+
+        // Find the key in the leaf
+        let slot = match leaf.binary_search(key) {
+            Ok(i) => i,
+            Err(_) => return Ok(false), // key not found
+        };
+
+        // Get existing PKs and remove the target
+        let (entry_key, mut pks) = leaf.get_leaf(slot).ok_or_else(|| {
+            onto_core::CoreError::Corruption("failed to read leaf entry".into())
+        })?;
+        let pk_pos = pks.iter().position(|p| p.as_slice() == pk);
+        let pk_pos = match pk_pos {
+            Some(i) => i,
+            None => return Ok(false), // pk not found
+        };
+        pks.remove(pk_pos);
+
+        if pks.is_empty() {
+            // Last PK removed — delete the entire entry
+            leaf.remove_entry(slot)?;
+            self.put_page(&leaf)?;
+
+            // Handle underflow if this isn't the root
+            if leaf_id != self.meta.root_page {
+                let min = Self::min_leaf_entries();
+                if leaf.num_entries() < min {
+                    self.handle_leaf_underflow(leaf_id)?;
+                }
+            }
+
+            // Update parent separator if the first key changed
+            self.update_parent_separator(leaf_id)?;
+
+            // Root collapse: if root is internal with 0 entries, make child the new root
+            self.try_collapse_root()?;
+        } else {
+            // PKs remain — update the entry in place
+            leaf.remove_entry(slot)?;
+            leaf.insert_leaf(slot, &entry_key, &pks)?;
+            self.put_page(&leaf)?;
+        }
+
+        Ok(true)
+    }
+
+    /// Minimum entries in a non-root leaf before underflow.
+    fn min_leaf_entries() -> u16 {
+        50 // half of max_leaf_entries (100)
+    }
+
+    /// Minimum entries in a non-root internal node before underflow.
+    fn min_internal_entries() -> u16 {
+        64 // half of max_internal_entries (128)
+    }
+
+    /// Handles underflow in a leaf by borrowing from siblings or merging.
+    fn handle_leaf_underflow(&mut self, leaf_id: u32) -> Result<()> {
+        let leaf = self.get_page(leaf_id)?;
+        let header = leaf.header().ok_or_else(|| {
+            onto_core::CoreError::Corruption("invalid page header".into())
+        })?;
+        let parent_id = header.parent;
+        if parent_id == NULL_PAGE {
+            return Ok(());
+        }
+
+        let parent = self.get_page(parent_id)?;
+        let child_idx = self.find_child_index(&parent, leaf_id)?;
+
+        let num_children = parent.num_entries() + 1; // entries + 1 = children
+
+        // Try borrow from left sibling
+        if child_idx > 0 {
+            let left_id = self.get_child(&parent, child_idx - 1)?;
+            let left = self.get_page(left_id)?;
+            if left.num_entries() > Self::min_leaf_entries() {
+                self.redistribute_leaf_left(parent_id, child_idx)?;
+                return Ok(());
+            }
+        }
+
+        // Try borrow from right sibling
+        if child_idx < num_children - 1 {
+            let right_id = self.get_child(&parent, child_idx + 1)?;
+            let right = self.get_page(right_id)?;
+            if right.num_entries() > Self::min_leaf_entries() {
+                self.redistribute_leaf_right(parent_id, child_idx)?;
+                return Ok(());
+            }
+        }
+
+        // Merge with a sibling
+        if child_idx > 0 {
+            self.merge_leaves(parent_id, child_idx - 1, child_idx)?;
+        } else if num_children > 1 {
+            self.merge_leaves(parent_id, child_idx, child_idx + 1)?;
+        }
+
+        Ok(())
+    }
+
+    /// Handles underflow in an internal node by borrowing or merging.
+    fn handle_internal_underflow(&mut self, node_id: u32) -> Result<()> {
+        let node = self.get_page(node_id)?;
+        let header = node.header().ok_or_else(|| {
+            onto_core::CoreError::Corruption("invalid page header".into())
+        })?;
+        let parent_id = header.parent;
+        if parent_id == NULL_PAGE {
+            return Ok(());
+        }
+
+        let parent = self.get_page(parent_id)?;
+        let child_idx = self.find_child_index(&parent, node_id)?;
+        let num_children = parent.num_entries() + 1;
+
+        // Try borrow from left
+        if child_idx > 0 {
+            let left_id = self.get_child(&parent, child_idx - 1)?;
+            let left = self.get_page(left_id)?;
+            if left.num_entries() > Self::min_internal_entries() {
+                self.redistribute_internal_left(parent_id, child_idx)?;
+                return Ok(());
+            }
+        }
+
+        // Try borrow from right
+        if child_idx < num_children - 1 {
+            let right_id = self.get_child(&parent, child_idx + 1)?;
+            let right = self.get_page(right_id)?;
+            if right.num_entries() > Self::min_internal_entries() {
+                self.redistribute_internal_right(parent_id, child_idx)?;
+                return Ok(());
+            }
+        }
+
+        // Merge
+        if child_idx > 0 {
+            self.merge_internals(parent_id, child_idx - 1, child_idx)?;
+        } else if num_children > 1 {
+            self.merge_internals(parent_id, child_idx, child_idx + 1)?;
+        }
+
+        Ok(())
+    }
+
+    /// Redistributes a key from left leaf sibling to the underflowing leaf.
+    fn redistribute_leaf_left(&mut self, parent_id: u32, child_idx: u16) -> Result<()> {
+        let parent = self.get_page(parent_id)?;
+        let left_id = self.get_child(&parent, child_idx - 1)?;
+        let leaf_id = self.get_child(&parent, child_idx)?;
+
+        let mut left = self.get_page(left_id)?;
+        let mut leaf = self.get_page(leaf_id)?;
+
+        // Move last entry from left to front of leaf
+        let last_idx = left.num_entries() - 1;
+        let (key, pks) = left.get_leaf(last_idx).ok_or_else(|| {
+            onto_core::CoreError::Corruption("failed to read left sibling entry".into())
+        })?;
+        left.remove_entry(last_idx)?;
+        leaf.insert_leaf(0, &key, &pks)?;
+
+        self.put_page(&left)?;
+        self.put_page(&leaf)?;
+
+        // Update parent separator to new first key of leaf
+        let new_first = leaf.get_leaf(0).map(|(k, _)| k).unwrap_or_default();
+        let mut parent = self.get_page(parent_id)?;
+        parent.remove_entry(child_idx - 1)?;
+        parent.insert_internal(child_idx - 1, &new_first, leaf_id)?;
+        self.put_page(&parent)?;
+
+        Ok(())
+    }
+
+    /// Redistributes a key from right leaf sibling to the underflowing leaf.
+    fn redistribute_leaf_right(&mut self, parent_id: u32, child_idx: u16) -> Result<()> {
+        let parent = self.get_page(parent_id)?;
+        let leaf_id = self.get_child(&parent, child_idx)?;
+        let right_id = self.get_child(&parent, child_idx + 1)?;
+
+        let mut leaf = self.get_page(leaf_id)?;
+        let mut right = self.get_page(right_id)?;
+
+        // Move first entry from right to end of leaf
+        let (key, pks) = right.get_leaf(0).ok_or_else(|| {
+            onto_core::CoreError::Corruption("failed to read right sibling entry".into())
+        })?;
+        right.remove_entry(0)?;
+        let insert_pos = leaf.num_entries();
+        leaf.insert_leaf(insert_pos, &key, &pks)?;
+
+        self.put_page(&leaf)?;
+        self.put_page(&right)?;
+
+        // Update parent separator to new first key of right
+        let new_first = right.get_leaf(0).map(|(k, _)| k).unwrap_or_default();
+        let mut parent = self.get_page(parent_id)?;
+        parent.remove_entry(child_idx)?;
+        parent.insert_internal(child_idx, &new_first, right_id)?;
+        self.put_page(&parent)?;
+
+        Ok(())
+    }
+
+    /// Merges two adjacent leaf nodes. left absorbs right.
+    fn merge_leaves(&mut self, parent_id: u32, left_idx: u16, right_idx: u16) -> Result<()> {
+        let parent = self.get_page(parent_id)?;
+        let left_id = self.get_child(&parent, left_idx)?;
+        let right_id = self.get_child(&parent, right_idx)?;
+
+        let left_orig = self.get_page(left_id)?;
+        let right = self.get_page(right_id)?;
+
+        // Collect all entries from both pages
+        let mut all_entries: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+        let num_left = left_orig.num_entries();
+        for i in 0..num_left {
+            let (key, pks) = left_orig.get_leaf(i).ok_or_else(|| {
+                onto_core::CoreError::Corruption("failed to read left leaf entry".into())
+            })?;
+            all_entries.push((key, pks));
+        }
+        let num_right = right.num_entries();
+        for i in 0..num_right {
+            let (key, pks) = right.get_leaf(i).ok_or_else(|| {
+                onto_core::CoreError::Corruption("failed to read right leaf entry".into())
+            })?;
+            all_entries.push((key, pks));
+        }
+
+        // Rebuild left page from scratch to avoid fragmentation issues
+        let left_header = left_orig.header().unwrap();
+        let right_header = right.header().unwrap();
+        let mut left = DiskPage::new(left_id, PageType::Leaf);
+        left.set_parent(left_header.parent);
+        left.set_right_leaf(right_header.right_leaf);
+
+        for (key, pks) in &all_entries {
+            let pos = left.num_entries();
+            left.insert_leaf(pos, key, pks)?;
+        }
+
+        // If right had a right sibling, update its left pointer
+        if right_header.right_leaf != NULL_PAGE {
+            let mut right_right = self.get_page(right_header.right_leaf)?;
+            right_right.set_left_leaf(left_id);
+            self.put_page(&right_right)?;
+        }
+
+        self.put_page(&left)?;
+
+        // Remove separator from parent
+        let mut parent = self.get_page(parent_id)?;
+        parent.remove_entry(left_idx)?;
+        // Also remove right child pointer — it's at position left_idx+1 in children
+        // But since we removed the key at left_idx, the child at right_idx is now at left_idx+1
+        // Actually, we need to handle the child array. In our slotted layout,
+        // internal entries are (key, child_right). The leftmost child is in the header.
+        // After removing entry[left_idx], the right child pointer is implicitly removed.
+        // But we need to handle the case where right_idx corresponds to first_child.
+        // Actually, the structure is: first_child | entry[0]=(key0,c1) | entry[1]=(key1,c2) | ...
+        // Children: first_child=0, entry[0].child=1, entry[1].child=2, ...
+        // So child at index i is: if i==0 -> first_child, else entry[i-1].child_right
+        // When we merge left and right (left_idx, right_idx=left_idx+1):
+        // - right is the child at index right_idx
+        // - if right_idx == 1, right is entry[0].child_right — removing entry[0] removes it
+        // - if right_idx > 1, right is entry[right_idx-1].child_right — removing entry[left_idx] removes it
+        // In both cases, removing entry[left_idx] removes the right child reference.
+        // The left child stays as either first_child or entry[left_idx-1].child_right.
+        self.put_page(&parent)?;
+
+        // Handle parent underflow
+        if parent_id != self.meta.root_page && parent.num_entries() < Self::min_internal_entries() {
+            self.handle_internal_underflow(parent_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Redistributes from left internal sibling.
+    fn redistribute_internal_left(&mut self, parent_id: u32, child_idx: u16) -> Result<()> {
+        let parent = self.get_page(parent_id)?;
+        let left_id = self.get_child(&parent, child_idx - 1)?;
+        let node_id = self.get_child(&parent, child_idx)?;
+
+        // Get separator from parent
+        let (_, _separator_child) = parent.get_internal(child_idx - 1).ok_or_else(|| {
+            onto_core::CoreError::Corruption("failed to read parent entry".into())
+        })?;
+        // The separator key is at slot child_idx-1
+        let separator_key = parent.slot_key(child_idx - 1).unwrap().to_vec();
+
+        let mut left = self.get_page(left_id)?;
+        let mut node = self.get_page(node_id)?;
+
+        // Move last entry from left, push separator down
+        let last_idx = left.num_entries() - 1;
+        let (left_key, left_child) = left.get_internal(last_idx).unwrap();
+        left.remove_entry(last_idx)?;
+
+        // The moved child becomes the first_child of node, old first_child becomes entry
+        let old_first = node.first_child();
+        node.insert_internal(0, &separator_key, old_first)?;
+        node.set_first_child(left_child);
+
+        self.put_page(&left)?;
+        self.put_page(&node)?;
+
+        // Update parent separator
+        let mut parent = self.get_page(parent_id)?;
+        parent.remove_entry(child_idx - 1)?;
+        parent.insert_internal(child_idx - 1, &left_key, node_id)?;
+        self.put_page(&parent)?;
+
+        // Update moved child's parent pointer
+        let mut moved = self.get_page(left_child)?;
+        moved.set_parent(node_id);
+        self.put_page(&moved)?;
+
+        Ok(())
+    }
+
+    /// Redistributes from right internal sibling.
+    fn redistribute_internal_right(&mut self, parent_id: u32, child_idx: u16) -> Result<()> {
+        let parent = self.get_page(parent_id)?;
+        let node_id = self.get_child(&parent, child_idx)?;
+        let right_id = self.get_child(&parent, child_idx + 1)?;
+
+        let separator_key = parent.slot_key(child_idx).unwrap().to_vec();
+
+        let mut node = self.get_page(node_id)?;
+        let mut right = self.get_page(right_id)?;
+
+        // Move first child of right to node, push separator down
+        let right_first = right.first_child();
+        let pos = node.num_entries();
+        node.insert_internal(pos, &separator_key, right_first)?;
+
+        // Move right's first entry up to parent
+        let (right_key, right_child) = right.get_internal(0).unwrap();
+        right.remove_entry(0)?;
+        right.set_first_child(right_child);
+
+        self.put_page(&node)?;
+        self.put_page(&right)?;
+
+        // Update parent separator
+        let mut parent = self.get_page(parent_id)?;
+        parent.remove_entry(child_idx)?;
+        parent.insert_internal(child_idx, &right_key, right_id)?;
+        self.put_page(&parent)?;
+
+        // Update moved child's parent pointer
+        let mut moved = self.get_page(right_first)?;
+        moved.set_parent(node_id);
+        self.put_page(&moved)?;
+
+        Ok(())
+    }
+
+    /// Merges two adjacent internal nodes. left absorbs right.
+    fn merge_internals(&mut self, parent_id: u32, left_idx: u16, right_idx: u16) -> Result<()> {
+        let parent = self.get_page(parent_id)?;
+        let left_id = self.get_child(&parent, left_idx)?;
+        let right_id = self.get_child(&parent, right_idx)?;
+
+        let separator_key = parent.slot_key(left_idx).unwrap().to_vec();
+
+        let left_orig = self.get_page(left_id)?;
+        let right = self.get_page(right_id)?;
+
+        // Collect all entries: left's first_child + left's entries + separator + right's first_child + right's entries
+        let left_first = left_orig.first_child();
+        let right_first = right.first_child();
+
+        let mut all_entries: Vec<(Vec<u8>, u32)> = Vec::new();
+        // Separator goes first with right_first as its child
+        all_entries.push((separator_key.clone(), right_first));
+
+        // Left's existing entries
+        let num_left = left_orig.num_entries();
+        for i in 0..num_left {
+            let (key, child) = left_orig.get_internal(i).unwrap();
+            all_entries.push((key, child));
+        }
+
+        // Right's entries
+        let num_right = right.num_entries();
+        for i in 0..num_right {
+            let (key, child) = right.get_internal(i).unwrap();
+            all_entries.push((key, child));
+        }
+
+        // Rebuild left page from scratch
+        let left_header = left_orig.header().unwrap();
+        let mut left = DiskPage::new(left_id, PageType::Internal);
+        left.set_parent(left_header.parent);
+        left.set_first_child(left_first);
+
+        for (key, child) in &all_entries {
+            let pos = left.num_entries();
+            left.insert_internal(pos, key, *child)?;
+        }
+
+        // Update parent pointers for all children of the merged node
+        // (right_first + all right entries)
+        {
+            let mut rf = self.get_page(right_first)?;
+            rf.set_parent(left_id);
+            self.put_page(&rf)?;
+        }
+        for i in 0..num_right {
+            let (_, child) = right.get_internal(i).unwrap();
+            let mut c = self.get_page(child)?;
+            c.set_parent(left_id);
+            self.put_page(&c)?;
+        }
+
+        self.put_page(&left)?;
+
+        // Remove separator from parent
+        let mut parent = self.get_page(parent_id)?;
+        parent.remove_entry(left_idx)?;
+        self.put_page(&parent)?;
+
+        // Handle parent underflow
+        if parent_id != self.meta.root_page && parent.num_entries() < Self::min_internal_entries() {
+            self.handle_internal_underflow(parent_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Updates the parent separator key for a leaf whose first key may have changed.
+    fn update_parent_separator(&mut self, leaf_id: u32) -> Result<()> {
+        let leaf = self.get_page(leaf_id)?;
+        let header = leaf.header().unwrap();
+        let parent_id = header.parent;
+        if parent_id == NULL_PAGE {
+            return Ok(());
+        }
+
+        // Only update if this leaf is NOT the first child (leftmost)
+        let parent = self.get_page(parent_id)?;
+        let child_idx = self.find_child_index(&parent, leaf_id)?;
+        if child_idx == 0 {
+            return Ok(()); // first child doesn't have a separator
+        }
+
+        let new_first_key = leaf.get_leaf(0).map(|(k, _)| k).unwrap_or_default();
+        let mut parent = self.get_page(parent_id)?;
+        // The separator for child_idx is at slot child_idx-1
+        // It stores (key, child_right=leaf_id). We need to update the key.
+        parent.remove_entry(child_idx - 1)?;
+        parent.insert_internal(child_idx - 1, &new_first_key, leaf_id)?;
+        self.put_page(&parent)?;
+
+        Ok(())
+    }
+
+    /// If root is internal with 0 entries, make its only child the new root.
+    fn try_collapse_root(&mut self) -> Result<()> {
+        let root = self.get_page(self.meta.root_page)?;
+        if root.page_type() != PageType::Internal {
+            return Ok(());
+        }
+        if root.num_entries() != 0 {
+            return Ok(());
+        }
+
+        let new_root = root.first_child();
+        self.meta.root_page = new_root;
+
+        // Clear parent pointer on new root
+        let mut new_root_page = self.get_page(new_root)?;
+        new_root_page.set_parent(NULL_PAGE);
+        self.put_page(&new_root_page)?;
+
+        // Update header
+        let cached = self.pool.fetch_mut(HEADER_PAGE_ID, &mut self.file)?;
+        self.meta.encode(&mut cached.data);
+
+        Ok(())
+    }
+
+    /// Finds the index of a child page within a parent internal node.
+    /// Children: first_child=0, entry[0].child=1, entry[1].child=2, ...
+    fn find_child_index(&self, parent: &DiskPage, child_id: u32) -> Result<u16> {
+        if parent.first_child() == child_id {
+            return Ok(0);
+        }
+        let num = parent.num_entries();
+        for i in 0..num {
+            let (_, child) = parent.get_internal(i).ok_or_else(|| {
+                onto_core::CoreError::Corruption("failed to read internal entry".into())
+            })?;
+            if child == child_id {
+                return Ok(i + 1);
+            }
+        }
+        Err(onto_core::CoreError::Corruption("child not found in parent".into()))
+    }
+
+    /// Gets the child page ID at the given index within a parent.
+    fn get_child(&self, parent: &DiskPage, child_idx: u16) -> Result<u32> {
+        if child_idx == 0 {
+            Ok(parent.first_child())
+        } else {
+            let (_, child) = parent.get_internal(child_idx - 1).ok_or_else(|| {
+                onto_core::CoreError::Corruption("failed to read internal entry".into())
+            })?;
+            Ok(child)
+        }
+    }
+
     // ── Insert ───────────────────────────────────────────────────
 
     /// Inserts a (key, primary_key) pair into the index.
@@ -1871,5 +2397,155 @@ mod tests {
         // Range scan
         let pks = idx.range_scan(Some(b"0000000500"), Some(b"0000000599")).unwrap();
         assert_eq!(pks.len(), 100);
+    }
+
+    #[test]
+    fn test_btree_index_remove_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remove_basic.idx");
+
+        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+
+        idx.insert(b"100", b"pk1".to_vec()).unwrap();
+        idx.insert(b"200", b"pk2".to_vec()).unwrap();
+        idx.insert(b"300", b"pk3".to_vec()).unwrap();
+
+        // Remove one
+        let removed = idx.remove(b"200", b"pk2").unwrap();
+        assert!(removed);
+        assert!(idx.lookup(b"200").unwrap().is_empty());
+
+        // Others still present
+        assert_eq!(idx.lookup(b"100").unwrap().len(), 1);
+        assert_eq!(idx.lookup(b"300").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_btree_index_remove_one_of_many_pks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remove_partial.idx");
+
+        let mut idx = BTreeIndex::create(&path, "Order", "status").unwrap();
+
+        idx.insert(b"active", b"o1".to_vec()).unwrap();
+        idx.insert(b"active", b"o2".to_vec()).unwrap();
+        idx.insert(b"active", b"o3".to_vec()).unwrap();
+
+        idx.remove(b"active", b"o2").unwrap();
+        let pks = idx.lookup(b"active").unwrap();
+        assert_eq!(pks.len(), 2);
+        assert!(!pks.contains(&b"o2".to_vec()));
+
+        // Remove remaining
+        idx.remove(b"active", b"o1").unwrap();
+        idx.remove(b"active", b"o3").unwrap();
+        assert!(idx.lookup(b"active").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_btree_index_remove_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remove_none.idx");
+
+        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+        idx.insert(b"100", b"pk1".to_vec()).unwrap();
+
+        // Remove non-existent key
+        let removed = idx.remove(b"999", b"pk999").unwrap();
+        assert!(!removed);
+        assert_eq!(idx.lookup(b"100").unwrap().len(), 1);
+
+        // Remove non-existent pk on existing key
+        let removed = idx.remove(b"100", b"wrong_pk").unwrap();
+        assert!(!removed);
+        assert_eq!(idx.lookup(b"100").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_btree_index_remove_with_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remove_merge.idx");
+
+        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+
+        let n = 300u32;
+        for i in 0..n {
+            let key = format!("{:010}", i);
+            let pk = format!("pk_{}", i);
+            idx.insert(key.as_bytes(), pk.into_bytes()).unwrap();
+        }
+
+        // Remove most entries to trigger underflow and merges
+        for i in 0..(n - 5) {
+            let key = format!("{:010}", i);
+            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes()).unwrap();
+        }
+
+        // Verify remaining entries
+        for i in (n - 5)..n {
+            let key = format!("{:010}", i);
+            let pks = idx.lookup(key.as_bytes()).unwrap();
+            assert_eq!(pks.len(), 1, "key {} should still exist", key);
+        }
+
+        // Range scan should still work
+        let all = idx.range_scan(None, None).unwrap();
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn test_btree_index_remove_interleaved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remove_interleave.idx");
+
+        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+
+        for i in 0..200u32 {
+            let key = format!("{:010}", i);
+            idx.insert(key.as_bytes(), format!("pk_{}", i).into_bytes()).unwrap();
+        }
+
+        // Remove even keys
+        for i in (0..200u32).step_by(2) {
+            let key = format!("{:010}", i);
+            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes()).unwrap();
+        }
+        // Verify odd keys remain
+        for i in (1..200u32).step_by(2) {
+            let key = format!("{:010}", i);
+            assert_eq!(idx.lookup(key.as_bytes()).unwrap().len(), 1);
+        }
+        // Verify even keys are gone
+        for i in (0..200u32).step_by(2) {
+            let key = format!("{:010}", i);
+            assert!(idx.lookup(key.as_bytes()).unwrap().is_empty());
+        }
+
+        // Re-insert even keys
+        for i in (0..200u32).step_by(2) {
+            let key = format!("{:010}", i);
+            idx.insert(key.as_bytes(), format!("new_{}", i).into_bytes()).unwrap();
+        }
+        assert_eq!(idx.range_scan(None, None).unwrap().len(), 200);
+    }
+
+    #[test]
+    fn test_btree_index_remove_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remove_all.idx");
+
+        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+
+        for i in 0..100u32 {
+            let key = format!("{:010}", i);
+            idx.insert(key.as_bytes(), format!("pk_{}", i).into_bytes()).unwrap();
+        }
+
+        for i in 0..100u32 {
+            let key = format!("{:010}", i);
+            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes()).unwrap();
+        }
+
+        assert!(idx.range_scan(None, None).unwrap().is_empty());
     }
 }
