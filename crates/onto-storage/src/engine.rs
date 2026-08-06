@@ -424,12 +424,12 @@ impl LsmEngine {
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
 
-            // Parse level from filename like "L0_123.sst"
-            let level = if fname.starts_with('L') {
-                fname[1..2].parse::<usize>().unwrap_or(0)
-            } else {
-                0
-            };
+            // Parse level from filename like "L0_123.sst" or "L10_456.sst"
+            let level = fname
+                .strip_prefix('L')
+                .and_then(|s| s.split('_').next())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
 
             if level >= self.levels.len() {
                 continue;

@@ -53,8 +53,10 @@ pub struct SsTableBuilder {
     current_block_last_key: Vec<u8>,
     restart_points: Vec<u32>,
     entry_count_in_block: usize,
-    /// All keys for bloom filter.
-    all_keys: Vec<Vec<u8>>,
+    /// Keys collected during add(), used to build bloom filter at build time.
+    /// This is more memory-efficient than pre-allocating a large bloom filter
+    /// for small SSTables.
+    keys_for_bloom: Vec<Vec<u8>>,
 }
 
 impl SsTableBuilder {
@@ -69,13 +71,13 @@ impl SsTableBuilder {
             current_block_last_key: Vec::new(),
             restart_points: Vec::new(),
             entry_count_in_block: 0,
-            all_keys: Vec::new(),
+            keys_for_bloom: Vec::new(),
         }
     }
 
     /// Adds an entry to the SSTable. Entries MUST be added in sorted key order.
     pub fn add(&mut self, entry: &Entry) {
-        self.all_keys.push(entry.key.clone());
+        self.keys_for_bloom.push(entry.key.clone());
 
         // Record restart point
         if self.entry_count_in_block % RESTART_INTERVAL == 0 {
@@ -159,7 +161,10 @@ impl SsTableBuilder {
 
         // Build and write bloom filter
         let bloom_offset = index_offset + index_data.len() as u64;
-        let bloom = self.build_bloom_filter();
+        let mut bloom = BloomFilter::new(self.keys_for_bloom.len().max(1), 0.01);
+        for key in &self.keys_for_bloom {
+            bloom.insert(key);
+        }
         let bloom_data = bloom.to_bytes();
         file.write_all(&bloom_data)?;
 
@@ -211,13 +216,6 @@ impl SsTableBuilder {
         buf
     }
 
-    fn build_bloom_filter(&self) -> BloomFilter {
-        let mut bloom = BloomFilter::new(self.all_keys.len().max(1), 0.01);
-        for key in &self.all_keys {
-            bloom.insert(key);
-        }
-        bloom
-    }
 }
 
 impl SsTable {
