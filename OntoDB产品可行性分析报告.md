@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.12 | 更新日期：2026-08-06
+> 版本：v1.13 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -60,6 +60,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - **B+Tree 二级索引（内存版）**：HashMap 存储 O(1) 节点访问 + parent 指针 O(1) 父节点查找，支持等值/范围查询，自动回填/维护/去索引
 - **B+Tree 磁盘索引（Disk-based）**：4KB 页式存储，Slotted Page 布局，LRU Buffer Pool（单调计数器 O(1) touch），支持点查找 O(log n)、范围扫描（leaf chain）、节点分裂/合并/重平衡，独立 `.idx` 文件持久化
 - **全局 seq_no**：引擎级序列号确保跨 MemTable flush 的版本顺序正确
+- **HNSW 向量索引**：自研实现，支持 L2/Cosine/InnerProduct 三种距离度量，可配置 M/ef_construction/ef_search 参数，支持增量插入、过滤搜索（本体约束）、持久化元数据到 LSM（`__vec_meta__` 前缀），启动时自动重建索引，事务提交时自动维护向量索引（INSERT/UPDATE/DELETE），搜索时自动过滤已删除条目和过时向量（HNSW 不支持原地更新的补偿机制）
 
 ### 本体引擎详情
 
@@ -86,6 +87,9 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - `CREATE INDEX ON <class> (<column>)` — 创建二级索引（自动回填已有数据）
 - `DROP INDEX ON <class> (<column>)` — 删除二级索引
 - `MATCH (<var>: <Class>) WHERE ... RETURN ...` — 语义匹配查询
+- `CREATE VECTOR INDEX ON <class> (<column>) METRIC <metric> DIMENSION <dim> [M <m>] [EF_CONSTRUCTION <ef>] [EF_SEARCH <ef>]` — 创建 HNSW 向量索引
+- `DROP VECTOR INDEX ON <class> (<column>)` — 删除向量索引
+- `VECTOR SEARCH ON <class> (<column>) QUERY [v1, v2, ...] TOP <k> [WHERE ...]` — 向量相似度搜索，支持 SQL WHERE 过滤混合查询，返回 `_distance` 虚拟列
 
 ---
 
@@ -101,7 +105,9 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | B+Tree 磁盘索引 | **可行，已实现** | 4KB 页式存储、Slotted Page、LRU Buffer Pool（O(1) touch）、节点分裂/合并/重平衡、leaf chain 范围扫描，21 个专项测试验证 |
 | Raft 共识 | **可行** | `tikv/raft-rs` 是工业级 Rust Raft 实现 |
 | 本体模型 | **可行，已实现基础** | 类/属性/继承/约束模型已通 |
-| SQL 解析 | **可行，已实现基础** | 8 种语句（含 JOIN/UNION/子查询）已通 |
+| SQL 解析 | **可行，已实现基础** | 8 种语句（含 JOIN/UNION/子查询）+ 向量索引 DDL + VECTOR SEARCH 已通 |
+| HNSW 向量索引 | **可行，已实现** | 自研 HNSW 实现，支持 L2/Cosine/InnerProduct，增量插入、过滤搜索、持久化/重建、事务集成，12 个集成测试验证 |
+| 向量+SQL 混合查询 | **可行，已实现** | VECTOR SEARCH + WHERE 过滤，_distance 虚拟列，与 B+Tree 索引共存，跨 flush/compaction/restart 一致性 |
 | 序列化 | **可行** | serde + serde_json + bincode 生态成熟 |
 | CRC 数据校验 | **可行，已实现** | WAL 条目 CRC32 校验 + 损坏停止重放已通 |
 
@@ -351,7 +357,7 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 |--------|--------|------|
 | M2.1 | 文档存储模式 | JSON 文档 + 本体类型关联 |
 | M2.2 | 图存储模式 | 属性图 + 本体语义层 |
-| M2.3 | 向量存储模式 | HNSW 索引 + 本体过滤联合检索 |
+| M2.3 | 向量存储模式 | HNSW 索引 + 本体过滤联合检索 | **已完成（Phase 10+11）** |
 | M2.4 | 跨模查询 | 单条查询操作多种数据模型 |
 
 ### 第三阶段：AI 增强与生产化（12-18 个月）
