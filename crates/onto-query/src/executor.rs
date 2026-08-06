@@ -49,6 +49,9 @@ pub struct QueryExecutor {
     active_txn: Mutex<Option<onto_core::SeqNo>>,
     /// Query execution configuration.
     config: QueryConfig,
+    /// Inference cache: class name → hierarchy (all super/sub classes).
+    /// Cleared on ontology changes (CREATE ONTOLOGY).
+    inference_cache: Mutex<InferenceCache>,
 }
 
 /// Column-level statistics collected by ANALYZE.
@@ -100,6 +103,26 @@ impl RuntimeStats {
     }
 }
 
+/// Cached inference results for ontology reasoning.
+/// Avoids re-running the Reasoner on every query.
+#[derive(Debug, Default)]
+struct InferenceCache {
+    /// Class name → set of all classes in hierarchy (superclasses + subclasses + equivalent).
+    class_hierarchy: std::collections::HashMap<String, HashSet<String>>,
+    /// Property name → set of all equivalent/sub-property names.
+    property_aliases: std::collections::HashMap<String, HashSet<String>>,
+    /// Property name → inverse property name.
+    inverse_property: std::collections::HashMap<String, Option<String>>,
+}
+
+impl InferenceCache {
+    fn clear(&mut self) {
+        self.class_hierarchy.clear();
+        self.property_aliases.clear();
+        self.inverse_property.clear();
+    }
+}
+
 impl QueryExecutor {
     pub fn new(engine: Arc<RwLock<LsmEngine>>, ontology_store: OntologyStore) -> Self {
         Self::with_config(engine, ontology_store, QueryConfig::default())
@@ -116,6 +139,7 @@ impl QueryExecutor {
             runtime_stats: Arc::new(Mutex::new(RuntimeStats::default())),
             active_txn: Mutex::new(None),
             config,
+            inference_cache: Mutex::new(InferenceCache::default()),
         }
     }
 
@@ -305,6 +329,8 @@ impl QueryExecutor {
                 // DDL doesn't need MVCC transaction
                 let ontology = onto_ontology::OntologyParser::parse(sql)?;
                 self.ontology_store.save_with_engine(engine, &ontology)?;
+                // Invalidate inference cache on ontology changes
+                self.inference_cache.lock().unwrap().clear();
                 Ok(QueryResult::Success(format!(
                     "Ontology '{}' created with {} classes and {} properties",
                     ontology.name,
@@ -1294,27 +1320,36 @@ impl QueryExecutor {
     ///
     /// If no ontology is defined for the class, returns only the original class.
     fn get_class_hierarchy(&self, engine: &mut LsmEngine, table: &str) -> HashSet<String> {
+        // Check cache first
+        {
+            let cache = self.inference_cache.lock().unwrap();
+            if let Some(cached) = cache.class_hierarchy.get(table) {
+                return cached.clone();
+            }
+        }
+
         let mut classes = HashSet::new();
         classes.insert(table.to_string());
 
         if let Ok(Some(ontology)) = self.ontology_store.find_ontology_for_class(engine, table) {
-            // Use the inference engine's Cax-sco rule for subclass propagation.
-            // The rule propagates types upward: if x type A, then x type B for all B where A subClassOf B.
-            // For scanning, we need the inverse: find all subclasses of the target class.
             let reasoner = Reasoner::new(ontology.clone());
             let probe_triple = onto_ontology::Triple::type_of("__probe__", table);
             let result = reasoner.reason(&[probe_triple]);
 
-            // Collect all inferred type triples for the probe individual
             for triple in &result.all_facts {
                 if triple.subject == "__probe__" && triple.predicate == "rdf:type" {
                     classes.insert(triple.object.clone());
                 }
             }
 
-            // Also get direct subclasses from the ontology (covers the downward direction)
             let subclasses = ontology.get_all_subclasses(table);
             classes.extend(subclasses);
+        }
+
+        // Store in cache
+        {
+            let mut cache = self.inference_cache.lock().unwrap();
+            cache.class_hierarchy.insert(table.to_string(), classes.clone());
         }
 
         classes
@@ -2885,30 +2920,33 @@ impl QueryExecutor {
     /// For example, if `reportsTo` has subproperty `worksUnder` and equivalent property `supervisedBy`,
     /// then `get_property_aliases(engine, "reportsTo")` returns `{"reportsTo", "worksUnder", "supervisedBy"}`.
     fn get_property_aliases(&self, engine: &mut LsmEngine, property: &str) -> HashSet<String> {
+        // Check cache first
+        {
+            let cache = self.inference_cache.lock().unwrap();
+            if let Some(cached) = cache.property_aliases.get(property) {
+                return cached.clone();
+            }
+        }
+
         let mut aliases = HashSet::new();
         aliases.insert(property.to_string());
 
-        // Find the ontology that contains this property
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         for (_key, val_bytes) in entries {
             if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
                 if let Some(prop_def) = ontology.properties.get(property) {
-                    // Add equivalent properties
                     for equiv in &prop_def.equivalent_properties {
                         aliases.insert(equiv.clone());
                     }
-                    // Add subproperties (properties that are subproperties of this one)
                     for (name, other_prop) in &ontology.properties {
                         if other_prop.subproperty_of.contains(&property.to_string()) {
                             aliases.insert(name.clone());
                         }
                     }
                 }
-                // Also check if this property is a subproperty of something
                 if let Some(prop_def) = ontology.properties.get(property) {
                     for parent in &prop_def.subproperty_of {
                         aliases.insert(parent.clone());
-                        // And get the parent's equivalents
                         if let Some(parent_def) = ontology.properties.get(parent) {
                             for equiv in &parent_def.equivalent_properties {
                                 aliases.insert(equiv.clone());
@@ -2919,6 +2957,12 @@ impl QueryExecutor {
             }
         }
 
+        // Store in cache
+        {
+            let mut cache = self.inference_cache.lock().unwrap();
+            cache.property_aliases.insert(property.to_string(), aliases.clone());
+        }
+
         aliases
     }
 
@@ -2927,23 +2971,40 @@ impl QueryExecutor {
     ///
     /// For example, if `reportsTo` has inverse `manages`, returns `Some("manages")`.
     fn get_inverse_property(&self, engine: &mut LsmEngine, property: &str) -> Option<String> {
+        // Check cache first
+        {
+            let cache = self.inference_cache.lock().unwrap();
+            if let Some(cached) = cache.inverse_property.get(property) {
+                return cached.clone();
+            }
+        }
+
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+        let mut result = None;
         for (_key, val_bytes) in entries {
             if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
                 if let Some(prop_def) = ontology.properties.get(property) {
                     if let Some(ref inverse) = prop_def.inverse_of {
-                        return Some(inverse.clone());
+                        result = Some(inverse.clone());
+                        break;
                     }
                 }
-                // Also check if any property has this as its inverse
                 for (name, prop_def) in &ontology.properties {
                     if prop_def.inverse_of.as_deref() == Some(property) {
-                        return Some(name.clone());
+                        result = Some(name.clone());
+                        break;
                     }
                 }
             }
         }
-        None
+
+        // Store in cache
+        {
+            let mut cache = self.inference_cache.lock().unwrap();
+            cache.inverse_property.insert(property.to_string(), result.clone());
+        }
+
+        result
     }
 
     /// Checks if a property is transitive.
