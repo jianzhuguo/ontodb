@@ -1,14 +1,22 @@
 //! OntoDB Server - Main entry point.
 //!
-//! Supports two modes:
+//! Supports three modes:
 //! - Standalone REPL (interactive or stdin)
 //! - TCP server (accepts multiple CLI connections)
+//! - HTTP server (RESTful API with auth, rate limiting, and Prometheus metrics)
 
+mod auth;
+mod http;
+mod metrics;
+mod rate_limit;
+
+use auth::{AuthConfig, AuthState, Permission};
 use clap::Parser;
 use onto_core::Result;
 use onto_ontology::OntologyStore;
 use onto_query::{QueryExecutor, QueryParser};
 use onto_storage::{LsmEngine, StorageOptions};
+use rate_limit::{RateLimitConfig, RateLimiter};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -30,9 +38,33 @@ struct Args {
     #[arg(short, long)]
     interactive: bool,
 
-    /// TCP listen address (enables server mode)
+    /// TCP listen address (enables TCP server mode)
     #[arg(short = 'l', long, default_value = "127.0.0.1:6500")]
     listen: String,
+
+    /// HTTP listen address (enables HTTP API server mode)
+    #[arg(long)]
+    http: Option<String>,
+
+    /// Enable API key authentication
+    #[arg(long)]
+    auth: bool,
+
+    /// API keys file path (JSON format)
+    #[arg(long)]
+    api_keys_file: Option<PathBuf>,
+
+    /// Default rate limit (requests per minute)
+    #[arg(long, default_value = "60")]
+    rate_limit: u32,
+
+    /// Rate limit burst size
+    #[arg(long, default_value = "10")]
+    burst_size: u32,
+
+    /// Disable rate limiting
+    #[arg(long)]
+    no_rate_limit: bool,
 }
 
 fn main() -> Result<()> {
@@ -55,13 +87,109 @@ fn main() -> Result<()> {
 
     if args.interactive {
         run_repl(&executor)?;
+    } else if let Some(http_addr) = args.http {
+        // Load auth configuration
+        let auth_config = if args.auth {
+            load_auth_config(args.api_keys_file.as_deref())?
+        } else {
+            AuthConfig::default()
+        };
+
+        // Create rate limit config
+        let rate_limit_config = RateLimitConfig {
+            default_rpm: args.rate_limit,
+            enabled: !args.no_rate_limit,
+            burst_size: args.burst_size,
+        };
+
+        // Run HTTP API server
+        run_http_server(&http_addr, executor, auth_config, rate_limit_config)?;
     } else {
-        // Start TCP server
+        // Start TCP server (default)
         run_tcp_server(&args.listen, executor)?;
     }
 
     println!("Goodbye.");
     Ok(())
+}
+
+/// Loads authentication configuration from file or creates default.
+fn load_auth_config(file_path: Option<&std::path::Path>) -> Result<AuthConfig> {
+    if let Some(path) = file_path {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| onto_core::CoreError::Io(e))?;
+        let config: AuthConfig = serde_json::from_str(&content)
+            .map_err(|e| onto_core::CoreError::Custom(format!("Invalid auth config: {}", e)))?;
+        Ok(config)
+    } else {
+        // Create default config with a warning
+        eprintln!("WARNING: Authentication enabled without API keys file.");
+        eprintln!("Use --api-keys-file to specify keys, or requests will be rejected.");
+        Ok(AuthConfig {
+            enabled: true,
+            keys: Vec::new(),
+            default_permission: Permission::ReadOnly,
+        })
+    }
+}
+
+/// Runs the HTTP API server using axum with authentication and rate limiting.
+fn run_http_server(
+    addr: &str,
+    executor: Arc<QueryExecutor>,
+    auth_config: AuthConfig,
+    rate_limit_config: RateLimitConfig,
+) -> Result<()> {
+    let metrics = Arc::new(metrics::Metrics::new());
+    let state = http::AppState { executor, metrics };
+    let auth_state = AuthState::new(&auth_config);
+    let rate_limiter = RateLimiter::new(rate_limit_config.clone());
+
+    let app = http::build_router_with_auth(state, auth_state.clone(), rate_limiter);
+
+    println!("HTTP API server listening on {}", addr);
+    println!();
+    println!("API endpoints:");
+    println!("  GET  /api/health         - Health check");
+    println!("  GET  /api/health/ready   - Readiness probe (Kubernetes)");
+    println!("  GET  /api/health/live    - Liveness probe (Kubernetes)");
+    println!("  GET  /metrics            - Prometheus metrics");
+    println!("  GET  /api/metrics        - JSON metrics");
+    println!("  POST /api/query          - Execute SQL query");
+    println!("  POST /api/vector/search  - Vector similarity search");
+    println!("  POST /api/hybrid/query   - Hybrid SQL + vector search");
+    println!("  GET  /api/schema         - Schema introspection");
+    println!();
+
+    if auth_config.enabled {
+        println!("Authentication: ENABLED");
+        println!("  API keys: {}", auth_config.keys.len());
+        println!("  Provide key via:");
+        println!("    - Authorization: Bearer <key>");
+        println!("    - X-API-Key: <key>");
+        println!("    - ?api_key=<key> (query parameter)");
+    } else {
+        println!("Authentication: DISABLED");
+    }
+
+    if rate_limit_config.enabled {
+        println!("Rate limiting: ENABLED");
+        println!("  Default: {} requests/minute", rate_limit_config.default_rpm);
+        println!("  Burst size: {}", rate_limit_config.burst_size);
+    } else {
+        println!("Rate limiting: DISABLED");
+    }
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| onto_core::CoreError::Custom(format!("Failed to create tokio runtime: {}", e)))?;
+
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind(addr).await
+            .map_err(|e| onto_core::CoreError::Io(e))?;
+        axum::serve(listener, app).await
+            .map_err(|e| onto_core::CoreError::Custom(format!("HTTP server error: {}", e)))?;
+        Ok(())
+    })
 }
 
 /// Runs the TCP server, accepting client connections.
