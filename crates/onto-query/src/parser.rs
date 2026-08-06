@@ -8,6 +8,13 @@
 use onto_core::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 
+/// File format for IMPORT command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImportFormat {
+    Csv,
+    Json,
+}
+
 /// A parsed query in AST form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QueryAst {
@@ -42,6 +49,13 @@ pub enum QueryAst {
         values: Vec<LiteralValue>,
         conflict_column: String,
         assignments: Vec<(String, LiteralValue)>,
+    },
+
+    /// IMPORT INTO <class> FROM CSV/JSON '<file_path>'
+    Import {
+        class: String,
+        file_path: String,
+        format: ImportFormat,
     },
 
     /// BEGIN [TRANSACTION]
@@ -461,6 +475,8 @@ impl QueryParser {
             Ok(QueryAst::Commit)
         } else if upper.starts_with("ROLLBACK") {
             Ok(QueryAst::Rollback)
+        } else if upper.starts_with("IMPORT") {
+            Self::parse_import(input)
         } else if upper.starts_with("INSERT") {
             Self::parse_insert(input)
         } else if upper.starts_with("SELECT") {
@@ -669,6 +685,45 @@ impl QueryParser {
         Err(CoreError::InvalidArgument(
             "unmatched '(' in subquery".to_string(),
         ))
+    }
+
+    /// Parses IMPORT INTO <class> FROM CSV/JSON '<file_path>'
+    fn parse_import(input: &str) -> Result<QueryAst> {
+        let upper = input.to_uppercase();
+
+        // IMPORT INTO <class> FROM <format> '<path>'
+        let into_pos = upper.find("INTO")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'INTO' after IMPORT".to_string()))?;
+
+        let from_pos = upper.find(" FROM ")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'FROM' in IMPORT".to_string()))?;
+
+        let class = input[into_pos + 4..from_pos].trim().to_string();
+        if class.is_empty() {
+            return Err(CoreError::InvalidArgument("missing class name in IMPORT".to_string()));
+        }
+
+        let after_from = input[from_pos + 6..].trim();
+        let after_from_upper = after_from.to_uppercase();
+
+        let format = if after_from_upper.starts_with("CSV") {
+            ImportFormat::Csv
+        } else if after_from_upper.starts_with("JSON") {
+            ImportFormat::Json
+        } else {
+            return Err(CoreError::InvalidArgument("expected CSV or JSON after FROM".to_string()));
+        };
+
+        // Extract file path (between quotes)
+        let path_start = after_from.find('\'')
+            .or_else(|| after_from.find('"'))
+            .ok_or_else(|| CoreError::InvalidArgument("expected quoted file path in IMPORT".to_string()))?;
+        let quote_char = after_from.as_bytes()[path_start] as char;
+        let path_end = after_from[path_start + 1..].find(quote_char)
+            .ok_or_else(|| CoreError::InvalidArgument("unterminated file path in IMPORT".to_string()))?;
+        let file_path = after_from[path_start + 1..path_start + 1 + path_end].to_string();
+
+        Ok(QueryAst::Import { class, file_path, format })
     }
 
     fn parse_insert(input: &str) -> Result<QueryAst> {

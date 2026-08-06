@@ -1806,6 +1806,9 @@ impl QueryExecutor {
                 // No conflict - insert normally
                 self.execute_insert_txn(engine, txn_id, class, columns, values)
             }
+            QueryAst::Import { class, file_path, format } => {
+                self.execute_import(engine, txn_id, class, file_path, *format)
+            }
             QueryAst::Select {
                 distinct,
                 columns,
@@ -2474,6 +2477,256 @@ impl QueryExecutor {
 
         engine.txn_put(txn_id, key, value)?;
         Ok(QueryResult::Success("1 row inserted".to_string()))
+    }
+
+    /// Executes an IMPORT command: reads a CSV or JSON file and inserts rows into the target class.
+    ///
+    /// CSV format: first row is header (column names), subsequent rows are data.
+    /// JSON format: array of objects, or one object per line (JSON Lines).
+    ///
+    /// All rows are inserted within the given transaction for atomicity.
+    fn execute_import(
+        &self,
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        class: &str,
+        file_path: &str,
+        format: crate::parser::ImportFormat,
+    ) -> Result<QueryResult> {
+        use crate::parser::ImportFormat;
+
+        let content = std::fs::read_to_string(file_path).map_err(|e| {
+            CoreError::InvalidArgument(format!("failed to read file '{}': {}", file_path, e))
+        })?;
+
+        match format {
+            ImportFormat::Csv => self.execute_import_csv(engine, txn_id, class, &content),
+            ImportFormat::Json => self.execute_import_json(engine, txn_id, class, &content),
+        }
+    }
+
+    /// Imports data from CSV content.
+    /// First row is treated as header (column names).
+    fn execute_import_csv(
+        &self,
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        class: &str,
+        content: &str,
+    ) -> Result<QueryResult> {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(content.as_bytes());
+
+        let headers: Vec<String> = reader.headers()
+            .map_err(|e| CoreError::InvalidArgument(format!("CSV header error: {}", e)))?
+            .iter()
+            .map(|h| h.trim().to_string())
+            .collect();
+
+        if headers.is_empty() {
+            return Err(CoreError::InvalidArgument("CSV file has no headers".to_string()));
+        }
+
+        let mut imported = 0u64;
+        let mut errors = Vec::new();
+
+        for (line_num, result) in reader.records().enumerate() {
+            let record = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    errors.push(format!("line {}: parse error: {}", line_num + 2, e));
+                    continue;
+                }
+            };
+
+            let mut columns = Vec::new();
+            let mut values = Vec::new();
+
+            for (i, field) in record.iter().enumerate() {
+                if i < headers.len() {
+                    let col = &headers[i];
+                    if col.is_empty() {
+                        continue;
+                    }
+                    columns.push(col.clone());
+                    values.push(Self::parse_csv_value(field));
+                }
+            }
+
+            match self.execute_insert_txn(engine, txn_id, class, &columns, &values) {
+                Ok(_) => imported += 1,
+                Err(e) => {
+                    errors.push(format!("line {}: insert error: {}", line_num + 2, e));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(QueryResult::Success(format!("{} row(s) imported from CSV", imported)))
+        } else {
+            let msg = format!(
+                "{} row(s) imported, {} error(s): {}",
+                imported,
+                errors.len(),
+                errors.join("; ")
+            );
+            if imported == 0 {
+                Err(CoreError::InvalidArgument(msg))
+            } else {
+                Ok(QueryResult::Success(msg))
+            }
+        }
+    }
+
+    /// Parses a CSV field string into a LiteralValue.
+    /// Attempts to detect numeric and boolean types; defaults to String.
+    fn parse_csv_value(field: &str) -> LiteralValue {
+        let trimmed = field.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+            return LiteralValue::Null;
+        }
+        if trimmed.eq_ignore_ascii_case("true") {
+            return LiteralValue::Bool(true);
+        }
+        if trimmed.eq_ignore_ascii_case("false") {
+            return LiteralValue::Bool(false);
+        }
+        // Try integer
+        if let Ok(i) = trimmed.parse::<i64>() {
+            return LiteralValue::Int(i);
+        }
+        // Try float
+        if let Ok(f) = trimmed.parse::<f64>() {
+            return LiteralValue::Float(f);
+        }
+        LiteralValue::String(trimmed.to_string())
+    }
+
+    /// Imports data from JSON content.
+    /// Supports: array of objects `[{...}, {...}]` or JSON Lines (one object per line).
+    fn execute_import_json(
+        &self,
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        class: &str,
+        content: &str,
+    ) -> Result<QueryResult> {
+        let trimmed = content.trim();
+
+        // Try parsing as a JSON array first
+        if trimmed.starts_with('[') {
+            return self.execute_import_json_array(engine, txn_id, class, trimmed);
+        }
+
+        // Fall back to JSON Lines (one object per line)
+        self.execute_import_json_lines(engine, txn_id, class, trimmed)
+    }
+
+    /// Imports from a JSON array: `[{"col1": "val1"}, ...]`
+    fn execute_import_json_array(
+        &self,
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        class: &str,
+        content: &str,
+    ) -> Result<QueryResult> {
+        let arr: Vec<serde_json::Value> = serde_json::from_str(content).map_err(|e| {
+            CoreError::InvalidArgument(format!("JSON parse error: {}", e))
+        })?;
+
+        let mut imported = 0u64;
+        let mut errors = Vec::new();
+
+        for (i, item) in arr.iter().enumerate() {
+            match self.import_json_object(engine, txn_id, class, item, i + 1) {
+                Ok(_) => imported += 1,
+                Err(e) => errors.push(format!("item {}: {}", i + 1, e)),
+            }
+        }
+
+        Self::build_import_result(imported, errors)
+    }
+
+    /// Imports from JSON Lines format (one JSON object per line).
+    fn execute_import_json_lines(
+        &self,
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        class: &str,
+        content: &str,
+    ) -> Result<QueryResult> {
+        let mut imported = 0u64;
+        let mut errors = Vec::new();
+
+        for (line_num, line) in content.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let obj: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    errors.push(format!("line {}: JSON parse error: {}", line_num + 1, e));
+                    continue;
+                }
+            };
+
+            match self.import_json_object(engine, txn_id, class, &obj, line_num + 1) {
+                Ok(_) => imported += 1,
+                Err(e) => errors.push(format!("line {}: {}", line_num + 1, e)),
+            }
+        }
+
+        Self::build_import_result(imported, errors)
+    }
+
+    /// Imports a single JSON object as a row.
+    fn import_json_object(
+        &self,
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        class: &str,
+        obj: &serde_json::Value,
+        row_num: usize,
+    ) -> Result<()> {
+        let map = match obj {
+            serde_json::Value::Object(m) => m,
+            _ => return Err(CoreError::InvalidArgument(
+                format!("row {}: expected JSON object, got {}", row_num, obj_type_name(obj))
+            )),
+        };
+
+        let mut columns = Vec::new();
+        let mut values = Vec::new();
+
+        for (key, val) in map {
+            columns.push(key.clone());
+            values.push(json_to_literal(val));
+        }
+
+        self.execute_insert_txn(engine, txn_id, class, &columns, &values)?;
+        Ok(())
+    }
+
+    /// Builds the import result message, returning an error if all rows failed.
+    fn build_import_result(imported: u64, errors: Vec<String>) -> Result<QueryResult> {
+        if errors.is_empty() {
+            Ok(QueryResult::Success(format!("{} row(s) imported from JSON", imported)))
+        } else {
+            let msg = format!(
+                "{} row(s) imported, {} error(s): {}",
+                imported,
+                errors.len(),
+                errors.join("; ")
+            );
+            if imported == 0 {
+                Err(CoreError::InvalidArgument(msg))
+            } else {
+                Ok(QueryResult::Success(msg))
+            }
+        }
     }
 
     // Old execute_select_txn, execute_hash_join, execute_sort_merge_join,
@@ -3911,6 +4164,36 @@ impl QueryExecutor {
             }
         }
         val
+    }
+}
+
+/// Converts a JSON value to a LiteralValue for import.
+fn json_to_literal(val: &serde_json::Value) -> LiteralValue {
+    match val {
+        serde_json::Value::Null => LiteralValue::Null,
+        serde_json::Value::Bool(b) => LiteralValue::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                LiteralValue::Int(i)
+            } else {
+                LiteralValue::Float(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => LiteralValue::String(s.clone()),
+        // Arrays and objects are serialized as JSON strings for storage
+        other => LiteralValue::String(other.to_string()),
+    }
+}
+
+/// Returns a human-readable type name for a JSON value.
+fn obj_type_name(val: &serde_json::Value) -> &'static str {
+    match val {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -6517,6 +6800,253 @@ mod tests {
         match &result {
             Ok(_) => {},
             Err(e) => panic!("Parse error: {:?}", e),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  Import tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_import_csv_basic() {
+        let (executor, dir) = setup();
+        let csv_path = dir.path().join("products.csv");
+
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
+        ).unwrap()).unwrap();
+
+        // Write CSV file
+        std::fs::write(&csv_path, "name,price\nWidget,100\nGadget,200\nDoohickey,300\n").unwrap();
+
+        let result = executor.execute(&QueryParser::parse(
+            &format!("IMPORT INTO Product FROM CSV '{}'", csv_path.display())
+        ).unwrap()).unwrap();
+
+        match result {
+            QueryResult::Success(msg) => {
+                assert!(msg.contains("3 row(s) imported"), "unexpected msg: {}", msg);
+            }
+            _ => panic!("expected Success"),
+        }
+
+        // Verify data was inserted
+        let select_result = executor.execute(&QueryParser::parse(
+            "SELECT name, price FROM Product"
+        ).unwrap()).unwrap();
+        match select_result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_import_csv_type_detection() {
+        let (executor, dir) = setup();
+        let csv_path = dir.path().join("typed.csv");
+
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY test (CLASS Item, PROPERTY name DOMAIN Item RANGE STRING, PROPERTY qty DOMAIN Item RANGE INT64, PROPERTY active DOMAIN Item RANGE BOOL)"
+        ).unwrap()).unwrap();
+
+        std::fs::write(&csv_path, "name,qty,active\nA,42,true\nB,0,false\n").unwrap();
+
+        let result = executor.execute(&QueryParser::parse(
+            &format!("IMPORT INTO Item FROM CSV '{}'", csv_path.display())
+        ).unwrap()).unwrap();
+
+        match result {
+            QueryResult::Success(msg) => assert!(msg.contains("2 row(s) imported")),
+            _ => panic!("expected Success"),
+        }
+    }
+
+    #[test]
+    fn test_import_json_array() {
+        let (executor, dir) = setup();
+        let json_path = dir.path().join("products.json");
+
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
+        ).unwrap()).unwrap();
+
+        std::fs::write(&json_path, r#"[
+            {"name": "Widget", "price": 100},
+            {"name": "Gadget", "price": 200}
+        ]"#).unwrap();
+
+        let result = executor.execute(&QueryParser::parse(
+            &format!("IMPORT INTO Product FROM JSON '{}'", json_path.display())
+        ).unwrap()).unwrap();
+
+        match result {
+            QueryResult::Success(msg) => {
+                assert!(msg.contains("2 row(s) imported"), "unexpected msg: {}", msg);
+            }
+            _ => panic!("expected Success"),
+        }
+    }
+
+    #[test]
+    fn test_import_json_lines() {
+        let (executor, dir) = setup();
+        let json_path = dir.path().join("products.jsonl");
+
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
+        ).unwrap()).unwrap();
+
+        std::fs::write(&json_path, "{\"name\": \"Widget\", \"price\": 100}\n{\"name\": \"Gadget\", \"price\": 200}\n").unwrap();
+
+        let result = executor.execute(&QueryParser::parse(
+            &format!("IMPORT INTO Product FROM JSON '{}'", json_path.display())
+        ).unwrap()).unwrap();
+
+        match result {
+            QueryResult::Success(msg) => {
+                assert!(msg.contains("2 row(s) imported"), "unexpected msg: {}", msg);
+            }
+            _ => panic!("expected Success"),
+        }
+    }
+
+    #[test]
+    fn test_import_csv_file_not_found() {
+        let (executor, _dir) = setup();
+
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING)"
+        ).unwrap()).unwrap();
+
+        let result = executor.execute(&QueryParser::parse(
+            "IMPORT INTO Product FROM CSV '/nonexistent/file.csv'"
+        ).unwrap());
+
+        assert!(result.is_err(), "should fail for nonexistent file");
+    }
+
+    #[test]
+    fn test_import_csv_empty_file() {
+        let (executor, dir) = setup();
+        let csv_path = dir.path().join("empty.csv");
+
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING)"
+        ).unwrap()).unwrap();
+
+        std::fs::write(&csv_path, "name\n").unwrap();
+
+        let result = executor.execute(&QueryParser::parse(
+            &format!("IMPORT INTO Product FROM CSV '{}'", csv_path.display())
+        ).unwrap()).unwrap();
+
+        match result {
+            QueryResult::Success(msg) => {
+                assert!(msg.contains("0 row(s) imported"), "unexpected msg: {}", msg);
+            }
+            _ => panic!("expected Success"),
+        }
+    }
+
+    #[test]
+    fn test_import_json_array_with_nulls() {
+        let (executor, dir) = setup();
+        let json_path = dir.path().join("nullable.json");
+
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY test (CLASS Item, PROPERTY name DOMAIN Item RANGE STRING, PROPERTY value DOMAIN Item RANGE INT64)"
+        ).unwrap()).unwrap();
+
+        std::fs::write(&json_path, r#"[
+            {"name": "A", "value": 42},
+            {"name": "B", "value": null},
+            {"name": "C"}
+        ]"#).unwrap();
+
+        let result = executor.execute(&QueryParser::parse(
+            &format!("IMPORT INTO Item FROM JSON '{}'", json_path.display())
+        ).unwrap()).unwrap();
+
+        match result {
+            QueryResult::Success(msg) => {
+                assert!(msg.contains("3 row(s) imported"), "unexpected msg: {}", msg);
+            }
+            _ => panic!("expected Success"),
+        }
+    }
+
+    #[test]
+    fn test_import_csv_with_special_values() {
+        let (executor, dir) = setup();
+        let csv_path = dir.path().join("special.csv");
+
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY test (CLASS Item, PROPERTY name DOMAIN Item RANGE STRING, PROPERTY score DOMAIN Item RANGE FLOAT64)"
+        ).unwrap()).unwrap();
+
+        std::fs::write(&csv_path, "name,score\n\"quoted name\",3.14\nnormal,NaN\n").unwrap();
+
+        let result = executor.execute(&QueryParser::parse(
+            &format!("IMPORT INTO Item FROM CSV '{}'", csv_path.display())
+        ).unwrap()).unwrap();
+
+        match result {
+            QueryResult::Success(msg) => {
+                // "NaN" won't parse as f64 in Rust's parse (it does!), but let's check
+                assert!(msg.contains("imported"), "unexpected msg: {}", msg);
+            }
+            _ => panic!("expected Success"),
+        }
+    }
+
+    #[test]
+    fn test_parse_csv_value_types() {
+        // Test null/empty detection
+        match QueryExecutor::parse_csv_value("null") {
+            LiteralValue::Null => {}
+            other => panic!("expected Null, got {:?}", other),
+        }
+        match QueryExecutor::parse_csv_value("NULL") {
+            LiteralValue::Null => {}
+            other => panic!("expected Null, got {:?}", other),
+        }
+        match QueryExecutor::parse_csv_value("") {
+            LiteralValue::Null => {}
+            other => panic!("expected Null, got {:?}", other),
+        }
+        match QueryExecutor::parse_csv_value("  ") {
+            LiteralValue::Null => {}
+            other => panic!("expected Null, got {:?}", other),
+        }
+        // Test boolean detection
+        match QueryExecutor::parse_csv_value("true") {
+            LiteralValue::Bool(true) => {}
+            other => panic!("expected Bool(true), got {:?}", other),
+        }
+        match QueryExecutor::parse_csv_value("false") {
+            LiteralValue::Bool(false) => {}
+            other => panic!("expected Bool(false), got {:?}", other),
+        }
+        // Test integer detection
+        match QueryExecutor::parse_csv_value("42") {
+            LiteralValue::Int(42) => {}
+            other => panic!("expected Int(42), got {:?}", other),
+        }
+        match QueryExecutor::parse_csv_value("-7") {
+            LiteralValue::Int(-7) => {}
+            other => panic!("expected Int(-7), got {:?}", other),
+        }
+        // Test float detection
+        match QueryExecutor::parse_csv_value("3.14") {
+            LiteralValue::Float(f) => assert!((f - 3.14).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+        // Test string fallback
+        match QueryExecutor::parse_csv_value("hello") {
+            LiteralValue::String(ref s) if s == "hello" => {}
+            other => panic!("expected String(\"hello\"), got {:?}", other),
         }
     }
 }
