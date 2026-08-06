@@ -26,6 +26,12 @@ pub enum CoreError {
     #[error("checksum mismatch: expected {expected:#010x}, got {actual:#010x}")]
     ChecksumMismatch { expected: u32, actual: u32 },
 
+    #[error("inference error: {0}")]
+    Inference(String),
+
+    #[error("ontology inconsistent: {0}")]
+    OntologyInconsistent(String),
+
     #[error("{0}")]
     Custom(String),
 }

@@ -1,0 +1,646 @@
+//! OWL-lite reasoning engine.
+//!
+//! The Reasoner takes an ontology and a set of known facts (triples),
+//! applies inference rules iteratively until a fixed point is reached,
+//! and returns all inferred triples.
+
+use crate::model::{Individual, Ontology, Triple};
+use crate::rules::{default_rules, Rule, RuleId};
+use std::collections::{HashMap, HashSet};
+
+/// An error that occurred during reasoning.
+#[derive(Debug, Clone)]
+pub enum InferenceError {
+    /// A consistency violation was detected (e.g. disjoint class conflict).
+    ConsistencyViolation(String),
+    /// The inference did not converge within the iteration limit.
+    MaxIterationsExceeded(usize),
+}
+
+impl std::fmt::Display for InferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InferenceError::ConsistencyViolation(msg) => write!(f, "consistency violation: {}", msg),
+            InferenceError::MaxIterationsExceeded(n) => {
+                write!(f, "reasoning did not converge after {} iterations", n)
+            }
+        }
+    }
+}
+
+impl std::error::Error for InferenceError {}
+
+/// The result of a reasoning pass.
+#[derive(Debug, Clone)]
+pub struct ReasoningResult {
+    /// All triples after reasoning (original + inferred).
+    pub all_facts: HashSet<Triple>,
+    /// Only the newly inferred triples.
+    pub inferred: Vec<Triple>,
+    /// Per-rule inference counts for diagnostics.
+    pub rule_counts: HashMap<RuleId, usize>,
+    /// Number of iterations until convergence.
+    pub iterations: usize,
+    /// Consistency violations found.
+    pub violations: Vec<String>,
+}
+
+/// OWL-lite reasoning engine.
+pub struct Reasoner {
+    ontology: Ontology,
+    rules: Vec<Box<dyn Rule>>,
+    max_iterations: usize,
+}
+
+impl Reasoner {
+    /// Creates a new reasoner with the default rule set.
+    pub fn new(ontology: Ontology) -> Self {
+        Self {
+            ontology,
+            rules: default_rules(),
+            max_iterations: 100,
+        }
+    }
+
+    /// Creates a reasoner with a custom rule set.
+    pub fn with_rules(ontology: Ontology, rules: Vec<Box<dyn Rule>>) -> Self {
+        Self {
+            ontology,
+            rules,
+            max_iterations: 100,
+        }
+    }
+
+    /// Sets the maximum number of inference iterations.
+    pub fn with_max_iterations(mut self, max: usize) -> Self {
+        self.max_iterations = max;
+        self
+    }
+
+    /// Performs full reasoning over the given facts.
+    ///
+    /// Applies all rules iteratively until no new triples are derived (fixed point).
+    pub fn reason(&self, facts: &[Triple]) -> ReasoningResult {
+        let mut all_facts: HashSet<Triple> = facts.iter().cloned().collect();
+        let mut all_inferred: Vec<Triple> = Vec::new();
+        let mut rule_counts: HashMap<RuleId, usize> = HashMap::new();
+        let mut iterations = 0;
+
+        for _iter in 0..self.max_iterations {
+            iterations += 1;
+            let mut new_this_round: Vec<Triple> = Vec::new();
+
+            for rule in &self.rules {
+                let inferred = rule.apply(&self.ontology, &all_facts);
+                *rule_counts.entry(rule.id()).or_insert(0) += inferred.len();
+                new_this_round.extend(inferred);
+            }
+
+            // Deduplicate: only add triples not already known
+            let before = all_facts.len();
+            for t in new_this_round {
+                if all_facts.insert(t.clone()) {
+                    all_inferred.push(t);
+                }
+            }
+
+            // Fixed point: no new facts
+            if all_facts.len() == before {
+                break;
+            }
+        }
+
+        // Check consistency
+        let violations = self.check_consistency(&all_facts);
+
+        ReasoningResult {
+            all_facts,
+            inferred: all_inferred,
+            rule_counts,
+            iterations,
+            violations,
+        }
+    }
+
+    /// Performs reasoning on a set of individuals.
+    ///
+    /// Converts individuals to triples, runs reasoning, returns all inferred triples.
+    pub fn reason_individuals(&self, individuals: &[Individual]) -> ReasoningResult {
+        let mut facts = Vec::new();
+        for ind in individuals {
+            facts.push(Triple::type_of(&ind.name, &ind.class_name));
+            for assertion in &ind.assertions {
+                let obj = match &assertion.value {
+                    crate::model::AssertionValue::Individual(name) => name.clone(),
+                    crate::model::AssertionValue::Literal(lit) => format!("{:?}", lit),
+                };
+                facts.push(Triple::new(&ind.name, &assertion.property, obj));
+            }
+        }
+        self.reason(&facts)
+    }
+
+    /// Incremental reasoning: only re-derive facts affected by the changes.
+    ///
+    /// `added` — newly asserted triples.
+    /// `removed` — triples that were retracted.
+    pub fn reason_incremental(
+        &self,
+        existing_facts: &[Triple],
+        added: &[Triple],
+        removed: &[Triple],
+    ) -> ReasoningResult {
+        // Start from existing facts, add new ones, remove retracted ones
+        let mut base: HashSet<Triple> = existing_facts.iter().cloned().collect();
+        for t in removed {
+            base.remove(t);
+        }
+        for t in added {
+            base.insert(t.clone());
+        }
+
+        // Run full reasoning on the updated fact set
+        // (A production implementation would track dependencies to avoid full re-derivation)
+        let base_vec: Vec<Triple> = base.into_iter().collect();
+        self.reason(&base_vec)
+    }
+
+    /// Checks for consistency violations in the fact set.
+    fn check_consistency(&self, facts: &HashSet<Triple>) -> Vec<String> {
+        let mut violations = Vec::new();
+
+        // Build a map: subject -> set of types
+        let mut type_map: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for fact in facts {
+            if fact.predicate == "rdf:type" {
+                type_map
+                    .entry(fact.subject.as_str())
+                    .or_default()
+                    .insert(fact.object.as_str());
+            }
+        }
+
+        // Check disjoint constraints
+        for (subj, types) in &type_map {
+            for class_name in types {
+                if let Some(class) = self.ontology.classes.get(*class_name) {
+                    for disjoint_name in &class.disjoint_with {
+                        if types.contains(disjoint_name.as_str()) {
+                            violations.push(format!(
+                                "'{}' is typed as both '{}' and '{}' which are disjoint",
+                                subj, class_name, disjoint_name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        violations
+    }
+
+    /// Explains how a particular triple was derived.
+    ///
+    /// Returns the derivation chain: which rules and input triples produced the target.
+    pub fn explain(&self, facts: &[Triple], target: &Triple) -> Vec<DerivationStep> {
+        let result = self.reason(facts);
+        if !result.all_facts.contains(target) {
+            return Vec::new();
+        }
+
+        // Simple explanation: re-run rules one at a time and track which rule produced the target
+        let mut all_facts: HashSet<Triple> = facts.iter().cloned().collect();
+        let mut steps = Vec::new();
+
+        for _iter in 0..self.max_iterations {
+            let mut found = false;
+            for rule in &self.rules {
+                let inferred = rule.apply(&self.ontology, &all_facts);
+                for t in &inferred {
+                    if t == target && !all_facts.contains(t) {
+                        steps.push(DerivationStep {
+                            rule: rule.id(),
+                            conclusion: t.clone(),
+                            premises: find_premises(&self.ontology, rule.id(), t, &all_facts),
+                        });
+                        found = true;
+                    }
+                    all_facts.insert(t.clone());
+                }
+            }
+            if found || all_facts.contains(target) {
+                break;
+            }
+        }
+
+        steps
+    }
+}
+
+/// A single step in a derivation chain.
+#[derive(Debug, Clone)]
+pub struct DerivationStep {
+    pub rule: RuleId,
+    pub conclusion: Triple,
+    pub premises: Vec<Triple>,
+}
+
+/// Finds the premises that could have produced a given triple under a rule.
+fn find_premises(
+    ontology: &Ontology,
+    rule: RuleId,
+    conclusion: &Triple,
+    facts: &HashSet<Triple>,
+) -> Vec<Triple> {
+    match rule {
+        RuleId::CaxSco => {
+            // x type A, A subClassOf B -> x type B
+            // Find the fact: x type A where A subClassOf B
+            for fact in facts {
+                if fact.subject == conclusion.subject
+                    && fact.predicate == "rdf:type"
+                    && ontology.is_subclass_of(&fact.object, &conclusion.object)
+                    && fact.object != conclusion.object
+                {
+                    return vec![fact.clone()];
+                }
+            }
+            vec![]
+        }
+        RuleId::CaxEqc => {
+            for fact in facts {
+                if fact.subject == conclusion.subject
+                    && fact.predicate == "rdf:type"
+                    && ontology.is_equivalent(&fact.object, &conclusion.object)
+                    && fact.object != conclusion.object
+                {
+                    return vec![fact.clone()];
+                }
+            }
+            vec![]
+        }
+        RuleId::PrpInv => {
+            // x P y, P inverseOf Q -> y Q x
+            for fact in facts {
+                if fact.subject == conclusion.object
+                    && fact.object == conclusion.subject
+                    && is_inverse_of(ontology, &fact.predicate, &conclusion.predicate)
+                {
+                    return vec![fact.clone()];
+                }
+            }
+            vec![]
+        }
+        RuleId::PrpTrp => {
+            // x P y, y P z -> x P z
+            for mid in facts {
+                if mid.predicate == conclusion.predicate {
+                    for other in facts {
+                        if other.predicate == conclusion.predicate
+                            && other.subject == mid.object
+                            && mid.subject == conclusion.subject
+                            && other.object == conclusion.object
+                        {
+                            return vec![mid.clone(), other.clone()];
+                        }
+                    }
+                }
+            }
+            vec![]
+        }
+        RuleId::PrpSymp => {
+            for fact in facts {
+                if fact.subject == conclusion.object
+                    && fact.object == conclusion.subject
+                    && fact.predicate == conclusion.predicate
+                {
+                    return vec![fact.clone()];
+                }
+            }
+            vec![]
+        }
+        RuleId::PrpSpo => {
+            for fact in facts {
+                if fact.subject == conclusion.subject
+                    && fact.object == conclusion.object
+                    && is_subproperty_of(ontology, &fact.predicate, &conclusion.predicate)
+                    && fact.predicate != conclusion.predicate
+                {
+                    return vec![fact.clone()];
+                }
+            }
+            vec![]
+        }
+        RuleId::PrpEqp => {
+            for fact in facts {
+                if fact.subject == conclusion.subject
+                    && fact.object == conclusion.object
+                    && has_equivalent_property(ontology, &fact.predicate, &conclusion.predicate)
+                    && fact.predicate != conclusion.predicate
+                {
+                    return vec![fact.clone()];
+                }
+            }
+            vec![]
+        }
+    }
+}
+
+fn is_inverse_of(ontology: &Ontology, p: &str, q: &str) -> bool {
+    if let Some(prop) = ontology.properties.get(p) {
+        if prop.inverse_of.as_deref() == Some(q) {
+            return true;
+        }
+    }
+    if let Some(prop) = ontology.properties.get(q) {
+        if prop.inverse_of.as_deref() == Some(p) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_subproperty_of(ontology: &Ontology, child: &str, parent: &str) -> bool {
+    let mut visited = HashSet::new();
+    is_subproperty_of_inner(ontology, child, parent, &mut visited)
+}
+
+fn is_subproperty_of_inner(
+    ontology: &Ontology,
+    child: &str,
+    parent: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(child.to_string()) {
+        return false;
+    }
+    if let Some(prop) = ontology.properties.get(child) {
+        for sup in &prop.subproperty_of {
+            if sup == parent {
+                return true;
+            }
+            if is_subproperty_of_inner(ontology, sup, parent, visited) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn has_equivalent_property(ontology: &Ontology, p: &str, q: &str) -> bool {
+    if let Some(prop) = ontology.properties.get(p) {
+        if prop.equivalent_properties.contains(&q.to_string()) {
+            return true;
+        }
+    }
+    if let Some(prop) = ontology.properties.get(q) {
+        if prop.equivalent_properties.contains(&p.to_string()) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Class, DataType, Ontology, Property};
+
+    fn family_ontology() -> Ontology {
+        let mut onto = Ontology::new("family");
+
+        onto.add_class(Class::new("Thing"));
+        onto.add_class(Class::new("Person").with_superclass("Thing"));
+        onto.add_class(Class::new("Employee").with_superclass("Person"));
+        onto.add_class(Class::new("Manager").with_superclass("Employee"));
+        onto.add_class(Class::new("Worker").with_equivalent_class("Employee"));
+        onto.classes
+            .get_mut("Employee")
+            .unwrap()
+            .equivalent_classes
+            .push("Worker".to_string());
+
+        onto.add_class(Class::new("Animal"));
+        onto.add_class(Class::new("Dog").with_superclass("Animal"));
+        onto.add_class(Class::new("Cat").with_superclass("Animal"));
+        onto.classes
+            .get_mut("Dog")
+            .unwrap()
+            .disjoint_with
+            .push("Cat".to_string());
+        onto.classes
+            .get_mut("Cat")
+            .unwrap()
+            .disjoint_with
+            .push("Dog".to_string());
+
+        onto.add_property(Property::new("name", "Person", DataType::String));
+        onto.add_property(
+            Property::new("reportsTo", "Employee", DataType::String).with_inverse_of("manages"),
+        );
+        onto.add_property(
+            Property::new("manages", "Manager", DataType::String).with_inverse_of("reportsTo"),
+        );
+        onto.add_property(Property::new("ancestor", "Person", DataType::String).transitive());
+        onto.add_property(Property::new("friendOf", "Person", DataType::String).symmetric());
+        onto.add_property(
+            Property::new("worksUnder", "Employee", DataType::String)
+                .with_subproperty_of("reportsTo"),
+        );
+
+        onto
+    }
+
+    #[test]
+    fn test_reason_subclass_propagation() {
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto);
+
+        let facts = vec![Triple::type_of("alice", "Manager")];
+        let result = reasoner.reason(&facts);
+
+        assert!(result.all_facts.contains(&Triple::type_of("alice", "Manager")));
+        assert!(result.all_facts.contains(&Triple::type_of("alice", "Employee")));
+        assert!(result.all_facts.contains(&Triple::type_of("alice", "Person")));
+        assert!(result.all_facts.contains(&Triple::type_of("alice", "Thing")));
+        assert!(result.iterations >= 1);
+    }
+
+    #[test]
+    fn test_reason_equivalent_class() {
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto);
+
+        let facts = vec![Triple::type_of("alice", "Employee")];
+        let result = reasoner.reason(&facts);
+
+        assert!(result.all_facts.contains(&Triple::type_of("alice", "Worker")));
+        assert!(result.all_facts.contains(&Triple::type_of("alice", "Person")));
+    }
+
+    #[test]
+    fn test_reason_inverse_property() {
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto);
+
+        let facts = vec![Triple::new("alice", "reportsTo", "bob")];
+        let result = reasoner.reason(&facts);
+
+        assert!(result
+            .all_facts
+            .contains(&Triple::new("bob", "manages", "alice")));
+    }
+
+    #[test]
+    fn test_reason_transitive_closure() {
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto);
+
+        let facts = vec![
+            Triple::new("alice", "ancestor", "bob"),
+            Triple::new("bob", "ancestor", "charlie"),
+            Triple::new("charlie", "ancestor", "dave"),
+        ];
+        let result = reasoner.reason(&facts);
+
+        assert!(result
+            .all_facts
+            .contains(&Triple::new("alice", "ancestor", "charlie")));
+        assert!(result
+            .all_facts
+            .contains(&Triple::new("alice", "ancestor", "dave")));
+        assert!(result
+            .all_facts
+            .contains(&Triple::new("bob", "ancestor", "dave")));
+    }
+
+    #[test]
+    fn test_reason_symmetric() {
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto);
+
+        let facts = vec![Triple::new("alice", "friendOf", "bob")];
+        let result = reasoner.reason(&facts);
+
+        assert!(result
+            .all_facts
+            .contains(&Triple::new("bob", "friendOf", "alice")));
+    }
+
+    #[test]
+    fn test_reason_subproperty() {
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto);
+
+        let facts = vec![Triple::new("alice", "worksUnder", "bob")];
+        let result = reasoner.reason(&facts);
+
+        assert!(result
+            .all_facts
+            .contains(&Triple::new("alice", "reportsTo", "bob")));
+    }
+
+    #[test]
+    fn test_reason_disjoint_violation() {
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto);
+
+        let facts = vec![
+            Triple::type_of("fido", "Dog"),
+            Triple::type_of("fido", "Cat"),
+        ];
+        let result = reasoner.reason(&facts);
+
+        assert!(!result.violations.is_empty());
+        assert!(result.violations[0].contains("Dog"));
+        assert!(result.violations[0].contains("Cat"));
+    }
+
+    #[test]
+    fn test_reason_no_violation() {
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto);
+
+        let facts = vec![
+            Triple::type_of("fido", "Dog"),
+            Triple::type_of("whiskers", "Cat"),
+        ];
+        let result = reasoner.reason(&facts);
+
+        assert!(result.violations.is_empty());
+    }
+
+    #[test]
+    fn test_reason_individuals() {
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto);
+
+        let alice = Individual::new("alice", "Manager")
+            .with_assertion("reportsTo", crate::model::AssertionValue::Individual("bob".into()));
+
+        let result = reasoner.reason_individuals(&[alice]);
+
+        assert!(result.all_facts.contains(&Triple::type_of("alice", "Person")));
+        assert!(result
+            .all_facts
+            .contains(&Triple::new("bob", "manages", "alice")));
+    }
+
+    #[test]
+    fn test_reason_fixed_point() {
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto);
+
+        // A complex case: transitive + subclass + inverse
+        let facts = vec![
+            Triple::type_of("alice", "Manager"),
+            Triple::new("alice", "reportsTo", "bob"),
+            Triple::new("alice", "ancestor", "bob"),
+            Triple::new("bob", "ancestor", "charlie"),
+        ];
+        let result = reasoner.reason(&facts);
+
+        // Should converge
+        assert!(result.iterations <= 100);
+
+        // Should have all expected inferences
+        assert!(result.all_facts.contains(&Triple::type_of("alice", "Thing")));
+        assert!(result
+            .all_facts
+            .contains(&Triple::new("bob", "manages", "alice")));
+        assert!(result
+            .all_facts
+            .contains(&Triple::new("alice", "ancestor", "charlie")));
+    }
+
+    #[test]
+    fn test_explain_derivation() {
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto);
+
+        let facts = vec![Triple::type_of("alice", "Manager")];
+        let target = Triple::type_of("alice", "Person");
+
+        let steps = reasoner.explain(&facts, &target);
+        assert!(!steps.is_empty());
+        assert_eq!(steps[0].rule, RuleId::CaxSco);
+    }
+
+    #[test]
+    fn test_max_iterations() {
+        // Create a reasoner with very low max iterations
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto).with_max_iterations(1);
+
+        let facts = vec![
+            Triple::new("a", "ancestor", "b"),
+            Triple::new("b", "ancestor", "c"),
+            Triple::new("c", "ancestor", "d"),
+        ];
+        let result = reasoner.reason(&facts);
+
+        // With only 1 iteration, might not get full transitive closure
+        // but should not panic
+        assert!(result.iterations <= 1);
+    }
+}

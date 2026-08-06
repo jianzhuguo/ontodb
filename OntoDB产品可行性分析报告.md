@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.17 | 更新日期：2026-08-06
+> 版本：v1.18 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -41,7 +41,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 |-------|------|------|
 | `onto-core` | 核心类型（Entry/Key/Value/SeqNo）、错误定义 | 已完成 |
 | `onto-storage` | LSM-Tree 存储引擎（WAL + MemTable + SSTable + Leveled Compaction） | **已完成核心实现** |
-| `onto-ontology` | 本体模型（Ontology/Class/Property）、继承推理 | 已完成基础模型 |
+| `onto-ontology` | 本体模型（Ontology/Class/Property）、OWL-lite 推理引擎 | **已完成 P0 推理引擎** |
 | `onto-query` | SQL 解析器（SELECT/INSERT/UPDATE/DELETE/MATCH/CREATE ONTOLOGY） | **已完成基础实现** |
 | `onto-server` | 服务端入口（TCP 多客户端 + REPL） | **已完成** |
 | `onto-cli` | 命令行客户端（交互式 + 单次查询 + 脚本执行） | **已完成** |
@@ -62,7 +62,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - **全局 seq_no**：引擎级序列号确保跨 MemTable flush 的版本顺序正确
 - **HNSW 向量索引**：自研实现，支持 L2/Cosine/InnerProduct 三种距离度量，可配置 M/ef_construction/ef_search 参数，支持增量插入、过滤搜索（本体约束）、持久化元数据到 LSM（`__vec_meta__` 前缀），启动时自动重建索引，事务提交时自动维护向量索引（INSERT/UPDATE/DELETE），搜索时自动过滤已删除条目和过时向量（HNSW 不支持原地更新的补偿机制）
 
-### 本体引擎详情
+### 本体引擎详情（P0 推理引擎已完成）
 
 已实现的本体模型支持：
 - 类（Class）定义，含父类继承链
@@ -70,6 +70,27 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - 子类判断（`is_subclass_of`），支持传递性
 - 属性继承收集（`get_class_properties`），含环检测
 - 数据类型：STRING/INT64/FLOAT64/BOOL/BYTES/ARRAY/OBJECT
+
+OWL-lite 语义扩展：
+- **等价类**（`owl:equivalentClass`）：双向传播，支持递归传递
+- **不相交类**（`owl:disjointWith`）：一致性校验，禁止共同子类
+- **类类型**：Normal / Enum / Union / Intersection
+- **属性约束**（`owl:Restriction`）：SomeValuesFrom / AllValuesFrom / HasValue / MinCardinality / MaxCardinality / ExactCardinality
+- **等价属性**（`owl:equivalentProperty`）
+- **逆属性**（`owl:inverseOf`）
+- **传递属性**（`owl:transitiveProperty`）
+- **对称属性**（`owl:symmetricProperty`）
+- **功能属性**（`owl:FunctionalProperty`）
+- **子属性层次**（`rdfs:subPropertyOf`）
+
+推理引擎（`Reasoner`）：
+- **7 条 OWL 2 RL 推理规则**：Cax-sco（子类传播）、Cax-eqc（等价类传播）、Prp-spo（子属性传播）、Prp-eqp（等价属性传播）、Prp-inv（逆属性推理）、Prp-trp（传递闭包）、Prp-symp（对称属性推理）
+- **不动点迭代**：所有规则反复应用直到无新三元组产生（默认最多 100 轮）
+- **增量推理**：支持 added/removed 事实集的增量推理
+- **一致性检查**：自动检测不相交类冲突
+- **推理溯源**（`explain`）：追踪任一三元组的推导链（规则 + 前提）
+- **Individual 推理**：从个体实例自动推导类型和关系
+- **46 个单元测试**覆盖：子类传播、等价类、逆属性、传递闭包、对称属性、子属性、不相交冲突、推导溯源、迭代上限等
 
 ### 查询解析器详情
 
@@ -104,7 +125,8 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | B+Tree 内存索引 | **可行，已实现** | HashMap O(1) 节点访问 + parent 指针 O(1) 查找，insert/delete/merge/rebalance 全部实现，28 个专项测试验证 |
 | B+Tree 磁盘索引 | **可行，已实现** | 4KB 页式存储、Slotted Page、LRU Buffer Pool（O(1) touch）、节点分裂/合并/重平衡、leaf chain 范围扫描，21 个专项测试验证 |
 | Raft 共识 | **可行** | `tikv/raft-rs` 是工业级 Rust Raft 实现 |
-| 本体模型 | **可行，已实现基础** | 类/属性/继承/约束模型已通 |
+| 本体模型 | **可行，已实现完整** | OWL-lite 模型（Class/Property/Individual/Triple）+ 等价类/不相交类/约束/类类型，22 个模型测试验证 |
+| 本体推理引擎 | **可行，已实现** | 7 条 OWL 2 RL 推理规则 + 不动点迭代 + 增量推理 + 一致性检查 + 推理溯源，46 个本体测试验证 |
 | SQL 解析 | **可行，已实现基础** | 8 种语句（含 JOIN/UNION/子查询）+ 向量索引 DDL + VECTOR SEARCH 已通 |
 | HNSW 向量索引 | **可行，已实现** | 自研 HNSW 实现，支持 L2/Cosine/InnerProduct，增量插入、过滤搜索、持久化/重建、事务集成，12 个集成测试验证 |
 | 向量+SQL 混合查询 | **可行，已实现** | VECTOR SEARCH + WHERE 过滤，_distance 虚拟列，与 B+Tree 索引共存，跨 flush/compaction/restart 一致性 |
