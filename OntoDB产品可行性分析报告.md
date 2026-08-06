@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.16 | 更新日期：2026-08-06
+> 版本：v1.17 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -1394,7 +1394,68 @@ BEGIN / COMMIT / ROLLBACK 命令已解析（当前为 auto-commit 模式）。
 
 ---
 
-## 二十六、结论与建议
+## 二十六、执行器架构统一（Phase 25）
+
+### 26.1 删除旧执行路径
+
+Phase 24 引入了 plan-driven 执行，但旧的 `execute_select_txn` 路径仍保留。Phase 25 完成了架构统一：
+
+**删除的方法**（~400 行）：
+- `execute_select_txn` — 旧的单体 SELECT 执行器
+- `execute_hash_join` — 旧的哈希连接（事务版本）
+- `execute_sort_merge_join` — 旧的排序归并连接（事务版本）
+- `execute_delete_txn` — 旧的 DELETE 执行器
+- `execute_update_txn` — 旧的 UPDATE 执行器
+- `try_index_scan` — 旧的索引扫描（事务版本）
+- `full_scan` — 旧的全表扫描（事务版本）
+- `fetch_rows_by_pks_txn` — 旧的主键查找（事务版本）
+
+### 26.2 UPDATE/DELETE 走计划执行
+
+所有 DML 语句现在统一使用 plan-driven 执行：
+
+```rust
+// DELETE: scan + filter via plan, then delete matching rows
+let scan_plan = self.build_scan_plan(class, filter)?;
+let rows = self.execute_plan(&scan_plan, engine)?;
+for row in &rows {
+    if let Some(pk) = row.get("__pk__") {
+        engine.txn_delete(txn_id, pk)?;
+    }
+}
+
+// UPDATE: scan + filter via plan, then update matching rows
+let scan_plan = self.build_scan_plan(class, filter)?;
+let rows = self.execute_plan(&scan_plan, engine)?;
+for row in &rows {
+    if let Some(pk) = row.get("__pk__") {
+        // apply assignments, validate, write back
+        engine.txn_put(txn_id, pk, new_value)?;
+    }
+}
+```
+
+### 26.3 主键注入
+
+`plan_seq_scan` 现在在每行中注入 `__pk__` 虚拟列，存储主键值。DELETE/UPDATE 使用此主键定位要修改的行。
+
+### 26.4 MATCH 语句重构
+
+`MATCH (p: Product) WHERE ... RETURN ...` 现在也使用 plan-driven 路径，通过 `build_scan_plan` 构建扫描计划。
+
+### 26.5 统一执行架构
+
+Phase 25 后，所有查询的执行路径统一为：
+
+```
+SQL → Parser → AST → Planner → ExecutionPlan → Executor (plan-driven)
+```
+
+不再有旧的"直接执行"路径。优化器的所有优化（谓词下推、索引选择、JOIN 重排）对所有查询类型都生效。
+
+---
+
+## 二十七、结论与建议
 
 ### 核心结论
 
@@ -1403,8 +1464,9 @@ BEGIN / COMMIT / ROLLBACK 命令已解析（当前为 auto-commit 模式）。
 3. **100% 自研核心引擎是正确策略**：存储引擎、本体引擎、查询引擎、事务引擎必须自主掌控，基础设施（Raft、序列化、压缩）选择性复用
 4. **跨平台无实质风险**：当前 Rust 代码天然跨平台，Windows 开发 → Linux 生产完全可行，CI 双平台构建是最低成本保障
 5. **范围是最大风险**：必须砍掉 80% 的外围功能，聚焦核心
-6. **代码质量持续提升**：121 个测试全部通过（80 lib + 41 integration），查询引擎覆盖 Phase 15-23 全部功能
+6. **代码质量持续提升**：121 个测试全部通过（80 lib + 41 integration），查询引擎覆盖 Phase 15-25 全部功能
 7. **查询引擎已具备完整 OLAP 能力**：窗口函数、CTE、CASE WHEN、子查询、JOIN（Hash/SortMerge/NestedLoop）、EXPLAIN ANALYZE、Plan Cache、ICD、LIMIT OFFSET、UPSERT、11 个内置函数
+8. **执行架构统一**：所有 DML（SELECT/INSERT/UPDATE/DELETE/MATCH）统一使用 plan-driven 执行，优化器优化对所有查询生效
 
 ### 性能基线（v1.8）
 

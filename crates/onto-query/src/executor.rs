@@ -1,4 +1,4 @@
-//! Query executor: runs parsed queries against the storage and ontology engines.
+﻿//! Query executor: runs parsed queries against the storage and ontology engines.
 
 use crate::cache::{PlanCache, QueryCache};
 use crate::optimizer::QueryPlanner;
@@ -329,9 +329,27 @@ impl QueryExecutor {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
     //  Plan-driven execution engine (Phase 24)
-    // ═══════════════════════════════════════════════════════════════
+    // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+
+    /// Builds a simple scan+filter plan for DELETE/UPDATE operations.
+    fn build_scan_plan(&self, class: &str, filter: &Option<FilterExpr>) -> Result<ExecutionPlan> {
+        let mut node = PlanNode::SeqScan {
+            table: class.to_string(),
+            alias: None,
+            filter: None,
+            estimated_rows: 1000,
+        };
+        if let Some(f) = filter {
+            node = PlanNode::Filter {
+                input: Box::new(node),
+                predicate: f.clone(),
+                estimated_rows: 500,
+            };
+        }
+        Ok(ExecutionPlan::new(node, crate::optimizer::CostEstimate::zero()))
+    }
 
     /// Executes a query using the plan-driven execution engine.
     /// This is the Phase 24 architecture: the executor walks the PlanNode tree
@@ -503,9 +521,11 @@ impl QueryExecutor {
         let prefix = format!("{}::", table);
         let entries = engine.scan_prefix(prefix.as_bytes())?;
         let mut rows = Vec::new();
-        for (_key, val_bytes) in &entries {
-            if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+        for (key, val_bytes) in &entries {
+            if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
                 if doc.get("__class__").and_then(|v| v.as_str()) == Some(table) {
+                    // Store primary key for DELETE/UPDATE operations
+                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
                     rows.push(doc);
                 }
             }
@@ -939,7 +959,7 @@ impl QueryExecutor {
             }
         }
 
-        // Execute the main query — it will scan CTE tables via the prefix scan path
+        // Execute the main query 鈥?it will scan CTE tables via the prefix scan path
         // We need to handle CTE name resolution in the main query
         let result = self.execute_with_engine(query, engine);
 
@@ -1120,12 +1140,54 @@ impl QueryExecutor {
 
                 Ok(QueryResult::Rows(rows))
             }
-            QueryAst::Delete { class, filter } => self.execute_delete_txn(engine, txn_id, class, filter),
+            QueryAst::Delete { class, filter } => {
+                // Plan-driven DELETE: scan + filter via plan, then delete matching rows
+                let scan_plan = self.build_scan_plan(class, filter)?;
+                let plan_result = self.execute_plan(&scan_plan, engine)?;
+                let rows = match plan_result {
+                    QueryResult::Rows(r) => r,
+                    other => return Ok(other),
+                };
+                let mut deleted = 0usize;
+                for row in &rows {
+                    if let Some(Value::String(pk)) = row.get("__pk__") {
+                        engine.txn_delete(txn_id, pk.as_bytes().to_vec())?;
+                        deleted += 1;
+                    }
+                }
+                Ok(QueryResult::Success(format!("{} row(s) deleted", deleted)))
+            }
             QueryAst::Update {
                 class,
                 assignments,
                 filter,
-            } => self.execute_update_txn(engine, txn_id, class, assignments, filter),
+            } => {
+                // Plan-driven UPDATE: scan + filter via plan, then update matching rows
+                let scan_plan = self.build_scan_plan(class, filter)?;
+                let plan_result = self.execute_plan(&scan_plan, engine)?;
+                let rows = match plan_result {
+                    QueryResult::Rows(r) => r,
+                    other => return Ok(other),
+                };
+                let mut updated = 0usize;
+                for row in &rows {
+                    if let Some(Value::String(pk)) = row.get("__pk__") {
+                        let mut doc = row.clone();
+                        doc.remove("__pk__"); // Don't persist the virtual pk column
+                        for (col, val) in assignments {
+                            let json_val = self.literal_to_json(val);
+                            let json_val = Self::try_parse_vector(json_val);
+                            doc.insert(col.clone(), json_val);
+                        }
+                        self.validate_document(engine, class, &doc)?;
+                        let new_value = serde_json::to_vec(&Value::Object(doc))
+                            .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                        engine.txn_put(txn_id, pk.as_bytes().to_vec(), new_value)?;
+                        updated += 1;
+                    }
+                }
+                Ok(QueryResult::Success(format!("{} row(s) updated", updated)))
+            }
             QueryAst::Match {
                 variable,
                 class,
@@ -1651,9 +1713,9 @@ impl QueryExecutor {
         a.cmp(b)
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
     //  Transactional versions (use txn_* API)
-    // ═══════════════════════════════════════════════════════════════
+    // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 
     fn execute_insert_txn(
         &self,
@@ -1684,444 +1746,47 @@ impl QueryExecutor {
         Ok(QueryResult::Success("1 row inserted".to_string()))
     }
 
-    fn execute_select_txn(
-        &self,
-        engine: &mut LsmEngine,
-        txn_id: u64,
-        distinct: bool,
-        columns: &SelectColumns,
-        from: &str,
-        from_alias: Option<&str>,
-        joins: &[crate::parser::JoinClause],
-        filter: &Option<FilterExpr>,
-        group_by: Option<&crate::parser::GroupByClause>,
-        having: &Option<FilterExpr>,
-        order_by: Option<&crate::parser::OrderBy>,
-        limit: Option<usize>,
-        offset: Option<usize>,
-    ) -> Result<QueryResult> {
-        // Try index-accelerated scan for filters that can use an index
-        let mut left_rows = match Self::try_index_scan(engine, txn_id, from, filter)? {
-            Some(rows) => rows,
-            None => Self::full_scan(engine, txn_id, from)?,
-        };
-
-        // JOIN expansion - choose join algorithm based on data characteristics
-        if !joins.is_empty() {
-            for join in joins {
-                if Self::should_use_sort_merge_join(&left_rows, 1000) {
-                    // Sort-merge join for large tables
-                    left_rows = Self::execute_sort_merge_join(
-                        engine, txn_id, left_rows, join, from_alias,
-                    )?;
-                } else if Self::should_use_hash_join(join) {
-                    // Hash join: O(n + m)
-                    left_rows = Self::execute_hash_join(
-                        engine, txn_id, left_rows, join, from_alias,
-                    )?;
-                } else {
-                    // Fallback to nested loop join: O(n * m)
-                    let join_prefix = format!("{}::", join.table);
-                    let right_entries = engine.txn_scan_prefix(txn_id, join_prefix.as_bytes())?;
-                    let right_alias = join.alias.as_deref().unwrap_or(&join.table);
-                    let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
-
-                    let mut right_rows: Vec<Map<String, Value>> = Vec::new();
-                    for (_key, val_bytes) in &right_entries {
-                        if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
-                            if doc.get("__class__").and_then(|v| v.as_str()) == Some(&join.table) {
-                                right_rows.push(doc);
-                            }
-                        }
-                    }
-
-                    let mut new_rows: Vec<Map<String, Value>> = Vec::new();
-                    for left_row in &left_rows {
-                        let left_val = Self::resolve_column_value(left_row, &left_col);
-                        for right_row in &right_rows {
-                            let right_val = Self::resolve_column_value(right_row, &right_col);
-                            if left_val.is_some() && right_val.is_some() && left_val == right_val {
-                                let mut merged = Map::new();
-                                for (k, v) in left_row {
-                                    let key = match from_alias {
-                                        Some(alias) => format!("{}.{}", alias, k),
-                                        None => k.clone(),
-                                    };
-                                    merged.insert(key, v.clone());
-                                    if from_alias.is_some() && !merged.contains_key(k) {
-                                        merged.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                for (k, v) in right_row {
-                                    let key = format!("{}.{}", right_alias, k);
-                                    merged.insert(key, v.clone());
-                                    if !merged.contains_key(k) {
-                                        merged.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                new_rows.push(merged);
-                            }
-                        }
-                    }
-                    left_rows = new_rows;
-                }
-            }
-        }
-
-        // Apply WHERE filter
-        let mut filtered: Vec<Map<String, Value>> = Vec::new();
-        for doc in left_rows {
-            if self.matches_filter(engine, &doc, filter) {
-                filtered.push(doc);
-            }
-        }
-
-        // Aggregate or normal query
-        let has_aggregates = Self::columns_have_aggregates(columns);
-        if group_by.is_some() || has_aggregates {
-            let ob_vec: Vec<crate::parser::OrderBy> = order_by.map(|ob| ob.clone()).into_iter().collect();
-            let mut result = self.execute_aggregation(engine, columns, &filtered, group_by, having, &ob_vec, limit)?;
-            if let QueryResult::Rows(ref mut rows) = result {
-                if distinct {
-                    Self::dedup_rows(rows);
-                }
-            }
-            return Ok(result);
-        }
-
-        // Sort before projection so ORDER BY columns are available
-        let mut sorted = filtered;
-        if let Some(ob) = order_by {
-            Self::sort_rows(&mut sorted, &ob.column, ob.ascending);
-        }
-
-        let mut rows: Vec<Map<String, Value>> = Vec::new();
-        for doc in sorted {
-            let mut projected = self.project_columns(&doc, columns);
-            // Evaluate any ValueExpr expressions (CASE WHEN, scalar subquery, etc.)
-            if let SelectColumns::Columns(items) = columns {
-                for item in items {
-                    if let SelectItem::Expression(expr) = item {
-                        let val = self.evaluate_value_expr(expr, &doc, engine)?;
-                        let name = Self::value_expr_default_name(expr);
-                        projected.insert(name, val);
-                    }
-                }
-            }
-            rows.push(projected);
-        }
-
-        // Apply window functions
-        if let SelectColumns::Columns(items) = columns {
-            let window_exprs: Vec<&WindowExpr> = items.iter().filter_map(|item| {
-                if let SelectItem::WindowFunction(w) = item { Some(w) } else { None }
-            }).collect();
-            if !window_exprs.is_empty() {
-                Self::execute_window_functions(&mut rows, &window_exprs);
-            }
-        }
-
-        if distinct {
-            Self::dedup_rows(&mut rows);
-        }
-        // Apply OFFSET then LIMIT
-        if let Some(offset) = offset {
-            if offset < rows.len() {
-                rows = rows.split_off(offset);
-            } else {
-                rows.clear();
-            }
-        }
-        if let Some(limit) = limit {
-            rows.truncate(limit);
-        }
-        Ok(QueryResult::Rows(rows))
-    }
-
-    /// Performs a hash join between left_rows and the right table.
-    /// More efficient than nested loop join for equi-joins: O(n + m) vs O(n * m).
-    fn execute_hash_join(
-        engine: &mut LsmEngine,
-        txn_id: u64,
-        left_rows: Vec<Map<String, Value>>,
-        join: &crate::parser::JoinClause,
-        left_alias: Option<&str>,
-    ) -> Result<Vec<Map<String, Value>>> {
-        let right_alias = join.alias.as_deref().unwrap_or(&join.table);
-        let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
-
-        // Phase 1: Build hash table on the right side
-        let join_prefix = format!("{}::", join.table);
-        let right_entries = engine.txn_scan_prefix(txn_id, join_prefix.as_bytes())?;
-
-        let mut hash_table: std::collections::HashMap<String, Vec<Map<String, Value>>> =
-            std::collections::HashMap::new();
-
-        for (_key, val_bytes) in &right_entries {
-            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
-                if doc.get("__class__").and_then(|v| v.as_str()) == Some(&join.table) {
-                    if let Some(val) = Self::resolve_column_value(&doc, &right_col) {
-                        hash_table.entry(val).or_default().push(doc);
-                    }
-                }
-            }
-        }
-
-        // Phase 2: Probe hash table with left rows
-        let mut result_rows: Vec<Map<String, Value>> = Vec::new();
-
-        for left_row in &left_rows {
-            if let Some(left_val) = Self::resolve_column_value(left_row, &left_col) {
-                if let Some(matching_rights) = hash_table.get(&left_val) {
-                    for right_row in matching_rights {
-                        let mut merged = Map::new();
-
-                        // Merge left row with alias
-                        for (k, v) in left_row {
-                            let key = match left_alias {
-                                Some(alias) => format!("{}.{}", alias, k),
-                                None => k.clone(),
-                            };
-                            merged.insert(key, v.clone());
-                            if left_alias.is_some() && !merged.contains_key(k) {
-                                merged.insert(k.clone(), v.clone());
-                            }
-                        }
-
-                        // Merge right row with alias
-                        for (k, v) in right_row {
-                            let key = format!("{}.{}", right_alias, k);
-                            merged.insert(key, v.clone());
-                            if !merged.contains_key(k) {
-                                merged.insert(k.clone(), v.clone());
-                            }
-                        }
-
-                        result_rows.push(merged);
-                    }
-                }
-            }
-        }
-
-        Ok(result_rows)
-    }
-
-    /// Determines whether to use hash join or nested loop join.
-    /// Hash join is preferred for equi-joins when:
-    /// - The join condition is equality (=)
-    /// - The right side fits in memory
-    fn should_use_hash_join(join: &crate::parser::JoinClause) -> bool {
-        // Currently, all joins are equi-joins (ON left = right)
-        // In the future, we could check statistics to decide
-        true
-    }
-
-    /// Performs a sort-merge join between left_rows and the right table.
-    /// Best for: already sorted data, large tables, disk-based joins.
-    /// Complexity: O(n log n + m log m) for sorting + O(n + m) for merging.
-    fn execute_sort_merge_join(
-        engine: &mut LsmEngine,
-        txn_id: u64,
-        left_rows: Vec<Map<String, Value>>,
-        join: &crate::parser::JoinClause,
-        left_alias: Option<&str>,
-    ) -> Result<Vec<Map<String, Value>>> {
-        let right_alias = join.alias.as_deref().unwrap_or(&join.table);
-        let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
-
-        // Phase 1: Load right table
-        let join_prefix = format!("{}::", join.table);
-        let right_entries = engine.txn_scan_prefix(txn_id, join_prefix.as_bytes())?;
-
-        let mut right_rows: Vec<Map<String, Value>> = Vec::new();
-        for (_key, val_bytes) in &right_entries {
-            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
-                if doc.get("__class__").and_then(|v| v.as_str()) == Some(&join.table) {
-                    right_rows.push(doc);
-                }
-            }
-        }
-
-        // Phase 2: Sort both sides by join key
-        let mut sorted_left = left_rows;
-        sorted_left.sort_by(|a, b| {
-            let a_val = Self::resolve_column_value(a, &left_col).unwrap_or_default();
-            let b_val = Self::resolve_column_value(b, &left_col).unwrap_or_default();
-            Self::compare_values(&a_val, &b_val)
-        });
-
-        let mut sorted_right = right_rows;
-        sorted_right.sort_by(|a, b| {
-            let a_val = Self::resolve_column_value(a, &right_col).unwrap_or_default();
-            let b_val = Self::resolve_column_value(b, &right_col).unwrap_or_default();
-            Self::compare_values(&a_val, &b_val)
-        });
-
-        // Phase 3: Merge - linear scan with two pointers
-        let mut result_rows: Vec<Map<String, Value>> = Vec::new();
-        let mut left_idx = 0;
-        let mut right_idx = 0;
-
-        while left_idx < sorted_left.len() && right_idx < sorted_right.len() {
-            let left_val = Self::resolve_column_value(&sorted_left[left_idx], &left_col).unwrap_or_default();
-            let right_val = Self::resolve_column_value(&sorted_right[right_idx], &right_col).unwrap_or_default();
-
-            match Self::compare_values(&left_val, &right_val) {
-                std::cmp::Ordering::Less => {
-                    left_idx += 1;
-                }
-                std::cmp::Ordering::Greater => {
-                    right_idx += 1;
-                }
-                std::cmp::Ordering::Equal => {
-                    // Found a match - handle multiple matches (duplicate keys)
-                    let match_left_idx = left_idx;
-                    let match_right_start = right_idx;
-
-                    // Collect all right rows with the same key
-                    while right_idx < sorted_right.len() {
-                        let rv = Self::resolve_column_value(&sorted_right[right_idx], &right_col).unwrap_or_default();
-                        if Self::compare_values(&rv, &right_val) != std::cmp::Ordering::Equal {
-                            break;
-                        }
-
-                        // For each matching left row, merge with this right row
-                        let mut li = match_left_idx;
-                        while li < sorted_left.len() {
-                            let lv = Self::resolve_column_value(&sorted_left[li], &left_col).unwrap_or_default();
-                            if Self::compare_values(&lv, &left_val) != std::cmp::Ordering::Equal {
-                                break;
-                            }
-
-                            let mut merged = Map::new();
-
-                            // Merge left row with alias
-                            for (k, v) in &sorted_left[li] {
-                                let key = match left_alias {
-                                    Some(alias) => format!("{}.{}", alias, k),
-                                    None => k.clone(),
-                                };
-                                merged.insert(key, v.clone());
-                                if left_alias.is_some() && !merged.contains_key(k) {
-                                    merged.insert(k.clone(), v.clone());
-                                }
-                            }
-
-                            // Merge right row with alias
-                            for (k, v) in &sorted_right[right_idx] {
-                                let key = format!("{}.{}", right_alias, k);
-                                merged.insert(key, v.clone());
-                                if !merged.contains_key(k) {
-                                    merged.insert(k.clone(), v.clone());
-                                }
-                            }
-
-                            result_rows.push(merged);
-                            li += 1;
-                        }
-
-                        right_idx += 1;
-                    }
-
-                    // Skip remaining left rows with the same key
-                    while left_idx < sorted_left.len() {
-                        let lv = Self::resolve_column_value(&sorted_left[left_idx], &left_col).unwrap_or_default();
-                        if Self::compare_values(&lv, &left_val) != std::cmp::Ordering::Equal {
-                            break;
-                        }
-                        left_idx += 1;
-                    }
-                }
-            }
-        }
-
-        Ok(result_rows)
-    }
-
-    /// Determines whether to use sort-merge join.
-    /// Sort-merge join is preferred for:
-    /// - Large tables (> 10K rows)
-    /// - Already sorted data
-    /// - Disk-based joins where memory is limited
-    fn should_use_sort_merge_join(left_rows: &[Map<String, Value>], right_estimate: u64) -> bool {
-        left_rows.len() > 10000 || right_estimate > 10000
-    }
-
-    fn execute_delete_txn(
-        &self,
-        engine: &mut LsmEngine,
-        txn_id: u64,
-        class: &str,
-        filter: &Option<FilterExpr>,
-    ) -> Result<QueryResult> {
-        let prefix = format!("{}::", class);
-        let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
-
-        let mut deleted = 0usize;
-        for (key, val_bytes) in entries {
-            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&val_bytes) {
-                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
-                    if self.matches_filter(engine, &doc, filter) {
-                        engine.txn_delete(txn_id, key)?;
-                        deleted += 1;
-                    }
-                }
-            }
-        }
-        Ok(QueryResult::Success(format!("{} row(s) deleted", deleted)))
-    }
-
-    fn execute_update_txn(
-        &self,
-        engine: &mut LsmEngine,
-        txn_id: u64,
-        class: &str,
-        assignments: &[(String, LiteralValue)],
-        filter: &Option<FilterExpr>,
-    ) -> Result<QueryResult> {
-        let prefix = format!("{}::", class);
-        let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
-
-        let mut updated = 0usize;
-        for (key, val_bytes) in entries {
-            if let Ok(Value::Object(mut doc)) = serde_json::from_slice::<Value>(&val_bytes) {
-                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
-                    if self.matches_filter(engine, &doc, filter) {
-                        for (col, val) in assignments {
-                            let json_val = self.literal_to_json(val);
-                            let json_val = Self::try_parse_vector(json_val);
-                            doc.insert(col.clone(), json_val);
-                        }
-                        // Validate the updated document against ontology schema
-                        self.validate_document(engine, class, &doc)?;
-                        let new_value = serde_json::to_vec(&Value::Object(doc))
-                            .map_err(|e| CoreError::Serialization(e.to_string()))?;
-                        engine.txn_put(txn_id, key, new_value)?;
-                        updated += 1;
-                    }
-                }
-            }
-        }
-        Ok(QueryResult::Success(format!("{} row(s) updated", updated)))
-    }
+    // Old execute_select_txn, execute_hash_join, execute_sort_merge_join,
+    // execute_delete_txn, execute_update_txn removed in Phase 25.
+    // All queries now use plan-driven execution via execute_plan().
 
     fn execute_match_txn(
         &self,
         engine: &mut LsmEngine,
-        txn_id: u64,
+        _txn_id: u64,
         _variable: &str,
         class: &str,
         filter: &Option<FilterExpr>,
         returns: &[String],
     ) -> Result<QueryResult> {
-        let columns = if returns.is_empty() {
-            SelectColumns::All
-        } else {
-            SelectColumns::Columns(
-                returns.iter().map(|r| SelectItem::Column(r.clone())).collect(),
-            )
+        // Build a scan+filter plan for the MATCH pattern
+        let scan_plan = self.build_scan_plan(class, filter)?;
+        let plan_result = self.execute_plan(&scan_plan, engine)?;
+        let rows = match plan_result {
+            QueryResult::Rows(r) => r,
+            other => return Ok(other),
         };
-        self.execute_select_txn(engine, txn_id, false, &columns, class, None, &[], filter, None, &None, None, None, None)
+
+        // Project requested columns
+        if returns.is_empty() {
+            // Remove __pk__ from results
+            let cleaned: Vec<Map<String, Value>> = rows.into_iter().map(|mut r| {
+                r.remove("__pk__");
+                r
+            }).collect();
+            Ok(QueryResult::Rows(cleaned))
+        } else {
+            let projected: Vec<Map<String, Value>> = rows.iter().map(|row| {
+                let mut result = Map::new();
+                for col in returns {
+                    if let Some(val) = Self::resolve_column_value(row, col) {
+                        result.insert(col.clone(), Value::String(val));
+                    }
+                }
+                result
+            }).collect();
+            Ok(QueryResult::Rows(projected))
+        }
     }
 
     /// Executes a VECTOR SEARCH query.
@@ -2214,72 +1879,6 @@ impl QueryExecutor {
     }
 
     /// Tries to use a secondary index for the given filter.
-    /// Supports Index Condition Pushdown (ICD): filters are applied during index scan.
-    /// Supports AND: uses index for one condition, post-filters the rest.
-    /// Supports OR: uses index for each OR branch.
-    /// Returns Some(rows) if an index was used, None if a full scan is needed.
-    fn try_index_scan(
-        engine: &mut LsmEngine,
-        txn_id: u64,
-        class: &str,
-        filter: &Option<FilterExpr>,
-    ) -> Result<Option<Vec<Map<String, Value>>>> {
-        let filter = match filter {
-            Some(f) => f,
-            None => return Ok(None),
-        };
-
-        // Try to handle AND conditions with ICD
-        if let FilterExpr::And(left, right) = filter {
-            // Try to use index for the left side
-            let left_pkeys = Self::try_index_scan_single(engine, class, left)?;
-            if let Some(pkeys) = left_pkeys {
-                // Index scan on left side succeeded - fetch rows and apply right filter as post-filter
-                let rows = Self::fetch_rows_by_pks_txn(engine, txn_id, &pkeys)?;
-                let filtered: Vec<Map<String, Value>> = rows
-                    .into_iter()
-                    .filter(|row| Self::eval_filter_static(row, right))
-                    .collect();
-                return Ok(Some(filtered));
-            }
-            // Try right side
-            let right_pkeys = Self::try_index_scan_single(engine, class, right)?;
-            if let Some(pkeys) = right_pkeys {
-                let rows = Self::fetch_rows_by_pks_txn(engine, txn_id, &pkeys)?;
-                let filtered: Vec<Map<String, Value>> = rows
-                    .into_iter()
-                    .filter(|row| Self::eval_filter_static(row, left))
-                    .collect();
-                return Ok(Some(filtered));
-            }
-            return Ok(None);
-        }
-
-        // Try to handle OR conditions
-        if let FilterExpr::Or(left, right) = filter {
-            let left_pkeys = Self::try_index_scan_single(engine, class, left)?;
-            let right_pkeys = Self::try_index_scan_single(engine, class, right)?;
-            if let (Some(lp), Some(rp)) = (left_pkeys, right_pkeys) {
-                // Union the primary keys
-                let mut all_pkeys = lp;
-                let mut seen: std::collections::HashSet<Vec<u8>> = all_pkeys.iter().cloned().collect();
-                for pk in rp {
-                    if seen.insert(pk.clone()) {
-                        all_pkeys.push(pk);
-                    }
-                }
-                let rows = Self::fetch_rows_by_pks_txn(engine, txn_id, &all_pkeys)?;
-                return Ok(Some(rows));
-            }
-            return Ok(None);
-        }
-
-        // Single predicate - try direct index scan
-        Self::try_index_scan_single(engine, class, filter)?
-            .map(|pkeys| Self::fetch_rows_by_pks_txn(engine, txn_id, &pkeys))
-            .transpose()
-    }
-
     /// Tries to use an index for a single (non-AND/OR) predicate.
     /// Returns Some(primary_keys) if index was used, None otherwise.
     fn try_index_scan_single(
@@ -2476,23 +2075,6 @@ impl QueryExecutor {
         Ok(rows)
     }
 
-    /// Fetches rows by their primary keys within a transaction.
-    fn fetch_rows_by_pks_txn(
-        engine: &mut LsmEngine,
-        txn_id: u64,
-        pkeys: &[Vec<u8>],
-    ) -> Result<Vec<Map<String, Value>>> {
-        let mut rows = Vec::new();
-        for pk in pkeys {
-            if let Ok(Some(val_bytes)) = engine.txn_get(txn_id, pk) {
-                if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&val_bytes) {
-                    rows.push(doc);
-                }
-            }
-        }
-        Ok(rows)
-    }
-
     /// Converts a LiteralValue to a serde_json::Value (static helper).
     fn literal_to_json_static(lit: &LiteralValue) -> serde_json::Value {
         match lit {
@@ -2502,64 +2084,6 @@ impl QueryExecutor {
             LiteralValue::Float(f) => serde_json::json!(f),
             LiteralValue::String(s) => serde_json::json!(s),
         }
-    }
-
-    /// Performs a full prefix scan (non-indexed path).
-    /// Also checks for CTE materialized tables.
-    fn full_scan(
-        engine: &mut LsmEngine,
-        txn_id: u64,
-        class: &str,
-    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>> {
-        // First check if this is a CTE reference
-        let cte_prefix = format!("__cte_{}::", class.to_lowercase());
-        let cte_entries = engine.txn_scan_prefix(txn_id, cte_prefix.as_bytes());
-        if let Ok(entries) = cte_entries {
-            if !entries.is_empty() {
-                let mut rows = Vec::new();
-                for (_key, val_bytes) in &entries {
-                    if val_bytes == b"__deleted__" { continue; }
-                    if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
-                        rows.push(doc);
-                    }
-                }
-                if !rows.is_empty() {
-                    return Ok(rows);
-                }
-            }
-        }
-
-        // Check if this is a materialized view reference
-        let mv_prefix = format!("__mv_{}::", class.to_lowercase());
-        let mv_entries = engine.txn_scan_prefix(txn_id, mv_prefix.as_bytes());
-        if let Ok(entries) = mv_entries {
-            if !entries.is_empty() {
-                let mut rows = Vec::new();
-                for (_key, val_bytes) in &entries {
-                    if val_bytes == b"__deleted__" { continue; }
-                    if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
-                        rows.push(doc);
-                    }
-                }
-                if !rows.is_empty() {
-                    return Ok(rows);
-                }
-            }
-        }
-
-        // Regular table scan
-        let prefix = format!("{}::", class);
-        let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
-
-        let mut rows = Vec::new();
-        for (_key, val_bytes) in &entries {
-            if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
-                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
-                    rows.push(doc);
-                }
-            }
-        }
-        Ok(rows)
     }
 
     fn matches_filter(&self, engine: &mut LsmEngine, doc: &Map<String, Value>, filter: &Option<FilterExpr>) -> bool {
@@ -2988,9 +2512,9 @@ impl QueryExecutor {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
     //  Schema Validation
-    // ═══════════════════════════════════════════════════════════════
+    // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 
     /// Validates a document against the ontology schema.
     /// Checks: class exists, required fields present, type compatibility.
@@ -3004,7 +2528,7 @@ impl QueryExecutor {
         // Find the ontology containing this class
         let ontology = match self.ontology_store.find_ontology_for_class(engine, class)? {
             Some(o) => o,
-            None => return Ok(()), // No ontology defined — skip validation
+            None => return Ok(()), // No ontology defined 鈥?skip validation
         };
 
         let class_def = match ontology.classes.get(class) {
@@ -3466,7 +2990,7 @@ mod tests {
         }
     }
 
-    // ── UPDATE edge cases ──────────────────────────────────────────
+    // 鈹€鈹€ UPDATE edge cases 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_update_no_match() {
@@ -3531,7 +3055,7 @@ mod tests {
         }
     }
 
-    // ── DELETE edge cases ──────────────────────────────────────────
+    // 鈹€鈹€ DELETE edge cases 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_delete_no_match() {
@@ -3606,7 +3130,7 @@ mod tests {
         }
     }
 
-    // ── Full lifecycle ─────────────────────────────────────────────
+    // 鈹€鈹€ Full lifecycle 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_full_lifecycle() {
@@ -3690,7 +3214,7 @@ mod tests {
         }
     }
 
-    // ── Data persistence across flush ──────────────────────────────
+    // 鈹€鈹€ Data persistence across flush 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_data_persists_after_flush() {
@@ -3736,7 +3260,7 @@ mod tests {
         }
     }
 
-    // ── JOIN tests ────────────────────────────────────────────────
+    // 鈹€鈹€ JOIN tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     fn insert_order(executor: &QueryExecutor, product_id: &str, quantity: i64) {
         let ast = QueryAst::Insert {
@@ -3877,7 +3401,7 @@ mod tests {
         }
     }
 
-    // ── GROUP BY and aggregate tests ──────────────────────────────
+    // 鈹€鈹€ GROUP BY and aggregate tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_count_star() {
@@ -4090,7 +3614,7 @@ mod tests {
         }
     }
 
-    // ── ORDER BY tests ────────────────────────────────────────────
+    // 鈹€鈹€ ORDER BY tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_order_by_asc() {
@@ -4194,7 +3718,7 @@ mod tests {
         }
     }
 
-    // ── DISTINCT tests ────────────────────────────────────────────
+    // 鈹€鈹€ DISTINCT tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_distinct() {
@@ -4214,7 +3738,7 @@ mod tests {
         }
     }
 
-    // ── LIKE tests ────────────────────────────────────────────────
+    // 鈹€鈹€ LIKE tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_like_prefix() {
@@ -4274,7 +3798,7 @@ mod tests {
         }
     }
 
-    // ── BETWEEN tests ─────────────────────────────────────────────
+    // 鈹€鈹€ BETWEEN tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_between() {
@@ -4295,7 +3819,7 @@ mod tests {
         }
     }
 
-    // ── IN tests ──────────────────────────────────────────────────
+    // 鈹€鈹€ IN tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_in() {
@@ -4334,7 +3858,7 @@ mod tests {
         }
     }
 
-    // ── UNION tests ───────────────────────────────────────────────
+    // 鈹€鈹€ UNION tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_union_basic() {
@@ -4401,7 +3925,7 @@ mod tests {
         }
     }
 
-    // ── Subquery tests ────────────────────────────────────────────
+    // 鈹€鈹€ Subquery tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_subquery_in_where() {
@@ -4443,7 +3967,7 @@ mod tests {
         }
     }
 
-    // ── Index-accelerated range query tests ───────────────────────
+    // 鈹€鈹€ Index-accelerated range query tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_index_range_gt() {
@@ -4459,7 +3983,7 @@ mod tests {
         insert_row(&executor, "Product", "AirPods", 249);
         executor.engine.write().unwrap().flush().unwrap();
 
-        // Range query: price > 500 — should use index
+        // Range query: price > 500 鈥?should use index
         let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price > 500").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
@@ -4572,7 +4096,7 @@ mod tests {
         }
     }
 
-    // ── Index consistency on UPDATE/DELETE ───────────────────────
+    // 鈹€鈹€ Index consistency on UPDATE/DELETE 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_index_update_consistency() {
@@ -4687,7 +4211,7 @@ mod tests {
         }
     }
 
-    // ── Vector search tests ───────────────────────────────────────
+    // 鈹€鈹€ Vector search tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_vector_search_basic() {
@@ -4881,7 +4405,7 @@ mod tests {
         }
     }
 
-    // ── Phase 21: CASE WHEN tests ──────────────────────────────────
+    // 鈹€鈹€ Phase 21: CASE WHEN tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_case_when_basic() {
@@ -4908,7 +4432,7 @@ mod tests {
         }
     }
 
-    // ── Phase 21: CTE tests ────────────────────────────────────────
+    // 鈹€鈹€ Phase 21: CTE tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_cte_basic() {
@@ -4930,7 +4454,7 @@ mod tests {
         }
     }
 
-    // ── Phase 21: Window Function tests ────────────────────────────
+    // 鈹€鈹€ Phase 21: Window Function tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_window_row_number() {
@@ -4956,7 +4480,7 @@ mod tests {
         }
     }
 
-    // ── Phase 21: EXPLAIN ANALYZE tests ────────────────────────────
+    // 鈹€鈹€ Phase 21: EXPLAIN ANALYZE tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_explain_analyze() {
@@ -4977,7 +4501,7 @@ mod tests {
         }
     }
 
-    // ── Phase 21: Materialized View tests ──────────────────────────
+    // 鈹€鈹€ Phase 21: Materialized View tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_materialized_view_create_and_query() {
@@ -5040,7 +4564,7 @@ mod tests {
         }
     }
 
-    // ── Phase 22: ANALYZE tests ───────────────────────────────────
+    // 鈹€鈹€ Phase 22: ANALYZE tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_analyze_command() {
@@ -5064,7 +4588,7 @@ mod tests {
         }
     }
 
-    // ── Phase 22: Plan Cache tests ────────────────────────────────
+    // 鈹€鈹€ Phase 22: Plan Cache tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_plan_cache_integration() {
@@ -5084,7 +4608,7 @@ mod tests {
         assert_eq!(stats.plan_cache_hits, 1, "should have 1 plan cache hit");
     }
 
-    // ── Phase 22: Composite Index tests ───────────────────────────
+    // 鈹€鈹€ Phase 22: Composite Index tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_composite_index_create() {
@@ -5105,7 +4629,7 @@ mod tests {
         }
     }
 
-    // ── Phase 22: Index Condition Pushdown tests ──────────────────
+    // 鈹€鈹€ Phase 22: Index Condition Pushdown tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_index_condition_pushdown_and() {
@@ -5135,7 +4659,7 @@ mod tests {
         }
     }
 
-    // ── Phase 22: Runtime stats tests ─────────────────────────────
+    // 鈹€鈹€ Phase 22: Runtime stats tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_runtime_stats_tracking() {
@@ -5157,7 +4681,7 @@ mod tests {
         assert!(stats.table_scan_counts.contains_key("Product"));
     }
 
-    // ── Phase 23: LIMIT OFFSET tests ──────────────────────────────
+    // 鈹€鈹€ Phase 23: LIMIT OFFSET tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_limit_offset() {
@@ -5194,7 +4718,7 @@ mod tests {
         }
     }
 
-    // ── Phase 23: Batch INSERT tests ──────────────────────────────
+    // 鈹€鈹€ Phase 23: Batch INSERT tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_batch_insert() {
@@ -5218,7 +4742,7 @@ mod tests {
         }
     }
 
-    // ── Phase 23: Built-in function tests ─────────────────────────
+    // 鈹€鈹€ Phase 23: Built-in function tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_coalesce_function() {
@@ -5274,7 +4798,7 @@ mod tests {
         }
     }
 
-    // ── Phase 23: Transaction command tests ───────────────────────
+    // 鈹€鈹€ Phase 23: Transaction command tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_transaction_commands() {
@@ -5302,7 +4826,7 @@ mod tests {
         }
     }
 
-    // ── Phase 23: Recursive CTE parser test ───────────────────────
+    // 鈹€鈹€ Phase 23: Recursive CTE parser test 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
     fn test_recursive_cte_parse() {
