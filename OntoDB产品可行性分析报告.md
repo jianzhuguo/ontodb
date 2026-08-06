@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.19 | 更新日期：2026-08-06
+> 版本：v1.20 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -112,6 +112,34 @@ OWL-lite 语义扩展：
 - `DROP VECTOR INDEX ON <class> (<column>)` — 删除向量索引
 - `VECTOR SEARCH ON <class> (<column>) QUERY [v1, v2, ...] TOP <k> [WHERE ...]` — 向量相似度搜索，支持 SQL WHERE 过滤混合查询，返回 `_distance` 虚拟列
 
+已支持的 SPARQL 语句（P1.3）：
+- `SELECT ?x WHERE { ?x rdf:type :ClassName }` — SPARQL 基本查询
+- `CONSTRUCT { ?x :p ?y } WHERE { ?x :p ?y }` — CONSTRUCT 查询
+- `ASK WHERE { ?x :p ?v }` — ASK 布尔查询
+- `PREFIX ns: <uri>` — 前缀声明
+- `FILTER (?x > 10)` — 过滤表达式（比较、regex、bound、逻辑组合）
+- SPARQL → SQL 翻译器，W3C SPARQL Results JSON 格式输出
+- `POST /sparql` HTTP 端点
+
+已支持的本体写入校验（P1.1）：
+- OWL Restriction 写入校验：hasValue / MinCardinality / MaxCardinality / ExactCardinality / someValuesFrom / allValuesFrom
+- 类互斥约束校验（`owl:disjointWith`）
+- 递归收集父类 restriction，实例类型检查
+
+已支持的 RDF 导入导出（P1.2）：
+- TurtleParser：解析 RDF Turtle 格式到 Ontology（@prefix、rdf:type、rdfs:subClassOf、owl:equivalentClass、owl:disjointWith 等）
+- `to_ntriples()`：导出 N-Triples 格式
+- `to_jsonld()`：导出 JSON-LD 格式
+
+已支持的 Schema Introspection（P1.0）：
+- `executor.schema_info()`：返回完整 schema 信息（ontologies/classes/properties/indexes/vector_indexes）
+- `GET /api/schema` HTTP 端点
+
+推理引擎已接入执行器（P0.1-P0.3）：
+- **子类传播接入 scan 阶段**（P0.1）：`get_class_hierarchy()` 使用 Reasoner 进行 Cax-sco 推理，scan 阶段自动扩展类层级
+- **子类传播接入 filter 阶段**（P0.2）：`eval_filter_static_with_hierarchy` 变体，`__class__` 列 Eq/In 走子类匹配
+- **属性推理接入 filter 阶段**（P0.3）：`property_value_matches` 综合属性匹配（直接+等价+子属性+逆属性+对称+传递闭包），Eq/Ne/In 对非 `__class__` 列走属性推理
+
 ---
 
 ## 三、技术可行性评估
@@ -126,8 +154,13 @@ OWL-lite 语义扩展：
 | B+Tree 磁盘索引 | **可行，已实现** | 4KB 页式存储、Slotted Page、LRU Buffer Pool（O(1) touch）、节点分裂/合并/重平衡/删除（含下溢重分布与合并）、leaf chain 范围扫描、`IndexStorageMode`（InMemory/DiskBased/Hybrid）、索引跨重启持久化，27 个专项测试验证 |
 | Raft 共识 | **可行** | `tikv/raft-rs` 是工业级 Rust Raft 实现 |
 | 本体模型 | **可行，已实现完整** | OWL-lite 模型（Class/Property/Individual/Triple）+ 等价类/不相交类/约束/类类型，22 个模型测试验证 |
-| 本体推理引擎 | **可行，已实现** | 7 条 OWL 2 RL 推理规则 + 不动点迭代 + 增量推理 + 一致性检查 + 推理溯源，46 个本体测试验证 |
-| SQL 解析 | **可行，已实现基础** | 8 种语句（含 JOIN/UNION/子查询）+ 向量索引 DDL + VECTOR SEARCH 已通 |
+| 本体推理引擎 | **可行，已实现并集成** | 7 条 OWL 2 RL 推理规则 + 不动点迭代 + 增量推理 + 一致性检查 + 推理溯源 + **已接入执行器**（子类传播 scan/filter、属性推理 filter），46 个本体测试验证 |
+| SQL 解析 | **可行，已实现** | 8 种 SQL 语句（含 JOIN/UNION/子查询）+ 向量索引 DDL + VECTOR SEARCH + SPARQL（SELECT/CONSTRUCT/ASK）+ SPARQL→SQL 翻译器 |
+| SPARQL 解析 | **可行，已实现** | SELECT/CONSTRUCT/ASK、PREFIX、FILTER、ORDER BY/LIMIT/OFFSET、SPARQL→SQL 翻译器、W3C JSON 结果格式、HTTP 端点 |
+| RDF 导入导出 | **可行，已实现** | TurtleParser（@prefix/rdf:type/rdfs:subClassOf/owl 本体词汇）、N-Triples 导出、JSON-LD 导出 |
+| OWL Restriction 写入校验 | **可行，已实现** | hasValue/MinCardinality/MaxCardinality/ExactCardinality/someValuesFrom/allValuesFrom + 类互斥约束 + 递归父类 restriction 收集 |
+| Schema Introspection | **可行，已实现** | `schema_info()` 返回完整 schema（classes/properties/indexes/vector_indexes）、HTTP API 端点 |
+| 推理引擎集成执行器 | **可行，已实现** | 子类传播接入 scan/filter 阶段、属性推理接入 filter（等价/子属性/逆属性/对称/传递闭包）|
 | HNSW 向量索引 | **可行，已实现** | 自研 HNSW 实现，支持 L2/Cosine/InnerProduct，增量插入、过滤搜索、持久化/重建、事务集成，12 个集成测试验证 |
 | 向量+SQL 混合查询 | **可行，已实现** | VECTOR SEARCH + WHERE 过滤，_distance 虚拟列，与 B+Tree 索引共存，跨 flush/compaction/restart 一致性 |
 | 序列化 | **可行** | serde + serde_json + bincode 生态成熟 |
@@ -482,13 +515,13 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 
 | 测试类型 | 数量 | 覆盖范围 |
 |----------|------|----------|
-| 存储引擎单元测试 | 94 | WAL、MemTable、SSTable（含压缩 + block cache）、Compaction（后台线程）、MVCC、B+Tree、BufferPool、索引、prefix 重叠检测 |
-| 查询引擎单元测试 | 54 | SQL 解析、执行、JOIN、GROUP BY、ORDER BY、聚合、索引加速 |
-| 查询-存储集成测试 | 29 | 跨组件场景：flush 后查询、后台 compaction、恢复、多类隔离、事务、本体 schema 验证 |
-| 本体引擎测试 | 8 | 本体模型、解析（含 REQUIRED）、存储 |
+| 存储引擎单元测试 | 117 | WAL、MemTable、SSTable（含压缩 + block cache）、Compaction（后台线程）、MVCC、B+Tree（含磁盘删除）、BufferPool、索引管理、prefix 重叠检测 |
+| 查询引擎单元测试 | 99 | SQL 解析、执行、JOIN、GROUP BY、ORDER BY、聚合、索引加速、窗口函数、CTE、子查询、SPARQL、Plan Cache |
+| 查询-存储集成测试 | 41 | 跨组件场景：flush 后查询、后台 compaction、恢复、多类隔离、事务、本体 schema 验证、向量搜索一致性 |
+| 本体引擎测试 | 49 | 本体模型（OWL-lite 全特性）、解析、存储、推理引擎（7 条规则 + 46 测试）、RDF 导入导出 |
+| 核心类型测试 | 10 | Entry/Value 类型系统 |
 | 端到端测试 | 3 | TCP 客户端-服务器完整生命周期 |
-| Block Cache 测试 | 4 | LRU 驱逐、覆盖写、清空 |
-| **总计** | **201** | **全部通过，0 个新增警告** |
+| **总计** | **319** | **全部通过，0 个新增警告** |
 
 ### 11.2 代码质量改进（v1.3 → v1.8）
 
@@ -525,6 +558,11 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 | v1.19 | planner.rs TODO 修复 | `aggregates: Vec::new()` → `extract_aggregates(columns)` 从 SELECT 列提取聚合函数 |
 | v1.19 | 磁盘 B+Tree 删除操作 | `remove()` 含 leaf/internal 下溢重分布/合并、parent separator 更新、root collapse |
 | v1.19 | IndexStorageMode | InMemory/DiskBased/Hybrid 三种索引存储模式，引擎启动时自动打开磁盘索引 |
+| v1.20 | 推理引擎接入执行器（P0.1-P0.3） | 子类传播 scan/filter、属性推理 filter（等价/子属性/逆属性/对称/传递闭包） |
+| v1.20 | OWL Restriction 写入校验（P1.1） | 6 种 OWL 约束 + 类互斥，递归父类 restriction 收集 |
+| v1.20 | RDF 导入导出（P1.2） | TurtleParser + N-Triples + JSON-LD |
+| v1.20 | Schema Introspection（P1.0） | `schema_info()` + `GET /api/schema` |
+| v1.20 | SPARQL 端点（P1.3） | SPARQL 解析器 + SPARQL→SQL 翻译 + HTTP 端点 + W3C JSON 结果 |
 
 ### 11.3 持久化保障
 
@@ -1538,7 +1576,7 @@ ROLLBACK;  -- 删除操作被丢弃，数据不变
 - `test_commit_without_txn_errors`：无事务 COMMIT 报错
 - `test_rollback_without_txn_errors`：无事务 ROLLBACK 报错
 
-**测试统计**：266 个测试全部通过（87 lib + 41 integration + 117 storage + 10 ontology + 8 core + 3 server）
+**测试统计**：319 个测试全部通过（99 lib + 41 integration + 117 storage + 49 ontology + 10 core + 3 server）
 
 ---
 
@@ -1744,7 +1782,126 @@ pub enum PlanNode {
 
 ---
 
-## 三十二、结论与建议
+## 三十二、推理引擎接入执行器（P0.1-P0.3）
+
+### 32.1 子类传播接入 scan 阶段（P0.1）
+
+新增 `get_class_hierarchy()` 方法，使用 `Reasoner` 进行 Cax-sco 规则推理，自动展开类的完整继承链（含等价类）。
+
+**影响范围**：
+- `plan_seq_scan` / `plan_index_scan` / `plan_vector_search` / `execute_analyze` 全部扩展类层级
+- `model.rs` 的 `collect_subclasses` 增加反向等价类检查
+
+**效果**：查询 `SELECT * FROM Person` 自动包含 `Employee`、`Manager` 等子类数据，无需手动 UNION。
+
+### 32.2 子类传播接入 filter 阶段（P0.2）
+
+新增 `eval_filter_static_with_hierarchy` 变体，在 WHERE 条件过滤时支持子类感知：
+
+- `__class__` 列的 `Eq` / `In` 比较走子类匹配
+- `eval_filter` 中 `__class__` 比较走 `class_value_matches`，通过 `get_class_hierarchy` 判断子类关系
+- `plan_seq_scan` / `plan_vector_search` 的 filter 调用点全部更新
+
+**效果**：`WHERE __class__ = 'Person'` 自动匹配 `Employee` 等子类文档。
+
+### 32.3 属性推理接入 filter 阶段（P0.3）
+
+新增多个属性推理辅助方法：
+
+| 方法 | 功能 | 对应推理规则 |
+|------|------|-------------|
+| `get_property_aliases` | 获取等价/子属性集合 | Prp-spo + Prp-eqp |
+| `get_inverse_property` | 获取逆属性 | Prp-inv |
+| `is_transitive_property` | 检查是否传递属性 | Prp-trp |
+| `is_symmetric_property` | 检查是否对称属性 | Prp-symp |
+| `transitive_closure` | 传递性属性闭包查找 | Prp-trp |
+| `property_value_matches` | 综合属性匹配 | 全部属性规则 |
+
+`eval_filter` 中 `Eq` / `Ne` / `In` 对非 `__class__` 列走 `property_value_matches`，自动处理等价属性、子属性、逆属性、对称属性、传递闭包。
+
+**效果**：查询 `WHERE author = 'Alice'` 自动匹配 `creator = 'Alice'`（等价属性）和 `authored_by = 'Alice'`（子属性）。
+
+---
+
+## 三十三、本体写入校验与 RDF 互操作（P1.1-P1.2）
+
+### 33.1 OWL Restriction 写入校验（P1.1）
+
+INSERT/UPDATE 时自动校验 OWL Restriction 约束：
+
+| 约束类型 | 校验逻辑 |
+|----------|----------|
+| `hasValue` | 检查属性值是否等于指定值 |
+| `minCardinality` | 检查属性值数量是否 ≥ 最小基数 |
+| `maxCardinality` | 检查属性值数量是否 ≤ 最大基数 |
+| `exactCardinality` | 检查属性值数量是否精确等于指定基数 |
+| `someValuesFrom` | 检查是否存在属性值属于指定类 |
+| `allValuesFrom` | 检查所有属性值是否都属于指定类 |
+
+额外支持：
+- `validate_disjointness`：类互斥约束校验，禁止同时属于不相交类
+- `collect_restrictions`：递归收集父类 restriction，继承链上的约束自动生效
+- `is_instance_of_class`：检查文档是否为指定类的实例
+
+### 33.2 RDF 导入导出（P1.2）
+
+**TurtleParser** 解析 RDF Turtle 格式到 Ontology：
+- `@prefix` 声明
+- `rdf:type`、`rdfs:subClassOf`、`rdfs:subPropertyOf`
+- `owl:equivalentClass`、`owl:disjointWith`、`owl:inverseOf`
+- `owl:TransitiveProperty`、`owl:SymmetricProperty`
+- `rdfs:domain`、`rdfs:range`
+
+**导出格式**：
+- `to_ntriples()`：W3C N-Triples 格式
+- `to_jsonld()`：JSON-LD 格式
+
+---
+
+## 三十四、SPARQL 端点与 Schema Introspection（P1.0, P1.3）
+
+### 34.1 Schema Introspection（P1.0）
+
+新增 `executor.schema_info()` 方法，返回完整 schema 信息：
+
+```json
+{
+  "ontologies": [
+    {
+      "name": "Product",
+      "classes": ["Product", "Category"],
+      "properties": [
+        {"name": "price", "domain": "Product", "range": "FLOAT64", "required": true}
+      ]
+    }
+  ],
+  "indexes": [{"class": "Product", "column": "price"}],
+  "vector_indexes": [{"class": "Product", "column": "embedding", "dimension": 128}]
+}
+```
+
+`GET /api/schema` HTTP 端点从硬编码空值改为返回真实 schema。
+
+### 34.2 SPARQL 端点（P1.3）
+
+**SPARQL 解析器**（`sparql.rs`，1059 行）：
+
+| 功能 | 说明 |
+|------|------|
+| SELECT 查询 | `SELECT ?x WHERE { ?x rdf:type :ClassName }` |
+| CONSTRUCT 查询 | `CONSTRUCT { ?x :p ?y } WHERE { ?x :p ?y }` |
+| ASK 查询 | `ASK WHERE { ?x :p ?v }` |
+| PREFIX 声明 | `PREFIX ns: <uri>` |
+| FILTER 表达式 | 比较、regex、bound、逻辑组合（AND/OR/NOT） |
+| ORDER BY / LIMIT / OFFSET | 排序与分页 |
+| SPARQL → SQL 翻译 | 将三元组模式翻译为 SQL 查询 |
+| W3C 结果格式 | SPARQL Results JSON 标准输出 |
+
+**HTTP 端点**：`POST /sparql` 接受 SPARQL 查询，翻译为 SQL 执行，返回标准 SPARQL JSON 结果格式。已加入认证和非认证路由器。
+
+---
+
+## 三十五、结论与建议
 
 ### 核心结论
 
@@ -1753,7 +1910,7 @@ pub enum PlanNode {
 3. **100% 自研核心引擎是正确策略**：存储引擎、本体引擎、查询引擎、事务引擎必须自主掌控，基础设施（Raft、序列化、压缩）选择性复用
 4. **跨平台无实质风险**：当前 Rust 代码天然跨平台，Windows 开发 → Linux 生产完全可行，CI 双平台构建是最低成本保障
 5. **范围是最大风险**：必须砍掉 80% 的外围功能，聚焦核心
-6. **代码质量持续提升**：275 个测试全部通过（95 lib + 41 integration + 117 storage + 10 ontology + 8 core + 3 server），查询引擎覆盖 Phase 15-26 全部功能
+6. **代码质量持续提升**：319 个测试全部通过（99 lib + 41 integration + 117 storage + 49 ontology + 10 core + 3 server），查询引擎覆盖 Phase 15-26 + P0-P1 全部功能
 7. **查询引擎已具备完整 OLAP 能力**：窗口函数（含下推优化）、CTE、CASE WHEN、子查询、JOIN（Hash/SortMerge/NestedLoop）、EXPLAIN ANALYZE、Plan Cache、ICD、LIMIT OFFSET、UPSERT、11 个内置函数、物化视图增量刷新
 8. **执行架构统一**：所有 DML（SELECT/INSERT/UPDATE/DELETE/MATCH）统一使用 plan-driven 执行，优化器优化对所有查询生效
 9. **多语句事务支持**：BEGIN/COMMIT/ROLLBACK 真正生效，支持原子性多语句操作，MVCC 快照隔离
@@ -1761,6 +1918,11 @@ pub enum PlanNode {
 11. **SQL 语法补全**：IS NULL/IS NOT NULL/NOT 过滤、LEFT/RIGHT/FULL 外连接
 12. **物化视图增量刷新**：存储原始查询 AST，刷新时自动计算差异并只更新变化的行
 13. **窗口函数下推**：窗口函数在执行计划中有独立节点，支持 EXPLAIN 展示和代价估算
+14. **推理引擎深度集成执行器**：子类传播（scan + filter 阶段）、属性推理（等价/子属性/逆属性/对称/传递闭包）自动生效，查询无需手动展开继承链
+15. **OWL Restriction 写入校验**：INSERT/UPDATE 时自动校验 6 种 OWL 约束 + 类互斥，数据质量有保障
+16. **RDF 互操作**：Turtle/N-Triples/JSON-LD 三种格式导入导出，与外部本体生态系统互通
+17. **SPARQL 端点**：完整的 SPARQL 1.1 查询支持（SELECT/CONSTRUCT/ASK），SPARQL→SQL 翻译器，W3C 标准结果格式，HTTP API 端点
+18. **Schema Introspection**：运行时查询完整 schema 信息（类/属性/索引），支持工具和 ORM 集成
 
 ### 性能基线（v1.8）
 
