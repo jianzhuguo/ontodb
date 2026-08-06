@@ -2,7 +2,16 @@
 
 ## Overview
 
-OntoDB provides a RESTful HTTP API for executing SQL queries, vector similarity searches, and hybrid queries that combine SQL filtering with vector search.
+OntoDB provides a RESTful HTTP API for executing SQL queries, SPARQL queries, vector similarity searches, and hybrid queries that combine SQL filtering with vector search. It also includes ontology-driven semantic features with OWL-lite reasoning.
+
+## Features
+
+- **SQL Query Engine**: Full SQL support with JOINs, aggregates, window functions, CTEs, transactions
+- **SPARQL Endpoint**: W3C SPARQL 1.1 subset support with automatic SQL translation
+- **Vector Search**: HNSW-based similarity search with L2, Cosine, InnerProduct metrics
+- **Ontology Engine**: OWL-lite model with 7 inference rules (subclass, inverse, transitive, symmetric, etc.)
+- **RDF Import/Export**: Turtle parsing, N-Triples and JSON-LD export
+- **Schema Introspection**: GET /api/schema for database metadata
 
 ## Quick Start
 
@@ -506,6 +515,190 @@ curl -X POST http://127.0.0.1:8080/api/hybrid/query \
     "top_k": 3,
     "class": "Product"
   }'
+```
+
+### 4. SPARQL Query Endpoint
+
+Execute SPARQL queries against the ontology store. Queries are automatically translated to SQL and executed.
+
+#### POST `/sparql` - Execute SPARQL Query
+
+**Request:**
+```json
+{
+  "query": "PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?x rdf:type ex:Person . ?x ex:name ?name . }"
+}
+```
+
+**Response (W3C SPARQL Results JSON Format):**
+```json
+{
+  "success": true,
+  "data": {
+    "head": {
+      "vars": ["?name"]
+    },
+    "results": {
+      "bindings": [
+        {
+          "?name": {
+            "type": "literal",
+            "value": "Alice"
+          }
+        },
+        {
+          "?name": {
+            "type": "literal",
+            "value": "Bob"
+          }
+        }
+      ]
+    }
+  },
+  "elapsed_ms": 1.23
+}
+```
+
+**Supported SPARQL features:**
+- `SELECT` with variables (`?x`, `?y`)
+- `WHERE` with triple patterns
+- `FILTER` with comparisons (`=`, `!=`, `>`, `<`, `>=`, `<=`), `regex()`, `bound()`
+- Logical operators (`&&`, `||`, `!`)
+- `ORDER BY` (ASC/DESC)
+- `LIMIT`, `OFFSET`
+- `PREFIX` declarations
+
+**Example with FILTER:**
+```json
+{
+  "query": "PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?x rdf:type ex:Person . ?x ex:name ?name . FILTER(?name = \"Alice\") }"
+}
+```
+
+**Example with LIMIT:**
+```json
+{
+  "query": "SELECT ?x ?y WHERE { ?x rdf:type <http://example.org/Person> . ?x <http://example.org/name> ?y . } LIMIT 10"
+}
+```
+
+### 5. Schema Introspection
+
+#### GET `/api/schema` - Get Database Schema
+
+Returns complete schema information including ontologies, classes, properties, indexes, and vector indexes.
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "ontologies": [
+      {
+        "name": "my_ontology",
+        "classes": {
+          "Person": {
+            "type": "Normal",
+            "superclasses": [],
+            "equivalent_classes": [],
+            "disjoint_with": [],
+            "properties": ["name", "age"]
+          },
+          "Employee": {
+            "type": "Normal",
+            "superclasses": ["Person"],
+            "equivalent_classes": [],
+            "disjoint_with": [],
+            "properties": ["employeeId", "department"]
+          }
+        },
+        "properties": {
+          "name": {
+            "domain": "Person",
+            "range": "STRING",
+            "required": true,
+            "multi_valued": false,
+            "is_transitive": false,
+            "is_symmetric": false,
+            "is_functional": true
+          },
+          "reportsTo": {
+            "domain": "Employee",
+            "range": "STRING",
+            "required": false,
+            "multi_valued": false,
+            "inverse_of": "manages",
+            "is_transitive": true,
+            "is_symmetric": false,
+            "is_functional": false
+          }
+        }
+      }
+    ],
+    "indexes": [...],
+    "vector_indexes": [...]
+  },
+  "elapsed_ms": 0.5
+}
+```
+
+---
+
+## Ontology & Reasoning
+
+OntoDB includes an OWL-lite ontology engine with automatic reasoning:
+
+### Creating an Ontology
+
+```sql
+CREATE ONTOLOGY my_ontology (
+  CLASS Person,
+  CLASS Employee SUBCLASS OF Person,
+  CLASS Manager SUBCLASS OF Employee,
+  PROPERTY name ON Person TYPE STRING REQUIRED,
+  PROPERTY reportsTo ON Employee TYPE STRING INVERSE OF manages,
+  PROPERTY ancestor ON Person TYPE STRING TRANSITIVE,
+  PROPERTY friendOf ON Person TYPE STRING SYMMETRIC
+)
+```
+
+### Inference Rules
+
+The following OWL-lite rules are automatically applied during query execution:
+
+| Rule | Description | Example |
+|------|-------------|---------|
+| Cax-sco | Subclass propagation | If `x type Employee` then `x type Person` |
+| Cax-eqc | Equivalent class | If `x type Worker` and `Worker equiv Employee` then `x type Employee` |
+| Prp-spo | Subproperty | If `x worksUnder y` and `worksUnder subPropertyOf reportsTo` then `x reportsTo y` |
+| Prp-eqp | Equivalent property | If `x email y` and `email equiv emailAddress` then `x emailAddress y` |
+| Prp-inv | Inverse property | If `x reportsTo y` then `y manages x` |
+| Prp-trp | Transitive closure | If `x ancestor y` and `y ancestor z` then `x ancestor z` |
+| Prp-symp | Symmetric | If `x friendOf y` then `y friendOf x` |
+
+### OWL Restrictions (Write-time Validation)
+
+Restrictions are enforced during INSERT:
+
+- `hasValue` - Property must have specific value
+- `minCardinality` - Minimum number of values
+- `maxCardinality` - Maximum number of values
+- `exactCardinality` - Exact number of values
+- `someValuesFrom` - At least one value from class
+- `allValuesFrom` - All values from class
+
+### RDF Import/Export
+
+```rust
+// Parse Turtle
+let mut parser = onto_ontology::TurtleParser::new();
+let ontology = parser.parse(turtle_input, "my_ontology")?;
+
+// Export N-Triples
+let ntriples = onto_ontology::to_ntriples(&ontology);
+
+// Export JSON-LD
+let jsonld = onto_ontology::to_jsonld(&ontology);
 ```
 
 ---
