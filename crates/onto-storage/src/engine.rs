@@ -11,9 +11,9 @@ use crate::lsm::wal::{self, Wal};
 use crate::mvcc::{TxnManager, WriteOp};
 use crate::options::StorageOptions;
 use onto_core::{Entry, EntryKind, Key, Result, SeqNo, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The main LSM-Tree storage engine with MVCC support.
@@ -26,6 +26,10 @@ pub struct LsmEngine {
 
     /// SSTables organized by level. Level 0 is newest.
     levels: Vec<Vec<SsTableInfo>>,
+
+    /// Cache of opened SSTable handles, keyed by file path.
+    /// Avoids re-opening files and re-reading footer/bloom/index on every read.
+    sst_cache: HashMap<PathBuf, SsTable>,
 
     /// Write-Ahead Log for durability.
     wal: Wal,
@@ -71,6 +75,7 @@ impl LsmEngine {
             memtable: MemTable::new(),
             immutable_memtable: None,
             levels: vec![Vec::new(); options.num_levels],
+            sst_cache: HashMap::new(),
             wal,
             options,
             seq_counter: AtomicU64::new(0),
@@ -125,18 +130,23 @@ impl LsmEngine {
         }
 
         // 3. Check SSTables (newest to oldest)
+        // Collect paths to avoid borrow conflict with self.sst_cache
+        let mut candidates: Vec<PathBuf> = Vec::new();
         for level in &self.levels {
             for sst_info in level.iter().rev() {
                 if key < sst_info.min_key.as_slice() || key > sst_info.max_key.as_slice() {
                     continue;
                 }
+                candidates.push(sst_info.path.clone());
+            }
+        }
 
-                let mut sst = SsTable::open(&sst_info.path)?;
-                match sst.get_full(key)? {
-                    Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
-                    Some((_, _, EntryKind::Delete)) => return Ok(None),
-                    None => continue,
-                }
+        for path in &candidates {
+            let sst = self.get_sst(path)?;
+            match sst.get_full(key)? {
+                Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
+                Some((_, _, EntryKind::Delete)) => return Ok(None),
+                None => continue,
             }
         }
 
@@ -170,6 +180,8 @@ impl LsmEngine {
         };
 
         // 1. Scan SSTables (oldest to newest, so newer entries overwrite older)
+        // Collect paths first to avoid borrow conflict with self.sst_cache
+        let mut sst_paths: Vec<PathBuf> = Vec::new();
         for level in self.levels.iter().rev() {
             for sst_info in level.iter() {
                 if !prefix.is_empty() {
@@ -182,35 +194,38 @@ impl LsmEngine {
                         continue;
                     }
                 }
+                sst_paths.push(sst_info.path.clone());
+            }
+        }
 
-                let mut sst = SsTable::open(&sst_info.path)?;
-                let mut iter = sst.iter()?;
+        for path in &sst_paths {
+            let sst = self.get_sst(path)?;
+            let mut iter = sst.iter()?;
 
-                while iter.is_valid() && iter.key() < prefix {
-                    iter.next();
+            while iter.is_valid() && iter.key() < prefix {
+                iter.next();
+            }
+
+            while iter.is_valid() {
+                if !iter.key().starts_with(prefix) {
+                    break;
+                }
+                let key = iter.key().to_vec();
+                let value = iter.value().to_vec();
+                let seq = iter.seq_no();
+                let kind = iter.kind();
+
+                if is_visible(seq) {
+                    let should_update = match seen.get(&key) {
+                        Some((_, existing_seq, _)) => seq > *existing_seq,
+                        None => true,
+                    };
+                    if should_update {
+                        seen.insert(key, (value, seq, kind));
+                    }
                 }
 
-                while iter.is_valid() {
-                    if !iter.key().starts_with(prefix) {
-                        break;
-                    }
-                    let key = iter.key().to_vec();
-                    let value = iter.value().to_vec();
-                    let seq = iter.seq_no();
-                    let kind = iter.kind();
-
-                    if is_visible(seq) {
-                        let should_update = match seen.get(&key) {
-                            Some((_, existing_seq, _)) => seq > *existing_seq,
-                            None => true,
-                        };
-                        if should_update {
-                            seen.insert(key, (value, seq, kind));
-                        }
-                    }
-
-                    iter.next();
-                }
+                iter.next();
             }
         }
 
@@ -434,6 +449,7 @@ impl LsmEngine {
                 }
                 iter.next();
             }
+            drop(iter);
 
             // Update sst_counter if needed
             if let Some(id_str) = fname.split('_').nth(1) {
@@ -444,6 +460,9 @@ impl LsmEngine {
                     }
                 }
             }
+
+            // Cache the opened SSTable handle for future reads
+            self.sst_cache.insert(path.clone(), sst);
 
             self.levels[level].push(SsTableInfo {
                 path,
@@ -711,11 +730,13 @@ impl LsmEngine {
             });
         }
 
-        // Step 7: Delete old SSTable files
+        // Step 7: Delete old SSTable files and evict from cache
         for sst_info in &ssts_to_compact {
+            self.evict_sst(&sst_info.path);
             let _ = fs::remove_file(&sst_info.path);
         }
         for sst_info in &next_level_ssts {
+            self.evict_sst(&sst_info.path);
             let _ = fs::remove_file(&sst_info.path);
         }
 
@@ -806,6 +827,21 @@ impl LsmEngine {
 
     fn next_seq(&self) -> SeqNo {
         self.seq_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Gets or opens a cached SSTable handle.
+    /// Opens the file and reads footer/bloom/index only on first access.
+    fn get_sst(&mut self, path: &Path) -> Result<&mut SsTable> {
+        if !self.sst_cache.contains_key(path) {
+            let sst = SsTable::open(path)?;
+            self.sst_cache.insert(path.to_path_buf(), sst);
+        }
+        Ok(self.sst_cache.get_mut(path).unwrap())
+    }
+
+    /// Removes an SSTable from the cache (called during compaction when files are deleted).
+    fn evict_sst(&mut self, path: &Path) {
+        self.sst_cache.remove(path);
     }
 
     /// Rebuilds secondary indexes by scanning persisted index entries from SSTables.
@@ -1042,21 +1078,26 @@ impl LsmEngine {
         }
 
         // Check SSTables (newest to oldest)
+        let mut candidates: Vec<PathBuf> = Vec::new();
         for level in &self.levels {
             for sst_info in level.iter().rev() {
                 if key < sst_info.min_key.as_slice() || key > sst_info.max_key.as_slice() {
                     continue;
                 }
-                let mut sst = SsTable::open(&sst_info.path)?;
-                match sst.get_full(key)? {
-                    Some((value, seq, kind)) if vis.is_visible(seq) => {
-                        if kind == EntryKind::Delete {
-                            return Ok(None);
-                        }
-                        return Ok(Some(value));
+                candidates.push(sst_info.path.clone());
+            }
+        }
+
+        for path in &candidates {
+            let sst = self.get_sst(path)?;
+            match sst.get_full(key)? {
+                Some((value, seq, kind)) if vis.is_visible(seq) => {
+                    if kind == EntryKind::Delete {
+                        return Ok(None);
                     }
-                    _ => continue,
+                    return Ok(Some(value));
                 }
+                _ => continue,
             }
         }
 
