@@ -111,6 +111,22 @@ pub enum QueryAst {
         ctes: Vec<CteDefinition>,
         query: Box<QueryAst>,
     },
+
+    /// CREATE MATERIALIZED VIEW <name> AS <query> - Materialized View
+    CreateMaterializedView {
+        name: String,
+        query: Box<QueryAst>,
+    },
+
+    /// DROP MATERIALIZED VIEW <name>
+    DropMaterializedView {
+        name: String,
+    },
+
+    /// REFRESH MATERIALIZED VIEW <name>
+    RefreshMaterializedView {
+        name: String,
+    },
 }
 
 /// A CTE (Common Table Expression) definition.
@@ -130,13 +146,15 @@ pub enum SelectColumns {
     Columns(Vec<SelectItem>),
 }
 
-/// A single item in SELECT: either a column reference or an aggregate function.
+/// A single item in SELECT: either a column reference, aggregate, or window function.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SelectItem {
     /// A regular column: `name` or `p.name`
     Column(String),
     /// An aggregate: `COUNT(*)`, `SUM(price) as total`
     Aggregate(AggregateExpr),
+    /// A window function: `ROW_NUMBER() OVER (...)`
+    WindowFunction(WindowExpr),
 }
 
 /// An aggregate function in SELECT: COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col)
@@ -154,6 +172,101 @@ pub enum AggregateFunc {
     Avg,
     Min,
     Max,
+}
+
+/// Window function expression.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowExpr {
+    /// The window function type.
+    pub func: WindowFunc,
+    /// Function argument (column name or "*").
+    pub arg: Option<String>,
+    /// OVER clause specification.
+    pub over: WindowSpec,
+    /// Output column alias.
+    pub alias: Option<String>,
+}
+
+/// Window function types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WindowFunc {
+    /// ROW_NUMBER() - sequential row number
+    RowNumber,
+    /// RANK() - rank with gaps for ties
+    Rank,
+    /// DENSE_RANK() - rank without gaps
+    DenseRank,
+    /// LAG(col, offset, default) - value from previous row
+    Lag,
+    /// LEAD(col, offset, default) - value from next row
+    Lead,
+    /// FIRST_VALUE(col) - first value in window
+    FirstValue,
+    /// LAST_VALUE(col) - last value in window
+    LastValue,
+    /// NTH_VALUE(col, n) - nth value in window
+    NthValue,
+    /// SUM(col) OVER (...) - cumulative sum
+    Sum,
+    /// AVG(col) OVER (...) - moving average
+    Avg,
+    /// MIN(col) OVER (...) - running minimum
+    Min,
+    /// MAX(col) OVER (...) - running maximum
+    Max,
+    /// COUNT(*) OVER (...) - running count
+    Count,
+}
+
+/// Window specification (OVER clause).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowSpec {
+    /// PARTITION BY columns.
+    pub partition_by: Vec<String>,
+    /// ORDER BY columns with direction.
+    pub order_by: Vec<WindowOrderBy>,
+    /// Frame specification (ROWS/RANGE).
+    pub frame: Option<WindowFrame>,
+}
+
+/// ORDER BY column in window specification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowOrderBy {
+    pub column: String,
+    pub ascending: bool,
+}
+
+/// Window frame specification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowFrame {
+    /// Frame type: ROWS or RANGE
+    pub frame_type: WindowFrameType,
+    /// Frame start boundary.
+    pub start: WindowFrameBound,
+    /// Frame end boundary (None = CURRENT ROW).
+    pub end: Option<WindowFrameBound>,
+}
+
+/// Window frame type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WindowFrameType {
+    Rows,
+    Range,
+}
+
+/// Window frame boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WindowFrameBound {
+    /// UNBOUNDED PRECEDING
+    UnboundedPreceding,
+    /// N PRECEDING
+    Preceding(u64),
+    /// CURRENT ROW
+    CurrentRow,
+    /// N FOLLOWING
+    Following(u64),
+    /// UNBOUNDED FOLLOWING
+    UnboundedFollowing,
 }
 
 /// GROUP BY clause
@@ -236,6 +349,12 @@ impl QueryParser {
             Self::parse_drop_vector_index(input)
         } else if upper.starts_with("VECTOR SEARCH") {
             Self::parse_vector_search(input)
+        } else if upper.starts_with("CREATE MATERIALIZED VIEW") {
+            Self::parse_create_materialized_view(input)
+        } else if upper.starts_with("DROP MATERIALIZED VIEW") {
+            Self::parse_drop_materialized_view(input)
+        } else if upper.starts_with("REFRESH MATERIALIZED VIEW") {
+            Self::parse_refresh_materialized_view(input)
         } else if upper.starts_with("CREATE INDEX") {
             Self::parse_create_index(input)
         } else if upper.starts_with("DROP INDEX") {
@@ -702,6 +821,13 @@ impl QueryParser {
             }
             let upper = part.to_uppercase();
 
+            // Check for window functions: ROW_NUMBER(), RANK(), etc. with OVER
+            if Self::contains_window_function(&upper) {
+                let window_expr = Self::parse_window_function(part)?;
+                items.push(SelectItem::WindowFunction(window_expr));
+                continue;
+            }
+
             // Check for aggregate functions: COUNT, SUM, AVG, MIN, MAX
             let func = if upper.starts_with("COUNT(") {
                 Some(AggregateFunc::Count)
@@ -757,6 +883,224 @@ impl QueryParser {
             }
         }
         Ok(items)
+    }
+
+    /// Check if the expression contains a window function (has OVER keyword).
+    fn contains_window_function(upper: &str) -> bool {
+        // Window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, etc.
+        // Must have OVER keyword after the function call
+        let window_funcs = ["ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD", 
+                           "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE"];
+        for func in &window_funcs {
+            if upper.contains(func) && upper.contains(" OVER ") {
+                return true;
+            }
+        }
+        // Also check for aggregate OVER (e.g., SUM(x) OVER (...))
+        if upper.contains(") OVER ") || upper.contains(")OVER ") {
+            return true;
+        }
+        false
+    }
+
+    /// Parse a window function expression.
+    fn parse_window_function(input: &str) -> Result<WindowExpr> {
+        let upper = input.to_uppercase();
+        
+        // Find OVER keyword
+        let over_pos = Self::find_unquoted(&upper, " OVER ")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'OVER' in window function".to_string()))?;
+        
+        let func_part = input[..over_pos].trim();
+        let over_part = input[over_pos + 6..].trim();
+
+        // Parse function name and argument
+        let (func, arg) = Self::parse_window_func_name(func_part)?;
+
+        // Parse OVER clause
+        let over = Self::parse_window_spec(over_part)?;
+
+        // Check for alias after OVER clause
+        let after_over = &input[over_pos + 6..];
+        let close_paren = Self::find_matching_paren(after_over)?;
+        let after = after_over[close_paren + 1..].trim();
+        let alias = if after.to_uppercase().starts_with("AS") {
+            Some(after[2..].trim().to_string())
+        } else if !after.is_empty() {
+            Some(after.to_string())
+        } else {
+            None
+        };
+
+        Ok(WindowExpr { func, arg, over, alias })
+    }
+
+    /// Parse window function name and argument.
+    fn parse_window_func_name(input: &str) -> Result<(WindowFunc, Option<String>)> {
+        let upper = input.to_uppercase();
+        
+        // Find the opening parenthesis
+        let open = input.find('(')
+            .ok_or_else(|| CoreError::InvalidArgument("expected '(' in window function".to_string()))?;
+        let close = input.rfind(')')
+            .ok_or_else(|| CoreError::InvalidArgument("expected ')' in window function".to_string()))?;
+        
+        let func_name = &upper[..open];
+        let arg_str = input[open + 1..close].trim();
+        let arg = if arg_str.is_empty() || arg_str == "*" {
+            None
+        } else {
+            Some(arg_str.to_string())
+        };
+
+        let func = match func_name {
+            "ROW_NUMBER" => WindowFunc::RowNumber,
+            "RANK" => WindowFunc::Rank,
+            "DENSE_RANK" => WindowFunc::DenseRank,
+            "LAG" => WindowFunc::Lag,
+            "LEAD" => WindowFunc::Lead,
+            "FIRST_VALUE" => WindowFunc::FirstValue,
+            "LAST_VALUE" => WindowFunc::LastValue,
+            "NTH_VALUE" => WindowFunc::NthValue,
+            "SUM" => WindowFunc::Sum,
+            "AVG" => WindowFunc::Avg,
+            "MIN" => WindowFunc::Min,
+            "MAX" => WindowFunc::Max,
+            "COUNT" => WindowFunc::Count,
+            _ => return Err(CoreError::InvalidArgument(format!("unknown window function: {}", func_name))),
+        };
+
+        Ok((func, arg))
+    }
+
+    /// Parse window specification (OVER clause).
+    fn parse_window_spec(input: &str) -> Result<WindowSpec> {
+        let input = input.trim();
+        
+        // Remove outer parentheses
+        let input = if input.starts_with('(') && input.ends_with(')') {
+            &input[1..input.len() - 1].trim()
+        } else {
+            input
+        };
+
+        let mut partition_by = Vec::new();
+        let mut order_by = Vec::new();
+        let mut frame = None;
+
+        let upper = input.to_uppercase();
+
+        // Parse PARTITION BY
+        if let Some(pb_pos) = Self::find_unquoted(&upper, "PARTITION BY") {
+            let pb_str = &input[pb_pos + 12..].trim();
+            let (pb_cols, remaining) = Self::consume_until_keywords(pb_str, &["ORDER BY", "ROWS", "RANGE"]);
+            partition_by = pb_cols.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            
+            // Parse ORDER BY from remaining
+            let remaining_upper = remaining.to_uppercase();
+            if remaining_upper.starts_with("ORDER BY") {
+                let ob_str = &remaining[8..].trim();
+                order_by = Self::parse_window_order_by(ob_str)?;
+            }
+        } else if upper.starts_with("ORDER BY") {
+            let ob_str = &input[8..].trim();
+            order_by = Self::parse_window_order_by(ob_str)?;
+        }
+
+        // Parse frame specification
+        if let Some(rows_pos) = Self::find_unquoted(&upper, "ROWS") {
+            frame = Some(Self::parse_window_frame(&input[rows_pos..], WindowFrameType::Rows)?);
+        } else if let Some(range_pos) = Self::find_unquoted(&upper, "RANGE") {
+            frame = Some(Self::parse_window_frame(&input[range_pos..], WindowFrameType::Range)?);
+        }
+
+        Ok(WindowSpec { partition_by, order_by, frame })
+    }
+
+    /// Parse ORDER BY columns in window specification.
+    fn parse_window_order_by(input: &str) -> Result<Vec<WindowOrderBy>> {
+        let mut result = Vec::new();
+        let (ob_str, _) = Self::consume_until_keywords(input, &["ROWS", "RANGE"]);
+        
+        for part in ob_str.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let upper = part.to_uppercase();
+            let (col, ascending) = if upper.ends_with(" DESC") {
+                (part[..part.len() - 5].trim().to_string(), false)
+            } else if upper.ends_with(" ASC") {
+                (part[..part.len() - 4].trim().to_string(), true)
+            } else {
+                (part.to_string(), true)
+            };
+            result.push(WindowOrderBy { column: col, ascending });
+        }
+
+        Ok(result)
+    }
+
+    /// Parse window frame specification.
+    fn parse_window_frame(input: &str, frame_type: WindowFrameType) -> Result<WindowFrame> {
+        let upper = input.to_uppercase();
+        
+        // Parse: ROWS BETWEEN <start> AND <end>
+        let between_pos = Self::find_unquoted(&upper, "BETWEEN")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'BETWEEN' in window frame".to_string()))?;
+        let frame_str = &input[between_pos + 7..].trim();
+
+        // Find AND separator
+        let and_pos = Self::find_unquoted(&frame_str.to_uppercase(), " AND ")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'AND' in window frame".to_string()))?;
+
+        let start_str = frame_str[..and_pos].trim();
+        let end_str = frame_str[and_pos + 5..].trim();
+
+        let start = Self::parse_frame_bound(start_str)?;
+        let end = Some(Self::parse_frame_bound(end_str)?);
+
+        Ok(WindowFrame { frame_type, start, end })
+    }
+
+    /// Parse a window frame bound.
+    fn parse_frame_bound(input: &str) -> Result<WindowFrameBound> {
+        let upper = input.trim().to_uppercase();
+        match upper.as_str() {
+            "UNBOUNDED PRECEDING" => Ok(WindowFrameBound::UnboundedPreceding),
+            "UNBOUNDED FOLLOWING" => Ok(WindowFrameBound::UnboundedFollowing),
+            "CURRENT ROW" => Ok(WindowFrameBound::CurrentRow),
+            _ => {
+                if upper.ends_with("PRECEDING") {
+                    let n_str = upper[..upper.len() - 9].trim();
+                    let n = n_str.parse::<u64>()
+                        .map_err(|_| CoreError::InvalidArgument("invalid frame bound".to_string()))?;
+                    Ok(WindowFrameBound::Preceding(n))
+                } else if upper.ends_with("FOLLOWING") {
+                    let n_str = upper[..upper.len() - 9].trim();
+                    let n = n_str.parse::<u64>()
+                        .map_err(|_| CoreError::InvalidArgument("invalid frame bound".to_string()))?;
+                    Ok(WindowFrameBound::Following(n))
+                } else {
+                    Err(CoreError::InvalidArgument(format!("invalid frame bound: {}", input)))
+                }
+            }
+        }
+    }
+
+    /// Find matching closing parenthesis.
+    fn find_matching_paren(input: &str) -> Result<usize> {
+        let mut depth = 0;
+        for (i, c) in input.char_indices() {
+            if c == '(' { depth += 1; }
+            if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(i);
+                }
+            }
+        }
+        Err(CoreError::InvalidArgument("unmatched parenthesis".to_string()))
     }
 
     /// Consumes input until a keyword is found. Returns (consumed, remaining).
@@ -1360,6 +1704,49 @@ impl QueryParser {
             .find(|c: char| c.is_whitespace() || c == ';' || c == ',')
             .unwrap_or(input.len());
         (input[..end].to_string(), input[end..].trim().to_string())
+    }
+
+    /// Parse CREATE MATERIALIZED VIEW <name> AS <query>
+    fn parse_create_materialized_view(input: &str) -> Result<QueryAst> {
+        let upper = input.to_uppercase();
+        if !upper.starts_with("CREATE MATERIALIZED VIEW") {
+            return Err(CoreError::InvalidArgument("expected CREATE MATERIALIZED VIEW".to_string()));
+        }
+
+        let rest = input[24..].trim();
+        let as_pos = rest.to_uppercase().find(" AS ")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'AS' in CREATE MATERIALIZED VIEW".to_string()))?;
+
+        let name = rest[..as_pos].trim().to_string();
+        let query_str = rest[as_pos + 4..].trim();
+        let query = Self::parse(query_str)?;
+
+        Ok(QueryAst::CreateMaterializedView {
+            name,
+            query: Box::new(query),
+        })
+    }
+
+    /// Parse DROP MATERIALIZED VIEW <name>
+    fn parse_drop_materialized_view(input: &str) -> Result<QueryAst> {
+        let upper = input.to_uppercase();
+        if !upper.starts_with("DROP MATERIALIZED VIEW") {
+            return Err(CoreError::InvalidArgument("expected DROP MATERIALIZED VIEW".to_string()));
+        }
+
+        let name = input[22..].trim().to_string();
+        Ok(QueryAst::DropMaterializedView { name })
+    }
+
+    /// Parse REFRESH MATERIALIZED VIEW <name>
+    fn parse_refresh_materialized_view(input: &str) -> Result<QueryAst> {
+        let upper = input.to_uppercase();
+        if !upper.starts_with("REFRESH MATERIALIZED VIEW") {
+            return Err(CoreError::InvalidArgument("expected REFRESH MATERIALIZED VIEW".to_string()));
+        }
+
+        let name = input[24..].trim().to_string();
+        Ok(QueryAst::RefreshMaterializedView { name })
     }
 
     fn parse_literal(s: &str) -> Result<LiteralValue> {

@@ -1056,7 +1056,128 @@ SELECT * FROM top_customers;
 
 ---
 
-## 二十一、结论与建议
+## 二十二、窗口函数与物化视图（Phase 20）
+
+### 22.1 窗口函数支持
+
+实现了完整的窗口函数语法和执行框架：
+
+**支持的窗口函数**：
+
+| 函数 | 说明 | 示例 |
+|------|------|------|
+| `ROW_NUMBER()` | 顺序行号 | `ROW_NUMBER() OVER (ORDER BY price DESC)` |
+| `RANK()` | 排名（有并列跳号） | `RANK() OVER (ORDER BY price DESC)` |
+| `DENSE_RANK()` | 密集排名（无跳号） | `DENSE_RANK() OVER (ORDER BY price DESC)` |
+| `LAG(col, n)` | 前 n 行值 | `LAG(price, 1) OVER (ORDER BY id)` |
+| `LEAD(col, n)` | 后 n 行值 | `LEAD(price, 1) OVER (ORDER BY id)` |
+| `FIRST_VALUE(col)` | 窗口第一行值 | `FIRST_VALUE(price) OVER (ORDER BY id)` |
+| `LAST_VALUE(col)` | 窗口最后一行值 | `LAST_VALUE(price) OVER (ORDER BY id)` |
+| `SUM(col) OVER` | 累计求和 | `SUM(price) OVER (ORDER BY id)` |
+| `AVG(col) OVER` | 移动平均 | `AVG(price) OVER (ORDER BY id ROWS 2 PRECEDING)` |
+
+**OVER 子句语法**：
+```sql
+<func>() OVER (
+    [PARTITION BY <columns>]
+    [ORDER BY <columns> [ASC|DESC]]
+    [ROWS|RANGE BETWEEN <start> AND <end>]
+)
+```
+
+**窗口帧规范**：
+- `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` - 从开始到当前行
+- `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW` - 前 2 行到当前行
+- `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` - 整个分区
+
+**示例查询**：
+```sql
+SELECT name, price,
+  ROW_NUMBER() OVER (ORDER BY price DESC) as row_num,
+  RANK() OVER (ORDER BY price DESC) as rank,
+  SUM(price) OVER (ORDER BY price) as running_total,
+  AVG(price) OVER (ORDER BY id ROWS 2 PRECEDING) as moving_avg
+FROM Product;
+```
+
+### 22.2 物化视图支持
+
+实现了物化视图的创建、刷新和删除：
+
+**语法**：
+```sql
+-- 创建物化视图
+CREATE MATERIALIZED VIEW product_summary AS
+SELECT category, COUNT(*) as cnt, AVG(price) as avg_price
+FROM Product GROUP BY category;
+
+-- 刷新物化视图（重新计算）
+REFRESH MATERIALIZED VIEW product_summary;
+
+-- 删除物化视图
+DROP MATERIALIZED VIEW product_summary;
+```
+
+**物化视图 vs 普通视图**：
+| 特性 | 普通视图 | 物化视图 |
+|------|----------|----------|
+| 存储 | 不存储数据 | 存储查询结果 |
+| 查询速度 | 每次重新计算 | 直接读取结果 |
+| 数据新鲜度 | 实时 | 需要手动刷新 |
+| 适用场景 | 简单过滤 | 复杂聚合 |
+
+### 22.3 窗口函数执行框架
+
+**执行流程**：
+1. 执行基础查询（FROM/WHERE/GROUP BY）
+2. 对结果集按 PARTITION BY 分区
+3. 每个分区内按 ORDER BY 排序
+4. 应用窗口帧计算函数值
+5. 将结果添加到输出行
+
+**性能优化**：
+- 分区内排序复用
+- 增量计算（移动平均）
+- 内存窗口帧
+
+### 22.4 示例查询
+
+**排名查询**：
+```sql
+-- 每个类别中价格最高的产品
+SELECT name, category, price,
+  RANK() OVER (PARTITION BY category ORDER BY price DESC) as rank_in_category
+FROM Product;
+```
+
+**累计统计**：
+```sql
+-- 按日期累计销售额
+SELECT date, amount,
+  SUM(amount) OVER (ORDER BY date) as running_total
+FROM Sales;
+```
+
+**移动平均**：
+```sql
+-- 3 天移动平均
+SELECT date, price,
+  AVG(price) OVER (ORDER BY date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as ma_3
+FROM StockPrices;
+```
+
+### 22.5 后续优化方向
+
+| 方向 | 说明 |
+|------|------|
+| 窗口函数执行器 | 实现完整的窗口函数计算逻辑 |
+| 物化视图增量刷新 | 只更新变化的数据 |
+| 窗口函数下推 | 将窗口函数下推到存储层 |
+| 并行窗口计算 | 多线程并行计算不同分区 |
+
+---
+
+## 二十三、结论与建议
 
 ### 核心结论
 

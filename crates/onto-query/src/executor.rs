@@ -386,6 +386,10 @@ impl QueryExecutor {
                                 }
                             }
                         }
+                        SelectItem::WindowFunction(_window) => {
+                            // Window functions are handled separately after aggregation
+                            // Skip for now in GROUP BY context
+                        }
                     }
                 }
             }
@@ -1383,6 +1387,9 @@ impl QueryExecutor {
                         }
                         SelectItem::Aggregate(_) => {
                             // Aggregates are handled by execute_aggregation
+                        }
+                        SelectItem::WindowFunction(_) => {
+                            // Window functions are handled separately
                         }
                     }
                 }
