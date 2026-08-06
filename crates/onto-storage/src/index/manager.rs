@@ -101,6 +101,7 @@ impl IndexManager {
     }
 
     /// Opens existing disk-based indexes from the data directory.
+    /// Corrupted `.idx` files are automatically deleted so they can be rebuilt.
     pub fn open_disk_indexes(&mut self) -> Result<(), String> {
         let data_dir = match &self.data_dir {
             Some(d) => d.clone(),
@@ -119,6 +120,12 @@ impl IndexManager {
             if path.extension().and_then(|e| e.to_str()) == Some("idx") {
                 let filename = path.file_stem().and_then(|f| f.to_str()).unwrap_or("");
                 if let Some((class, column)) = filename.split_once('_') {
+                    // Validate before opening — if corrupted, delete and skip
+                    if !BTreeIndex::validate(&path) {
+                        eprintln!("Warning: corrupted disk index {}, deleting for rebuild", path.display());
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
                     match BTreeIndex::open(&path) {
                         Ok(idx) => {
                             let key = (class.to_string(), column.to_string());
@@ -129,7 +136,8 @@ impl IndexManager {
                                 .or_insert_with(|| BPlusTree::new(class, column));
                         }
                         Err(e) => {
-                            eprintln!("Warning: failed to open disk index {}: {}", path.display(), e);
+                            eprintln!("Warning: failed to open disk index {}, deleting: {}", path.display(), e);
+                            let _ = std::fs::remove_file(&path);
                         }
                     }
                 }
@@ -410,6 +418,9 @@ impl IndexManager {
     /// Call this on startup after loading SSTables.
     ///
     /// Index entries have key format: `__idx__{class}__{column}::{encoded_value}::{primary_key}`
+    ///
+    /// If a disk-based index is missing (e.g., corrupted `.idx` file was deleted),
+    /// it is automatically recreated from the LSM entries.
     pub fn rebuild_from_entries(&mut self, entries: &[(Vec<u8>, Vec<u8>)]) {
         for (key, _value) in entries {
             if let Some((class, column, encoded_val, pk)) = Self::parse_index_key(key) {
@@ -420,8 +431,22 @@ impl IndexManager {
                     .or_insert_with(|| BPlusTree::new(&class, &column));
                 tree.insert(encoded_val.clone(), pk.clone());
 
-                // Rebuild disk-based index if present
+                // Rebuild disk-based index — create if missing
                 let disk_key = (class.clone(), column.clone());
+                if !self.disk_indexes.contains_key(&disk_key) {
+                    // Disk index missing (corrupted file was deleted or never existed) — recreate
+                    if let Some(path) = self.index_path(&class, &column) {
+                        match BTreeIndex::create(&path, &class, &column) {
+                            Ok(idx) => {
+                                self.disk_indexes.insert(disk_key.clone(), idx);
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: failed to create disk index {}.{}: {}", class, column, e);
+                                continue;
+                            }
+                        }
+                    }
+                }
                 if let Some(disk_idx) = self.disk_indexes.get_mut(&disk_key) {
                     if let Err(e) = disk_idx.insert(&encoded_val, pk) {
                         eprintln!("Warning: disk index rebuild failed for {}.{}: {}", class, column, e);
@@ -430,7 +455,7 @@ impl IndexManager {
             }
         }
 
-        // Flush all disk indexes after rebuild
+        // Flush all disk indexes after rebuild (with fsync)
         for (_, disk_idx) in &mut self.disk_indexes {
             let _ = disk_idx.flush();
         }
@@ -537,5 +562,48 @@ mod tests {
         let c = IndexManager::encode_value(&json!(1000));
         assert!(a < b);
         assert!(b < c);
+    }
+
+    #[test]
+    fn test_corrupted_idx_file_deleted_and_rebuilt() {
+        use crate::index::disk::BTreeIndex;
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Create a valid disk index
+        let idx_path = data_dir.join("Product_price.idx");
+        {
+            let mut idx = BTreeIndex::create(&idx_path, "Product", "price").unwrap();
+            idx.insert(b"100", b"pk1".to_vec()).unwrap();
+            idx.flush().unwrap();
+        }
+        assert!(idx_path.exists());
+
+        // Corrupt the file (overwrite with garbage)
+        std::fs::write(&idx_path, b"garbage data that is not a valid index").unwrap();
+
+        // Open manager — should detect corruption and delete the file
+        let mut mgr = IndexManager::with_disk_storage(&data_dir, IndexStorageMode::DiskBased);
+        mgr.open_disk_indexes().unwrap();
+
+        // Corrupted file should be deleted
+        assert!(!idx_path.exists(), "corrupted .idx file should be deleted");
+
+        // Now rebuild from LSM entries
+        let entries = vec![
+            (b"__idx__Product__price::00000000000000000100::pk1".to_vec(), Vec::new()),
+            (b"__idx__Product__price::00000000000000000200::pk2".to_vec(), Vec::new()),
+        ];
+        mgr.rebuild_from_entries(&entries);
+
+        // Disk index should be recreated
+        assert!(idx_path.exists(), ".idx file should be recreated after rebuild");
+        assert!(mgr.has_index("Product", "price"));
+
+        // Verify data is accessible
+        let pks = mgr.lookup_eq("Product", "price", &json!(100)).unwrap();
+        assert_eq!(pks.len(), 1);
+        assert_eq!(pks[0], b"pk1");
     }
 }

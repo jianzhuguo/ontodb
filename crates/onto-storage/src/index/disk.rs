@@ -913,9 +913,26 @@ impl BTreeIndex {
         &self.meta
     }
 
-    /// Flushes all dirty pages to disk.
+    /// Flushes all dirty pages to disk and fsync.
     pub fn flush(&mut self) -> Result<()> {
-        self.pool.flush(&mut self.file)
+        self.pool.flush(&mut self.file)?;
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Validates that the index file is readable and has a valid header.
+    pub fn validate(path: &Path) -> bool {
+        match std::fs::File::open(path) {
+            Ok(mut file) => {
+                let mut buf = [0u8; PAGE_SIZE];
+                use std::io::Read;
+                if file.read_exact(&mut buf).is_err() {
+                    return false;
+                }
+                IndexMeta::decode(&buf).is_some()
+            }
+            Err(_) => false,
+        }
     }
 
     // ── Page I/O helpers ─────────────────────────────────────────
