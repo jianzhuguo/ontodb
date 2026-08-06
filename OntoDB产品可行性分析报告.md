@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.15 | 更新日期：2026-08-06
+> 版本：v1.16 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -1310,7 +1310,91 @@ CREATE INDEX ON Product (name, price);
 
 ---
 
-## 二十五、结论与建议
+## 二十五、SQL 完整性增强（Phase 23）
+
+### 25.1 LIMIT OFFSET 分页
+
+```sql
+SELECT name, price FROM Product ORDER BY price LIMIT 10 OFFSET 20;
+```
+
+OFFSET 在 LIMIT 之前应用，支持标准分页查询模式。
+
+### 25.2 批量 INSERT
+
+```sql
+INSERT INTO Product (name, price) VALUES
+  ('iPhone', 999),
+  ('iPad', 799),
+  ('MacBook', 1999);
+```
+
+一次插入多行数据，减少网络往返。
+
+### 25.3 INSERT INTO SELECT
+
+```sql
+INSERT INTO Archive (name, price)
+SELECT name, price FROM Product WHERE price < 500;
+```
+
+从查询结果批量插入，列名自动映射。
+
+### 25.4 UPSERT (ON CONFLICT)
+
+```sql
+INSERT INTO Product (name, price) VALUES ('iPhone', 1099)
+ON CONFLICT (name) DO UPDATE SET price = 1099;
+```
+
+冲突时更新，不存在时插入。支持唯一键冲突检测。
+
+### 25.5 内置函数库
+
+| 函数 | 说明 | 示例 |
+|------|------|------|
+| `COALESCE(a, b, ...)` | 第一个非 NULL 值 | `COALESCE(nickname, name, 'anonymous')` |
+| `NULLIF(a, b)` | a=b 时返回 NULL | `NULLIF(status, '')` |
+| `CONCAT(a, b, ...)` | 字符串拼接 | `CONCAT(first, ' ', last)` |
+| `SUBSTRING(s, start, len)` | 子串提取 | `SUBSTRING(name, 1, 3)` |
+| `UPPER(s)` / `LOWER(s)` | 大小写转换 | `UPPER(email)` |
+| `NOW()` | 当前时间戳 | `NOW()` |
+| `LENGTH(s)` | 字符串长度 | `LENGTH(name)` |
+| `TRIM(s)` | 去空白 | `TRIM(input)` |
+| `ABS(n)` | 绝对值 | `ABS(delta)` |
+| `ROUND(n, d)` | 四舍五入 | `ROUND(price, 2)` |
+
+### 25.6 递归 CTE
+
+```sql
+WITH RECURSIVE tree AS (
+  SELECT id, name, parent_id FROM Category WHERE parent_id IS NULL
+  UNION ALL
+  SELECT c.id, c.name, c.parent_id
+  FROM Category c JOIN tree t ON c.parent_id = t.id
+)
+SELECT * FROM tree;
+```
+
+`WITH RECURSIVE` 语法已解析，支持层次结构和图遍历查询。
+
+### 25.7 事务命令
+
+```sql
+BEGIN;
+INSERT INTO Product (name, price) VALUES ('Test', 999);
+COMMIT;
+```
+
+BEGIN / COMMIT / ROLLBACK 命令已解析（当前为 auto-commit 模式）。
+
+### 25.8 Bug 修复
+
+- `split_quoted()` 现在跟踪括号深度，修复了 `COALESCE(name, 'unknown')` 等函数参数中逗号被错误分割的问题
+
+---
+
+## 二十六、结论与建议
 
 ### 核心结论
 
@@ -1319,8 +1403,8 @@ CREATE INDEX ON Product (name, price);
 3. **100% 自研核心引擎是正确策略**：存储引擎、本体引擎、查询引擎、事务引擎必须自主掌控，基础设施（Raft、序列化、压缩）选择性复用
 4. **跨平台无实质风险**：当前 Rust 代码天然跨平台，Windows 开发 → Linux 生产完全可行，CI 双平台构建是最低成本保障
 5. **范围是最大风险**：必须砍掉 80% 的外围功能，聚焦核心
-6. **代码质量持续提升**：113 个测试全部通过（72 lib + 41 integration），查询引擎覆盖 Phase 15-22 全部功能
-7. **查询引擎已具备完整 OLAP 能力**：窗口函数、CTE、CASE WHEN、子查询、JOIN（Hash/SortMerge/NestedLoop）、EXPLAIN ANALYZE、Plan Cache、ICD
+6. **代码质量持续提升**：121 个测试全部通过（80 lib + 41 integration），查询引擎覆盖 Phase 15-23 全部功能
+7. **查询引擎已具备完整 OLAP 能力**：窗口函数、CTE、CASE WHEN、子查询、JOIN（Hash/SortMerge/NestedLoop）、EXPLAIN ANALYZE、Plan Cache、ICD、LIMIT OFFSET、UPSERT、11 个内置函数
 
 ### 性能基线（v1.8）
 
