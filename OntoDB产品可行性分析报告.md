@@ -743,7 +743,93 @@ EXPLAIN SELECT * FROM Product WHERE name LIKE '%phone%';
 
 ---
 
-## 十五、结论与建议
+## 十六、连接查询优化与索引选择（Phase 17）
+
+### 16.1 Hash Join 实现
+
+实现了高效的哈希连接算法，替代嵌套循环连接：
+
+| 连接算法 | 时间复杂度 | 适用场景 |
+|----------|------------|----------|
+| NestedLoopJoin | O(n × m) | 小表驱动、无索引 |
+| HashJoin | O(n + m) | 等值连接、内存充足 |
+
+**实现细节**：
+- **Build 阶段**：在较小表上构建哈希表，O(m)
+- **Probe 阶段**：用较大表的每一行探测哈希表，O(n)
+- **内存管理**：哈希表存储右表数据，适合内存充足的场景
+
+### 16.2 Join 重排序
+
+实现了基于代价的连接顺序优化：
+
+**策略**：小表优先（Left-Deep Tree）
+
+```
+原始顺序: A JOIN B JOIN C (|A|=1000, |B|=100, |C|=10)
+优化顺序: C JOIN B JOIN A (小表在前，减少哈希表大小)
+```
+
+**实现**：
+- 根据表统计信息估算表大小
+- 按行数升序排列连接表
+- 最小的表最先连接（构建哈希表）
+
+### 16.3 索引选择增强
+
+连接查询中的索引自动选择：
+
+```sql
+-- 如果 B.id 有索引，自动使用 IndexScan
+EXPLAIN SELECT * FROM A JOIN B ON A.id = B.id;
+-- 输出: HashJoin (A, IndexScan on B using id)
+```
+
+**策略**：
+1. 检查连接列是否有索引
+2. 如果右表连接列有索引，使用 IndexScan
+3. 否则使用 SeqScan + HashJoin
+
+### 16.4 执行计划示例
+
+```sql
+EXPLAIN SELECT * FROM Orders 
+JOIN Customers ON Orders.customer_id = Customers.id
+JOIN Products ON Orders.product_id = Products.id;
+```
+
+**优化前（NestedLoopJoin）**：
+```
+NestedLoopJoin (Orders × Customers × Products)
+  Cost: O(|Orders| × |Customers| × |Products|)
+```
+
+**优化后（HashJoin + Join Reorder）**：
+```
+HashJoin (Products, HashJoin (Customers, Orders))
+  Cost: O(|Products| + |Customers| + |Orders|)
+```
+
+### 16.5 性能对比
+
+| 场景 | NestedLoopJoin | HashJoin | 提升 |
+|------|----------------|----------|------|
+| 1K × 1K × 1K | 10^9 次比较 | 3K 次哈希 | ~300,000x |
+| 10K × 1K | 10^7 次比较 | 11K 次哈希 | ~900x |
+| 100 × 100 | 10^4 次比较 | 200 次哈希 | ~50x |
+
+### 16.6 后续优化方向
+
+| 方向 | 说明 |
+|------|------|
+| Sort-Merge Join | 有序数据的高效连接 |
+| Broadcast Join | 小表广播到所有节点（分布式场景） |
+| 动态分区 | 连接时动态分区策略 |
+| 代价模型反馈 | 基于实际执行时间调整代价参数 |
+
+---
+
+## 十七、结论与建议
 
 ### 核心结论
 

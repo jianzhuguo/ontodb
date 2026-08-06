@@ -422,8 +422,9 @@ impl QueryPlanner {
             );
         }
 
-        // Apply joins
-        for join in joins {
+        // Apply joins - use hash join for better performance
+        let ordered_joins = self.reorder_joins(joins);
+        for join in &ordered_joins {
             let right_stats = self.stats.get(&join.table).cloned().unwrap_or_else(|| TableStats {
                 row_count: 100,
                 avg_row_size: 100,
@@ -432,17 +433,40 @@ impl QueryPlanner {
                 secondary_indexes: Vec::new(),
                 vector_indexes: Vec::new(),
             });
-            let right_cost = self.cost_model.seq_scan_cost(&right_stats);
-            let join_cost = self.cost_model.nested_loop_join_cost(&current_cost, &right_cost);
 
-            current_node = PlanNode::NestedLoopJoin {
-                left: Box::new(current_node),
-                right: Box::new(PlanNode::SeqScan {
+            // Check if join column has an index for potential index scan
+            let right_col = join.on.right.split('.').last().unwrap_or(&join.on.right);
+            let has_index = right_stats.secondary_indexes.iter().any(|i| i.column == right_col);
+
+            let right_plan = if has_index {
+                // Use index scan for the right side of join
+                let index = right_stats.secondary_indexes.iter().find(|i| i.column == right_col).unwrap();
+                let index_cost = self.cost_model.index_range_scan_cost(&right_stats, index, 1.0);
+                PlanNode::IndexScan {
+                    table: join.table.clone(),
+                    alias: join.alias.clone(),
+                    index_column: right_col.to_string(),
+                    filter: None,
+                    estimated_rows: index_cost.rows,
+                }
+            } else {
+                // Use sequential scan
+                let right_cost = self.cost_model.seq_scan_cost(&right_stats);
+                PlanNode::SeqScan {
                     table: join.table.clone(),
                     alias: join.alias.clone(),
                     filter: None,
                     estimated_rows: right_cost.rows,
-                }),
+                }
+            };
+
+            // Use hash join for equi-joins (better performance)
+            let right_cost = self.cost_model.seq_scan_cost(&right_stats);
+            let join_cost = self.cost_model.hash_join_cost(&current_cost, &right_cost);
+
+            current_node = PlanNode::HashJoin {
+                left: Box::new(current_node),
+                right: Box::new(right_plan),
                 join_clause: join.clone(),
                 estimated_rows: join_cost.rows,
             };
@@ -528,8 +552,9 @@ impl QueryPlanner {
         };
         let mut current_cost = index_cost;
 
-        // Apply joins
-        for join in joins {
+        // Apply joins - use hash join for better performance
+        let ordered_joins = self.reorder_joins(joins);
+        for join in &ordered_joins {
             let right_stats = self.stats.get(&join.table).cloned().unwrap_or_else(|| TableStats {
                 row_count: 100,
                 avg_row_size: 100,
@@ -538,17 +563,40 @@ impl QueryPlanner {
                 secondary_indexes: Vec::new(),
                 vector_indexes: Vec::new(),
             });
-            let right_cost = self.cost_model.seq_scan_cost(&right_stats);
-            let join_cost = self.cost_model.nested_loop_join_cost(&current_cost, &right_cost);
 
-            current_node = PlanNode::NestedLoopJoin {
-                left: Box::new(current_node),
-                right: Box::new(PlanNode::SeqScan {
+            // Check if join column has an index for potential index scan
+            let right_col = join.on.right.split('.').last().unwrap_or(&join.on.right);
+            let has_index = right_stats.secondary_indexes.iter().any(|i| i.column == right_col);
+
+            let right_plan = if has_index {
+                // Use index scan for the right side of join
+                let index = right_stats.secondary_indexes.iter().find(|i| i.column == right_col).unwrap();
+                let index_cost = self.cost_model.index_range_scan_cost(&right_stats, index, 1.0);
+                PlanNode::IndexScan {
+                    table: join.table.clone(),
+                    alias: join.alias.clone(),
+                    index_column: right_col.to_string(),
+                    filter: None,
+                    estimated_rows: index_cost.rows,
+                }
+            } else {
+                // Use sequential scan
+                let right_cost = self.cost_model.seq_scan_cost(&right_stats);
+                PlanNode::SeqScan {
                     table: join.table.clone(),
                     alias: join.alias.clone(),
                     filter: None,
                     estimated_rows: right_cost.rows,
-                }),
+                }
+            };
+
+            // Use hash join for equi-joins (better performance)
+            let right_cost = self.cost_model.seq_scan_cost(&right_stats);
+            let join_cost = self.cost_model.hash_join_cost(&current_cost, &right_cost);
+
+            current_node = PlanNode::HashJoin {
+                left: Box::new(current_node),
+                right: Box::new(right_plan),
                 join_clause: join.clone(),
                 estimated_rows: join_cost.rows,
             };
@@ -643,6 +691,30 @@ impl QueryPlanner {
         };
 
         Ok(ExecutionPlan::new(node, cost).with_index())
+    }
+
+    /// Reorder joins for optimal execution.
+    /// Strategy: smallest tables first (left-deep tree).
+    /// This minimizes the size of the hash table built in hash joins.
+    fn reorder_joins(&self, joins: &[JoinClause]) -> Vec<JoinClause> {
+        if joins.len() <= 1 {
+            return joins.to_vec();
+        }
+
+        // Sort joins by estimated table size (smallest first)
+        let mut ordered: Vec<(usize, &JoinClause, u64)> = joins
+            .iter()
+            .enumerate()
+            .map(|(i, j)| {
+                let stats = self.stats.get(&j.table);
+                let row_count = stats.map(|s| s.row_count).unwrap_or(100);
+                (i, j, row_count)
+            })
+            .collect();
+
+        ordered.sort_by_key(|&(_, _, rows)| rows);
+
+        ordered.into_iter().map(|(_, j, _)| j.clone()).collect()
     }
 
     /// Plan a UNION query.

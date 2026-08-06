@@ -541,52 +541,60 @@ impl QueryExecutor {
             None => Self::full_scan(engine, txn_id, from)?,
         };
 
-        // JOIN expansion (same logic as non-txn version)
+        // JOIN expansion - use hash join for better performance
         if !joins.is_empty() {
             for join in joins {
-                let join_prefix = format!("{}::", join.table);
-                let right_entries = engine.txn_scan_prefix(txn_id, join_prefix.as_bytes())?;
-                let right_alias = join.alias.as_deref().unwrap_or(&join.table);
-                let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+                if Self::should_use_hash_join(join) {
+                    // Hash join: O(n + m)
+                    left_rows = Self::execute_hash_join(
+                        engine, txn_id, left_rows, join, from_alias,
+                    )?;
+                } else {
+                    // Fallback to nested loop join: O(n * m)
+                    let join_prefix = format!("{}::", join.table);
+                    let right_entries = engine.txn_scan_prefix(txn_id, join_prefix.as_bytes())?;
+                    let right_alias = join.alias.as_deref().unwrap_or(&join.table);
+                    let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
 
-                let mut right_rows: Vec<Map<String, Value>> = Vec::new();
-                for (_key, val_bytes) in &right_entries {
-                    if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
-                        if doc.get("__class__").and_then(|v| v.as_str()) == Some(&join.table) {
-                            right_rows.push(doc);
+                    let mut right_rows: Vec<Map<String, Value>> = Vec::new();
+                    for (_key, val_bytes) in &right_entries {
+                        if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
+                            if doc.get("__class__").and_then(|v| v.as_str()) == Some(&join.table) {
+                                right_rows.push(doc);
+                            }
                         }
                     }
-                }
 
-                let mut new_rows: Vec<Map<String, Value>> = Vec::new();
-                for left_row in &left_rows {
-                    let left_val = Self::resolve_column_value(left_row, &left_col);
-                    for right_row in &right_rows {
-                        let right_val = Self::resolve_column_value(right_row, &right_col);
-                        if left_val.is_some() && right_val.is_some() && left_val == right_val {
-                            let mut merged = Map::new();
-                            for (k, v) in left_row {
-                                let key = match from_alias {
-                                    Some(alias) => format!("{}.{}", alias, k),
-                                    None => k.clone(),
-                                };
-                                merged.insert(key, v.clone());
-                                if from_alias.is_some() && !merged.contains_key(k) {
-                                    merged.insert(k.clone(), v.clone());
+                    let mut new_rows: Vec<Map<String, Value>> = Vec::new();
+                    for left_row in &left_rows {
+                        let left_val = Self::resolve_column_value(left_row, &left_col);
+                        for right_row in &right_rows {
+                            let right_val = Self::resolve_column_value(right_row, &right_col);
+                            if left_val.is_some() && right_val.is_some() && left_val == right_val {
+                                let mut merged = Map::new();
+                                for (k, v) in left_row {
+                                    let key = match from_alias {
+                                        Some(alias) => format!("{}.{}", alias, k),
+                                        None => k.clone(),
+                                    };
+                                    merged.insert(key, v.clone());
+                                    if from_alias.is_some() && !merged.contains_key(k) {
+                                        merged.insert(k.clone(), v.clone());
+                                    }
                                 }
-                            }
-                            for (k, v) in right_row {
-                                let key = format!("{}.{}", right_alias, k);
-                                merged.insert(key, v.clone());
-                                if !merged.contains_key(k) {
-                                    merged.insert(k.clone(), v.clone());
+                                for (k, v) in right_row {
+                                    let key = format!("{}.{}", right_alias, k);
+                                    merged.insert(key, v.clone());
+                                    if !merged.contains_key(k) {
+                                        merged.insert(k.clone(), v.clone());
+                                    }
                                 }
+                                new_rows.push(merged);
                             }
-                            new_rows.push(merged);
                         }
                     }
+                    left_rows = new_rows;
                 }
-                left_rows = new_rows;
             }
         }
 
@@ -627,6 +635,84 @@ impl QueryExecutor {
             rows.truncate(limit);
         }
         Ok(QueryResult::Rows(rows))
+    }
+
+    /// Performs a hash join between left_rows and the right table.
+    /// More efficient than nested loop join for equi-joins: O(n + m) vs O(n * m).
+    fn execute_hash_join(
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        left_rows: Vec<Map<String, Value>>,
+        join: &crate::parser::JoinClause,
+        left_alias: Option<&str>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let right_alias = join.alias.as_deref().unwrap_or(&join.table);
+        let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+
+        // Phase 1: Build hash table on the right side
+        let join_prefix = format!("{}::", join.table);
+        let right_entries = engine.txn_scan_prefix(txn_id, join_prefix.as_bytes())?;
+
+        let mut hash_table: std::collections::HashMap<String, Vec<Map<String, Value>>> =
+            std::collections::HashMap::new();
+
+        for (_key, val_bytes) in &right_entries {
+            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
+                if doc.get("__class__").and_then(|v| v.as_str()) == Some(&join.table) {
+                    if let Some(val) = Self::resolve_column_value(&doc, &right_col) {
+                        hash_table.entry(val).or_default().push(doc);
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Probe hash table with left rows
+        let mut result_rows: Vec<Map<String, Value>> = Vec::new();
+
+        for left_row in &left_rows {
+            if let Some(left_val) = Self::resolve_column_value(left_row, &left_col) {
+                if let Some(matching_rights) = hash_table.get(&left_val) {
+                    for right_row in matching_rights {
+                        let mut merged = Map::new();
+
+                        // Merge left row with alias
+                        for (k, v) in left_row {
+                            let key = match left_alias {
+                                Some(alias) => format!("{}.{}", alias, k),
+                                None => k.clone(),
+                            };
+                            merged.insert(key, v.clone());
+                            if left_alias.is_some() && !merged.contains_key(k) {
+                                merged.insert(k.clone(), v.clone());
+                            }
+                        }
+
+                        // Merge right row with alias
+                        for (k, v) in right_row {
+                            let key = format!("{}.{}", right_alias, k);
+                            merged.insert(key, v.clone());
+                            if !merged.contains_key(k) {
+                                merged.insert(k.clone(), v.clone());
+                            }
+                        }
+
+                        result_rows.push(merged);
+                    }
+                }
+            }
+        }
+
+        Ok(result_rows)
+    }
+
+    /// Determines whether to use hash join or nested loop join.
+    /// Hash join is preferred for equi-joins when:
+    /// - The join condition is equality (=)
+    /// - The right side fits in memory
+    fn should_use_hash_join(join: &crate::parser::JoinClause) -> bool {
+        // Currently, all joins are equi-joins (ON left = right)
+        // In the future, we could check statistics to decide
+        true
     }
 
     fn execute_delete_txn(
