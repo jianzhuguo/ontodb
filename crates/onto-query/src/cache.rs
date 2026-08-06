@@ -4,7 +4,6 @@
 //! to avoid redundant computation.
 
 use crate::optimizer::ExecutionPlan;
-use crate::parser::QueryAst;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};

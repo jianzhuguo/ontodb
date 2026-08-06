@@ -155,6 +155,8 @@ pub enum SelectItem {
     Aggregate(AggregateExpr),
     /// A window function: `ROW_NUMBER() OVER (...)`
     WindowFunction(WindowExpr),
+    /// A general expression: CASE WHEN, scalar subquery, arithmetic
+    Expression(ValueExpr),
 }
 
 /// An aggregate function in SELECT: COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col)
@@ -172,6 +174,37 @@ pub enum AggregateFunc {
     Avg,
     Min,
     Max,
+}
+
+/// A value expression that can appear in SELECT, HAVING, etc.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ValueExpr {
+    /// Column reference: `name` or `p.name`
+    Column(String),
+    /// Literal value: 42, 'hello', NULL
+    Literal(LiteralValue),
+    /// CASE WHEN condition THEN result ... [ELSE default] END
+    CaseWhen {
+        when_branches: Vec<(FilterExpr, ValueExpr)>,
+        else_expr: Option<Box<ValueExpr>>,
+    },
+    /// Scalar subquery: (SELECT col FROM table WHERE ...)
+    ScalarSubquery(Box<QueryAst>),
+    /// Arithmetic: left + right
+    Arithmetic {
+        op: ArithmeticOp,
+        left: Box<ValueExpr>,
+        right: Box<ValueExpr>,
+    },
+}
+
+/// Arithmetic operators.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ArithmeticOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
 /// Window function expression.
@@ -820,6 +853,24 @@ impl QueryParser {
                 continue;
             }
             let upper = part.to_uppercase();
+
+            // Check for CASE WHEN expression
+            if upper.starts_with("CASE ") || upper.starts_with("CASE\n") {
+                let case_expr = Self::parse_case_when(part)?;
+                // Check for alias after END
+                let end_upper = part.to_uppercase();
+                let end_pos = end_upper.find(" END").unwrap_or(part.len());
+                let after_end = part[end_pos + 4..].trim();
+                let expr = if after_end.to_uppercase().starts_with("AS ") {
+                    let alias = after_end[3..].trim().to_string();
+                    // Store with alias info — we'll wrap in a named expression
+                    SelectItem::Expression(case_expr)
+                } else {
+                    SelectItem::Expression(case_expr)
+                };
+                items.push(expr);
+                continue;
+            }
 
             // Check for window functions: ROW_NUMBER(), RANK(), etc. with OVER
             if Self::contains_window_function(&upper) {
@@ -1747,6 +1798,138 @@ impl QueryParser {
 
         let name = input[24..].trim().to_string();
         Ok(QueryAst::RefreshMaterializedView { name })
+    }
+
+    /// Parses a CASE WHEN ... THEN ... ELSE ... END expression.
+    fn parse_case_when(input: &str) -> Result<ValueExpr> {
+        let upper = input.to_uppercase();
+        if !upper.starts_with("CASE ") && !upper.starts_with("CASE\n") {
+            return Err(CoreError::InvalidArgument("expected CASE".to_string()));
+        }
+
+        let mut remaining = input[5..].trim();
+        let mut when_branches = Vec::new();
+        let mut else_expr: Option<Box<ValueExpr>> = None;
+
+        loop {
+            let rem_upper = remaining.to_uppercase().trim().to_string();
+
+            if rem_upper.starts_with("WHEN ") || rem_upper.starts_with("WHEN\n") {
+                // Find THEN keyword
+                let then_pos = Self::find_unquoted(&rem_upper, " THEN ")
+                    .ok_or_else(|| CoreError::InvalidArgument("expected THEN after WHEN".to_string()))?;
+                let cond_str = remaining[5..then_pos].trim();
+                remaining = remaining[then_pos + 6..].trim();
+
+                // Parse condition as filter expression
+                let (cond, _) = Self::parse_where(cond_str)?;
+
+                // Find the end of THEN value (next WHEN, ELSE, or END)
+                let (value_str, rest) = Self::consume_until_keywords(
+                    remaining,
+                    &["WHEN", "ELSE", "END"],
+                );
+                let value = Self::parse_value_expr(&value_str)?;
+                remaining = rest;
+
+                if let Some(cond_expr) = cond {
+                    when_branches.push((cond_expr, value));
+                }
+            } else if rem_upper.starts_with("ELSE ") || rem_upper.starts_with("ELSE\n") {
+                remaining = remaining[5..].trim();
+                let (value_str, rest) = Self::consume_until_keywords(remaining, &["END"]);
+                else_expr = Some(Box::new(Self::parse_value_expr(&value_str)?));
+                remaining = rest;
+            } else if rem_upper.starts_with("END") {
+                break;
+            } else {
+                return Err(CoreError::InvalidArgument(format!(
+                    "unexpected token in CASE: {}",
+                    remaining
+                )));
+            }
+        }
+
+        Ok(ValueExpr::CaseWhen {
+            when_branches,
+            else_expr,
+        })
+    }
+
+    /// Parses a value expression: column reference, literal, CASE WHEN, arithmetic, or scalar subquery.
+    fn parse_value_expr(input: &str) -> Result<ValueExpr> {
+        let input = input.trim();
+        let upper = input.to_uppercase();
+
+        // CASE WHEN
+        if upper.starts_with("CASE ") {
+            return Self::parse_case_when(input);
+        }
+
+        // Scalar subquery: (SELECT ...)
+        if input.starts_with('(') && upper[1..].trim_start().starts_with("SELECT") {
+            let subquery = Self::parse_subquery(input)?;
+            return Ok(ValueExpr::ScalarSubquery(Box::new(subquery)));
+        }
+
+        // Try arithmetic: look for + or - outside parentheses
+        // Simple approach: find the rightmost + or - at depth 0
+        if let Some((op, pos)) = Self::find_top_level_arithmetic(input) {
+            let left = Self::parse_value_expr(&input[..pos])?;
+            let right = Self::parse_value_expr(&input[pos + 1..])?;
+            return Ok(ValueExpr::Arithmetic {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            });
+        }
+
+        // Literal
+        if let Ok(lit) = Self::parse_literal(input) {
+            // Check if it's actually a column name that happens to look like a literal
+            // Literals: numbers, quoted strings, NULL, TRUE, FALSE
+            if input.starts_with('\'') || input.starts_with('"')
+                || input.eq_ignore_ascii_case("NULL")
+                || input.eq_ignore_ascii_case("TRUE")
+                || input.eq_ignore_ascii_case("FALSE")
+                || input.parse::<i64>().is_ok()
+                || input.parse::<f64>().is_ok()
+            {
+                return Ok(ValueExpr::Literal(lit));
+            }
+        }
+
+        // Default: column reference
+        Ok(ValueExpr::Column(input.to_string()))
+    }
+
+    /// Finds the top-level arithmetic operator (+ or -) at depth 0, preferring the rightmost one.
+    fn find_top_level_arithmetic(input: &str) -> Option<(ArithmeticOp, usize)> {
+        let mut depth = 0i32;
+        let mut in_quote: Option<char> = None;
+        let mut last_op: Option<(ArithmeticOp, usize)> = None;
+
+        for (i, c) in input.char_indices() {
+            if let Some(q) = in_quote {
+                if c == q { in_quote = None; }
+                continue;
+            }
+            match c {
+                '\'' | '"' => { in_quote = Some(c); }
+                '(' => { depth += 1; }
+                ')' => { depth -= 1; }
+                '+' if depth == 0 => { last_op = Some((ArithmeticOp::Add, i)); }
+                '-' if depth == 0 && i > 0 => { last_op = Some((ArithmeticOp::Sub, i)); }
+                '*' if depth == 0 => {
+                    if last_op.is_none() { last_op = Some((ArithmeticOp::Mul, i)); }
+                }
+                '/' if depth == 0 => {
+                    if last_op.is_none() { last_op = Some((ArithmeticOp::Div, i)); }
+                }
+                _ => {}
+            }
+        }
+        last_op
     }
 
     fn parse_literal(s: &str) -> Result<LiteralValue> {
