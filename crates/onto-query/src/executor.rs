@@ -5,9 +5,10 @@ use crate::optimizer::QueryPlanner;
 use crate::parser::{AggregateFunc, ArithmeticOp, FilterExpr, LiteralValue, QueryAst, SelectColumns, SelectItem, ValueExpr, WindowExpr, WindowFunc};
 use crate::optimizer::{ExecutionPlan, PlanNode, PlanWindowExpr};
 use onto_core::{CoreError, Result};
-use onto_ontology::{DataType, OntologyStore};
+use onto_ontology::{DataType, OntologyStore, Reasoner};
 use onto_storage::LsmEngine;
 use serde_json::{json, Map, Value};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Mutex};
 use std::time::Duration;
@@ -746,16 +747,19 @@ impl QueryExecutor {
             }
         }
 
-        // Regular table scan
-        let prefix = format!("{}::", table);
-        let entries = engine.scan_prefix(prefix.as_bytes())?;
+        // Regular table scan — expand class hierarchy via ontology reasoning
+        let class_hierarchy = self.get_class_hierarchy(engine, table);
         let mut rows = Vec::new();
-        for (key, val_bytes) in &entries {
-            if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
-                if doc.get("__class__").and_then(|v| v.as_str()) == Some(table) {
-                    // Store primary key for DELETE/UPDATE operations
-                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
-                    rows.push(doc);
+        for scan_class in &class_hierarchy {
+            let prefix = format!("{}::", scan_class);
+            let entries = engine.scan_prefix(prefix.as_bytes())?;
+            for (key, val_bytes) in &entries {
+                if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                    if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                        // Store primary key for DELETE/UPDATE operations
+                        doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                        rows.push(doc);
+                    }
                 }
             }
         }
@@ -792,18 +796,31 @@ impl QueryExecutor {
         index_column: &str,
         filter: &Option<FilterExpr>,
     ) -> Result<Vec<Map<String, Value>>> {
-        // Try to use the index for the primary lookup
-        if engine.has_index(table, index_column) {
-            if let Some(f) = filter {
-                // Use index for the filter
-                if let Some(pkeys) = Self::try_index_scan_single(engine, table, f)? {
-                    let mut rows = Self::fetch_rows_by_pks(engine, &pkeys)?;
-                    // Apply alias
-                    if let Some(a) = alias {
-                        Self::apply_alias(&mut rows, a);
+        let class_hierarchy = self.get_class_hierarchy(engine, table);
+
+        // Try to use the index for the primary lookup across the class hierarchy
+        if let Some(f) = filter {
+            let mut all_pkeys: Vec<Vec<u8>> = Vec::new();
+            for scan_class in &class_hierarchy {
+                if engine.has_index(scan_class, index_column) {
+                    if let Some(pkeys) = Self::try_index_scan_single(engine, scan_class, f)? {
+                        all_pkeys.extend(pkeys);
                     }
-                    return Ok(rows);
                 }
+            }
+            if !all_pkeys.is_empty() {
+                let mut rows = Self::fetch_rows_by_pks(engine, &all_pkeys)?;
+                // Filter by class hierarchy
+                rows.retain(|row| {
+                    row.get("__class__")
+                        .and_then(|v| v.as_str())
+                        .map(|c| class_hierarchy.contains(c))
+                        .unwrap_or(false)
+                });
+                if let Some(a) = alias {
+                    Self::apply_alias(&mut rows, a);
+                }
+                return Ok(rows);
             }
         }
 
@@ -848,14 +865,17 @@ impl QueryExecutor {
         }
 
         let search_results = if let Some(f) = filter {
-            let prefix = format!("{}::", table);
-            let entries = engine.scan_prefix(prefix.as_bytes())?;
-            let mut allowed_ids = std::collections::HashSet::new();
-            for (key, val_bytes) in &entries {
-                if let Ok(serde_json::Value::Object(ref doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
-                    if doc.get("__class__").and_then(|v| v.as_str()) == Some(table) {
-                        if Self::eval_filter_static(doc, f) {
-                            allowed_ids.insert(key.clone());
+            let class_hierarchy = self.get_class_hierarchy(engine, table);
+            let mut allowed_ids = HashSet::new();
+            for scan_class in &class_hierarchy {
+                let prefix = format!("{}::", scan_class);
+                let entries = engine.scan_prefix(prefix.as_bytes())?;
+                for (key, val_bytes) in &entries {
+                    if let Ok(serde_json::Value::Object(ref doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                            if Self::eval_filter_static(doc, f) {
+                                allowed_ids.insert(key.clone());
+                            }
                         }
                     }
                 }
@@ -1178,6 +1198,41 @@ impl QueryExecutor {
         Ok(result)
     }
 
+    /// Returns the set of classes to scan for a given table name,
+    /// including all subclasses from the ontology hierarchy.
+    ///
+    /// Uses the inference engine's Cax-sco rule (subclass type propagation)
+    /// to determine the complete class hierarchy: if x type A and A subClassOf B,
+    /// then x type B. This means scanning for class A should include all subclasses.
+    ///
+    /// If no ontology is defined for the class, returns only the original class.
+    fn get_class_hierarchy(&self, engine: &mut LsmEngine, table: &str) -> HashSet<String> {
+        let mut classes = HashSet::new();
+        classes.insert(table.to_string());
+
+        if let Ok(Some(ontology)) = self.ontology_store.find_ontology_for_class(engine, table) {
+            // Use the inference engine's Cax-sco rule for subclass propagation.
+            // The rule propagates types upward: if x type A, then x type B for all B where A subClassOf B.
+            // For scanning, we need the inverse: find all subclasses of the target class.
+            let reasoner = Reasoner::new(ontology.clone());
+            let probe_triple = onto_ontology::Triple::type_of("__probe__", table);
+            let result = reasoner.reason(&[probe_triple]);
+
+            // Collect all inferred type triples for the probe individual
+            for triple in &result.all_facts {
+                if triple.subject == "__probe__" && triple.predicate == "rdf:type" {
+                    classes.insert(triple.object.clone());
+                }
+            }
+
+            // Also get direct subclasses from the ontology (covers the downward direction)
+            let subclasses = ontology.get_all_subclasses(table);
+            classes.extend(subclasses);
+        }
+
+        classes
+    }
+
     /// Apply alias prefix to row column names.
     fn apply_alias(rows: &mut Vec<Map<String, Value>>, alias: &str) {
         for row in rows {
@@ -1231,30 +1286,34 @@ impl QueryExecutor {
 
     /// Executes ANALYZE: collects table statistics for query optimization.
     /// Scans the table, counts rows, and collects column-level statistics.
+    /// Uses class hierarchy expansion to include subclass documents.
     fn execute_analyze(&self, table: &str, engine: &mut LsmEngine) -> Result<QueryResult> {
-        let prefix = format!("{}::", table);
-        let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
-
+        let class_hierarchy = self.get_class_hierarchy(engine, table);
         let mut row_count = 0u64;
         let mut column_stats: std::collections::HashMap<String, ColumnStats> = std::collections::HashMap::new();
 
-        for (_key, val_bytes) in &entries {
-            if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
-                if doc.get("__class__").and_then(|v| v.as_str()) == Some(table) {
-                    row_count += 1;
-                    for (col_name, col_value) in &doc {
-                        if col_name == "__class__" { continue; }
-                        let stats = column_stats.entry(col_name.clone()).or_default();
-                        stats.non_null_count += 1;
-                        // Track distinct values (sample up to 1000)
-                        if stats.distinct_values.len() < 1000 {
-                            let val_str = match col_value {
-                                serde_json::Value::String(s) => s.clone(),
-                                serde_json::Value::Number(n) => n.to_string(),
-                                serde_json::Value::Bool(b) => b.to_string(),
-                                _ => col_value.to_string(),
-                            };
-                            stats.distinct_values.insert(val_str);
+        for scan_class in &class_hierarchy {
+            let prefix = format!("{}::", scan_class);
+            let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
+
+            for (_key, val_bytes) in &entries {
+                if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                    if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                        row_count += 1;
+                        for (col_name, col_value) in &doc {
+                            if col_name == "__class__" { continue; }
+                            let stats = column_stats.entry(col_name.clone()).or_default();
+                            stats.non_null_count += 1;
+                            // Track distinct values (sample up to 1000)
+                            if stats.distinct_values.len() < 1000 {
+                                let val_str = match col_value {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    serde_json::Value::Number(n) => n.to_string(),
+                                    serde_json::Value::Bool(b) => b.to_string(),
+                                    _ => col_value.to_string(),
+                                };
+                                stats.distinct_values.insert(val_str);
+                            }
                         }
                     }
                 }
@@ -2201,17 +2260,20 @@ impl QueryExecutor {
         }
 
         let search_results = if let Some(filter_expr) = filter {
-            // Get document keys matching the filter
-            let prefix = format!("{}::", class);
-            let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
-            let mut allowed_ids = std::collections::HashSet::new();
-            for (key, val_bytes) in &entries {
-                if let Ok(serde_json::Value::Object(ref doc)) =
-                    serde_json::from_slice::<serde_json::Value>(val_bytes)
-                {
-                    if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
-                        if self.matches_filter(engine, doc, &Some(filter_expr.clone())) {
-                            allowed_ids.insert(key.clone());
+            // Get document keys matching the filter, expanding class hierarchy
+            let class_hierarchy = self.get_class_hierarchy(engine, class);
+            let mut allowed_ids = HashSet::new();
+            for scan_class in &class_hierarchy {
+                let prefix = format!("{}::", scan_class);
+                let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
+                for (key, val_bytes) in &entries {
+                    if let Ok(serde_json::Value::Object(ref doc)) =
+                        serde_json::from_slice::<serde_json::Value>(val_bytes)
+                    {
+                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                            if self.matches_filter(engine, doc, &Some(filter_expr.clone())) {
+                                allowed_ids.insert(key.clone());
+                            }
                         }
                     }
                 }

@@ -285,11 +285,20 @@ impl Ontology {
             }
         }
 
-        // Add equivalent classes and their subclasses
+        // Add equivalent classes and their subclasses (bidirectional)
         if let Some(class) = self.classes.get(class_name) {
             for equiv in &class.equivalent_classes {
                 if result.insert(equiv.clone()) {
                     self.collect_subclasses(equiv, result, visited);
+                }
+            }
+        }
+
+        // Check reverse equivalence: other classes that declare class_name as equivalent
+        for (name, class) in &self.classes {
+            if class.equivalent_classes.contains(&class_name.to_string()) {
+                if result.insert(name.clone()) {
+                    self.collect_subclasses(name, result, visited);
                 }
             }
         }
