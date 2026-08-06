@@ -1,5 +1,6 @@
 //! Query executor: runs parsed queries against the storage and ontology engines.
 
+use crate::cache::{PlanCache, QueryCache};
 use crate::optimizer::QueryPlanner;
 use crate::parser::{AggregateFunc, FilterExpr, LiteralValue, QueryAst, SelectColumns, SelectItem};
 use onto_core::{CoreError, Result};
@@ -7,14 +8,19 @@ use onto_ontology::{DataType, OntologyStore};
 use onto_storage::LsmEngine;
 use serde_json::{json, Map, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Mutex};
+use std::time::Duration;
 
-/// Executes parsed queries.
+/// Executes parsed queries with caching support.
 pub struct QueryExecutor {
     engine: Arc<RwLock<LsmEngine>>,
     ontology_store: OntologyStore,
     /// Query planner for optimization.
     planner: QueryPlanner,
+    /// Query result cache.
+    query_cache: Arc<Mutex<QueryCache>>,
+    /// Execution plan cache.
+    plan_cache: Arc<Mutex<PlanCache>>,
     /// Monotonic counter for generating unique document keys.
     doc_counter: AtomicU64,
 }
@@ -25,6 +31,8 @@ impl QueryExecutor {
             engine,
             ontology_store,
             planner: QueryPlanner::new(),
+            query_cache: Arc::new(Mutex::new(QueryCache::new(1000, Duration::from_secs(60)))),
+            plan_cache: Arc::new(Mutex::new(PlanCache::new(500))),
             doc_counter: AtomicU64::new(0),
         }
     }
@@ -37,6 +45,22 @@ impl QueryExecutor {
     /// Get a mutable reference to the query planner (for updating stats).
     pub fn planner_mut(&mut self) -> &mut QueryPlanner {
         &mut self.planner
+    }
+
+    /// Get query cache statistics.
+    pub fn query_cache_stats(&self) -> crate::cache::CacheStats {
+        self.query_cache.lock().unwrap().stats().clone()
+    }
+
+    /// Get plan cache statistics.
+    pub fn plan_cache_stats(&self) -> crate::cache::CacheStats {
+        self.plan_cache.lock().unwrap().stats().clone()
+    }
+
+    /// Clear all caches.
+    pub fn clear_caches(&self) {
+        self.query_cache.lock().unwrap().clear();
+        self.plan_cache.lock().unwrap().clear();
     }
 
     /// Executes a query and returns results as JSON.
@@ -541,10 +565,15 @@ impl QueryExecutor {
             None => Self::full_scan(engine, txn_id, from)?,
         };
 
-        // JOIN expansion - use hash join for better performance
+        // JOIN expansion - choose join algorithm based on data characteristics
         if !joins.is_empty() {
             for join in joins {
-                if Self::should_use_hash_join(join) {
+                if Self::should_use_sort_merge_join(&left_rows, 1000) {
+                    // Sort-merge join for large tables
+                    left_rows = Self::execute_sort_merge_join(
+                        engine, txn_id, left_rows, join, from_alias,
+                    )?;
+                } else if Self::should_use_hash_join(join) {
                     // Hash join: O(n + m)
                     left_rows = Self::execute_hash_join(
                         engine, txn_id, left_rows, join, from_alias,
@@ -713,6 +742,137 @@ impl QueryExecutor {
         // Currently, all joins are equi-joins (ON left = right)
         // In the future, we could check statistics to decide
         true
+    }
+
+    /// Performs a sort-merge join between left_rows and the right table.
+    /// Best for: already sorted data, large tables, disk-based joins.
+    /// Complexity: O(n log n + m log m) for sorting + O(n + m) for merging.
+    fn execute_sort_merge_join(
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        left_rows: Vec<Map<String, Value>>,
+        join: &crate::parser::JoinClause,
+        left_alias: Option<&str>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let right_alias = join.alias.as_deref().unwrap_or(&join.table);
+        let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+
+        // Phase 1: Load right table
+        let join_prefix = format!("{}::", join.table);
+        let right_entries = engine.txn_scan_prefix(txn_id, join_prefix.as_bytes())?;
+
+        let mut right_rows: Vec<Map<String, Value>> = Vec::new();
+        for (_key, val_bytes) in &right_entries {
+            if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(val_bytes) {
+                if doc.get("__class__").and_then(|v| v.as_str()) == Some(&join.table) {
+                    right_rows.push(doc);
+                }
+            }
+        }
+
+        // Phase 2: Sort both sides by join key
+        let mut sorted_left = left_rows;
+        sorted_left.sort_by(|a, b| {
+            let a_val = Self::resolve_column_value(a, &left_col).unwrap_or_default();
+            let b_val = Self::resolve_column_value(b, &left_col).unwrap_or_default();
+            Self::compare_values(&a_val, &b_val)
+        });
+
+        let mut sorted_right = right_rows;
+        sorted_right.sort_by(|a, b| {
+            let a_val = Self::resolve_column_value(a, &right_col).unwrap_or_default();
+            let b_val = Self::resolve_column_value(b, &right_col).unwrap_or_default();
+            Self::compare_values(&a_val, &b_val)
+        });
+
+        // Phase 3: Merge - linear scan with two pointers
+        let mut result_rows: Vec<Map<String, Value>> = Vec::new();
+        let mut left_idx = 0;
+        let mut right_idx = 0;
+
+        while left_idx < sorted_left.len() && right_idx < sorted_right.len() {
+            let left_val = Self::resolve_column_value(&sorted_left[left_idx], &left_col).unwrap_or_default();
+            let right_val = Self::resolve_column_value(&sorted_right[right_idx], &right_col).unwrap_or_default();
+
+            match Self::compare_values(&left_val, &right_val) {
+                std::cmp::Ordering::Less => {
+                    left_idx += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    right_idx += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    // Found a match - handle multiple matches (duplicate keys)
+                    let match_left_idx = left_idx;
+                    let match_right_start = right_idx;
+
+                    // Collect all right rows with the same key
+                    while right_idx < sorted_right.len() {
+                        let rv = Self::resolve_column_value(&sorted_right[right_idx], &right_col).unwrap_or_default();
+                        if Self::compare_values(&rv, &right_val) != std::cmp::Ordering::Equal {
+                            break;
+                        }
+
+                        // For each matching left row, merge with this right row
+                        let mut li = match_left_idx;
+                        while li < sorted_left.len() {
+                            let lv = Self::resolve_column_value(&sorted_left[li], &left_col).unwrap_or_default();
+                            if Self::compare_values(&lv, &left_val) != std::cmp::Ordering::Equal {
+                                break;
+                            }
+
+                            let mut merged = Map::new();
+
+                            // Merge left row with alias
+                            for (k, v) in &sorted_left[li] {
+                                let key = match left_alias {
+                                    Some(alias) => format!("{}.{}", alias, k),
+                                    None => k.clone(),
+                                };
+                                merged.insert(key, v.clone());
+                                if left_alias.is_some() && !merged.contains_key(k) {
+                                    merged.insert(k.clone(), v.clone());
+                                }
+                            }
+
+                            // Merge right row with alias
+                            for (k, v) in &sorted_right[right_idx] {
+                                let key = format!("{}.{}", right_alias, k);
+                                merged.insert(key, v.clone());
+                                if !merged.contains_key(k) {
+                                    merged.insert(k.clone(), v.clone());
+                                }
+                            }
+
+                            result_rows.push(merged);
+                            li += 1;
+                        }
+
+                        right_idx += 1;
+                    }
+
+                    // Skip remaining left rows with the same key
+                    while left_idx < sorted_left.len() {
+                        let lv = Self::resolve_column_value(&sorted_left[left_idx], &left_col).unwrap_or_default();
+                        if Self::compare_values(&lv, &left_val) != std::cmp::Ordering::Equal {
+                            break;
+                        }
+                        left_idx += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(result_rows)
+    }
+
+    /// Determines whether to use sort-merge join.
+    /// Sort-merge join is preferred for:
+    /// - Large tables (> 10K rows)
+    /// - Already sorted data
+    /// - Disk-based joins where memory is limited
+    fn should_use_sort_merge_join(left_rows: &[Map<String, Value>], right_estimate: u64) -> bool {
+        left_rows.len() > 10000 || right_estimate > 10000
     }
 
     fn execute_delete_txn(
@@ -1429,6 +1589,14 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
         PlanNode::HashJoin { left, right, estimated_rows, .. } => {
             json!({
                 "type": "HashJoin",
+                "left": format_plan_node(left),
+                "right": format_plan_node(right),
+                "rows": estimated_rows,
+            })
+        }
+        PlanNode::SortMergeJoin { left, right, estimated_rows, .. } => {
+            json!({
+                "type": "SortMergeJoin",
                 "left": format_plan_node(left),
                 "right": format_plan_node(right),
                 "rows": estimated_rows,

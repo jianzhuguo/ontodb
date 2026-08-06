@@ -77,6 +77,14 @@ pub enum PlanNode {
         estimated_rows: u64,
     },
 
+    /// Sort-merge join.
+    SortMergeJoin {
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+        join_clause: JoinClause,
+        estimated_rows: u64,
+    },
+
     /// Sort.
     Sort {
         input: Box<PlanNode>,
@@ -196,6 +204,11 @@ impl ExecutionPlan {
             }
             PlanNode::HashJoin { left, right, estimated_rows, .. } => {
                 output.push_str(&format!("{}HashJoin (rows: {})\n", indent, estimated_rows));
+                self.describe_node(left, depth + 1, output);
+                self.describe_node(right, depth + 1, output);
+            }
+            PlanNode::SortMergeJoin { left, right, estimated_rows, .. } => {
+                output.push_str(&format!("{}SortMergeJoin (rows: {})\n", indent, estimated_rows));
                 self.describe_node(left, depth + 1, output);
                 self.describe_node(right, depth + 1, output);
             }
@@ -422,7 +435,7 @@ impl QueryPlanner {
             );
         }
 
-        // Apply joins - use hash join for better performance
+        // Apply joins - choose between HashJoin and SortMergeJoin
         let ordered_joins = self.reorder_joins(joins);
         for join in &ordered_joins {
             let right_stats = self.stats.get(&join.table).cloned().unwrap_or_else(|| TableStats {
@@ -460,17 +473,34 @@ impl QueryPlanner {
                 }
             };
 
-            // Use hash join for equi-joins (better performance)
+            // Choose join algorithm based on cost
             let right_cost = self.cost_model.seq_scan_cost(&right_stats);
-            let join_cost = self.cost_model.hash_join_cost(&current_cost, &right_cost);
+            let hash_cost = self.cost_model.hash_join_cost(&current_cost, &right_cost);
+            let sort_merge_cost = self.cost_model.sort_merge_join_cost(&current_cost, &right_cost);
 
-            current_node = PlanNode::HashJoin {
-                left: Box::new(current_node),
-                right: Box::new(right_plan),
-                join_clause: join.clone(),
-                estimated_rows: join_cost.rows,
-            };
-            current_cost = join_cost;
+            // Prefer SortMergeJoin for large tables or when data is already sorted
+            // Prefer HashJoin for smaller tables or when memory is available
+            let use_sort_merge = current_cost.rows > 10000
+                || right_cost.rows > 10000
+                || (current_cost.is_sorted && right_cost.is_sorted);
+
+            if use_sort_merge && sort_merge_cost.total_cost < hash_cost.total_cost {
+                current_node = PlanNode::SortMergeJoin {
+                    left: Box::new(current_node),
+                    right: Box::new(right_plan),
+                    join_clause: join.clone(),
+                    estimated_rows: sort_merge_cost.rows,
+                };
+                current_cost = sort_merge_cost;
+            } else {
+                current_node = PlanNode::HashJoin {
+                    left: Box::new(current_node),
+                    right: Box::new(right_plan),
+                    join_clause: join.clone(),
+                    estimated_rows: hash_cost.rows,
+                };
+                current_cost = hash_cost;
+            }
         }
 
         // Apply aggregation

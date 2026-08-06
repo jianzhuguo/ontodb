@@ -223,6 +223,38 @@ impl CostModel {
         CostEstimate::new(rows, io_cost, cpu_cost)
     }
 
+    /// Estimate the cost of a sort-merge join.
+    /// Best for: already sorted data, large tables, disk-based joins.
+    pub fn sort_merge_join_cost(
+        &self,
+        left: &CostEstimate,
+        right: &CostEstimate,
+    ) -> CostEstimate {
+        // Sort cost: O(n log n) for each side
+        let left_sort = if left.is_sorted {
+            0.0
+        } else {
+            let n = left.rows as f64;
+            if n > 0.0 { n * n.log2() * self.compare_cpu } else { 0.0 }
+        };
+        let right_sort = if right.is_sorted {
+            0.0
+        } else {
+            let n = right.rows as f64;
+            if n > 0.0 { n * n.log2() * self.compare_cpu } else { 0.0 }
+        };
+
+        // Merge cost: O(n + m) linear scan
+        let merge_cost = (left.rows + right.rows) as f64 * self.compare_cpu;
+
+        // Output rows: assume 10% join selectivity
+        let rows = (left.rows as f64 * right.rows as f64 * 0.1) as u64;
+        let io_cost = left.io_cost + right.io_cost;
+        let cpu_cost = left_sort + right_sort + merge_cost;
+
+        CostEstimate::new(rows, io_cost, cpu_cost).with_sorted()
+    }
+
     /// Estimate the cost of a sort operation.
     pub fn sort_cost(&self, input: &CostEstimate) -> CostEstimate {
         let n = input.rows as f64;
