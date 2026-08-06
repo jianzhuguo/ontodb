@@ -1,13 +1,15 @@
-//! SPARQL query parser and executor for OntoDB.
+//! SPARQL query parser and translator for OntoDB.
 //!
-//! Supports a basic subset of SPARQL 1.1:
-//! - SELECT with variables (?x, ?y)
+//! Supports a subset of SPARQL 1.1:
+//! - SELECT / SELECT DISTINCT with variables (?x, ?y) or *
 //! - WHERE with triple patterns
-//! - FILTER with basic comparisons
+//! - FILTER with comparisons, regex, bound, EXISTS, NOT EXISTS, AND/OR/NOT
+//! - OPTIONAL (document-model NULL semantics)
+//! - UNION (translated to SQL UNION ALL)
 //! - ORDER BY, LIMIT, OFFSET
-//! - OPTIONAL (basic left join)
+//! - CONSTRUCT, ASK
 //!
-//! Translates SPARQL queries to SQL for execution against the OntoDB engine.
+//! Translates SPARQL queries to SQL for execution against the OntoDB document engine.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -21,6 +23,12 @@ pub struct SparqlQuery {
     pub where_patterns: Vec<TriplePattern>,
     /// Optional FILTER expressions.
     pub filters: Vec<SparqlFilter>,
+    /// OPTIONAL blocks (left join).
+    pub optional: Vec<OptionalBlock>,
+    /// UNION alternatives.
+    pub unions: Vec<Vec<TriplePattern>>,
+    /// Whether SELECT DISTINCT is used.
+    pub distinct: bool,
     /// Optional ORDER BY.
     pub order_by: Option<SparqlOrderBy>,
     /// Optional LIMIT.
@@ -29,6 +37,13 @@ pub struct SparqlQuery {
     pub offset: Option<usize>,
     /// Whether this is a CONSTRUCT query.
     pub construct: Option<Vec<TriplePattern>>,
+}
+
+/// An OPTIONAL block in SPARQL (translates to LEFT JOIN).
+#[derive(Debug, Clone)]
+pub struct OptionalBlock {
+    pub patterns: Vec<TriplePattern>,
+    pub filters: Vec<SparqlFilter>,
 }
 
 /// SELECT clause.
@@ -86,6 +101,10 @@ pub enum SparqlFilter {
     And(Box<SparqlFilter>, Box<SparqlFilter>),
     /// expr1 || expr2
     Or(Box<SparqlFilter>, Box<SparqlFilter>),
+    /// EXISTS { ... }
+    Exists(Vec<TriplePattern>),
+    /// NOT EXISTS { ... }
+    NotExists(Vec<TriplePattern>),
 }
 
 /// ORDER BY clause.
@@ -131,6 +150,16 @@ pub struct SparqlTerm {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "xml:lang")]
     pub language: Option<String>,
+}
+
+/// A segment of a WHERE clause body.
+enum WhereSegment {
+    /// Main triple patterns.
+    Main(String),
+    /// OPTIONAL block body.
+    Optional(String),
+    /// UNION block bodies (alternatives).
+    Union(Vec<String>),
 }
 
 /// SPARQL parser.
@@ -195,10 +224,10 @@ impl SparqlParser {
         let where_part = input[where_pos..].trim();
 
         // Parse SELECT clause
-        let select = self.parse_select_clause(select_part)?;
+        let (select, select_distinct) = self.parse_select_clause(select_part)?;
 
         // Parse WHERE clause
-        let (patterns, filters, remaining) = self.parse_where_clause(where_part)?;
+        let (patterns, filters, optional, unions, remaining) = self.parse_where_clause(where_part)?;
 
         // Parse optional clauses (ORDER BY, LIMIT, OFFSET)
         let mut order_by = None;
@@ -229,6 +258,9 @@ impl SparqlParser {
             select,
             where_patterns: patterns,
             filters,
+            optional,
+            unions,
+            distinct: select_distinct,
             order_by,
             limit,
             offset,
@@ -254,12 +286,15 @@ impl SparqlParser {
         let construct_patterns = self.parse_triple_patterns(construct_body)?;
 
         // Parse WHERE clause
-        let (patterns, filters, _remaining) = self.parse_where_clause(where_part)?;
+        let (patterns, filters, _optional, _unions, _remaining) = self.parse_where_clause(where_part)?;
 
         Ok(SparqlQuery {
             select: SparqlSelect::All,
             where_patterns: patterns,
             filters,
+            optional: Vec::new(),
+            unions: Vec::new(),
+            distinct: false,
             order_by: None,
             limit: None,
             offset: None,
@@ -276,12 +311,15 @@ impl SparqlParser {
             .ok_or("Missing WHERE clause in ASK")?;
 
         let where_part = input[where_pos..].trim();
-        let (patterns, filters, _) = self.parse_where_clause(where_part)?;
+        let (patterns, filters, _optional, _unions, _) = self.parse_where_clause(where_part)?;
 
         Ok(SparqlQuery {
             select: SparqlSelect::Variables(vec!["ask".to_string()]),
             where_patterns: patterns,
             filters,
+            optional: Vec::new(),
+            unions: Vec::new(),
+            distinct: false,
             order_by: None,
             limit: Some(1),
             offset: None,
@@ -289,8 +327,8 @@ impl SparqlParser {
         })
     }
 
-    /// Parses SELECT clause.
-    fn parse_select_clause(&self, input: &str) -> Result<SparqlSelect, String> {
+    /// Parses SELECT clause. Returns (select, distinct).
+    fn parse_select_clause(&self, input: &str) -> Result<(SparqlSelect, bool), String> {
         let input = input.trim();
         let upper = input.to_uppercase();
 
@@ -301,14 +339,14 @@ impl SparqlParser {
         let after_select = input[6..].trim();
 
         if after_select == "*" || after_select.to_uppercase().starts_with("*") {
-            return Ok(SparqlSelect::All);
+            return Ok((SparqlSelect::All, false));
         }
 
         // Check for DISTINCT
-        let after_select = if after_select.to_uppercase().starts_with("DISTINCT") {
-            after_select[8..].trim()
+        let (after_select, distinct) = if after_select.to_uppercase().starts_with("DISTINCT") {
+            (after_select[8..].trim(), true)
         } else {
-            after_select
+            (after_select, false)
         };
 
         let mut variables = Vec::new();
@@ -325,11 +363,11 @@ impl SparqlParser {
             return Err("No variables in SELECT clause".to_string());
         }
 
-        Ok(SparqlSelect::Variables(variables))
+        Ok((SparqlSelect::Variables(variables), distinct))
     }
 
     /// Parses WHERE clause with triple patterns and FILTERs.
-    fn parse_where_clause(&self, input: &str) -> Result<(Vec<TriplePattern>, Vec<SparqlFilter>, String), String> {
+    fn parse_where_clause(&self, input: &str) -> Result<(Vec<TriplePattern>, Vec<SparqlFilter>, Vec<OptionalBlock>, Vec<Vec<TriplePattern>>, String), String> {
         let input = input.trim();
 
         // Find the opening {
@@ -337,12 +375,167 @@ impl SparqlParser {
         let end = self.find_matching_brace(&input[start..]).ok_or("Missing } in WHERE clause")?;
         let body = &input[start+1..start+end];
 
-        let patterns = self.parse_triple_patterns(body)?;
-        let filters = self.parse_filters(body)?;
+        let (main_patterns, filters, optional_blocks, union_blocks) = self.parse_where_body(body)?;
 
         let remaining = input[start+end+1..].to_string();
 
-        Ok((patterns, filters, remaining))
+        Ok((main_patterns, filters, optional_blocks, union_blocks, remaining))
+    }
+
+    /// Parses the body of a WHERE clause, handling OPTIONAL and UNION blocks.
+    fn parse_where_body(&self, body: &str) -> Result<(Vec<TriplePattern>, Vec<SparqlFilter>, Vec<OptionalBlock>, Vec<Vec<TriplePattern>>), String> {
+        let mut main_patterns = Vec::new();
+        let mut filters = Vec::new();
+        let mut optional_blocks = Vec::new();
+        let mut union_blocks = Vec::new();
+
+        // Split body into segments: main patterns, OPTIONAL blocks, UNION blocks
+        let segments = self.split_where_segments(body);
+
+        for segment in &segments {
+            match segment {
+                WhereSegment::Main(body) => {
+                    let pats = self.parse_triple_patterns(body)?;
+                    let filts = self.parse_filters(body)?;
+                    main_patterns.extend(pats);
+                    filters.extend(filts);
+                }
+                WhereSegment::Optional(body) => {
+                    let pats = self.parse_triple_patterns(body)?;
+                    let filts = self.parse_filters(body)?;
+                    optional_blocks.push(OptionalBlock { patterns: pats, filters: filts });
+                }
+                WhereSegment::Union(bodies) => {
+                    for body in bodies {
+                        let pats = self.parse_triple_patterns(body)?;
+                        union_blocks.push(pats);
+                    }
+                }
+            }
+        }
+
+        Ok((main_patterns, filters, optional_blocks, union_blocks))
+    }
+
+    /// Splits WHERE body into segments (main, OPTIONAL, UNION).
+    fn split_where_segments(&self, body: &str) -> Vec<WhereSegment> {
+        let mut segments = Vec::new();
+        let mut current_main = String::new();
+        let chars: Vec<char> = body.chars().collect();
+        let mut i = 0;
+
+        while i < chars.len() {
+            // Check for OPTIONAL keyword
+            if i + 8 <= chars.len() {
+                let word: String = chars[i..i+8].iter().collect();
+                if word.to_uppercase() == "OPTIONAL" {
+                    // Flush current main
+                    let trimmed = current_main.trim().to_string();
+                    if !trimmed.is_empty() {
+                        segments.push(WhereSegment::Main(trimmed));
+                    }
+                    current_main.clear();
+
+                    // Find the { } block after OPTIONAL
+                    let after = &chars[i+8..];
+                    let mut j = 0;
+                    while j < after.len() && after[j] != '{' { j += 1; }
+                    if j < after.len() {
+                        let block_start = i + 8 + j;
+                        let mut depth = 0;
+                        let mut k = block_start;
+                        while k < chars.len() {
+                            if chars[k] == '{' { depth += 1; }
+                            if chars[k] == '}' { depth -= 1; if depth == 0 { break; } }
+                            k += 1;
+                        }
+                        let block_body: String = chars[block_start+1..k].iter().collect();
+                        segments.push(WhereSegment::Optional(block_body));
+                        i = k + 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Check for '{' at top level — could be a UNION block
+            if chars[i] == '{' {
+                // Find matching '}'
+                let mut depth = 0;
+                let mut k = i;
+                while k < chars.len() {
+                    if chars[k] == '{' { depth += 1; }
+                    if chars[k] == '}' { depth -= 1; if depth == 0 { break; } }
+                    k += 1;
+                }
+                if k < chars.len() {
+                    // Check what comes after '}' — is it UNION?
+                    let mut after = k + 1;
+                    while after < chars.len() && chars[after].is_whitespace() { after += 1; }
+                    if after + 5 <= chars.len() {
+                        let next_word: String = chars[after..after+5].iter().collect();
+                        if next_word.to_uppercase() == "UNION" {
+                            // This is a UNION! Collect all alternatives.
+                            let trimmed = current_main.trim().to_string();
+                            if !trimmed.is_empty() {
+                                segments.push(WhereSegment::Main(trimmed));
+                            }
+                            current_main.clear();
+
+                            let mut alternatives = Vec::new();
+                            // First alternative: content between { and }
+                            let block_body: String = chars[i+1..k].iter().collect();
+                            alternatives.push(block_body);
+                            i = after + 5;
+
+                            // Collect more UNION alternatives
+                            loop {
+                                while i < chars.len() && chars[i].is_whitespace() { i += 1; }
+                                if i < chars.len() && chars[i] == '{' {
+                                    let mut d = 0;
+                                    let mut m = i;
+                                    while m < chars.len() {
+                                        if chars[m] == '{' { d += 1; }
+                                        if chars[m] == '}' { d -= 1; if d == 0 { break; } }
+                                        m += 1;
+                                    }
+                                    let body: String = chars[i+1..m].iter().collect();
+                                    alternatives.push(body);
+                                    i = m + 1;
+                                    // Check for another UNION
+                                    let mut j = i;
+                                    while j < chars.len() && chars[j].is_whitespace() { j += 1; }
+                                    if j + 5 <= chars.len() {
+                                        let w: String = chars[j..j+5].iter().collect();
+                                        if w.to_uppercase() == "UNION" {
+                                            i = j + 5;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                            segments.push(WhereSegment::Union(alternatives));
+                            continue;
+                        }
+                    }
+                }
+                // Not a UNION block — treat '{' as regular content
+                current_main.push(chars[i]);
+                i += 1;
+                continue;
+            }
+
+            current_main.push(chars[i]);
+            i += 1;
+        }
+
+        // Flush remaining main
+        let trimmed = current_main.trim().to_string();
+        if !trimmed.is_empty() {
+            segments.push(WhereSegment::Main(trimmed));
+        }
+
+        segments
     }
 
     /// Finds the matching closing brace.
@@ -535,6 +728,35 @@ impl SparqlParser {
             return Ok(SparqlFilter::Bound(var));
         }
 
+        // Check for NOT EXISTS
+        let expr_upper = expr.to_uppercase();
+        if expr_upper.starts_with("NOT EXISTS") || expr_upper.starts_with("NOTEXIST") {
+            let after = if expr_upper.starts_with("NOT EXISTS") {
+                expr[10..].trim()
+            } else {
+                expr[9..].trim()
+            };
+            if after.starts_with('{') {
+                if let Some(end) = self.find_matching_brace(after) {
+                    let body = &after[1..end];
+                    let patterns = self.parse_triple_patterns(body)?;
+                    return Ok(SparqlFilter::NotExists(patterns));
+                }
+            }
+        }
+
+        // Check for EXISTS
+        if expr_upper.starts_with("EXISTS") {
+            let after = expr[6..].trim();
+            if after.starts_with('{') {
+                if let Some(end) = self.find_matching_brace(after) {
+                    let body = &after[1..end];
+                    let patterns = self.parse_triple_patterns(body)?;
+                    return Ok(SparqlFilter::Exists(patterns));
+                }
+            }
+        }
+
         // Check for NOT
         if expr.starts_with('!') {
             let inner = self.parse_filter_expr(&expr[1..])?;
@@ -688,46 +910,27 @@ impl SparqlParser {
 
     /// Translates a SPARQL query to SQL.
     pub fn translate_to_sql(&self, query: &SparqlQuery) -> Result<String, String> {
-        // Group triple patterns by subject to determine the main class
-        let mut subject_patterns: HashMap<String, Vec<&TriplePattern>> = HashMap::new();
-        for pattern in &query.where_patterns {
-            match &pattern.subject {
-                PatternTerm::Variable(var) => {
-                    subject_patterns.entry(var.clone()).or_default().push(pattern);
-                }
-                PatternTerm::Iri(iri) => {
-                    subject_patterns.entry(iri.clone()).or_default().push(pattern);
-                }
-                _ => {}
-            }
+        // Handle UNION: each alternative is a separate SELECT with UNION ALL
+        if !query.unions.is_empty() {
+            return self.translate_union(query);
         }
 
         // Find the main class from rdf:type patterns
-        let mut main_class: Option<String> = None;
-        let mut _main_var: Option<String> = None;
-        for pattern in &query.where_patterns {
-            if let PatternTerm::Iri(pred) = &pattern.predicate {
-                if pred.ends_with("#type") || pred == "rdf:type" || pred == "type" {
-                    if let PatternTerm::Iri(class_iri) = &pattern.object {
-                        main_class = Some(class_iri.clone());
-                        if let PatternTerm::Variable(var) = &pattern.subject {
-                            _main_var = Some(var.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        let main_class = main_class.ok_or("No rdf:type pattern found in WHERE clause")?;
+        let main_class = self.find_main_class(&query.where_patterns)?;
         let class_name = extract_local_name(&main_class);
 
         // Build SELECT clause
         let select_cols = match &query.select {
             SparqlSelect::All => {
-                // Collect all variables
                 let mut vars: Vec<String> = Vec::new();
                 for pattern in &query.where_patterns {
                     self.collect_variables(pattern, &mut vars);
+                }
+                // Also collect from OPTIONAL blocks
+                for opt in &query.optional {
+                    for pattern in &opt.patterns {
+                        self.collect_variables(pattern, &mut vars);
+                    }
                 }
                 vars.sort();
                 vars.dedup();
@@ -743,61 +946,41 @@ impl SparqlParser {
         // Build SQL
         let mut sql = String::new();
         sql.push_str("SELECT ");
+        if query.distinct {
+            sql.push_str("DISTINCT ");
+        }
 
-        // Map variables to column names
         let col_exprs: Vec<String> = select_cols.iter().map(|var| {
-            // Check if this variable appears as a predicate in any pattern
-            for pattern in &query.where_patterns {
-                if let PatternTerm::Variable(pred_var) = &pattern.predicate {
-                    if pred_var == var {
-                        return format!("\"{}\"", var);
-                    }
-                }
-            }
             format!("\"{}\"", var)
         }).collect();
-
         sql.push_str(&col_exprs.join(", "));
         sql.push_str(&format!(" FROM {}", class_name));
 
-        // Build WHERE clause
+        // Build WHERE clause — main patterns only (not OPTIONAL)
         let mut conditions = Vec::new();
         for pattern in &query.where_patterns {
-            // Skip rdf:type patterns (handled by FROM clause)
             if let PatternTerm::Iri(pred) = &pattern.predicate {
                 if pred.ends_with("#type") || pred == "rdf:type" || pred == "type" {
                     continue;
                 }
             }
-
-            // Convert triple pattern to SQL condition
-            if let (PatternTerm::Variable(_subj_var), PatternTerm::Iri(pred_iri), PatternTerm::Variable(obj_var)) =
-                (&pattern.subject, &pattern.predicate, &pattern.object)
-            {
-                let prop_name = extract_local_name(pred_iri);
-                conditions.push(format!("\"{}\" IS NOT NULL", prop_name));
-                // If the object variable is in SELECT, we need to alias it
-                if select_cols.contains(obj_var) {
-                    // This is a property access - we'll handle it in post-processing
-                }
-            } else if let (PatternTerm::Variable(_subj_var), PatternTerm::Iri(pred_iri), PatternTerm::Literal(lit)) =
-                (&pattern.subject, &pattern.predicate, &pattern.object)
-            {
-                let prop_name = extract_local_name(pred_iri);
-                conditions.push(format!("\"{}\" = '{}'", prop_name, lit.replace('\'', "''")));
-            } else if let (PatternTerm::Variable(_subj_var), PatternTerm::Iri(pred_iri), PatternTerm::Iri(obj_iri)) =
-                (&pattern.subject, &pattern.predicate, &pattern.object)
-            {
-                let prop_name = extract_local_name(pred_iri);
-                let obj_name = extract_local_name(obj_iri);
-                conditions.push(format!("\"{}\" = '{}'", prop_name, obj_name));
+            if let Some(cond) = self.pattern_to_condition(pattern) {
+                conditions.push(cond);
             }
         }
 
-        // Add FILTER conditions
+        // Add FILTER conditions (including from main block)
         for filter in &query.filters {
             if let Some(cond) = self.translate_filter(filter) {
                 conditions.push(cond);
+            }
+        }
+        // Add OPTIONAL block filters (those inside OPTIONAL { ... FILTER(...) })
+        for opt in &query.optional {
+            for filter in &opt.filters {
+                if let Some(cond) = self.translate_filter(filter) {
+                    conditions.push(cond);
+                }
             }
         }
 
@@ -817,17 +1000,107 @@ impl SparqlParser {
             }
         }
 
-        // Add LIMIT
         if let Some(limit) = query.limit {
             sql.push_str(&format!(" LIMIT {}", limit));
         }
 
-        // Add OFFSET
         if let Some(offset) = query.offset {
             sql.push_str(&format!(" OFFSET {}", offset));
         }
 
         Ok(sql)
+    }
+
+    /// Translates a UNION query: each alternative becomes a SELECT ... UNION ALL ...
+    fn translate_union(&self, query: &SparqlQuery) -> Result<String, String> {
+        let mut parts = Vec::new();
+
+        // Each union alternative is a Vec<TriplePattern>
+        for alt_patterns in &query.unions {
+            let main_class = self.find_main_class(alt_patterns)?;
+            let class_name = extract_local_name(&main_class);
+
+            let select_cols = match &query.select {
+                SparqlSelect::All => {
+                    let mut vars: Vec<String> = Vec::new();
+                    for pattern in alt_patterns {
+                        self.collect_variables(pattern, &mut vars);
+                    }
+                    vars.sort();
+                    vars.dedup();
+                    vars
+                }
+                SparqlSelect::Variables(vars) => vars.clone(),
+            };
+
+            let mut sql = String::new();
+            sql.push_str("SELECT ");
+            if query.distinct {
+                sql.push_str("DISTINCT ");
+            }
+            let col_exprs: Vec<String> = select_cols.iter().map(|v| format!("\"{}\"", v)).collect();
+            sql.push_str(&col_exprs.join(", "));
+            sql.push_str(&format!(" FROM {}", class_name));
+
+            let mut conditions = Vec::new();
+            for pattern in alt_patterns {
+                if let PatternTerm::Iri(pred) = &pattern.predicate {
+                    if pred.ends_with("#type") || pred == "rdf:type" || pred == "type" {
+                        continue;
+                    }
+                }
+                if let Some(cond) = self.pattern_to_condition(pattern) {
+                    conditions.push(cond);
+                }
+            }
+            // Add global filters to each alternative
+            for filter in &query.filters {
+                if let Some(cond) = self.translate_filter(filter) {
+                    conditions.push(cond);
+                }
+            }
+            if !conditions.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(&conditions.join(" AND "));
+            }
+            parts.push(sql);
+        }
+
+        Ok(parts.join(" UNION ALL "))
+    }
+
+    /// Finds the main class IRI from rdf:type patterns.
+    fn find_main_class(&self, patterns: &[TriplePattern]) -> Result<String, String> {
+        for pattern in patterns {
+            if let PatternTerm::Iri(pred) = &pattern.predicate {
+                if pred.ends_with("#type") || pred == "rdf:type" || pred == "type" {
+                    if let PatternTerm::Iri(class_iri) = &pattern.object {
+                        return Ok(class_iri.clone());
+                    }
+                }
+            }
+        }
+        Err("No rdf:type pattern found in WHERE clause".to_string())
+    }
+
+    /// Converts a triple pattern to a SQL condition. Returns None for rdf:type patterns.
+    fn pattern_to_condition(&self, pattern: &TriplePattern) -> Option<String> {
+        match (&pattern.subject, &pattern.predicate, &pattern.object) {
+            (PatternTerm::Variable(_), PatternTerm::Iri(pred_iri), PatternTerm::Variable(_)) => {
+                let prop_name = extract_local_name(pred_iri);
+                Some(format!("\"{}\" IS NOT NULL", prop_name))
+            }
+            (PatternTerm::Variable(_), PatternTerm::Iri(pred_iri), PatternTerm::Literal(lit)) => {
+                let prop_name = extract_local_name(pred_iri);
+                Some(format!("\"{}\" = '{}'", prop_name, lit.replace('\'', "''")))
+            }
+            (PatternTerm::Variable(_), PatternTerm::Iri(pred_iri), PatternTerm::Iri(obj_iri)) => {
+                let prop_name = extract_local_name(pred_iri);
+                let obj_name = extract_local_name(obj_iri);
+                Some(format!("\"{}\" = '{}'", prop_name, obj_name))
+            }
+            _ => None,
+        }
     }
 
     /// Collects all variables from a triple pattern.
@@ -888,6 +1161,46 @@ impl SparqlParser {
                 let l = self.translate_filter(left)?;
                 let r = self.translate_filter(right)?;
                 Some(format!("({}) OR ({})", l, r))
+            }
+            SparqlFilter::Exists(patterns) => {
+                // In document model: EXISTS { ?x ex:prop ?y } → "prop" IS NOT NULL
+                let conds: Vec<String> = patterns.iter()
+                    .filter_map(|p| {
+                        if let PatternTerm::Iri(pred) = &p.predicate {
+                            let prop = extract_local_name(pred);
+                            Some(format!("\"{}\" IS NOT NULL", prop))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if conds.is_empty() {
+                    None
+                } else if conds.len() == 1 {
+                    Some(conds.into_iter().next().unwrap())
+                } else {
+                    Some(format!("({})", conds.join(" AND ")))
+                }
+            }
+            SparqlFilter::NotExists(patterns) => {
+                // NOT EXISTS { ?x ex:prop ?y } → "prop" IS NULL
+                let conds: Vec<String> = patterns.iter()
+                    .filter_map(|p| {
+                        if let PatternTerm::Iri(pred) = &p.predicate {
+                            let prop = extract_local_name(pred);
+                            Some(format!("\"{}\" IS NULL", prop))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if conds.is_empty() {
+                    None
+                } else if conds.len() == 1 {
+                    Some(conds.into_iter().next().unwrap())
+                } else {
+                    Some(format!("({})", conds.join(" AND ")))
+                }
             }
         }
     }
@@ -1055,5 +1368,199 @@ SELECT ?name WHERE {
 
         let sql = sql.unwrap();
         assert!(sql.contains("Person"), "SQL should reference Person class: {}", sql);
+    }
+
+    #[test]
+    fn test_parse_distinct() {
+        let mut parser = SparqlParser::new();
+        let query = r#"
+PREFIX ex: <http://example.org/>
+SELECT DISTINCT ?name WHERE {
+    ?x rdf:type ex:Person .
+    ?x ex:name ?name .
+}
+"#;
+        let q = parser.parse(query).unwrap();
+        assert!(q.distinct, "DISTINCT should be parsed");
+    }
+
+    #[test]
+    fn test_translate_distinct() {
+        let mut parser = SparqlParser::new();
+        let query = r#"
+PREFIX ex: <http://example.org/>
+SELECT DISTINCT ?name WHERE {
+    ?x rdf:type ex:Person .
+    ?x ex:name ?name .
+}
+"#;
+        let q = parser.parse(query).unwrap();
+        let sql = parser.translate_to_sql(&q).unwrap();
+        assert!(sql.contains("SELECT DISTINCT"), "SQL should contain SELECT DISTINCT: {}", sql);
+    }
+
+    #[test]
+    fn test_parse_optional() {
+        let mut parser = SparqlParser::new();
+        let query = r#"
+PREFIX ex: <http://example.org/>
+SELECT ?name ?email WHERE {
+    ?x rdf:type ex:Person .
+    ?x ex:name ?name .
+    OPTIONAL { ?x ex:email ?email }
+}
+"#;
+        let q = parser.parse(query).unwrap();
+        assert_eq!(q.optional.len(), 1, "Should have 1 OPTIONAL block");
+        assert_eq!(q.optional[0].patterns.len(), 1, "OPTIONAL should have 1 pattern");
+    }
+
+    #[test]
+    fn test_translate_optional() {
+        let mut parser = SparqlParser::new();
+        let query = r#"
+PREFIX ex: <http://example.org/>
+SELECT ?name ?email WHERE {
+    ?x rdf:type ex:Person .
+    ?x ex:name ?name .
+    OPTIONAL { ?x ex:email ?email }
+}
+"#;
+        let q = parser.parse(query).unwrap();
+        let sql = parser.translate_to_sql(&q).unwrap();
+        // Optional column should be in SELECT but not require IS NOT NULL in WHERE
+        assert!(sql.contains("\"email\""), "SQL should include optional email column: {}", sql);
+        // Main pattern should still have IS NOT NULL
+        assert!(sql.contains("\"name\" IS NOT NULL"), "SQL should require name IS NOT NULL: {}", sql);
+        // Should NOT have email IS NOT NULL (it's optional)
+        assert!(!sql.contains("\"email\" IS NOT NULL"), "SQL should NOT require email IS NOT NULL: {}", sql);
+    }
+
+    #[test]
+    fn test_parse_union() {
+        let mut parser = SparqlParser::new();
+        let query = r#"
+PREFIX ex: <http://example.org/>
+SELECT ?name WHERE {
+    {
+        ?x rdf:type ex:Person .
+        ?x ex:name ?name .
+    }
+    UNION
+    {
+        ?x rdf:type ex:Organization .
+        ?x ex:name ?name .
+    }
+}
+"#;
+        let q = parser.parse(query).unwrap();
+        assert_eq!(q.unions.len(), 2, "Should have 2 UNION alternatives");
+    }
+
+    #[test]
+    fn test_translate_union() {
+        let mut parser = SparqlParser::new();
+        let query = r#"
+PREFIX ex: <http://example.org/>
+SELECT ?name WHERE {
+    {
+        ?x rdf:type ex:Person .
+        ?x ex:name ?name .
+    }
+    UNION
+    {
+        ?x rdf:type ex:Organization .
+        ?x ex:name ?name .
+    }
+}
+"#;
+        let q = parser.parse(query).unwrap();
+        let sql = parser.translate_to_sql(&q).unwrap();
+        assert!(sql.contains("UNION ALL"), "SQL should contain UNION ALL: {}", sql);
+        assert!(sql.contains("Person"), "SQL should reference Person: {}", sql);
+        assert!(sql.contains("Organization"), "SQL should reference Organization: {}", sql);
+    }
+
+    #[test]
+    fn test_parse_filter_exists() {
+        let mut parser = SparqlParser::new();
+        let query = r#"
+PREFIX ex: <http://example.org/>
+SELECT ?name WHERE {
+    ?x rdf:type ex:Person .
+    ?x ex:name ?name .
+    FILTER (EXISTS { ?x ex:email ?email })
+}
+"#;
+        let q = parser.parse(query).unwrap();
+        assert_eq!(q.filters.len(), 1, "Should have 1 filter");
+        assert!(matches!(q.filters[0], SparqlFilter::Exists(_)), "Should be Exists filter");
+    }
+
+    #[test]
+    fn test_parse_filter_not_exists() {
+        let mut parser = SparqlParser::new();
+        let query = r#"
+PREFIX ex: <http://example.org/>
+SELECT ?name WHERE {
+    ?x rdf:type ex:Person .
+    ?x ex:name ?name .
+    FILTER (NOT EXISTS { ?x ex:email ?email })
+}
+"#;
+        let q = parser.parse(query).unwrap();
+        assert_eq!(q.filters.len(), 1, "Should have 1 filter");
+        assert!(matches!(q.filters[0], SparqlFilter::NotExists(_)), "Should be NotExists filter");
+    }
+
+    #[test]
+    fn test_translate_filter_exists() {
+        let mut parser = SparqlParser::new();
+        let query = r#"
+PREFIX ex: <http://example.org/>
+SELECT ?name WHERE {
+    ?x rdf:type ex:Person .
+    ?x ex:name ?name .
+    FILTER (EXISTS { ?x ex:email ?email })
+}
+"#;
+        let q = parser.parse(query).unwrap();
+        let sql = parser.translate_to_sql(&q).unwrap();
+        assert!(sql.contains("\"email\" IS NOT NULL"), "EXISTS should translate to IS NOT NULL: {}", sql);
+    }
+
+    #[test]
+    fn test_translate_filter_not_exists() {
+        let mut parser = SparqlParser::new();
+        let query = r#"
+PREFIX ex: <http://example.org/>
+SELECT ?name WHERE {
+    ?x rdf:type ex:Person .
+    ?x ex:name ?name .
+    FILTER (NOT EXISTS { ?x ex:email ?email })
+}
+"#;
+        let q = parser.parse(query).unwrap();
+        let sql = parser.translate_to_sql(&q).unwrap();
+        assert!(sql.contains("\"email\" IS NULL"), "NOT EXISTS should translate to IS NULL: {}", sql);
+    }
+
+    #[test]
+    fn test_optional_with_filter() {
+        let mut parser = SparqlParser::new();
+        let query = r#"
+PREFIX ex: <http://example.org/>
+SELECT ?name ?email WHERE {
+    ?x rdf:type ex:Person .
+    ?x ex:name ?name .
+    OPTIONAL {
+        ?x ex:email ?email .
+        FILTER(?email = "alice@example.org")
+    }
+}
+"#;
+        let q = parser.parse(query).unwrap();
+        assert_eq!(q.optional.len(), 1);
+        assert_eq!(q.optional[0].filters.len(), 1, "OPTIONAL block should have 1 filter");
     }
 }
