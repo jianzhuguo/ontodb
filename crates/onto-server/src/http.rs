@@ -519,12 +519,14 @@ async fn hybrid_query(
 
 /// GET /api/schema - Get database schema information.
 async fn get_schema(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
-    // TODO: Implement schema introspection from ontology store
-    Json(json!({
-        "classes": [],
-        "indexes": [],
-        "vector_indexes": []
-    }))
+    let start = std::time::Instant::now();
+    match state.executor.schema_info() {
+        Ok(schema) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            Json(ApiResponse::success(schema, elapsed))
+        }
+        Err(e) => Json(ApiResponse::error(format!("schema introspection failed: {}", e))),
+    }
 }

@@ -150,6 +150,90 @@ impl QueryExecutor {
         self.plan_cache.lock().unwrap().clear();
     }
 
+    /// Returns schema introspection data: all ontologies, classes, properties, and indexes.
+    pub fn schema_info(&self) -> Result<serde_json::Value> {
+        let mut engine = self.engine.write().map_err(|e| {
+            CoreError::Custom(format!("engine lock poisoned: {}", e))
+        })?;
+
+        let mut ontologies = Vec::new();
+        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+        for (_key, val_bytes) in entries {
+            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+                let mut classes = serde_json::Map::new();
+                for (name, class) in &ontology.classes {
+                    let mut class_info = serde_json::Map::new();
+                    class_info.insert("type".to_string(), serde_json::json!(format!("{:?}", class.class_type)));
+                    class_info.insert("superclasses".to_string(), serde_json::json!(class.superclasses));
+                    class_info.insert("equivalent_classes".to_string(), serde_json::json!(class.equivalent_classes));
+                    class_info.insert("disjoint_with".to_string(), serde_json::json!(class.disjoint_with));
+                    class_info.insert("properties".to_string(), serde_json::json!(class.properties));
+                    classes.insert(name.clone(), serde_json::Value::Object(class_info));
+                }
+
+                let mut properties = serde_json::Map::new();
+                for (name, prop) in &ontology.properties {
+                    let mut prop_info = serde_json::Map::new();
+                    prop_info.insert("domain".to_string(), serde_json::json!(prop.domain));
+                    prop_info.insert("range".to_string(), serde_json::json!(prop.range.as_str()));
+                    prop_info.insert("required".to_string(), serde_json::json!(prop.required));
+                    prop_info.insert("multi_valued".to_string(), serde_json::json!(prop.multi_valued));
+                    if let Some(ref inverse) = prop.inverse_of {
+                        prop_info.insert("inverse_of".to_string(), serde_json::json!(inverse));
+                    }
+                    prop_info.insert("is_transitive".to_string(), serde_json::json!(prop.is_transitive));
+                    prop_info.insert("is_symmetric".to_string(), serde_json::json!(prop.is_symmetric));
+                    prop_info.insert("is_functional".to_string(), serde_json::json!(prop.is_functional));
+                    if !prop.subproperty_of.is_empty() {
+                        prop_info.insert("subproperty_of".to_string(), serde_json::json!(prop.subproperty_of));
+                    }
+                    if !prop.equivalent_properties.is_empty() {
+                        prop_info.insert("equivalent_properties".to_string(), serde_json::json!(prop.equivalent_properties));
+                    }
+                    properties.insert(name.clone(), serde_json::Value::Object(prop_info));
+                }
+
+                let mut onto_info = serde_json::Map::new();
+                onto_info.insert("name".to_string(), serde_json::json!(ontology.name));
+                onto_info.insert("classes".to_string(), serde_json::Value::Object(classes));
+                onto_info.insert("properties".to_string(), serde_json::Value::Object(properties));
+                ontologies.push(serde_json::Value::Object(onto_info));
+            }
+        }
+
+        // Collect index information
+        let mut indexes = Vec::new();
+        let index_entries = engine.scan_prefix(b"__idx_meta__").unwrap_or_default();
+        for (key, val_bytes) in index_entries {
+            let key_str = String::from_utf8_lossy(&key);
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val_bytes) {
+                indexes.push(serde_json::json!({
+                    "key": key_str,
+                    "metadata": meta
+                }));
+            }
+        }
+
+        // Collect vector index information
+        let mut vector_indexes = Vec::new();
+        let vec_entries = engine.scan_prefix(b"__vec_meta__").unwrap_or_default();
+        for (key, val_bytes) in vec_entries {
+            let key_str = String::from_utf8_lossy(&key);
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val_bytes) {
+                vector_indexes.push(serde_json::json!({
+                    "key": key_str,
+                    "metadata": meta
+                }));
+            }
+        }
+
+        Ok(serde_json::json!({
+            "ontologies": ontologies,
+            "indexes": indexes,
+            "vector_indexes": vector_indexes
+        }))
+    }
+
     /// Returns the active transaction ID, if any.
     pub fn active_txn_id(&self) -> Option<onto_core::SeqNo> {
         *self.active_txn.lock().unwrap()
@@ -459,31 +543,34 @@ impl QueryExecutor {
             }
             _ => {
                 // For SELECT queries, check plan cache first
-                if matches!(ast, QueryAst::Select { .. }) {
+                let cached_plan = if matches!(ast, QueryAst::Select { .. }) {
                     let ast_hash = Self::hash_ast(ast);
-                    let cached_plan = self.plan_cache.lock().unwrap().get(ast_hash);
-                    if cached_plan.is_some() {
-                        // Plan cache hit - skip planning
+                    let cached = self.plan_cache.lock().unwrap().get(ast_hash);
+                    if cached.is_some() {
                         self.runtime_stats.lock().unwrap().plan_cache_hits += 1;
+                        cached
                     } else {
                         // Plan cache miss - generate and cache plan
                         let plan = self.planner.read().unwrap().plan(ast);
-                        if let Ok(p) = plan {
-                            self.plan_cache.lock().unwrap().insert(ast_hash, p);
+                        if let Ok(ref p) = plan {
+                            self.plan_cache.lock().unwrap().insert(ast_hash, p.clone());
                         }
                         self.runtime_stats.lock().unwrap().plan_cache_misses += 1;
+                        plan.ok()
                     }
-                }
+                } else {
+                    None
+                };
 
                 // Check if there's an active multi-statement transaction
                 let active_txn_id = *self.active_txn.lock().unwrap();
                 if let Some(txn_id) = active_txn_id {
                     // Use the active transaction (writes are buffered until COMMIT)
-                    self.execute_in_txn(ast, engine, txn_id)
+                    self.execute_in_txn_with_plan(ast, engine, txn_id, cached_plan.as_ref())
                 } else {
                     // Auto-commit mode: each statement runs in its own transaction
                     let txn_id = engine.begin_txn();
-                    let result = self.execute_in_txn(ast, engine, txn_id);
+                    let result = self.execute_in_txn_with_plan(ast, engine, txn_id, cached_plan.as_ref());
                     // Commit on success, abort on error
                     match &result {
                         Ok(_) => { engine.commit_txn(txn_id)?; }
@@ -1421,6 +1508,67 @@ impl QueryExecutor {
         }
 
         result
+    }
+
+    /// Executes a statement within an existing transaction, with an optional pre-computed plan.
+    /// When a cached plan is provided for SELECT queries, skips re-planning.
+    fn execute_in_txn_with_plan(
+        &self,
+        ast: &QueryAst,
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        cached_plan: Option<&ExecutionPlan>,
+    ) -> Result<QueryResult> {
+        // For SELECT queries with a cached plan, use it directly
+        if let (QueryAst::Select { .. }, Some(plan)) = (ast, cached_plan) {
+            let plan_result = self.execute_plan(plan, engine)?;
+            let mut rows = match plan_result {
+                QueryResult::Rows(r) => r,
+                other => return Ok(other),
+            };
+
+            // Post-processing: aggregation, window functions, DISTINCT, OFFSET/LIMIT
+            if let QueryAst::Select {
+                distinct, columns, group_by, having, order_by, limit, offset, ..
+            } = ast {
+                let has_aggregates = Self::columns_have_aggregates(columns);
+                if group_by.is_some() || has_aggregates {
+                    let result = self.execute_aggregation(engine, columns, &rows, group_by.as_ref(), having, order_by, *limit)?;
+                    if let QueryResult::Rows(mut agg_rows) = result {
+                        if *distinct { Self::dedup_rows(&mut agg_rows); }
+                        return Ok(QueryResult::Rows(agg_rows));
+                    }
+                    return Ok(result);
+                }
+
+                if let SelectColumns::Columns(items) = columns {
+                    let window_exprs: Vec<&WindowExpr> = items.iter().filter_map(|item| {
+                        if let SelectItem::WindowFunction(w) = item { Some(w) } else { None }
+                    }).collect();
+                    if !window_exprs.is_empty() {
+                        Self::execute_window_functions(&mut rows, &window_exprs);
+                    }
+                }
+
+                if *distinct { Self::dedup_rows(&mut rows); }
+
+                if let Some(off) = offset {
+                    if *off < rows.len() {
+                        rows = rows.split_off(*off);
+                    } else {
+                        rows.clear();
+                    }
+                }
+                if let Some(lim) = limit {
+                    rows.truncate(*lim);
+                }
+            }
+
+            return Ok(QueryResult::Rows(rows));
+        }
+
+        // Fallback to regular execution
+        self.execute_in_txn(ast, engine, txn_id)
     }
 
     /// Executes a statement within an existing transaction.
