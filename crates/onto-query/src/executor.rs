@@ -26,6 +26,8 @@ pub struct QueryExecutor {
     doc_counter: AtomicU64,
     /// Runtime execution statistics.
     runtime_stats: Arc<Mutex<RuntimeStats>>,
+    /// Active multi-statement transaction ID (None = auto-commit mode).
+    active_txn: Mutex<Option<onto_core::SeqNo>>,
 }
 
 /// Column-level statistics collected by ANALYZE.
@@ -87,6 +89,7 @@ impl QueryExecutor {
             plan_cache: Arc::new(Mutex::new(PlanCache::new(500))),
             doc_counter: AtomicU64::new(0),
             runtime_stats: Arc::new(Mutex::new(RuntimeStats::default())),
+            active_txn: Mutex::new(None),
         }
     }
 
@@ -119,6 +122,16 @@ impl QueryExecutor {
     pub fn clear_caches(&self) {
         self.query_cache.lock().unwrap().clear();
         self.plan_cache.lock().unwrap().clear();
+    }
+
+    /// Returns the active transaction ID, if any.
+    pub fn active_txn_id(&self) -> Option<onto_core::SeqNo> {
+        *self.active_txn.lock().unwrap()
+    }
+
+    /// Returns true if a multi-statement transaction is active.
+    pub fn in_transaction(&self) -> bool {
+        self.active_txn.lock().unwrap().is_some()
     }
 
     /// Executes a query and returns results as JSON.
@@ -289,14 +302,39 @@ impl QueryExecutor {
                 )))
             }
             QueryAst::Begin => {
-                // Explicit transaction - already in auto-commit mode, just acknowledge
-                Ok(QueryResult::Success("Transaction started".to_string()))
+                let mut txn = self.active_txn.lock().unwrap();
+                if txn.is_some() {
+                    return Err(CoreError::InvalidArgument(
+                        "transaction already active (use COMMIT or ROLLBACK first)".to_string()
+                    ));
+                }
+                let txn_id = engine.begin_txn();
+                *txn = Some(txn_id);
+                Ok(QueryResult::Success(format!("Transaction started (txn_id={})", txn_id)))
             }
             QueryAst::Commit => {
-                Ok(QueryResult::Success("Transaction committed".to_string()))
+                let mut txn = self.active_txn.lock().unwrap();
+                match txn.take() {
+                    Some(txn_id) => {
+                        engine.commit_txn(txn_id)?;
+                        Ok(QueryResult::Success("Transaction committed".to_string()))
+                    }
+                    None => Err(CoreError::InvalidArgument(
+                        "no active transaction to commit".to_string()
+                    )),
+                }
             }
             QueryAst::Rollback => {
-                Ok(QueryResult::Success("Transaction rolled back".to_string()))
+                let mut txn = self.active_txn.lock().unwrap();
+                match txn.take() {
+                    Some(txn_id) => {
+                        engine.abort_txn(txn_id)?;
+                        Ok(QueryResult::Success("Transaction rolled back".to_string()))
+                    }
+                    None => Err(CoreError::InvalidArgument(
+                        "no active transaction to roll back".to_string()
+                    )),
+                }
             }
             _ => {
                 // For SELECT queries, check plan cache first
@@ -316,15 +354,22 @@ impl QueryExecutor {
                     }
                 }
 
-                // All other statements run in an auto-committed transaction
-                let txn_id = engine.begin_txn();
-                let result = self.execute_in_txn(ast, engine, txn_id);
-                // Commit on success, abort on error
-                match &result {
-                    Ok(_) => { engine.commit_txn(txn_id)?; }
-                    Err(_) => { let _ = engine.abort_txn(txn_id); }
+                // Check if there's an active multi-statement transaction
+                let active_txn_id = *self.active_txn.lock().unwrap();
+                if let Some(txn_id) = active_txn_id {
+                    // Use the active transaction (writes are buffered until COMMIT)
+                    self.execute_in_txn(ast, engine, txn_id)
+                } else {
+                    // Auto-commit mode: each statement runs in its own transaction
+                    let txn_id = engine.begin_txn();
+                    let result = self.execute_in_txn(ast, engine, txn_id);
+                    // Commit on success, abort on error
+                    match &result {
+                        Ok(_) => { engine.commit_txn(txn_id)?; }
+                        Err(_) => { let _ = engine.abort_txn(txn_id); }
+                    }
+                    result
                 }
-                result
             }
         }
     }
@@ -4804,12 +4849,28 @@ mod tests {
     fn test_transaction_commands() {
         let (executor, _dir) = setup();
 
+        // BEGIN starts a transaction
         let ast = QueryParser::parse("BEGIN").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Success(msg) => assert!(msg.contains("started")),
             _ => panic!("expected Success"),
         }
+        assert!(executor.in_transaction());
+
+        // ROLLBACK aborts the transaction
+        let ast = QueryParser::parse("ROLLBACK").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("rolled back")),
+            _ => panic!("expected Success"),
+        }
+        assert!(!executor.in_transaction());
+
+        // BEGIN + COMMIT works
+        let ast = QueryParser::parse("BEGIN").unwrap();
+        executor.execute(&ast).unwrap();
+        assert!(executor.in_transaction());
 
         let ast = QueryParser::parse("COMMIT").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -4817,13 +4878,7 @@ mod tests {
             QueryResult::Success(msg) => assert!(msg.contains("committed")),
             _ => panic!("expected Success"),
         }
-
-        let ast = QueryParser::parse("ROLLBACK").unwrap();
-        let result = executor.execute(&ast).unwrap();
-        match &result {
-            QueryResult::Success(msg) => assert!(msg.contains("rolled back")),
-            _ => panic!("expected Success"),
-        }
+        assert!(!executor.in_transaction());
     }
 
     // 鈹€鈹€ Phase 23: Recursive CTE parser test 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -4837,5 +4892,166 @@ mod tests {
             QueryAst::With { recursive, .. } => assert!(recursive),
             _ => panic!("expected With"),
         }
+    }
+
+    // Multi-statement transaction tests (Phase 26)
+
+    #[test]
+    fn test_multi_stmt_txn_commit() {
+        let (executor, _dir) = setup();
+
+        // Create a class with an ontology
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
+        ).unwrap()).unwrap();
+
+        // BEGIN, INSERT, COMMIT - data should persist
+        executor.execute(&QueryParser::parse("BEGIN").unwrap()).unwrap();
+        assert!(executor.in_transaction());
+
+        executor.execute(&QueryParser::parse(
+            "INSERT INTO Product (name, price) VALUES ('Widget', 100)"
+        ).unwrap()).unwrap();
+
+        executor.execute(&QueryParser::parse("COMMIT").unwrap()).unwrap();
+        assert!(!executor.in_transaction());
+
+        // Data should be visible after commit
+        let result = executor.execute(&QueryParser::parse(
+            "SELECT name, price FROM Product"
+        ).unwrap()).unwrap();
+        match result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("name").unwrap(), &Value::String("Widget".to_string()));
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_multi_stmt_txn_rollback() {
+        let (executor, _dir) = setup();
+
+        // Create a class
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
+        ).unwrap()).unwrap();
+
+        // BEGIN, INSERT, ROLLBACK - data should be discarded
+        executor.execute(&QueryParser::parse("BEGIN").unwrap()).unwrap();
+        executor.execute(&QueryParser::parse(
+            "INSERT INTO Product (name, price) VALUES ('Widget', 100)"
+        ).unwrap()).unwrap();
+        executor.execute(&QueryParser::parse("ROLLBACK").unwrap()).unwrap();
+        assert!(!executor.in_transaction());
+
+        // Data should NOT be visible after rollback
+        let result = executor.execute(&QueryParser::parse(
+            "SELECT name, price FROM Product"
+        ).unwrap()).unwrap();
+        match result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 0);
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_multi_stmt_txn_multiple_inserts() {
+        let (executor, _dir) = setup();
+
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
+        ).unwrap()).unwrap();
+
+        // BEGIN, multiple INSERTs, COMMIT
+        executor.execute(&QueryParser::parse("BEGIN").unwrap()).unwrap();
+        executor.execute(&QueryParser::parse(
+            "INSERT INTO Product (name, price) VALUES ('A', 10)"
+        ).unwrap()).unwrap();
+        executor.execute(&QueryParser::parse(
+            "INSERT INTO Product (name, price) VALUES ('B', 20)"
+        ).unwrap()).unwrap();
+        executor.execute(&QueryParser::parse(
+            "INSERT INTO Product (name, price) VALUES ('C', 30)"
+        ).unwrap()).unwrap();
+        executor.execute(&QueryParser::parse("COMMIT").unwrap()).unwrap();
+
+        // All three rows should be visible
+        let result = executor.execute(&QueryParser::parse(
+            "SELECT name FROM Product ORDER BY name"
+        ).unwrap()).unwrap();
+        match result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3);
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_multi_stmt_txn_update_rollback() {
+        let (executor, _dir) = setup();
+
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
+        ).unwrap()).unwrap();
+
+        // Insert initial data (auto-commit)
+        executor.execute(&QueryParser::parse(
+            "INSERT INTO Product (name, price) VALUES ('Widget', 100)"
+        ).unwrap()).unwrap();
+
+        // BEGIN, UPDATE, ROLLBACK - update should be discarded
+        executor.execute(&QueryParser::parse("BEGIN").unwrap()).unwrap();
+        executor.execute(&QueryParser::parse(
+            "UPDATE Product SET price = 999 WHERE name = 'Widget'"
+        ).unwrap()).unwrap();
+        executor.execute(&QueryParser::parse("ROLLBACK").unwrap()).unwrap();
+
+        // Original price should be visible
+        let result = executor.execute(&QueryParser::parse(
+            "SELECT price FROM Product WHERE name = 'Widget'"
+        ).unwrap()).unwrap();
+        match result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("price").unwrap(), &Value::Number(100.into()));
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_begin_while_in_txn_errors() {
+        let (executor, _dir) = setup();
+
+        executor.execute(&QueryParser::parse("BEGIN").unwrap()).unwrap();
+        let result = executor.execute(&QueryParser::parse("BEGIN").unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("transaction already active"));
+
+        // Clean up
+        executor.execute(&QueryParser::parse("ROLLBACK").unwrap()).unwrap();
+    }
+
+    #[test]
+    fn test_commit_without_txn_errors() {
+        let (executor, _dir) = setup();
+
+        let result = executor.execute(&QueryParser::parse("COMMIT").unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no active transaction"));
+    }
+
+    #[test]
+    fn test_rollback_without_txn_errors() {
+        let (executor, _dir) = setup();
+
+        let result = executor.execute(&QueryParser::parse("ROLLBACK").unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no active transaction"));
     }
 }

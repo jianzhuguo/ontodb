@@ -1455,7 +1455,63 @@ SQL → Parser → AST → Planner → ExecutionPlan → Executor (plan-driven)
 
 ---
 
-## 二十七、结论与建议
+## 二十七、多语句事务支持（Phase 26）
+
+### 27.1 真正的 BEGIN/COMMIT/ROLLBACK
+
+Phase 25 之前，`BEGIN`、`COMMIT`、`ROLLBACK` 是空操作（no-op）。Phase 26 实现了真正的多语句事务：
+
+**实现要点**：
+- `QueryExecutor` 新增 `active_txn: Mutex<Option<SeqNo>>` 字段，跟踪当前活跃事务
+- `BEGIN` 调用 `engine.begin_txn()` 开启事务，存储事务 ID
+- 后续 DML 语句复用活跃事务（写操作缓冲在事务的 write buffer 中）
+- `COMMIT` 调用 `engine.commit_txn()` 将缓冲的写操作刷入 WAL + MemTable
+- `ROLLBACK` 调用 `engine.abort_txn()` 丢弃缓冲的写操作
+
+**使用示例**：
+```sql
+BEGIN;
+INSERT INTO Product (name, price) VALUES ('Widget', 100);
+INSERT INTO Product (name, price) VALUES ('Gadget', 200);
+UPDATE Product SET price = 150 WHERE name = 'Widget';
+COMMIT;  -- 所有写操作原子提交
+```
+
+```sql
+BEGIN;
+DELETE FROM Product WHERE price < 100;
+ROLLBACK;  -- 删除操作被丢弃，数据不变
+```
+
+### 27.2 错误处理
+
+- 嵌套 `BEGIN` 报错：`transaction already active (use COMMIT or ROLLBACK first)`
+- 无事务时 `COMMIT` 报错：`no active transaction to commit`
+- 无事务时 `ROLLBACK` 报错：`no active transaction to roll back`
+
+### 27.3 事务隔离
+
+使用 MVCC 快照隔离：
+- 事务内的读操作看到的是事务开始时的数据快照
+- 其他事务的提交不影响当前事务的视图
+- 写操作缓冲在事务的 write buffer 中，直到 COMMIT 才可见
+
+### 27.4 测试覆盖
+
+新增 7 个事务测试：
+- `test_multi_stmt_txn_commit`：多语句提交后数据可见
+- `test_multi_stmt_txn_rollback`：回滚后数据不可见
+- `test_multi_stmt_txn_multiple_inserts`：多条 INSERT 原子提交
+- `test_multi_stmt_txn_update_rollback`：UPDATE 回滚恢复原值
+- `test_begin_while_in_txn_errors`：嵌套 BEGIN 报错
+- `test_commit_without_txn_errors`：无事务 COMMIT 报错
+- `test_rollback_without_txn_errors`：无事务 ROLLBACK 报错
+
+**测试统计**：260 个测试全部通过（87 lib + 41 integration + 111 storage + 10 ontology + 8 core + 3 server）
+
+---
+
+## 二十八、结论与建议
 
 ### 核心结论
 
@@ -1464,9 +1520,10 @@ SQL → Parser → AST → Planner → ExecutionPlan → Executor (plan-driven)
 3. **100% 自研核心引擎是正确策略**：存储引擎、本体引擎、查询引擎、事务引擎必须自主掌控，基础设施（Raft、序列化、压缩）选择性复用
 4. **跨平台无实质风险**：当前 Rust 代码天然跨平台，Windows 开发 → Linux 生产完全可行，CI 双平台构建是最低成本保障
 5. **范围是最大风险**：必须砍掉 80% 的外围功能，聚焦核心
-6. **代码质量持续提升**：121 个测试全部通过（80 lib + 41 integration），查询引擎覆盖 Phase 15-25 全部功能
+6. **代码质量持续提升**：260 个测试全部通过（87 lib + 41 integration + 111 storage + 10 ontology + 8 core + 3 server），查询引擎覆盖 Phase 15-26 全部功能
 7. **查询引擎已具备完整 OLAP 能力**：窗口函数、CTE、CASE WHEN、子查询、JOIN（Hash/SortMerge/NestedLoop）、EXPLAIN ANALYZE、Plan Cache、ICD、LIMIT OFFSET、UPSERT、11 个内置函数
 8. **执行架构统一**：所有 DML（SELECT/INSERT/UPDATE/DELETE/MATCH）统一使用 plan-driven 执行，优化器优化对所有查询生效
+9. **多语句事务支持**：BEGIN/COMMIT/ROLLBACK 真正生效，支持原子性多语句操作，MVCC 快照隔离
 
 ### 性能基线（v1.8）
 
