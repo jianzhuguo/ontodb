@@ -100,6 +100,11 @@ pub enum QueryAst {
         top_k: usize,
         filter: Option<FilterExpr>,
     },
+
+    /// EXPLAIN <query> - Show execution plan without executing
+    Explain {
+        query: Box<QueryAst>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,7 +203,9 @@ impl QueryParser {
 
         let upper = input.to_uppercase();
 
-        if upper.starts_with("CREATE ONTOLOGY") {
+        if upper.starts_with("EXPLAIN") {
+            Self::parse_explain(input)
+        } else if upper.starts_with("CREATE ONTOLOGY") {
             Ok(QueryAst::CreateOntology {
                 sql: input.to_string(),
             })
@@ -229,6 +236,30 @@ impl QueryParser {
                 input
             )))
         }
+    }
+
+    /// Parses EXPLAIN <query>
+    fn parse_explain(input: &str) -> Result<QueryAst> {
+        let upper = input.to_uppercase();
+        let query_start = if upper.starts_with("EXPLAIN ANALYZE") {
+            14
+        } else if upper.starts_with("EXPLAIN") {
+            7
+        } else {
+            return Err(CoreError::InvalidArgument("expected EXPLAIN".to_string()));
+        };
+
+        let inner_query = input[query_start..].trim();
+        if inner_query.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "expected query after EXPLAIN".to_string(),
+            ));
+        }
+
+        let inner_ast = Self::parse(inner_query)?;
+        Ok(QueryAst::Explain {
+            query: Box::new(inner_ast),
+        })
     }
 
     /// Checks for UNION [ALL] in the input and wraps the first SELECT in a Union node.

@@ -1,5 +1,6 @@
 //! Query executor: runs parsed queries against the storage and ontology engines.
 
+use crate::optimizer::QueryPlanner;
 use crate::parser::{AggregateFunc, FilterExpr, LiteralValue, QueryAst, SelectColumns, SelectItem};
 use onto_core::{CoreError, Result};
 use onto_ontology::{DataType, OntologyStore};
@@ -12,6 +13,8 @@ use std::sync::{Arc, RwLock};
 pub struct QueryExecutor {
     engine: Arc<RwLock<LsmEngine>>,
     ontology_store: OntologyStore,
+    /// Query planner for optimization.
+    planner: QueryPlanner,
     /// Monotonic counter for generating unique document keys.
     doc_counter: AtomicU64,
 }
@@ -21,8 +24,19 @@ impl QueryExecutor {
         Self {
             engine,
             ontology_store,
+            planner: QueryPlanner::new(),
             doc_counter: AtomicU64::new(0),
         }
+    }
+
+    /// Get a reference to the query planner.
+    pub fn planner(&self) -> &QueryPlanner {
+        &self.planner
+    }
+
+    /// Get a mutable reference to the query planner (for updating stats).
+    pub fn planner_mut(&mut self) -> &mut QueryPlanner {
+        &mut self.planner
     }
 
     /// Executes a query and returns results as JSON.
@@ -39,6 +53,10 @@ impl QueryExecutor {
     /// Each statement runs in its own auto-committed transaction.
     fn execute_with_engine(&self, ast: &QueryAst, engine: &mut LsmEngine) -> Result<QueryResult> {
         match ast {
+            QueryAst::Explain { query } => {
+                // EXPLAIN: generate and return the execution plan
+                self.execute_explain(query)
+            }
             QueryAst::CreateOntology { sql } => {
                 // DDL doesn't need MVCC transaction
                 let ontology = onto_ontology::OntologyParser::parse(sql)?;
@@ -117,6 +135,29 @@ impl QueryExecutor {
                 result
             }
         }
+    }
+
+    /// Executes EXPLAIN: generates and returns the execution plan.
+    fn execute_explain(&self, query: &QueryAst) -> Result<QueryResult> {
+        let plan = self.planner.plan(query)?;
+        let description = plan.describe();
+
+        let plan_json = json!({
+            "plan": format_plan_node(&plan.root),
+            "cost": {
+                "total": plan.cost.total_cost,
+                "io": plan.cost.io_cost,
+                "cpu": plan.cost.cpu_cost,
+                "rows": plan.cost.rows,
+            },
+            "uses_index": plan.uses_index,
+            "is_sorted": plan.is_sorted,
+            "description": description,
+        });
+
+        Ok(QueryResult::Rows(vec![Map::from_iter(vec![
+            ("plan".to_string(), plan_json),
+        ])]))
     }
 
     /// Executes a statement within an existing transaction.
@@ -1235,6 +1276,113 @@ impl QueryResult {
                 output.push_str(&format!("({} rows)", rows.len()));
                 output
             }
+        }
+    }
+}
+
+/// Format a PlanNode as a JSON value for EXPLAIN output.
+fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
+    use crate::optimizer::PlanNode;
+
+    match node {
+        PlanNode::SeqScan { table, alias, estimated_rows, .. } => {
+            json!({
+                "type": "SeqScan",
+                "table": table,
+                "alias": alias,
+                "rows": estimated_rows,
+            })
+        }
+        PlanNode::IndexScan { table, index_column, estimated_rows, .. } => {
+            json!({
+                "type": "IndexScan",
+                "table": table,
+                "index": index_column,
+                "rows": estimated_rows,
+            })
+        }
+        PlanNode::IndexLookup { table, index_column, estimated_rows, .. } => {
+            json!({
+                "type": "IndexLookup",
+                "table": table,
+                "index": index_column,
+                "rows": estimated_rows,
+            })
+        }
+        PlanNode::VectorSearch { table, column, top_k, estimated_rows, .. } => {
+            json!({
+                "type": "VectorSearch",
+                "table": table,
+                "column": column,
+                "top_k": top_k,
+                "rows": estimated_rows,
+            })
+        }
+        PlanNode::Filter { input, estimated_rows, .. } => {
+            json!({
+                "type": "Filter",
+                "input": format_plan_node(input),
+                "rows": estimated_rows,
+            })
+        }
+        PlanNode::Projection { input, estimated_rows, .. } => {
+            json!({
+                "type": "Projection",
+                "input": format_plan_node(input),
+                "rows": estimated_rows,
+            })
+        }
+        PlanNode::NestedLoopJoin { left, right, estimated_rows, .. } => {
+            json!({
+                "type": "NestedLoopJoin",
+                "left": format_plan_node(left),
+                "right": format_plan_node(right),
+                "rows": estimated_rows,
+            })
+        }
+        PlanNode::HashJoin { left, right, estimated_rows, .. } => {
+            json!({
+                "type": "HashJoin",
+                "left": format_plan_node(left),
+                "right": format_plan_node(right),
+                "rows": estimated_rows,
+            })
+        }
+        PlanNode::Sort { input, order_by, estimated_rows, .. } => {
+            json!({
+                "type": "Sort",
+                "input": format_plan_node(input),
+                "order_by": {
+                    "column": order_by.column,
+                    "ascending": order_by.ascending,
+                },
+                "rows": estimated_rows,
+            })
+        }
+        PlanNode::Aggregation { input, group_by, estimated_rows, .. } => {
+            json!({
+                "type": "Aggregation",
+                "input": format_plan_node(input),
+                "group_by": group_by,
+                "rows": estimated_rows,
+            })
+        }
+        PlanNode::Limit { input, count, estimated_rows, .. } => {
+            json!({
+                "type": "Limit",
+                "input": format_plan_node(input),
+                "count": count,
+                "rows": estimated_rows,
+            })
+        }
+        PlanNode::Union { left, right, all, estimated_rows, .. } => {
+            json!({
+                "type": "Union",
+                "all": all,
+                "left": format_plan_node(left),
+                "right": format_plan_node(right),
+                "rows": estimated_rows,
+            })
         }
     }
 }

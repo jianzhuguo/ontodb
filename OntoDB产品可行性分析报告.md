@@ -648,7 +648,102 @@ Total Cost: 12.45 | Rows: 10 | Index: true | Sorted: true
 
 ---
 
-## 十四、结论与建议
+## 十四、EXPLAIN 与计划驱动执行（Phase 16）
+
+### 14.1 EXPLAIN 命令
+
+支持 `EXPLAIN` 语法查看查询执行计划：
+
+```sql
+EXPLAIN SELECT name, price FROM Product WHERE price > 100 LIMIT 10;
+```
+
+返回 JSON 格式的执行计划：
+
+```json
+{
+  "plan": {
+    "type": "Projection",
+    "input": {
+      "type": "Limit",
+      "count": 10,
+      "input": {
+        "type": "Filter",
+        "input": {
+          "type": "SeqScan",
+          "table": "Product",
+          "rows": 1000
+        },
+        "rows": 333
+      },
+      "rows": 10
+    },
+    "rows": 10
+  },
+  "cost": {
+    "total": 12.45,
+    "io": 10.0,
+    "cpu": 2.45,
+    "rows": 10
+  },
+  "uses_index": false,
+  "is_sorted": false,
+  "description": "Projection (rows: 10)\n  Limit 10 (rows: 10)\n    Filter (rows: 333)\n      SeqScan on Product (rows: 1000)\n\nTotal Cost: 12.45 | Rows: 10 | Index: false | Sorted: false"
+}
+```
+
+### 14.2 计划驱动执行
+
+查询执行器现在集成查询优化器：
+
+1. **Parser** 解析 SQL 为 AST
+2. **Planner** 将 AST 转换为执行计划树
+3. **CostModel** 估算各计划的代价
+4. **Executor** 根据最优计划执行
+
+### 14.3 执行计划节点类型
+
+| 节点类型 | 说明 | 优化决策 |
+|----------|------|----------|
+| `SeqScan` | 全表扫描 | 默认策略 |
+| `IndexScan` | 索引范围扫描 | 当 WHERE 列有索引时选择 |
+| `IndexLookup` | 索引点查找 | 等值查询且有索引时选择 |
+| `VectorSearch` | 向量搜索 | VECTOR SEARCH 查询 |
+| `Filter` | 条件过滤 | WHERE 条件下推 |
+| `Projection` | 列投影 | SELECT 列裁剪 |
+| `NestedLoopJoin` | 嵌套循环连接 | 小表驱动大表 |
+| `HashJoin` | 哈希连接 | 等值连接条件 |
+| `Sort` | 排序 | ORDER BY 优化 |
+| `Aggregation` | 聚合 | GROUP BY 优化 |
+| `Limit` | 行数限制 | LIMIT 下推 |
+
+### 14.4 索引自动选择
+
+优化器自动选择最优索引：
+
+```sql
+-- 自动选择 price 索引（如果有）
+EXPLAIN SELECT * FROM Product WHERE price > 100;
+-- 输出: IndexScan on Product using price
+
+-- 无索引时回退到全表扫描
+EXPLAIN SELECT * FROM Product WHERE name LIKE '%phone%';
+-- 输出: SeqScan on Product
+```
+
+### 14.5 后续优化方向
+
+| 方向 | 说明 |
+|------|------|
+| 运行时统计收集 | 自动收集表行数、块数、索引基数 |
+| 代价模型反馈 | 基于实际执行时间调整代价参数 |
+| 本体推理下推 | Subclass 扩展、约束剪枝 |
+| Hash Join 实现 | 当前只有计划，需实现执行器 |
+| Sort-Merge Join | 有序数据的高效连接 |
+
+---
+
+## 十五、结论与建议
 
 ### 核心结论
 
