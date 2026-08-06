@@ -1,4 +1,4 @@
-﻿//! Query executor: runs parsed queries against the storage and ontology engines.
+//! Query executor: runs parsed queries against the storage and ontology engines.
 
 use crate::cache::{PlanCache, QueryCache};
 use crate::optimizer::QueryPlanner;
@@ -2503,7 +2503,7 @@ impl QueryExecutor {
                         SelectItem::Expression(expr) => {
                             // Evaluate the expression against the current row
                             // We need engine access, but project_columns doesn't have it
-                            // This is handled in execute_select_txn before calling project_columns
+                            // This is handled in the Projection plan node before calling project_columns
                         }
                     }
                 }
