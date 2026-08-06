@@ -1046,3 +1046,543 @@ fn integration_special_characters_in_values() {
     let result = exec_ok(&executor, "SELECT * FROM Product");
     assert_row_count(&result, 2);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Phase 11: Vector Search + SQL Hybrid Query Integration Tests
+// ═══════════════════════════════════════════════════════════════════
+
+// ── 15. Vector search basic lifecycle ─────────────────────────────
+
+#[test]
+fn integration_vector_search_after_flush() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    // Create vector index
+    exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3");
+
+    // Insert products with vectors
+    exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('cat', 10, '[0.9, 0.1, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('dog', 20, '[0.8, 0.2, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('car', 30, '[0.0, 0.1, 0.9]')");
+    exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('truck', 40, '[0.1, 0.0, 0.8]')");
+
+    engine.write().unwrap().flush().unwrap();
+
+    // Vector search: nearest to [1,0,0] should return cat first
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 2");
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "cat");
+            assert!(rows[0].get("_distance").is_some(), "should have _distance column");
+        }
+        _ => panic!("expected Rows"),
+    }
+
+    // Vector search: nearest to [0,0,1] should return car/truck
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [0.0, 0.0, 1.0] TOP 2");
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows.len(), 2);
+            let names: Vec<&str> = rows.iter().map(|r| r.get("name").unwrap().as_str().unwrap()).collect();
+            assert!(names.contains(&"car"));
+            assert!(names.contains(&"truck"));
+        }
+        _ => panic!("expected Rows"),
+    }
+}
+
+#[test]
+fn integration_vector_search_across_multiple_flushes() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC l2 DIMENSION 4");
+
+    // Batch 1
+    for i in 0..5 {
+        exec_ok(&executor, &format!(
+            "INSERT INTO Product (name, price, embedding) VALUES ('item_{}', {}, '[1.0, 0.0, 0.0, 0.0]')",
+            i, (i + 1) * 100
+        ));
+    }
+    engine.write().unwrap().flush().unwrap();
+
+    // Batch 2
+    for i in 5..10 {
+        exec_ok(&executor, &format!(
+            "INSERT INTO Product (name, price, embedding) VALUES ('item_{}', {}, '[0.0, 0.0, 0.0, 1.0]')",
+            i, (i + 1) * 100
+        ));
+    }
+    engine.write().unwrap().flush().unwrap();
+
+    // Search should find items from both flushes
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0, 0.0] TOP 3");
+    assert_row_count(&result, 3);
+    // All results should be from batch 1 (closer to [1,0,0,0])
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            for row in rows {
+                let name = row.get("name").unwrap().as_str().unwrap();
+                let idx: i32 = name.strip_prefix("item_").unwrap().parse().unwrap();
+                assert!(idx < 5, "expected item from batch 1 (0-4), got {}", name);
+            }
+        }
+        _ => panic!("expected Rows"),
+    }
+}
+
+// ── 16. Vector search + SQL WHERE hybrid ──────────────────────────
+
+#[test]
+fn integration_vector_search_with_where_filter() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3");
+
+    // Products with categories
+    exec_ok(&executor, "INSERT INTO Product (name, category, embedding) VALUES ('cat', 'animal', '[0.9, 0.1, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, category, embedding) VALUES ('dog', 'animal', '[0.8, 0.2, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, category, embedding) VALUES ('car', 'vehicle', '[0.0, 0.1, 0.9]')");
+    exec_ok(&executor, "INSERT INTO Product (name, category, embedding) VALUES ('truck', 'vehicle', '[0.1, 0.0, 0.8]')");
+
+    engine.write().unwrap().flush().unwrap();
+
+    // Vector search with category filter — only animals
+    let result = exec_ok(&executor,
+        "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 10 WHERE category = 'animal'"
+    );
+    assert_row_count(&result, 2);
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            let names: Vec<&str> = rows.iter().map(|r| r.get("name").unwrap().as_str().unwrap()).collect();
+            assert!(names.contains(&"cat"));
+            assert!(names.contains(&"dog"));
+            // Should NOT contain vehicle items
+            assert!(!names.contains(&"car"));
+            assert!(!names.contains(&"truck"));
+        }
+        _ => panic!("expected Rows"),
+    }
+
+    // Vector search with price filter
+    let result = exec_ok(&executor,
+        "VECTOR SEARCH ON Product (embedding) QUERY [0.0, 0.0, 1.0] TOP 10 WHERE name = 'car'"
+    );
+    assert_row_count(&result, 1);
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "car");
+        }
+        _ => panic!("expected Rows"),
+    }
+}
+
+// ── 17. Vector search consistency with SQL mutations ──────────────
+
+#[test]
+fn integration_vector_search_after_update() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3");
+
+    exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('item_a', '[1.0, 0.0, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('item_b', '[0.0, 1.0, 0.0]')");
+    engine.write().unwrap().flush().unwrap();
+
+    // Verify initial search
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 1");
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "item_a");
+        }
+        _ => panic!("expected Rows"),
+    }
+
+    // Update item_a's embedding to be far away
+    exec_ok(&executor, "UPDATE Product SET embedding = '[0.0, 0.0, 1.0]' WHERE name = 'item_a'");
+
+    // Now item_b should be closest to [1,0,0]
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 1");
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "item_b");
+        }
+        _ => panic!("expected Rows"),
+    }
+}
+
+#[test]
+fn integration_vector_search_after_delete() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3");
+
+    exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('cat', '[0.9, 0.1, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('dog', '[0.8, 0.2, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('car', '[0.0, 0.1, 0.9]')");
+    engine.write().unwrap().flush().unwrap();
+
+    // Delete cat
+    exec_ok(&executor, "DELETE FROM Product WHERE name = 'cat'");
+
+    // Vector search should not return deleted 'cat'
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 10");
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            let names: Vec<&str> = rows.iter().map(|r| r.get("name").unwrap().as_str().unwrap()).collect();
+            assert!(!names.contains(&"cat"), "deleted 'cat' should not appear in vector search");
+            assert!(names.contains(&"dog"));
+            assert!(names.contains(&"car"));
+        }
+        _ => panic!("expected Rows"),
+    }
+}
+
+// ── 18. Vector index persistence across restart ───────────────────
+
+#[test]
+fn integration_vector_index_recovery_after_restart() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_path_buf();
+
+    // Phase 1: Create vector index, insert data, flush
+    {
+        let options = StorageOptions {
+            data_dir: data_dir.clone(),
+            memtable_size_limit: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let executor = make_executor(&engine);
+
+        exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3 M 8 EF_CONSTRUCTION 50 EF_SEARCH 30");
+        exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('alpha', '[1.0, 0.0, 0.0]')");
+        exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('beta', '[0.0, 1.0, 0.0]')");
+        exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('gamma', '[0.0, 0.0, 1.0]')");
+        engine.write().unwrap().flush().unwrap();
+    }
+
+    // Phase 2: Reopen — vector index should be rebuilt from persisted metadata
+    {
+        let options = StorageOptions {
+            data_dir,
+            memtable_size_limit: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).unwrap();
+
+        // Verify vector index exists
+        assert!(engine.has_vector_index("Product", "embedding"));
+
+        // Search should work with rebuilt index
+        let results = engine.vector_index_manager().search(
+            "Product", "embedding", &[1.0, 0.0, 0.0], 1,
+        ).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.id.len() > 0, true);
+    }
+}
+
+// ── 19. Vector search with compaction ─────────────────────────────
+
+#[test]
+fn integration_vector_search_after_compaction() {
+    let dir = tempdir().unwrap();
+    let options = StorageOptions {
+        data_dir: dir.path().to_path_buf(),
+        memtable_size_limit: 128,  // Small memtable → many flushes
+        size_ratio: 2,
+        ..Default::default()
+    };
+    let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+    let executor = make_executor(&engine);
+
+    exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 2");
+
+    // Insert enough to trigger compaction
+    for i in 0..20 {
+        let v1 = (i as f32) / 20.0;
+        let v2 = 1.0 - v1;
+        exec_ok(&executor, &format!(
+            "INSERT INTO Product (name, embedding) VALUES ('item_{:03}', '[{}, {}]')",
+            i, v1, v2
+        ));
+    }
+    engine.write().unwrap().flush().unwrap();
+    engine.write().unwrap().flush_compaction().unwrap();
+
+    // Vector search should still work after compaction
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0] TOP 3");
+    assert_row_count(&result, 3);
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            // item_19 has [0.95, 0.05] — closest to [1.0, 0.0]
+            assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "item_019");
+        }
+        _ => panic!("expected Rows"),
+    }
+}
+
+// ── 20. Multi-class vector isolation ──────────────────────────────
+
+#[test]
+fn integration_vector_search_class_isolation() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    // Create vector indexes on two different classes
+    exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3");
+    exec_ok(&executor, "CREATE VECTOR INDEX ON Document (embedding) METRIC cosine DIMENSION 3");
+
+    exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('iPhone', '[1.0, 0.0, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Document (title, embedding) VALUES ('manual', '[0.0, 1.0, 0.0]')");
+
+    engine.write().unwrap().flush().unwrap();
+
+    // Search Product — should only return Product results
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 10");
+    assert_row_count(&result, 1);
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "iPhone");
+        }
+        _ => panic!("expected Rows"),
+    }
+
+    // Search Document — should only return Document results
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Document (embedding) QUERY [0.0, 1.0, 0.0] TOP 10");
+    assert_row_count(&result, 1);
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows[0].get("title").unwrap().as_str().unwrap(), "manual");
+        }
+        _ => panic!("expected Rows"),
+    }
+}
+
+// ── 21. Vector + B-Tree index coexistence ─────────────────────────
+
+#[test]
+fn integration_vector_and_btree_index_coexistence() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    // Create both index types
+    exec_ok(&executor, "CREATE INDEX ON Product (price)");
+    exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3");
+
+    exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('iPhone', 999, '[1.0, 0.0, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('iPad', 799, '[0.9, 0.1, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('MacBook', 1999, '[0.0, 0.0, 1.0]')");
+
+    engine.write().unwrap().flush().unwrap();
+
+    // B-Tree index query
+    let result = exec_ok(&executor, "SELECT name FROM Product WHERE price > 900");
+    assert_row_count(&result, 2);
+
+    // Vector search
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 2");
+    assert_row_count(&result, 2);
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "iPhone");
+        }
+        _ => panic!("expected Rows"),
+    }
+
+    // Vector search with SQL filter (hybrid)
+    let result = exec_ok(&executor,
+        "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 10 WHERE price > 900"
+    );
+    assert_row_count(&result, 2); // iPhone(999) and MacBook(1999)
+}
+
+// ── 22. Full lifecycle: vector + SQL + ontology ───────────────────
+
+#[test]
+fn integration_vector_full_lifecycle_with_ontology() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    // 1. Create ontology
+    exec_ok(&executor,
+        "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING REQUIRED, PROPERTY price DOMAIN Product RANGE INT64)"
+    );
+
+    // 2. Create vector index
+    exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3");
+
+    // 3. Create B-Tree index
+    exec_ok(&executor, "CREATE INDEX ON Product (price)");
+
+    // 4. Insert data
+    exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('iPhone', 999, '[1.0, 0.0, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('iPad', 799, '[0.9, 0.1, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('MacBook', 1999, '[0.0, 0.0, 1.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('AirPods', 249, '[0.5, 0.5, 0.0]')");
+
+    engine.write().unwrap().flush().unwrap();
+
+    // 5. SQL query via B-Tree index
+    let result = exec_ok(&executor, "SELECT name FROM Product WHERE price > 900");
+    assert_row_count(&result, 2);
+
+    // 6. Vector search
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 2");
+    assert_row_count(&result, 2);
+
+    // 7. Vector search + SQL filter (hybrid)
+    let result = exec_ok(&executor,
+        "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 10 WHERE price > 500"
+    );
+    assert_row_count(&result, 3); // iPhone, iPad, MacBook (not AirPods)
+
+    // 8. UPDATE vector
+    exec_ok(&executor, "UPDATE Product SET embedding = '[0.0, 1.0, 0.0]' WHERE name = 'iPhone'");
+
+    // 9. Verify vector search reflects update
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [0.0, 1.0, 0.0] TOP 1");
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "iPhone");
+        }
+        _ => panic!("expected Rows"),
+    }
+
+    // 10. DELETE + verify vector search
+    exec_ok(&executor, "DELETE FROM Product WHERE name = 'AirPods'");
+
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 10");
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            let names: Vec<&str> = rows.iter().map(|r| r.get("name").unwrap().as_str().unwrap()).collect();
+            assert!(!names.contains(&"AirPods"), "deleted item should not appear");
+            assert_eq!(rows.len(), 3);
+        }
+        _ => panic!("expected Rows"),
+    }
+
+    // 11. Aggregation still works
+    let result = exec_ok(&executor, "SELECT COUNT(*) as cnt FROM Product");
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows[0].get("cnt").unwrap().as_i64().unwrap(), 3);
+        }
+        _ => panic!("expected count"),
+    }
+
+    // 12. Drop vector index
+    assert_success_contains(
+        &exec_ok(&executor, "DROP VECTOR INDEX ON Product (embedding)"),
+        "Vector index dropped",
+    );
+
+    // 13. Verify vector search fails after drop
+    let result = exec(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 1");
+    assert!(result.is_err(), "vector search should fail after index is dropped");
+
+    // 14. SQL queries still work
+    let result = exec_ok(&executor, "SELECT * FROM Product");
+    assert_row_count(&result, 3);
+}
+
+// ── 23. Vector search with L2 and InnerProduct metrics ────────────
+
+#[test]
+fn integration_vector_search_different_metrics() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    // L2 metric
+    exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding_l2) METRIC l2 DIMENSION 3");
+    exec_ok(&executor, "INSERT INTO Product (name, embedding_l2) VALUES ('a', '[1.0, 0.0, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, embedding_l2) VALUES ('b', '[0.0, 1.0, 0.0]')");
+
+    // InnerProduct metric on a different column
+    exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding_ip) METRIC innerproduct DIMENSION 3");
+    exec_ok(&executor, "INSERT INTO Product (name, embedding_ip) VALUES ('a', '[1.0, 0.0, 0.0]')");
+    exec_ok(&executor, "INSERT INTO Product (name, embedding_ip) VALUES ('b', '[0.0, 1.0, 0.0]')");
+
+    engine.write().unwrap().flush().unwrap();
+
+    // L2 search
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding_l2) QUERY [1.0, 0.0, 0.0] TOP 1");
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "a");
+        }
+        _ => panic!("expected Rows"),
+    }
+
+    // InnerProduct search
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding_ip) QUERY [1.0, 0.0, 0.0] TOP 1");
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "a");
+        }
+        _ => panic!("expected Rows"),
+    }
+}
+
+// ── 24. Large dataset vector search ───────────────────────────────
+
+#[test]
+fn integration_vector_search_large_dataset() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 8");
+
+    // Insert 100 items with known patterns
+    for i in 0..100 {
+        // First 50 items: vector points towards [1,0,...]
+        // Last 50 items: vector points towards [0,1,...]
+        let vec = if i < 50 {
+            format!("[0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]")
+        } else {
+            format!("[0.1, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]")
+        };
+        exec_ok(&executor, &format!(
+            "INSERT INTO Product (name, price, embedding) VALUES ('item_{:03}', {}, '{}')",
+            i, (i + 1) * 10, vec
+        ));
+    }
+    engine.write().unwrap().flush().unwrap();
+
+    // Search for top-5 nearest to [1,0,...]
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] TOP 5");
+    assert_row_count(&result, 5);
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            // All results should be from the first group (items 0-49)
+            for row in rows {
+                let name = row.get("name").unwrap().as_str().unwrap();
+                let idx: i32 = name.strip_prefix("item_").unwrap().parse().unwrap();
+                assert!(idx < 50, "expected item from first group, got {}", name);
+            }
+        }
+        _ => panic!("expected Rows"),
+    }
+
+    // Vector search + price filter (hybrid)
+    let result = exec_ok(&executor,
+        "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] TOP 5 WHERE price > 500"
+    );
+    assert_row_count(&result, 5);
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            for row in rows {
+                let price = row.get("price").unwrap().as_i64().unwrap();
+                assert!(price > 500, "expected price > 500, got {}", price);
+            }
+        }
+        _ => panic!("expected Rows"),
+    }
+}

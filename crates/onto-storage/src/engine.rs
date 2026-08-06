@@ -10,6 +10,7 @@
 //! invalidate stale SSTable cache entries.
 
 use crate::index::IndexManager;
+use crate::vector::VectorIndexManager;
 use crate::lsm::compaction_worker::{CompactionMsg, CompactionNotification, CompactionWorker, SsTableInfo};
 use crate::lsm::memtable::MemTable;
 use crate::lsm::sstable::{SsTable, SsTableBuilder};
@@ -57,6 +58,9 @@ pub struct LsmEngine {
 
     /// Secondary index manager.
     index_manager: IndexManager,
+
+    /// Vector index manager (HNSW).
+    vector_index_manager: VectorIndexManager,
 
     /// Channel to send flush notifications to the background compaction worker.
     compaction_sender: mpsc::Sender<CompactionMsg>,
@@ -196,12 +200,16 @@ impl LsmEngine {
             sst_counter,
             txn_manager: TxnManager::new(),
             index_manager: IndexManager::new(),
+            vector_index_manager: VectorIndexManager::new(),
             compaction_sender,
             compaction_notif_receiver: std::sync::Mutex::new(compaction_notif_receiver),
         };
 
         // Rebuild secondary indexes from persisted index entries
         engine.rebuild_indexes()?;
+
+        // Rebuild vector indexes from persisted metadata
+        engine.rebuild_vector_indexes()?;
 
         Ok(engine)
     }
@@ -613,6 +621,85 @@ impl LsmEngine {
         Ok(())
     }
 
+    /// Rebuilds vector indexes by scanning persisted metadata and document data.
+    fn rebuild_vector_indexes(&mut self) -> Result<()> {
+        let meta_entries = self.scan_prefix(b"__vec_meta__")?;
+        if meta_entries.is_empty() {
+            return Ok(());
+        }
+
+        // Parse and recreate vector indexes from metadata
+        let mut index_configs: Vec<(String, String, usize, crate::vector::DistanceMetric, usize, usize, usize)> = Vec::new();
+        for (_key, val_bytes) in &meta_entries {
+            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                let class = meta["class"].as_str().unwrap_or("").to_string();
+                let column = meta["column"].as_str().unwrap_or("").to_string();
+                let dimension = meta["dimension"].as_u64().unwrap_or(0) as usize;
+                let metric_str = meta["metric"].as_str().unwrap_or("Cosine");
+                let metric = match metric_str {
+                    "L2" => crate::vector::DistanceMetric::L2,
+                    "InnerProduct" => crate::vector::DistanceMetric::InnerProduct,
+                    _ => crate::vector::DistanceMetric::Cosine,
+                };
+                let m = meta["m"].as_u64().unwrap_or(16) as usize;
+                let ef_construction = meta["ef_construction"].as_u64().unwrap_or(200) as usize;
+                let ef_search = meta["ef_search"].as_u64().unwrap_or(100) as usize;
+
+                if !class.is_empty() && !column.is_empty() && dimension > 0 {
+                    index_configs.push((class, column, dimension, metric, m, ef_construction, ef_search));
+                }
+            }
+        }
+
+        // Create the indexes
+        for (class, column, dimension, metric, m, ef_construction, ef_search) in &index_configs {
+            let _ = self.vector_index_manager.create_index(
+                class, column, *dimension, *metric, *m, *ef_construction, *ef_search,
+            );
+        }
+
+        // Backfill vectors from document data
+        for (class, column, dimension, _, _, _, _) in &index_configs {
+            let prefix = format!("{}::", class);
+            let entries = self.scan_prefix(prefix.as_bytes())?;
+            let mut count = 0usize;
+            for (pk, val_bytes) in entries {
+                if let Ok(serde_json::Value::Object(doc)) =
+                    serde_json::from_slice::<serde_json::Value>(&val_bytes)
+                {
+                    if doc.get("__class__").and_then(|v| v.as_str()) == Some(class.as_str()) {
+                        if let Some(serde_json::Value::Array(arr)) = doc.get(column.as_str()) {
+                            let vec: Vec<f32> = arr
+                                .iter()
+                                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                                .collect();
+                            if vec.len() == *dimension {
+                                self.vector_index_manager.index_vector(&pk, class, column, vec);
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            tracing::info!(
+                "Rebuilt vector index on {}.{} ({} vectors)",
+                class, column, count
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Builds the LSM key for vector index metadata.
+    fn make_vec_meta_key(class: &str, column: &str) -> Vec<u8> {
+        let mut key = Vec::new();
+        key.extend_from_slice(b"__vec_meta__");
+        key.extend_from_slice(class.as_bytes());
+        key.extend_from_slice(b"__");
+        key.extend_from_slice(column.as_bytes());
+        key
+    }
+
     // ══════════════════════════════════════════════════════════════�?    //  MVCC Transaction API
     // ══════════════════════════════════════════════════════════════�?
     /// Begins a new transaction. Returns the transaction ID.
@@ -635,17 +722,25 @@ impl LsmEngine {
             let has_indexes = class.as_ref().map_or(false, |c| {
                 !self.index_manager.indexes_for_class(c).is_empty()
             });
+            let has_vector_indexes = class.as_ref().map_or(false, |c| {
+                self.vector_index_manager.has_any_index(c)
+            });
 
             match op {
                 WriteOp::Put(value) => {
-                    if has_indexes {
+                    if has_indexes || has_vector_indexes {
                         // Deindex the old value first (handles UPDATE case)
                         if let Some(old_val) = self.get(&key)? {
                             if let Ok(serde_json::Value::Object(ref old_doc)) =
                                 serde_json::from_slice::<serde_json::Value>(&old_val)
                             {
                                 if let Some(ref c) = class {
-                                    self.index_manager.deindex_document(c, &key, old_doc);
+                                    if has_indexes {
+                                        self.index_manager.deindex_document(c, &key, old_doc);
+                                    }
+                                    if has_vector_indexes {
+                                        self.vector_index_manager.deindex_vectors(&key);
+                                    }
                                 }
                             }
                         }
@@ -654,14 +749,21 @@ impl LsmEngine {
                             serde_json::from_slice::<serde_json::Value>(&value)
                         {
                             if let Some(ref c) = class {
-                                let index_entries = self.index_manager.index_document(c, &key, doc);
-                                for (idx_key, idx_val) in index_entries {
-                                    let idx_seq = self.next_seq();
-                                    let idx_entry = Entry::put(idx_key.clone(), idx_val.clone(), idx_seq);
-                                    self.wal.append(&idx_entry)?;
-                                    self.memtable.put_with_seq(idx_key, idx_val, idx_seq);
+                                if has_indexes {
+                                    let index_entries = self.index_manager.index_document(c, &key, doc);
+                                    for (idx_key, idx_val) in index_entries {
+                                        let idx_seq = self.next_seq();
+                                        let idx_entry = Entry::put(idx_key.clone(), idx_val.clone(), idx_seq);
+                                        self.wal.append(&idx_entry)?;
+                                        self.memtable.put_with_seq(idx_key, idx_val, idx_seq);
+                                    }
+                                }
+                                if has_vector_indexes {
+                                    self.vector_index_manager.index_document_vectors(&key, c, doc);
                                 }
                             }
+                        } else {
+                            // Value deserialization failed — skip indexing
                         }
                     }
 
@@ -671,13 +773,18 @@ impl LsmEngine {
                 }
                 WriteOp::Delete => {
                     // For deletes, we need the old value to de-index
-                    if has_indexes {
+                    if has_indexes || has_vector_indexes {
                         if let Some(old_val) = self.get(&key)? {
                             if let Ok(serde_json::Value::Object(ref doc)) =
                                 serde_json::from_slice::<serde_json::Value>(&old_val)
                             {
                                 if let Some(ref c) = class {
-                                    self.index_manager.deindex_document(c, &key, doc);
+                                    if has_indexes {
+                                        self.index_manager.deindex_document(c, &key, doc);
+                                    }
+                                    if has_vector_indexes {
+                                        self.vector_index_manager.deindex_vectors(&key);
+                                    }
                                 }
                             }
                         }
@@ -925,6 +1032,96 @@ impl LsmEngine {
     /// Returns a mutable reference to the index manager.
     pub fn index_manager_mut(&mut self) -> &mut IndexManager {
         &mut self.index_manager
+    }
+
+    // =================================================================
+    //  Vector Index API
+    // =================================================================
+
+    /// Creates a vector index on a class.column with HNSW parameters.
+    pub fn create_vector_index(
+        &mut self,
+        class: &str,
+        column: &str,
+        dimension: usize,
+        metric: crate::vector::DistanceMetric,
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+    ) -> Result<()> {
+        self.vector_index_manager
+            .create_index(class, column, dimension, metric, m, ef_construction, ef_search)?;
+
+        // Persist vector index metadata to LSM
+        let meta_key = Self::make_vec_meta_key(class, column);
+        let meta_json = serde_json::json!({
+            "class": class,
+            "column": column,
+            "dimension": dimension,
+            "metric": format!("{:?}", metric),
+            "m": m,
+            "ef_construction": ef_construction,
+            "ef_search": ef_search,
+        });
+        let meta_val = serde_json::to_vec(&meta_json)
+            .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
+        let seq = self.next_seq();
+        let entry = Entry::put(meta_key.clone(), meta_val.clone(), seq);
+        self.wal.append(&entry)?;
+        self.memtable.put_with_seq(meta_key, meta_val, seq);
+
+        // Backfill: scan existing documents and index their vectors
+        let prefix = format!("{}::", class);
+        let entries = self.scan_prefix(prefix.as_bytes())?;
+
+        for (pk, val_bytes) in entries {
+            if let Ok(serde_json::Value::Object(doc)) =
+                serde_json::from_slice::<serde_json::Value>(&val_bytes)
+            {
+                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
+                    if let Some(serde_json::Value::Array(arr)) = doc.get(column) {
+                        let vec: Vec<f32> = arr
+                            .iter()
+                            .filter_map(|v| v.as_f64().map(|f| f as f32))
+                            .collect();
+                        if vec.len() == dimension {
+                            self.vector_index_manager.index_vector(&pk, class, column, vec);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Drops a vector index.
+    pub fn drop_vector_index(&mut self, class: &str, column: &str) -> bool {
+        let removed = self.vector_index_manager.drop_index(class, column);
+        if removed {
+            // Remove persisted metadata
+            let meta_key = Self::make_vec_meta_key(class, column);
+            let seq = self.next_seq();
+            let del_entry = Entry::delete(meta_key.clone(), seq);
+            let _ = self.wal.append(&del_entry);
+            self.memtable.delete_with_seq(meta_key, seq);
+        }
+        removed
+    }
+
+    /// Returns true if a vector index exists on the given class.column.
+    pub fn has_vector_index(&self, class: &str, column: &str) -> bool {
+        self.vector_index_manager.has_index(class, column)
+    }
+
+    /// Returns a reference to the vector index manager.
+    pub fn vector_index_manager(&self) -> &VectorIndexManager {
+        &self.vector_index_manager
+    }
+
+    /// Returns a mutable reference to the vector index manager.
+    pub fn vector_index_manager_mut(&mut self) -> &mut VectorIndexManager {
+        &mut self.vector_index_manager
     }
 
     /// Returns engine statistics.

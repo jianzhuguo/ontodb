@@ -74,6 +74,32 @@ pub enum QueryAst {
         class: String,
         column: String,
     },
+
+    /// CREATE VECTOR INDEX ON <class> (<column>) METRIC <metric> DIMENSION <dim>
+    CreateVectorIndex {
+        class: String,
+        column: String,
+        metric: String,
+        dimension: usize,
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+    },
+
+    /// DROP VECTOR INDEX ON <class> (<column>)
+    DropVectorIndex {
+        class: String,
+        column: String,
+    },
+
+    /// VECTOR SEARCH ON <class> (<column>) QUERY [v1, v2, ...] TOP <k> [WHERE ...]
+    VectorSearch {
+        class: String,
+        column: String,
+        query_vector: Vec<f32>,
+        top_k: usize,
+        filter: Option<FilterExpr>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +202,12 @@ impl QueryParser {
             Ok(QueryAst::CreateOntology {
                 sql: input.to_string(),
             })
+        } else if upper.starts_with("CREATE VECTOR INDEX") {
+            Self::parse_create_vector_index(input)
+        } else if upper.starts_with("DROP VECTOR INDEX") {
+            Self::parse_drop_vector_index(input)
+        } else if upper.starts_with("VECTOR SEARCH") {
+            Self::parse_vector_search(input)
         } else if upper.starts_with("CREATE INDEX") {
             Self::parse_create_index(input)
         } else if upper.starts_with("DROP INDEX") {
@@ -305,8 +337,8 @@ impl QueryParser {
         }
         let vals_inner = &values_str[1..values_str.len() - 1];
 
-        let values: Vec<LiteralValue> = vals_inner
-            .split(',')
+        let values: Vec<LiteralValue> = Self::split_quoted(vals_inner, ',')
+            .iter()
             .map(|s| Self::parse_literal(s.trim()))
             .collect::<Result<Vec<_>>>()?;
 
@@ -657,6 +689,191 @@ impl QueryParser {
         }
 
         Ok(QueryAst::DropIndex { class, column })
+    }
+
+    /// Parses: CREATE VECTOR INDEX ON <class> (<column>) METRIC <metric> DIMENSION <dim> [M <m>] [EF_CONSTRUCTION <ef>] [EF_SEARCH <ef>]
+    fn parse_create_vector_index(input: &str) -> Result<QueryAst> {
+        let upper = input.to_uppercase();
+        let on_pos = upper
+            .find(" ON ")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after CREATE VECTOR INDEX".to_string()))?;
+        let rest = input[on_pos + 4..].trim();
+
+        // Find the parenthesized column
+        let paren_open = rest
+            .find('(')
+            .ok_or_else(|| CoreError::InvalidArgument("expected '(column)' in CREATE VECTOR INDEX".to_string()))?;
+        let class = rest[..paren_open].trim().to_string();
+        let paren_close = rest
+            .find(')')
+            .ok_or_else(|| CoreError::InvalidArgument("expected ')' in CREATE VECTOR INDEX".to_string()))?;
+        let column = rest[paren_open + 1..paren_close].trim().to_string();
+
+        if class.is_empty() || column.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "class and column cannot be empty in CREATE VECTOR INDEX".to_string(),
+            ));
+        }
+
+        let after_paren = rest[paren_close + 1..].trim().to_uppercase();
+
+        // Parse METRIC
+        let metric = if let Some(pos) = after_paren.find("METRIC") {
+            let metric_str = after_paren[pos + 6..].trim();
+            let end = metric_str.find(|c: char| c.is_whitespace()).unwrap_or(metric_str.len());
+            metric_str[..end].to_lowercase()
+        } else {
+            "cosine".to_string()
+        };
+
+        // Parse DIMENSION
+        let dimension = if let Some(pos) = after_paren.find("DIMENSION") {
+            let dim_str = after_paren[pos + 9..].trim();
+            let end = dim_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(dim_str.len());
+            dim_str[..end].parse::<usize>()
+                .map_err(|_| CoreError::InvalidArgument("invalid DIMENSION value".to_string()))?
+        } else {
+            return Err(CoreError::InvalidArgument("DIMENSION is required in CREATE VECTOR INDEX".to_string()));
+        };
+
+        // Parse optional M
+        let m = if let Some(pos) = after_paren.find(" M ") {
+            let m_str = after_paren[pos + 3..].trim();
+            let end = m_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(m_str.len());
+            m_str[..end].parse::<usize>().unwrap_or(16)
+        } else {
+            16
+        };
+
+        // Parse optional EF_CONSTRUCTION
+        let ef_construction = if let Some(pos) = after_paren.find("EF_CONSTRUCTION") {
+            let ef_str = after_paren[pos + 15..].trim();
+            let end = ef_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(ef_str.len());
+            ef_str[..end].parse::<usize>().unwrap_or(200)
+        } else {
+            200
+        };
+
+        // Parse optional EF_SEARCH
+        let ef_search = if let Some(pos) = after_paren.find("EF_SEARCH") {
+            let ef_str = after_paren[pos + 9..].trim();
+            let end = ef_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(ef_str.len());
+            ef_str[..end].parse::<usize>().unwrap_or(100)
+        } else {
+            100
+        };
+
+        Ok(QueryAst::CreateVectorIndex {
+            class,
+            column,
+            metric,
+            dimension,
+            m,
+            ef_construction,
+            ef_search,
+        })
+    }
+
+    /// Parses: DROP VECTOR INDEX ON <class> (<column>)
+    fn parse_drop_vector_index(input: &str) -> Result<QueryAst> {
+        let upper = input.to_uppercase();
+        let on_pos = upper
+            .find(" ON ")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after DROP VECTOR INDEX".to_string()))?;
+        let rest = input[on_pos + 4..].trim();
+
+        let paren_open = rest
+            .find('(')
+            .ok_or_else(|| CoreError::InvalidArgument("expected '(column)' in DROP VECTOR INDEX".to_string()))?;
+        let class = rest[..paren_open].trim().to_string();
+        let paren_close = rest
+            .find(')')
+            .ok_or_else(|| CoreError::InvalidArgument("expected ')' in DROP VECTOR INDEX".to_string()))?;
+        let column = rest[paren_open + 1..paren_close].trim().to_string();
+
+        if class.is_empty() || column.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "class and column cannot be empty in DROP VECTOR INDEX".to_string(),
+            ));
+        }
+
+        Ok(QueryAst::DropVectorIndex { class, column })
+    }
+
+    /// Parses: VECTOR SEARCH ON <class> (<column>) QUERY [v1, v2, ...] TOP <k> [WHERE ...]
+    fn parse_vector_search(input: &str) -> Result<QueryAst> {
+        let upper = input.to_uppercase();
+        let on_pos = upper
+            .find(" ON ")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after VECTOR SEARCH".to_string()))?;
+        let rest = input[on_pos + 4..].trim();
+
+        // Find the parenthesized column
+        let paren_open = rest
+            .find('(')
+            .ok_or_else(|| CoreError::InvalidArgument("expected '(column)' in VECTOR SEARCH".to_string()))?;
+        let class = rest[..paren_open].trim().to_string();
+        let paren_close = rest
+            .find(')')
+            .ok_or_else(|| CoreError::InvalidArgument("expected ')' in VECTOR SEARCH".to_string()))?;
+        let column = rest[paren_open + 1..paren_close].trim().to_string();
+
+        if class.is_empty() || column.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "class and column cannot be empty in VECTOR SEARCH".to_string(),
+            ));
+        }
+
+        let after_paren = rest[paren_close + 1..].trim();
+
+        // Parse QUERY keyword
+        let upper_after = after_paren.to_uppercase();
+        let query_pos = upper_after
+            .find("QUERY")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'QUERY' in VECTOR SEARCH".to_string()))?;
+        let after_query = after_paren[query_pos + 5..].trim();
+
+        // Parse the vector: [v1, v2, ...]
+        let bracket_open = after_query
+            .find('[')
+            .ok_or_else(|| CoreError::InvalidArgument("expected '[' for query vector".to_string()))?;
+        let bracket_close = after_query
+            .find(']')
+            .ok_or_else(|| CoreError::InvalidArgument("expected ']' for query vector".to_string()))?;
+        let vec_str = &after_query[bracket_open + 1..bracket_close];
+        let query_vector: Vec<f32> = vec_str
+            .split(',')
+            .map(|s| s.trim().parse::<f32>())
+            .collect::<std::result::Result<Vec<f32>, _>>()
+            .map_err(|_| CoreError::InvalidArgument("invalid vector element".to_string()))?;
+
+        let after_vec = after_query[bracket_close + 1..].trim();
+        let upper_after_vec = after_vec.to_uppercase();
+
+        // Parse TOP <k>
+        let top_pos = upper_after_vec
+            .find("TOP")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'TOP' in VECTOR SEARCH".to_string()))?;
+        let after_top = after_vec[top_pos + 3..].trim();
+        let (top_str, remaining) = Self::parse_word(after_top)?;
+        let top_k = top_str
+            .parse::<usize>()
+            .map_err(|_| CoreError::InvalidArgument("invalid TOP value".to_string()))?;
+
+        // Parse optional WHERE
+        let filter = if remaining.to_uppercase().starts_with("WHERE") {
+            Self::parse_where(remaining[5..].trim())?.0
+        } else {
+            None
+        };
+
+        Ok(QueryAst::VectorSearch {
+            class,
+            column,
+            query_vector,
+            top_k,
+            filter,
+        })
     }
 
     fn parse_update(input: &str) -> Result<QueryAst> {

@@ -6,6 +6,8 @@
 
 pub mod distance;
 pub mod hnsw;
+pub mod manager;
 
 pub use distance::DistanceMetric;
 pub use hnsw::{HnswConfig, HnswIndex, SearchResult, VectorEntry};
+pub use manager::VectorIndexManager;

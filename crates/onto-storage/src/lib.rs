@@ -20,4 +20,4 @@ pub use index::IndexManager;
 pub use iterator::StorageIterator;
 pub use mvcc::{TxnManager, Transaction, TxnStatus, WriteOp};
 pub use options::StorageOptions;
-pub use vector::{DistanceMetric, HnswConfig, HnswIndex, VectorEntry, SearchResult};
+pub use vector::{DistanceMetric, HnswConfig, HnswIndex, VectorEntry, SearchResult, VectorIndexManager};

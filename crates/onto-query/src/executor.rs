@@ -71,6 +71,40 @@ impl QueryExecutor {
                     )))
                 }
             }
+            QueryAst::CreateVectorIndex {
+                class,
+                column,
+                metric,
+                dimension,
+                m,
+                ef_construction,
+                ef_search,
+            } => {
+                let distance_metric = match metric.to_lowercase().as_str() {
+                    "l2" | "euclidean" => onto_storage::DistanceMetric::L2,
+                    "cosine" => onto_storage::DistanceMetric::Cosine,
+                    "innerproduct" | "inner_product" | "dot" => onto_storage::DistanceMetric::InnerProduct,
+                    _ => onto_storage::DistanceMetric::Cosine,
+                };
+                engine.create_vector_index(
+                    class, column, *dimension, distance_metric, *m, *ef_construction, *ef_search,
+                )?;
+                Ok(QueryResult::Success(format!(
+                    "Vector index created on {}.{} (dim={}, metric={:?})",
+                    class, column, dimension, distance_metric
+                )))
+            }
+            QueryAst::DropVectorIndex { class, column } => {
+                if engine.drop_vector_index(class, column) {
+                    Ok(QueryResult::Success(format!(
+                        "Vector index dropped on {}.{}", class, column
+                    )))
+                } else {
+                    Ok(QueryResult::Success(format!(
+                        "No vector index found on {}.{}", class, column
+                    )))
+                }
+            }
             _ => {
                 // All other statements run in an auto-committed transaction
                 let txn_id = engine.begin_txn();
@@ -121,6 +155,13 @@ impl QueryExecutor {
                 filter,
                 returns,
             } => self.execute_match_txn(engine, txn_id, variable, class, filter, returns),
+            QueryAst::VectorSearch {
+                class,
+                column,
+                query_vector,
+                top_k,
+                filter,
+            } => self.execute_vector_search_txn(engine, txn_id, class, column, query_vector, *top_k, filter),
             _ => Err(onto_core::CoreError::InvalidArgument(
                 "unsupported statement type in transaction".to_string(),
             )),
@@ -422,7 +463,10 @@ impl QueryExecutor {
         let mut doc = Map::new();
         doc.insert("__class__".to_string(), json!(class));
         for (col, val) in columns.iter().zip(values.iter()) {
-            doc.insert(col.clone(), self.literal_to_json(val));
+            let json_val = self.literal_to_json(val);
+            // Auto-parse vector strings like "[0.1, 0.2, 0.3]" into JSON arrays
+            let json_val = Self::try_parse_vector(json_val);
+            doc.insert(col.clone(), json_val);
         }
 
         // Validate against ontology schema
@@ -585,7 +629,9 @@ impl QueryExecutor {
                 if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
                     if self.matches_filter(engine, &doc, filter) {
                         for (col, val) in assignments {
-                            doc.insert(col.clone(), self.literal_to_json(val));
+                            let json_val = self.literal_to_json(val);
+                            let json_val = Self::try_parse_vector(json_val);
+                            doc.insert(col.clone(), json_val);
                         }
                         // Validate the updated document against ontology schema
                         self.validate_document(engine, class, &doc)?;
@@ -617,6 +663,74 @@ impl QueryExecutor {
             )
         };
         self.execute_select_txn(engine, txn_id, false, &columns, class, None, &[], filter, None, &None, None, None)
+    }
+
+    /// Executes a VECTOR SEARCH query.
+    /// 1. If a WHERE filter is provided, get matching document keys first
+    /// 2. Perform vector similarity search (with optional filter)
+    /// 3. Fetch full documents for the results
+    fn execute_vector_search_txn(
+        &self,
+        engine: &mut LsmEngine,
+        txn_id: u64,
+        class: &str,
+        column: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        filter: &Option<FilterExpr>,
+    ) -> Result<QueryResult> {
+        // Check that a vector index exists
+        if !engine.has_vector_index(class, column) {
+            return Err(CoreError::InvalidArgument(format!(
+                "no vector index on {}.{}",
+                class, column
+            )));
+        }
+
+        let search_results = if let Some(filter_expr) = filter {
+            // Get document keys matching the filter
+            let prefix = format!("{}::", class);
+            let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
+            let mut allowed_ids = std::collections::HashSet::new();
+            for (key, val_bytes) in &entries {
+                if let Ok(serde_json::Value::Object(ref doc)) =
+                    serde_json::from_slice::<serde_json::Value>(val_bytes)
+                {
+                    if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
+                        if self.matches_filter(engine, doc, &Some(filter_expr.clone())) {
+                            allowed_ids.insert(key.clone());
+                        }
+                    }
+                }
+            }
+
+            engine.vector_index_manager().search_filtered(
+                class, column, query_vector, top_k, &allowed_ids,
+            )?
+        } else {
+            engine.vector_index_manager().search(
+                class, column, query_vector, top_k,
+            )?
+        };
+
+        // Fetch full documents for the search results
+        let mut rows = Vec::new();
+        for result in &search_results {
+            if let Ok(Some(val_bytes)) = engine.txn_get(txn_id, &result.entry.id) {
+                if let Ok(serde_json::Value::Object(mut doc)) =
+                    serde_json::from_slice::<serde_json::Value>(&val_bytes)
+                {
+                    // Add the distance as a virtual column
+                    doc.insert(
+                        "_distance".to_string(),
+                        serde_json::json!(result.distance),
+                    );
+                    rows.push(doc);
+                }
+            }
+        }
+
+        Ok(QueryResult::Rows(rows))
     }
 
     fn generate_doc_key(&self, class: &str) -> Vec<u8> {
@@ -1055,6 +1169,20 @@ impl QueryExecutor {
             LiteralValue::Float(f) => json!(f),
             LiteralValue::String(s) => json!(s),
         }
+    }
+
+    /// Attempts to parse a JSON string that looks like a vector array "[0.1, 0.2, ...]"
+    /// into an actual JSON array of numbers. Returns the original value if not a vector string.
+    fn try_parse_vector(val: Value) -> Value {
+        if let Value::String(ref s) = val {
+            let trimmed = s.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                if let Ok(arr) = serde_json::from_str::<Vec<f64>>(trimmed) {
+                    return Value::Array(arr.into_iter().map(|f| json!(f)).collect());
+                }
+            }
+        }
+        val
     }
 }
 
@@ -2524,6 +2652,200 @@ mod tests {
                 assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "iPad");
             }
             _ => panic!("expected 1 row in range > 600"),
+        }
+    }
+
+    // ── Vector search tests ───────────────────────────────────────
+
+    #[test]
+    fn test_vector_search_basic() {
+        let (executor, _dir) = setup();
+
+        // Create vector index
+        let ast = QueryParser::parse(
+            "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3"
+        ).unwrap();
+        executor.execute(&ast).unwrap();
+
+        // Insert documents with vectors
+        let ast = QueryAst::Insert {
+            class: "Product".to_string(),
+            columns: vec!["name".to_string(), "embedding".to_string()],
+            values: vec![
+                LiteralValue::String("cat".to_string()),
+                LiteralValue::String("[0.9, 0.1, 0.0]".to_string()),
+            ],
+        };
+        executor.execute(&ast).unwrap();
+
+        let ast = QueryAst::Insert {
+            class: "Product".to_string(),
+            columns: vec!["name".to_string(), "embedding".to_string()],
+            values: vec![
+                LiteralValue::String("dog".to_string()),
+                LiteralValue::String("[0.8, 0.2, 0.0]".to_string()),
+            ],
+        };
+        executor.execute(&ast).unwrap();
+
+        let ast = QueryAst::Insert {
+            class: "Product".to_string(),
+            columns: vec!["name".to_string(), "embedding".to_string()],
+            values: vec![
+                LiteralValue::String("car".to_string()),
+                LiteralValue::String("[0.0, 0.1, 0.9]".to_string()),
+            ],
+        };
+        executor.execute(&ast).unwrap();
+
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Vector search: find 2 nearest to [1.0, 0.0, 0.0]
+        let ast = QueryParser::parse(
+            "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 2"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2);
+                // First result should be "cat" (closest to [1,0,0])
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "cat");
+                // Should have _distance column
+                assert!(rows[0].get("_distance").is_some());
+            }
+            _ => panic!("expected 2 rows from vector search"),
+        }
+    }
+
+    #[test]
+    fn test_vector_search_with_filter() {
+        let (executor, _dir) = setup();
+
+        let ast = QueryParser::parse(
+            "CREATE VECTOR INDEX ON Product (embedding) METRIC l2 DIMENSION 3"
+        ).unwrap();
+        executor.execute(&ast).unwrap();
+
+        // Insert products with category
+        for (name, cat, vec_str) in [
+            ("cat", "animal", "[0.9, 0.1, 0.0]"),
+            ("dog", "animal", "[0.8, 0.2, 0.0]"),
+            ("car", "vehicle", "[0.0, 0.1, 0.9]"),
+            ("truck", "vehicle", "[0.1, 0.0, 0.8]"),
+        ] {
+            let ast = QueryAst::Insert {
+                class: "Product".to_string(),
+                columns: vec![
+                    "name".to_string(),
+                    "category".to_string(),
+                    "embedding".to_string(),
+                ],
+                values: vec![
+                    LiteralValue::String(name.to_string()),
+                    LiteralValue::String(cat.to_string()),
+                    LiteralValue::String(vec_str.to_string()),
+                ],
+            };
+            executor.execute(&ast).unwrap();
+        }
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // Vector search with filter: only "animal" category
+        let ast = QueryParser::parse(
+            "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 3 WHERE category = 'animal'"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // only cat and dog
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "cat");
+                assert_eq!(rows[1].get("name").unwrap().as_str().unwrap(), "dog");
+            }
+            _ => panic!("expected 2 rows from filtered vector search"),
+        }
+    }
+
+    #[test]
+    fn test_vector_index_create_drop() {
+        let (executor, _dir) = setup();
+
+        // Create
+        let ast = QueryParser::parse(
+            "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 128 M 32 EF_CONSTRUCTION 400 EF_SEARCH 200"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("Vector index created")),
+            _ => panic!("expected Success"),
+        }
+
+        // Verify it exists
+        assert!(executor.engine.read().unwrap().has_vector_index("Product", "embedding"));
+
+        // Drop
+        let ast = QueryParser::parse(
+            "DROP VECTOR INDEX ON Product (embedding)"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("Vector index dropped")),
+            _ => panic!("expected Success"),
+        }
+
+        // Verify it's gone
+        assert!(!executor.engine.read().unwrap().has_vector_index("Product", "embedding"));
+    }
+
+    #[test]
+    fn test_vector_index_persistence_across_restart() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        // Create vector index and insert data
+        {
+            let options = StorageOptions {
+                data_dir: data_dir.clone(),
+                memtable_size_limit: 1024 * 1024,
+                ..Default::default()
+            };
+            let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+            let ontology_store = OntologyStore::new(engine.clone());
+            let executor = QueryExecutor::new(engine.clone(), ontology_store);
+
+            let ast = QueryParser::parse(
+                "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3"
+            ).unwrap();
+            executor.execute(&ast).unwrap();
+
+            let ast = QueryAst::Insert {
+                class: "Product".to_string(),
+                columns: vec!["name".to_string(), "embedding".to_string()],
+                values: vec![
+                    LiteralValue::String("item1".to_string()),
+                    LiteralValue::String("[1.0, 0.0, 0.0]".to_string()),
+                ],
+            };
+            executor.execute(&ast).unwrap();
+            engine.write().unwrap().flush().unwrap();
+        }
+
+        // Reopen and verify vector index is rebuilt
+        {
+            let options = StorageOptions {
+                data_dir,
+                memtable_size_limit: 1024 * 1024,
+                ..Default::default()
+            };
+            let engine = LsmEngine::open(options).unwrap();
+
+            // Vector index should be rebuilt from persisted metadata
+            assert!(engine.has_vector_index("Product", "embedding"));
+
+            // Search should work with rebuilt index
+            let results = engine.vector_index_manager().search(
+                "Product", "embedding", &[1.0, 0.0, 0.0], 1,
+            ).unwrap();
+            assert_eq!(results.len(), 1);
         }
     }
 }
