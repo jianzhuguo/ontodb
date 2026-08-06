@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.7 | 更新日期：2026-08-06
+> 版本：v1.8 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -95,7 +95,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 | 模块 | 评估 | 依据 |
 |------|------|------|
-| LSM-Tree 存储引擎 | **可行，已实现完整** | WAL + MemTable（O(log n) BTreeMap range 查询）+ SSTable + Leveled Compaction（size-based scoring + smart L0 + tombstone cleanup）+ tombstone 感知读取 + WAL fsync 持久化 + prefix 重叠检测，88 个存储引擎测试 + 25 个集成测试验证 |
+| LSM-Tree 存储引擎 | **可行，已实现完整** | WAL（atomic reset + corruption-safe replay）+ MemTable（O(log n) BTreeMap range 查询）+ SSTable + Leveled Compaction（size-based scoring + smart L0 + tombstone cleanup）+ tombstone 感知读取 + WAL fsync 持久化 + prefix 重叠检测，90 个存储引擎测试 + 25 个集成测试验证 |
 | MVCC 事务 | **可行，已实现** | 快照隔离、事务写缓冲、提交/回滚、可见性过滤，已集成到查询层 |
 | B+Tree 磁盘索引 | **可行，已实现** | 4KB 页式存储、Slotted Page、LRU Buffer Pool、节点分裂/合并、下溢重平衡（redistribute + merge）、根节点收缩、leaf chain 范围扫描，26 个专项测试验证（含500条目分裂、2000条目大数据集、持久化重开、1000条目级联下溢合并、交错插入删除） |
 | Raft 共识 | **可行** | `tikv/raft-rs` 是工业级 Rust Raft 实现 |
@@ -367,12 +367,12 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 | 测试类型 | 数量 | 覆盖范围 |
 |----------|------|----------|
-| 存储引擎单元测试 | 88 | WAL、MemTable（O(log n) 查询）、SSTable、Compaction（size-based scoring）、MVCC、B+Tree（HashMap + parent pointers）、索引、prefix 重叠检测 |
+| 存储引擎单元测试 | 90 | WAL（atomic reset + corruption-safe replay）、MemTable（O(log n) 查询）、SSTable、Compaction（size-based scoring）、MVCC、B+Tree（HashMap + parent pointers）、索引、prefix 重叠检测 |
 | 查询引擎单元测试 | 54 | SQL 解析、执行、JOIN、GROUP BY、ORDER BY、聚合、索引加速 |
 | 查询-存储集成测试 | 25 | 跨组件场景：flush 后查询、compaction、恢复、多类隔离、事务 |
 | 本体引擎测试 | 7 | 本体模型、解析、存储 |
 | 端到端测试 | 3 | TCP 客户端-服务器完整生命周期 |
-| **总计** | **187** | **全部通过，0 个警告** |
+| **总计** | **189** | **全部通过，0 个警告** |
 
 ### 10.2 代码质量改进（v1.3 - v1.6）
 
@@ -387,6 +387,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | BufferPool LRU 优化（v1.6） | `touch()` 从 O(n) Vec retain+insert 改为 O(1) HashMap + 单调计数器 |
 | B+Tree 重构（v1.6） | `nodes` 从 Vec 改为 HashMap O(1) 查找，添加 parent 指针消除 find_parent O(n) 遍历 |
 | Compaction 调度优化（v1.7） | 数量触发改为 size-based scoring 评分机制，L0 半量合并减少写放大，tombstone 跨层清理 |
+| WAL 原子性 + 损坏安全重放（v1.8） | reset_wal 改为 write-new-then-rename 原子操作；replay_wal 遇 CRC/长度异常立即停止，防止级联错位 |
 | MVCC 可见性修复 | 重启后 seq_counter 正确同步 SSTable 最大序列号 |
 | ORDER BY 修复 | 排序移到列投影之前，确保 ORDER BY 列可用 |
 | AND/OR 解析修复 | WHERE 子句支持递归 AND/OR 组合条件 |
@@ -397,7 +398,8 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 |----------|------|------|
 | 进程 crash | 默认 | WAL append 后 flush 到 OS 缓存，进程崩溃不丢数据 |
 | OS crash | `sync_wal_on_commit: true`（默认） | 事务提交时 fsync 到磁盘，OS 崩溃不丢已提交数据 |
-| 数据完整性 | CRC32 | WAL 条目 CRC 校验，损坏条目可跳过 |
+| 数据完整性 | CRC32 | WAL 条目 CRC 校验，损坏时立即停止重放（防止级联错位） |
+| WAL 重置安全 | write-new-then-rename | WAL 重置为原子操作，不会因 crash 导致 WAL 丢失 |
 
 ---
 
@@ -410,7 +412,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 3. **100% 自研核心引擎是正确策略**：存储引擎、本体引擎、查询引擎、事务引擎必须自主掌控，基础设施（Raft、序列化、压缩）选择性复用
 4. **跨平台无实质风险**：当前 Rust 代码天然跨平台，Windows 开发 → Linux 生产完全可行，CI 双平台构建是最低成本保障
 5. **范围是最大风险**：必须砍掉 80% 的外围功能，聚焦核心
-6. **代码质量持续提升**：187 个测试全部通过，0 个编译警告，生产代码错误处理规范化，WAL 持久化保障已完善
+6. **代码质量持续提升**：189 个测试全部通过，0 个编译警告，生产代码错误处理规范化，WAL 持久化保障已完善
 
 ### 行动建议
 
