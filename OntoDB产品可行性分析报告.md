@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.18 | 更新日期：2026-08-06
+> 版本：v1.19 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -58,7 +58,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - **Leveled Compaction**：size-based scoring 评分触发，L0 半量合并，跨层 tombstone 清理，去重保留最新版本
 - **MVCC 事务**：快照隔离，写不阻塞读，事务写缓冲 + 提交时批量刷入 WAL，所有 SQL 操作自动走事务
 - **B+Tree 二级索引（内存版）**：HashMap 存储 O(1) 节点访问 + parent 指针 O(1) 父节点查找，支持等值/范围查询，自动回填/维护/去索引
-- **B+Tree 磁盘索引（Disk-based）**：4KB 页式存储，Slotted Page 布局，LRU Buffer Pool（单调计数器 O(1) touch），支持点查找 O(log n)、范围扫描（leaf chain）、节点分裂/合并/重平衡，独立 `.idx` 文件持久化
+- **B+Tree 磁盘索引（Disk-based）**：4KB 页式存储，Slotted Page 布局，LRU Buffer Pool（单调计数器 O(1) touch），支持点查找 O(log n)、范围扫描（leaf chain）、节点分裂/合并/重平衡，独立 `.idx` 文件持久化，**新增 remove() 操作**（含 leaf/internal 下溢重分布与合并、parent separator 更新、root collapse），支持 `IndexStorageMode`（InMemory/DiskBased/Hybrid 三种模式），引擎启动时自动打开已有磁盘索引文件，`IndexManager` 同步维护内存和磁盘双索引
 - **全局 seq_no**：引擎级序列号确保跨 MemTable flush 的版本顺序正确
 - **HNSW 向量索引**：自研实现，支持 L2/Cosine/InnerProduct 三种距离度量，可配置 M/ef_construction/ef_search 参数，支持增量插入、过滤搜索（本体约束）、持久化元数据到 LSM（`__vec_meta__` 前缀），启动时自动重建索引，事务提交时自动维护向量索引（INSERT/UPDATE/DELETE），搜索时自动过滤已删除条目和过时向量（HNSW 不支持原地更新的补偿机制）
 
@@ -123,7 +123,7 @@ OWL-lite 语义扩展：
 | LSM-Tree 存储引擎 | **可行，已实现完整** | WAL（atomic reset + corruption-safe replay）+ MemTable（O(log n) range 查询）+ SSTable（cached handles）+ Leveled Compaction（size-based scoring + smart L0 + tombstone cleanup）+ MVCC + prefix 重叠检测，90 个引擎测试 + 25 个集成测试验证 |
 | MVCC 事务 | **可行，已实现** | 快照隔离、事务写缓冲、提交/回滚、可见性过滤，已集成到查询层 |
 | B+Tree 内存索引 | **可行，已实现** | HashMap O(1) 节点访问 + parent 指针 O(1) 查找，insert/delete/merge/rebalance 全部实现，28 个专项测试验证 |
-| B+Tree 磁盘索引 | **可行，已实现** | 4KB 页式存储、Slotted Page、LRU Buffer Pool（O(1) touch）、节点分裂/合并/重平衡、leaf chain 范围扫描，21 个专项测试验证 |
+| B+Tree 磁盘索引 | **可行，已实现** | 4KB 页式存储、Slotted Page、LRU Buffer Pool（O(1) touch）、节点分裂/合并/重平衡/删除（含下溢重分布与合并）、leaf chain 范围扫描、`IndexStorageMode`（InMemory/DiskBased/Hybrid）、索引跨重启持久化，27 个专项测试验证 |
 | Raft 共识 | **可行** | `tikv/raft-rs` 是工业级 Rust Raft 实现 |
 | 本体模型 | **可行，已实现完整** | OWL-lite 模型（Class/Property/Individual/Triple）+ 等价类/不相交类/约束/类类型，22 个模型测试验证 |
 | 本体推理引擎 | **可行，已实现** | 7 条 OWL 2 RL 推理规则 + 不动点迭代 + 增量推理 + 一致性检查 + 推理溯源，46 个本体测试验证 |
@@ -234,8 +234,13 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 | `index/manager.rs` | 移除未使用的 `onto_core::Result`、`serde::{Deserialize, Serialize}` | v1.6 |
 | `mvcc/manager.rs` | 移除未使用的 `Value` | v1.6 |
 | `index/disk.rs` | `entry_offset` → `_entry_offset` | v1.6 |
+| `executor.rs` | 未使用变量 `_having`/`_from`/`_left_alias`/`_recursive`/`_frame`/`_rank`/`_ob`/`_expr`，移除未使用导入 `PlanWindowExpr`，`group_by: _` 解构标注，`#[allow(dead_code)]` 标注 7 个暂未调用的辅助函数 | v1.19 |
+| `planner.rs` | `having` → `_having`（两处），修复 `aggregates: Vec::new()` TODO | v1.19 |
+| `parser.rs` / `cost.rs` / `sparql.rs` | 未使用变量/导入清理 | v1.19 |
+| `auth.rs` / `http.rs` / `metrics.rs` / `rate_limit.rs` | `#[allow(dead_code)]` 标注未来使用的函数和类型 | v1.19 |
+| `engine.rs` / `index/mod.rs` / `lib.rs` / `options.rs` | 导出路径和类型对齐 | v1.19 |
 
-**最终状态：onto-storage crate 编译 0 个警告。**
+**最终状态：全部 6 个 crate 编译 0 个警告。**
 
 ---
 
@@ -516,6 +521,10 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 | v1.11 | Block Cache | LRU 缓存解压后的数据块（64 blocks/SSTable），消除重复解压 |
 | v1.12 | 后台 Compaction 线程 | CompactionWorker 独立线程执行，Arc<Mutex> 共享 levels，原子更新消除数据可见性间隙 |
 | v1.12 | 本体 Schema 验证增强 | UPDATE 路径新增 schema 验证，parser 支持 REQUIRED/MULTI_VALUED 关键字 |
+| v1.19 | 编译警告全面清零 | 6 个 crate 全部 0 警告，未使用变量/导入清理 + `#[allow(dead_code)]` 标注 |
+| v1.19 | planner.rs TODO 修复 | `aggregates: Vec::new()` → `extract_aggregates(columns)` 从 SELECT 列提取聚合函数 |
+| v1.19 | 磁盘 B+Tree 删除操作 | `remove()` 含 leaf/internal 下溢重分布/合并、parent separator 更新、root collapse |
+| v1.19 | IndexStorageMode | InMemory/DiskBased/Hybrid 三种索引存储模式，引擎启动时自动打开磁盘索引 |
 
 ### 11.3 持久化保障
 
@@ -1529,7 +1538,7 @@ ROLLBACK;  -- 删除操作被丢弃，数据不变
 - `test_commit_without_txn_errors`：无事务 COMMIT 报错
 - `test_rollback_without_txn_errors`：无事务 ROLLBACK 报错
 
-**测试统计**：260 个测试全部通过（87 lib + 41 integration + 111 storage + 10 ontology + 8 core + 3 server）
+**测试统计**：266 个测试全部通过（87 lib + 41 integration + 117 storage + 10 ontology + 8 core + 3 server）
 
 ---
 
@@ -1744,7 +1753,7 @@ pub enum PlanNode {
 3. **100% 自研核心引擎是正确策略**：存储引擎、本体引擎、查询引擎、事务引擎必须自主掌控，基础设施（Raft、序列化、压缩）选择性复用
 4. **跨平台无实质风险**：当前 Rust 代码天然跨平台，Windows 开发 → Linux 生产完全可行，CI 双平台构建是最低成本保障
 5. **范围是最大风险**：必须砍掉 80% 的外围功能，聚焦核心
-6. **代码质量持续提升**：269 个测试全部通过（95 lib + 41 integration + 111 storage + 10 ontology + 8 core + 3 server），查询引擎覆盖 Phase 15-26 全部功能
+6. **代码质量持续提升**：275 个测试全部通过（95 lib + 41 integration + 117 storage + 10 ontology + 8 core + 3 server），查询引擎覆盖 Phase 15-26 全部功能
 7. **查询引擎已具备完整 OLAP 能力**：窗口函数（含下推优化）、CTE、CASE WHEN、子查询、JOIN（Hash/SortMerge/NestedLoop）、EXPLAIN ANALYZE、Plan Cache、ICD、LIMIT OFFSET、UPSERT、11 个内置函数、物化视图增量刷新
 8. **执行架构统一**：所有 DML（SELECT/INSERT/UPDATE/DELETE/MATCH）统一使用 plan-driven 执行，优化器优化对所有查询生效
 9. **多语句事务支持**：BEGIN/COMMIT/ROLLBACK 真正生效，支持原子性多语句操作，MVCC 快照隔离
@@ -1765,6 +1774,7 @@ pub enum PlanNode {
 | B+Tree 内存版 | find_parent | O(1) | parent 指针 |
 | B+Tree 内存版 | insert / delete | O(log n) | 树高 = log(n/MAX_KEYS) |
 | B+Tree 磁盘版 | lookup / range_scan | O(log n) | 页式树遍历 |
+| B+Tree 磁盘版 | insert / remove | O(log n) | 含分裂/合并/重平衡，下溢处理 |
 | SSTable | point lookup | O(log n) | bloom filter 快速否定 + index 二分 + block 内搜索，handle 缓存避免重复 open |
 | SSTable | prefix scan | O(log n + k) | index 定位起点 + leaf chain 顺序扫描，handle 缓存 |
 | Compaction | 触发判断 | O(L) | L = level 数量（7），评分计算 |
