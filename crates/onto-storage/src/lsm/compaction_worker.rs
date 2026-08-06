@@ -67,6 +67,8 @@ pub struct CompactionWorker {
     notif_sender: Option<mpsc::Sender<CompactionNotification>>,
     /// Cache of opened SSTable handles for reading during compaction.
     sst_cache: HashMap<PathBuf, SsTable>,
+    /// Files pending deletion (deferred until next compaction cycle).
+    pending_deletions: Vec<PathBuf>,
 }
 
 impl CompactionWorker {
@@ -100,6 +102,7 @@ impl CompactionWorker {
                 receiver,
                 notif_sender: Some(notif_sender),
                 sst_cache: HashMap::new(),
+                pending_deletions: Vec::new(),
             };
             worker.run();
         });
@@ -166,6 +169,12 @@ impl CompactionWorker {
 
     /// Checks all levels and performs compaction on the most urgent one.
     fn try_compact(&mut self) -> Result<()> {
+        // Delete files from previous compaction cycles (deferred to avoid race with engine)
+        for path in self.pending_deletions.drain(..) {
+            self.sst_cache.remove(&path);
+            let _ = fs::remove_file(&path);
+        }
+
         // Find the level with the highest compaction score
         let (best_level, best_score) = {
             let levels = self.levels.lock().unwrap();
@@ -400,17 +409,17 @@ impl CompactionWorker {
             });
         }
 
-        // Step 7: Delete old SSTable files and collect evicted paths
+        // Step 7: Collect evicted paths for notification and deferred deletion
         let mut evicted_paths = Vec::new();
         for sst_info in &ssts_to_compact {
             self.sst_cache.remove(&sst_info.path);
             evicted_paths.push(sst_info.path.clone());
-            let _ = fs::remove_file(&sst_info.path);
+            self.pending_deletions.push(sst_info.path.clone());
         }
         for sst_info in &next_level_ssts {
             self.sst_cache.remove(&sst_info.path);
             evicted_paths.push(sst_info.path.clone());
-            let _ = fs::remove_file(&sst_info.path);
+            self.pending_deletions.push(sst_info.path.clone());
         }
 
         // Step 8: Atomically update shared levels under lock

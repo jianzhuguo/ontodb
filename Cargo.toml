@@ -53,6 +53,9 @@ crc32fast = "1"
 # Compression
 zstd = "0.13"
 
+# Random
+rand = "0.8"
+
 [profile.release]
 opt-level = 3
 lto = true
