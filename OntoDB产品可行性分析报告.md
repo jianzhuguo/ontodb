@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.21 | 更新日期：2026-08-06
+> 版本：v1.22 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -565,6 +565,7 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 | v1.20 | SPARQL 端点（P1.3） | SPARQL 解析器 + SPARQL→SQL 翻译 + HTTP 端点 + W3C JSON 结果 |
 | v1.21 | TCP server 异步化 | tokio::spawn + tokio::io 异步 I/O + 共享 runtime + 连接追踪 metrics |
 | v1.21 | Bloom Filter 确认 | 已集成到 SSTable get()/get_full() 读取路径，1% 误报率 |
+| v1.22 | 推理结果物化缓存 | InferenceCache 缓存 class_hierarchy/property_aliases/inverse_property，CREATE ONTOLOGY 自动失效 |
 
 ### 11.3 持久化保障
 
@@ -1936,7 +1937,44 @@ Bloom Filter 已完整集成到 SSTable 读取路径，无需额外工作：
 
 ---
 
-## 三十六、结论与建议
+## 三十六、推理结果物化缓存
+
+### 36.1 问题背景
+
+每次查询执行时，`get_class_hierarchy`、`get_property_aliases`、`get_inverse_property` 都会：
+1. 扫描所有 `__ontology__` 前缀的 LSM 条目
+2. 反序列化 Ontology 结构
+3. 创建新的 `Reasoner` 实例
+4. 执行不动点迭代推理（最多 100 轮）
+
+同一个类/属性在同一会话中被反复查询时，这些开销完全重复。
+
+### 36.2 缓存方案
+
+新增 `InferenceCache` 结构，包含三个缓存映射：
+
+| 缓存项 | Key | Value | 失效时机 |
+|--------|-----|-------|----------|
+| `class_hierarchy` | 类名 | 所有超类+子类+等价类集合 | CREATE ONTOLOGY |
+| `property_aliases` | 属性名 | 所有等价属性+子属性+父属性集合 | CREATE ONTOLOGY |
+| `inverse_property` | 属性名 | 逆属性名（Option） | CREATE ONTOLOGY |
+
+**命中路径**：`Mutex<HashMap>::get()` → 命中直接返回 clone，跳过全部推理
+**未命中路径**：执行原有推理逻辑 → 结果写入缓存 → 返回
+**失效**：`CREATE ONTOLOGY` 执行后自动 `clear()` 全部缓存
+
+### 36.3 性能影响
+
+| 场景 | 优化前 | 优化后 |
+|------|--------|--------|
+| 首次查询某类 | Reasoner 推理 | Reasoner 推理 + 写缓存 |
+| 同类后续查询 | Reasoner 推理 | HashMap 查找 O(1) |
+| 涉及 N 个类的查询 | N 次 Reasoner 推理 | 首次 N 次，后续 0 次 |
+| CREATE ONTOLOGY 后 | 无影响 | 缓存清空，下次查询重建 |
+
+---
+
+## 三十七、结论与建议
 
 ### 核心结论
 
@@ -1959,6 +1997,7 @@ Bloom Filter 已完整集成到 SSTable 读取路径，无需额外工作：
 17. **SPARQL 端点**：完整的 SPARQL 1.1 查询支持（SELECT/CONSTRUCT/ASK），SPARQL→SQL 翻译器，W3C 标准结果格式，HTTP API 端点
 18. **Schema Introspection**：运行时查询完整 schema 信息（类/属性/索引），支持工具和 ORM 集成
 19. **TCP 异步并发**：TCP server 从 OS 线程改为 tokio 异步任务，连接追踪 + 查询 metrics，与 HTTP 共享 runtime
+20. **推理结果物化缓存**：InferenceCache 缓存类层级/属性别名/逆属性，命中时跳过 Reasoner 不动点迭代，CREATE ONTOLOGY 自动失效
 
 ### 性能基线（v1.8）
 
