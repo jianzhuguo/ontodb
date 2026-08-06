@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.9 | 更新日期：2026-08-06
+> 版本：v1.10 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -150,6 +150,8 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | WAL reset | 非原子 remove + open | 原子 write-new-then-rename | **消除数据丢失窗口** | v1.8 |
 | WAL replay | CRC 失败后继续解析 | 遇损坏立即停止 | **防止级联错位** | v1.8 |
 | SSTable handle 缓存 | 每次读取重新 open 文件 | 打开后缓存，后续读取复用 | **消除 3 次磁盘 I/O/读** | v1.9 |
+| Bloom filter 构建 | 存储所有 key 到 Vec 再构建 | build() 时从 keys_for_bloom 构建 | **写入内存更可控** | v1.10 |
+| Level 解析 | `fname[1..2]` 只支持 0-9 | `strip_prefix('L').split('_')` 支持多位数 | **修复 bug** | v1.10 |
 
 ### 4.2 关键路径性能影响分析
 
@@ -475,6 +477,8 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 | v1.8 | WAL 原子重置 | write-new-then-rename 消除数据丢失窗口 |
 | v1.8 | WAL 损坏安全重放 | CRC/长度异常立即停止，防止级联错位 |
 | v1.9 | SSTable handle 缓存 | 避免每次读取重新 open 文件，消除 footer/bloom/index 重复读取 |
+| v1.10 | Bloom filter 构建优化 | build() 时从 keys_for_bloom 构建，写入内存更可控 |
+| v1.10 | Level 解析修复 | 支持多位数 level（L10+），原来只支持 0-9 |
 
 ### 11.3 持久化保障
 
