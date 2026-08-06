@@ -862,13 +862,17 @@ impl QueryExecutor {
 
         // Regular table scan — expand class hierarchy via ontology reasoning
         let class_hierarchy = self.get_class_hierarchy(engine, table);
+
+        // Semantic optimization: narrow scan scope using __class__ filter and disjoint constraints
+        let scan_classes = self.narrow_scan_scope(engine, table, filter, &class_hierarchy);
+
         let mut rows = Vec::new();
-        for scan_class in &class_hierarchy {
+        for scan_class in &scan_classes {
             let prefix = format!("{}::", scan_class);
             let entries = engine.scan_prefix(prefix.as_bytes())?;
             for (key, val_bytes) in &entries {
                 if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
-                    if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                    if scan_classes.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
                         // Store primary key for DELETE/UPDATE operations
                         doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
                         rows.push(doc);
@@ -1353,6 +1357,96 @@ impl QueryExecutor {
         }
 
         classes
+    }
+
+    /// Returns classes that are disjoint with the given class.
+    fn get_disjoint_classes(&self, engine: &mut LsmEngine, class: &str) -> HashSet<String> {
+        let mut disjoint = HashSet::new();
+        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+        for (_key, val_bytes) in entries {
+            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+                if let Some(class_def) = ontology.classes.get(class) {
+                    for d in &class_def.disjoint_with {
+                        disjoint.insert(d.clone());
+                    }
+                }
+                // Check reverse: if any class declares disjoint with our class
+                for (name, class_def) in &ontology.classes {
+                    if class_def.disjoint_with.contains(&class.to_string()) {
+                        disjoint.insert(name.clone());
+                    }
+                }
+            }
+        }
+        disjoint
+    }
+
+    /// Narrows the scan scope using __class__ filter and disjoint constraints.
+    /// If the filter explicitly targets specific classes, only scan those.
+    /// Exclude classes that are disjoint with the targeted classes.
+    fn narrow_scan_scope(
+        &self,
+        engine: &mut LsmEngine,
+        table: &str,
+        filter: &Option<FilterExpr>,
+        class_hierarchy: &HashSet<String>,
+    ) -> HashSet<String> {
+        let targeted = Self::extract_class_filter(filter);
+
+        if targeted.is_empty() {
+            // No __class__ constraint — scan full hierarchy but exclude disjoint classes
+            let disjoint = self.get_disjoint_classes(engine, table);
+            return class_hierarchy.difference(&disjoint).cloned().collect();
+        }
+
+        // __class__ constraint found — only scan targeted classes
+        let mut scan_classes = HashSet::new();
+        for target in &targeted {
+            // Expand each targeted class to include its subclasses
+            let hierarchy = self.get_class_hierarchy(engine, target);
+            scan_classes.extend(hierarchy);
+        }
+
+        // Intersect with the original hierarchy (only scan classes that are in scope)
+        let in_scope: HashSet<String> = scan_classes.intersection(class_hierarchy).cloned().collect();
+
+        // Exclude disjoint classes for each targeted class
+        let mut excluded = HashSet::new();
+        for target in &targeted {
+            let disjoint = self.get_disjoint_classes(engine, target);
+            excluded.extend(disjoint);
+        }
+
+        in_scope.difference(&excluded).cloned().collect()
+    }
+
+    /// Extracts class names from __class__ = 'X' or __class__ IN ('X', 'Y') filter conditions.
+    fn extract_class_filter(filter: &Option<FilterExpr>) -> HashSet<String> {
+        let mut classes = HashSet::new();
+        if let Some(f) = filter {
+            Self::extract_class_from_expr(f, &mut classes);
+        }
+        classes
+    }
+
+    fn extract_class_from_expr(expr: &FilterExpr, classes: &mut HashSet<String>) {
+        match expr {
+            FilterExpr::Eq(col, LiteralValue::String(val)) if col == "__class__" => {
+                classes.insert(val.clone());
+            }
+            FilterExpr::In(col, vals) if col == "__class__" => {
+                for v in vals {
+                    if let LiteralValue::String(s) = v {
+                        classes.insert(s.clone());
+                    }
+                }
+            }
+            FilterExpr::And(left, right) => {
+                Self::extract_class_from_expr(left, classes);
+                Self::extract_class_from_expr(right, classes);
+            }
+            _ => {}
+        }
     }
 
     /// Apply alias prefix to row column names.
