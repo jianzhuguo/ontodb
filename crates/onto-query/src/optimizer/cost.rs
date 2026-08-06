@@ -371,6 +371,28 @@ impl CostModel {
                     index_column: None,
                 }
             }
+            crate::parser::FilterExpr::IsNull(col) => {
+                FilterSelectivity {
+                    selectivity: 0.1, // Assume 10% NULL
+                    can_use_index: stats.secondary_indexes.iter().any(|idx| idx.column == *col),
+                    index_column: Some(col.clone()),
+                }
+            }
+            crate::parser::FilterExpr::IsNotNull(col) => {
+                FilterSelectivity {
+                    selectivity: 0.9, // Assume 90% NOT NULL
+                    can_use_index: stats.secondary_indexes.iter().any(|idx| idx.column == *col),
+                    index_column: Some(col.clone()),
+                }
+            }
+            crate::parser::FilterExpr::Not(expr) => {
+                let inner = self.estimate_selectivity(stats, expr);
+                FilterSelectivity {
+                    selectivity: 1.0 - inner.selectivity,
+                    can_use_index: inner.can_use_index,
+                    index_column: inner.index_column,
+                }
+            }
             crate::parser::FilterExpr::And(left, right) => {
                 let l = self.estimate_selectivity(stats, left);
                 let r = self.estimate_selectivity(stats, right);

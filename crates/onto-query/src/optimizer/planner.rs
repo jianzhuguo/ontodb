@@ -523,6 +523,8 @@ impl QueryPlanner {
             FilterExpr::Between(col, _, _) => col.clone(),
             FilterExpr::In(col, _) => col.clone(),
             FilterExpr::InSubquery(col, _) => col.clone(),
+            FilterExpr::IsNull(col) => col.clone(),
+            FilterExpr::IsNotNull(col) => col.clone(),
             _ => return None, // Can't determine for complex predicates
         };
 

@@ -379,6 +379,9 @@ pub enum FilterExpr {
     InSubquery(String, Box<QueryAst>),              // column IN (SELECT ...)
     Exists(Box<QueryAst>),                          // EXISTS (SELECT ...)
     NotExists(Box<QueryAst>),                       // NOT EXISTS (SELECT ...)
+    IsNull(String),                                 // column IS NULL
+    IsNotNull(String),                              // column IS NOT NULL
+    Not(Box<FilterExpr>),                           // NOT (expr)
     And(Box<FilterExpr>, Box<FilterExpr>),
     Or(Box<FilterExpr>, Box<FilterExpr>),
 }
@@ -389,12 +392,22 @@ pub struct OrderBy {
     pub ascending: bool,
 }
 
+/// Join type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
 /// A JOIN clause: JOIN <table> [AS <alias>] ON <left_col> = <right_col>
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinClause {
     pub table: String,
     pub alias: Option<String>,
     pub on: JoinOn,
+    pub join_type: JoinType,
 }
 
 /// The ON condition of a JOIN: <left> = <right>
@@ -954,6 +967,11 @@ impl QueryParser {
         } else if !rest.is_empty()
             && !rest_upper.starts_with("WHERE")
             && !rest_upper.starts_with("JOIN")
+            && !rest_upper.starts_with("LEFT")
+            && !rest_upper.starts_with("RIGHT")
+            && !rest_upper.starts_with("FULL")
+            && !rest_upper.starts_with("INNER")
+            && !rest_upper.starts_with("ON")
             && !rest_upper.starts_with("GROUP")
             && !rest_upper.starts_with("HAVING")
             && !rest_upper.starts_with("ORDER")
@@ -974,12 +992,27 @@ impl QueryParser {
 
         loop {
             let upper = rest.to_uppercase().trim().to_string();
-            if !upper.starts_with("JOIN") {
-                break;
-            }
 
-            // Skip "JOIN"
-            let after_join = rest[4..].trim();
+            // Detect join type
+            let (join_type, skip_len) = if upper.starts_with("LEFT JOIN") || upper.starts_with("LEFT OUTER JOIN") {
+                let len = if upper.starts_with("LEFT OUTER JOIN") { 15 } else { 10 };
+                (JoinType::Left, len)
+            } else if upper.starts_with("RIGHT JOIN") || upper.starts_with("RIGHT OUTER JOIN") {
+                let len = if upper.starts_with("RIGHT OUTER JOIN") { 16 } else { 11 };
+                (JoinType::Right, len)
+            } else if upper.starts_with("FULL JOIN") || upper.starts_with("FULL OUTER JOIN") {
+                let len = if upper.starts_with("FULL OUTER JOIN") { 15 } else { 10 };
+                (JoinType::Full, len)
+            } else if upper.starts_with("INNER JOIN") {
+                (JoinType::Inner, 11)
+            } else if upper.starts_with("JOIN") {
+                (JoinType::Inner, 4)
+            } else {
+                break;
+            };
+
+            // Skip join keyword
+            let after_join = rest[skip_len..].trim();
 
             // Parse table name and optional alias
             let (table, alias, after_table) = Self::parse_from_clause(after_join)?;
@@ -1002,13 +1035,14 @@ impl QueryParser {
             // Right side ends at WHERE/JOIN/ORDER/LIMIT or end of string
             let (right, rest_after_on) = Self::consume_until_keywords(
                 right_on,
-                &["WHERE", "JOIN", "ORDER BY", "LIMIT"],
+                &["WHERE", "JOIN", "LEFT", "RIGHT", "FULL", "ORDER BY", "LIMIT"],
             );
 
             joins.push(JoinClause {
                 table,
                 alias,
                 on: JoinOn { left, right },
+                join_type,
             });
 
             rest = rest_after_on.to_string();
@@ -1789,8 +1823,38 @@ impl QueryParser {
     fn parse_where(input: &str) -> Result<(Option<FilterExpr>, String)> {
         let input = input.trim();
 
-        // Try keyword operators first: EXISTS, LIKE, BETWEEN, IN
+        // Try keyword operators first: EXISTS, LIKE, BETWEEN, IN, IS NULL, NOT
         let upper = input.to_uppercase();
+
+        // Check for NOT (expr)
+        if upper.starts_with("NOT ") || upper.starts_with("NOT(") {
+            let not_len = if upper.starts_with("NOT(") { 4 } else { 4 };
+            let rest = input[not_len..].trim();
+            if rest.starts_with('(') {
+                // Find matching closing paren
+                let mut depth = 0i32;
+                let mut close_pos = None;
+                for (i, c) in rest.char_indices() {
+                    if c == '(' { depth += 1; }
+                    if c == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            close_pos = Some(i);
+                            break;
+                        }
+                    }
+                }
+                if let Some(close) = close_pos {
+                    let inner = rest[1..close].trim();
+                    let remaining = rest[close + 1..].trim();
+                    let (inner_expr, _) = Self::parse_where(inner)?;
+                    if let Some(expr) = inner_expr {
+                        let expr = FilterExpr::Not(Box::new(expr));
+                        return Self::wrap_chain(expr, remaining);
+                    }
+                }
+            }
+        }
 
         // Check for EXISTS (SELECT ...)
         if upper.starts_with("EXISTS") || upper.starts_with("NOT EXISTS") {
@@ -1825,6 +1889,22 @@ impl QueryParser {
                     };
                     return Self::wrap_chain(expr, remaining);
                 }
+            }
+        }
+
+        // Check for IS NULL / IS NOT NULL: column IS [NOT] NULL
+        if let Some(is_pos) = Self::find_unquoted(&upper, " IS ") {
+            let col = input[..is_pos].trim().to_string();
+            let rest = input[is_pos + 4..].trim();
+            let rest_upper = rest.to_uppercase();
+            if rest_upper.starts_with("NOT NULL") {
+                let remaining = rest[8..].trim();
+                let expr = FilterExpr::IsNotNull(col);
+                return Self::wrap_chain(expr, remaining);
+            } else if rest_upper.starts_with("NULL") {
+                let remaining = rest[4..].trim();
+                let expr = FilterExpr::IsNull(col);
+                return Self::wrap_chain(expr, remaining);
             }
         }
 

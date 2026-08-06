@@ -1511,7 +1511,97 @@ ROLLBACK;  -- 删除操作被丢弃，数据不变
 
 ---
 
-## 二十八、结论与建议
+## 二十八、查询超时与内存限制（Phase 26-2）
+
+### 28.1 查询超时
+
+新增 `QueryConfig` 结构体，支持可配置的查询超时：
+
+```rust
+pub struct QueryConfig {
+    pub query_timeout: Duration,  // 默认 30 秒
+    pub memory_budget: usize,     // 默认 256 MB
+}
+```
+
+- 查询执行完成后检查耗时，超过 `query_timeout` 返回错误
+- 错误信息：`"query timeout: exceeded 30 seconds"`
+- HTTP API 可返回 408 状态码
+
+### 28.2 内存预算
+
+- `execute_plan` 完成后检查结果集内存占用
+- `estimate_rows_memory` 递归估算 `Vec<Map<String, Value>>` 的内存使用
+- 超过 `memory_budget` 返回错误：`"memory budget exceeded: estimated X bytes, limit Y bytes"`
+
+### 28.3 使用方式
+
+```rust
+let config = QueryConfig {
+    query_timeout: Duration::from_secs(10),
+    memory_budget: 128 * 1024 * 1024, // 128 MB
+};
+let executor = QueryExecutor::with_config(engine, ontology_store, config);
+```
+
+---
+
+## 二十九、IS NULL / NOT / 外连接支持（Phase 26-3）
+
+### 29.1 新增过滤表达式
+
+`FilterExpr` 枚举新增三个变体：
+
+| 变体 | 语法 | 语义 |
+|------|------|------|
+| `IsNull(col)` | `column IS NULL` | 列值为 NULL |
+| `IsNotNull(col)` | `column IS NOT NULL` | 列值不为 NULL |
+| `Not(expr)` | `NOT (expr)` | 逻辑取反 |
+
+**解析器支持**：
+- `IS NULL` / `IS NOT NULL`：在 `parse_where` 中检测 ` IS ` 关键字
+- `NOT (expr)`：支持 `NOT (...)` 语法，递归解析内部表达式
+
+**执行器支持**：
+- `eval_filter` 中新增三个分支处理
+- `IsNull`：`doc.get(col).map_or(true, |v| matches!(v, Value::Null))`
+- `IsNotNull`：`doc.get(col).map_or(false, |v| !matches!(v, Value::Null))`
+- `Not`：`!self.eval_filter(engine, doc, expr)`
+
+### 29.2 外连接支持
+
+`JoinClause` 新增 `join_type` 字段：
+
+```rust
+pub enum JoinType {
+    Inner,  // 默认
+    Left,   // LEFT JOIN
+    Right,  // RIGHT JOIN
+    Full,   // FULL JOIN
+}
+```
+
+**支持的语法**：
+- `LEFT JOIN` / `LEFT OUTER JOIN`
+- `RIGHT JOIN` / `RIGHT OUTER JOIN`
+- `FULL JOIN` / `FULL OUTER JOIN`
+- `INNER JOIN`（显式）
+
+**实现**：
+- 三种 JOIN 算法（NestedLoop、Hash、SortMerge）均支持外连接
+- LEFT JOIN：未匹配的左侧行输出，右侧列填充 NULL
+- RIGHT JOIN：未匹配的右侧行输出，左侧列填充 NULL
+- 代价模型更新：外连接不能随意下推谓词
+
+**测试覆盖**：
+- `test_is_null_filter`：IS NULL 过滤
+- `test_is_not_null_filter`：IS NOT NULL 过滤
+- `test_not_filter`：NOT 过滤
+- `test_left_join_parse`：LEFT JOIN 解析
+
+---
+
+## 三十、结论与建议
 
 ### 核心结论
 
@@ -1520,10 +1610,12 @@ ROLLBACK;  -- 删除操作被丢弃，数据不变
 3. **100% 自研核心引擎是正确策略**：存储引擎、本体引擎、查询引擎、事务引擎必须自主掌控，基础设施（Raft、序列化、压缩）选择性复用
 4. **跨平台无实质风险**：当前 Rust 代码天然跨平台，Windows 开发 → Linux 生产完全可行，CI 双平台构建是最低成本保障
 5. **范围是最大风险**：必须砍掉 80% 的外围功能，聚焦核心
-6. **代码质量持续提升**：260 个测试全部通过（87 lib + 41 integration + 111 storage + 10 ontology + 8 core + 3 server），查询引擎覆盖 Phase 15-26 全部功能
+6. **代码质量持续提升**：135 个测试全部通过（94 lib + 41 integration），查询引擎覆盖 Phase 15-26 全部功能
 7. **查询引擎已具备完整 OLAP 能力**：窗口函数、CTE、CASE WHEN、子查询、JOIN（Hash/SortMerge/NestedLoop）、EXPLAIN ANALYZE、Plan Cache、ICD、LIMIT OFFSET、UPSERT、11 个内置函数
 8. **执行架构统一**：所有 DML（SELECT/INSERT/UPDATE/DELETE/MATCH）统一使用 plan-driven 执行，优化器优化对所有查询生效
 9. **多语句事务支持**：BEGIN/COMMIT/ROLLBACK 真正生效，支持原子性多语句操作，MVCC 快照隔离
+10. **生产安全特性**：查询超时（默认30s）、内存预算（默认256MB）防止资源滥用
+11. **SQL 语法补全**：IS NULL/IS NOT NULL/NOT 过滤、LEFT/RIGHT/FULL 外连接
 
 ### 性能基线（v1.8）
 

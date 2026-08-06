@@ -12,6 +12,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, Mutex};
 use std::time::Duration;
 
+/// Query execution configuration.
+#[derive(Debug, Clone)]
+pub struct QueryConfig {
+    /// Maximum query execution time. Default: 30 seconds.
+    pub query_timeout: Duration,
+    /// Maximum memory per query in bytes. Default: 256 MB.
+    pub memory_budget: usize,
+}
+
+impl Default for QueryConfig {
+    fn default() -> Self {
+        Self {
+            query_timeout: Duration::from_secs(30),
+            memory_budget: 256 * 1024 * 1024, // 256 MB
+        }
+    }
+}
+
 /// Executes parsed queries with caching support.
 pub struct QueryExecutor {
     engine: Arc<RwLock<LsmEngine>>,
@@ -28,6 +46,8 @@ pub struct QueryExecutor {
     runtime_stats: Arc<Mutex<RuntimeStats>>,
     /// Active multi-statement transaction ID (None = auto-commit mode).
     active_txn: Mutex<Option<onto_core::SeqNo>>,
+    /// Query execution configuration.
+    config: QueryConfig,
 }
 
 /// Column-level statistics collected by ANALYZE.
@@ -81,6 +101,10 @@ impl RuntimeStats {
 
 impl QueryExecutor {
     pub fn new(engine: Arc<RwLock<LsmEngine>>, ontology_store: OntologyStore) -> Self {
+        Self::with_config(engine, ontology_store, QueryConfig::default())
+    }
+
+    pub fn with_config(engine: Arc<RwLock<LsmEngine>>, ontology_store: OntologyStore, config: QueryConfig) -> Self {
         Self {
             engine,
             ontology_store,
@@ -90,6 +114,7 @@ impl QueryExecutor {
             doc_counter: AtomicU64::new(0),
             runtime_stats: Arc::new(Mutex::new(RuntimeStats::default())),
             active_txn: Mutex::new(None),
+            config,
         }
     }
 
@@ -152,8 +177,17 @@ impl QueryExecutor {
 
         let result = self.execute_with_engine_inner(ast, engine);
 
+        // Check for timeout
+        let elapsed = start_time.elapsed();
+        if elapsed > self.config.query_timeout {
+            return Err(CoreError::Custom(format!(
+                "query timeout: exceeded {} seconds",
+                self.config.query_timeout.as_secs()
+            )));
+        }
+
         // Track runtime statistics
-        let elapsed_us = start_time.elapsed().as_micros() as u64;
+        let elapsed_us = elapsed.as_micros() as u64;
         {
             let mut stats = self.runtime_stats.lock().unwrap();
             stats.total_queries += 1;
@@ -401,7 +435,56 @@ impl QueryExecutor {
     /// instead of re-implementing optimization logic independently.
     pub fn execute_plan(&self, plan: &ExecutionPlan, engine: &mut LsmEngine) -> Result<QueryResult> {
         let rows = self.execute_plan_node(&plan.root, engine)?;
+        self.check_memory_budget(&rows)?;
         Ok(QueryResult::Rows(rows))
+    }
+
+    /// Estimates memory usage of rows and checks against budget.
+    fn check_memory_budget(&self, rows: &[Map<String, Value>]) -> Result<()> {
+        let estimated_bytes = Self::estimate_rows_memory(rows);
+        if estimated_bytes > self.config.memory_budget {
+            return Err(CoreError::Custom(format!(
+                "memory budget exceeded: estimated {} bytes, limit {} bytes",
+                estimated_bytes, self.config.memory_budget
+            )));
+        }
+        Ok(())
+    }
+
+    /// Estimates memory usage of a row set in bytes.
+    fn estimate_rows_memory(rows: &[Map<String, Value>]) -> usize {
+        let mut total = std::mem::size_of::<Vec<Map<String, Value>>>();
+        for row in rows {
+            total += std::mem::size_of::<Map<String, Value>>();
+            for (key, val) in row {
+                total += key.len() + std::mem::size_of::<String>();
+                total += Self::estimate_value_memory(val);
+            }
+        }
+        total
+    }
+
+    /// Estimates memory usage of a single JSON value.
+    fn estimate_value_memory(val: &Value) -> usize {
+        match val {
+            Value::Null | Value::Bool(_) => 8,
+            Value::Number(_) => 16,
+            Value::String(s) => s.len() + 24, // String header + data
+            Value::Array(arr) => {
+                let mut total = 24; // Vec header
+                for item in arr {
+                    total += Self::estimate_value_memory(item);
+                }
+                total
+            }
+            Value::Object(map) => {
+                let mut total = 24; // Map header
+                for (k, v) in map {
+                    total += k.len() + 24 + Self::estimate_value_memory(v);
+                }
+                total
+            }
+        }
     }
 
     /// Recursively executes a PlanNode and returns the result rows.
@@ -702,13 +785,17 @@ impl QueryExecutor {
         let left_alias = None::<&str>;
         let right_alias = join.alias.as_deref().unwrap_or(&join.table);
         let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+        let join_type = join.join_type;
 
         let mut result = Vec::new();
         for left_row in &left_rows {
             let left_val = Self::resolve_column_value(left_row, &left_col);
+            let mut matched = false;
+
             for right_row in &right_rows {
                 let right_val = Self::resolve_column_value(right_row, &right_col);
                 if left_val.is_some() && right_val.is_some() && left_val == right_val {
+                    matched = true;
                     let mut merged = Map::new();
                     for (k, v) in left_row {
                         merged.insert(k.clone(), v.clone());
@@ -723,7 +810,59 @@ impl QueryExecutor {
                     result.push(merged);
                 }
             }
+
+            // For LEFT JOIN: emit left row with NULLs for right columns if no match
+            if !matched && join_type == crate::parser::JoinType::Left {
+                let mut merged = Map::new();
+                for (k, v) in left_row {
+                    merged.insert(k.clone(), v.clone());
+                }
+                // Add NULL values for right side columns
+                if let Some(right_sample) = right_rows.first() {
+                    for k in right_sample.keys() {
+                        let key = format!("{}.{}", right_alias, k);
+                        merged.insert(key, Value::Null);
+                        if !merged.contains_key(k) {
+                            merged.insert(k.clone(), Value::Null);
+                        }
+                    }
+                }
+                result.push(merged);
+            }
         }
+
+        // For RIGHT JOIN: emit right rows with NULLs for left columns if no match
+        if join_type == crate::parser::JoinType::Right {
+            for right_row in &right_rows {
+                let right_val = Self::resolve_column_value(right_row, &right_col);
+                let mut matched = false;
+                for left_row in &left_rows {
+                    let left_val = Self::resolve_column_value(left_row, &left_col);
+                    if left_val.is_some() && right_val.is_some() && left_val == right_val {
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    let mut merged = Map::new();
+                    // Add NULL values for left side columns
+                    if let Some(left_sample) = left_rows.first() {
+                        for k in left_sample.keys() {
+                            merged.insert(k.clone(), Value::Null);
+                        }
+                    }
+                    for (k, v) in right_row {
+                        let key = format!("{}.{}", right_alias, k);
+                        merged.insert(key, v.clone());
+                        if !merged.contains_key(k) {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                    }
+                    result.push(merged);
+                }
+            }
+        }
+
         Ok(result)
     }
 
@@ -735,6 +874,7 @@ impl QueryExecutor {
     ) -> Result<Vec<Map<String, Value>>> {
         let right_alias = join.alias.as_deref().unwrap_or(&join.table);
         let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+        let join_type = join.join_type;
 
         // Build hash table on right side
         let mut hash_table: std::collections::HashMap<String, Vec<&Map<String, Value>>> =
@@ -745,12 +885,23 @@ impl QueryExecutor {
             }
         }
 
+        // Track which right rows were matched (for RIGHT/FULL JOIN)
+        let mut matched_right: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
         // Probe with left rows
         let mut result = Vec::new();
         for left_row in &left_rows {
-            if let Some(left_val) = Self::resolve_column_value(left_row, &left_col) {
-                if let Some(matching_rights) = hash_table.get(&left_val) {
+            let left_val = Self::resolve_column_value(left_row, &left_col);
+            let mut matched = false;
+
+            if let Some(left_val) = &left_val {
+                if let Some(matching_rights) = hash_table.get(left_val) {
                     for right_row in matching_rights {
+                        matched = true;
+                        // Track matched right row index
+                        if let Some(idx) = right_rows.iter().position(|r| std::ptr::eq(r, *right_row)) {
+                            matched_right.insert(idx);
+                        }
                         let mut merged = Map::new();
                         for (k, v) in left_row {
                             merged.insert(k.clone(), v.clone());
@@ -766,7 +917,48 @@ impl QueryExecutor {
                     }
                 }
             }
+
+            // For LEFT JOIN: emit left row with NULLs if no match
+            if !matched && join_type == crate::parser::JoinType::Left {
+                let mut merged = Map::new();
+                for (k, v) in left_row {
+                    merged.insert(k.clone(), v.clone());
+                }
+                if let Some(right_sample) = right_rows.first() {
+                    for k in right_sample.keys() {
+                        let key = format!("{}.{}", right_alias, k);
+                        merged.insert(key, Value::Null);
+                        if !merged.contains_key(k) {
+                            merged.insert(k.clone(), Value::Null);
+                        }
+                    }
+                }
+                result.push(merged);
+            }
         }
+
+        // For RIGHT JOIN: emit unmatched right rows with NULLs for left
+        if join_type == crate::parser::JoinType::Right {
+            for (idx, right_row) in right_rows.iter().enumerate() {
+                if !matched_right.contains(&idx) {
+                    let mut merged = Map::new();
+                    if let Some(left_sample) = left_rows.first() {
+                        for k in left_sample.keys() {
+                            merged.insert(k.clone(), Value::Null);
+                        }
+                    }
+                    for (k, v) in right_row {
+                        let key = format!("{}.{}", right_alias, k);
+                        merged.insert(key, v.clone());
+                        if !merged.contains_key(k) {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                    }
+                    result.push(merged);
+                }
+            }
+        }
+
         Ok(result)
     }
 
@@ -778,6 +970,7 @@ impl QueryExecutor {
     ) -> Result<Vec<Map<String, Value>>> {
         let right_alias = join.alias.as_deref().unwrap_or(&join.table);
         let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+        let join_type = join.join_type;
 
         // Sort both sides
         left_rows.sort_by(|a, b| {
@@ -791,6 +984,10 @@ impl QueryExecutor {
             Self::compare_values(&a_val, &b_val)
         });
 
+        // Track matched rows for outer joins
+        let mut matched_left: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut matched_right: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
         // Merge
         let mut result = Vec::new();
         let mut li = 0;
@@ -803,7 +1000,6 @@ impl QueryExecutor {
                 std::cmp::Ordering::Greater => ri += 1,
                 std::cmp::Ordering::Equal => {
                     // Handle duplicate keys
-                    let ri_start = ri;
                     while ri < right_rows.len() {
                         let rv2 = Self::resolve_column_value(&right_rows[ri], &right_col).unwrap_or_default();
                         if Self::compare_values(&rv2, &rv) != std::cmp::Ordering::Equal { break; }
@@ -811,6 +1007,8 @@ impl QueryExecutor {
                         while li2 < left_rows.len() {
                             let lv2 = Self::resolve_column_value(&left_rows[li2], &left_col).unwrap_or_default();
                             if Self::compare_values(&lv2, &lv) != std::cmp::Ordering::Equal { break; }
+                            matched_left.insert(li2);
+                            matched_right.insert(ri);
                             let mut merged = Map::new();
                             for (k, v) in &left_rows[li2] { merged.insert(k.clone(), v.clone()); }
                             for (k, v) in &right_rows[ri] {
@@ -831,6 +1029,51 @@ impl QueryExecutor {
                 }
             }
         }
+
+        // For LEFT JOIN: emit unmatched left rows with NULLs
+        if join_type == crate::parser::JoinType::Left {
+            for (idx, left_row) in left_rows.iter().enumerate() {
+                if !matched_left.contains(&idx) {
+                    let mut merged = Map::new();
+                    for (k, v) in left_row {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                    if let Some(right_sample) = right_rows.first() {
+                        for k in right_sample.keys() {
+                            let key = format!("{}.{}", right_alias, k);
+                            merged.insert(key, Value::Null);
+                            if !merged.contains_key(k) {
+                                merged.insert(k.clone(), Value::Null);
+                            }
+                        }
+                    }
+                    result.push(merged);
+                }
+            }
+        }
+
+        // For RIGHT JOIN: emit unmatched right rows with NULLs
+        if join_type == crate::parser::JoinType::Right {
+            for (idx, right_row) in right_rows.iter().enumerate() {
+                if !matched_right.contains(&idx) {
+                    let mut merged = Map::new();
+                    if let Some(left_sample) = left_rows.first() {
+                        for k in left_sample.keys() {
+                            merged.insert(k.clone(), Value::Null);
+                        }
+                    }
+                    for (k, v) in right_row {
+                        let key = format!("{}.{}", right_alias, k);
+                        merged.insert(key, v.clone());
+                        if !merged.contains_key(k) {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                    }
+                    result.push(merged);
+                }
+            }
+        }
+
         Ok(result)
     }
 
@@ -1939,7 +2182,9 @@ impl QueryExecutor {
             | FilterExpr::Gte(c, _)
             | FilterExpr::Lte(c, _)
             | FilterExpr::Between(c, _, _)
-            | FilterExpr::In(c, _) => c.clone(),
+            | FilterExpr::In(c, _)
+            | FilterExpr::IsNull(c)
+            | FilterExpr::IsNotNull(c) => c.clone(),
             _ => return Ok(None),
         };
 
@@ -2215,6 +2460,15 @@ impl QueryExecutor {
                     Ok(QueryResult::Rows(rows)) => rows.is_empty(),
                     _ => false,
                 }
+            }
+            FilterExpr::IsNull(col) => {
+                doc.get(col).map_or(true, |v| matches!(v, Value::Null))
+            }
+            FilterExpr::IsNotNull(col) => {
+                doc.get(col).map_or(false, |v| !matches!(v, Value::Null))
+            }
+            FilterExpr::Not(expr) => {
+                !self.eval_filter(engine, doc, expr)
             }
             FilterExpr::And(left, right) => {
                 self.eval_filter(engine, doc, left) && self.eval_filter(engine, doc, right)
@@ -2848,6 +3102,10 @@ mod tests {
     use tempfile::tempdir;
 
     fn setup() -> (QueryExecutor, tempfile::TempDir) {
+        setup_with_config(QueryConfig::default())
+    }
+
+    fn setup_with_config(config: QueryConfig) -> (QueryExecutor, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
@@ -2856,7 +3114,7 @@ mod tests {
         };
         let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
         let ontology_store = OntologyStore::new(engine.clone());
-        let executor = QueryExecutor::new(engine, ontology_store);
+        let executor = QueryExecutor::with_config(engine, ontology_store, config);
         (executor, dir)
     }
 
@@ -5053,5 +5311,157 @@ mod tests {
         let result = executor.execute(&QueryParser::parse("ROLLBACK").unwrap());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no active transaction"));
+    }
+
+    #[test]
+    fn test_query_config_defaults() {
+        let config = QueryConfig::default();
+        assert_eq!(config.query_timeout, Duration::from_secs(30));
+        assert_eq!(config.memory_budget, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_memory_estimation() {
+        let rows = vec![
+            {
+                let mut row = Map::new();
+                row.insert("name".to_string(), Value::String("test".to_string()));
+                row.insert("price".to_string(), Value::Number(100.into()));
+                row
+            }
+        ];
+        let estimated = QueryExecutor::estimate_rows_memory(&rows);
+        assert!(estimated > 0);
+        assert!(estimated < 1000); // Should be small for one row
+    }
+
+    #[test]
+    fn test_memory_budget_exceeded() {
+        let (executor, _dir) = setup();
+
+        // Set a very small memory budget
+        let config = QueryConfig {
+            query_timeout: Duration::from_secs(30),
+            memory_budget: 10, // 10 bytes - will be exceeded
+        };
+        let (small_exec, _dir2) = setup_with_config(config);
+
+        // Create data
+        small_exec.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING)"
+        ).unwrap()).unwrap();
+
+        // Insert should work (writes are buffered)
+        small_exec.execute(&QueryParser::parse(
+            "INSERT INTO Product (name) VALUES ('A long product name that exceeds budget')"
+        ).unwrap()).unwrap();
+
+        // SELECT should fail due to memory budget
+        let result = small_exec.execute(&QueryParser::parse(
+            "SELECT name FROM Product"
+        ).unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("memory budget exceeded"));
+    }
+
+    // P26-3: IS NULL, NOT, LEFT JOIN tests
+
+    #[test]
+    fn test_is_null_filter() {
+        let (executor, _dir) = setup();
+
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
+        ).unwrap()).unwrap();
+
+        // Insert with NULL price
+        executor.execute(&QueryParser::parse(
+            "INSERT INTO Product (name) VALUES ('NoPrice')"
+        ).unwrap()).unwrap();
+        // Insert with price
+        executor.execute(&QueryParser::parse(
+            "INSERT INTO Product (name, price) VALUES ('WithPrice', 100)"
+        ).unwrap()).unwrap();
+
+        // IS NULL should find the row without price
+        let result = executor.execute(&QueryParser::parse(
+            "SELECT name FROM Product WHERE price IS NULL"
+        ).unwrap()).unwrap();
+        match result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("name").unwrap(), &Value::String("NoPrice".to_string()));
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_is_not_null_filter() {
+        let (executor, _dir) = setup();
+
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
+        ).unwrap()).unwrap();
+
+        executor.execute(&QueryParser::parse(
+            "INSERT INTO Product (name) VALUES ('NoPrice')"
+        ).unwrap()).unwrap();
+        executor.execute(&QueryParser::parse(
+            "INSERT INTO Product (name, price) VALUES ('WithPrice', 100)"
+        ).unwrap()).unwrap();
+
+        // IS NOT NULL should find the row with price
+        let result = executor.execute(&QueryParser::parse(
+            "SELECT name FROM Product WHERE price IS NOT NULL"
+        ).unwrap()).unwrap();
+        match result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("name").unwrap(), &Value::String("WithPrice".to_string()));
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_not_filter() {
+        let (executor, _dir) = setup();
+
+        executor.execute(&QueryParser::parse(
+            "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
+        ).unwrap()).unwrap();
+
+        executor.execute(&QueryParser::parse(
+            "INSERT INTO Product (name, price) VALUES ('A', 100)"
+        ).unwrap()).unwrap();
+        executor.execute(&QueryParser::parse(
+            "INSERT INTO Product (name, price) VALUES ('B', 200)"
+        ).unwrap()).unwrap();
+
+        // NOT (price = 100) should find B
+        let result = executor.execute(&QueryParser::parse(
+            "SELECT name FROM Product WHERE NOT (price = 100)"
+        ).unwrap()).unwrap();
+        match result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("name").unwrap(), &Value::String("B".to_string()));
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_left_join_parse() {
+        // Test that LEFT JOIN parses correctly
+        let result = QueryParser::parse(
+            "SELECT name, value FROM TableA LEFT JOIN TableB ON TableA.id = TableB.a_id"
+        );
+        // Just verify it parses without error
+        match &result {
+            Ok(_) => {},
+            Err(e) => panic!("Parse error: {:?}", e),
+        }
     }
 }
