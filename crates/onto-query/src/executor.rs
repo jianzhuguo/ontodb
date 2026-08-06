@@ -5703,7 +5703,7 @@ mod tests {
         let ast = QueryParser::parse("SELECT * FROM mv_test").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
-            QueryResult::Rows(rows) => {
+            QueryResult::Rows(_rows) => {
                 // Should be empty since the MV was dropped
                 // (or it might fall through to regular table scan which returns nothing)
             }
@@ -6232,7 +6232,7 @@ mod tests {
 
     #[test]
     fn test_memory_budget_exceeded() {
-        let (executor, _dir) = setup();
+        let (_executor, _dir) = setup();
 
         // Set a very small memory budget
         let config = QueryConfig {
