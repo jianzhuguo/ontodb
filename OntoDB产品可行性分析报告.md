@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.8 | 更新日期：2026-08-06
+> 版本：v1.9 | 更新日期：2026-08-06
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -95,7 +95,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 | 模块 | 评估 | 依据 |
 |------|------|------|
-| LSM-Tree 存储引擎 | **可行，已实现完整** | WAL（atomic reset + corruption-safe replay）+ MemTable（O(log n) range 查询）+ SSTable + Leveled Compaction（size-based scoring + smart L0 + tombstone cleanup）+ MVCC + prefix 重叠检测，90 个引擎测试 + 25 个集成测试验证 |
+| LSM-Tree 存储引擎 | **可行，已实现完整** | WAL（atomic reset + corruption-safe replay）+ MemTable（O(log n) range 查询）+ SSTable（cached handles）+ Leveled Compaction（size-based scoring + smart L0 + tombstone cleanup）+ MVCC + prefix 重叠检测，90 个引擎测试 + 25 个集成测试验证 |
 | MVCC 事务 | **可行，已实现** | 快照隔离、事务写缓冲、提交/回滚、可见性过滤，已集成到查询层 |
 | B+Tree 内存索引 | **可行，已实现** | HashMap O(1) 节点访问 + parent 指针 O(1) 查找，insert/delete/merge/rebalance 全部实现，28 个专项测试验证 |
 | B+Tree 磁盘索引 | **可行，已实现** | 4KB 页式存储、Slotted Page、LRU Buffer Pool（O(1) touch）、节点分裂/合并/重平衡、leaf chain 范围扫描，21 个专项测试验证 |
@@ -149,6 +149,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | Tombstone 清理 | 仅最底层可清理 | 跨层检查，key 不存在即清理 | **减少空间浪费** | v1.7 |
 | WAL reset | 非原子 remove + open | 原子 write-new-then-rename | **消除数据丢失窗口** | v1.8 |
 | WAL replay | CRC 失败后继续解析 | 遇损坏立即停止 | **防止级联错位** | v1.8 |
+| SSTable handle 缓存 | 每次读取重新 open 文件 | 打开后缓存，后续读取复用 | **消除 3 次磁盘 I/O/读** | v1.9 |
 
 ### 4.2 关键路径性能影响分析
 
@@ -473,6 +474,7 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 | v1.7 | Tombstone 跨层清理 | 减少空间浪费 |
 | v1.8 | WAL 原子重置 | write-new-then-rename 消除数据丢失窗口 |
 | v1.8 | WAL 损坏安全重放 | CRC/长度异常立即停止，防止级联错位 |
+| v1.9 | SSTable handle 缓存 | 避免每次读取重新 open 文件，消除 footer/bloom/index 重复读取 |
 
 ### 11.3 持久化保障
 
@@ -508,6 +510,8 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 | B+Tree 内存版 | find_parent | O(1) | parent 指针 |
 | B+Tree 内存版 | insert / delete | O(log n) | 树高 = log(n/MAX_KEYS) |
 | B+Tree 磁盘版 | lookup / range_scan | O(log n) | 页式树遍历 |
+| SSTable | point lookup | O(log n) | bloom filter 快速否定 + index 二分 + block 内搜索，handle 缓存避免重复 open |
+| SSTable | prefix scan | O(log n + k) | index 定位起点 + leaf chain 顺序扫描，handle 缓存 |
 | Compaction | 触发判断 | O(L) | L = level 数量（7），评分计算 |
 | Compaction | tombstone 清理 | O(L * S) | L 层 * S 个 SSTable 范围检查 |
 | WAL | append | O(1) | BufWriter 顺序写入 |
