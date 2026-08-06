@@ -302,6 +302,7 @@ impl QueryPlanner {
                 having,
                 order_by,
                 limit,
+                offset: _,
             } => self.plan_select(
                 columns,
                 from,

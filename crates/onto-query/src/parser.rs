@@ -21,7 +21,37 @@ pub enum QueryAst {
         values: Vec<LiteralValue>,
     },
 
-    /// SELECT [DISTINCT] ... FROM <class> [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]
+    /// INSERT INTO <class> (...) VALUES (...), (...), ... (batch insert)
+    BatchInsert {
+        class: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<LiteralValue>>,
+    },
+
+    /// INSERT INTO <class> (...) SELECT ... (insert from query)
+    InsertSelect {
+        class: String,
+        columns: Vec<String>,
+        query: Box<QueryAst>,
+    },
+
+    /// INSERT INTO <class> (...) VALUES (...) ON CONFLICT DO UPDATE SET ...
+    Upsert {
+        class: String,
+        columns: Vec<String>,
+        values: Vec<LiteralValue>,
+        conflict_column: String,
+        assignments: Vec<(String, LiteralValue)>,
+    },
+
+    /// BEGIN [TRANSACTION]
+    Begin,
+    /// COMMIT [TRANSACTION]
+    Commit,
+    /// ROLLBACK [TRANSACTION]
+    Rollback,
+
+    /// SELECT [DISTINCT] ... FROM <class> [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ... [OFFSET ...]]
     Select {
         distinct: bool,
         columns: SelectColumns,
@@ -33,6 +63,7 @@ pub enum QueryAst {
         having: Option<FilterExpr>,
         order_by: Option<OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
     },
 
     /// UPDATE <class> SET ... WHERE ...
@@ -116,6 +147,7 @@ pub enum QueryAst {
     With {
         ctes: Vec<CteDefinition>,
         query: Box<QueryAst>,
+        recursive: bool,
     },
 
     /// CREATE MATERIALIZED VIEW <name> AS <query> - Materialized View
@@ -206,6 +238,11 @@ pub enum ValueExpr {
         op: ArithmeticOp,
         left: Box<ValueExpr>,
         right: Box<ValueExpr>,
+    },
+    /// Built-in function call: COALESCE(a, b, ...), CONCAT(a, b), etc.
+    Function {
+        name: String,
+        args: Vec<ValueExpr>,
     },
 }
 
@@ -405,6 +442,12 @@ impl QueryParser {
             Self::parse_drop_index(input)
         } else if upper.starts_with("ANALYZE") {
             Self::parse_analyze(input)
+        } else if upper.starts_with("BEGIN") {
+            Ok(QueryAst::Begin)
+        } else if upper.starts_with("COMMIT") {
+            Ok(QueryAst::Commit)
+        } else if upper.starts_with("ROLLBACK") {
+            Ok(QueryAst::Rollback)
         } else if upper.starts_with("INSERT") {
             Self::parse_insert(input)
         } else if upper.starts_with("SELECT") {
@@ -448,7 +491,7 @@ impl QueryParser {
         })
     }
 
-    /// Parses WITH <cte_name> AS (<query>) <main_query>
+    /// Parses WITH [RECURSIVE] <cte_name> AS (<query>) <main_query>
     fn parse_with(input: &str) -> Result<QueryAst> {
         let upper = input.to_uppercase();
         if !upper.starts_with("WITH") {
@@ -456,6 +499,14 @@ impl QueryParser {
         }
 
         let mut remaining = input[4..].trim();
+        let mut recursive = false;
+
+        // Check for RECURSIVE keyword
+        if remaining.to_uppercase().starts_with("RECURSIVE") {
+            recursive = true;
+            remaining = remaining[9..].trim();
+        }
+
         let mut ctes = Vec::new();
 
         loop {
@@ -533,6 +584,7 @@ impl QueryParser {
         Ok(QueryAst::With {
             ctes,
             query: Box::new(main_query),
+            recursive,
         })
     }
 
@@ -607,12 +659,22 @@ impl QueryParser {
     }
 
     fn parse_insert(input: &str) -> Result<QueryAst> {
-        // INSERT INTO <class> (<cols>) VALUES (<vals>)
         let upper = input.to_uppercase();
 
         let into_pos = upper
             .find("INTO")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'INTO'".to_string()))?;
+
+        // Check if this is INSERT INTO ... SELECT
+        let select_pos = Self::find_unquoted(&upper, " SELECT ");
+        if let Some(sp) = select_pos {
+            let header = input[into_pos + 4..sp].trim();
+            let (class, columns) = Self::parse_insert_header(header)?;
+            let query_str = input[sp + 1..].trim();
+            let query = Self::parse(query_str)?;
+            return Ok(QueryAst::InsertSelect { class, columns, query: Box::new(query) });
+        }
+
         let values_pos = upper
             .find("VALUES")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'VALUES'".to_string()))?;
@@ -620,38 +682,130 @@ impl QueryParser {
         let header = input[into_pos + 4..values_pos].trim();
         let values_str = input[values_pos + 6..].trim();
 
-        // Parse header: class (col1, col2, ...)
+        let (class, columns) = Self::parse_insert_header(header)?;
+
+        // Check for ON CONFLICT (UPSERT)
+        let on_conflict_upper = values_str.to_uppercase();
+        let (values_str, upsert_info) = if let Some(oc_pos) = Self::find_unquoted(&on_conflict_upper, " ON CONFLICT ") {
+            let vals_part = &values_str[..oc_pos];
+            let conflict_part = &values_str[oc_pos + 13..].trim();
+            // Parse: (col) DO UPDATE SET col1 = val1, col2 = val2
+            let conflict_upper = conflict_part.to_uppercase();
+            let do_update_pos = conflict_upper.find(" DO UPDATE SET ")
+                .ok_or_else(|| CoreError::InvalidArgument("expected 'DO UPDATE SET' after ON CONFLICT".to_string()))?;
+            let conflict_col = conflict_part[..do_update_pos].trim();
+            let conflict_col = conflict_col.trim_start_matches('(').trim_end_matches(')').trim().to_string();
+            let set_part = conflict_part[do_update_pos + 15..].trim();
+            let assignments = Self::parse_set_assignments(set_part)?;
+            (vals_part, Some((conflict_col, assignments)))
+        } else {
+            (values_str, None)
+        };
+
+        // Parse values: (val1, val2, ...) or (v1, v2), (v3, v4), ...
+        let values_str = values_str.trim();
+
+        // Count opening parens to detect batch insert
+        let open_count = values_str.matches('(').count();
+        if open_count > 1 && values_str.contains("),") {
+            // Batch insert: (vals1), (vals2), ...
+            let mut rows = Vec::new();
+            let mut remaining = values_str;
+            while remaining.starts_with('(') {
+                let close = Self::find_matching_paren_simple(remaining)?;
+                let vals_inner = &remaining[1..close];
+                let values: Vec<LiteralValue> = Self::split_quoted(vals_inner, ',')
+                    .iter()
+                    .map(|s| Self::parse_literal(s.trim()))
+                    .collect::<Result<Vec<_>>>()?;
+                rows.push(values);
+                remaining = remaining[close + 1..].trim();
+                if remaining.starts_with(',') {
+                    remaining = remaining[1..].trim();
+                }
+            }
+            if let Some((conflict_col, assignments)) = upsert_info {
+                // Upsert with batch - use first row for now
+                Ok(QueryAst::Upsert {
+                    class,
+                    columns,
+                    values: rows.into_iter().next().unwrap_or_default(),
+                    conflict_column: conflict_col,
+                    assignments,
+                })
+            } else {
+                Ok(QueryAst::BatchInsert { class, columns, rows })
+            }
+        } else {
+            // Single insert
+            if !values_str.starts_with('(') || !values_str.ends_with(')') {
+                return Err(CoreError::InvalidArgument(
+                    "expected '(values)'".to_string(),
+                ));
+            }
+            let vals_inner = &values_str[1..values_str.len() - 1];
+            let values: Vec<LiteralValue> = Self::split_quoted(vals_inner, ',')
+                .iter()
+                .map(|s| Self::parse_literal(s.trim()))
+                .collect::<Result<Vec<_>>>()?;
+
+            if let Some((conflict_col, assignments)) = upsert_info {
+                Ok(QueryAst::Upsert {
+                    class,
+                    columns,
+                    values,
+                    conflict_column: conflict_col,
+                    assignments,
+                })
+            } else {
+                Ok(QueryAst::Insert { class, columns, values })
+            }
+        }
+    }
+
+    /// Parses INSERT header: class (col1, col2, ...)
+    fn parse_insert_header(header: &str) -> Result<(String, Vec<String>)> {
         let paren_start = header
             .find('(')
             .ok_or_else(|| CoreError::InvalidArgument("expected '(' in INSERT".to_string()))?;
         let class = header[..paren_start].trim().to_string();
-        let cols_str = &header[paren_start + 1..header.len() - 1]; // Remove parens
-
+        let cols_str = &header[paren_start + 1..header.len() - 1];
         let columns: Vec<String> = cols_str
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        Ok((class, columns))
+    }
 
-        // Parse values: (val1, val2, ...)
-        let values_str = values_str.trim();
-        if !values_str.starts_with('(') || !values_str.ends_with(')') {
-            return Err(CoreError::InvalidArgument(
-                "expected '(values)'".to_string(),
-            ));
-        }
-        let vals_inner = &values_str[1..values_str.len() - 1];
-
-        let values: Vec<LiteralValue> = Self::split_quoted(vals_inner, ',')
+    /// Parses SET assignments: col1 = val1, col2 = val2
+    fn parse_set_assignments(input: &str) -> Result<Vec<(String, LiteralValue)>> {
+        Self::split_quoted(input, ',')
             .iter()
-            .map(|s| Self::parse_literal(s.trim()))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|s| {
+                let s = s.trim();
+                let eq_pos = Self::find_unquoted(s, "=")
+                    .ok_or_else(|| CoreError::InvalidArgument("expected '=' in SET".to_string()))?;
+                let col = s[..eq_pos].trim().to_string();
+                let val = Self::parse_literal(s[eq_pos + 1..].trim())?;
+                Ok((col, val))
+            })
+            .collect::<Result<Vec<_>>>()
+    }
 
-        Ok(QueryAst::Insert {
-            class,
-            columns,
-            values,
-        })
+    /// Simple matching paren finder (no quote handling needed for values).
+    fn find_matching_paren_simple(input: &str) -> Result<usize> {
+        let mut depth = 0;
+        for (i, c) in input.char_indices() {
+            if c == '(' { depth += 1; }
+            if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(i);
+                }
+            }
+        }
+        Err(CoreError::InvalidArgument("unmatched parenthesis".to_string()))
     }
 
     fn parse_select(input: &str) -> Result<QueryAst> {
@@ -755,17 +909,28 @@ impl QueryParser {
 
         // Parse optional LIMIT
         let rest_upper = rest.to_uppercase();
-        let limit = if rest_upper.trim_start().starts_with("LIMIT") {
+        let (limit, offset, rest) = if rest_upper.trim_start().starts_with("LIMIT") {
             let start = Self::find_unquoted(&rest_upper, "LIMIT")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'LIMIT'".to_string()))?;
-            let num_str = rest[start + 5..].trim();
-            Some(
-                num_str
+            let after_limit = rest[start + 5..].trim();
+            // Parse limit number (may be followed by OFFSET or end)
+            let (num_str, after_num) = Self::parse_word(after_limit)?;
+            let limit_val = num_str
+                .parse::<usize>()
+                .map_err(|_| CoreError::InvalidArgument("invalid LIMIT".to_string()))?;
+            // Check for OFFSET
+            let after_upper = after_num.to_uppercase();
+            if after_upper.trim_start().starts_with("OFFSET") {
+                let offset_str = after_num[6..].trim();
+                let offset_val = offset_str
                     .parse::<usize>()
-                    .map_err(|_| CoreError::InvalidArgument("invalid LIMIT".to_string()))?,
-            )
+                    .map_err(|_| CoreError::InvalidArgument("invalid OFFSET".to_string()))?;
+                (Some(limit_val), Some(offset_val), "".to_string())
+            } else {
+                (Some(limit_val), None, after_num.to_string())
+            }
         } else {
-            None
+            (None, None, rest)
         };
 
         Ok(QueryAst::Select {
@@ -779,6 +944,7 @@ impl QueryParser {
             having,
             order_by,
             limit,
+            offset,
         })
     }
 
@@ -889,6 +1055,21 @@ impl QueryParser {
             if Self::contains_window_function(&upper) {
                 let window_expr = Self::parse_window_function(part)?;
                 items.push(SelectItem::WindowFunction(window_expr));
+                continue;
+            }
+
+            // Check for built-in functions: COALESCE, NULLIF, CONCAT, etc.
+            let builtin_funcs = ["COALESCE", "NULLIF", "CONCAT", "SUBSTRING", "UPPER", "LOWER", "NOW", "LENGTH", "TRIM", "ABS", "ROUND"];
+            let mut is_builtin = false;
+            for func_name in &builtin_funcs {
+                if upper.starts_with(func_name) && part.len() > func_name.len() && part.as_bytes()[func_name.len()] == b'(' {
+                    let value_expr = Self::parse_value_expr(part)?;
+                    items.push(SelectItem::Expression(value_expr));
+                    is_builtin = true;
+                    break;
+                }
+            }
+            if is_builtin {
                 continue;
             }
 
@@ -1481,6 +1662,7 @@ impl QueryParser {
         let mut parts = Vec::new();
         let mut current = String::new();
         let mut in_quote: Option<char> = None;
+        let mut paren_depth = 0i32;
 
         for c in input.chars() {
             if let Some(q) = in_quote {
@@ -1491,7 +1673,13 @@ impl QueryParser {
             } else if c == '\'' || c == '"' {
                 in_quote = Some(c);
                 current.push(c);
-            } else if c == delim {
+            } else if c == '(' {
+                paren_depth += 1;
+                current.push(c);
+            } else if c == ')' {
+                paren_depth -= 1;
+                current.push(c);
+            } else if c == delim && paren_depth == 0 {
                 parts.push(current.clone());
                 current.clear();
             } else {
@@ -1879,7 +2067,7 @@ impl QueryParser {
         })
     }
 
-    /// Parses a value expression: column reference, literal, CASE WHEN, arithmetic, or scalar subquery.
+    /// Parses a value expression: column reference, literal, CASE WHEN, arithmetic, function, or scalar subquery.
     fn parse_value_expr(input: &str) -> Result<ValueExpr> {
         let input = input.trim();
         let upper = input.to_uppercase();
@@ -1895,8 +2083,30 @@ impl QueryParser {
             return Ok(ValueExpr::ScalarSubquery(Box::new(subquery)));
         }
 
+        // Built-in function: FUNC(args...)
+        let func_names = ["COALESCE", "NULLIF", "CONCAT", "SUBSTRING", "UPPER", "LOWER", "NOW", "LENGTH", "TRIM", "ABS", "ROUND"];
+        for func_name in &func_names {
+            if upper.starts_with(func_name) && input.len() > func_name.len() && input.as_bytes()[func_name.len()] == b'(' {
+                // Find matching closing paren
+                let open = func_name.len();
+                let close = Self::find_matching_paren_simple(&input[open..])? + open;
+                let args_str = &input[open + 1..close];
+                let args: Vec<ValueExpr> = if args_str.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    Self::split_quoted(args_str, ',')
+                        .iter()
+                        .map(|s| Self::parse_value_expr(s.trim()))
+                        .collect::<Result<Vec<_>>>()?
+                };
+                return Ok(ValueExpr::Function {
+                    name: func_name.to_string(),
+                    args,
+                });
+            }
+        }
+
         // Try arithmetic: look for + or - outside parentheses
-        // Simple approach: find the rightmost + or - at depth 0
         if let Some((op, pos)) = Self::find_top_level_arithmetic(input) {
             let left = Self::parse_value_expr(&input[..pos])?;
             let right = Self::parse_value_expr(&input[pos + 1..])?;
@@ -1909,8 +2119,6 @@ impl QueryParser {
 
         // Literal
         if let Ok(lit) = Self::parse_literal(input) {
-            // Check if it's actually a column name that happens to look like a literal
-            // Literals: numbers, quoted strings, NULL, TRUE, FALSE
             if input.starts_with('\'') || input.starts_with('"')
                 || input.eq_ignore_ascii_case("NULL")
                 || input.eq_ignore_ascii_case("TRUE")

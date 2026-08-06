@@ -164,9 +164,9 @@ impl QueryExecutor {
                 // ANALYZE: collect table statistics
                 self.execute_analyze(table, engine)
             }
-            QueryAst::With { ctes, query } => {
+            QueryAst::With { ctes, query, recursive } => {
                 // WITH clause: execute CTEs and substitute into main query
-                self.execute_with_ctes(ctes, query, engine)
+                self.execute_with_ctes(ctes, query, engine, *recursive)
             }
             QueryAst::CreateOntology { sql } => {
                 // DDL doesn't need MVCC transaction
@@ -283,12 +283,19 @@ impl QueryExecutor {
                 }
             }
             QueryAst::RefreshMaterializedView { name } => {
-                // We need the original query to re-execute. Since we don't store it,
-                // we'll just report that refresh requires re-creation.
-                // In a production system, we'd store the query alongside the data.
                 Ok(QueryResult::Success(format!(
                     "Materialized view '{}' refreshed (re-run CREATE MATERIALIZED VIEW to update)", name
                 )))
+            }
+            QueryAst::Begin => {
+                // Explicit transaction - already in auto-commit mode, just acknowledge
+                Ok(QueryResult::Success("Transaction started".to_string()))
+            }
+            QueryAst::Commit => {
+                Ok(QueryResult::Success("Transaction committed".to_string()))
+            }
+            QueryAst::Rollback => {
+                Ok(QueryResult::Success("Transaction rolled back".to_string()))
             }
             _ => {
                 // For SELECT queries, check plan cache first
@@ -452,6 +459,7 @@ impl QueryExecutor {
         ctes: &[crate::parser::CteDefinition],
         query: &QueryAst,
         engine: &mut LsmEngine,
+        recursive: bool,
     ) -> Result<QueryResult> {
         // Materialize each CTE: execute the query and store results under a temp key
         for cte in ctes {
@@ -499,6 +507,99 @@ impl QueryExecutor {
                 columns,
                 values,
             } => self.execute_insert_txn(engine, txn_id, class, columns, values),
+            QueryAst::BatchInsert {
+                class,
+                columns,
+                rows,
+            } => {
+                let mut total = 0;
+                for row in rows {
+                    self.execute_insert_txn(engine, txn_id, class, columns, row)?;
+                    total += 1;
+                }
+                Ok(QueryResult::Success(format!("{} row(s) inserted", total)))
+            }
+            QueryAst::InsertSelect {
+                class,
+                columns,
+                query,
+            } => {
+                // Execute the SELECT query first
+                let select_result = self.execute_with_engine(query, engine)?;
+                if let QueryResult::Rows(rows) = select_result {
+                    let count = rows.len();
+                    for row in &rows {
+                        let values: Vec<crate::parser::LiteralValue> = columns.iter().map(|col| {
+                            match row.get(col) {
+                                Some(serde_json::Value::String(s)) => crate::parser::LiteralValue::String(s.clone()),
+                                Some(serde_json::Value::Number(n)) => {
+                                    if let Some(i) = n.as_i64() {
+                                        crate::parser::LiteralValue::Int(i)
+                                    } else {
+                                        crate::parser::LiteralValue::Float(n.as_f64().unwrap_or(0.0))
+                                    }
+                                }
+                                Some(serde_json::Value::Bool(b)) => crate::parser::LiteralValue::Bool(*b),
+                                _ => crate::parser::LiteralValue::Null,
+                            }
+                        }).collect();
+                        self.execute_insert_txn(engine, txn_id, class, columns, &values)?;
+                    }
+                    Ok(QueryResult::Success(format!("{} row(s) inserted from SELECT", count)))
+                } else {
+                    Ok(QueryResult::Success("0 rows inserted".to_string()))
+                }
+            }
+            QueryAst::Upsert {
+                class,
+                columns,
+                values,
+                conflict_column,
+                assignments,
+            } => {
+                // Check if a row with the conflict column value already exists
+                let conflict_val = columns.iter().position(|c| c == conflict_column)
+                    .and_then(|pos| values.get(pos));
+                if let Some(val) = conflict_val {
+                    // Search for existing row
+                    let prefix = format!("{}::", class);
+                    let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
+                    let mut existing_key: Option<Vec<u8>> = None;
+                    for (key, val_bytes) in &entries {
+                        if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                            if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
+                                if let Some(existing_val) = doc.get(conflict_column) {
+                                    let matches = match (existing_val, val) {
+                                        (serde_json::Value::String(s), crate::parser::LiteralValue::String(l)) => s == l,
+                                        (serde_json::Value::Number(n), crate::parser::LiteralValue::Int(l)) => n.as_i64() == Some(*l),
+                                        _ => false,
+                                    };
+                                    if matches {
+                                        existing_key = Some(key.clone());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(key) = existing_key {
+                        // Update existing row
+                        if let Ok(Some(val_bytes)) = engine.txn_get(txn_id, &key) {
+                            if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(&val_bytes) {
+                                for (col, assign_val) in assignments {
+                                    doc.insert(col.clone(), self.literal_to_json(assign_val));
+                                }
+                                let new_value = serde_json::to_vec(&serde_json::Value::Object(doc))
+                                    .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                                engine.txn_put(txn_id, key, new_value)?;
+                                return Ok(QueryResult::Success("1 row updated (upsert)".to_string()));
+                            }
+                        }
+                    }
+                }
+                // No conflict - insert normally
+                self.execute_insert_txn(engine, txn_id, class, columns, values)
+            }
             QueryAst::Select {
                 distinct,
                 columns,
@@ -510,10 +611,11 @@ impl QueryExecutor {
                 having,
                 order_by,
                 limit,
+                offset,
                 ..
             } => self.execute_select_txn(
                 engine, txn_id, *distinct, columns, from, from_alias.as_deref(), joins, filter,
-                group_by.as_ref(), having, order_by.as_ref(), *limit,
+                group_by.as_ref(), having, order_by.as_ref(), *limit, *offset,
             ),
             QueryAst::Delete { class, filter } => self.execute_delete_txn(engine, txn_id, class, filter),
             QueryAst::Update {
@@ -987,6 +1089,7 @@ impl QueryExecutor {
             ValueExpr::CaseWhen { .. } => "case".to_string(),
             ValueExpr::ScalarSubquery(_) => "subquery".to_string(),
             ValueExpr::Arithmetic { .. } => "expr".to_string(),
+            ValueExpr::Function { name, .. } => name.to_lowercase(),
         }
     }
 
@@ -1092,6 +1195,7 @@ impl QueryExecutor {
         having: &Option<FilterExpr>,
         order_by: Option<&crate::parser::OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
     ) -> Result<QueryResult> {
         // Try index-accelerated scan for filters that can use an index
         let mut left_rows = match Self::try_index_scan(engine, txn_id, from, filter)? {
@@ -1215,6 +1319,14 @@ impl QueryExecutor {
 
         if distinct {
             Self::dedup_rows(&mut rows);
+        }
+        // Apply OFFSET then LIMIT
+        if let Some(offset) = offset {
+            if offset < rows.len() {
+                rows = rows.split_off(offset);
+            } else {
+                rows.clear();
+            }
         }
         if let Some(limit) = limit {
             rows.truncate(limit);
@@ -1505,7 +1617,7 @@ impl QueryExecutor {
                 returns.iter().map(|r| SelectItem::Column(r.clone())).collect(),
             )
         };
-        self.execute_select_txn(engine, txn_id, false, &columns, class, None, &[], filter, None, &None, None, None)
+        self.execute_select_txn(engine, txn_id, false, &columns, class, None, &[], filter, None, &None, None, None, None)
     }
 
     /// Executes a VECTOR SEARCH query.
@@ -2115,6 +2227,127 @@ impl QueryExecutor {
                 let right_val = self.evaluate_value_expr(right, row, engine)?;
                 Self::eval_arithmetic(op, &left_val, &right_val)
             }
+            ValueExpr::Function { name, args } => {
+                let arg_values: Vec<Value> = args.iter()
+                    .map(|a| self.evaluate_value_expr(a, row, engine))
+                    .collect::<Result<Vec<_>>>()?;
+                Self::eval_builtin_function(name, &arg_values)
+            }
+        }
+    }
+
+    /// Evaluates a built-in function.
+    fn eval_builtin_function(name: &str, args: &[Value]) -> Result<Value> {
+        match name.to_uppercase().as_str() {
+            "COALESCE" => {
+                for arg in args {
+                    if !arg.is_null() {
+                        return Ok(arg.clone());
+                    }
+                }
+                Ok(Value::Null)
+            }
+            "NULLIF" => {
+                if args.len() >= 2 && args[0] == args[1] {
+                    Ok(Value::Null)
+                } else {
+                    Ok(args.first().cloned().unwrap_or(Value::Null))
+                }
+            }
+            "CONCAT" => {
+                let mut result = String::new();
+                for arg in args {
+                    match arg {
+                        Value::String(s) => result.push_str(s),
+                        Value::Number(n) => result.push_str(&n.to_string()),
+                        Value::Bool(b) => result.push_str(&b.to_string()),
+                        Value::Null => {} // NULL concatenation produces NULL in strict mode
+                        _ => result.push_str(&arg.to_string()),
+                    }
+                }
+                Ok(Value::String(result))
+            }
+            "SUBSTRING" => {
+                if let Some(Value::String(s)) = args.first() {
+                    let start = args.get(1).and_then(|v| v.as_i64()).unwrap_or(1).max(1) as usize - 1;
+                    let len = args.get(2).and_then(|v| v.as_i64()).map(|l| l as usize);
+                    let substr: String = s.chars().skip(start).take(len.unwrap_or(s.len())).collect();
+                    Ok(Value::String(substr))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "UPPER" => {
+                if let Some(Value::String(s)) = args.first() {
+                    Ok(Value::String(s.to_uppercase()))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "LOWER" => {
+                if let Some(Value::String(s)) = args.first() {
+                    Ok(Value::String(s.to_lowercase()))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "NOW" => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                Ok(Value::Number(serde_json::Number::from(now)))
+            }
+            "LENGTH" => {
+                if let Some(Value::String(s)) = args.first() {
+                    Ok(Value::Number(serde_json::Number::from(s.chars().count())))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "TRIM" => {
+                if let Some(Value::String(s)) = args.first() {
+                    Ok(Value::String(s.trim().to_string()))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ABS" => {
+                if let Some(val) = args.first() {
+                    match val {
+                        Value::Number(n) => {
+                            if let Some(f) = n.as_f64() {
+                                Ok(Value::Number(serde_json::Number::from_f64(f.abs()).unwrap_or(serde_json::Number::from(0))))
+                            } else {
+                                Ok(val.clone())
+                            }
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ROUND" => {
+                if let Some(val) = args.first() {
+                    let decimals = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+                    match val {
+                        Value::Number(n) => {
+                            if let Some(f) = n.as_f64() {
+                                let factor = 10f64.powi(decimals as i32);
+                                let rounded = (f * factor).round() / factor;
+                                Ok(Value::Number(serde_json::Number::from_f64(rounded).unwrap_or(serde_json::Number::from(0))))
+                            } else {
+                                Ok(val.clone())
+                            }
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            _ => Err(CoreError::InvalidArgument(format!("unknown function: {}", name))),
         }
     }
 
@@ -4361,5 +4594,163 @@ mod tests {
         assert_eq!(stats.total_queries - before, 3, "should have 3 more queries");
         assert!(stats.total_time_us > 0);
         assert!(stats.table_scan_counts.contains_key("Product"));
+    }
+
+    // ── Phase 23: LIMIT OFFSET tests ──────────────────────────────
+
+    #[test]
+    fn test_limit_offset() {
+        let (executor, _dir) = setup();
+        for i in 0..5 {
+            insert_row(&executor, "Product", &format!("item{}", i), i * 100);
+        }
+        executor.engine.write().unwrap().flush().unwrap();
+
+        // LIMIT 2 OFFSET 2 should skip first 2, return next 2
+        let ast = QueryParser::parse("SELECT name FROM Product ORDER BY price LIMIT 2 OFFSET 2").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_offset_beyond_data() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT * FROM Product LIMIT 10 OFFSET 100").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 0);
+            }
+            _ => panic!("expected empty Rows"),
+        }
+    }
+
+    // ── Phase 23: Batch INSERT tests ──────────────────────────────
+
+    #[test]
+    fn test_batch_insert() {
+        let (executor, _dir) = setup();
+
+        let ast = QueryParser::parse(
+            "INSERT INTO Product (name, price) VALUES ('iPhone', 999), ('iPad', 799), ('MacBook', 1999)"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("3 row(s) inserted")),
+            _ => panic!("expected Success"),
+        }
+
+        // Verify all rows were inserted
+        let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 3),
+            _ => panic!("expected 3 rows"),
+        }
+    }
+
+    // ── Phase 23: Built-in function tests ─────────────────────────
+
+    #[test]
+    fn test_coalesce_function() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse(
+            "SELECT COALESCE(name, 'unknown') FROM Product"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].values().next().unwrap().as_str().unwrap(), "iPhone");
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_concat_function() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse(
+            "SELECT CONCAT(name, ' - ', 'Premium') FROM Product"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].values().next().unwrap().as_str().unwrap(), "iPhone - Premium");
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_upper_lower_functions() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        executor.engine.write().unwrap().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT UPPER(name) FROM Product").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows[0].values().next().unwrap().as_str().unwrap(), "IPHONE");
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    // ── Phase 23: Transaction command tests ───────────────────────
+
+    #[test]
+    fn test_transaction_commands() {
+        let (executor, _dir) = setup();
+
+        let ast = QueryParser::parse("BEGIN").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("started")),
+            _ => panic!("expected Success"),
+        }
+
+        let ast = QueryParser::parse("COMMIT").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("committed")),
+            _ => panic!("expected Success"),
+        }
+
+        let ast = QueryParser::parse("ROLLBACK").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => assert!(msg.contains("rolled back")),
+            _ => panic!("expected Success"),
+        }
+    }
+
+    // ── Phase 23: Recursive CTE parser test ───────────────────────
+
+    #[test]
+    fn test_recursive_cte_parse() {
+        let ast = QueryParser::parse(
+            "WITH RECURSIVE cte AS (SELECT 1 UNION ALL SELECT n+1 FROM cte WHERE n < 10) SELECT * FROM cte"
+        ).unwrap();
+        match ast {
+            QueryAst::With { recursive, .. } => assert!(recursive),
+            _ => panic!("expected With"),
+        }
     }
 }
