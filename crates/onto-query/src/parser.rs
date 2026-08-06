@@ -61,7 +61,7 @@ pub enum QueryAst {
         filter: Option<FilterExpr>,
         group_by: Option<GroupByClause>,
         having: Option<FilterExpr>,
-        order_by: Option<OrderBy>,
+        order_by: Vec<OrderBy>,
         limit: Option<usize>,
         offset: Option<usize>,
     },
@@ -874,37 +874,31 @@ impl QueryParser {
             (None, rest)
         };
 
-        // Parse optional ORDER BY
+        // Parse optional ORDER BY (multi-column)
         let rest_upper = rest.to_uppercase();
         let rest = rest; // reborrow
         let (order_by, rest) = if rest_upper.trim_start().starts_with("ORDER BY") {
             let start = Self::find_unquoted(&rest_upper, "ORDER BY")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'ORDER BY'".to_string()))?;
-            let rest = rest[start + 8..].trim();
-            let (col, rest) = Self::parse_word(rest)?;
-            let rest_upper = rest.to_uppercase();
-            let ascending = if rest_upper.trim_start().starts_with("DESC") {
-                let pos = Self::find_unquoted(&rest_upper, "DESC")
-                    .ok_or_else(|| CoreError::InvalidArgument("expected 'DESC'".to_string()))?;
-                let rest = rest[pos + 4..].trim();
-                (false, rest.to_string())
-            } else if rest_upper.trim_start().starts_with("ASC") {
-                let pos = Self::find_unquoted(&rest_upper, "ASC")
-                    .ok_or_else(|| CoreError::InvalidArgument("expected 'ASC'".to_string()))?;
-                let rest = rest[pos + 3..].trim();
-                (true, rest.to_string())
-            } else {
-                (true, rest.to_string())
-            };
-            (
-                Some(OrderBy {
-                    column: col,
-                    ascending: ascending.0,
-                }),
-                ascending.1,
-            )
+            let (ob_str, rest) = Self::consume_until_keywords(rest[start + 8..].trim(), &["LIMIT", "OFFSET"]);
+            let mut order_cols = Vec::new();
+            for part in Self::split_quoted(ob_str.trim(), ',') {
+                let part = part.trim();
+                let part_upper = part.to_uppercase();
+                let (col, ascending) = if part_upper.ends_with(" DESC") {
+                    (part[..part.len() - 5].trim().to_string(), false)
+                } else if part_upper.ends_with(" ASC") {
+                    (part[..part.len() - 4].trim().to_string(), true)
+                } else {
+                    (part.to_string(), true)
+                };
+                if !col.is_empty() {
+                    order_cols.push(OrderBy { column: col, ascending });
+                }
+            }
+            (order_cols, rest.to_string())
         } else {
-            (None, rest)
+            (Vec::new(), rest.to_string())
         };
 
         // Parse optional LIMIT

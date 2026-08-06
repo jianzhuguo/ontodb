@@ -88,7 +88,7 @@ pub enum PlanNode {
     /// Sort.
     Sort {
         input: Box<PlanNode>,
-        order_by: OrderBy,
+        order_by: Vec<OrderBy>,
         estimated_rows: u64,
     },
 
@@ -213,11 +213,13 @@ impl ExecutionPlan {
                 self.describe_node(right, depth + 1, output);
             }
             PlanNode::Sort { input, order_by, estimated_rows, .. } => {
+                let ob_desc: Vec<String> = order_by.iter()
+                    .map(|ob| format!("{} {}", ob.column, if ob.ascending { "ASC" } else { "DESC" }))
+                    .collect();
                 output.push_str(&format!(
-                    "{}Sort by {} {} (rows: {})\n",
+                    "{}Sort by {} (rows: {})\n",
                     indent,
-                    order_by.column,
-                    if order_by.ascending { "ASC" } else { "DESC" },
+                    ob_desc.join(", "),
                     estimated_rows
                 ));
                 self.describe_node(input, depth + 1, output);
@@ -311,7 +313,7 @@ impl QueryPlanner {
                 filter,
                 group_by.as_ref(),
                 having,
-                order_by.as_ref(),
+                order_by,
                 *limit,
             ),
             QueryAst::VectorSearch {
@@ -347,7 +349,7 @@ impl QueryPlanner {
         filter: &Option<FilterExpr>,
         group_by: Option<&crate::parser::GroupByClause>,
         having: &Option<FilterExpr>,
-        order_by: Option<&OrderBy>,
+        order_by: &[OrderBy],
         limit: Option<usize>,
     ) -> Result<ExecutionPlan> {
         let stats = self.stats.get(from).cloned().unwrap_or_else(|| TableStats {
@@ -422,6 +424,16 @@ impl QueryPlanner {
             );
         }
 
+        // Add projection as the final step (after filter)
+        best_plan = ExecutionPlan::new(
+            PlanNode::Projection {
+                input: Box::new(best_plan.root),
+                columns: columns.clone(),
+                estimated_rows: best_plan.cost.rows,
+            },
+            best_plan.cost,
+        );
+
         Ok(best_plan)
     }
 
@@ -493,6 +505,7 @@ impl QueryPlanner {
     }
 
     /// Determine which table a predicate belongs to.
+    /// Returns None if the predicate references a join alias (should be applied after join).
     fn determine_table_for_predicate(
         pred: &FilterExpr,
         main_table: &str,
@@ -516,14 +529,15 @@ impl QueryPlanner {
         // Check if column has table prefix
         if let Some(dot_pos) = col.find('.') {
             let table_prefix = &col[..dot_pos];
-            // Match against main table or alias
+            // Match against main table or alias - can push down
             if table_prefix == main_table || Some(table_prefix) == main_alias.as_deref() {
                 return Some(main_table.to_string());
             }
-            // Match against join tables
+            // Match against join tables - DON'T push down
+            // (join alias references must be resolved after the join)
             for join in joins {
                 if table_prefix == join.table || Some(table_prefix) == join.alias.as_deref() {
-                    return Some(join.table.clone());
+                    return None; // Keep as post-join filter
                 }
             }
         }
@@ -542,7 +556,7 @@ impl QueryPlanner {
         joins: &[JoinClause],
         group_by: Option<&crate::parser::GroupByClause>,
         having: &Option<FilterExpr>,
-        order_by: Option<&OrderBy>,
+        order_by: &[OrderBy],
         limit: Option<usize>,
         columns: &SelectColumns,
     ) -> ExecutionPlan {
@@ -653,11 +667,11 @@ impl QueryPlanner {
         }
 
         // Apply sort
-        if let Some(ob) = order_by {
+        if !order_by.is_empty() {
             let sort_cost = self.cost_model.sort_cost(&current_cost);
             current_node = PlanNode::Sort {
                 input: Box::new(current_node),
-                order_by: ob.clone(),
+                order_by: order_by.to_vec(),
                 estimated_rows: sort_cost.rows,
             };
             current_cost = sort_cost;
@@ -675,12 +689,7 @@ impl QueryPlanner {
             current_cost = CostEstimate::new(limited_rows, current_cost.io_cost, current_cost.cpu_cost);
         }
 
-        // Apply projection
-        current_node = PlanNode::Projection {
-            input: Box::new(current_node),
-            columns: columns.clone(),
-            estimated_rows: current_cost.rows,
-        };
+        // Note: Projection is added in plan_select after remaining filter
 
         ExecutionPlan::new(current_node, current_cost)
     }
@@ -696,7 +705,7 @@ impl QueryPlanner {
         joins: &[JoinClause],
         group_by: Option<&crate::parser::GroupByClause>,
         having: &Option<FilterExpr>,
-        order_by: Option<&OrderBy>,
+        order_by: &[OrderBy],
         limit: Option<usize>,
         columns: &SelectColumns,
     ) -> ExecutionPlan {
@@ -783,12 +792,13 @@ impl QueryPlanner {
         }
 
         // Index scan is already sorted, so no need for sort unless ORDER BY is on different column
-        if let Some(ob) = order_by {
-            if ob.column != index.column {
+        if !order_by.is_empty() {
+            let needs_sort = order_by.iter().any(|ob| ob.column != index.column);
+            if needs_sort {
                 let sort_cost = self.cost_model.sort_cost(&current_cost);
                 current_node = PlanNode::Sort {
                     input: Box::new(current_node),
-                    order_by: ob.clone(),
+                    order_by: order_by.to_vec(),
                     estimated_rows: sort_cost.rows,
                 };
                 current_cost = sort_cost;
@@ -806,12 +816,7 @@ impl QueryPlanner {
             current_cost = CostEstimate::new(limited_rows, current_cost.io_cost, current_cost.cpu_cost);
         }
 
-        // Apply projection
-        current_node = PlanNode::Projection {
-            input: Box::new(current_node),
-            columns: columns.clone(),
-            estimated_rows: current_cost.rows,
-        };
+        // Note: Projection is added in plan_select after remaining filter
 
         ExecutionPlan::new(current_node, current_cost).with_index()
     }

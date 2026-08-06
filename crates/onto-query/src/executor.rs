@@ -3,6 +3,7 @@
 use crate::cache::{PlanCache, QueryCache};
 use crate::optimizer::QueryPlanner;
 use crate::parser::{AggregateFunc, ArithmeticOp, FilterExpr, LiteralValue, QueryAst, SelectColumns, SelectItem, ValueExpr, WindowExpr, WindowFunc};
+use crate::optimizer::{ExecutionPlan, PlanNode};
 use onto_core::{CoreError, Result};
 use onto_ontology::{DataType, OntologyStore};
 use onto_storage::LsmEngine;
@@ -328,6 +329,461 @@ impl QueryExecutor {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  Plan-driven execution engine (Phase 24)
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Executes a query using the plan-driven execution engine.
+    /// This is the Phase 24 architecture: the executor walks the PlanNode tree
+    /// instead of re-implementing optimization logic independently.
+    pub fn execute_plan(&self, plan: &ExecutionPlan, engine: &mut LsmEngine) -> Result<QueryResult> {
+        let rows = self.execute_plan_node(&plan.root, engine)?;
+        Ok(QueryResult::Rows(rows))
+    }
+
+    /// Recursively executes a PlanNode and returns the result rows.
+    fn execute_plan_node(&self, node: &PlanNode, engine: &mut LsmEngine) -> Result<Vec<Map<String, Value>>> {
+        match node {
+            PlanNode::SeqScan { table, alias, filter, .. } => {
+                self.plan_seq_scan(engine, table, alias.as_deref(), filter)
+            }
+            PlanNode::IndexScan { table, alias, index_column, filter, .. } => {
+                self.plan_index_scan(engine, table, alias.as_deref(), index_column, filter)
+            }
+            PlanNode::IndexLookup { table, alias, index_column, key, .. } => {
+                self.plan_index_lookup(engine, table, alias.as_deref(), index_column, key)
+            }
+            PlanNode::VectorSearch { table, column, query_vector, top_k, filter, .. } => {
+                self.plan_vector_search(engine, table, column, query_vector, *top_k, filter)
+            }
+            PlanNode::Filter { input, predicate, .. } => {
+                let mut rows = self.execute_plan_node(input, engine)?;
+                let filter_expr = Some(predicate.clone());
+                rows.retain(|row| self.matches_filter(engine, row, &filter_expr));
+                Ok(rows)
+            }
+            PlanNode::Projection { input, columns, .. } => {
+                // Get the raw rows from the child node (before projection)
+                let raw_rows = self.execute_plan_node(input, engine)?;
+                // Check if there are aggregates or expressions that need all columns
+                let has_aggregates = Self::columns_have_aggregates(columns);
+                let has_expr = match columns {
+                    SelectColumns::Columns(items) => items.iter().any(|item| matches!(item, SelectItem::Expression(_))),
+                    _ => false,
+                };
+                if has_aggregates {
+                    // Aggregation handles projection in post-processing; pass through raw rows
+                    Ok(raw_rows)
+                } else if has_expr {
+                    // Evaluate expressions using raw rows, then build projected result
+                    let mut result = Vec::new();
+                    for raw_row in &raw_rows {
+                        let mut projected = Map::new();
+                        if let SelectColumns::Columns(items) = columns {
+                            for item in items {
+                                match item {
+                                    SelectItem::Column(col) => {
+                                        let (real_col, alias_part) = if let Some(as_pos) = col.find(" as ") {
+                                            (&col[..as_pos], Some(col[as_pos + 4..].trim()))
+                                        } else {
+                                            (col.as_str(), None)
+                                        };
+                                        if let Some(val) = raw_row.get(real_col) {
+                                            let name = alias_part.unwrap_or(real_col);
+                                            let name = name.split('.').last().unwrap_or(name);
+                                            projected.insert(name.to_string(), val.clone());
+                                        }
+                                    }
+                                    SelectItem::Expression(expr) => {
+                                        let val = self.evaluate_value_expr(expr, raw_row, engine)?;
+                                        let name = Self::value_expr_default_name(expr);
+                                        projected.insert(name, val);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        result.push(projected);
+                    }
+                    Ok(result)
+                } else {
+                    let projected: Vec<Map<String, Value>> = raw_rows.iter()
+                        .map(|row| self.project_columns(row, columns))
+                        .collect();
+                    Ok(projected)
+                }
+            }
+            PlanNode::NestedLoopJoin { left, right, join_clause, .. } => {
+                let left_rows = self.execute_plan_node(left, engine)?;
+                let right_rows = self.execute_plan_node(right, engine)?;
+                Self::execute_nested_loop_join(left_rows, right_rows, join_clause)
+            }
+            PlanNode::HashJoin { left, right, join_clause, .. } => {
+                let left_rows = self.execute_plan_node(left, engine)?;
+                let right_rows = self.execute_plan_node(right, engine)?;
+                Self::execute_hash_join_rows(left_rows, right_rows, join_clause)
+            }
+            PlanNode::SortMergeJoin { left, right, join_clause, .. } => {
+                let left_rows = self.execute_plan_node(left, engine)?;
+                let right_rows = self.execute_plan_node(right, engine)?;
+                Self::execute_sort_merge_join_rows(left_rows, right_rows, join_clause)
+            }
+            PlanNode::Sort { input, order_by, .. } => {
+                let mut rows = self.execute_plan_node(input, engine)?;
+                // Apply each ORDER BY column in reverse (last key has highest priority)
+                for ob in order_by.iter().rev() {
+                    Self::sort_rows(&mut rows, &ob.column, ob.ascending);
+                }
+                Ok(rows)
+            }
+            PlanNode::Aggregation { input, group_by, .. } => {
+                let rows = self.execute_plan_node(input, engine)?;
+                // Basic aggregation: just return grouped rows
+                // Full aggregation is handled by execute_aggregation
+                Ok(rows)
+            }
+            PlanNode::Limit { input, .. } => {
+                // LIMIT is handled in post-processing along with OFFSET
+                // (OFFSET must be applied before LIMIT)
+                self.execute_plan_node(input, engine)
+            }
+            PlanNode::Union { left, right, all, .. } => {
+                let mut left_rows = self.execute_plan_node(left, engine)?;
+                let right_rows = self.execute_plan_node(right, engine)?;
+                left_rows.extend(right_rows);
+                if !all {
+                    Self::dedup_rows(&mut left_rows);
+                }
+                Ok(left_rows)
+            }
+        }
+    }
+
+    /// Plan-driven sequential scan with optional filter.
+    fn plan_seq_scan(
+        &self,
+        engine: &mut LsmEngine,
+        table: &str,
+        alias: Option<&str>,
+        filter: &Option<FilterExpr>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        // Check CTE tables first
+        let cte_prefix = format!("__cte_{}::", table.to_lowercase());
+        let cte_entries = engine.scan_prefix(cte_prefix.as_bytes()).unwrap_or_default();
+        if !cte_entries.is_empty() {
+            let mut rows = Vec::new();
+            for (_key, val_bytes) in &cte_entries {
+                if val_bytes == b"__deleted__" { continue; }
+                if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                    rows.push(doc);
+                }
+            }
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
+        }
+
+        // Check materialized views
+        let mv_prefix = format!("__mv_{}::", table.to_lowercase());
+        let mv_entries = engine.scan_prefix(mv_prefix.as_bytes()).unwrap_or_default();
+        if !mv_entries.is_empty() {
+            let mut rows = Vec::new();
+            for (_key, val_bytes) in &mv_entries {
+                if val_bytes == b"__deleted__" { continue; }
+                if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                    rows.push(doc);
+                }
+            }
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
+        }
+
+        // Regular table scan
+        let prefix = format!("{}::", table);
+        let entries = engine.scan_prefix(prefix.as_bytes())?;
+        let mut rows = Vec::new();
+        for (_key, val_bytes) in &entries {
+            if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                if doc.get("__class__").and_then(|v| v.as_str()) == Some(table) {
+                    rows.push(doc);
+                }
+            }
+        }
+
+        // Apply filter if present
+        if let Some(f) = filter {
+            rows.retain(|row| Self::eval_filter_static(row, f));
+        }
+
+        // Apply alias to column names if specified
+        if let Some(a) = alias {
+            for row in &mut rows {
+                let keys: Vec<String> = row.keys().cloned().collect();
+                for key in keys {
+                    if key != "__class__" {
+                        if let Some(val) = row.remove(&key) {
+                            row.insert(format!("{}.{}", a, key), val.clone());
+                            row.insert(key, val);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
+    /// Plan-driven index scan.
+    fn plan_index_scan(
+        &self,
+        engine: &mut LsmEngine,
+        table: &str,
+        alias: Option<&str>,
+        index_column: &str,
+        filter: &Option<FilterExpr>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        // Try to use the index for the primary lookup
+        if engine.has_index(table, index_column) {
+            if let Some(f) = filter {
+                // Use index for the filter
+                if let Some(pkeys) = Self::try_index_scan_single(engine, table, f)? {
+                    let mut rows = Self::fetch_rows_by_pks(engine, &pkeys)?;
+                    // Apply alias
+                    if let Some(a) = alias {
+                        Self::apply_alias(&mut rows, a);
+                    }
+                    return Ok(rows);
+                }
+            }
+        }
+
+        // Fallback to full scan
+        self.plan_seq_scan(engine, table, alias, filter)
+    }
+
+    /// Plan-driven index lookup (point query).
+    fn plan_index_lookup(
+        &self,
+        engine: &mut LsmEngine,
+        table: &str,
+        alias: Option<&str>,
+        index_column: &str,
+        key: &LiteralValue,
+    ) -> Result<Vec<Map<String, Value>>> {
+        if engine.has_index(table, index_column) {
+            let index_mgr = engine.index_manager();
+            let json_val = Self::literal_to_json_static(key);
+            let pkeys = index_mgr.lookup_eq(table, index_column, &json_val).unwrap_or_default();
+            let mut rows = Self::fetch_rows_by_pks(engine, &pkeys)?;
+            if let Some(a) = alias {
+                Self::apply_alias(&mut rows, a);
+            }
+            return Ok(rows);
+        }
+        Ok(Vec::new())
+    }
+
+    /// Plan-driven vector search.
+    fn plan_vector_search(
+        &self,
+        engine: &mut LsmEngine,
+        table: &str,
+        column: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        filter: &Option<FilterExpr>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        if !engine.has_vector_index(table, column) {
+            return Ok(Vec::new());
+        }
+
+        let search_results = if let Some(f) = filter {
+            let prefix = format!("{}::", table);
+            let entries = engine.scan_prefix(prefix.as_bytes())?;
+            let mut allowed_ids = std::collections::HashSet::new();
+            for (key, val_bytes) in &entries {
+                if let Ok(serde_json::Value::Object(ref doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                    if doc.get("__class__").and_then(|v| v.as_str()) == Some(table) {
+                        if Self::eval_filter_static(doc, f) {
+                            allowed_ids.insert(key.clone());
+                        }
+                    }
+                }
+            }
+            engine.vector_index_manager().search_filtered(table, column, query_vector, top_k, &allowed_ids)?
+        } else {
+            engine.vector_index_manager().search(table, column, query_vector, top_k)?
+        };
+
+        let mut rows = Vec::new();
+        for result in &search_results {
+            if let Ok(Some(val_bytes)) = engine.get(&result.entry.id) {
+                if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(&val_bytes) {
+                    doc.insert("_distance".to_string(), serde_json::json!(result.distance));
+                    rows.push(doc);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Nested loop join on pre-fetched rows.
+    fn execute_nested_loop_join(
+        left_rows: Vec<Map<String, Value>>,
+        right_rows: Vec<Map<String, Value>>,
+        join: &crate::parser::JoinClause,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let left_alias = None::<&str>;
+        let right_alias = join.alias.as_deref().unwrap_or(&join.table);
+        let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+
+        let mut result = Vec::new();
+        for left_row in &left_rows {
+            let left_val = Self::resolve_column_value(left_row, &left_col);
+            for right_row in &right_rows {
+                let right_val = Self::resolve_column_value(right_row, &right_col);
+                if left_val.is_some() && right_val.is_some() && left_val == right_val {
+                    let mut merged = Map::new();
+                    for (k, v) in left_row {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                    for (k, v) in right_row {
+                        let key = format!("{}.{}", right_alias, k);
+                        merged.insert(key, v.clone());
+                        if !merged.contains_key(k) {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                    }
+                    result.push(merged);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Hash join on pre-fetched rows.
+    fn execute_hash_join_rows(
+        left_rows: Vec<Map<String, Value>>,
+        right_rows: Vec<Map<String, Value>>,
+        join: &crate::parser::JoinClause,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let right_alias = join.alias.as_deref().unwrap_or(&join.table);
+        let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+
+        // Build hash table on right side
+        let mut hash_table: std::collections::HashMap<String, Vec<&Map<String, Value>>> =
+            std::collections::HashMap::new();
+        for right_row in &right_rows {
+            if let Some(val) = Self::resolve_column_value(right_row, &right_col) {
+                hash_table.entry(val).or_default().push(right_row);
+            }
+        }
+
+        // Probe with left rows
+        let mut result = Vec::new();
+        for left_row in &left_rows {
+            if let Some(left_val) = Self::resolve_column_value(left_row, &left_col) {
+                if let Some(matching_rights) = hash_table.get(&left_val) {
+                    for right_row in matching_rights {
+                        let mut merged = Map::new();
+                        for (k, v) in left_row {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                        for (k, v) in *right_row {
+                            let key = format!("{}.{}", right_alias, k);
+                            merged.insert(key, v.clone());
+                            if !merged.contains_key(k) {
+                                merged.insert(k.clone(), v.clone());
+                            }
+                        }
+                        result.push(merged);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Sort-merge join on pre-fetched rows.
+    fn execute_sort_merge_join_rows(
+        mut left_rows: Vec<Map<String, Value>>,
+        mut right_rows: Vec<Map<String, Value>>,
+        join: &crate::parser::JoinClause,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let right_alias = join.alias.as_deref().unwrap_or(&join.table);
+        let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+
+        // Sort both sides
+        left_rows.sort_by(|a, b| {
+            let a_val = Self::resolve_column_value(a, &left_col).unwrap_or_default();
+            let b_val = Self::resolve_column_value(b, &left_col).unwrap_or_default();
+            Self::compare_values(&a_val, &b_val)
+        });
+        right_rows.sort_by(|a, b| {
+            let a_val = Self::resolve_column_value(a, &right_col).unwrap_or_default();
+            let b_val = Self::resolve_column_value(b, &right_col).unwrap_or_default();
+            Self::compare_values(&a_val, &b_val)
+        });
+
+        // Merge
+        let mut result = Vec::new();
+        let mut li = 0;
+        let mut ri = 0;
+        while li < left_rows.len() && ri < right_rows.len() {
+            let lv = Self::resolve_column_value(&left_rows[li], &left_col).unwrap_or_default();
+            let rv = Self::resolve_column_value(&right_rows[ri], &right_col).unwrap_or_default();
+            match Self::compare_values(&lv, &rv) {
+                std::cmp::Ordering::Less => li += 1,
+                std::cmp::Ordering::Greater => ri += 1,
+                std::cmp::Ordering::Equal => {
+                    // Handle duplicate keys
+                    let ri_start = ri;
+                    while ri < right_rows.len() {
+                        let rv2 = Self::resolve_column_value(&right_rows[ri], &right_col).unwrap_or_default();
+                        if Self::compare_values(&rv2, &rv) != std::cmp::Ordering::Equal { break; }
+                        let mut li2 = li;
+                        while li2 < left_rows.len() {
+                            let lv2 = Self::resolve_column_value(&left_rows[li2], &left_col).unwrap_or_default();
+                            if Self::compare_values(&lv2, &lv) != std::cmp::Ordering::Equal { break; }
+                            let mut merged = Map::new();
+                            for (k, v) in &left_rows[li2] { merged.insert(k.clone(), v.clone()); }
+                            for (k, v) in &right_rows[ri] {
+                                let key = format!("{}.{}", right_alias, k);
+                                merged.insert(key, v.clone());
+                                if !merged.contains_key(k) { merged.insert(k.clone(), v.clone()); }
+                            }
+                            result.push(merged);
+                            li2 += 1;
+                        }
+                        ri += 1;
+                    }
+                    while li < left_rows.len() {
+                        let lv2 = Self::resolve_column_value(&left_rows[li], &left_col).unwrap_or_default();
+                        if Self::compare_values(&lv2, &lv) != std::cmp::Ordering::Equal { break; }
+                        li += 1;
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Apply alias prefix to row column names.
+    fn apply_alias(rows: &mut Vec<Map<String, Value>>, alias: &str) {
+        for row in rows {
+            let keys: Vec<String> = row.keys().cloned().collect();
+            for key in keys {
+                if key != "__class__" && !key.contains('.') {
+                    if let Some(val) = row.remove(&key) {
+                        row.insert(format!("{}.{}", alias, key), val.clone());
+                        row.insert(key, val);
+                    }
+                }
+            }
+        }
+    }
+
     /// Executes EXPLAIN: generates and returns the execution plan.
     /// If ANALYZE mode, also executes the query and measures actual time.
     fn execute_explain(&self, query: &QueryAst, engine: &mut LsmEngine) -> Result<QueryResult> {
@@ -613,10 +1069,57 @@ impl QueryExecutor {
                 limit,
                 offset,
                 ..
-            } => self.execute_select_txn(
-                engine, txn_id, *distinct, columns, from, from_alias.as_deref(), joins, filter,
-                group_by.as_ref(), having, order_by.as_ref(), *limit, *offset,
-            ),
+            } => {
+                // Phase 24: Use plan-driven execution
+                // Generate execution plan, then execute it
+                let plan = self.planner.read().unwrap().plan(ast)?;
+
+                // Execute the plan to get core result rows
+                let plan_result = self.execute_plan(&plan, engine)?;
+                let mut rows = match plan_result {
+                    QueryResult::Rows(r) => r,
+                    other => return Ok(other),
+                };
+
+                // Post-processing steps not yet in the plan:
+                // 1. Aggregation (GROUP BY + HAVING)
+                let has_aggregates = Self::columns_have_aggregates(columns);
+                if group_by.is_some() || has_aggregates {
+                    let result = self.execute_aggregation(engine, columns, &rows, group_by.as_ref(), having, order_by, *limit)?;
+                    if let QueryResult::Rows(mut agg_rows) = result {
+                        if *distinct { Self::dedup_rows(&mut agg_rows); }
+                        return Ok(QueryResult::Rows(agg_rows));
+                    }
+                    return Ok(result);
+                }
+
+                // 2. Window functions (ValueExpr expressions are handled by Projection)
+                if let SelectColumns::Columns(items) = columns {
+                    let window_exprs: Vec<&WindowExpr> = items.iter().filter_map(|item| {
+                        if let SelectItem::WindowFunction(w) = item { Some(w) } else { None }
+                    }).collect();
+                    if !window_exprs.is_empty() {
+                        Self::execute_window_functions(&mut rows, &window_exprs);
+                    }
+                }
+
+                // 4. DISTINCT
+                if *distinct { Self::dedup_rows(&mut rows); }
+
+                // 5. OFFSET then LIMIT (correct pagination order)
+                if let Some(off) = offset {
+                    if *off < rows.len() {
+                        rows = rows.split_off(*off);
+                    } else {
+                        rows.clear();
+                    }
+                }
+                if let Some(lim) = limit {
+                    rows.truncate(*lim);
+                }
+
+                Ok(QueryResult::Rows(rows))
+            }
             QueryAst::Delete { class, filter } => self.execute_delete_txn(engine, txn_id, class, filter),
             QueryAst::Update {
                 class,
@@ -712,7 +1215,7 @@ impl QueryExecutor {
         rows: &[Map<String, Value>],
         group_by: Option<&crate::parser::GroupByClause>,
         having: &Option<FilterExpr>,
-        order_by: Option<&crate::parser::OrderBy>,
+        order_by: &[crate::parser::OrderBy],
         limit: Option<usize>,
     ) -> Result<QueryResult> {
         // Group rows by GROUP BY columns (or single group if no GROUP BY)
@@ -793,8 +1296,8 @@ impl QueryExecutor {
             }
         }
 
-        // Sort if ORDER BY specified
-        if let Some(ob) = order_by {
+        // Sort if ORDER BY specified (multi-column)
+        for ob in order_by.iter().rev() {
             Self::sort_rows(&mut result_rows, &ob.column, ob.ascending);
         }
 
@@ -1276,7 +1779,8 @@ impl QueryExecutor {
         // Aggregate or normal query
         let has_aggregates = Self::columns_have_aggregates(columns);
         if group_by.is_some() || has_aggregates {
-            let mut result = self.execute_aggregation(engine, columns, &filtered, group_by, having, order_by, limit)?;
+            let ob_vec: Vec<crate::parser::OrderBy> = order_by.map(|ob| ob.clone()).into_iter().collect();
+            let mut result = self.execute_aggregation(engine, columns, &filtered, group_by, having, &ob_vec, limit)?;
             if let QueryResult::Rows(ref mut rows) = result {
                 if distinct {
                     Self::dedup_rows(rows);
@@ -1731,7 +2235,7 @@ impl QueryExecutor {
             let left_pkeys = Self::try_index_scan_single(engine, class, left)?;
             if let Some(pkeys) = left_pkeys {
                 // Index scan on left side succeeded - fetch rows and apply right filter as post-filter
-                let rows = Self::fetch_rows_by_pks(engine, txn_id, &pkeys)?;
+                let rows = Self::fetch_rows_by_pks_txn(engine, txn_id, &pkeys)?;
                 let filtered: Vec<Map<String, Value>> = rows
                     .into_iter()
                     .filter(|row| Self::eval_filter_static(row, right))
@@ -1741,7 +2245,7 @@ impl QueryExecutor {
             // Try right side
             let right_pkeys = Self::try_index_scan_single(engine, class, right)?;
             if let Some(pkeys) = right_pkeys {
-                let rows = Self::fetch_rows_by_pks(engine, txn_id, &pkeys)?;
+                let rows = Self::fetch_rows_by_pks_txn(engine, txn_id, &pkeys)?;
                 let filtered: Vec<Map<String, Value>> = rows
                     .into_iter()
                     .filter(|row| Self::eval_filter_static(row, left))
@@ -1764,7 +2268,7 @@ impl QueryExecutor {
                         all_pkeys.push(pk);
                     }
                 }
-                let rows = Self::fetch_rows_by_pks(engine, txn_id, &all_pkeys)?;
+                let rows = Self::fetch_rows_by_pks_txn(engine, txn_id, &all_pkeys)?;
                 return Ok(Some(rows));
             }
             return Ok(None);
@@ -1772,7 +2276,7 @@ impl QueryExecutor {
 
         // Single predicate - try direct index scan
         Self::try_index_scan_single(engine, class, filter)?
-            .map(|pkeys| Self::fetch_rows_by_pks(engine, txn_id, &pkeys))
+            .map(|pkeys| Self::fetch_rows_by_pks_txn(engine, txn_id, &pkeys))
             .transpose()
     }
 
@@ -1857,24 +2361,57 @@ impl QueryExecutor {
 
     /// Static filter evaluation (no engine needed for simple predicates).
     fn eval_filter_static(doc: &Map<String, Value>, filter: &FilterExpr) -> bool {
+        // Helper to resolve column value (preserving original type) with alias support
+        let resolve_val = |col: &str| -> Option<&Value> {
+            // Try exact match first
+            if let Some(v) = doc.get(col) {
+                return Some(v);
+            }
+            // Try alias-aware lookup (e.g., "o.quantity" matches "quantity")
+            for (k, v) in doc {
+                if k.ends_with(&format!(".{}", col)) || k == col {
+                    return Some(v);
+                }
+            }
+            None
+        };
         match filter {
             FilterExpr::Eq(col, val) => {
-                doc.get(col).map_or(false, |v| Self::value_matches_static(v, val))
+                resolve_val(col).map_or(false, |v| Self::value_matches_static(v, val))
             }
             FilterExpr::Ne(col, val) => {
-                !doc.get(col).map_or(false, |v| Self::value_matches_static(v, val))
+                !resolve_val(col).map_or(false, |v| Self::value_matches_static(v, val))
             }
             FilterExpr::Gt(col, val) => {
-                doc.get(col).map_or(false, |v| Self::value_gt_static(v, val))
+                resolve_val(col).map_or(false, |v| Self::value_gt_static(v, val))
             }
             FilterExpr::Lt(col, val) => {
-                doc.get(col).map_or(false, |v| Self::value_lt_static(v, val))
+                resolve_val(col).map_or(false, |v| Self::value_lt_static(v, val))
             }
             FilterExpr::Gte(col, val) => {
-                doc.get(col).map_or(false, |v| Self::value_gt_static(v, val) || Self::value_matches_static(v, val))
+                resolve_val(col).map_or(false, |v| Self::value_gte_static(v, val))
             }
             FilterExpr::Lte(col, val) => {
-                doc.get(col).map_or(false, |v| Self::value_lt_static(v, val) || Self::value_matches_static(v, val))
+                resolve_val(col).map_or(false, |v| Self::value_lte_static(v, val))
+            }
+            FilterExpr::Like(col, pattern) => {
+                resolve_val(col).map_or(false, |v| {
+                    let s = match v {
+                        Value::String(s) => s.clone(),
+                        _ => v.to_string(),
+                    };
+                    Self::like_match(&s, pattern)
+                })
+            }
+            FilterExpr::Between(col, low, high) => {
+                resolve_val(col).map_or(false, |v| {
+                    Self::value_gte_static(v, low) && Self::value_lte_static(v, high)
+                })
+            }
+            FilterExpr::In(col, values) => {
+                resolve_val(col).map_or(false, |v| {
+                    values.iter().any(|lv| Self::value_matches_static(v, lv))
+                })
             }
             FilterExpr::And(left, right) => {
                 Self::eval_filter_static(doc, left) && Self::eval_filter_static(doc, right)
@@ -1882,8 +2419,16 @@ impl QueryExecutor {
             FilterExpr::Or(left, right) => {
                 Self::eval_filter_static(doc, left) || Self::eval_filter_static(doc, right)
             }
-            _ => true, // Complex filters pass through
+            _ => true, // Complex filters (EXISTS, subqueries) pass through
         }
+    }
+
+    fn value_gte_static(v: &Value, lit: &LiteralValue) -> bool {
+        Self::value_gt_static(v, lit) || Self::value_matches_static(v, lit)
+    }
+
+    fn value_lte_static(v: &Value, lit: &LiteralValue) -> bool {
+        Self::value_lt_static(v, lit) || Self::value_matches_static(v, lit)
     }
 
     fn value_matches_static(v: &Value, lit: &LiteralValue) -> bool {
@@ -1915,8 +2460,24 @@ impl QueryExecutor {
         }
     }
 
-    /// Fetches rows by their primary keys within a transaction.
+    /// Fetches rows by their primary keys (plan-driven path, no txn).
     fn fetch_rows_by_pks(
+        engine: &mut LsmEngine,
+        pkeys: &[Vec<u8>],
+    ) -> Result<Vec<Map<String, Value>>> {
+        let mut rows = Vec::new();
+        for pk in pkeys {
+            if let Ok(Some(val_bytes)) = engine.get(pk) {
+                if let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&val_bytes) {
+                    rows.push(doc);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Fetches rows by their primary keys within a transaction.
+    fn fetch_rows_by_pks_txn(
         engine: &mut LsmEngine,
         txn_id: u64,
         pkeys: &[Vec<u8>],
@@ -2672,13 +3233,13 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
             })
         }
         PlanNode::Sort { input, order_by, estimated_rows, .. } => {
+            let ob_json: Vec<Value> = order_by.iter().map(|ob| {
+                json!({"column": ob.column, "ascending": ob.ascending})
+            }).collect();
             json!({
                 "type": "Sort",
                 "input": format_plan_node(input),
-                "order_by": {
-                    "column": order_by.column,
-                    "ascending": order_by.ascending,
-                },
+                "order_by": ob_json,
                 "rows": estimated_rows,
             })
         }
