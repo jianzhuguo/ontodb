@@ -52,13 +52,13 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - **写入路径**：WAL → MemTable →（满时）flush 到 SSTable
 - **读取路径**：MemTable → immutable MemTable → SSTables（从新到旧），tombstone 感知
 - **删除**：写入 tombstone 标记，tombstone 在读取时正确拦截旧值
-- **恢复**：启动时从 WAL 重放恢复 MemTable 状态
-- **WAL 格式**：`[length: u32][crc32: u32][payload: bytes]`，支持 CRC 校验跳过损坏条目
-- **WAL 持久化**：每次 append 后 flush 到 OS 缓存；可配置 `sync_wal_on_commit`（默认开启），事务提交时 fsync 确保 OS crash 不丢数据
-- **Leveled Compaction**：L0 全量合并 → L1+ 逐级合并，去重保留最新版本，最底层 tombstone 可清理
+- **恢复**：启动时从 WAL 重放恢复 MemTable 状态（corruption-safe，遇损坏立即停止）
+- **WAL 格式**：`[length: u32][crc32: u32][payload: bytes]`，CRC 校验 + 长度合理性检查
+- **WAL 持久化**：append 后 flush 到 OS 缓存；`sync_wal_on_commit`（默认开启）事务提交时 fsync；WAL 重置为 write-new-then-rename 原子操作
+- **Leveled Compaction**：size-based scoring 评分触发，L0 半量合并，跨层 tombstone 清理，去重保留最新版本
 - **MVCC 事务**：快照隔离，写不阻塞读，事务写缓冲 + 提交时批量刷入 WAL，所有 SQL 操作自动走事务
-- **B+Tree 二级索引（内存版）**：内存 B+Tree + LSM 持久化，支持等值/范围查询，自动回填/维护/去索引
-- **B+Tree 磁盘索引（Disk-based）**：4KB 页式存储，Slotted Page 布局，LRU Buffer Pool，支持点查找 O(log n)、范围扫描（leaf chain）、节点分裂/合并自动传播、下溢重平衡（redistribute + merge）、根节点收缩，独立 `.idx` 文件持久化
+- **B+Tree 二级索引（内存版）**：HashMap 存储 O(1) 节点访问 + parent 指针 O(1) 父节点查找，支持等值/范围查询，自动回填/维护/去索引
+- **B+Tree 磁盘索引（Disk-based）**：4KB 页式存储，Slotted Page 布局，LRU Buffer Pool（单调计数器 O(1) touch），支持点查找 O(log n)、范围扫描（leaf chain）、节点分裂/合并/重平衡，独立 `.idx` 文件持久化
 - **全局 seq_no**：引擎级序列号确保跨 MemTable flush 的版本顺序正确
 
 ### 本体引擎详情
@@ -95,14 +95,15 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 | 模块 | 评估 | 依据 |
 |------|------|------|
-| LSM-Tree 存储引擎 | **可行，已实现完整** | WAL（atomic reset + corruption-safe replay）+ MemTable（O(log n) BTreeMap range 查询）+ SSTable + Leveled Compaction（size-based scoring + smart L0 + tombstone cleanup）+ tombstone 感知读取 + WAL fsync 持久化 + prefix 重叠检测，90 个存储引擎测试 + 25 个集成测试验证 |
+| LSM-Tree 存储引擎 | **可行，已实现完整** | WAL（atomic reset + corruption-safe replay）+ MemTable（O(log n) range 查询）+ SSTable + Leveled Compaction（size-based scoring + smart L0 + tombstone cleanup）+ MVCC + prefix 重叠检测，90 个引擎测试 + 25 个集成测试验证 |
 | MVCC 事务 | **可行，已实现** | 快照隔离、事务写缓冲、提交/回滚、可见性过滤，已集成到查询层 |
-| B+Tree 磁盘索引 | **可行，已实现** | 4KB 页式存储、Slotted Page、LRU Buffer Pool、节点分裂/合并、下溢重平衡（redistribute + merge）、根节点收缩、leaf chain 范围扫描，26 个专项测试验证（含500条目分裂、2000条目大数据集、持久化重开、1000条目级联下溢合并、交错插入删除） |
+| B+Tree 内存索引 | **可行，已实现** | HashMap O(1) 节点访问 + parent 指针 O(1) 查找，insert/delete/merge/rebalance 全部实现，28 个专项测试验证 |
+| B+Tree 磁盘索引 | **可行，已实现** | 4KB 页式存储、Slotted Page、LRU Buffer Pool（O(1) touch）、节点分裂/合并/重平衡、leaf chain 范围扫描，21 个专项测试验证 |
 | Raft 共识 | **可行** | `tikv/raft-rs` 是工业级 Rust Raft 实现 |
 | 本体模型 | **可行，已实现基础** | 类/属性/继承/约束模型已通 |
 | SQL 解析 | **可行，已实现基础** | 8 种语句（含 JOIN/UNION/子查询）已通 |
 | 序列化 | **可行** | serde + serde_json + bincode 生态成熟 |
-| CRC 数据校验 | **可行，已实现** | WAL 条目 CRC32 校验已通 |
+| CRC 数据校验 | **可行，已实现** | WAL 条目 CRC32 校验 + 损坏停止重放已通 |
 
 ### 3.2 需要攻克的技术挑战
 
@@ -112,9 +113,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | **语义查询优化** | 高 | SPARQL 查询下推到多模存储层，本体推理在查询计划阶段完成，利用本体约束做查询剪枝 |
 | **语义向量检索** | 中 | HNSW 向量索引 + 本体过滤联合查询，先用本体约束缩小候选集再做向量排序 |
 | **推理性能** | 中高 | 预计算推理结果（物化视图）+ 增量推理 + 分级推理（快速规则推理内联，完整 DL 推理异步） |
-| **Compaction 策略** | 低 | **已完成** Leveled Compaction 实现，含合并去重和 tombstone 清理 |
-| **B+Tree 磁盘索引** | 低 | **已完成** 页式 B+Tree 实现，含 insert/lookup/range_scan/split/delete/merge/rebalance/persistence |
-| **Bloom Filter** | 低 | 当前框架已预留配置，实现相对直接 |
+| **Bloom Filter 集成** | 低 | 框架已预留配置和基础实现，需集成到 SSTable 读取路径 |
 
 ### 3.3 应该砍掉或延后的方向
 
@@ -129,13 +128,89 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 ---
 
-## 四、跨平台分析：Windows 开发 → Linux 生产
+## 四、性能优化汇总（v1.4 → v1.8）
 
-### 4.1 核心结论
+本节汇总 v1.4 至 v1.8 的全部性能优化和 bug 修复，涵盖 10 个 commit。
+
+### 4.1 优化总览
+
+| 优化项 | 优化前 | 优化后 | 性能提升 | 版本 |
+|--------|--------|--------|----------|------|
+| MemTable::get() | O(n) 线性遍历全表 | O(log n) BTreeMap range 查询 | **10-100x** | v1.5 |
+| MemTable::get_with_visibility() | O(n) 线性遍历 | O(log n) range + 版本过滤 | **10-100x** | v1.5 |
+| prefix_may_overlap() | 逻辑错误，扫描无关 SSTable | 正确的前缀范围检测 | **消除无效 I/O** | v1.5 |
+| BufferPool::touch() | O(n) Vec retain + insert(0,..) | O(1) HashMap + 单调计数器 | **256x**（capacity=256） | v1.6 |
+| BufferPool::flush() | 遍历 LRU Vec 查找 dirty 页 | 直接遍历 HashMap | **简化** | v1.6 |
+| B+Tree get_node/get_node_mut() | O(n) Vec 线性扫描 | O(1) HashMap 查找 | **10-100x** | v1.6 |
+| B+Tree find_parent() | O(n) 树遍历（DFS） | O(1) parent 指针直接读取 | **O(n)→O(1)** | v1.6 |
+| B+Tree 节点删除 | O(n) nodes.retain() | O(1) HashMap::remove() | **O(n)→O(1)** | v1.6 |
+| Compaction 触发 | 按数量（len > 10） | 按大小评分（size/target > 1.0） | **更精准** | v1.7 |
+| L0 Compaction | 全量合并所有 L0 SSTable | 半量合并（最老的一半） | **减少写放大** | v1.7 |
+| Tombstone 清理 | 仅最底层可清理 | 跨层检查，key 不存在即清理 | **减少空间浪费** | v1.7 |
+| WAL reset | 非原子 remove + open | 原子 write-new-then-rename | **消除数据丢失窗口** | v1.8 |
+| WAL replay | CRC 失败后继续解析 | 遇损坏立即停止 | **防止级联错位** | v1.8 |
+
+### 4.2 关键路径性能影响分析
+
+**读取路径（point lookup）优化链：**
+```
+get(key) → MemTable::get() → [immutable MemTable::get()] → SSTable 查找
+```
+- MemTable::get(): O(n) → O(log n) — **每次读操作的热路径**
+- get_with_visibility(): O(n) → O(log n) — **MVCC 事务读的热路径**
+- prefix_may_overlap(): 修复逻辑错误 — **prefix scan 的过滤路径**
+
+**写入路径优化链：**
+```
+put(key, value) → WAL append → MemTable put → [flush → compaction]
+```
+- Compaction 触发: 数量 → 大小评分 — **更精准的触发时机**
+- L0 Compaction: 全量 → 半量 — **减少写放大**
+- Tombstone 跨层清理 — **减少空间放大**
+
+**索引路径优化链：**
+```
+insert/delete → B+Tree 递归 → [split/merge/rebalance]
+```
+- get_node: O(n) → O(1) — **每次树操作的热路径**
+- find_parent: O(n) → O(1) — **每次 underflow 的热路径**
+- 节点删除: O(n) → O(1) — **每次 merge 操作**
+
+**Buffer Pool 路径优化链：**
+```
+BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
+```
+- touch(): O(n) → O(1) — **每次磁盘页访问的热路径**
+
+### 4.3 Bug 修复汇总
+
+| Bug | 影响 | 修复 | 版本 |
+|-----|------|------|------|
+| B+Tree redistribute_leaf_from_left 分隔键错误 | 范围扫描返回错误结果 | 使用移动后的首键作为分隔键 | v1.4 |
+| prefix_may_overlap 逻辑错误 | 扫描无关 SSTable，浪费 I/O | 修正为 `prefix <= max && (min.starts_with(prefix) \|\| min < prefix)` | v1.5 |
+| MemTable::get() 误匹配前缀键 | `key\x00` 被 `key` 查询命中 | 使用 inclusive range + 精确键匹配 | v1.5 |
+| WAL reset 非原子 | flush 期间 crash 丢失 WAL | write-new-then-rename 原子操作 | v1.8 |
+| WAL replay 损坏后继续 | 长度字段损坏导致全部条目错位 | CRC/长度异常立即停止 | v1.8 |
+
+### 4.4 编译警告清理
+
+| 文件 | 清理内容 | 版本 |
+|------|----------|------|
+| `index/manager.rs` | 移除未使用的 `onto_core::Result`、`serde::{Deserialize, Serialize}` | v1.6 |
+| `mvcc/manager.rs` | 移除未使用的 `Value` | v1.6 |
+| `index/disk.rs` | `entry_offset` → `_entry_offset` | v1.6 |
+
+**最终状态：onto-storage crate 编译 0 个警告。**
+
+---
+
+## 五、跨平台分析：Windows 开发 → Linux 生产
+
+### 5.1 核心结论
 
 **Windows 开发 → Linux 生产的跨平台风险很低。** Rust 语言天然跨平台，当前代码全部使用标准库 API，无任何平台特有调用。但需要在开发流程中做好规范，避免后期踩坑。
 
-### 4.2 当前代码跨平台兼容性
+### 5.2 当前代码跨平台兼容性
 
 全部使用 Rust 标准库，无平台特有 API：
 - 文件操作：`std::fs`（跨平台）
@@ -144,7 +219,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - 文件同步：`sync_all()`（跨平台，Linux 映射到 `fsync`）
 - 并发原语：`std::sync::atomic`（跨平台）
 
-### 4.3 需关注的平台差异点
+### 5.3 需关注的平台差异点
 
 | 差异点 | Windows 行为 | Linux 行为 | 影响 | 应对措施 |
 |--------|-------------|------------|------|---------|
@@ -156,7 +231,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | 行尾符 | CRLF | LF | 源码和 WAL 二进制格式需一致 | `.gitattributes` 已配置 `* text=auto`，WAL 为 binary 格式不受影响 |
 | 默认栈大小 | 1 MB | 8 MB | 递归深度查询可能在 Windows 上先爆栈 | 深递归改为迭代，或测试时调整栈大小 |
 
-### 4.4 Windows 开发环境注意事项
+### 5.4 Windows 开发环境注意事项
 
 | 事项 | 说明 | 建议 |
 |------|------|------|
@@ -167,7 +242,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | WSL2 | 可用于模拟 Linux 环境 | 适合快速验证 Linux 行为，但 I/O 性能有折扣，不适合性能测试 |
 | 依赖编译 | 部分 crate 可能需要 C 编译器 | Windows 上安装 `Visual Studio Build Tools`，Linux 上用 `gcc` |
 
-### 4.5 后续可能的 Linux 专属优化
+### 5.5 后续可能的 Linux 专属优化
 
 | 优化 | 说明 | 建议时机 |
 |------|------|---------|
@@ -177,7 +252,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | NUMA 感知内存分配 | `jemalloc` + NUMA 绑定 | 高并发场景 |
 | `O_DIRECT` | 绕过页缓存直接 IO | WAL 写入场景，减少双缓冲 |
 
-### 4.6 建议的开发流程
+### 5.6 建议的开发流程
 
 1. **开发环境**：Windows + Rust 工具链（当前状态）
 2. **CI/CD**：GitHub Actions 同时构建 Windows + Linux（`ubuntu-latest`）
@@ -188,9 +263,9 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 ---
 
-## 五、100% 自研策略评估
+## 六、100% 自研策略评估
 
-### 5.1 "100% 自研"的定义与边界
+### 6.1 "100% 自研"的定义与边界
 
 **"100% 自研"指的是：核心数据库引擎的所有关键路径完全自主实现，不依赖任何外部数据库引擎或存储引擎作为底层。**
 
@@ -208,14 +283,14 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | **Raft 共识** | 建议复用 `tikv/raft-rs` | 工业级实现，自行实现无额外收益 |
 | **压缩/加密** | 复用成熟库 | zstd、ring 等，工具性依赖 |
 
-### 5.2 为什么必须 100% 自研核心引擎
+### 6.2 为什么必须 100% 自研核心引擎
 
 1. **语义下沉需要深度定制**：OntoDB 的核心价值是将本体语义下沉到存储层——每条数据写入时关联本体类型，查询时利用本体约束做剪枝。这种深度集成无法在外部存储引擎之上实现。
 2. **避免"套壳"质疑**：如果核心存储依赖 RocksDB 或其他引擎，产品定位将从"自研数据库"降级为"基于 RocksDB 的应用层"，在国产数据库赛道中毫无竞争力。
 3. **性能优化空间**：自研引擎可以针对本体查询模式做极致优化（如本体感知的 Compaction 策略、语义感知的缓存淘汰），外部依赖会锁死优化空间。
 4. **许可证安全**：100% 自研确保无任何 GPL/AGPL 传染风险，企业客户可放心使用。
 
-### 5.3 自研范围界定
+### 6.3 自研范围界定
 
 | 组件 | 自研 vs 复用 | 理由 |
 |------|-------------|------|
@@ -230,7 +305,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | 网络协议 | **建议复用** | gRPC（tonic）或自定义协议基于现有框架 |
 | 压缩算法 | **复用** | zstd 等成熟库 |
 
-### 5.4 自研的风险与收益
+### 6.4 自研的风险与收益
 
 **收益**：
 - 完全掌控代码，深度优化本体语义路径
@@ -243,7 +318,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - 需要高水平 Rust 系统工程师（市场上稀缺）
 - 需要持续的工程投入，不能半途而废
 
-### 5.5 平衡建议
+### 6.5 平衡建议
 
 **核心路径 100% 自研**（存储引擎 + 本体引擎 + 语义查询 + 事务引擎 + 向量索引），
 **基础设施选择性复用**（Raft 共识、网络框架、序列化、压缩算法）。
@@ -252,7 +327,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 ---
 
-## 六、实施路线图
+## 七、实施路线图
 
 ### 第一阶段：本体筑基（0-6 个月）
 
@@ -283,7 +358,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 ---
 
-## 七、团队与预算
+## 八、团队与预算
 
 ### 核心团队需求
 
@@ -310,7 +385,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 ---
 
-## 八、风险矩阵
+## 九、风险矩阵
 
 | 风险 | 概率 | 影响 | 缓解措施 |
 |------|------|------|---------|
@@ -322,9 +397,9 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 ---
 
-## 九、开源策略与 Go-to-Market
+## 十、开源策略与 Go-to-Market
 
-### 9.1 开源策略
+### 10.1 开源策略
 
 | 方案 | 优点 | 缺点 | 推荐度 |
 |------|------|------|--------|
@@ -334,7 +409,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 **推荐方案**：核心引擎开源（Apache 2.0），企业功能（集群管理、安全审计、SLA 保障）闭源。参考 TiDB、CockroachDB 模式。
 
-### 9.2 Go-to-Market 路径
+### 10.2 Go-to-Market 路径
 
 | 阶段 | 时间 | 动作 |
 |------|------|------|
@@ -343,7 +418,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | 开发者生态 | 12-18 个月 | 举办黑客松、发布教程、建立社区 |
 | 商业化 | 18 个月+ | 推出企业版，开始收费 |
 
-### 9.3 首批标杆客户方向
+### 10.3 首批标杆客户方向
 
 | 行业 | 场景 | 为什么适合 OntoDB |
 |------|------|-------------------|
@@ -351,7 +426,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 | **金融** | 风控知识图谱 + 反欺诈 | 关系复杂、实时性要求高，本体建模需求强 |
 | **法律** | 法规语义检索 + 案例推理 | 大量中文非结构化数据，语义理解是刚需 |
 
-### 9.4 专利布局建议
+### 10.4 专利布局建议
 
 优先申请的专利方向：
 - 本体约束下的向量检索方法
@@ -361,38 +436,45 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 ---
 
-## 十、代码质量与测试覆盖
+## 十一、代码质量与测试覆盖
 
-### 10.1 测试统计
+### 11.1 测试统计
 
 | 测试类型 | 数量 | 覆盖范围 |
 |----------|------|----------|
-| 存储引擎单元测试 | 90 | WAL（atomic reset + corruption-safe replay）、MemTable（O(log n) 查询）、SSTable、Compaction（size-based scoring）、MVCC、B+Tree（HashMap + parent pointers）、索引、prefix 重叠检测 |
+| 存储引擎单元测试 | 90 | WAL（atomic reset + corruption-safe replay）、MemTable（O(log n) 查询）、SSTable、Compaction（size-based scoring）、MVCC、B+Tree（HashMap + parent pointers）、BufferPool（O(1) LRU）、索引、prefix 重叠检测 |
 | 查询引擎单元测试 | 54 | SQL 解析、执行、JOIN、GROUP BY、ORDER BY、聚合、索引加速 |
 | 查询-存储集成测试 | 25 | 跨组件场景：flush 后查询、compaction、恢复、多类隔离、事务 |
 | 本体引擎测试 | 7 | 本体模型、解析、存储 |
 | 端到端测试 | 3 | TCP 客户端-服务器完整生命周期 |
 | **总计** | **189** | **全部通过，0 个警告** |
 
-### 10.2 代码质量改进（v1.3 - v1.6）
+### 11.2 代码质量改进（v1.3 → v1.8）
 
-| 改进项 | 说明 |
-|--------|------|
-| 生产代码 unwrap 消除 | RwLock、解析器关键路径改用 `map_err` + `?` 返回错误 |
-| 死代码清理 | 移除 5 个未使用的 executor 方法、未使用的 IndexMeta、未使用的 tokio 依赖 |
-| 编译警告清零 | 从 16 个警告降至 0 个（含 v1.6 清理 manager.rs/mvcc/disk.rs 最后 4 个警告） |
-| 文档键唯一性 | 使用 AtomicU64 计数器 + 时间戳组合，消除碰撞风险 |
-| MemTable 查询优化（v1.5） | `get()` 从 O(n) 线性扫描改为 O(log n) BTreeMap range 查询 |
-| prefix_may_overlap 修复（v1.5） | 修复前缀重叠检测逻辑错误，消除无效 SSTable 扫描 |
-| BufferPool LRU 优化（v1.6） | `touch()` 从 O(n) Vec retain+insert 改为 O(1) HashMap + 单调计数器 |
-| B+Tree 重构（v1.6） | `nodes` 从 Vec 改为 HashMap O(1) 查找，添加 parent 指针消除 find_parent O(n) 遍历 |
-| Compaction 调度优化（v1.7） | 数量触发改为 size-based scoring 评分机制，L0 半量合并减少写放大，tombstone 跨层清理 |
-| WAL 原子性 + 损坏安全重放（v1.8） | reset_wal 改为 write-new-then-rename 原子操作；replay_wal 遇 CRC/长度异常立即停止，防止级联错位 |
-| MVCC 可见性修复 | 重启后 seq_counter 正确同步 SSTable 最大序列号 |
-| ORDER BY 修复 | 排序移到列投影之前，确保 ORDER BY 列可用 |
-| AND/OR 解析修复 | WHERE 子句支持递归 AND/OR 组合条件 |
+| 版本 | 改进项 | 说明 |
+|------|--------|------|
+| v1.3 | 生产代码 unwrap 消除 | RwLock、解析器关键路径改用 `map_err` + `?` 返回错误 |
+| v1.3 | 死代码清理 | 移除 5 个未使用的 executor 方法、未使用的 IndexMeta、未使用的 tokio 依赖 |
+| v1.3 | 编译警告清零 | 从 16 个警告降至 0 个 |
+| v1.3 | 文档键唯一性 | 使用 AtomicU64 计数器 + 时间戳组合，消除碰撞风险 |
+| v1.3 | MVCC 可见性修复 | 重启后 seq_counter 正确同步 SSTable 最大序列号 |
+| v1.3 | ORDER BY 修复 | 排序移到列投影之前，确保 ORDER BY 列可用 |
+| v1.3 | AND/OR 解析修复 | WHERE 子句支持递归 AND/OR 组合条件 |
+| v1.4 | B+Tree remove separator 修复 | redistribute_leaf_from_left 分隔键使用移动后的首键 |
+| v1.5 | MemTable 查询优化 | `get()` 从 O(n) 线性扫描改为 O(log n) BTreeMap range 查询 |
+| v1.5 | prefix_may_overlap 修复 | 修正前缀重叠检测逻辑，消除无效 SSTable 扫描 |
+| v1.5 | MemTable 前缀键边界 | 修复 `key\x00` 被 `key` 查询误匹配的问题 |
+| v1.6 | BufferPool LRU 优化 | `touch()` 从 O(n) Vec 改为 O(1) HashMap + 单调计数器 |
+| v1.6 | 编译警告清理 | 清理 manager.rs/mvcc/disk.rs 最后 4 个警告 |
+| v1.6 | B+Tree HashMap 重构 | `nodes` 从 Vec 改为 HashMap，O(1) 节点访问 |
+| v1.6 | B+Tree parent 指针 | 消除 find_parent O(n) 树遍历，O(1) 父节点查找 |
+| v1.7 | Compaction size-based scoring | 数量触发改为大小评分，更精准的触发时机 |
+| v1.7 | L0 半量合并 | 减少写放大和延迟尖峰 |
+| v1.7 | Tombstone 跨层清理 | 减少空间浪费 |
+| v1.8 | WAL 原子重置 | write-new-then-rename 消除数据丢失窗口 |
+| v1.8 | WAL 损坏安全重放 | CRC/长度异常立即停止，防止级联错位 |
 
-### 10.3 持久化保障
+### 11.3 持久化保障
 
 | 保障级别 | 配置 | 说明 |
 |----------|------|------|
@@ -403,7 +485,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 
 ---
 
-## 十一、结论与建议
+## 十二、结论与建议
 
 ### 核心结论
 
@@ -412,7 +494,24 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 3. **100% 自研核心引擎是正确策略**：存储引擎、本体引擎、查询引擎、事务引擎必须自主掌控，基础设施（Raft、序列化、压缩）选择性复用
 4. **跨平台无实质风险**：当前 Rust 代码天然跨平台，Windows 开发 → Linux 生产完全可行，CI 双平台构建是最低成本保障
 5. **范围是最大风险**：必须砍掉 80% 的外围功能，聚焦核心
-6. **代码质量持续提升**：189 个测试全部通过，0 个编译警告，生产代码错误处理规范化，WAL 持久化保障已完善
+6. **代码质量持续提升**：189 个测试全部通过，0 个编译警告，核心热路径已全面优化至 O(1)/O(log n)，WAL 持久化保障已完善
+
+### 性能基线（v1.8）
+
+| 组件 | 关键操作 | 复杂度 | 说明 |
+|------|----------|--------|------|
+| MemTable | get / get_versions | O(log n) | BTreeMap range 查询 |
+| MemTable | put / delete | O(log n) | BTreeMap insert |
+| BufferPool | touch (page access) | O(1) | HashMap + 单调计数器 |
+| BufferPool | evict | O(n) | HashMap min_by_key（n=256，可接受） |
+| B+Tree 内存版 | get_node / get_node_mut | O(1) | HashMap 查找 |
+| B+Tree 内存版 | find_parent | O(1) | parent 指针 |
+| B+Tree 内存版 | insert / delete | O(log n) | 树高 = log(n/MAX_KEYS) |
+| B+Tree 磁盘版 | lookup / range_scan | O(log n) | 页式树遍历 |
+| Compaction | 触发判断 | O(L) | L = level 数量（7），评分计算 |
+| Compaction | tombstone 清理 | O(L * S) | L 层 * S 个 SSTable 范围检查 |
+| WAL | append | O(1) | BufWriter 顺序写入 |
+| WAL | replay | O(n) | 顺序读取，遇损坏停止 |
 
 ### 行动建议
 
