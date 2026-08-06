@@ -506,7 +506,77 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 
 ---
 
-## 十二、结论与建议
+## 十二、HTTP API 与生产化（Phase 12-14）
+
+### 12.1 Phase 12：RESTful HTTP API
+
+基于 axum 框架实现完整的 HTTP API 层：
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/health` | GET | 健康检查 |
+| `/api/query` | POST | SQL/OntoDB 查询执行 |
+| `/api/vector/search` | POST | 向量相似度搜索 |
+| `/api/hybrid/query` | POST | SQL + 向量混合查询 |
+| `/api/schema` | GET | Schema 内省 |
+
+**设计特点**：
+- 统一的 JSON 响应格式，包含 `success`、`data`、`error`、`elapsed_ms`
+- 支持所有查询类型（SELECT/INSERT/UPDATE/DELETE/MATCH/VECTOR SEARCH）
+- 向量搜索支持 SQL WHERE 过滤的混合查询
+
+### 12.2 Phase 13：认证与限流
+
+**API Key 认证**：
+- 支持三种密钥传递方式：`Authorization: Bearer`、`X-API-Key`、查询参数
+- 三级权限：`ReadOnly`（查询）、`ReadWrite`（读写）、`Admin`（含 Schema 修改）
+- JSON 配置文件管理 API Key
+
+**令牌桶限流**：
+- 基于令牌桶算法的 per-key 限流
+- 可配置的每分钟请求数（RPM）和突发大小
+- 响应头：`X-RateLimit-Limit`、`X-RateLimit-Remaining`、`X-RateLimit-Reset`
+- 支持 per-key 自定义限流配置
+
+### 12.3 Phase 14：健康检查与监控
+
+**健康检查端点**：
+| 端点 | 用途 |
+|------|------|
+| `/api/health` | 组件级健康检查（存储/查询引擎状态） |
+| `/api/health/ready` | Kubernetes Readiness Probe |
+| `/api/health/live` | Kubernetes Liveness Probe |
+
+**Prometheus 指标**：
+| 指标 | 类型 | 说明 |
+|------|------|------|
+| `ontodb_queries_total` | counter | 查询总数 |
+| `ontodb_queries_by_type` | counter | 按类型分类的查询数 |
+| `ontodb_query_duration_seconds` | histogram | 查询延迟分布 |
+| `ontodb_vector_search_duration_seconds` | histogram | 向量搜索延迟 |
+| `ontodb_http_connections_active` | gauge | 活跃 HTTP 连接 |
+| `ontodb_auth_attempts_total` | counter | 认证尝试 |
+| `ontodb_rate_limited_total` | counter | 被限流的请求 |
+| `ontodb_storage_entries` | gauge | 存储条目数 |
+
+### 12.4 服务器启动模式
+
+```bash
+# 交互式 REPL
+ontodb-server --interactive
+
+# TCP 服务器
+ontodb-server --listen 127.0.0.1:6500
+
+# HTTP API 服务器（带认证和限流）
+ontodb-server --http 127.0.0.1:8080 \
+  --auth --api-keys-file config/api_keys.json \
+  --rate-limit 120 --burst-size 20
+```
+
+---
+
+## 十三、结论与建议
 
 ### 核心结论
 
