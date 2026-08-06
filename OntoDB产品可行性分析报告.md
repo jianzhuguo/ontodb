@@ -576,7 +576,79 @@ ontodb-server --http 127.0.0.1:8080 \
 
 ---
 
-## 十三、结论与建议
+## 十三、查询优化器（Phase 15）
+
+### 13.1 查询计划器
+
+实现了基于代价的查询优化器，将 AST 转换为物理执行计划树：
+
+| 计划节点 | 说明 |
+|----------|------|
+| `SeqScan` | 全表顺序扫描 |
+| `IndexScan` | 索引范围扫描 |
+| `IndexLookup` | 索引点查找 |
+| `VectorSearch` | 向量相似度搜索 |
+| `Filter` | WHERE 条件过滤 |
+| `Projection` | 列投影 |
+| `NestedLoopJoin` | 嵌套循环连接 |
+| `HashJoin` | 哈希连接 |
+| `Sort` | 排序 |
+| `Aggregation` | 聚合（GROUP BY） |
+| `Limit` | 行数限制 |
+| `Union` | 合并查询 |
+
+### 13.2 代价模型
+
+基于统计信息的代价估算：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `seq_scan_cpu_per_row` | 0.01 | 顺序扫描每行 CPU 代价 |
+| `index_lookup_io` | 1.0 | 索引查找 I/O 代价 |
+| `page_read_io` | 1.0 | 页面读取 I/O 代价 |
+| `eq_selectivity` | 0.1 | 等值查询选择率 |
+| `range_selectivity` | 0.333 | 范围查询选择率 |
+
+**表统计信息**：
+- `row_count`：行数估算
+- `avg_row_size`：平均行大小
+- `block_count`：数据块数
+- `secondary_indexes`：二级索引信息（基数、是否排序）
+- `vector_indexes`：向量索引信息（维度、层数）
+
+### 13.3 索引选择策略
+
+查询优化器自动选择最优索引：
+
+1. **等值查询**：检查是否有匹配的二级索引，使用 `1/cardinality` 估算选择率
+2. **范围查询**：检查列是否有索引，使用 `1/3` 默认选择率
+3. **复合条件**：AND 条件选择率相乘，OR 条件使用并集公式
+4. **向量搜索**：基于 HNSW 图层数估算搜索代价
+
+### 13.4 执行计划示例
+
+```
+Projection (rows: 10)
+  Limit 10 (rows: 10)
+    Filter (rows: 100)
+      IndexScan on Product using price (rows: 333)
+
+Total Cost: 12.45 | Rows: 10 | Index: true | Sorted: true
+```
+
+### 13.5 后续优化方向
+
+| 方向 | 说明 |
+|------|------|
+| 统计信息收集 | 运行时自动收集表统计信息 |
+| 代价模型调优 | 基于实际执行反馈调整代价参数 |
+| 更多连接策略 | Sort-Merge Join、Broadcast Join |
+| 子查询优化 | 子查询展开、物化 |
+| 本体推理下推 | 利用本体约束做查询剪枝 |
+
+---
+
+## 十四、结论与建议
 
 ### 核心结论
 
