@@ -17,11 +17,11 @@ use onto_ontology::OntologyStore;
 use onto_query::{QueryExecutor, QueryParser};
 use onto_storage::{LsmEngine, StorageOptions};
 use rate_limit::{RateLimitConfig, RateLimiter};
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::thread;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 
 #[derive(Parser, Debug)]
 #[command(name = "ontodb-server", about = "OntoDB - Ontology-driven semantic database")]
@@ -87,26 +87,33 @@ fn main() -> Result<()> {
 
     if args.interactive {
         run_repl(&executor)?;
-    } else if let Some(http_addr) = args.http {
-        // Load auth configuration
-        let auth_config = if args.auth {
-            load_auth_config(args.api_keys_file.as_deref())?
-        } else {
-            AuthConfig::default()
-        };
-
-        // Create rate limit config
-        let rate_limit_config = RateLimitConfig {
-            default_rpm: args.rate_limit,
-            enabled: !args.no_rate_limit,
-            burst_size: args.burst_size,
-        };
-
-        // Run HTTP API server
-        run_http_server(&http_addr, executor, auth_config, rate_limit_config)?;
     } else {
-        // Start TCP server (default)
-        run_tcp_server(&args.listen, executor)?;
+        let metrics = Arc::new(metrics::Metrics::new());
+
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| onto_core::CoreError::Custom(format!("Failed to create tokio runtime: {}", e)))?;
+
+        if let Some(http_addr) = args.http {
+            // Load auth configuration
+            let auth_config = if args.auth {
+                load_auth_config(args.api_keys_file.as_deref())?
+            } else {
+                AuthConfig::default()
+            };
+
+            // Create rate limit config
+            let rate_limit_config = RateLimitConfig {
+                default_rpm: args.rate_limit,
+                enabled: !args.no_rate_limit,
+                burst_size: args.burst_size,
+            };
+
+            // Run HTTP API server
+            rt.block_on(run_http_server(&http_addr, executor, auth_config, rate_limit_config, metrics))?;
+        } else {
+            // Start TCP server (default)
+            rt.block_on(run_tcp_server(&args.listen, executor, metrics))?;
+        }
     }
 
     println!("Goodbye.");
@@ -134,13 +141,13 @@ fn load_auth_config(file_path: Option<&std::path::Path>) -> Result<AuthConfig> {
 }
 
 /// Runs the HTTP API server using axum with authentication and rate limiting.
-fn run_http_server(
+async fn run_http_server(
     addr: &str,
     executor: Arc<QueryExecutor>,
     auth_config: AuthConfig,
     rate_limit_config: RateLimitConfig,
+    metrics: Arc<metrics::Metrics>,
 ) -> Result<()> {
-    let metrics = Arc::new(metrics::Metrics::new());
     let state = http::AppState { executor, metrics };
     let auth_state = AuthState::new(&auth_config);
     let rate_limiter = RateLimiter::new(rate_limit_config.clone());
@@ -180,46 +187,40 @@ fn run_http_server(
         println!("Rate limiting: DISABLED");
     }
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| onto_core::CoreError::Custom(format!("Failed to create tokio runtime: {}", e)))?;
-
-    rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind(addr).await
-            .map_err(|e| onto_core::CoreError::Io(e))?;
-        axum::serve(listener, app).await
-            .map_err(|e| onto_core::CoreError::Custom(format!("HTTP server error: {}", e)))?;
-        Ok(())
-    })
+    let listener = tokio::net::TcpListener::bind(addr).await
+        .map_err(|e| onto_core::CoreError::Io(e))?;
+    axum::serve(listener, app).await
+        .map_err(|e| onto_core::CoreError::Custom(format!("HTTP server error: {}", e)))?;
+    Ok(())
 }
 
-/// Runs the TCP server, accepting client connections.
-fn run_tcp_server(addr: &str, executor: Arc<QueryExecutor>) -> Result<()> {
-    let listener = TcpListener::bind(addr)
+/// Runs the async TCP server, accepting client connections.
+async fn run_tcp_server(addr: &str, executor: Arc<QueryExecutor>, metrics: Arc<metrics::Metrics>) -> Result<()> {
+    let listener = TcpListener::bind(addr).await
         .map_err(|e| onto_core::CoreError::Io(e))?;
 
     println!("Listening on {}", addr);
     println!("Connect with: ontodb-cli {}", addr);
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let executor = Arc::clone(&executor);
-                thread::spawn(move || {
-                    if let Err(e) = handle_client(stream, &executor) {
-                        eprintln!("Client error: {}", e);
-                    }
-                });
-            }
-            Err(e) => {
-                eprintln!("Connection error: {}", e);
-            }
-        }
-    }
+    loop {
+        let (stream, _peer_addr) = listener.accept().await
+            .map_err(|e| onto_core::CoreError::Io(e))?;
 
-    Ok(())
+        let executor = Arc::clone(&executor);
+        let metrics = Arc::clone(&metrics);
+        metrics.tcp_connections_total.inc();
+        metrics.tcp_connections_active.inc();
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_client(stream, &executor, &metrics).await {
+                eprintln!("Client error: {}", e);
+            }
+            metrics.tcp_connections_active.dec();
+        });
+    }
 }
 
-/// Handles a single client connection.
+/// Handles a single client connection asynchronously.
 ///
 /// Protocol:
 /// - Client sends SQL queries, one per line (terminated by `\n`)
@@ -227,20 +228,30 @@ fn run_tcp_server(addr: &str, executor: Arc<QueryExecutor>) -> Result<()> {
 /// - Result is terminated by a null byte (`\0`) as end-of-message marker
 /// - Errors are prefixed with `ERR: `
 /// - Client sends `quit` or `exit` to disconnect
-fn handle_client(stream: TcpStream, executor: &QueryExecutor) -> Result<()> {
+async fn handle_client(
+    stream: tokio::net::TcpStream,
+    executor: &QueryExecutor,
+    metrics: &metrics::Metrics,
+) -> Result<()> {
     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     println!("Client connected: {}", peer);
 
-    let reader = BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
 
-    for line in reader.lines() {
-        let line = line.map_err(|e| onto_core::CoreError::Io(e))?;
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await
+            .map_err(|e| onto_core::CoreError::Io(e))?;
+        if n == 0 {
+            break;
+        }
+
         let input = line.trim();
 
         if input.is_empty() {
-            // Send empty response
-            writer.write_all(&[0])?;
+            writer.write_all(&[0]).await?;
             continue;
         }
 
@@ -252,18 +263,40 @@ fn handle_client(stream: TcpStream, executor: &QueryExecutor) -> Result<()> {
         let input = input.trim_end_matches(';').trim();
 
         // Execute query
+        let start = std::time::Instant::now();
         let response = match QueryParser::parse(input) {
-            Ok(ast) => match executor.execute(&ast) {
-                Ok(result) => result.format(),
-                Err(e) => format!("ERR: {}", e),
-            },
-            Err(e) => format!("ERR: Parse error: {}", e),
+            Ok(ast) => {
+                let query_type = match &ast {
+                    onto_query::QueryAst::Select { .. } => "SELECT",
+                    onto_query::QueryAst::Insert { .. } => "INSERT",
+                    onto_query::QueryAst::Update { .. } => "UPDATE",
+                    onto_query::QueryAst::Delete { .. } => "DELETE",
+                    onto_query::QueryAst::VectorSearch { .. } => "VECTOR_SEARCH",
+                    _ => "OTHER",
+                };
+                match executor.execute(&ast) {
+                    Ok(result) => {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        metrics.record_query(query_type, elapsed, true);
+                        result.format()
+                    }
+                    Err(e) => {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        metrics.record_query(query_type, elapsed, false);
+                        format!("ERR: {}", e)
+                    }
+                }
+            }
+            Err(e) => {
+                metrics.record_parse_error();
+                format!("ERR: Parse error: {}", e)
+            }
         };
 
         // Send response + null terminator
-        writer.write_all(response.as_bytes())?;
-        writer.write_all(&[0])?;
-        writer.flush()?;
+        writer.write_all(response.as_bytes()).await?;
+        writer.write_all(&[0]).await?;
+        writer.flush().await?;
     }
 
     println!("Client disconnected: {}", peer);
