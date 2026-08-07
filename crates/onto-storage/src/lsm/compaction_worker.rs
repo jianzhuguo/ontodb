@@ -323,9 +323,10 @@ impl CompactionWorker {
         all_entries.sort_by(|a, b| a.0.cmp(&b.0).then(b.2.cmp(&a.2)));
 
         // Step 5: Deduplicate + tombstone cleanup
-        let deepest_level = {
+        // Snapshot levels once to avoid per-entry lock acquisition in the loop
+        let (deepest_level, levels_snapshot) = {
             let levels = self.levels.lock().unwrap();
-            levels.len() - 1
+            (levels.len() - 1, levels.clone())
         };
 
         let mut merged: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
@@ -337,11 +338,8 @@ impl CompactionWorker {
             }
 
             if *kind == EntryKind::Delete {
-                // Check if we can drop this tombstone
-                let can_drop = next_level >= deepest_level || {
-                    let levels = self.levels.lock().unwrap();
-                    Self::can_drop_tombstone_static(key, next_level, &levels)
-                };
+                let can_drop = next_level >= deepest_level
+                    || Self::can_drop_tombstone_static(key, next_level, &levels_snapshot);
                 if can_drop {
                     last_key = Some(key.clone());
                     continue;

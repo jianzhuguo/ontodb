@@ -306,23 +306,19 @@ impl LsmEngine {
             cands
         };
 
-        // Snapshot SST handles from cache; open missing ones outside the lock
+        // Snapshot SST handles from cache (brief lock — open + clone Arc)
+        // Then iterate outside the lock.
         let sst_handles: Vec<Arc<SsTable>> = {
             let mut ws = self.write_state.lock().unwrap();
-            let mut handles = Vec::with_capacity(candidates.len());
-            for path in &candidates {
-                if let Some(sst) = ws.sst_cache.get(path) {
-                    handles.push(Arc::clone(sst));
-                } else {
-                    let sst = Arc::new(SsTable::open(path)?);
-                    ws.sst_cache.insert(path.to_path_buf(), Arc::clone(&sst));
-                    handles.push(sst);
+            candidates.iter().filter_map(|path| {
+                if !ws.sst_cache.contains_key(path) {
+                    let sst = SsTable::open(path).ok()?;
+                    ws.sst_cache.insert(path.clone(), Arc::new(sst));
                 }
-            }
-            handles
+                ws.sst_cache.get(path).map(Arc::clone)
+            }).collect()
         };
 
-        // Iterate outside the lock
         for sst in &sst_handles {
             match sst.get_full(key)? {
                 Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
@@ -1151,19 +1147,28 @@ impl LsmEngine {
         let prefix = format!("{}::", class);
         let entries = self.scan_prefix(prefix.as_bytes())?;
 
-        for (pk, val_bytes) in entries {
-            if let Some(doc) = parse_doc_bytes(&val_bytes) {
-                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
-                    let index_entries = self.index_manager.write().unwrap().index_document(class, &pk, &doc);
-                    // Persist index entries to WAL + MemTable
-                    for (key, value) in index_entries {
-                        let seq = self.next_seq();
-                        let entry = Entry::put(key.clone(), value.clone(), seq);
-                        let mut ws = self.write_state.lock().unwrap();
-                        ws.wal.append(&entry)?;
-                        ws.memtable.put_with_seq(key, value, seq);
+        // Phase 1: Insert into index under a single write lock (not per-document)
+        let all_index_entries: Vec<(Vec<u8>, Vec<u8>)> = {
+            let mut mgr = self.index_manager.write().unwrap();
+            let mut all = Vec::new();
+            for (pk, val_bytes) in &entries {
+                if let Some(doc) = parse_doc_bytes(val_bytes) {
+                    if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
+                        all.extend(mgr.index_document(class, pk, &doc));
                     }
                 }
+            }
+            all
+        };
+
+        // Phase 2: Persist index entries to WAL + MemTable under a single write lock
+        if !all_index_entries.is_empty() {
+            let mut ws = self.write_state.lock().unwrap();
+            for (key, value) in all_index_entries {
+                let seq = self.next_seq();
+                let entry = Entry::put(key.clone(), value.clone(), seq);
+                ws.wal.append(&entry)?;
+                ws.memtable.put_with_seq(key, value, seq);
             }
         }
 
