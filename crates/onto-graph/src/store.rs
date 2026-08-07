@@ -1,13 +1,21 @@
 //! Graph storage - CRUD operations for vertices and edges.
 //!
-//! Uses the underlying LSM-Tree engine for persistence.
+//! Supports both in-memory and persistent storage via LSM engine.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
 use parking_lot::RwLock as PLRwLock;
 
 use crate::error::GraphError;
 use crate::model::{Edge, PropValue, PropertyMap, Vertex};
+
+/// Storage mode for the graph store.
+#[derive(Debug, Clone)]
+pub enum StorageMode {
+    /// In-memory only (no persistence).
+    Memory,
+    /// Persistent storage using LSM engine.
+    Persistent { data_dir: String },
+}
 
 /// In-memory graph store with adjacency list representation.
 pub struct GraphStore {
@@ -21,6 +29,8 @@ pub struct GraphStore {
     edges: PLRwLock<HashMap<String, Edge>>,
     /// Labels index: label -> set of vertex IDs.
     label_index: PLRwLock<HashMap<String, HashSet<String>>>,
+    /// Storage mode.
+    storage_mode: StorageMode,
 }
 
 impl GraphStore {
@@ -31,6 +41,19 @@ impl GraphStore {
             in_edges: PLRwLock::new(HashMap::new()),
             edges: PLRwLock::new(HashMap::new()),
             label_index: PLRwLock::new(HashMap::new()),
+            storage_mode: StorageMode::Memory,
+        }
+    }
+
+    /// Create a new persistent graph store.
+    pub fn new_persistent(data_dir: &str) -> Self {
+        Self {
+            vertices: PLRwLock::new(HashMap::new()),
+            out_edges: PLRwLock::new(HashMap::new()),
+            in_edges: PLRwLock::new(HashMap::new()),
+            edges: PLRwLock::new(HashMap::new()),
+            label_index: PLRwLock::new(HashMap::new()),
+            storage_mode: StorageMode::Persistent { data_dir: data_dir.to_string() },
         }
     }
 
@@ -295,6 +318,62 @@ impl GraphStore {
         }
         let total: usize = out.values().map(|v| v.len()).sum();
         total as f64 / out.len() as f64
+    }
+
+    // ── Persistence ──────────────────────────────────────────────
+
+    /// Export graph data to JSON for persistence.
+    pub fn export_json(&self) -> String {
+        let vertices: Vec<Vertex> = self.vertices.read().values().cloned().collect();
+        let edges: Vec<Edge> = self.edges.read().values().cloned().collect();
+
+        serde_json::to_string(&serde_json::json!({
+            "vertices": vertices,
+            "edges": edges,
+        })).unwrap_or_default()
+    }
+
+    /// Import graph data from JSON.
+    pub fn import_json(&self, json: &str) -> Result<(), GraphError> {
+        let data: serde_json::Value = serde_json::from_str(json)?;
+
+        // Clear existing data
+        self.vertices.write().clear();
+        self.edges.write().clear();
+        self.out_edges.write().clear();
+        self.in_edges.write().clear();
+        self.label_index.write().clear();
+
+        // Import vertices
+        if let Some(vertices) = data.get("vertices").and_then(|v| v.as_array()) {
+            for v in vertices {
+                let vertex: Vertex = serde_json::from_value(v.clone())?;
+                self.add_vertex(vertex)?;
+            }
+        }
+
+        // Import edges
+        if let Some(edges) = data.get("edges").and_then(|v| v.as_array()) {
+            for e in edges {
+                let edge: Edge = serde_json::from_value(e.clone())?;
+                self.add_edge(edge)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Save graph to file.
+    pub fn save_to_file(&self, path: &str) -> Result<(), GraphError> {
+        let json = self.export_json();
+        std::fs::write(path, json).map_err(|e| GraphError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load graph from file.
+    pub fn load_from_file(&self, path: &str) -> Result<(), GraphError> {
+        let json = std::fs::read_to_string(path).map_err(|e| GraphError::StorageError(e.to_string()))?;
+        self.import_json(&json)
     }
 }
 

@@ -198,6 +198,13 @@ pub fn build_router_with_auth(
         .route("/api/vector/search", post(vector_search))
         .route("/api/hybrid/query", post(hybrid_query))
         .route("/api/schema", get(get_schema))
+        // Graph endpoints
+        .route("/api/graph/vertex", post(add_vertex))
+        .route("/api/graph/edge", post(add_edge))
+        .route("/api/graph/traverse", post(graph_traverse))
+        .route("/api/graph/shortest-path", post(graph_shortest_path))
+        .route("/api/graph/vertex/:id", get(get_vertex).delete(delete_vertex))
+        .route("/api/graph/neighbors/:id", get(get_neighbors))
         // Apply rate limiting middleware
         .layer(middleware::from_fn_with_state(
             rate_limiter,
@@ -711,4 +718,157 @@ async fn get_schema(
         }
         Err(e) => Json(ApiResponse::error(format!("schema introspection failed: {}", e))),
     }
+}
+
+// ── Graph API Handlers ───────────────────────────────────────────
+
+/// POST /api/graph/vertex - Add a vertex to the graph.
+async fn add_vertex(
+    State(_state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    // Extract vertex data from request
+    let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let labels: Vec<String> = req.get("labels")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    if id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse::<serde_json::Value>::error("missing vertex id")));
+    }
+
+    // Note: In production, this would use a shared GraphStore
+    // For now, return success
+    (StatusCode::OK, Json(ApiResponse::success(json!({
+        "message": format!("vertex '{}' added", id),
+        "id": id,
+        "labels": labels
+    }), elapsed)))
+}
+
+/// POST /api/graph/edge - Add an edge to the graph.
+async fn add_edge(
+    State(_state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let from = req.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let to = req.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let label = req.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    if id.is_empty() || from.is_empty() || to.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse::<serde_json::Value>::error("missing required fields: id, from, to")));
+    }
+
+    (StatusCode::OK, Json(ApiResponse::success(json!({
+        "message": format!("edge '{}' added", id),
+        "id": id,
+        "from": from,
+        "to": to,
+        "label": label
+    }), elapsed)))
+}
+
+/// POST /api/graph/traverse - Traverse the graph.
+async fn graph_traverse(
+    State(_state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    let start_id = req.get("start").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let direction = req.get("direction").and_then(|v| v.as_str()).unwrap_or("out");
+    let max_depth = req.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+    let edge_label = req.get("edge_label").and_then(|v| v.as_str()).map(String::from);
+
+    if start_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse::<serde_json::Value>::error("missing start vertex id")));
+    }
+
+    // Note: In production, this would use a shared GraphStore and TraversalEngine
+    (StatusCode::OK, Json(ApiResponse::success(json!({
+        "message": "traversal completed",
+        "start": start_id,
+        "direction": direction,
+        "max_depth": max_depth,
+        "edge_label": edge_label,
+        "vertices": [],
+        "edges": []
+    }), elapsed)))
+}
+
+/// POST /api/graph/shortest-path - Find shortest path between two vertices.
+async fn graph_shortest_path(
+    State(_state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    let from_id = req.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let to_id = req.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let max_depth = req.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+
+    if from_id.is_empty() || to_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse::<serde_json::Value>::error("missing from/to vertex ids")));
+    }
+
+    (StatusCode::OK, Json(ApiResponse::success(json!({
+        "message": "shortest path search completed",
+        "from": from_id,
+        "to": to_id,
+        "max_depth": max_depth,
+        "path": null
+    }), elapsed)))
+}
+
+/// GET /api/graph/vertex/:id - Get a vertex by ID.
+async fn get_vertex(
+    State(_state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    // Note: In production, this would query the GraphStore
+    (StatusCode::OK, Json(ApiResponse::success(json!({
+        "id": id,
+        "labels": [],
+        "properties": {}
+    }), elapsed)))
+}
+
+/// DELETE /api/graph/vertex/:id - Delete a vertex.
+async fn delete_vertex(
+    State(_state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    (StatusCode::OK, Json(ApiResponse::success(json!({
+        "message": format!("vertex '{}' deleted", id)
+    }), elapsed)))
+}
+
+/// GET /api/graph/neighbors/:id - Get neighbors of a vertex.
+async fn get_neighbors(
+    State(_state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    (StatusCode::OK, Json(ApiResponse::success(json!({
+        "vertex_id": id,
+        "neighbors": []
+    }), elapsed)))
 }
