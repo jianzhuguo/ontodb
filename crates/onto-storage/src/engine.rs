@@ -538,34 +538,36 @@ impl LsmEngine {
             ws.immutable_memtable = Some(old_mem);
         }
 
-        // Step 2: Build SSTable from immutable MemTable (I/O heavy, no lock)
+        // Step 2: Snapshot immutable MemTable entries (brief lock), then build SSTable outside lock
         let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
         let sst_path = self.options.data_dir.join(format!("L0_{}.sst", sst_id));
-        let (min_key, max_key) = {
+        let (entries_snapshot, min_key, max_key) = {
             let ws = self.write_state.lock().unwrap();
             if let Some(ref imm) = ws.immutable_memtable {
-                let mut builder = SsTableBuilder::new();
-                builder.set_compression_level(self.options.compression_level);
-                for entry in imm.entries() {
-                    builder.add(&Entry {
-                        key: entry.key.clone(),
-                        value: entry.value.clone(),
-                        seq_no: entry.seq_no,
-                        kind: entry.kind,
-                    });
-                }
-                let min_key = imm.entries().next().map(|e| e.key.clone()).unwrap_or_default();
-                let max_key = imm.entries().last().map(|e| e.key.clone()).unwrap_or_default();
-                // Release lock before disk I/O
-                drop(ws);
-
-                builder.build(&sst_path)?;
-
-                (min_key, max_key)
+                let entries: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = imm
+                    .entries()
+                    .map(|e| (e.key.clone(), e.value.clone(), e.seq_no, e.kind))
+                    .collect();
+                let min_key = entries.first().map(|(k, _, _, _)| k.clone()).unwrap_or_default();
+                let max_key = entries.last().map(|(k, _, _, _)| k.clone()).unwrap_or_default();
+                (entries, min_key, max_key)
             } else {
                 return Ok(());
             }
         };
+
+        // Build SSTable from snapshot OUTSIDE the lock (disk I/O)
+        let mut builder = SsTableBuilder::new();
+        builder.set_compression_level(self.options.compression_level);
+        for (key, value, seq_no, kind) in &entries_snapshot {
+            builder.add(&Entry {
+                key: key.clone(),
+                value: value.clone(),
+                seq_no: *seq_no,
+                kind: *kind,
+            });
+        }
+        builder.build(&sst_path)?;
 
         // Step 3: Add to shared levels (brief lock)
         let metadata = fs::metadata(&sst_path)?;
