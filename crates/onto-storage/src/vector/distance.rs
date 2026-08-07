@@ -24,28 +24,62 @@ pub fn distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
 }
 
 /// L2 (Euclidean) distance: sqrt(sum((a_i - b_i)^2))
+/// Optimized with loop unrolling for better SIMD auto-vectorization.
 fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len();
     let mut sum = 0.0f32;
-    for i in 0..a.len() {
+    let mut i = 0;
+
+    // Process 4 elements at a time (SIMD-friendly)
+    while i + 4 <= len {
+        let d0 = a[i] - b[i];
+        let d1 = a[i+1] - b[i+1];
+        let d2 = a[i+2] - b[i+2];
+        let d3 = a[i+3] - b[i+3];
+        sum += d0*d0 + d1*d1 + d2*d2 + d3*d3;
+        i += 4;
+    }
+
+    // Handle remaining elements
+    while i < len {
         let diff = a[i] - b[i];
         sum += diff * diff;
+        i += 1;
     }
+
     sum.sqrt()
 }
 
 /// Cosine distance: 1 - (a . b) / (||a|| * ||b||)
+/// Optimized with loop unrolling.
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len();
     let mut dot = 0.0f32;
     let mut norm_a = 0.0f32;
     let mut norm_b = 0.0f32;
-    for i in 0..a.len() {
+    let mut i = 0;
+
+    // Process 4 elements at a time
+    while i + 4 <= len {
+        let (a0, a1, a2, a3) = (a[i], a[i+1], a[i+2], a[i+3]);
+        let (b0, b1, b2, b3) = (b[i], b[i+1], b[i+2], b[i+3]);
+        dot += a0*b0 + a1*b1 + a2*b2 + a3*b3;
+        norm_a += a0*a0 + a1*a1 + a2*a2 + a3*a3;
+        norm_b += b0*b0 + b1*b1 + b2*b2 + b3*b3;
+        i += 4;
+    }
+
+    // Handle remaining
+    while i < len {
         dot += a[i] * b[i];
         norm_a += a[i] * a[i];
         norm_b += b[i] * b[i];
+        i += 1;
     }
+
     let denom = norm_a.sqrt() * norm_b.sqrt();
     if denom == 0.0 {
-        return 1.0; // Maximum distance for zero vectors
+        return 1.0;
     }
     1.0 - (dot / denom)
 }

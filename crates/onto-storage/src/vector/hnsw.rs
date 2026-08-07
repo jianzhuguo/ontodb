@@ -150,6 +150,10 @@ pub struct HnswIndex {
     nodes: Vec<HnswNode>,
     entry_point: Option<usize>,
     max_layer: usize,
+    /// Reusable visited bitmap (interior mutability for search performance).
+    visited: std::cell::RefCell<Vec<u64>>,
+    /// Current generation for visited bitmap (avoids clearing).
+    visited_gen: std::cell::Cell<u64>,
 }
 
 impl HnswIndex {
@@ -159,6 +163,8 @@ impl HnswIndex {
             nodes: Vec::new(),
             entry_point: None,
             max_layer: 0,
+            visited: std::cell::RefCell::new(Vec::new()),
+            visited_gen: std::cell::Cell::new(0),
         }
     }
 
@@ -171,6 +177,8 @@ impl HnswIndex {
     }
 
     pub fn insert_batch(&mut self, entries: Vec<VectorEntry>) {
+        let n = entries.len();
+        self.nodes.reserve(n);
         for entry in entries {
             self.insert(entry);
         }
@@ -195,13 +203,17 @@ impl HnswIndex {
         }
 
         let Some(ep) = self.entry_point else { return };
-        let query = self.nodes[idx].entry.vector.clone();
+
+        // Borrow the vector without cloning - we only read it
+        let query_ptr = self.nodes[idx].entry.vector.as_ptr();
+        let query_len = self.nodes[idx].entry.vector.len();
+        // SAFETY: we only read the vector, and it stays valid as long as nodes exist
+        let query = unsafe { std::slice::from_raw_parts(query_ptr, query_len) };
 
         // === Phase 1: Find entry point at each layer ===
-        // Search from top layer down to level+1
         let mut curr = ep;
         for layer in (level + 1..=self.max_layer).rev() {
-            curr = self.search_layer_greedy(&query, curr, layer);
+            curr = self.search_layer_greedy(query, curr, layer);
         }
 
         // === Phase 2: Connect at layers 0..=min(level, max_layer) ===
@@ -210,10 +222,10 @@ impl HnswIndex {
             let m = if layer == 0 { self.config.m_max0 } else { self.config.m };
 
             // Find nearest neighbors at this layer
-            let candidates = self.search_layer_beam(&query, curr, ef_c, layer);
+            let candidates = self.search_layer_beam(query, curr, ef_c, layer);
 
             // Select M nearest neighbors
-            let selected = self.select_nearest(&query, &candidates, m);
+            let selected = self.select_nearest(query, &candidates, m);
 
             // Connect bidirectional edges
             self.connect_bidirectional(idx, &selected, layer);
@@ -236,10 +248,8 @@ impl HnswIndex {
         let m = if layer == 0 { self.config.m_max0 } else { self.config.m };
 
         for &nbr_idx in neighbors {
-            // Add edge: idx -> nbr
-            if !self.nodes[idx].neighbors[layer].contains(&nbr_idx) {
-                self.nodes[idx].neighbors[layer].push(nbr_idx);
-            }
+            // Add edge: idx -> nbr (skip contains check - selected neighbors are unique)
+            self.nodes[idx].neighbors[layer].push(nbr_idx);
 
             // Ensure neighbor has this layer allocated
             while self.nodes[nbr_idx].neighbors.len() <= layer {
@@ -247,9 +257,7 @@ impl HnswIndex {
             }
 
             // Add edge: nbr -> idx
-            if !self.nodes[nbr_idx].neighbors[layer].contains(&idx) {
-                self.nodes[nbr_idx].neighbors[layer].push(idx);
-            }
+            self.nodes[nbr_idx].neighbors[layer].push(idx);
 
             // Prune nbr if it has too many neighbors
             // IMPORTANT: We prune ONLY the neighbor's connections, NOT removing
@@ -263,19 +271,20 @@ impl HnswIndex {
     /// Prune a node's neighbors to max_neighbors.
     /// CRITICAL: We NEVER remove the edge back to the newly connected node.
     fn prune_node_neighbors(&mut self, node_idx: usize, layer: usize, max_neighbors: usize) {
-        let node_vec = self.nodes[node_idx].entry.vector.clone();
-        let nbrs = self.nodes[node_idx].neighbors[layer].clone();
-
-        // Sort by distance to this node
-        let mut with_dist: Vec<(usize, f32)> = nbrs
+        // Sort neighbors by distance to this node (avoid cloning vector)
+        let mut with_dist: Vec<(usize, f32)> = self.nodes[node_idx].neighbors[layer]
             .iter()
-            .map(|&i| (i, distance(&node_vec, &self.nodes[i].entry.vector, self.config.metric)))
+            .map(|&i| (i, distance(&self.nodes[node_idx].entry.vector, &self.nodes[i].entry.vector, self.config.metric)))
             .collect();
-        with_dist.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        with_dist.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
         // Keep the nearest max_neighbors
         let keep: Vec<usize> = with_dist.iter().take(max_neighbors).map(|(i, _)| *i).collect();
-        let remove: Vec<usize> = nbrs.iter().filter(|i| !keep.contains(i)).copied().collect();
+        let remove: Vec<usize> = self.nodes[node_idx].neighbors[layer]
+            .iter()
+            .filter(|i| !keep.contains(i))
+            .copied()
+            .collect();
 
         // Remove edges from removed nodes back to this node
         for removed_idx in remove {
@@ -397,8 +406,16 @@ impl HnswIndex {
         let mut results = BinaryHeap::new();
         results.push(MaxEntry { idx: entry, dist: entry_dist });
 
-        let mut visited = vec![false; self.nodes.len()];
-        visited[entry] = true;
+        // Reuse visited bitmap (interior mutability)
+        let gen = self.visited_gen.get() + 1;
+        self.visited_gen.set(gen);
+        {
+            let mut visited = self.visited.borrow_mut();
+            if visited.len() < self.nodes.len() {
+                visited.resize(self.nodes.len(), 0);
+            }
+            visited[entry] = gen;
+        }
 
         while let Some(curr) = candidates.pop() {
             // Get the farthest result distance
@@ -409,13 +426,21 @@ impl HnswIndex {
                 break;
             }
 
-            // Expand neighbors
-            let nbrs = self.get_neighbors(curr.idx, layer).to_vec();
-            for &nbr in &nbrs {
-                if visited[nbr] {
-                    continue;
+            // Expand neighbors - borrow without cloning
+            let nbrs_len = if layer < self.nodes[curr.idx].neighbors.len() {
+                self.nodes[curr.idx].neighbors[layer].len()
+            } else {
+                0
+            };
+            for i in 0..nbrs_len {
+                let nbr = self.nodes[curr.idx].neighbors[layer][i];
+                {
+                    let mut visited = self.visited.borrow_mut();
+                    if visited[nbr] == gen {
+                        continue;
+                    }
+                    visited[nbr] = gen;
                 }
-                visited[nbr] = true;
 
                 let d = distance(query, &self.nodes[nbr].entry.vector, self.config.metric);
 
@@ -446,7 +471,7 @@ impl HnswIndex {
             .iter()
             .map(|&i| (i, distance(query, &self.nodes[i].entry.vector, self.config.metric)))
             .collect();
-        with_dist.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        with_dist.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         with_dist.truncate(m);
         with_dist.into_iter().map(|(i, _)| i).collect()
     }

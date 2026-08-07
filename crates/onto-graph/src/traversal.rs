@@ -92,6 +92,27 @@ impl<'a> TraversalEngine<'a> {
         Self { store }
     }
 
+    /// Fast multi-hop BFS using integer indices (no string allocations).
+    /// Returns vertex IDs of visited nodes.
+    pub fn traverse_bfs_fast(
+        &self,
+        start_id: &str,
+        max_depth: usize,
+        direction: Direction,
+    ) -> Result<Vec<String>, GraphError> {
+        let start_idx = self.store.get_idx(start_id)
+            .ok_or_else(|| GraphError::VertexNotFound(start_id.to_string()))?;
+
+        let result_indices = self.store.bfs_fast(start_idx, max_depth, direction);
+
+        let result: Vec<String> = result_indices
+            .into_iter()
+            .filter_map(|idx| self.store.get_id(idx))
+            .collect();
+
+        Ok(result)
+    }
+
     /// Single-hop traversal: get neighbors of a vertex.
     pub fn hop(
         &self,
@@ -155,7 +176,7 @@ impl<'a> TraversalEngine<'a> {
         Ok(result)
     }
 
-    /// Multi-hop BFS traversal.
+    /// Multi-hop BFS traversal (optimized).
     pub fn traverse_bfs(
         &self,
         start_id: &str,
@@ -164,17 +185,19 @@ impl<'a> TraversalEngine<'a> {
         edge_label: Option<&str>,
         vertex_filter: Option<&PropertyFilter>,
     ) -> Result<TraversalResult, GraphError> {
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new(); // (id, depth)
         let mut result_vertices = Vec::new();
         let mut result_edges = Vec::new();
         let mut result_paths = Vec::new();
+        // Parent tracking for path reconstruction (child -> (parent, edge_id))
+        let mut parent_map: HashMap<String, Option<(String, String)>> = HashMap::new();
 
-        // BFS state: (vertex_id, depth, path_vertices, path_edges)
-        queue.push_back((start_id.to_string(), 0, vec![start_id.to_string()], vec![]));
+        queue.push_back((start_id.to_string(), 0));
         visited.insert(start_id.to_string());
+        parent_map.insert(start_id.to_string(), None);
 
-        while let Some((current_id, depth, path_verts, path_edges)) = queue.pop_front() {
+        while let Some((current_id, depth)) = queue.pop_front() {
             if depth > 0 {
                 if let Some(vertex) = self.store.get_vertex(&current_id) {
                     if let Some(f) = vertex_filter {
@@ -182,10 +205,12 @@ impl<'a> TraversalEngine<'a> {
                             continue;
                         }
                     }
+                    // Reconstruct path from parent_map
+                    let (path_verts, path_edges) = self.reconstruct_path(&parent_map, &current_id);
                     result_vertices.push(vertex.clone());
                     result_paths.push(TraversalPath {
-                        vertex_ids: path_verts.clone(),
-                        edge_ids: path_edges.clone(),
+                        vertex_ids: path_verts,
+                        edge_ids: path_edges,
                         target: vertex,
                         length: depth,
                     });
@@ -225,14 +250,8 @@ impl<'a> TraversalEngine<'a> {
                 visited.insert(next_id.clone());
 
                 result_edges.push(edge.clone());
-
-                let mut new_path_verts = path_verts.clone();
-                new_path_verts.push(next_id.clone());
-
-                let mut new_path_edges = path_edges.clone();
-                new_path_edges.push(edge.id.clone());
-
-                queue.push_back((next_id, depth + 1, new_path_verts, new_path_edges));
+                parent_map.insert(next_id.clone(), Some((current_id.clone(), edge.id.clone())));
+                queue.push_back((next_id, depth + 1));
             }
         }
 
@@ -242,6 +261,32 @@ impl<'a> TraversalEngine<'a> {
             paths: result_paths,
             visited_count: visited.len(),
         })
+    }
+
+    /// Reconstruct path from parent_map (lazy path construction).
+    fn reconstruct_path(
+        &self,
+        parent_map: &HashMap<String, Option<(String, String)>>,
+        target: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut verts = Vec::new();
+        let mut edges = Vec::new();
+        let mut current = target.to_string();
+
+        loop {
+            verts.push(current.clone());
+            match parent_map.get(&current) {
+                Some(Some((parent, edge_id))) => {
+                    edges.push(edge_id.clone());
+                    current = parent.clone();
+                }
+                _ => break,
+            }
+        }
+
+        verts.reverse();
+        edges.reverse();
+        (verts, edges)
     }
 
     /// Multi-hop DFS traversal.

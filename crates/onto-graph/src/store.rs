@@ -2,11 +2,12 @@
 //!
 //! Supports both in-memory and persistent storage via LSM engine.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use parking_lot::RwLock as PLRwLock;
 
 use crate::error::GraphError;
 use crate::model::{Edge, PropertyMap, Vertex};
+use crate::traversal::Direction;
 
 /// Storage mode for the graph store.
 #[derive(Debug, Clone)]
@@ -32,6 +33,16 @@ pub struct GraphStore {
     /// Storage mode.
     #[allow(dead_code)]
     storage_mode: StorageMode,
+    /// Internal integer ID mapping for fast traversal.
+    /// Maps string ID -> integer index.
+    id_to_idx: PLRwLock<HashMap<String, u32>>,
+    /// Maps integer index -> string ID.
+    idx_to_id: PLRwLock<Vec<String>>,
+    /// Adjacency list using integer indices: idx -> list of (neighbor_idx, edge_idx).
+    adj_out: PLRwLock<Vec<Vec<(u32, u32)>>>,
+    adj_in: PLRwLock<Vec<Vec<(u32, u32)>>>,
+    /// Edge index -> (from_idx, to_idx, edge_id).
+    edge_index: PLRwLock<Vec<(u32, u32, String)>>,
 }
 
 impl GraphStore {
@@ -43,6 +54,11 @@ impl GraphStore {
             edges: PLRwLock::new(HashMap::new()),
             label_index: PLRwLock::new(HashMap::new()),
             storage_mode: StorageMode::Memory,
+            id_to_idx: PLRwLock::new(HashMap::new()),
+            idx_to_id: PLRwLock::new(Vec::new()),
+            adj_out: PLRwLock::new(Vec::new()),
+            adj_in: PLRwLock::new(Vec::new()),
+            edge_index: PLRwLock::new(Vec::new()),
         }
     }
 
@@ -55,7 +71,36 @@ impl GraphStore {
             edges: PLRwLock::new(HashMap::new()),
             label_index: PLRwLock::new(HashMap::new()),
             storage_mode: StorageMode::Persistent { data_dir: data_dir.to_string() },
+            id_to_idx: PLRwLock::new(HashMap::new()),
+            idx_to_id: PLRwLock::new(Vec::new()),
+            adj_out: PLRwLock::new(Vec::new()),
+            adj_in: PLRwLock::new(Vec::new()),
+            edge_index: PLRwLock::new(Vec::new()),
         }
+    }
+
+    /// Get or create integer index for a vertex ID.
+    fn get_or_create_idx(&self, id: &str) -> u32 {
+        let mut map = self.id_to_idx.write();
+        if let Some(&idx) = map.get(id) {
+            return idx;
+        }
+        let idx = map.len() as u32;
+        map.insert(id.to_string(), idx);
+        drop(map);
+
+        let mut ids = self.idx_to_id.write();
+        ids.push(id.to_string());
+        drop(ids);
+
+        let mut adj_out = self.adj_out.write();
+        adj_out.push(Vec::new());
+        drop(adj_out);
+
+        let mut adj_in = self.adj_in.write();
+        adj_in.push(Vec::new());
+
+        idx
     }
 
     // ── Vertex CRUD ──────────────────────────────────────────────
@@ -88,8 +133,11 @@ impl GraphStore {
         }
         {
             let mut in_e = self.in_edges.write();
-            in_e.entry(id).or_insert_with(Vec::new);
+            in_e.entry(id.clone()).or_insert_with(Vec::new);
         }
+
+        // Create integer index for fast traversal
+        self.get_or_create_idx(&id);
 
         Ok(())
     }
@@ -194,16 +242,34 @@ impl GraphStore {
             if edges.contains_key(&id) {
                 return Err(GraphError::DuplicateVertex(format!("Edge {}", id)));
             }
-            edges.insert(id, edge.clone());
+            edges.insert(id.clone(), edge.clone());
         }
 
         {
             let mut out = self.out_edges.write();
-            out.entry(from).or_insert_with(Vec::new).push(edge.clone());
+            out.entry(from.clone()).or_insert_with(Vec::new).push(edge.clone());
         }
         {
             let mut inp = self.in_edges.write();
-            inp.entry(to).or_insert_with(Vec::new).push(edge);
+            inp.entry(to.clone()).or_insert_with(Vec::new).push(edge);
+        }
+
+        // Update integer adjacency lists
+        let from_idx = self.get_or_create_idx(&from);
+        let to_idx = self.get_or_create_idx(&to);
+        let edge_idx = {
+            let mut ei = self.edge_index.write();
+            let idx = ei.len() as u32;
+            ei.push((from_idx, to_idx, id));
+            idx
+        };
+        {
+            let mut adj_out = self.adj_out.write();
+            adj_out[from_idx as usize].push((to_idx, edge_idx));
+        }
+        {
+            let mut adj_in = self.adj_in.write();
+            adj_in[to_idx as usize].push((from_idx, edge_idx));
         }
 
         Ok(())
@@ -319,6 +385,68 @@ impl GraphStore {
         }
         let total: usize = out.values().map(|v| v.len()).sum();
         total as f64 / out.len() as f64
+    }
+
+    /// Get integer index for a vertex ID.
+    pub fn get_idx(&self, id: &str) -> Option<u32> {
+        self.id_to_idx.read().get(id).copied()
+    }
+
+    /// Get vertex ID from integer index.
+    pub fn get_id(&self, idx: u32) -> Option<String> {
+        self.idx_to_id.read().get(idx as usize).cloned()
+    }
+
+    /// Get outgoing neighbors using integer indices (fast path).
+    pub fn get_out_neighbors_idx(&self, idx: u32) -> Vec<(u32, u32)> {
+        self.adj_out.read().get(idx as usize).cloned().unwrap_or_default()
+    }
+
+    /// Get incoming neighbors using integer indices (fast path).
+    pub fn get_in_neighbors_idx(&self, idx: u32) -> Vec<(u32, u32)> {
+        self.adj_in.read().get(idx as usize).cloned().unwrap_or_default()
+    }
+
+    /// Fast BFS using integer indices (no string allocations during traversal).
+    pub fn bfs_fast(
+        &self,
+        start_idx: u32,
+        max_depth: usize,
+        direction: Direction,
+    ) -> Vec<u32> {
+        let mut visited = vec![false; self.idx_to_id.read().len()];
+        visited[start_idx as usize] = true;
+        let mut queue = VecDeque::new();
+        queue.push_back((start_idx, 0usize));
+        let mut result = Vec::new();
+
+        while let Some((curr, depth)) = queue.pop_front() {
+            if depth > 0 {
+                result.push(curr);
+            }
+            if depth >= max_depth {
+                continue;
+            }
+
+            let neighbors = match direction {
+                Direction::Out => self.get_out_neighbors_idx(curr),
+                Direction::In => self.get_in_neighbors_idx(curr),
+                Direction::Both => {
+                    let mut n = self.get_out_neighbors_idx(curr);
+                    n.extend(self.get_in_neighbors_idx(curr));
+                    n
+                }
+            };
+
+            for (nbr, _) in neighbors {
+                if !visited[nbr as usize] {
+                    visited[nbr as usize] = true;
+                    queue.push_back((nbr, depth + 1));
+                }
+            }
+        }
+
+        result
     }
 
     // ── Persistence ──────────────────────────────────────────────

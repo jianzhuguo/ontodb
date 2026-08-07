@@ -113,7 +113,7 @@ fn bench_traversal(store: &GraphStore, num_queries: usize, max_depth: usize) {
     }
     let hop1_time = start.elapsed();
 
-    // Multi-hop BFS
+    // Multi-hop BFS (string-based)
     let start = Instant::now();
     let mut total_visited = 0;
     for _ in 0..num_queries {
@@ -123,12 +123,26 @@ fn bench_traversal(store: &GraphStore, num_queries: usize, max_depth: usize) {
     }
     let bfs_time = start.elapsed();
 
+    // Fast BFS (integer-indexed)
+    let start = Instant::now();
+    let mut total_fast_visited = 0;
+    for _ in 0..num_queries {
+        let vid = format!("v{}", rng.gen_range(0..num_vertices));
+        if let Ok(result) = engine.traverse_bfs_fast(&vid, max_depth, Direction::Out) {
+            total_fast_visited += result.len();
+        }
+    }
+    let bfs_fast_time = start.elapsed();
+
     println!("  Single-hop: {:.2}s ({:.0} qps), avg_neighbors={:.1}",
         hop1_time.as_secs_f64(), num_queries as f64 / hop1_time.as_secs_f64(),
         total_neighbors as f64 / num_queries as f64);
     println!("  {}-hop BFS: {:.2}s ({:.0} qps), avg_visited={:.1}",
         max_depth, bfs_time.as_secs_f64(), num_queries as f64 / bfs_time.as_secs_f64(),
         total_visited as f64 / num_queries as f64);
+    println!("  {}-hop BFS (fast): {:.2}s ({:.0} qps), avg_visited={:.1}",
+        max_depth, bfs_fast_time.as_secs_f64(), num_queries as f64 / bfs_fast_time.as_secs_f64(),
+        total_fast_visited as f64 / num_queries as f64);
 }
 
 fn bench_graph_vector_hybrid(store: &GraphStore, num_queries: usize) {
