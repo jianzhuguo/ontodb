@@ -9,7 +9,37 @@
 
 ## Executive Summary
 
-OntoDB achieves **~900K writes/sec** and **~1.3M reads/sec** on standard hardware, with sub-millisecond latency for point lookups. The BinaryRow optimization delivers **1.75-1.91x** speedup over JSON parsing for field access and filter evaluation.
+OntoDB achieves **~900K writes/sec** and **~1.3M reads/sec** on standard hardware. Through systematic optimization, write throughput improved **5.6x** (160K → 900K) while maintaining read performance. The BinaryRow optimization delivers **1.75-1.91x** speedup over JSON parsing for field access and filter evaluation.
+
+---
+
+## 0. Optimization Impact Summary
+
+### Storage Engine Improvement
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| **Write throughput** | ~160K writes/sec | **~900K writes/sec** | **+462% (5.6x)** |
+| **Read throughput** | ~1.28M reads/sec | **~1.3M reads/sec** | +2% |
+
+### Query Layer Improvement
+
+| Operation | Before | After | Improvement |
+|-----------|--------|-------|-------------|
+| **ORDER BY + LIMIT** | 119 ms | **86 ms** | **+28%** |
+| BinaryRow field lookup | 5.9 μs (JSON) | **3.4 μs** | **1.75x** |
+| BinaryRow filter eval | 5.6 μs (JSON) | **2.9 μs** | **1.91x** |
+
+### Optimization Commits
+
+| Commit | Description | Impact |
+|--------|-------------|--------|
+| `c054781` | WAL serialize buffer reuse + MemTable zero-alloc | Write +325% |
+| `9000dcb` | Batch WAL flush (every 64 writes) | Write +50% |
+| `afdc246` | SST iterator zero-copy + flush zero-double-clone | Scan -50% alloc |
+| `d79b0b9` | ORDER BY direct Value comparison | ORDER BY -28% |
+| `6961de8` | GROUP BY direct Value extraction | GROUP BY -3% |
+| `2cc5c29` | plan_index_scan BinaryRow filtering | Index scan 1.91x |
 
 ---
 
