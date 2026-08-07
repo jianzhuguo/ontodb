@@ -220,6 +220,34 @@ impl IndexManager {
         index_entries
     }
 
+    /// Computes LSM index key entries for a document WITHOUT modifying the index.
+    /// Used by commit_txn Phase 1 to pre-compute WAL entries.
+    pub fn index_document_read_only(
+        &self,
+        class: &str,
+        primary_key: &[u8],
+        doc: &serde_json::Map<String, serde_json::Value>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut index_entries = Vec::new();
+
+        // Check both in-memory and disk-based indexes
+        let mut seen = std::collections::HashSet::new();
+        for (idx_class, idx_col) in self.indexes.keys().chain(self.disk_indexes.keys()) {
+            if idx_class != class || !seen.insert(idx_col.clone()) {
+                continue;
+            }
+            if let Some(val) = doc.get(idx_col.as_str()) {
+                let encoded = Self::encode_value(val);
+                index_entries.push((
+                    Self::make_index_key(class, idx_col, &encoded, primary_key),
+                    Vec::new(),
+                ));
+            }
+        }
+
+        index_entries
+    }
+
     /// Removes index entries for a document.
     /// Called during DELETE and UPDATE (before re-indexing).
     pub fn deindex_document(
@@ -382,6 +410,43 @@ impl IndexManager {
         }
 
         None
+    }
+
+    // ── Read-only lookup methods (for concurrent read path, &self) ──
+
+    /// Read-only equality lookup using in-memory index only.
+    pub fn lookup_eq_read(&self, class: &str, column: &str, value: &serde_json::Value) -> Option<Vec<Vec<u8>>> {
+        let key = (class.to_string(), column.to_string());
+        let encoded = Self::encode_value(value);
+        self.indexes.get(&key).map(|tree| tree.lookup(&encoded))
+    }
+
+    /// Read-only range scan using in-memory index only.
+    pub fn lookup_range_read(
+        &self,
+        class: &str,
+        column: &str,
+        low: Option<&serde_json::Value>,
+        high: Option<&serde_json::Value>,
+    ) -> Option<Vec<Vec<u8>>> {
+        let key = (class.to_string(), column.to_string());
+        let low_bytes = low.map(|v| Self::encode_value(v));
+        let high_bytes = high.map(|v| Self::encode_value(v));
+        self.indexes.get(&key).map(|tree| tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref()))
+    }
+
+    /// Read-only GT lookup using in-memory index only.
+    pub fn lookup_gt_read(&self, class: &str, column: &str, value: &serde_json::Value) -> Option<Vec<Vec<u8>>> {
+        let key = (class.to_string(), column.to_string());
+        let encoded = Self::encode_value(value);
+        self.indexes.get(&key).map(|tree| tree.gt_scan(&encoded))
+    }
+
+    /// Read-only LT lookup using in-memory index only.
+    pub fn lookup_lt_read(&self, class: &str, column: &str, value: &serde_json::Value) -> Option<Vec<Vec<u8>>> {
+        let key = (class.to_string(), column.to_string());
+        let encoded = Self::encode_value(value);
+        self.indexes.get(&key).map(|tree| tree.lt_scan(&encoded))
     }
 
     /// Builds the index key format:

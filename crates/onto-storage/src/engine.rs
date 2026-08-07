@@ -795,22 +795,25 @@ impl LsmEngine {
     }
 
     /// Commits a transaction. Flushes its write buffer to WAL + MemTable.
+    ///
+    /// Lock strategy (3 phases to avoid nesting write_state inside index locks):
+    ///  Phase 1 — brief write_state: take writes, assign seqs, read old values
+    ///  Phase 2 — no write_state:    index de/re mutations (independent locks)
+    ///  Phase 3 — brief write_state: WAL + memtable writes
     pub fn commit_txn(&self, txn_id: SeqNo) -> Result<()> {
-        // Take the writes from the transaction manager (brief lock)
-        let writes = {
+        // ── Phase 1: Take writes, assign sequence numbers, read old values ──
+        let (writes_with_seq, old_values, index_entries_batch) = {
             let mut ws = self.write_state.lock().unwrap();
-            ws.txn_manager.commit(txn_id)?
-        };
+            let writes = ws.txn_manager.commit(txn_id)?;
 
-        // Process each write under write_state lock.
-        // commit_txn is inherently serial — holding the lock for the duration is fine.
-        let needs_flush = {
-            let mut ws = self.write_state.lock().unwrap();
+            let mut writes_with_seq: Vec<(Vec<u8>, WriteOp, SeqNo)> = Vec::with_capacity(writes.len());
+            let mut old_values: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+            let mut index_entries_batch: Vec<(Vec<u8>, Vec<u8>, SeqNo)> = Vec::new();
 
             for (key, op) in writes {
                 let seq = self.next_seq();
 
-                // Maintain indexes if any exist for this class
+                // Check index existence (brief read locks, dropped immediately)
                 let class = Self::extract_class_from_key(&key);
                 let has_indexes = class.as_ref().map_or(false, |c| {
                     !self.index_manager.read().unwrap().indexes_for_class(c).is_empty()
@@ -819,61 +822,84 @@ impl LsmEngine {
                     self.vector_index_manager.read().unwrap().has_any_index(c)
                 });
 
-                match op {
-                    WriteOp::Put(value) => {
-                        if has_indexes || has_vector_indexes {
-                            // Deindex the old value first (handles UPDATE case)
-                            if let Some(old_val) = Self::get_from_locked(&ws, key.as_slice())? {
-                                if let Some(ref old_doc) = parse_doc_bytes(&old_val) {
-                                    if let Some(ref c) = class {
-                                        if has_indexes {
-                                            self.index_manager.write().unwrap().deindex_document(c, &key, old_doc);
-                                        }
-                                        if has_vector_indexes {
-                                            self.vector_index_manager.write().unwrap().deindex_vectors(&key);
-                                        }
-                                    }
-                                }
-                            }
-                            // Index the new value and persist index entries
-                            if let Some(ref doc) = parse_doc_bytes(&value) {
-                                if let Some(ref c) = class {
-                                    if has_indexes {
-                                        let index_entries = self.index_manager.write().unwrap().index_document(c, &key, doc);
-                                        for (idx_key, idx_val) in index_entries {
-                                            let idx_seq = self.next_seq();
-                                            let idx_entry = Entry::put(idx_key.clone(), idx_val.clone(), idx_seq);
-                                            ws.wal.append(&idx_entry)?;
-                                            ws.memtable.put_with_seq(idx_key, idx_val, idx_seq);
-                                        }
-                                    }
-                                    if has_vector_indexes {
-                                        self.vector_index_manager.write().unwrap().index_document_vectors(&key, c, doc);
-                                    }
+                // Read old value for de-indexing (from locked memtable + SST cache)
+                if has_indexes || has_vector_indexes {
+                    if let Some(old_val) = Self::get_from_locked(&ws, key.as_slice())? {
+                        old_values.insert(key.clone(), old_val);
+                    }
+                }
+
+                // Pre-compute index entries for Put operations (need new doc to compute)
+                if has_indexes {
+                    if let WriteOp::Put(ref value) = op {
+                        if let Some(ref c) = class {
+                            if let Some(ref doc) = parse_doc_bytes(value) {
+                                let entries = self.index_manager.read().unwrap().index_document_read_only(c, &key, doc);
+                                for (idx_key, idx_val) in entries {
+                                    let idx_seq = self.next_seq();
+                                    index_entries_batch.push((idx_key, idx_val, idx_seq));
                                 }
                             }
                         }
+                    }
+                }
 
+                writes_with_seq.push((key, op, seq));
+            }
+
+            (writes_with_seq, old_values, index_entries_batch)
+        };
+
+        // ── Phase 2: Index mutations (no write_state held) ──
+        {
+            let mut idx_mgr = self.index_manager.write().unwrap();
+            let mut vec_mgr = self.vector_index_manager.write().unwrap();
+
+            for (key, op, _) in &writes_with_seq {
+                let class = Self::extract_class_from_key(key);
+
+                // De-index old value (for both Put/Update and Delete)
+                if let Some(old_val) = old_values.get(key) {
+                    if let Some(ref old_doc) = parse_doc_bytes(old_val) {
+                        if let Some(ref c) = class {
+                            idx_mgr.deindex_document(c, key, old_doc);
+                            vec_mgr.deindex_vectors(key);
+                        }
+                    }
+                }
+
+                // Re-index new value (Put only)
+                if let WriteOp::Put(value) = op {
+                    if let Some(ref doc) = parse_doc_bytes(value) {
+                        if let Some(ref c) = class {
+                            idx_mgr.index_document(c, key, doc);
+                            vec_mgr.index_document_vectors(key, c, doc);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Phase 3: WAL + MemTable writes (brief write_state) ──
+        let needs_flush = {
+            let mut ws = self.write_state.lock().unwrap();
+
+            // Write index entries to WAL + memtable
+            for (idx_key, idx_val, idx_seq) in index_entries_batch {
+                let entry = Entry::put(idx_key.clone(), idx_val.clone(), idx_seq);
+                ws.wal.append(&entry)?;
+                ws.memtable.put_with_seq(idx_key, idx_val, idx_seq);
+            }
+
+            // Write data entries to WAL + memtable
+            for (key, op, seq) in writes_with_seq {
+                match op {
+                    WriteOp::Put(value) => {
                         let entry = Entry::put(key.clone(), value.clone(), seq);
                         ws.wal.append(&entry)?;
                         ws.memtable.put_with_seq(key, value, seq);
                     }
                     WriteOp::Delete => {
-                        if has_indexes || has_vector_indexes {
-                            if let Some(old_val) = Self::get_from_locked(&ws, key.as_slice())? {
-                                if let Some(ref old_doc) = parse_doc_bytes(&old_val) {
-                                    if let Some(ref c) = class {
-                                        if has_indexes {
-                                            self.index_manager.write().unwrap().deindex_document(c, &key, old_doc);
-                                        }
-                                        if has_vector_indexes {
-                                            self.vector_index_manager.write().unwrap().deindex_vectors(&key);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
                         let entry = Entry::delete(key.clone(), seq);
                         ws.wal.append(&entry)?;
                         ws.memtable.delete_with_seq(key, seq);
@@ -881,7 +907,6 @@ impl LsmEngine {
                 }
             }
 
-            // Sync WAL for durability if configured
             if self.options.sync_wal_on_commit {
                 ws.wal.sync()?;
             }
@@ -889,7 +914,6 @@ impl LsmEngine {
             ws.memtable.size() >= self.options.memtable_size_limit
         };
 
-        // Flush outside the lock if needed
         if needs_flush {
             self.flush_memtable()?;
         }
