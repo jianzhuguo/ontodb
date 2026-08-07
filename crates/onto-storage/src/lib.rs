@@ -21,3 +21,4 @@ pub use iterator::StorageIterator;
 pub use mvcc::{TxnManager, Transaction, TxnStatus, WriteOp};
 pub use options::StorageOptions;
 pub use vector::{DistanceMetric, HnswConfig, HnswIndex, VectorEntry, SearchResult, VectorIndexManager};
+pub use vector::distance;

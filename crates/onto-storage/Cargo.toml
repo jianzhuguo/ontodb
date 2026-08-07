@@ -27,3 +27,7 @@ tempfile = { workspace = true }
 [[bench]]
 name = "lock_contention"
 harness = false
+
+[[bench]]
+name = "vector_recall"
+harness = false

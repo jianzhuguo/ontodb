@@ -36,7 +36,7 @@ impl Eq for Neighbor {}
 
 impl PartialOrd for Neighbor {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // Reverse for max-heap (we want closest neighbors)
+        // Reverse for max-heap (we want closest neighbors at top for results)
         other.distance.partial_cmp(&self.distance)
     }
 }
@@ -218,7 +218,7 @@ impl HnswIndex {
 
             // Select M nearest neighbors (with diversity heuristic)
             let m = if layer == 0 { self.config.m_max0 } else { self.config.m };
-            let selected = self.select_neighbors(&candidates, m);
+            let selected = self.select_neighbors_diverse(&query, &candidates, m, layer);
 
             // Connect bidirectional edges
             for &neighbor_idx in &selected {
@@ -228,13 +228,24 @@ impl HnswIndex {
                 while self.nodes[neighbor_idx].neighbors.len() <= layer {
                     self.nodes[neighbor_idx].neighbors.push(Vec::new());
                 }
-                self.nodes[neighbor_idx].neighbors[layer].push(idx);
+
+                // Check if idx is already a neighbor (shouldn't be, but just in case)
+                if !self.nodes[neighbor_idx].neighbors[layer].contains(&idx) {
+                    self.nodes[neighbor_idx].neighbors[layer].push(idx);
+                }
 
                 // Prune neighbors of the neighbor if it has too many
                 let max_neighbors = if layer == 0 { self.config.m_max0 } else { self.config.m };
                 if self.nodes[neighbor_idx].neighbors[layer].len() > max_neighbors {
                     let nn = self.nodes[neighbor_idx].neighbors[layer].clone();
-                    let pruned = self.select_neighbors_simple(&query, &nn, max_neighbors, layer);
+                    // Use the neighbor's own vector for pruning
+                    let neighbor_vec = self.nodes[neighbor_idx].entry.vector.clone();
+                    let mut pruned = self.select_neighbors_simple(&neighbor_vec, &nn, max_neighbors, layer);
+                    // Ensure the newly added edge to idx is preserved
+                    if !pruned.contains(&idx) {
+                        pruned.pop(); // Remove the farthest
+                        pruned.push(idx); // Add back the new connection
+                    }
                     self.nodes[neighbor_idx].neighbors[layer] = pruned;
                 }
             }
@@ -364,25 +375,27 @@ impl HnswIndex {
 
     /// Beam search at a layer, returning up to ef candidates sorted by distance.
     fn search_layer(&self, query: &[f32], entry: usize, ef: usize, layer: usize) -> Vec<usize> {
+        use std::cmp::Reverse;
+
         let mut visited = HashSet::new();
         visited.insert(entry);
 
         let entry_dist = distance(query, &self.nodes[entry].entry.vector, self.config.metric);
 
-        // candidates: min-heap (closest first) — but BinaryHeap is max-heap,
-        // so we use Reverse or negate. Here we use Neighbor with reversed ordering.
+        // candidates: min-heap (closest first) using Reverse
         let mut candidates = BinaryHeap::new();
-        candidates.push(Neighbor { idx: entry, distance: entry_dist });
+        candidates.push(Reverse(Neighbor { idx: entry, distance: entry_dist }));
 
-        let mut results = BinaryHeap::new(); // max-heap (farthest at top for pruning)
-        results.push(Neighbor { idx: entry, distance: entry_dist });
+        // results: max-heap (farthest at top for pruning)
+        // Neighbor ordering is reversed, so max-heap gives us closest at top
+        // We need to manually handle this - use a Vec and sort
+        let mut results: Vec<Neighbor> = vec![Neighbor { idx: entry, distance: entry_dist }];
 
-        while let Some(curr) = candidates.pop() {
+        while let Some(Reverse(curr)) = candidates.pop() {
             // If the farthest result is closer than the nearest candidate, stop
-            if let Some(farthest) = results.peek() {
-                if curr.distance > farthest.distance && results.len() >= ef {
-                    break;
-                }
+            let farthest_dist = results.iter().map(|n| n.distance).fold(0.0f32, f32::max);
+            if curr.distance > farthest_dist && results.len() >= ef {
+                break;
             }
 
             // Expand neighbors (skip if node doesn't have this layer)
@@ -401,57 +414,71 @@ impl HnswIndex {
                 let d = distance(query, &self.nodes[neighbor_idx].entry.vector, self.config.metric);
 
                 if results.len() < ef {
-                    candidates.push(Neighbor { idx: neighbor_idx, distance: d });
+                    candidates.push(Reverse(Neighbor { idx: neighbor_idx, distance: d }));
                     results.push(Neighbor { idx: neighbor_idx, distance: d });
-                } else if let Some(farthest) = results.peek() {
-                    if d < farthest.distance {
-                        results.pop();
-                        results.push(Neighbor { idx: neighbor_idx, distance: d });
-                        candidates.push(Neighbor { idx: neighbor_idx, distance: d });
+                } else {
+                    // Find and replace the farthest result if this is closer
+                    if let Some(farthest_idx) = results.iter().enumerate()
+                        .max_by(|(_, a), (_, b)| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal))
+                        .map(|(i, _)| i)
+                    {
+                        if d < results[farthest_idx].distance {
+                            results[farthest_idx] = Neighbor { idx: neighbor_idx, distance: d };
+                            candidates.push(Reverse(Neighbor { idx: neighbor_idx, distance: d }));
+                        }
                     }
                 }
             }
         }
 
         // Extract results sorted by distance (closest first)
-        let mut result_vec: Vec<usize> = results.into_iter().map(|n| n.idx).collect();
-        result_vec.sort_by(|&a, &b| {
-            let da = distance(query, &self.nodes[a].entry.vector, self.config.metric);
-            let db = distance(query, &self.nodes[b].entry.vector, self.config.metric);
-            da.partial_cmp(&db).unwrap_or(Ordering::Equal)
-        });
-        result_vec
+        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        results.into_iter().map(|n| n.idx).collect()
     }
 
-    /// Select neighbors using the diversity heuristic from the HNSW paper.
-    /// Prefer neighbors that are not only close to the query but also diverse.
-    fn select_neighbors(&self, candidates: &[usize], m: usize) -> Vec<usize> {
-        if candidates.len() <= m {
-            return candidates.to_vec();
-        }
-
-        // Simple heuristic: just take the M nearest (diversity heuristic can be added later)
-        candidates[..m.min(candidates.len())].to_vec()
-    }
-
-    /// Simple neighbor selection (just take M nearest by distance to the node).
-    fn select_neighbors_simple(
+    /// Select neighbors with simple nearest-first strategy.
+    fn select_neighbors_diverse(
         &self,
-        _query: &[f32],
+        query: &[f32],
         candidates: &[usize],
         m: usize,
-        layer: usize,
+        _layer: usize,
     ) -> Vec<usize> {
         if candidates.len() <= m {
             return candidates.to_vec();
         }
 
-        // Compute distance from each candidate to each other, take M nearest to center
+        // Sort by distance to query and take the M nearest
+        let mut sorted: Vec<(usize, f32)> = candidates
+            .iter()
+            .map(|&idx| {
+                let d = distance(query, &self.nodes[idx].entry.vector, self.config.metric);
+                (idx, d)
+            })
+            .collect();
+        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        sorted.truncate(m);
+        sorted.into_iter().map(|(idx, _)| idx).collect()
+    }
+
+    /// Simple neighbor selection (just take M nearest by distance to the node).
+    fn select_neighbors_simple(
+        &self,
+        query: &[f32],
+        candidates: &[usize],
+        m: usize,
+        _layer: usize,
+    ) -> Vec<usize> {
+        if candidates.len() <= m {
+            return candidates.to_vec();
+        }
+
+        // Sort by distance to query
         let mut sorted = candidates.to_vec();
         sorted.sort_by(|&a, &b| {
-            let da = self.nodes[a].neighbors[layer].len();
-            let db = self.nodes[b].neighbors[layer].len();
-            da.cmp(&db) // Fewer neighbors = keep for balance
+            let da = distance(query, &self.nodes[a].entry.vector, self.config.metric);
+            let db = distance(query, &self.nodes[b].entry.vector, self.config.metric);
+            da.partial_cmp(&db).unwrap_or(Ordering::Equal)
         });
         sorted.truncate(m);
         sorted
