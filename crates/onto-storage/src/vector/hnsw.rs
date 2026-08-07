@@ -150,10 +150,10 @@ pub struct HnswIndex {
     nodes: Vec<HnswNode>,
     entry_point: Option<usize>,
     max_layer: usize,
-    /// Reusable visited bitmap (interior mutability for search performance).
-    visited: std::cell::RefCell<Vec<u64>>,
+    /// Reusable visited bitmap (thread-safe interior mutability).
+    visited: parking_lot::RwLock<Vec<u64>>,
     /// Current generation for visited bitmap (avoids clearing).
-    visited_gen: std::cell::Cell<u64>,
+    visited_gen: std::sync::atomic::AtomicU64,
 }
 
 impl HnswIndex {
@@ -163,8 +163,8 @@ impl HnswIndex {
             nodes: Vec::new(),
             entry_point: None,
             max_layer: 0,
-            visited: std::cell::RefCell::new(Vec::new()),
-            visited_gen: std::cell::Cell::new(0),
+            visited: parking_lot::RwLock::new(Vec::new()),
+            visited_gen: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -406,11 +406,10 @@ impl HnswIndex {
         let mut results = BinaryHeap::new();
         results.push(MaxEntry { idx: entry, dist: entry_dist });
 
-        // Reuse visited bitmap (interior mutability)
-        let gen = self.visited_gen.get() + 1;
-        self.visited_gen.set(gen);
+        // Reuse visited bitmap (thread-safe interior mutability)
+        let gen = self.visited_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         {
-            let mut visited = self.visited.borrow_mut();
+            let mut visited = self.visited.write();
             if visited.len() < self.nodes.len() {
                 visited.resize(self.nodes.len(), 0);
             }
@@ -435,7 +434,7 @@ impl HnswIndex {
             for i in 0..nbrs_len {
                 let nbr = self.nodes[curr.idx].neighbors[layer][i];
                 {
-                    let mut visited = self.visited.borrow_mut();
+                    let mut visited = self.visited.write();
                     if visited[nbr] == gen {
                         continue;
                     }

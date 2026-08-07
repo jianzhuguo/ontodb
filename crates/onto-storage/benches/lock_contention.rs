@@ -1,55 +1,51 @@
 //! Benchmark: OntoDB storage engine performance.
 //!
 //! Tests:
-//! 1. Lock contention (read vs write lock) on scan_prefix
+//! 1. Concurrent scan_prefix throughput (internal Mutex contention)
 //! 2. WAL write throughput (put operations)
-//! 3. HNSW batch construction vs individual inserts
+//! 3. Mixed read/write throughput
+//! 4. HNSW batch construction vs individual inserts
 
 use onto_storage::vector::DistanceMetric;
 use onto_storage::{LsmEngine, StorageOptions};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-fn setup_engine(row_count: usize) -> (Arc<RwLock<LsmEngine>>, tempfile::TempDir) {
+fn setup_engine(row_count: usize) -> (Arc<LsmEngine>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let options = StorageOptions {
         data_dir: dir.path().to_path_buf(),
         memtable_size_limit: 4 * 1024 * 1024,
         ..Default::default()
     };
-    let engine = LsmEngine::open(options).unwrap();
-    let engine = Arc::new(RwLock::new(engine));
+    let engine = Arc::new(LsmEngine::open(options).unwrap());
 
-    {
-        let eng = engine.write().unwrap();
-        for i in 0..row_count {
-            let key = format!("Product::{:020}", i).into_bytes();
-            let val = format!(
-                r#"{{"__class__":"Product","name":"item_{}","price":{}}}"#,
-                i,
-                (i * 10) % 10000
-            )
-            .into_bytes();
-            eng.put(key, val).unwrap();
-        }
+    for i in 0..row_count {
+        let key = format!("Product::{:020}", i).into_bytes();
+        let val = format!(
+            r#"{{"__class__":"Product","name":"item_{}","price":{}}}"#,
+            i,
+            (i * 10) % 10000
+        )
+        .into_bytes();
+        engine.put(key, val).unwrap();
     }
 
     (engine, dir)
 }
 
 /// Sequential scan_prefix baseline (single-threaded).
-fn bench_sequential_scan(engine: &RwLock<LsmEngine>, iterations: usize) -> Duration {
+fn bench_sequential_scan(engine: &LsmEngine, iterations: usize) -> Duration {
     let start = Instant::now();
     for _ in 0..iterations {
-        let eng = engine.read().unwrap();
-        let _ = eng.scan_prefix(b"Product::").unwrap();
+        let _ = engine.scan_prefix(b"Product::").unwrap();
     }
     start.elapsed()
 }
 
-/// Concurrent scan_prefix via read lock (allows parallelism).
-fn bench_concurrent_read_lock(
-    engine: Arc<RwLock<LsmEngine>>,
+/// Concurrent scan_prefix — tests internal Mutex contention.
+fn bench_concurrent_scan(
+    engine: Arc<LsmEngine>,
     iterations: usize,
     num_threads: usize,
 ) -> Duration {
@@ -62,34 +58,7 @@ fn bench_concurrent_read_lock(
         let eng = Arc::clone(&engine);
         handles.push(std::thread::spawn(move || {
             for _ in 0..count {
-                let guard = eng.read().unwrap();
-                let _ = guard.scan_prefix(b"Product::").unwrap();
-            }
-        }));
-    }
-    for h in handles {
-        h.join().unwrap();
-    }
-    start.elapsed()
-}
-
-/// Concurrent scan_prefix via write lock (serialized).
-fn bench_concurrent_write_lock(
-    engine: Arc<RwLock<LsmEngine>>,
-    iterations: usize,
-    num_threads: usize,
-) -> Duration {
-    let per_thread = iterations / num_threads;
-    let start = Instant::now();
-    let mut handles = Vec::new();
-
-    for t in 0..num_threads {
-        let count = per_thread + if t < iterations % num_threads { 1 } else { 0 };
-        let eng = Arc::clone(&engine);
-        handles.push(std::thread::spawn(move || {
-            for _ in 0..count {
-                let guard = eng.write().unwrap();
-                let _ = guard.scan_prefix(b"Product::").unwrap();
+                let _ = eng.scan_prefix(b"Product::").unwrap();
             }
         }));
     }
@@ -101,7 +70,7 @@ fn bench_concurrent_write_lock(
 
 /// Mixed: concurrent readers + a writer doing flush (heavy I/O).
 fn bench_mixed_read_write(
-    engine: Arc<RwLock<LsmEngine>>,
+    engine: Arc<LsmEngine>,
     read_iters: usize,
     num_readers: usize,
 ) -> Duration {
@@ -113,8 +82,7 @@ fn bench_mixed_read_write(
         let eng = Arc::clone(&engine);
         handles.push(std::thread::spawn(move || {
             for _ in 0..reads_per {
-                let guard = eng.read().unwrap();
-                let _ = guard.scan_prefix(b"Product::").unwrap();
+                let _ = eng.scan_prefix(b"Product::").unwrap();
             }
         }));
     }
@@ -123,11 +91,10 @@ fn bench_mixed_read_write(
         let eng = Arc::clone(&engine);
         handles.push(std::thread::spawn(move || {
             for i in 0..50 {
-                let guard = eng.write().unwrap();
                 let key = format!("New::{:020}", i).into_bytes();
                 let val = b"{}".to_vec();
-                let _ = guard.put(key, val);
-                let _ = guard.flush();
+                let _ = eng.put(key, val);
+                let _ = eng.flush();
             }
         }));
     }
@@ -233,24 +200,19 @@ fn main() {
     println!("{}", "=".repeat(72));
     println!();
 
-    // ── Section 1: Lock Contention ──
-    println!("─── 1. Lock Contention (scan_prefix) ───");
+    // ── Section 1: Concurrent Scan Throughput ──
+    println!("─── 1. Concurrent Scan Throughput ───");
     let seq = bench_sequential_scan(&engine, iterations);
     println!("  Sequential scan (1 thread):  {:>8?}", seq);
     println!();
 
-    println!("  Concurrent scan_prefix (read-lock vs write-lock):");
+    println!("  Concurrent scan_prefix (multi-threaded):");
     for &nt in &[2, 4, 8] {
-        let rl = bench_concurrent_read_lock(Arc::clone(&engine), iterations, nt);
-        let wl = bench_concurrent_write_lock(Arc::clone(&engine), iterations, nt);
-        let speedup = if rl.as_micros() > 0 {
-            wl.as_secs_f64() / rl.as_secs_f64()
-        } else {
-            f64::INFINITY
-        };
+        let ct = bench_concurrent_scan(Arc::clone(&engine), iterations, nt);
+        let speedup = seq.as_secs_f64() / ct.as_secs_f64();
         println!(
-            "    {} threads:  read={:>8?}  write={:>8?}  speedup={:.2}x",
-            nt, rl, wl, speedup
+            "    {} threads:  {:>8?}  speedup={:.2}x",
+            nt, ct, speedup
         );
     }
     println!();

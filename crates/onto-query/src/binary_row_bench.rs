@@ -25,9 +25,7 @@ fn setup() -> (Arc<QueryExecutor>, tempfile::TempDir) {
         memtable_size_limit: 64 * 1024 * 1024,
         ..Default::default()
     };
-    let engine = Arc::new(std::sync::RwLock::new(
-        onto_storage::LsmEngine::open(options).unwrap(),
-    ));
+    let engine = Arc::new(onto_storage::LsmEngine::open(options).unwrap());
     let ontology_store = onto_ontology::OntologyStore::new(engine.clone());
     let executor = Arc::new(QueryExecutor::new(engine, ontology_store));
 
@@ -277,10 +275,8 @@ mod tests {
         // 6. Micro-bench: parse + to_map
         // ─────────────────────────────────────────────────────────────────────
         println!("── Micro: BinaryRow::parse+to_map vs serde_json::from_slice ──");
-        let engine_guard = executor.engine();
-        let entries = engine_guard.scan_prefix(b"Product::").unwrap();
+        let entries = executor.engine().scan_prefix(b"Product::").unwrap();
         let sample_bytes = entries.first().map(|(_, v)| v.clone()).unwrap();
-        drop(engine_guard);
 
         let (bin_parse, json_parse) = bench_parse_comparison(&sample_bytes, PARSE_ITERS);
         print_comparison("parse + to_map", bin_parse, json_parse, PARSE_ITERS);

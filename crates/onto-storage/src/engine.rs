@@ -36,12 +36,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 
-/// Mutable write-path state, protected by a single Mutex.
+/// Mutable write-path state, protected by RwLock for concurrent read access.
 ///
-/// Grouping these fields allows the engine to use `&self` for all methods
-/// (interior mutability), so reads never need an outer RwLock.
-/// The lock is held only for fast in-memory operations; I/O-heavy work
-/// (SSTable building) happens outside the lock.
+/// Read-path operations (get, scan_prefix) acquire a shared read lock.
+/// Write-path operations (put, delete, flush) acquire an exclusive write lock.
+/// SST cache is separated into its own Mutex because read-path code may
+/// lazily open SSTable files (cache miss).
 struct WriteState {
     /// Active MemTable for writes.
     memtable: MemTable,
@@ -55,9 +55,6 @@ struct WriteState {
     /// MVCC transaction manager.
     txn_manager: TxnManager,
 
-    /// Cache of opened SSTable handles, keyed by file path.
-    sst_cache: HashMap<PathBuf, Arc<SsTable>>,
-
     /// Number of appends since last WAL flush. Batched to reduce syscalls.
     wal_pending_count: u32,
 }
@@ -66,10 +63,15 @@ struct WriteState {
 ///
 /// All methods take `&self` — the engine is `Sync` and can be shared via
 /// `Arc<LsmEngine>` without an outer `RwLock`.  Write-path state lives
-/// behind `Mutex<WriteState>`; index managers behind `RwLock`.
+/// behind `RwLock<WriteState>` for concurrent read access; SST cache
+/// behind a separate `Mutex` for lazy loading; index managers behind `RwLock`.
 pub struct LsmEngine {
-    /// Write-path state (memtable, WAL, txn manager, SST cache).
-    write_state: Mutex<WriteState>,
+    /// Write-path state (memtable, WAL, txn manager).
+    /// Read lock for get/scan, write lock for put/delete/flush.
+    write_state: RwLock<WriteState>,
+
+    /// SSTable handle cache (separate Mutex — read path may lazily open files).
+    sst_cache: Mutex<HashMap<PathBuf, Arc<SsTable>>>,
 
     /// SSTables organized by level. Level 0 is newest.
     /// Shared with the background compaction worker via Arc<Mutex>.
@@ -106,6 +108,7 @@ pub struct LsmEngine {
 /// Temporary helper for loading WAL + SSTables before spawning the compaction worker.
 struct PreLoadEngine {
     write_state: WriteState,
+    sst_cache: HashMap<PathBuf, Arc<SsTable>>,
     levels: Vec<Vec<SsTableInfo>>,
     options: StorageOptions,
     seq_counter: AtomicU64,
@@ -174,7 +177,7 @@ impl PreLoadEngine {
                     }
                 }
             }
-            self.write_state.sst_cache.insert(path.clone(), Arc::new(sst));
+            self.sst_cache.insert(path.clone(), Arc::new(sst));
             self.levels[level].push(SsTableInfo {
                 path,
                 size: metadata.len(),
@@ -204,9 +207,9 @@ impl LsmEngine {
                 immutable_memtable: None,
                 wal,
                 txn_manager: TxnManager::new(),
-                sst_cache: HashMap::new(),
                 wal_pending_count: 0,
             },
+            sst_cache: HashMap::new(),
             levels: vec![Vec::new(); options.num_levels],
             options: options.clone(),
             seq_counter: AtomicU64::new(0),
@@ -238,7 +241,8 @@ impl LsmEngine {
         };
 
         let engine = LsmEngine {
-            write_state: Mutex::new(pre_engine.write_state),
+            write_state: RwLock::new(pre_engine.write_state),
+            sst_cache: Mutex::new(pre_engine.sst_cache),
             levels,
             options,
             seq_counter: pre_engine.seq_counter,
@@ -265,7 +269,7 @@ impl LsmEngine {
         let entry = Entry::put(key.clone(), value.clone(), seq);
 
         let needs_flush = {
-            let mut ws = self.write_state.lock().unwrap();
+            let mut ws = self.write_state.write().unwrap();
             ws.wal.append(&entry)?;
             ws.wal_pending_count += 1;
             // Batch flush: only flush WAL buffer every 64 writes
@@ -303,11 +307,9 @@ impl LsmEngine {
             cands
         };
 
-        // 2. Check MemTables + snapshot SST handles in a single write_state lock.
-        let sst_handles: Vec<Arc<SsTable>> = {
-            let mut ws = self.write_state.lock().unwrap();
-
-            // Check MemTables first (in-memory, fast path)
+        // 2. Check MemTables under read lock (concurrent with other readers).
+        {
+            let ws = self.write_state.read().unwrap();
             if let Some((val, _)) = ws.memtable.get(key) {
                 return Ok(Some(val.to_vec()));
             }
@@ -316,18 +318,21 @@ impl LsmEngine {
                     return Ok(Some(val.to_vec()));
                 }
             }
+        }
 
-            // Snapshot SST handles from cache (open missing ones lazily)
+        // 3. Snapshot SST handles from cache (may lazily open files).
+        let sst_handles: Vec<Arc<SsTable>> = {
+            let mut cache = self.sst_cache.lock().unwrap();
             candidates.iter().filter_map(|path| {
-                if !ws.sst_cache.contains_key(path) {
+                if !cache.contains_key(path) {
                     let sst = SsTable::open(path).ok()?;
-                    ws.sst_cache.insert(path.clone(), Arc::new(sst));
+                    cache.insert(path.clone(), Arc::new(sst));
                 }
-                ws.sst_cache.get(path).map(Arc::clone)
+                cache.get(path).map(Arc::clone)
             }).collect()
         };
 
-        // 3. Iterate SST handles outside the lock (I/O-heavy).
+        // 4. Iterate SST handles outside the lock (I/O-heavy).
         for sst in &sst_handles {
             match sst.get_full(key)? {
                 Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
@@ -393,14 +398,14 @@ impl LsmEngine {
 
         // Step 1: Snapshot SST handles from cache (brief lock — open missing files outside)
         let sst_handles: Vec<Arc<SsTable>> = {
-            let mut ws = self.write_state.lock().unwrap();
+            let mut cache = self.sst_cache.lock().unwrap();
             let mut handles = Vec::with_capacity(sst_paths.len());
             for path in &sst_paths {
-                if let Some(sst) = ws.sst_cache.get(path) {
+                if let Some(sst) = cache.get(path) {
                     handles.push(Arc::clone(sst));
                 } else {
                     let sst = Arc::new(SsTable::open(path)?);
-                    ws.sst_cache.insert(path.to_path_buf(), Arc::clone(&sst));
+                    cache.insert(path.to_path_buf(), Arc::clone(&sst));
                     handles.push(sst);
                 }
             }
@@ -438,9 +443,9 @@ impl LsmEngine {
             }
         }
 
-        // Step 3: Scan MemTables (brief lock — in-memory, fast)
+        // Step 3: Scan MemTables (read lock — concurrent with other readers)
         {
-            let ws = self.write_state.lock().unwrap();
+            let ws = self.write_state.read().unwrap();
 
             // Scan immutable MemTable (overrides SSTables)
             if let Some(ref imm) = ws.immutable_memtable {
@@ -512,7 +517,7 @@ impl LsmEngine {
         let entry = Entry::delete(key.clone(), seq);
 
         let needs_flush = {
-            let mut ws = self.write_state.lock().unwrap();
+            let mut ws = self.write_state.write().unwrap();
             ws.wal.append(&entry)?;
             ws.wal_pending_count += 1;
             // Batch flush: only flush WAL buffer every 64 writes
@@ -535,7 +540,7 @@ impl LsmEngine {
     /// Call this after a batch of writes to ensure all data is persisted.
     pub fn flush(&self) -> Result<()> {
         let needs_flush = {
-            let ws = self.write_state.lock().unwrap();
+            let ws = self.write_state.read().unwrap();
             !ws.memtable.is_empty()
         };
         if needs_flush {
@@ -548,7 +553,7 @@ impl LsmEngine {
     fn flush_memtable(&self) -> Result<()> {
         // Step 1: Swap current MemTable to immutable (brief lock)
         {
-            let mut ws = self.write_state.lock().unwrap();
+            let mut ws = self.write_state.write().unwrap();
             // Flush any pending WAL writes before swapping
             if ws.wal_pending_count > 0 {
                 ws.wal.flush_buf()?;
@@ -562,7 +567,7 @@ impl LsmEngine {
         let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
         let sst_path = self.options.data_dir.join(format!("L0_{}.sst", sst_id));
         let (entries_snapshot, min_key, max_key) = {
-            let ws = self.write_state.lock().unwrap();
+            let ws = self.write_state.read().unwrap();
             if let Some(ref imm) = ws.immutable_memtable {
                 let entries: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = imm
                     .entries()
@@ -608,8 +613,10 @@ impl LsmEngine {
         // immutable MT cleared and the next lazy SST open.
         let new_sst = SsTable::open(&sst_path)?;
         {
-            let mut ws = self.write_state.lock().unwrap();
-            ws.sst_cache.insert(sst_path, Arc::new(new_sst));
+            self.sst_cache.lock().unwrap().insert(sst_path, Arc::new(new_sst));
+        }
+        {
+            let mut ws = self.write_state.write().unwrap();
             ws.immutable_memtable = None;
             self.reset_wal_internal(&mut ws)?;
         }
@@ -648,9 +655,9 @@ impl LsmEngine {
 
         // Selectively remove only the evicted SST paths from the cache.
         if !evicted_paths.is_empty() {
-            let mut ws = self.write_state.lock().unwrap();
+            let mut cache = self.sst_cache.lock().unwrap();
             for path in &evicted_paths {
-                ws.sst_cache.remove(path);
+                cache.remove(path);
             }
         }
 
@@ -682,9 +689,9 @@ impl LsmEngine {
         }
         drop(receiver);
         if !evicted_paths.is_empty() {
-            let mut ws = self.write_state.lock().unwrap();
+            let mut cache = self.sst_cache.lock().unwrap();
             for path in &evicted_paths {
-                ws.sst_cache.remove(path);
+                cache.remove(path);
             }
         }
         Ok(())
@@ -828,7 +835,7 @@ impl LsmEngine {
     pub fn begin_txn(&self) -> SeqNo {
         // seq_counter is the NEXT value to assign, so last committed = seq_counter - 1
         let last_seq = self.seq_counter.load(Ordering::Relaxed).saturating_sub(1);
-        self.write_state.lock().unwrap().txn_manager.begin(last_seq)
+        self.write_state.write().unwrap().txn_manager.begin(last_seq)
     }
 
     /// Commits a transaction. Flushes its write buffer to WAL + MemTable.
@@ -839,8 +846,14 @@ impl LsmEngine {
     ///  Phase 3 — brief write_state: WAL + memtable writes
     pub fn commit_txn(&self, txn_id: SeqNo) -> Result<()> {
         // ── Phase 1: Take writes, assign sequence numbers, read old values ──
+        // Snapshot SST cache BEFORE acquiring write_state lock to avoid nested lock deadlock.
+        let sst_cache_snapshot: HashMap<PathBuf, Arc<SsTable>> = {
+            let cache = self.sst_cache.lock().unwrap();
+            cache.clone()
+        };
+
         let (writes_with_seq, old_values, index_entries_batch) = {
-            let mut ws = self.write_state.lock().unwrap();
+            let mut ws = self.write_state.write().unwrap();
             let writes = ws.txn_manager.commit(txn_id)?;
 
             let mut writes_with_seq: Vec<(Vec<u8>, WriteOp, SeqNo)> = Vec::with_capacity(writes.len());
@@ -859,9 +872,9 @@ impl LsmEngine {
                     self.vector_index_manager.read().unwrap().has_any_index(c)
                 });
 
-                // Read old value for de-indexing (from locked memtable + SST cache)
+                // Read old value for de-indexing (from locked memtable + SST cache snapshot)
                 if has_indexes || has_vector_indexes {
-                    if let Some(old_val) = Self::get_from_locked(&ws, key.as_slice())? {
+                    if let Some(old_val) = Self::get_from_locked(&ws, &sst_cache_snapshot, key.as_slice())? {
                         old_values.insert(key.clone(), old_val);
                     }
                 }
@@ -919,7 +932,7 @@ impl LsmEngine {
 
         // ── Phase 3: WAL + MemTable writes (brief write_state) ──
         let needs_flush = {
-            let mut ws = self.write_state.lock().unwrap();
+            let mut ws = self.write_state.write().unwrap();
 
             // Write index entries to WAL + memtable
             for (idx_key, idx_val, idx_seq) in index_entries_batch {
@@ -971,9 +984,9 @@ impl LsmEngine {
         }
     }
 
-    /// Gets a value by key from already-locked write state (memtable + SST cache).
-    /// Used by `commit_txn` which holds the write_state lock.
-    fn get_from_locked(ws: &WriteState, key: &[u8]) -> Result<Option<Value>> {
+    /// Gets a value by key from already-locked write state + SST cache.
+    /// Used by `commit_txn` which holds the write_state write lock.
+    fn get_from_locked(ws: &WriteState, sst_cache: &HashMap<PathBuf, Arc<SsTable>>, key: &[u8]) -> Result<Option<Value>> {
         if let Some((val, _)) = ws.memtable.get(key) {
             return Ok(Some(val.to_vec()));
         }
@@ -982,7 +995,7 @@ impl LsmEngine {
                 return Ok(Some(val.to_vec()));
             }
         }
-        for sst in ws.sst_cache.values() {
+        for sst in sst_cache.values() {
             match sst.get_full(key)? {
                 Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
                 Some((_, _, EntryKind::Delete)) => return Ok(None),
@@ -994,12 +1007,12 @@ impl LsmEngine {
 
     /// Aborts a transaction. Discards all pending writes.
     pub fn abort_txn(&self, txn_id: SeqNo) -> Result<()> {
-        self.write_state.lock().unwrap().txn_manager.abort(txn_id)
+        self.write_state.write().unwrap().txn_manager.abort(txn_id)
     }
 
     /// Buffers a put operation in a transaction.
     pub fn txn_put(&self, txn_id: SeqNo, key: Key, value: Value) -> Result<()> {
-        self.write_state.lock().unwrap()
+        self.write_state.write().unwrap()
             .txn_manager
             .get_mut(txn_id)
             .ok_or_else(|| onto_core::CoreError::InvalidArgument(
@@ -1011,7 +1024,7 @@ impl LsmEngine {
 
     /// Buffers a delete operation in a transaction.
     pub fn txn_delete(&self, txn_id: SeqNo, key: Key) -> Result<()> {
-        self.write_state.lock().unwrap()
+        self.write_state.write().unwrap()
             .txn_manager
             .get_mut(txn_id)
             .ok_or_else(|| onto_core::CoreError::InvalidArgument(
@@ -1030,7 +1043,7 @@ impl LsmEngine {
     pub fn txn_get(&self, txn_id: SeqNo, key: &[u8]) -> Result<Option<Value>> {
         // 1. Check transaction's own write buffer
         {
-            let ws = self.write_state.lock().unwrap();
+            let ws = self.write_state.read().unwrap();
             if let Some(txn) = ws.txn_manager.get(txn_id) {
                 if let Some(op) = txn.write_buffer_get(key) {
                     return match op {
@@ -1042,7 +1055,7 @@ impl LsmEngine {
         }
 
         // 2-3. Read from storage with snapshot visibility
-        let vis = self.write_state.lock().unwrap().txn_manager.visibility_for(txn_id);
+        let vis = self.write_state.read().unwrap().txn_manager.visibility_for(txn_id);
         self.get_with_visibility(key, &vis)
     }
 
@@ -1053,7 +1066,7 @@ impl LsmEngine {
         prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let (vis, write_buffer) = {
-            let ws = self.write_state.lock().unwrap();
+            let ws = self.write_state.read().unwrap();
             let vis = ws.txn_manager.visibility_for(txn_id);
             let buf: Vec<(Vec<u8>, WriteOp)> = ws.txn_manager.get(txn_id)
                 .map(|t| t.write_buffer_iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -1095,7 +1108,7 @@ impl LsmEngine {
     ) -> Result<Option<Value>> {
         // Check active MemTable — use range query to find visible version
         {
-            let ws = self.write_state.lock().unwrap();
+            let ws = self.write_state.read().unwrap();
             for entry in ws.memtable.get_versions(key) {
                 if vis.is_visible(entry.seq_no) {
                     if entry.is_tombstone() {
@@ -1134,14 +1147,14 @@ impl LsmEngine {
 
         // Snapshot SST handles from cache (brief lock)
         let sst_handles: Vec<Arc<SsTable>> = {
-            let mut ws = self.write_state.lock().unwrap();
+            let mut cache = self.sst_cache.lock().unwrap();
             let mut handles = Vec::with_capacity(candidates.len());
             for path in &candidates {
-                if let Some(sst) = ws.sst_cache.get(path) {
+                if let Some(sst) = cache.get(path) {
                     handles.push(Arc::clone(sst));
                 } else {
                     let sst = Arc::new(SsTable::open(path)?);
-                    ws.sst_cache.insert(path.to_path_buf(), Arc::clone(&sst));
+                    cache.insert(path.to_path_buf(), Arc::clone(&sst));
                     handles.push(sst);
                 }
             }
@@ -1175,7 +1188,7 @@ impl LsmEngine {
 
     /// Returns the number of active transactions.
     pub fn active_txn_count(&self) -> usize {
-        self.write_state.lock().unwrap().txn_manager.active_count()
+        self.write_state.read().unwrap().txn_manager.active_count()
     }
 
     // =================================================================
@@ -1206,7 +1219,7 @@ impl LsmEngine {
 
         // Phase 2: Persist index entries to WAL + MemTable under a single write lock
         if !all_index_entries.is_empty() {
-            let mut ws = self.write_state.lock().unwrap();
+            let mut ws = self.write_state.write().unwrap();
             for (key, value) in all_index_entries {
                 let seq = self.next_seq();
                 let entry = Entry::put(key.clone(), value.clone(), seq);
@@ -1268,7 +1281,7 @@ impl LsmEngine {
         let seq = self.next_seq();
         let entry = Entry::put(meta_key.clone(), meta_val.clone(), seq);
         {
-            let mut ws = self.write_state.lock().unwrap();
+            let mut ws = self.write_state.write().unwrap();
             ws.wal.append(&entry)?;
             ws.wal.flush_buf()?;
             ws.memtable.put_with_seq(meta_key, meta_val, seq);
@@ -1315,7 +1328,7 @@ impl LsmEngine {
             let meta_key = Self::make_vec_meta_key(class, column);
             let seq = self.next_seq();
             let del_entry = Entry::delete(meta_key.clone(), seq);
-            let mut ws = self.write_state.lock().unwrap();
+            let mut ws = self.write_state.write().unwrap();
             let _ = ws.wal.append(&del_entry);
             let _ = ws.wal.flush_buf();
             ws.memtable.delete_with_seq(meta_key, seq);
@@ -1335,7 +1348,7 @@ impl LsmEngine {
 
     /// Returns engine statistics.
     pub fn stats(&self) -> EngineStats {
-        let ws = self.write_state.lock().unwrap();
+        let ws = self.write_state.read().unwrap();
         let levels = self.levels.lock().unwrap();
         let total_sstables: usize = levels.iter().map(|l| l.len()).sum();
         let total_sst_size: u64 = levels

@@ -14,7 +14,7 @@ fn setup_bench(row_count: usize) -> (Arc<QueryExecutor>, tempfile::TempDir) {
         memtable_size_limit: 4 * 1024 * 1024,
         ..Default::default()
     };
-    let engine = Arc::new(std::sync::RwLock::new(onto_storage::LsmEngine::open(options).unwrap()));
+    let engine = Arc::new(onto_storage::LsmEngine::open(options).unwrap());
     let ontology_store = onto_ontology::OntologyStore::new(engine.clone());
     let executor = Arc::new(QueryExecutor::new(engine, ontology_store));
 

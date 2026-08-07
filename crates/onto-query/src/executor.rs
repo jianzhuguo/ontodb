@@ -228,7 +228,7 @@ fn storage_bytes_to_doc(bytes: &[u8]) -> Option<Map<String, Value>> {
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Query execution configuration.
@@ -251,7 +251,7 @@ impl Default for QueryConfig {
 
 /// Executes parsed queries with caching support.
 pub struct QueryExecutor {
-    engine: Arc<RwLock<LsmEngine>>,
+    engine: Arc<LsmEngine>,
     ontology_store: OntologyStore,
     /// Query planner for optimization (wrapped for interior mutability).
     planner: std::sync::RwLock<QueryPlanner>,
@@ -342,11 +342,11 @@ impl InferenceCache {
 }
 
 impl QueryExecutor {
-    pub fn new(engine: Arc<RwLock<LsmEngine>>, ontology_store: OntologyStore) -> Self {
+    pub fn new(engine: Arc<LsmEngine>, ontology_store: OntologyStore) -> Self {
         Self::with_config(engine, ontology_store, QueryConfig::default())
     }
 
-    pub fn with_config(engine: Arc<RwLock<LsmEngine>>, ontology_store: OntologyStore, config: QueryConfig) -> Self {
+    pub fn with_config(engine: Arc<LsmEngine>, ontology_store: OntologyStore, config: QueryConfig) -> Self {
         Self {
             engine,
             ontology_store,
@@ -368,13 +368,13 @@ impl QueryExecutor {
 
     /// Get engine storage statistics (SSTable count, total entries, etc.).
     pub fn engine_stats(&self) -> Option<onto_storage::engine::EngineStats> {
-        self.engine.read().ok().map(|e| e.stats())
+        Some(self.engine.stats())
     }
 
-    /// Access the engine for benchmarks (read lock).
+    /// Access the engine for benchmarks and tests.
     #[cfg(test)]
-    pub(crate) fn engine(&self) -> std::sync::RwLockReadGuard<'_, onto_storage::LsmEngine> {
-        self.engine.read().unwrap()
+    pub(crate) fn engine(&self) -> &onto_storage::LsmEngine {
+        &self.engine
     }
 
     /// Get a reference to the query planner.
@@ -405,9 +405,7 @@ impl QueryExecutor {
 
     /// Returns schema introspection data: all ontologies, classes, properties, and indexes.
     pub fn schema_info(&self) -> Result<serde_json::Value> {
-        let engine = self.engine.read().map_err(|e| {
-            CoreError::Custom(format!("engine lock poisoned: {}", e))
-        })?;
+        let engine = &self.engine;
 
         let mut ontologies = Vec::new();
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
@@ -532,9 +530,7 @@ impl QueryExecutor {
 
         // For DDL, transactions, and complex queries, use a read lock
         // (all LsmEngine methods take &self via interior mutability)
-        let engine = self.engine.read().map_err(|e| {
-            CoreError::Custom(format!("engine lock poisoned: {}", e))
-        })?;
+        let engine = &self.engine;
         self.execute_write_with_engine(ast, &engine)
     }
 
@@ -542,32 +538,18 @@ impl QueryExecutor {
     /// The write lock is only held during transaction begin + commit, not during query planning/execution.
     fn execute_dml_short_lock(&self, ast: &QueryAst) -> Result<QueryResult> {
         let start_time = std::time::Instant::now();
+        let engine = &self.engine;
 
-        // Phase 1: Begin transaction (brief read lock — interior mutability handles the rest)
-        let txn_id = {
-            let engine = self.engine.read().map_err(|e| {
-                CoreError::Custom(format!("engine lock poisoned: {}", e))
-            })?;
-            engine.begin_txn()
-        };
+        // Phase 1: Begin transaction
+        let txn_id = engine.begin_txn();
 
         // Phase 2: Execute query
-        let result = {
-            let engine = self.engine.read().map_err(|e| {
-                CoreError::Custom(format!("engine lock poisoned: {}", e))
-            })?;
-            self.execute_in_txn_with_plan(ast, &engine, txn_id, None)
-        };
+        let result = self.execute_in_txn_with_plan(ast, engine, txn_id, None);
 
         // Phase 3: Commit or abort
-        {
-            let engine = self.engine.read().map_err(|e| {
-                CoreError::Custom(format!("engine lock poisoned: {}", e))
-            })?;
-            match &result {
-                Ok(_) => { engine.commit_txn(txn_id)?; }
-                Err(_) => { let _ = engine.abort_txn(txn_id); }
-            }
+        match &result {
+            Ok(_) => { engine.commit_txn(txn_id)?; }
+            Err(_) => { let _ = engine.abort_txn(txn_id); }
         }
 
         let elapsed = start_time.elapsed();
@@ -593,9 +575,7 @@ impl QueryExecutor {
     /// materialized views, CTEs, or expression evaluation.
     /// Multiple `execute_read` calls can run concurrently.
     pub fn execute_read(&self, ast: &QueryAst) -> Result<QueryResult> {
-        let engine = self.engine.read().map_err(|e| {
-            CoreError::Custom(format!("engine lock poisoned: {}", e))
-        })?;
+        let engine = &self.engine;
         self.execute_select_read(ast, &engine)
     }
 
@@ -6254,7 +6234,7 @@ mod tests {
             memtable_size_limit: 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
         let ontology_store = OntologyStore::new(engine.clone());
         let executor = QueryExecutor::with_config(engine, ontology_store, config);
         (executor, dir)
@@ -6281,7 +6261,7 @@ mod tests {
         insert_row(&executor, "Product", "MacBook", 1999);
 
         // Flush to ensure data is in SSTables
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6300,7 +6280,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
 
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price > 900").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6321,7 +6301,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
 
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT * FROM Product LIMIT 2").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6340,7 +6320,7 @@ mod tests {
         insert_row(&executor, "Customer", "Alice", 0);
         insert_row(&executor, "Product", "iPad", 799);
 
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Should only return Products
         let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
@@ -6366,7 +6346,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
 
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'iPhone'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6394,7 +6374,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
 
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("DELETE FROM Product WHERE name = 'iPhone'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6422,7 +6402,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
 
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("MATCH (p: Product) WHERE price > 900 RETURN name, price").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6441,7 +6421,7 @@ mod tests {
     fn test_update_no_match() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'Galaxy'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6457,7 +6437,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 999);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Update all rows with price 999
         let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE price = 999").unwrap();
@@ -6480,7 +6460,7 @@ mod tests {
     fn test_update_multiple_fields() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("UPDATE Product SET name = 'iPhone 15', price = 1099 WHERE name = 'iPhone'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6506,7 +6486,7 @@ mod tests {
     fn test_delete_no_match() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("DELETE FROM Product WHERE name = 'Galaxy'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6530,7 +6510,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Delete all with price < 1000
         let ast = QueryParser::parse("DELETE FROM Product WHERE price < 1000").unwrap();
@@ -6557,7 +6537,7 @@ mod tests {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Delete all (no WHERE)
         let ast = QueryParser::parse("DELETE FROM Product").unwrap();
@@ -6666,11 +6646,11 @@ mod tests {
         let (executor, _dir) = setup();
 
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Insert more, flush again
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Both should be visible
         let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
@@ -6686,12 +6666,12 @@ mod tests {
         let (executor, _dir) = setup();
 
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Update
         let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'iPhone'").unwrap();
         executor.execute(&ast).unwrap();
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Verify after flush
         let ast = QueryParser::parse("SELECT price FROM Product WHERE name = 'iPhone'").unwrap();
@@ -6732,7 +6712,7 @@ mod tests {
         insert_order(&executor, "iPad", 5);
         insert_order(&executor, "iPhone", 1);
 
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // JOIN: Product p JOIN Order o ON p.name = o.product_id
         let ast = QueryParser::parse(
@@ -6758,7 +6738,7 @@ mod tests {
         insert_order(&executor, "iPad", 5);
         insert_order(&executor, "iPhone", 1);
 
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // JOIN with WHERE filter on right table
         let ast = QueryParser::parse(
@@ -6784,7 +6764,7 @@ mod tests {
         insert_order(&executor, "iPad", 5);
         insert_order(&executor, "iPhone", 1);
 
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id LIMIT 2"
@@ -6807,7 +6787,7 @@ mod tests {
         // Order references non-existent product
         insert_order(&executor, "Galaxy", 1);
 
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id"
@@ -6828,7 +6808,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_order(&executor, "iPhone", 3);
 
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // SELECT * with JOIN should return all columns from both tables
         let ast = QueryParser::parse(
@@ -6854,7 +6834,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT COUNT(*) FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6873,7 +6853,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT SUM(price) as total, AVG(price) as avg_price FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6894,7 +6874,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT MIN(price) as min_p, MAX(price) as max_p FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6957,7 +6937,7 @@ mod tests {
         };
         executor.execute(&ast).unwrap();
 
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // GROUP BY category with COUNT and SUM
         let ast = QueryParser::parse(
@@ -7007,7 +6987,7 @@ mod tests {
             };
             executor.execute(&ast).unwrap();
         }
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // GROUP BY category HAVING COUNT(*) > 1
         let ast = QueryParser::parse(
@@ -7045,7 +7025,7 @@ mod tests {
             };
             executor.execute(&ast).unwrap();
         }
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT category, COUNT(*) as cnt FROM Item GROUP BY category LIMIT 2"
@@ -7067,7 +7047,7 @@ mod tests {
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name, price FROM Product ORDER BY price").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7088,7 +7068,7 @@ mod tests {
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name, price FROM Product ORDER BY price DESC").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7109,7 +7089,7 @@ mod tests {
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product ORDER BY price DESC LIMIT 2").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7144,7 +7124,7 @@ mod tests {
             };
             executor.execute(&ast).unwrap();
         }
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // GROUP BY + ORDER BY total DESC
         let ast = QueryParser::parse(
@@ -7171,7 +7151,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPhone", 999); // duplicate
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT DISTINCT name, price FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7192,7 +7172,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "iMac", 1299);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product WHERE name LIKE 'i%'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7210,7 +7190,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook Pro", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product WHERE name LIKE '%Pro'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7229,7 +7209,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "iMac", 1299);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // i_ade should NOT match (underscore is exactly one char)
         let ast = QueryParser::parse("SELECT name FROM Product WHERE name LIKE 'iP_d'").unwrap();
@@ -7252,7 +7232,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "AirPods", 249);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price BETWEEN 500 AND 1500").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7273,7 +7253,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "AirPods", 249);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product WHERE name IN ('iPhone', 'MacBook', 'AirPods')").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7291,7 +7271,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product WHERE price IN (799, 1999)").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7318,7 +7298,7 @@ mod tests {
             values: vec![LiteralValue::String("Widget".to_string()), LiteralValue::Int(49)],
         };
         executor.execute(&ast).unwrap();
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT name FROM Product UNION SELECT name FROM Item"
@@ -7343,7 +7323,7 @@ mod tests {
             values: vec![LiteralValue::String("iPhone".to_string()), LiteralValue::Int(999)],
         };
         executor.execute(&ast).unwrap();
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // UNION ALL keeps duplicates
         let ast = QueryParser::parse(
@@ -7378,7 +7358,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Subquery: select names where price > 900
         let ast = QueryParser::parse(
@@ -7397,7 +7377,7 @@ mod tests {
     fn test_subquery_no_match() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Subquery returns empty set
         let ast = QueryParser::parse(
@@ -7426,7 +7406,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "AirPods", 249);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Range query: price > 500 鈥?should use index
         let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price > 500").unwrap();
@@ -7449,7 +7429,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "AirPods", 249);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product WHERE price < 500").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7473,7 +7453,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "AirPods", 249);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price BETWEEN 700 AND 1000").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7495,7 +7475,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // >=
         let ast = QueryParser::parse("SELECT name FROM Product WHERE price >= 999").unwrap();
@@ -7529,7 +7509,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "AirPods", 249);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product WHERE price IN (249, 1999)").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7551,7 +7531,7 @@ mod tests {
         executor.execute(&ast).unwrap();
 
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Verify index works for original price
         let ast = QueryParser::parse("SELECT name FROM Product WHERE price = 999").unwrap();
@@ -7594,7 +7574,7 @@ mod tests {
 
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Delete iPhone
         let ast = QueryParser::parse("DELETE FROM Product WHERE name = 'iPhone'").unwrap();
@@ -7626,7 +7606,7 @@ mod tests {
 
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Move iPhone from 999 to 599
         let ast = QueryParser::parse("UPDATE Product SET price = 599 WHERE name = 'iPhone'").unwrap();
@@ -7699,7 +7679,7 @@ mod tests {
         };
         executor.execute(&ast).unwrap();
 
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Vector search: find 2 nearest to [1.0, 0.0, 0.0]
         let ast = QueryParser::parse(
@@ -7749,7 +7729,7 @@ mod tests {
             };
             executor.execute(&ast).unwrap();
         }
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Vector search with filter: only "animal" category
         let ast = QueryParser::parse(
@@ -7781,7 +7761,7 @@ mod tests {
         }
 
         // Verify it exists
-        assert!(executor.engine.read().unwrap().has_vector_index("Product", "embedding"));
+        assert!(executor.engine().has_vector_index("Product", "embedding"));
 
         // Drop
         let ast = QueryParser::parse(
@@ -7794,7 +7774,7 @@ mod tests {
         }
 
         // Verify it's gone
-        assert!(!executor.engine.read().unwrap().has_vector_index("Product", "embedding"));
+        assert!(!executor.engine().has_vector_index("Product", "embedding"));
     }
 
     #[test]
@@ -7809,7 +7789,7 @@ mod tests {
                 memtable_size_limit: 1024 * 1024,
                 ..Default::default()
             };
-            let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+            let engine = Arc::new(LsmEngine::open(options).unwrap());
             let ontology_store = OntologyStore::new(engine.clone());
             let executor = QueryExecutor::new(engine.clone(), ontology_store);
 
@@ -7827,7 +7807,7 @@ mod tests {
                 ],
             };
             executor.execute(&ast).unwrap();
-            engine.read().unwrap().flush().unwrap();
+            engine.flush().unwrap();
         }
 
         // Reopen and verify vector index is rebuilt
@@ -7858,7 +7838,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT name, CASE WHEN price > 1000 THEN 'expensive' ELSE 'affordable' END FROM Product"
@@ -7885,7 +7865,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse(
             "WITH expensive AS (SELECT * FROM Product WHERE price > 900) SELECT * FROM expensive"
@@ -7907,7 +7887,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT name, ROW_NUMBER() OVER (ORDER BY price DESC) FROM Product"
@@ -7931,7 +7911,7 @@ mod tests {
     fn test_explain_analyze() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("EXPLAIN SELECT * FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7954,7 +7934,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Create materialized view
         let ast = QueryParser::parse(
@@ -7981,7 +7961,7 @@ mod tests {
     fn test_materialized_view_drop() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Create
         let ast = QueryParser::parse(
@@ -8013,7 +7993,7 @@ mod tests {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Create materialized view
         let ast = QueryParser::parse(
@@ -8030,7 +8010,7 @@ mod tests {
 
         // Add a new product
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Refresh the materialized view
         let ast = QueryParser::parse("REFRESH MATERIALIZED VIEW expensive_mv").unwrap();
@@ -8066,7 +8046,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("ANALYZE Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -8088,7 +8068,7 @@ mod tests {
     fn test_plan_cache_integration() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // First query - plan cache miss
         let ast = QueryParser::parse("SELECT * FROM Product WHERE price > 500").unwrap();
@@ -8108,7 +8088,7 @@ mod tests {
     fn test_composite_index_create() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // Create composite index
         let ast = QueryParser::parse("CREATE INDEX ON Product (name, price)").unwrap();
@@ -8136,7 +8116,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // AND condition: price > 800 AND price < 1500
         // Should use index for price > 800, then filter price < 1500
@@ -8159,7 +8139,7 @@ mod tests {
     fn test_runtime_stats_tracking() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let before = executor.runtime_stats().total_queries;
 
@@ -8183,7 +8163,7 @@ mod tests {
         for i in 0..5 {
             insert_row(&executor, "Product", &format!("item{}", i), i * 100);
         }
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         // LIMIT 2 OFFSET 2 should skip first 2, return next 2
         let ast = QueryParser::parse("SELECT name FROM Product ORDER BY price LIMIT 2 OFFSET 2").unwrap();
@@ -8200,7 +8180,7 @@ mod tests {
     fn test_offset_beyond_data() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT * FROM Product LIMIT 10 OFFSET 100").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -8242,7 +8222,7 @@ mod tests {
     fn test_coalesce_function() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT COALESCE(name, 'unknown') FROM Product"
@@ -8261,7 +8241,7 @@ mod tests {
     fn test_concat_function() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT CONCAT(name, ' - ', 'Premium') FROM Product"
@@ -8280,7 +8260,7 @@ mod tests {
     fn test_upper_lower_functions() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.read().unwrap().flush().unwrap();
+        executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT UPPER(name) FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();

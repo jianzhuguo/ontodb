@@ -21,6 +21,7 @@
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::convert::TryInto;
+use std::sync::OnceLock;
 
 // Type tags
 pub const TAG_NULL: u8 = 0;
@@ -35,10 +36,10 @@ pub const TAG_ARRAY: u8 = 6;
 pub struct BinaryRow<'a> {
     data: &'a [u8],
     num_fields: u16,
-    /// Per-field: (name_len, type_tag, name_offset, value_offset)
+    /// Per-field metadata.
     fields: Vec<FieldMeta>,
-    /// O(1) field name → index lookup, built during parse().
-    name_index: HashMap<&'a str, usize>,
+    /// O(1) field name → index lookup, built lazily on first use.
+    name_index: OnceLock<HashMap<&'a str, usize>>,
 }
 
 struct FieldMeta {
@@ -46,6 +47,8 @@ struct FieldMeta {
     type_tag: u8,
     name_offset: usize,
     value_offset: usize,
+    /// Pre-computed total value size in bytes (including length prefix for var-len types).
+    value_size: usize,
 }
 
 impl<'a> BinaryRow<'a> {
@@ -60,28 +63,32 @@ impl<'a> BinaryRow<'a> {
             return None;
         }
 
-        // Parse name lengths
-        let mut name_lens = Vec::with_capacity(num_fields);
-        for i in 0..num_fields {
-            let off = 2 + i * 2;
-            name_lens.push(u16::from_le_bytes([data[off], data[off + 1]]) as usize);
-        }
+        // Compute total name bytes inline (no temp Vec)
+        let name_lens_base = 2usize;
+        let tags_start = 2 + num_fields * 2;
+        let names_start = tags_start + num_fields;
+
+        let total_name_bytes: usize = (0..num_fields)
+            .map(|i| {
+                let off = name_lens_base + i * 2;
+                u16::from_le_bytes([data[off], data[off + 1]]) as usize
+            })
+            .sum();
 
         // Parse type tags
-        let tags_start = 2 + num_fields * 2;
         let type_tags: &[u8] = &data[tags_start..tags_start + num_fields];
 
-        // Build field metadata
-        let names_start = tags_start + num_fields;
+        // Build field metadata with pre-computed value_size
         let mut name_offset = names_start;
-        let mut value_offset = names_start + name_lens.iter().sum::<usize>();
+        let mut value_offset = names_start + total_name_bytes;
         let mut fields = Vec::with_capacity(num_fields);
 
         for i in 0..num_fields {
-            let name_len = name_lens[i];
+            let off = name_lens_base + i * 2;
+            let name_len = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
             let type_tag = type_tags[i];
 
-            // Validate value can be read
+            // Validate value can be read and compute size
             let value_size = match type_tag {
                 TAG_NULL => 0,
                 TAG_BOOL => 1,
@@ -107,23 +114,15 @@ impl<'a> BinaryRow<'a> {
                 type_tag,
                 name_offset,
                 value_offset,
+                value_size,
             });
 
             name_offset += name_len;
             value_offset += value_size;
         }
 
-        // Build name → index map for O(1) field lookup
-        let mut name_index = HashMap::with_capacity(num_fields);
-        for (i, fm) in fields.iter().enumerate() {
-            let start = fm.name_offset;
-            let end = start + fm.name_len as usize;
-            if let Ok(name) = std::str::from_utf8(&data[start..end]) {
-                name_index.insert(name, i);
-            }
-        }
-
-        Some(BinaryRow { data, num_fields: num_fields as u16, fields, name_index })
+        // name_index is built lazily on first find_field() call
+        Some(BinaryRow { data, num_fields: num_fields as u16, fields, name_index: OnceLock::new() })
     }
 
     /// Number of fields in this row.
@@ -147,26 +146,23 @@ impl<'a> BinaryRow<'a> {
     /// Get the raw value bytes and type tag for a field by index.
     pub fn field_value_raw(&self, idx: usize) -> (u8, &[u8]) {
         let fm = &self.fields[idx];
-        let size = match fm.type_tag {
-            TAG_NULL => 0,
-            TAG_BOOL => 1,
-            TAG_INT | TAG_FLOAT => 8,
-            TAG_STRING | TAG_OBJECT | TAG_ARRAY => {
-                let len = u32::from_le_bytes(
-                    self.data[fm.value_offset..fm.value_offset + 4]
-                        .try_into()
-                        .unwrap_or([0; 4]),
-                ) as usize;
-                4 + len
-            }
-            _ => 0,
-        };
-        (fm.type_tag, &self.data[fm.value_offset..fm.value_offset + size])
+        (fm.type_tag, &self.data[fm.value_offset..fm.value_offset + fm.value_size])
     }
 
-    /// Find a field by name. Returns its index, or None. O(1) via pre-built HashMap.
+    /// Find a field by name. Returns its index, or None. O(1) via lazily-built HashMap.
     pub fn find_field(&self, name: &str) -> Option<usize> {
-        self.name_index.get(name).copied()
+        let index = self.name_index.get_or_init(|| {
+            let mut map = HashMap::with_capacity(self.num_fields as usize);
+            for (i, fm) in self.fields.iter().enumerate() {
+                let start = fm.name_offset;
+                let end = start + fm.name_len as usize;
+                if let Ok(n) = std::str::from_utf8(&self.data[start..end]) {
+                    map.insert(n, i);
+                }
+            }
+            map
+        });
+        index.get(name).copied()
     }
 
     /// Get the `__class__` field value as a string, if present.
@@ -287,13 +283,127 @@ impl<'a> BinaryRow<'a> {
     }
 
     /// Iterate over all fields as (name, tag, raw_value) triples.
-    pub fn iter_fields(&self) -> impl Iterator<Item = (&str, u8, &[u8])> {
+    pub fn iter_fields(&self) -> impl Iterator<Item = (&str, u8, &[u8])> + use<'_, 'a> {
         (0..self.num_fields as usize).map(move |i| {
             let name = self.field_name(i);
             let (tag, raw) = self.field_value_raw(i);
             (name, tag, raw)
         })
     }
+}
+
+/// Convert binary row bytes directly to a `Map<String, Value>` in a single pass.
+/// Skips building the `BinaryRow` struct entirely — no `Vec<FieldMeta>`, no `HashMap`.
+/// This is the fastest path when you only need the `Map` result.
+pub fn binary_bytes_to_map(data: &[u8]) -> Option<Map<String, Value>> {
+    if data.len() < 2 {
+        return None;
+    }
+    let num_fields = u16::from_le_bytes([data[0], data[1]]) as usize;
+    let header_end = 2 + num_fields * 2 + num_fields;
+    if data.len() < header_end {
+        return None;
+    }
+
+    let name_lens_base = 2usize;
+    let tags_start = 2 + num_fields * 2;
+    let names_start = tags_start + num_fields;
+
+    // Compute total name bytes
+    let total_name_bytes: usize = (0..num_fields)
+        .map(|i| {
+            let off = name_lens_base + i * 2;
+            u16::from_le_bytes([data[off], data[off + 1]]) as usize
+        })
+        .sum();
+
+    let type_tags: &[u8] = &data[tags_start..tags_start + num_fields];
+    let mut name_offset = names_start;
+    let mut value_offset = names_start + total_name_bytes;
+    let mut map = Map::with_capacity(num_fields);
+
+    for i in 0..num_fields {
+        let off = name_lens_base + i * 2;
+        let name_len = u16::from_le_bytes([data[off], data[off + 1]]) as usize;
+        let type_tag = type_tags[i];
+
+        // Extract field name
+        let name_end = name_offset + name_len;
+        if name_end > data.len() {
+            return None;
+        }
+        let name = std::str::from_utf8(&data[name_offset..name_end]).ok()?;
+
+        // Parse value inline
+        let value = match type_tag {
+            TAG_NULL => Value::Null,
+            TAG_BOOL => {
+                if value_offset >= data.len() { return None; }
+                Value::Bool(data[value_offset] != 0)
+            }
+            TAG_INT => {
+                if value_offset + 8 > data.len() { return None; }
+                let arr: [u8; 8] = data[value_offset..value_offset + 8].try_into().ok()?;
+                Value::Number(serde_json::Number::from(i64::from_be_bytes(arr)))
+            }
+            TAG_FLOAT => {
+                if value_offset + 8 > data.len() { return None; }
+                let arr: [u8; 8] = data[value_offset..value_offset + 8].try_into().ok()?;
+                let f = f64::from_be_bytes(arr);
+                match serde_json::Number::from_f64(f) {
+                    Some(n) => Value::Number(n),
+                    None => return None,
+                }
+            }
+            TAG_STRING => {
+                if value_offset + 4 > data.len() { return None; }
+                let slen = u32::from_le_bytes(
+                    data[value_offset..value_offset + 4].try_into().ok()?,
+                ) as usize;
+                if value_offset + 4 + slen > data.len() { return None; }
+                let s = std::str::from_utf8(&data[value_offset + 4..value_offset + 4 + slen]).ok()?;
+                Value::String(s.to_string())
+            }
+            TAG_OBJECT => {
+                if value_offset + 4 > data.len() { return None; }
+                let olen = u32::from_le_bytes(
+                    data[value_offset..value_offset + 4].try_into().ok()?,
+                ) as usize;
+                if value_offset + 4 + olen > data.len() { return None; }
+                let inner = &data[value_offset + 4..value_offset + 4 + olen];
+                match binary_bytes_to_map(inner) {
+                    Some(m) => Value::Object(m),
+                    None => return None,
+                }
+            }
+            TAG_ARRAY => {
+                if value_offset + 8 > data.len() { return None; }
+                let arr_data = &data[value_offset..];
+                binary_to_serde_value(TAG_ARRAY, arr_data)?
+            }
+            _ => return None,
+        };
+
+        map.insert(name.to_string(), value);
+
+        // Advance offsets
+        name_offset = name_end;
+        let value_size = match type_tag {
+            TAG_NULL => 0,
+            TAG_BOOL => 1,
+            TAG_INT | TAG_FLOAT => 8,
+            TAG_STRING | TAG_OBJECT | TAG_ARRAY => {
+                if value_offset + 4 > data.len() { return None; }
+                4 + u32::from_le_bytes(
+                    data[value_offset..value_offset + 4].try_into().ok()?,
+                ) as usize
+            }
+            _ => return None,
+        };
+        value_offset += value_size;
+    }
+
+    Some(map)
 }
 
 // ─── Conversion: JSON Map → Binary ───────────────────────────────────────
@@ -405,8 +515,7 @@ pub fn binary_to_serde_value(tag: u8, raw: &[u8]) -> Option<Value> {
         }
         TAG_OBJECT => {
             let inner_bytes = parse_length_prefixed(raw)?;
-            let inner_row = BinaryRow::parse(inner_bytes)?;
-            inner_row.to_map().map(Value::Object)
+            binary_bytes_to_map(inner_bytes).map(Value::Object)
         }
         TAG_ARRAY => {
             if raw.len() < 8 {

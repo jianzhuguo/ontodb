@@ -5,7 +5,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -52,7 +52,7 @@ fn start_test_server() -> (u16, thread::JoinHandle<()>) {
         ..Default::default()
     };
 
-    let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+    let engine = Arc::new(LsmEngine::open(options).unwrap());
     let ontology_store = OntologyStore::new(Arc::clone(&engine));
     let executor = Arc::new(QueryExecutor::new(Arc::clone(&engine), ontology_store));
 

@@ -7,25 +7,25 @@
 use onto_ontology::OntologyStore;
 use onto_query::{QueryExecutor, QueryParser};
 use onto_storage::{LsmEngine, StorageOptions};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
 
 // ═══════════════════════════════════════════════════════════════════
 //  Helpers
 // ═══════════════════════════════════════════════════════════════════
 
-fn setup_engine(options_overrides: Option<StorageOptions>) -> (Arc<RwLock<LsmEngine>>, TempDir) {
+fn setup_engine(options_overrides: Option<StorageOptions>) -> (Arc<LsmEngine>, TempDir) {
     let dir = tempdir().unwrap();
     let options = options_overrides.unwrap_or(StorageOptions {
         data_dir: dir.path().to_path_buf(),
         memtable_size_limit: 1024 * 1024,
         ..Default::default()
     });
-    let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+    let engine = Arc::new(LsmEngine::open(options).unwrap());
     (engine, dir)
 }
 
-fn make_executor(engine: &Arc<RwLock<LsmEngine>>) -> QueryExecutor {
+fn make_executor(engine: &Arc<LsmEngine>) -> QueryExecutor {
     let ontology_store = OntologyStore::new(engine.clone());
     QueryExecutor::new(engine.clone(), ontology_store)
 }
@@ -77,7 +77,7 @@ fn integration_select_after_multiple_flushes() {
             i, (i + 1) * 100
         ));
     }
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Batch 2: insert + flush
     for i in 5..10 {
@@ -86,7 +86,7 @@ fn integration_select_after_multiple_flushes() {
             i, (i + 1) * 100
         ));
     }
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // All 10 items should be visible across multiple SSTables
     let result = exec_ok(&executor, "SELECT * FROM Product");
@@ -104,11 +104,11 @@ fn integration_update_across_sstables() {
 
     // Insert into first flush
     exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPhone', 999)");
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Insert into second flush
     exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPad', 799)");
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Update row from first SSTable
     exec_ok(&executor, "UPDATE Product SET price = 1099 WHERE name = 'iPhone'");
@@ -124,7 +124,7 @@ fn integration_update_across_sstables() {
     }
 
     // Flush and verify persistence
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
     let result = exec_ok(&executor, "SELECT price FROM Product WHERE name = 'iPhone'");
     match &result {
         onto_query::QueryResult::Rows(rows) => {
@@ -143,10 +143,10 @@ fn integration_delete_across_sstables() {
     // Two flushes
     exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPhone', 999)");
     exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPad', 799)");
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('MacBook', 1999)");
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Delete item from first SSTable
     exec_ok(&executor, "DELETE FROM Product WHERE name = 'iPhone'");
@@ -155,7 +155,7 @@ fn integration_delete_across_sstables() {
     assert_row_count(&result, 2);
 
     // Flush tombstone and verify
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
     let result = exec_ok(&executor, "SELECT * FROM Product");
     assert_row_count(&result, 2);
 }
@@ -173,7 +173,7 @@ fn integration_query_after_compaction() {
         size_ratio: 2,             // Compact when > 2 SSTables per level
         ..Default::default()
     };
-    let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+    let engine = Arc::new(LsmEngine::open(options).unwrap());
     let executor = make_executor(&engine);
 
     // Write enough to trigger multiple flushes and compaction
@@ -185,10 +185,10 @@ fn integration_query_after_compaction() {
     }
 
     // Force final flush and wait for compaction
-    engine.write().unwrap().flush().unwrap();
-    engine.write().unwrap().flush_compaction().unwrap();
+    engine.flush().unwrap();
+    engine.flush_compaction().unwrap();
 
-    let stats = engine.read().unwrap().stats();
+    let stats = engine.stats();
     assert!(stats.total_sstables > 0, "should have created SSTables");
 
     // All data should be readable after compaction
@@ -224,7 +224,7 @@ fn integration_overwrite_during_compaction() {
         size_ratio: 2,
         ..Default::default()
     };
-    let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+    let engine = Arc::new(LsmEngine::open(options).unwrap());
     let executor = make_executor(&engine);
 
     // Insert initial data
@@ -243,8 +243,8 @@ fn integration_overwrite_during_compaction() {
         ));
     }
 
-    engine.write().unwrap().flush().unwrap();
-    engine.write().unwrap().flush_compaction().unwrap();
+    engine.flush().unwrap();
+    engine.flush_compaction().unwrap();
 
     // Verify latest values survived compaction
     for i in 0..20 {
@@ -275,7 +275,7 @@ fn integration_delete_during_compaction() {
         size_ratio: 2,
         ..Default::default()
     };
-    let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+    let engine = Arc::new(LsmEngine::open(options).unwrap());
     let executor = make_executor(&engine);
 
     // Insert 20 items
@@ -293,8 +293,8 @@ fn integration_delete_during_compaction() {
         ));
     }
 
-    engine.write().unwrap().flush().unwrap();
-    engine.write().unwrap().flush_compaction().unwrap();
+    engine.flush().unwrap();
+    engine.flush_compaction().unwrap();
 
     // Only odd items should remain
     let result = exec_ok(&executor, "SELECT * FROM Product");
@@ -329,13 +329,13 @@ fn integration_recovery_query_after_restart() {
             memtable_size_limit: 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
         let executor = make_executor(&engine);
 
         exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPhone', 999)");
         exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPad', 799)");
         exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('MacBook', 1999)");
-        engine.write().unwrap().flush().unwrap();
+        engine.flush().unwrap();
     }
 
     // Phase 2: Reopen and verify queries work
@@ -345,7 +345,7 @@ fn integration_recovery_query_after_restart() {
             memtable_size_limit: 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
         let executor = make_executor(&engine);
 
         let result = exec_ok(&executor, "SELECT * FROM Product");
@@ -368,7 +368,7 @@ fn integration_recovery_wal_data() {
             memtable_size_limit: 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
         let executor = make_executor(&engine);
 
         exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPhone', 999)");
@@ -383,7 +383,7 @@ fn integration_recovery_wal_data() {
             memtable_size_limit: 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
         let executor = make_executor(&engine);
 
         let result = exec_ok(&executor, "SELECT * FROM Product");
@@ -403,7 +403,7 @@ fn integration_recovery_update_and_delete() {
             memtable_size_limit: 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
         let executor = make_executor(&engine);
 
         exec_ok(&executor, "INSERT INTO User (name, age) VALUES ('Alice', 30)");
@@ -416,7 +416,7 @@ fn integration_recovery_update_and_delete() {
         // Delete Bob
         exec_ok(&executor, "DELETE FROM User WHERE name = 'Bob'");
 
-        engine.write().unwrap().flush().unwrap();
+        engine.flush().unwrap();
     }
 
     // Phase 2: Reopen and verify mutations survived
@@ -426,7 +426,7 @@ fn integration_recovery_update_and_delete() {
             memtable_size_limit: 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
         let executor = make_executor(&engine);
 
         let result = exec_ok(&executor, "SELECT * FROM User");
@@ -461,14 +461,14 @@ fn integration_index_after_flush_and_restart() {
             memtable_size_limit: 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
         let executor = make_executor(&engine);
 
         exec_ok(&executor, "CREATE INDEX ON Product (price)");
         exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPhone', 999)");
         exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPad', 799)");
         exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('MacBook', 1999)");
-        engine.write().unwrap().flush().unwrap();
+        engine.flush().unwrap();
     }
 
     // Phase 2: Reopen — index should be rebuilt, queries should use it
@@ -478,7 +478,7 @@ fn integration_index_after_flush_and_restart() {
             memtable_size_limit: 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
         let executor = make_executor(&engine);
 
         // Index-accelerated equality
@@ -504,7 +504,7 @@ fn integration_index_update_after_compaction() {
         size_ratio: 2,
         ..Default::default()
     };
-    let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+    let engine = Arc::new(LsmEngine::open(options).unwrap());
     let executor = make_executor(&engine);
 
     exec_ok(&executor, "CREATE INDEX ON Product (price)");
@@ -516,8 +516,8 @@ fn integration_index_update_after_compaction() {
             i, (i + 1) * 10
         ));
     }
-    engine.write().unwrap().flush().unwrap();
-    engine.write().unwrap().flush_compaction().unwrap();
+    engine.flush().unwrap();
+    engine.flush_compaction().unwrap();
 
     // Update some items
     for i in 0..15 {
@@ -526,8 +526,8 @@ fn integration_index_update_after_compaction() {
             (i + 1) * 10 + 100, i
         ));
     }
-    engine.write().unwrap().flush().unwrap();
-    engine.write().unwrap().flush_compaction().unwrap();
+    engine.flush().unwrap();
+    engine.flush_compaction().unwrap();
 
     // Index should reflect updated prices
     let result = exec_ok(&executor, "SELECT name FROM Product WHERE price = 110");
@@ -554,7 +554,7 @@ fn integration_multi_class_isolation() {
     exec_ok(&executor, "INSERT INTO Customer (name, email) VALUES ('Bob', 'bob@test.com')");
     exec_ok(&executor, "INSERT INTO Order (product_id, quantity) VALUES ('iPhone', 3)");
 
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Each class should only see its own data
     assert_row_count(&exec_ok(&executor, "SELECT * FROM Product"), 2);
@@ -580,7 +580,7 @@ fn integration_cross_class_join_after_flush() {
     exec_ok(&executor, "INSERT INTO Order (product_id, quantity) VALUES ('iPad', 5)");
     exec_ok(&executor, "INSERT INTO Order (product_id, quantity) VALUES ('iPhone', 1)");
 
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // JOIN across flushed SSTables
     let result = exec_ok(
@@ -618,7 +618,7 @@ fn integration_group_by_after_flush() {
             name, cat, price
         ));
     }
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // GROUP BY with aggregation
     let result = exec_ok(
@@ -654,7 +654,7 @@ fn integration_subquery_after_flush() {
     exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('MacBook', 1999)");
     exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('AirPods', 249)");
 
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Subquery: find products whose price is in the top-2 prices
     let result = exec_ok(
@@ -672,12 +672,12 @@ fn integration_union_across_flushes() {
     // Flush 1: Products
     exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPhone', 999)");
     exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPad', 799)");
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Flush 2: Items
     exec_ok(&executor, "INSERT INTO Item (name, price) VALUES ('Widget', 49)");
     exec_ok(&executor, "INSERT INTO Item (name, price) VALUES ('Gadget', 149)");
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // UNION across classes and SSTables
     let result = exec_ok(
@@ -737,7 +737,7 @@ fn integration_order_by_after_flush() {
             "INSERT INTO Product (name, price) VALUES ('{}', {})", name, price
         ));
     }
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // ORDER BY ASC
     let result = exec_ok(&executor, "SELECT name FROM Product ORDER BY price");
@@ -780,7 +780,7 @@ fn integration_distinct_after_flush() {
     for _ in 0..2 {
         exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPad', 799)");
     }
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     let result = exec_ok(&executor, "SELECT DISTINCT name, price FROM Product");
     assert_row_count(&result, 2);
@@ -800,7 +800,7 @@ fn integration_like_after_flush() {
             "INSERT INTO Product (name, price) VALUES ('{}', 999)", name
         ));
     }
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Prefix match
     let result = exec_ok(&executor, "SELECT name FROM Product WHERE name LIKE 'i%'");
@@ -828,7 +828,7 @@ fn integration_full_crud_lifecycle() {
         size_ratio: 2,
         ..Default::default()
     };
-    let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+    let engine = Arc::new(LsmEngine::open(options).unwrap());
     let executor = make_executor(&engine);
 
     // CREATE ONTOLOGY
@@ -843,7 +843,7 @@ fn integration_full_crud_lifecycle() {
             "INSERT INTO Product (name, price) VALUES ('{}', {})", name, price
         ));
     }
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // SELECT verify
     let result = exec_ok(&executor, "SELECT * FROM Product");
@@ -855,7 +855,7 @@ fn integration_full_crud_lifecycle() {
             "INSERT INTO Product (name, price) VALUES ('{}', {})", name, price
         ));
     }
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // SELECT with complex filter
     let result = exec_ok(&executor, "SELECT name, price FROM Product WHERE price > 300 AND price < 1000");
@@ -1023,7 +1023,7 @@ fn integration_null_handling() {
 
     exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('iPhone', 999)");
     exec_ok(&executor, "INSERT INTO Product (name) VALUES ('Unknown')");
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Both rows should be visible
     assert_row_count(&exec_ok(&executor, "SELECT * FROM Product"), 2);
@@ -1041,7 +1041,7 @@ fn integration_special_characters_in_values() {
     // Strings with special characters
     exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('it''s a test', 100)");
     exec_ok(&executor, "INSERT INTO Product (name, price) VALUES ('hello world', 200)");
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     let result = exec_ok(&executor, "SELECT * FROM Product");
     assert_row_count(&result, 2);
@@ -1067,7 +1067,7 @@ fn integration_vector_search_after_flush() {
     exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('car', 30, '[0.0, 0.1, 0.9]')");
     exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('truck', 40, '[0.1, 0.0, 0.8]')");
 
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Vector search: nearest to [1,0,0] should return cat first
     let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 2");
@@ -1107,7 +1107,7 @@ fn integration_vector_search_across_multiple_flushes() {
             i, (i + 1) * 100
         ));
     }
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Batch 2
     for i in 5..10 {
@@ -1116,7 +1116,7 @@ fn integration_vector_search_across_multiple_flushes() {
             i, (i + 1) * 100
         ));
     }
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Search should find items from both flushes
     let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0, 0.0] TOP 3");
@@ -1149,7 +1149,7 @@ fn integration_vector_search_with_where_filter() {
     exec_ok(&executor, "INSERT INTO Product (name, category, embedding) VALUES ('car', 'vehicle', '[0.0, 0.1, 0.9]')");
     exec_ok(&executor, "INSERT INTO Product (name, category, embedding) VALUES ('truck', 'vehicle', '[0.1, 0.0, 0.8]')");
 
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Vector search with category filter — only animals
     let result = exec_ok(&executor,
@@ -1192,7 +1192,7 @@ fn integration_vector_search_after_update() {
 
     exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('item_a', '[1.0, 0.0, 0.0]')");
     exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('item_b', '[0.0, 1.0, 0.0]')");
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Verify initial search
     let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 1");
@@ -1226,7 +1226,7 @@ fn integration_vector_search_after_delete() {
     exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('cat', '[0.9, 0.1, 0.0]')");
     exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('dog', '[0.8, 0.2, 0.0]')");
     exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('car', '[0.0, 0.1, 0.9]')");
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Delete cat
     exec_ok(&executor, "DELETE FROM Product WHERE name = 'cat'");
@@ -1258,14 +1258,14 @@ fn integration_vector_index_recovery_after_restart() {
             memtable_size_limit: 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
         let executor = make_executor(&engine);
 
         exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3 M 8 EF_CONSTRUCTION 50 EF_SEARCH 30");
         exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('alpha', '[1.0, 0.0, 0.0]')");
         exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('beta', '[0.0, 1.0, 0.0]')");
         exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('gamma', '[0.0, 0.0, 1.0]')");
-        engine.write().unwrap().flush().unwrap();
+        engine.flush().unwrap();
     }
 
     // Phase 2: Reopen — vector index should be rebuilt from persisted metadata
@@ -1300,7 +1300,7 @@ fn integration_vector_search_after_compaction() {
         size_ratio: 2,
         ..Default::default()
     };
-    let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+    let engine = Arc::new(LsmEngine::open(options).unwrap());
     let executor = make_executor(&engine);
 
     exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 2");
@@ -1314,8 +1314,8 @@ fn integration_vector_search_after_compaction() {
             i, v1, v2
         ));
     }
-    engine.write().unwrap().flush().unwrap();
-    engine.write().unwrap().flush_compaction().unwrap();
+    engine.flush().unwrap();
+    engine.flush_compaction().unwrap();
 
     // Vector search should still work after compaction
     let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0] TOP 3");
@@ -1343,7 +1343,7 @@ fn integration_vector_search_class_isolation() {
     exec_ok(&executor, "INSERT INTO Product (name, embedding) VALUES ('iPhone', '[1.0, 0.0, 0.0]')");
     exec_ok(&executor, "INSERT INTO Document (title, embedding) VALUES ('manual', '[0.0, 1.0, 0.0]')");
 
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Search Product — should only return Product results
     let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 10");
@@ -1381,7 +1381,7 @@ fn integration_vector_and_btree_index_coexistence() {
     exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('iPad', 799, '[0.9, 0.1, 0.0]')");
     exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('MacBook', 1999, '[0.0, 0.0, 1.0]')");
 
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // B-Tree index query
     let result = exec_ok(&executor, "SELECT name FROM Product WHERE price > 900");
@@ -1428,7 +1428,7 @@ fn integration_vector_full_lifecycle_with_ontology() {
     exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('MacBook', 1999, '[0.0, 0.0, 1.0]')");
     exec_ok(&executor, "INSERT INTO Product (name, price, embedding) VALUES ('AirPods', 249, '[0.5, 0.5, 0.0]')");
 
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // 5. SQL query via B-Tree index
     let result = exec_ok(&executor, "SELECT name FROM Product WHERE price > 900");
@@ -1510,7 +1510,7 @@ fn integration_vector_search_different_metrics() {
     exec_ok(&executor, "INSERT INTO Product (name, embedding_ip) VALUES ('a', '[1.0, 0.0, 0.0]')");
     exec_ok(&executor, "INSERT INTO Product (name, embedding_ip) VALUES ('b', '[0.0, 1.0, 0.0]')");
 
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // L2 search
     let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding_l2) QUERY [1.0, 0.0, 0.0] TOP 1");
@@ -1551,7 +1551,7 @@ fn integration_vector_search_large_dataset() {
             i, (i + 1) * 10, vec
         ));
     }
-    engine.write().unwrap().flush().unwrap();
+    engine.flush().unwrap();
 
     // Search for top-5 nearest to [1,0,...]
     let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] TOP 5");

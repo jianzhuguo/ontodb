@@ -19,7 +19,7 @@ use onto_storage::{LsmEngine, StorageOptions};
 use rate_limit::{RateLimitConfig, RateLimiter};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
@@ -81,7 +81,7 @@ fn main() -> Result<()> {
     println!("OntoDB v{}", env!("CARGO_PKG_VERSION"));
     println!("Data directory: {:?}", options.data_dir);
 
-    let engine = Arc::new(RwLock::new(LsmEngine::open(options)?));
+    let engine = Arc::new(LsmEngine::open(options)?);
     let ontology_store = OntologyStore::new(Arc::clone(&engine));
     let executor = Arc::new(QueryExecutor::new(Arc::clone(&engine), ontology_store));
 

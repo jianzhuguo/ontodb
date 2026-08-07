@@ -5,18 +5,18 @@
 use crate::model::Ontology;
 use onto_core::Result;
 use onto_storage::LsmEngine;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// Prefix for ontology keys in the storage engine.
 const ONTOLOGY_PREFIX: &[u8] = b"__ontology__";
 
 /// Stores and retrieves ontologies from the storage engine.
 pub struct OntologyStore {
-    engine: Arc<RwLock<LsmEngine>>,
+    engine: Arc<LsmEngine>,
 }
 
 impl OntologyStore {
-    pub fn new(engine: Arc<RwLock<LsmEngine>>) -> Self {
+    pub fn new(engine: Arc<LsmEngine>) -> Self {
         Self { engine }
     }
 
@@ -25,11 +25,7 @@ impl OntologyStore {
         let key = Self::make_key(&ontology.name);
         let value = serde_json::to_vec(ontology)
             .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
-
-        let engine = self.engine.read().map_err(|e| {
-            onto_core::CoreError::Custom(format!("engine lock poisoned: {}", e))
-        })?;
-        engine.put(key, value)
+        self.engine.put(key, value)
     }
 
     /// Saves an ontology using an already-acquired engine reference.
@@ -43,11 +39,7 @@ impl OntologyStore {
     /// Loads an ontology by name.
     pub fn load(&self, name: &str) -> Result<Option<Ontology>> {
         let key = Self::make_key(name);
-
-        let engine = self.engine.read().map_err(|e| {
-            onto_core::CoreError::Custom(format!("engine lock poisoned: {}", e))
-        })?;
-        match engine.get(&key)? {
+        match self.engine.get(&key)? {
             Some(bytes) => {
                 let ontology: Ontology = serde_json::from_slice(&bytes)
                     .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
@@ -73,10 +65,7 @@ impl OntologyStore {
     /// Deletes an ontology by name.
     pub fn delete(&self, name: &str) -> Result<()> {
         let key = Self::make_key(name);
-        let engine = self.engine.read().map_err(|e| {
-            onto_core::CoreError::Custom(format!("engine lock poisoned: {}", e))
-        })?;
-        engine.delete(key)
+        self.engine.delete(key)
     }
 
     /// Finds the ontology that contains the given class name.
@@ -119,7 +108,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
         let store = OntologyStore::new(engine);
 
         let mut onto = Ontology::new("test");
@@ -141,7 +130,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let engine = Arc::new(RwLock::new(LsmEngine::open(options).unwrap()));
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
         let store = OntologyStore::new(engine);
 
         let result = store.load("nonexistent").unwrap();
