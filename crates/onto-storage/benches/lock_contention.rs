@@ -123,7 +123,7 @@ fn bench_mixed_read_write(
         let eng = Arc::clone(&engine);
         handles.push(std::thread::spawn(move || {
             for i in 0..50 {
-                let mut guard = eng.write().unwrap();
+                let guard = eng.write().unwrap();
                 let key = format!("New::{:020}", i).into_bytes();
                 let val = b"{}".to_vec();
                 let _ = guard.put(key, val);
