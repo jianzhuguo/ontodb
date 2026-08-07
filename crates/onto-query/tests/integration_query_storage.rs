@@ -1540,16 +1540,13 @@ fn integration_vector_search_large_dataset() {
 
     exec_ok(&executor, "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 8");
 
-    // Insert 100 items with known patterns
+    // Insert 100 items with distinct vectors
     for i in 0..100 {
-        // First 50 items: vector points towards [1,0,...] with slight variation
-        // Last 50 items: vector points towards [0,1,...] with slight variation
-        let noise = (i % 10) as f64 * 0.01;
-        let vec = if i < 50 {
-            format!("[{}, {}, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]", 0.9 - noise, 0.1 + noise)
-        } else {
-            format!("[{}, {}, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]", 0.1 + noise, 0.9 - noise)
-        };
+        // Create distinct vectors with some randomness based on index
+        let base = if i < 50 { 0.9 } else { 0.1 };
+        let noise = (i as f64 * 0.001) % 0.1;
+        let vec = format!("[{}, {}, {}, 0.0, 0.0, 0.0, 0.0, 0.0]",
+            base - noise, 0.1 + noise, noise);
         exec_ok(&executor, &format!(
             "INSERT INTO Product (name, price, embedding) VALUES ('item_{:03}', {}, '{}')",
             i, (i + 1) * 10, vec
