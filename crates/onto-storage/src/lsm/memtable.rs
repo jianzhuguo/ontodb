@@ -1,9 +1,10 @@
-//! MemTable: In-memory sorted key-value store using a skip list.
+//! MemTable: In-memory sorted key-value store.
 //!
 //! The MemTable is the write buffer. All writes go here first.
 //! When it reaches the size limit, it's flushed to an SSTable on disk.
 //!
-//! We use `crossbeam-skiplist` for a concurrent-friendly skip list.
+//! Backed by `std::collections::BTreeMap` with composite keys for sorted access.
+//! The `scan_prefix()` method uses BTreeMap range queries for efficient prefix scanning.
 
 use onto_core::{EntryKind, Key, SeqNo, Value};
 
@@ -205,6 +206,46 @@ impl MemTable {
     /// Returns an iterator over all entries in sorted order.
     pub fn entries(&self) -> impl Iterator<Item = &MemTableEntry> {
         self.data.values()
+    }
+
+    /// Returns an iterator over entries whose key starts with `prefix`.
+    /// Uses BTreeMap range query to skip non-matching entries — O(log n + matches)
+    /// instead of O(total_entries) for full iteration + filter.
+    ///
+    /// Note: returns ALL versions (including tombstones and older versions).
+    /// The caller is responsible for deduplication and tombstone filtering.
+    pub fn scan_prefix(&self, prefix: &[u8]) -> impl Iterator<Item = &MemTableEntry> {
+        // Composite key lower bound: prefix ++ 0x00*8 (smallest seq part)
+        let mut lower = Vec::with_capacity(prefix.len() + 8);
+        lower.extend_from_slice(prefix);
+        lower.extend_from_slice(&0u64.to_be_bytes());
+
+        // Composite key upper bound: prefix_upper ++ 0x00*8
+        // prefix_upper is prefix with last byte incremented by 1.
+        // This captures all keys starting with prefix, regardless of seq_no.
+        let upper = Self::prefix_upper_bound(prefix);
+
+        self.data.range(lower..upper)
+            .map(|(_, e)| e)
+    }
+
+    /// Compute the exclusive upper bound for a prefix range scan.
+    /// Returns prefix with its last byte incremented by 1.
+    /// E.g., "Product::" → "Product:;"  (':' = 0x3A, ';' = 0x3B)
+    fn prefix_upper_bound(prefix: &[u8]) -> Vec<u8> {
+        let mut upper = prefix.to_vec();
+        // Find the rightmost byte that can be incremented
+        for i in (0..upper.len()).rev() {
+            if upper[i] < 0xFF {
+                upper[i] += 1;
+                upper.truncate(i + 1);
+                return upper;
+            }
+        }
+        // All bytes were 0xFF — prefix is the maximum possible key
+        // Return an empty upper bound that compares greater than everything
+        upper.push(0x00);
+        upper
     }
 
     /// Returns the approximate size in bytes.

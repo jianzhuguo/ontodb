@@ -642,6 +642,19 @@ impl QueryExecutor {
                         distinct, columns, group_by, having, order_by, limit, offset, ..
                     } = ast {
                         let has_aggregates = Self::columns_have_aggregates(columns);
+
+                        // Fast path: COUNT(*) was already computed by plan_seq_scan_count_only.
+                        // Skip re-aggregation — just apply ORDER BY / LIMIT if present.
+                        if has_aggregates && group_by.is_none()
+                            && rows.len() == 1
+                            && Self::is_pure_count_star(columns)
+                        {
+                            if let Some(lim) = limit {
+                                rows.truncate(*lim);
+                            }
+                            return Ok(QueryResult::Rows(rows));
+                        }
+
                         if group_by.is_some() || has_aggregates {
                             let result = self.execute_aggregation_read(engine, columns, &rows, group_by.as_ref(), having, order_by, *limit)?;
                             if let QueryResult::Rows(mut agg_rows) = result {
@@ -1124,6 +1137,14 @@ impl QueryExecutor {
                     SelectColumns::Columns(items) => items.iter().any(|item| matches!(item, SelectItem::Expression(_))),
                     _ => false,
                 };
+
+                // Fast path: pure COUNT(*) — count rows without materializing Maps
+                if has_aggregates && Self::is_pure_count_star(columns) {
+                    if let PlanNode::SeqScan { table, filter, .. } = input.as_ref() {
+                        return self.plan_seq_scan_count_only(engine, table, filter, columns);
+                    }
+                }
+
                 // Only push column projection down when there are no aggregates/expressions
                 // (aggregates and expressions may reference columns not in the SELECT list)
                 let raw_rows = if !has_aggregates && !has_expr {
@@ -2299,6 +2320,14 @@ impl QueryExecutor {
                     SelectColumns::Columns(items) => items.iter().any(|item| matches!(item, SelectItem::Expression(_))),
                     _ => false,
                 };
+
+                // Fast path: pure COUNT(*) — count rows without materializing Maps
+                if has_aggregates && Self::is_pure_count_star(columns) {
+                    if let PlanNode::SeqScan { table, filter, .. } = input.as_ref() {
+                        return self.plan_seq_scan_count_only(engine, table, filter, columns);
+                    }
+                }
+
                 // Only push column projection down when there are no aggregates/expressions
                 let raw_rows = if !has_aggregates && !has_expr {
                     if let PlanNode::SeqScan { table, alias, filter, .. } = input.as_ref() {
@@ -2506,6 +2535,97 @@ impl QueryExecutor {
         }
 
         Ok(rows)
+    }
+
+    /// Returns true if the columns represent a pure `COUNT(*)` with no other items.
+    /// Used to trigger the count-only fast path that skips row materialization.
+    fn is_pure_count_star(columns: &SelectColumns) -> bool {
+        match columns {
+            SelectColumns::Columns(items) => {
+                items.len() == 1
+                    && matches!(
+                        &items[0],
+                        SelectItem::Aggregate(a) if a.func == AggregateFunc::Count && a.arg == "*"
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    /// Count-only scan: counts matching rows without materializing Maps.
+    /// For `SELECT COUNT(*) FROM T WHERE filter`, this avoids all deserialization
+    /// after `eval_binary_filter` determines the row passes.
+    fn plan_seq_scan_count_only(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        filter: &Option<FilterExpr>,
+        columns: &SelectColumns,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let class_hierarchy = self.get_class_hierarchy_read(engine, table);
+        let fast_filter_cols = Self::extract_fast_filter_columns(filter);
+        let mut count: u64 = 0;
+
+        for scan_class in &class_hierarchy {
+            let prefix = format!("{}::", scan_class);
+            let entries = engine.scan_prefix(prefix.as_bytes())?;
+            for (_key, val_bytes) in &entries {
+                // Tier 1: fast byte-level rejection
+                if !fast_filter_cols.is_empty() {
+                    if Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
+                        continue;
+                    }
+                }
+                // Tier 2: BinaryRow path — filter without full deserialization
+                if let Some(brow) = BinaryRow::parse(val_bytes) {
+                    if !brow.class_in_hierarchy(&class_hierarchy) {
+                        continue;
+                    }
+                    if let Some(f) = filter {
+                        match eval_binary_filter(&brow, f) {
+                            Some(true) => { count += 1; }
+                            Some(false) => continue,
+                            None => {
+                                // Filter needs full deserialization — rare case
+                                if let Some(doc) = brow.to_map() {
+                                    if self.eval_filter_read(engine, &doc, f) {
+                                        count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        count += 1;
+                    }
+                    continue;
+                }
+                // Tier 3: JSON fallback
+                if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                    if !class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                        continue;
+                    }
+                    if let Some(f) = filter {
+                        if !self.eval_filter_read(engine, &doc, f) { continue; }
+                    }
+                    count += 1;
+                }
+            }
+        }
+
+        // Return a single row with the count, using alias if provided
+        let count_key = match columns {
+            SelectColumns::Columns(items) => {
+                if let Some(SelectItem::Aggregate(a)) = items.first() {
+                    a.alias.clone().unwrap_or_else(|| "count(*)".to_string())
+                } else {
+                    "count(*)".to_string()
+                }
+            }
+            _ => "count(*)".to_string(),
+        };
+        let mut result_row = Map::new();
+        result_row.insert(count_key, Value::Number(serde_json::Number::from(count)));
+        Ok(vec![result_row])
     }
 
     /// Extracts column names from simple comparison filters for fast byte-level rejection.
@@ -3423,6 +3543,18 @@ impl QueryExecutor {
                 distinct, columns, group_by, having, order_by, limit, offset, ..
             } = ast {
                 let has_aggregates = Self::columns_have_aggregates(columns);
+
+                // Fast path: COUNT(*) was already computed by plan_seq_scan_count_only.
+                if has_aggregates && group_by.is_none()
+                    && rows.len() == 1
+                    && Self::is_pure_count_star(columns)
+                {
+                    if let Some(lim) = limit {
+                        rows.truncate(*lim);
+                    }
+                    return Ok(QueryResult::Rows(rows));
+                }
+
                 if group_by.is_some() || has_aggregates {
                     let result = self.execute_aggregation(engine, columns, &rows, group_by.as_ref(), having, order_by, *limit)?;
                     if let QueryResult::Rows(mut agg_rows) = result {
@@ -3593,6 +3725,18 @@ impl QueryExecutor {
                 // Post-processing steps not yet in the plan:
                 // 1. Aggregation (GROUP BY + HAVING)
                 let has_aggregates = Self::columns_have_aggregates(columns);
+
+                // Fast path: COUNT(*) was already computed by plan_seq_scan_count_only.
+                if has_aggregates && group_by.is_none()
+                    && rows.len() == 1
+                    && Self::is_pure_count_star(columns)
+                {
+                    if let Some(lim) = limit {
+                        rows.truncate(*lim);
+                    }
+                    return Ok(QueryResult::Rows(rows));
+                }
+
                 if group_by.is_some() || has_aggregates {
                     let result = self.execute_aggregation(engine, columns, &rows, group_by.as_ref(), having, order_by, *limit)?;
                     if let QueryResult::Rows(mut agg_rows) = result {

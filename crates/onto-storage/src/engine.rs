@@ -444,15 +444,14 @@ impl LsmEngine {
         }
 
         // Step 3: Scan MemTables (read lock — concurrent with other readers)
+        // Uses BTreeMap range query via scan_prefix() — O(log n + matches)
+        // instead of O(total_entries) full iteration + starts_with filter.
         {
             let ws = self.write_state.read().unwrap();
 
             // Scan immutable MemTable (overrides SSTables)
             if let Some(ref imm) = ws.immutable_memtable {
-                for entry in imm.entries() {
-                    if !entry.key.starts_with(prefix) {
-                        continue;
-                    }
+                for entry in imm.scan_prefix(prefix) {
                     if is_visible(entry.seq_no) {
                         let should_update = match seen.get(&entry.key) {
                             Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
@@ -469,10 +468,7 @@ impl LsmEngine {
             }
 
             // Scan active MemTable (overrides everything)
-            for entry in ws.memtable.entries() {
-                if !entry.key.starts_with(prefix) {
-                    continue;
-                }
+            for entry in ws.memtable.scan_prefix(prefix) {
                 if is_visible(entry.seq_no) {
                     let should_update = match seen.get(&entry.key) {
                         Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,

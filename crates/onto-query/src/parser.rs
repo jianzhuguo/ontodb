@@ -377,7 +377,7 @@ pub struct AggregateExpr {
     pub alias: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AggregateFunc {
     Count,
     Sum,
