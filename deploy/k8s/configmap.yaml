@@ -15,7 +15,7 @@ data:
   
   # Server configuration
   SERVER_LISTEN: "0.0.0.0:6500"
-  SERVER_HTTP: "0.0.0.0:8080"
+  SERVER_HTTP: "0.0.0.0:8088"
   
   # Rate limiting
   RATE_LIMIT_ENABLED: "true"

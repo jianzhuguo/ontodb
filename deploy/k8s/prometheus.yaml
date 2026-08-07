@@ -8,7 +8,7 @@ scrape_configs:
     scrape_timeout: 10s
     metrics_path: '/metrics'
     static_configs:
-      - targets: ['ontodb:8080']
+      - targets: ['ontodb:8088']
         labels:
           service: 'ontodb'
           environment: 'production'

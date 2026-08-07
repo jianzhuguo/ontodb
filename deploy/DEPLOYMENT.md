@@ -69,17 +69,17 @@ kubectl apply -f deploy/k8s/hpa.yaml
 ontodb-cli --host ontodb --port 6500
 
 # HTTP API
-curl http://ontodb:8080/api/health
+curl http://ontodb:8088/api/health
 ```
 
 ### From outside the cluster
 
 ```bash
 # Port forward
-kubectl port-forward svc/ontodb 8080:8080 6500:6500 -n ontodb
+kubectl port-forward svc/ontodb 8088:8088 6500:6500 -n ontodb
 
 # Then access locally
-curl http://localhost:8080/api/health
+curl http://localhost:8088/api/health
 ```
 
 ## Monitoring
@@ -89,7 +89,7 @@ curl http://localhost:8080/api/health
 OntoDB exposes metrics at `/metrics` in Prometheus format:
 
 ```bash
-curl http://ontodb:8080/metrics
+curl http://ontodb:8088/metrics
 ```
 
 Key metrics:

@@ -20,7 +20,7 @@ spec:
         app.kubernetes.io/component: database
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
+        prometheus.io/port: "8088"
         prometheus.io/path: "/metrics"
     spec:
       containers:
@@ -32,14 +32,14 @@ spec:
               containerPort: 6500
               protocol: TCP
             - name: http
-              containerPort: 8080
+              containerPort: 8088
               protocol: TCP
           envFrom:
             - configMapRef:
                 name: ontodb-config
           args:
             - "--data-dir=/data/ontodb"
-            - "--http=0.0.0.0:8080"
+            - "--http=0.0.0.0:8088"
             - "--listen=0.0.0.0:6500"
           volumeMounts:
             - name: data
