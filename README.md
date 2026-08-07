@@ -30,14 +30,14 @@ cargo build --release
 ### Run the Server
 
 ```bash
-# Start with TCP server (default: localhost:6500)
+# Start with TCP server (default: localhost:7913)
 ./target/release/ontodb-server --data-dir ./mydata
 
 # Start with HTTP API
-./target/release/ontodb-server --data-dir ./mydata --http 0.0.0.0:8080
+./target/release/ontodb-server --data-dir ./mydata --http 0.0.0.0:7912
 
 # Enable authentication
-./target/release/ontodb-server --data-dir ./mydata --http 0.0.0.0:8080 \
+./target/release/ontodb-server --data-dir ./mydata --http 0.0.0.0:7912 \
   --auth --api-keys-file config/api_keys.example.json
 ```
 
@@ -58,7 +58,7 @@ cargo build --release
 
 ```bash
 docker build -t ontodb .
-docker run -p 8080:8080 -v ontodb-data:/data ontodb
+docker run -p 7912:7912 -v ontodb-data:/data ontodb
 ```
 
 ## Usage Examples
@@ -103,20 +103,20 @@ VECTOR SEARCH ON product_embeddings
 
 ```bash
 # Execute a query
-curl -X POST http://localhost:8080/api/query \
+curl -X POST http://localhost:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "SELECT * FROM Product WHERE price > 50"}'
 
 # SPARQL query
-curl -X POST http://localhost:8080/sparql \
+curl -X POST http://localhost:7912/sparql \
   -H "Content-Type: application/sparql-query" \
   -d 'SELECT ?name WHERE { ?product <http://shop/name> ?name }'
 
 # Health check
-curl http://localhost:8080/api/health
+curl http://localhost:7912/api/health
 
 # Prometheus metrics
-curl http://localhost:8080/metrics
+curl http://localhost:7912/metrics
 ```
 
 ## Architecture
@@ -167,7 +167,7 @@ curl http://localhost:8080/metrics
 |------|---------|-------------|
 | `--data-dir` | `./ontodb_data` | Data directory path |
 | `--memtable-size` | `4194304` (4MB) | MemTable size limit in bytes |
-| `--listen` | `127.0.0.1:6500` | TCP listen address |
+| `--listen` | `127.0.0.1:7913` | TCP listen address |
 | `--http` | _(disabled)_ | HTTP listen address (enables HTTP API) |
 | `--auth` | `false` | Enable API key authentication |
 | `--api-keys-file` | _(none)_ | Path to API keys JSON file |

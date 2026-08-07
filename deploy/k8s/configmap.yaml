@@ -14,8 +14,8 @@ data:
   STORAGE_COMPRESSION_LEVEL: "3"    # zstd level 3
   
   # Server configuration
-  SERVER_LISTEN: "0.0.0.0:6500"
-  SERVER_HTTP: "0.0.0.0:8088"
+  SERVER_LISTEN: "0.0.0.0:7913"
+  SERVER_HTTP: "0.0.0.0:7912"
   
   # Rate limiting
   RATE_LIMIT_ENABLED: "true"

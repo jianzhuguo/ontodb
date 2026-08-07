@@ -19,6 +19,49 @@ use tower_http::trace::TraceLayer;
 
 use crate::metrics::SharedMetrics;
 
+/// Custom JSON response that supports pretty-printing.
+struct PrettyJson<T>(pub T, pub bool);
+
+impl<T: Serialize> IntoResponse for PrettyJson<T> {
+    fn into_response(self) -> axum::response::Response {
+        let body = if self.1 {
+            serde_json::to_string_pretty(&self.0).unwrap_or_else(|_| "{}".to_string())
+        } else {
+            serde_json::to_string(&self.0).unwrap_or_else(|_| "{}".to_string())
+        };
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response()
+    }
+}
+
+/// Validates a user-supplied filter expression to prevent SQL injection.
+/// Only allows simple comparison expressions (e.g., "price > 100", "name = 'foo'").
+fn validate_filter(filter: &str) -> Result<(), String> {
+    if filter.len() > 1024 {
+        return Err("filter expression too long (max 1024 chars)".into());
+    }
+    // Reject semicolons to prevent query chaining
+    if filter.contains(';') {
+        return Err("filter must not contain semicolons".into());
+    }
+    // Reject dangerous SQL keywords (case-insensitive)
+    let upper = filter.to_uppercase();
+    let forbidden = [
+        "DROP ", "DELETE ", "INSERT ", "UPDATE ", "UNION ",
+        "ALTER ", "CREATE ", "TRUNCATE ", "EXEC ", "EXECUTE ",
+        "-- ", "/*", "*/",
+    ];
+    for kw in &forbidden {
+        if upper.contains(kw) {
+            return Err(format!("filter must not contain '{}'", kw.trim()));
+        }
+    }
+    Ok(())
+}
+
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
@@ -114,6 +157,8 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Health check
         .route("/api/health", get(health))
+        .route("/api/health/ready", get(health_ready))
+        .route("/api/health/live", get(health_live))
         // Metrics (Prometheus and JSON)
         .route("/metrics", get(metrics_prometheus))
         .route("/api/metrics", get(metrics_json))
@@ -307,7 +352,7 @@ async fn execute_query(
             state.metrics.record_parse_error();
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<Value>::error(format!("Parse error: {}", e))),
+                PrettyJson(ApiResponse::<Value>::error(format!("Parse error: {}", e)), false),
             );
         }
     };
@@ -334,7 +379,7 @@ async fn execute_query(
             state.metrics.record_query(query_type, elapsed, false);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<Value>::error(format!("Execution error: {}", e))),
+                PrettyJson(ApiResponse::<Value>::error(format!("Execution error: {}", e)), false),
             );
         }
     };
@@ -346,16 +391,11 @@ async fn execute_query(
 
     let data = match result {
         onto_query::QueryResult::Success(msg) => json!({ "message": msg }),
-        onto_query::QueryResult::Rows(rows) => {
-            if req.pretty {
-                json!(rows)
-            } else {
-                json!(rows)
-            }
-        }
+        onto_query::QueryResult::Rows(rows) => json!(rows),
     };
 
-    (StatusCode::OK, Json(ApiResponse::success(data, elapsed_ms)))
+    let response = ApiResponse::success(data, elapsed_ms);
+    (StatusCode::OK, PrettyJson(response, req.pretty))
 }
 
 /// POST /sparql - Execute a SPARQL query.
@@ -460,6 +500,12 @@ async fn vector_search(
 
     // Build VECTOR SEARCH query
     let filter_clause = if let Some(f) = &req.filter {
+        if let Err(e) = validate_filter(f) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!("Invalid filter: {}", e))),
+            );
+        }
         format!(" WHERE {}", f)
     } else {
         String::new()
@@ -596,7 +642,14 @@ async fn hybrid_query(
             // Extract the WHERE clause from the original SQL
             let sql_upper = sql_query.to_uppercase();
             if let Some(where_pos) = sql_upper.find(" WHERE ") {
-                format!(" WHERE {}", &sql_query[where_pos + 7..].trim())
+                let extracted = &sql_query[where_pos + 7..].trim();
+                if let Err(e) = validate_filter(extracted) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::<Value>::error(format!("Invalid filter in SQL: {}", e))),
+                    );
+                }
+                format!(" WHERE {}", extracted)
             } else {
                 String::new()
             }

@@ -18,23 +18,23 @@ OntoDB provides a RESTful HTTP API for executing SQL queries, SPARQL queries, ve
 ### Starting the HTTP Server
 
 ```bash
-# Start HTTP API server on default port 8080 (no auth)
-ontodb-server --http 127.0.0.1:8080
+# Start HTTP API server on default port 7912 (no auth)
+ontodb-server --http 127.0.0.1:7912
 
 # Start with authentication enabled
-ontodb-server --http 127.0.0.1:8080 --auth --api-keys-file config/api_keys.json
+ontodb-server --http 127.0.0.1:7912 --auth --api-keys-file config/api_keys.json
 
 # Start with custom rate limiting
-ontodb-server --http 127.0.0.1:8080 --auth --api-keys-file config/api_keys.json --rate-limit 120 --burst-size 20
+ontodb-server --http 127.0.0.1:7912 --auth --api-keys-file config/api_keys.json --rate-limit 120 --burst-size 20
 
 # Disable rate limiting
-ontodb-server --http 127.0.0.1:8080 --auth --api-keys-file config/api_keys.json --no-rate-limit
+ontodb-server --http 127.0.0.1:7912 --auth --api-keys-file config/api_keys.json --no-rate-limit
 ```
 
 ### Base URL
 
 ```
-http://127.0.0.1:8080
+http://127.0.0.1:7912
 ```
 
 ## API Endpoints
@@ -79,7 +79,7 @@ Returns 200 if the server is alive.
 Returns metrics in Prometheus exposition format. Use with Prometheus, Grafana, or any compatible monitoring system.
 
 ```bash
-curl http://127.0.0.1:8080/metrics
+curl http://127.0.0.1:7912/metrics
 ```
 
 Example output:
@@ -113,7 +113,7 @@ ontodb_query_duration_seconds_count 1542
 Returns metrics in JSON format for programmatic access.
 
 ```bash
-curl http://127.0.0.1:8080/api/metrics
+curl http://127.0.0.1:7912/api/metrics
 ```
 
 Response:
@@ -194,7 +194,7 @@ Add to your `prometheus.yml`:
 scrape_configs:
   - job_name: 'ontodb'
     static_configs:
-      - targets: ['localhost:8080']
+      - targets: ['localhost:7912']
     metrics_path: '/metrics'
     scrape_interval: 15s
 ```
@@ -207,16 +207,16 @@ Import the OntoDB Grafana dashboard for pre-built visualizations of all metrics.
 
 ```bash
 # Health check
-curl http://127.0.0.1:8080/api/health
+curl http://127.0.0.1:7912/api/health
 
 # Readiness probe
-curl http://127.0.0.1:8080/api/health/ready
+curl http://127.0.0.1:7912/api/health/ready
 
 # Prometheus metrics
-curl http://127.0.0.1:8080/metrics
+curl http://127.0.0.1:7912/metrics
 
 # JSON metrics
-curl http://127.0.0.1:8080/api/metrics
+curl http://127.0.0.1:7912/api/metrics
 ```
 
 ---
@@ -271,22 +271,22 @@ Execute any SQL or OntoDB semantic query.
 
 ```bash
 # SELECT query
-curl -X POST http://127.0.0.1:8080/api/query \
+curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "SELECT name, price FROM Product WHERE price > 100 LIMIT 10"}'
 
 # INSERT query
-curl -X POST http://127.0.0.1:8080/api/query \
+curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "INSERT INTO Product (name, price) VALUES ('\"iPhone 15\"', 999)"}'
 
 # MATCH query (OntoDB semantic extension)
-curl -X POST http://127.0.0.1:8080/api/query \
+curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "MATCH (p: Product) WHERE price > 500 RETURN name, price"}'
 
 # Aggregation query
-curl -X POST http://127.0.0.1:8080/api/query \
+curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "SELECT category, COUNT(*) as cnt, AVG(price) as avg_price FROM Product GROUP BY category"}'
 ```
@@ -348,7 +348,7 @@ Perform vector similarity search on indexed vector columns.
 
 ```bash
 # Basic vector search
-curl -X POST http://127.0.0.1:8080/api/vector/search \
+curl -X POST http://127.0.0.1:7912/api/vector/search \
   -H "Content-Type: application/json" \
   -d '{
     "class": "Product",
@@ -358,7 +358,7 @@ curl -X POST http://127.0.0.1:8080/api/vector/search \
   }'
 
 # Vector search with filter (hybrid query)
-curl -X POST http://127.0.0.1:8080/api/vector/search \
+curl -X POST http://127.0.0.1:7912/api/vector/search \
   -H "Content-Type: application/json" \
   -d '{
     "class": "Product",
@@ -404,7 +404,7 @@ Same as vector search response.
 #### Example
 
 ```bash
-curl -X POST http://127.0.0.1:8080/api/hybrid/query \
+curl -X POST http://127.0.0.1:7912/api/hybrid/query \
   -H "Content-Type: application/json" \
   -d '{
     "sql_filter": "SELECT * FROM Product WHERE price > 100 AND category = '\"Electronics\"'",
@@ -440,7 +440,7 @@ Get database schema information including classes, indexes, and vector indexes.
 #### Example
 
 ```bash
-curl http://127.0.0.1:8080/api/schema
+curl http://127.0.0.1:7912/api/schema
 ```
 
 ---
@@ -475,17 +475,17 @@ All endpoints return a standard error response format:
 
 ```bash
 # Create ontology
-curl -X POST http://127.0.0.1:8080/api/query \
+curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "CREATE ONTOLOGY shop (CLASS Product (name STRING REQUIRED, price FLOAT64, category STRING, embedding ARRAY))"}'
 
 # Create vector index
-curl -X POST http://127.0.0.1:8080/api/query \
+curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 128"}'
 
 # Insert data with vector
-curl -X POST http://127.0.0.1:8080/api/query \
+curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "INSERT INTO Product (name, price, category, embedding) VALUES ('\"iPhone 15\"', 999, '\"Electronics\"', '\"[0.1, 0.2, 0.3, ...]\"')"}'
 ```
@@ -493,7 +493,7 @@ curl -X POST http://127.0.0.1:8080/api/query \
 ### 2. Search for Similar Products
 
 ```bash
-curl -X POST http://127.0.0.1:8080/api/vector/search \
+curl -X POST http://127.0.0.1:7912/api/vector/search \
   -H "Content-Type: application/json" \
   -d '{
     "class": "Product",
@@ -506,7 +506,7 @@ curl -X POST http://127.0.0.1:8080/api/vector/search \
 ### 3. Hybrid Search: Filter + Vector Similarity
 
 ```bash
-curl -X POST http://127.0.0.1:8080/api/hybrid/query \
+curl -X POST http://127.0.0.1:7912/api/hybrid/query \
   -H "Content-Type: application/json" \
   -d '{
     "sql_filter": "SELECT * FROM Product WHERE price < 1000 AND category = '\"Electronics\"'",
@@ -711,7 +711,7 @@ OntoDB supports API key authentication for securing HTTP API access.
 
 ```bash
 # Enable auth with API keys file
-ontodb-server --http 127.0.0.1:8080 --auth --api-keys-file config/api_keys.json
+ontodb-server --http 127.0.0.1:7912 --auth --api-keys-file config/api_keys.json
 ```
 
 ### API Keys Configuration
@@ -754,7 +754,7 @@ Three ways to provide your API key:
 #### 1. Authorization Header (Recommended)
 
 ```bash
-curl -X POST http://127.0.0.1:8080/api/query \
+curl -X POST http://127.0.0.1:7912/api/query \
   -H "Authorization: Bearer your-secret-api-key" \
   -H "Content-Type: application/json" \
   -d '{"query": "SELECT * FROM Product"}'
@@ -763,7 +763,7 @@ curl -X POST http://127.0.0.1:8080/api/query \
 #### 2. X-API-Key Header
 
 ```bash
-curl -X POST http://127.0.0.1:8080/api/query \
+curl -X POST http://127.0.0.1:7912/api/query \
   -H "X-API-Key: your-secret-api-key" \
   -H "Content-Type: application/json" \
   -d '{"query": "SELECT * FROM Product"}'
@@ -772,7 +772,7 @@ curl -X POST http://127.0.0.1:8080/api/query \
 #### 3. Query Parameter (Less Secure)
 
 ```bash
-curl -X POST "http://127.0.0.1:8080/api/query?api_key=your-secret-api-key" \
+curl -X POST "http://127.0.0.1:7912/api/query?api_key=your-secret-api-key" \
   -H "Content-Type: application/json" \
   -d '{"query": "SELECT * FROM Product"}'
 ```
@@ -809,13 +809,13 @@ OntoDB implements token bucket rate limiting to protect against abuse.
 
 ```bash
 # Custom rate limit (requests per minute)
-ontodb-server --http 127.0.0.1:8080 --auth --api-keys-file config/api_keys.json --rate-limit 120
+ontodb-server --http 127.0.0.1:7912 --auth --api-keys-file config/api_keys.json --rate-limit 120
 
 # Custom burst size
-ontodb-server --http 127.0.0.1:8080 --rate-limit 60 --burst-size 20
+ontodb-server --http 127.0.0.1:7912 --rate-limit 60 --burst-size 20
 
 # Disable rate limiting
-ontodb-server --http 127.0.0.1:8080 --no-rate-limit
+ontodb-server --http 127.0.0.1:7912 --no-rate-limit
 ```
 
 ### Rate Limit Headers
@@ -887,7 +887,7 @@ The `--burst-size` parameter allows short bursts above the steady rate:
 import requests
 
 API_KEY = "your-secret-api-key"
-BASE_URL = "http://127.0.0.1:8080"
+BASE_URL = "http://127.0.0.1:7912"
 
 headers = {
     "Authorization": f"Bearer {API_KEY}",
@@ -918,7 +918,7 @@ print(f"Reset: {response.headers.get('X-RateLimit-Reset')}s")
 
 ```javascript
 const API_KEY = "your-secret-api-key";
-const BASE_URL = "http://127.0.0.1:8080";
+const BASE_URL = "http://127.0.0.1:7912";
 
 const headers = {
   "Authorization": `Bearer ${API_KEY}`,
@@ -959,13 +959,13 @@ console.log(results);
 
 ```bash
 # Simple query with API key
-curl -X POST http://127.0.0.1:8080/api/query \
+curl -X POST http://127.0.0.1:7912/api/query \
   -H "Authorization: Bearer your-secret-api-key" \
   -H "Content-Type: application/json" \
   -d '{"query": "SELECT * FROM Product LIMIT 10"}'
 
 # Vector search with X-API-Key header
-curl -X POST http://127.0.0.1:8080/api/vector/search \
+curl -X POST http://127.0.0.1:7912/api/vector/search \
   -H "X-API-Key: your-secret-api-key" \
   -H "Content-Type: application/json" \
   -d '{
@@ -976,7 +976,7 @@ curl -X POST http://127.0.0.1:8080/api/vector/search \
   }'
 
 # Check rate limit headers
-curl -v -X POST http://127.0.0.1:8080/api/query \
+curl -v -X POST http://127.0.0.1:7912/api/query \
   -H "Authorization: Bearer your-secret-api-key" \
   -H "Content-Type: application/json" \
   -d '{"query": "SELECT 1"}' 2>&1 | grep -i "x-ratelimit"

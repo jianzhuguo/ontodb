@@ -652,10 +652,10 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 ontodb-server --interactive
 
 # TCP 服务器
-ontodb-server --listen 127.0.0.1:6500
+ontodb-server --listen 127.0.0.1:7913
 
 # HTTP API 服务器（带认证和限流）
-ontodb-server --http 127.0.0.1:8080 \
+ontodb-server --http 127.0.0.1:7912 \
   --auth --api-keys-file config/api_keys.json \
   --rate-limit 120 --burst-size 20
 ```

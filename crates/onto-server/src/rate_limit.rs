@@ -106,6 +106,12 @@ impl RateLimiter {
         }
     }
 
+    /// Remove token buckets that haven't been accessed in the given duration.
+    pub async fn cleanup_stale(&self, max_age: Duration) {
+        let mut buckets = self.buckets.lock().await;
+        buckets.retain(|_, bucket| bucket.last_refill.elapsed() < max_age);
+    }
+
     /// Check if a request is allowed for the given key.
     /// Returns Ok(remaining) if allowed, Err(retry_after) if rate limited.
     pub async fn check(&self, key: &str, custom_rpm: Option<u32>) -> Result<u32, Duration> {
@@ -162,8 +168,9 @@ pub async fn rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> impl IntoResponse {
-    // Skip rate limiting for health check
-    if request.uri().path() == "/api/health" {
+    // Skip rate limiting for health check endpoints
+    let path = request.uri().path();
+    if path == "/api/health" || path == "/api/health/ready" || path == "/api/health/live" {
         return next.run(request).await;
     }
 
@@ -186,7 +193,7 @@ pub async fn rate_limit_middleware(
     let custom_rpm = request
         .extensions()
         .get::<crate::auth::KeyInfo>()
-        .and_then(|_| None); // Will be set by auth state
+        .and_then(|info| info.rate_limit);
 
     match limiter.check(&key, custom_rpm).await {
         Ok(remaining) => {

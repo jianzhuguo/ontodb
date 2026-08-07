@@ -14,13 +14,13 @@
 # Pull and run
 docker run -d \
   --name ontodb \
-  -p 8080:8080 \
-  -p 6500:6500 \
+  -p 7912:7912 \
+  -p 7913:7913 \
   -v ontodb-data:/data \
   ontodb:latest
 
 # Verify
-curl http://localhost:8080/api/health
+curl http://localhost:7912/api/health
 ```
 
 ### Option 2: Docker Compose
@@ -31,8 +31,8 @@ services:
   ontodb:
     build: .
     ports:
-      - "8080:8080"
-      - "6500:6500"
+      - "7912:7912"
+      - "7913:7913"
     volumes:
       - ontodb-data:/data
     restart: unless-stopped
@@ -71,7 +71,7 @@ cargo build --release
 |------|---------|-------------|
 | `--data-dir <path>` | `./ontodb_data` | Directory for all persistent data |
 | `--memtable-size <bytes>` | `4194304` (4MB) | MemTable size before flush to SSTable |
-| `--listen <addr:port>` | `127.0.0.1:6500` | TCP listen address for CLI connections |
+| `--listen <addr:port>` | `127.0.0.1:7913` | TCP listen address for CLI connections |
 | `--http <addr:port>` | _(disabled)_ | HTTP API listen address (enables REST API) |
 | `--auth` | `false` | Enable API key authentication |
 | `--api-keys-file <path>` | _(none)_ | Path to API keys JSON file |
@@ -85,8 +85,8 @@ cargo build --release
 ```bash
 ontodb-server \
   --data-dir /var/lib/ontodb \
-  --http 0.0.0.0:8080 \
-  --listen 127.0.0.1:6500 \
+  --http 0.0.0.0:7912 \
+  --listen 127.0.0.1:7913 \
   --auth \
   --api-keys-file /etc/ontodb/api_keys.json \
   --rate-limit 300 \
@@ -99,7 +99,7 @@ ontodb-server \
 # No auth, no rate limit, local access only
 ontodb-server \
   --data-dir ./dev_data \
-  --http 127.0.0.1:8080 \
+  --http 127.0.0.1:7912 \
   --no-rate-limit
 ```
 
@@ -153,16 +153,16 @@ Three methods (pick one per request):
 ```bash
 # 1. Authorization header
 curl -H "Authorization: Bearer your-admin-secret-key-here" \
-  http://localhost:8080/api/query \
+  http://localhost:7912/api/query \
   -d '{"query": "SELECT * FROM Product"}'
 
 # 2. X-API-Key header
 curl -H "X-API-Key: your-admin-secret-key-here" \
-  http://localhost:8080/api/query \
+  http://localhost:7912/api/query \
   -d '{"query": "SELECT * FROM Product"}'
 
 # 3. Query parameter
-curl "http://localhost:8080/api/query?api_key=your-admin-secret-key-here" \
+curl "http://localhost:7912/api/query?api_key=your-admin-secret-key-here" \
   -d '{"query": "SELECT * FROM Product"}'
 ```
 
@@ -183,7 +183,7 @@ server {
     ssl_certificate_key /etc/ssl/private/ontodb.key;
 
     location / {
-        proxy_pass http://127.0.0.1:8080;
+        proxy_pass http://127.0.0.1:7912;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -205,7 +205,7 @@ server {
 
 ```
 ontodb.example.com {
-    reverse_proxy localhost:8080
+    reverse_proxy localhost:7912
 }
 ```
 
@@ -237,27 +237,27 @@ spec:
             - "--data-dir"
             - "/data"
             - "--http"
-            - "0.0.0.0:8080"
+            - "0.0.0.0:7912"
             - "--listen"
-            - "0.0.0.0:6500"
+            - "0.0.0.0:7913"
             - "--auth"
             - "--api-keys-file"
             - "/etc/ontodb/api_keys.json"
           ports:
-            - containerPort: 8080
+            - containerPort: 7912
               name: http
-            - containerPort: 6500
+            - containerPort: 7913
               name: tcp
           livenessProbe:
             httpGet:
               path: /api/health/live
-              port: 8080
+              port: 7912
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /api/health/ready
-              port: 8080
+              port: 7912
             initialDelaySeconds: 5
             periodSeconds: 10
           volumeMounts:
@@ -290,11 +290,11 @@ spec:
     app: ontodb
   ports:
     - name: http
-      port: 8080
-      targetPort: 8080
+      port: 7912
+      targetPort: 7912
     - name: tcp
-      port: 6500
-      targetPort: 6500
+      port: 7913
+      targetPort: 7913
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -328,7 +328,7 @@ OntoDB exposes Prometheus metrics at `/metrics`:
 scrape_configs:
   - job_name: 'ontodb'
     static_configs:
-      - targets: ['ontodb:8080']
+      - targets: ['ontodb:7912']
     metrics_path: /metrics
 ```
 
@@ -364,7 +364,7 @@ scrape_configs:
 ontodb-cli -q "BACKUP TO '/backup/ontodb-$(date +%Y%m%d)'"
 
 # Or copy data directory while server is running (after flush)
-curl -X POST http://localhost:8080/api/query \
+curl -X POST http://localhost:7912/api/query \
   -d '{"query": "FLUSH"}'
 cp -r /var/lib/ontodb /backup/ontodb-$(date +%Y%m%d)
 ```
@@ -395,8 +395,8 @@ User=ontodb
 Group=ontodb
 ExecStart=/usr/local/bin/ontodb-server \
   --data-dir /var/lib/ontodb \
-  --http 0.0.0.0:8080 \
-  --listen 127.0.0.1:6500 \
+  --http 0.0.0.0:7912 \
+  --listen 127.0.0.1:7913 \
   --auth \
   --api-keys-file /etc/ontodb/api_keys.json
 Restart=on-failure
@@ -468,11 +468,11 @@ Another process is using the port. Find and stop it:
 
 ```bash
 # Linux
-lsof -i :8080
+lsof -i :7912
 kill <pid>
 
 # Windows
-netstat -ano | findstr :8080
+netstat -ano | findstr :7912
 taskkill /PID <pid> /F
 ```
 
@@ -487,11 +487,11 @@ sudo chown -R ontodb:ontodb /var/lib/ontodb
 
 ```bash
 # Use EXPLAIN to see the execution plan
-curl http://localhost:8080/api/query \
+curl http://localhost:7912/api/query \
   -d '{"query": "EXPLAIN SELECT * FROM Product WHERE price > 100"}'
 
 # Check Prometheus metrics for query latency
-curl http://localhost:8080/metrics | grep query_duration
+curl http://localhost:7912/metrics | grep query_duration
 ```
 
 ### Checking server logs

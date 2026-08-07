@@ -88,6 +88,8 @@ pub struct AuthState {
     keys: Arc<HashMap<String, (String, Permission, Option<u32>)>>,
     /// Whether auth is enabled.
     pub enabled: bool,
+    /// Metrics counters for auth events.
+    pub metrics: Option<crate::metrics::SharedMetrics>,
 }
 
 impl AuthState {
@@ -107,7 +109,14 @@ impl AuthState {
         Self {
             keys: Arc::new(keys),
             enabled: config.enabled,
+            metrics: None,
         }
+    }
+
+    /// Set metrics for auth event tracking.
+    pub fn with_metrics(mut self, metrics: crate::metrics::SharedMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Validate an API key and return its permission level.
@@ -136,17 +145,26 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    // Skip auth for health check
-    if request.uri().path() == "/api/health" {
+    // Skip auth for health check endpoints
+    let path = request.uri().path();
+    if path == "/api/health" || path == "/api/health/ready" || path == "/api/health/live" {
         return next.run(request).await;
     }
 
     // Extract API key from headers
     let api_key = extract_api_key(&request);
 
+    // Record auth attempt
+    if let Some(ref metrics) = auth.metrics {
+        metrics.auth_attempts.inc();
+    }
+
     let key = match api_key {
         Some(k) => k,
         None => {
+            if let Some(ref metrics) = auth.metrics {
+                metrics.auth_failures.inc();
+            }
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({
@@ -159,9 +177,12 @@ pub async fn auth_middleware(
     };
 
     // Validate the key
-    let (description, permission, _rate_limit) = match auth.validate(&key) {
+    let (description, permission, rate_limit) = match auth.validate(&key) {
         Some(info) => info,
         None => {
+            if let Some(ref metrics) = auth.metrics {
+                metrics.auth_failures.inc();
+            }
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({
@@ -178,6 +199,9 @@ pub async fn auth_middleware(
     let path = request.uri().path();
 
     if !permission.allows(method, path) {
+        if let Some(ref metrics) = auth.metrics {
+            metrics.auth_failures.inc();
+        }
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -188,12 +212,18 @@ pub async fn auth_middleware(
             .into_response();
     }
 
+    // Record auth success
+    if let Some(ref metrics) = auth.metrics {
+        metrics.auth_successes.inc();
+    }
+
     // Add key info to request extensions for downstream handlers
     let mut request = request;
     request.extensions_mut().insert(KeyInfo {
         key: key.clone(),
         description,
         permission,
+        rate_limit,
     });
 
     next.run(request).await
@@ -233,9 +263,9 @@ fn extract_api_key(request: &Request) -> Option<String> {
 
 /// Information about the authenticated API key.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct KeyInfo {
     pub key: String,
     pub description: String,
     pub permission: Permission,
+    pub rate_limit: Option<u32>,
 }

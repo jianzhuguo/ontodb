@@ -18,14 +18,14 @@ use std::time::Instant;
     about = "OntoDB interactive command-line client",
     long_about = "Connect to an OntoDB server and execute queries interactively.\n\n\
         Examples:\n  \
-          ontodb-cli                              # connect to localhost:6500\n  \
-          ontodb-cli 192.168.1.100:6500           # connect to remote server\n  \
+          ontodb-cli                              # connect to localhost:7913\n  \
+          ontodb-cli 192.168.1.100:7913           # connect to remote server\n  \
           ontodb-cli -q \"SELECT * FROM Product\"   # single query, then exit\n  \
           ontodb-cli -f init.sql                  # execute SQL file"
 )]
 struct Args {
     /// Server address (host:port)
-    #[arg(default_value = "127.0.0.1:6500")]
+    #[arg(default_value = "127.0.0.1:7913")]
     address: String,
 
     /// Execute a single query and exit
@@ -351,7 +351,13 @@ fn print_table(raw: &str) {
 
 /// Handles backslash meta-commands.
 fn handle_meta_command(cmd: &str, stream: &TcpStream) {
-    let stream = stream.try_clone().unwrap();
+    let stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: failed to clone stream: {}", e);
+            return;
+        }
+    };
     match cmd {
         "\\?" | "\\help" => {
             print_help();

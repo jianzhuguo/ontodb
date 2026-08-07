@@ -21,7 +21,7 @@ pip install -e .
 from ontodb import OntoDBClient
 
 # Connect to OntoDB server
-client = OntoDBClient("http://localhost:8080")
+client = OntoDBClient("http://localhost:7912")
 
 # Check server health
 health = client.health()
@@ -65,7 +65,7 @@ results = client.hybrid_query(
 
 ```python
 client = OntoDBClient(
-    "http://localhost:8080",
+    "http://localhost:7912",
     api_key="your-secret-key"
 )
 ```
@@ -124,7 +124,7 @@ Execute a hybrid SQL + vector search query.
 from ontodb import OntoDBClient, OntoDBError, ConnectionError, QueryError
 
 try:
-    client = OntoDBClient("http://localhost:8080")
+    client = OntoDBClient("http://localhost:7912")
     result = client.query("SELECT * FROM Product")
 except ConnectionError:
     print("Failed to connect to server")

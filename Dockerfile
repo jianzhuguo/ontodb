@@ -21,10 +21,10 @@ COPY --from=builder /app/target/release/ontodb-cli /usr/local/bin/
 RUN mkdir -p /data && chown ontodb:ontodb /data
 
 VOLUME /data
-EXPOSE 8080 6500
+EXPOSE 7912 7913
 
 USER ontodb
 WORKDIR /home/ontodb
 
 ENTRYPOINT ["ontodb-server"]
-CMD ["--data-dir", "/data", "--http", "0.0.0.0:8080", "--listen", "0.0.0.0:6500"]
+CMD ["--data-dir", "/data", "--http", "0.0.0.0:7912", "--listen", "0.0.0.0:7913"]

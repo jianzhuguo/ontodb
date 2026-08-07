@@ -66,20 +66,20 @@ kubectl apply -f deploy/k8s/hpa.yaml
 
 ```bash
 # TCP connection
-ontodb-cli --host ontodb --port 6500
+ontodb-cli --host ontodb --port 7913
 
 # HTTP API
-curl http://ontodb:8088/api/health
+curl http://ontodb:7912/api/health
 ```
 
 ### From outside the cluster
 
 ```bash
 # Port forward
-kubectl port-forward svc/ontodb 8088:8088 6500:6500 -n ontodb
+kubectl port-forward svc/ontodb 7912:7912 7913:7913 -n ontodb
 
 # Then access locally
-curl http://localhost:8088/api/health
+curl http://localhost:7912/api/health
 ```
 
 ## Monitoring
@@ -89,7 +89,7 @@ curl http://localhost:8088/api/health
 OntoDB exposes metrics at `/metrics` in Prometheus format:
 
 ```bash
-curl http://ontodb:8088/metrics
+curl http://ontodb:7912/metrics
 ```
 
 Key metrics:
@@ -115,8 +115,8 @@ All configuration is via environment variables in `configmap.yaml`:
 | `STORAGE_BLOCK_SIZE` | `4096` | Block size (bytes) |
 | `STORAGE_NUM_LEVELS` | `7` | LSM-Tree levels |
 | `STORAGE_COMPRESSION_LEVEL` | `3` | zstd compression (0-21) |
-| `SERVER_LISTEN` | `0.0.0.0:6500` | TCP listen address |
-| `SERVER_HTTP` | `0.0.0.0:8080` | HTTP listen address |
+| `SERVER_LISTEN` | `0.0.0.0:7913` | TCP listen address |
+| `SERVER_HTTP` | `0.0.0.0:7912` | HTTP listen address |
 | `RATE_LIMIT_ENABLED` | `true` | Enable rate limiting |
 | `RATE_LIMIT_RPM` | `60` | Requests per minute |
 | `RATE_LIMIT_BURST` | `10` | Burst size |
@@ -128,7 +128,7 @@ All configuration is via environment variables in `configmap.yaml`:
 kubectl create job ontodb-backup --from=cronjob/ontodb-backup -n ontodb
 
 # Or use the backup API
-curl -X POST http://ontodb:8080/api/backup -d '{"path": "/data/backup"}'
+curl -X POST http://ontodb:7912/api/backup -d '{"path": "/data/backup"}'
 ```
 
 ## Troubleshooting
@@ -143,7 +143,7 @@ kubectl describe pod -l app.kubernetes.io/name=ontodb -n ontodb
 ### Health check failing
 
 ```bash
-kubectl exec -it deployment/ontodb -n ontodb -- curl http://localhost:8080/api/health
+kubectl exec -it deployment/ontodb -n ontodb -- curl http://localhost:7912/api/health
 ```
 
 ### Storage issues

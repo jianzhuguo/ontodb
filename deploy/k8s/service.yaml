@@ -10,11 +10,11 @@ spec:
   type: ClusterIP
   ports:
     - name: tcp
-      port: 6500
+      port: 7913
       targetPort: tcp
       protocol: TCP
     - name: http
-      port: 8088
+      port: 7912
       targetPort: http
       protocol: TCP
   selector:

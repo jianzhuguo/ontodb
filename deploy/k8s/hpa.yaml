@@ -11,7 +11,9 @@ spec:
     kind: Deployment
     name: ontodb
   minReplicas: 1
-  maxReplicas: 5
+  # maxReplicas MUST be 1 until Raft consensus is functional.
+  # Multiple replicas with isolated storage will cause data inconsistency.
+  maxReplicas: 1
   metrics:
     - type: Resource
       resource:

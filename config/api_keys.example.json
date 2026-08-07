@@ -2,19 +2,19 @@
   "enabled": true,
   "keys": [
     {
-      "key": "ontodb-admin-key-2024",
+      "key": "CHANGE_ME_ADMIN_KEY_HERE",
       "description": "Admin key with full access",
       "permission": "Admin",
       "rate_limit": 120
     },
     {
-      "key": "ontodb-readonly-key-2024",
+      "key": "CHANGE_ME_READONLY_KEY_HERE",
       "description": "Read-only access for dashboards",
       "permission": "ReadOnly",
       "rate_limit": 30
     },
     {
-      "key": "ontodb-app-key-2024",
+      "key": "CHANGE_ME_APP_KEY_HERE",
       "description": "Application read-write access",
       "permission": "ReadWrite",
       "rate_limit": 60

@@ -12,7 +12,7 @@ class OntoDBClient:
         ```python
         from ontodb import OntoDBClient
         
-        client = OntoDBClient("http://localhost:8080")
+        client = OntoDBClient("http://localhost:7912")
         
         # Execute SQL query
         result = client.query("SELECT * FROM Product WHERE price > 100")
@@ -27,7 +27,7 @@ class OntoDBClient:
     
     def __init__(
         self,
-        base_url: str = "http://localhost:8080",
+        base_url: str = "http://localhost:7912",
         api_key: Optional[str] = None,
         timeout: int = 30,
     ):

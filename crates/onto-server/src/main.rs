@@ -27,11 +27,11 @@ use tokio::net::TcpListener;
 #[command(name = "ontodb-server", about = "OntoDB - Ontology-driven semantic database")]
 struct Args {
     /// Data directory path
-    #[arg(short, long, default_value = "./ontodb_data")]
+    #[arg(short, long, default_value = "./ontodb_data", env = "STORAGE_DATA_DIR")]
     data_dir: PathBuf,
 
     /// MemTable size limit in bytes
-    #[arg(short, long, default_value = "4194304")]
+    #[arg(short, long, default_value = "4194304", env = "STORAGE_MEMTABLE_SIZE")]
     memtable_size: usize,
 
     /// Run in interactive mode (REPL)
@@ -39,31 +39,31 @@ struct Args {
     interactive: bool,
 
     /// TCP listen address (enables TCP server mode)
-    #[arg(short = 'l', long, default_value = "127.0.0.1:6500")]
+    #[arg(short = 'l', long, default_value = "127.0.0.1:7913", env = "SERVER_LISTEN")]
     listen: String,
 
     /// HTTP listen address (enables HTTP API server mode)
-    #[arg(long)]
+    #[arg(long, env = "SERVER_HTTP")]
     http: Option<String>,
 
     /// Enable API key authentication
-    #[arg(long)]
+    #[arg(long, env = "AUTH_ENABLED")]
     auth: bool,
 
     /// API keys file path (JSON format)
-    #[arg(long)]
+    #[arg(long, env = "AUTH_API_KEYS_FILE")]
     api_keys_file: Option<PathBuf>,
 
     /// Default rate limit (requests per minute)
-    #[arg(long, default_value = "60")]
+    #[arg(long, default_value = "60", env = "RATE_LIMIT_RPM")]
     rate_limit: u32,
 
     /// Rate limit burst size
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value = "10", env = "RATE_LIMIT_BURST")]
     burst_size: u32,
 
     /// Disable rate limiting
-    #[arg(long)]
+    #[arg(long, env = "RATE_LIMIT_DISABLED")]
     no_rate_limit: bool,
 }
 
@@ -93,25 +93,33 @@ fn main() -> Result<()> {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| onto_core::CoreError::Custom(format!("Failed to create tokio runtime: {}", e)))?;
 
-        if let Some(http_addr) = args.http {
-            // Load auth configuration
-            let auth_config = if args.auth {
-                load_auth_config(args.api_keys_file.as_deref())?
-            } else {
-                AuthConfig::default()
-            };
-
-            // Create rate limit config
-            let rate_limit_config = RateLimitConfig {
-                default_rpm: args.rate_limit,
-                enabled: !args.no_rate_limit,
-                burst_size: args.burst_size,
-            };
-
-            // Run HTTP API server
-            rt.block_on(run_http_server(&http_addr, executor, auth_config, rate_limit_config, metrics))?;
+        // Load auth configuration (needed if HTTP is enabled)
+        let auth_config = if args.auth {
+            load_auth_config(args.api_keys_file.as_deref())?
         } else {
-            // Start TCP server (default)
+            AuthConfig::default()
+        };
+
+        // Create rate limit config
+        let rate_limit_config = RateLimitConfig {
+            default_rpm: args.rate_limit,
+            enabled: !args.no_rate_limit,
+            burst_size: args.burst_size,
+        };
+
+        let has_http = args.http.is_some();
+        let http_addr = args.http.unwrap_or_default();
+
+        if has_http {
+            // Run both HTTP and TCP servers concurrently
+            rt.block_on(async {
+                tokio::select! {
+                    res = run_http_server(&http_addr, executor.clone(), auth_config, rate_limit_config, metrics.clone()) => res,
+                    res = run_tcp_server(&args.listen, executor, metrics) => res,
+                }
+            })?;
+        } else {
+            // TCP only
             rt.block_on(run_tcp_server(&args.listen, executor, metrics))?;
         }
     }
@@ -149,8 +157,18 @@ async fn run_http_server(
     metrics: Arc<metrics::Metrics>,
 ) -> Result<()> {
     let state = http::AppState { executor, metrics };
-    let auth_state = AuthState::new(&auth_config);
+    let auth_state = AuthState::new(&auth_config).with_metrics(state.metrics.clone());
     let rate_limiter = RateLimiter::new(rate_limit_config.clone());
+
+    // Spawn background task to clean up stale rate limit buckets every 5 minutes
+    let limiter_cleanup = rate_limiter.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            limiter_cleanup.cleanup_stale(std::time::Duration::from_secs(600)).await;
+        }
+    });
 
     let app = http::build_router_with_auth(state, auth_state.clone(), rate_limiter);
 

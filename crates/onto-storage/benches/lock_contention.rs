@@ -220,7 +220,7 @@ fn bench_hnsw_batch(count: usize, dim: usize) -> Duration {
 }
 
 fn main() {
-    let row_count = 10_000;
+    let row_count = 100_000;
     let iterations = 200;
 
     println!("Setting up engine with {} rows...", row_count);

@@ -20,7 +20,7 @@ spec:
         app.kubernetes.io/component: database
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "8088"
+        prometheus.io/port: "7912"
         prometheus.io/path: "/metrics"
     spec:
       containers:
@@ -29,18 +29,18 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - name: tcp
-              containerPort: 6500
+              containerPort: 7913
               protocol: TCP
             - name: http
-              containerPort: 8088
+              containerPort: 7912
               protocol: TCP
           envFrom:
             - configMapRef:
                 name: ontodb-config
           args:
             - "--data-dir=/data/ontodb"
-            - "--http=0.0.0.0:8088"
-            - "--listen=0.0.0.0:6500"
+            - "--http=0.0.0.0:7912"
+            - "--listen=0.0.0.0:7913"
           volumeMounts:
             - name: data
               mountPath: /data/ontodb
