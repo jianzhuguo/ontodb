@@ -1422,14 +1422,37 @@ impl QueryExecutor {
                 }
             }
             if !all_pkeys.is_empty() {
-                let mut rows = Self::fetch_rows_by_pks(engine, &all_pkeys)?;
-                // Filter by class hierarchy
-                rows.retain(|row| {
-                    row.get("__class__")
-                        .and_then(|v| v.as_str())
-                        .map(|c| class_hierarchy.contains(c))
-                        .unwrap_or(false)
-                });
+                // Use BinaryRow for filtering, only convert to Map for passing rows
+                let mut rows = Vec::new();
+                for pk in &all_pkeys {
+                    if let Ok(Some(val_bytes)) = engine.get(pk) {
+                        // Fast path: BinaryRow class check without full Map conversion
+                        if let Some(brow) = BinaryRow::parse(&val_bytes) {
+                            if !brow.class_in_hierarchy(&class_hierarchy) {
+                                continue;
+                            }
+                            // BinaryRow filter evaluation
+                            if let Some(true) = eval_binary_filter(&brow, f) {
+                                if let Some(mut doc) = brow.to_map() {
+                                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(pk).to_string()));
+                                    rows.push(doc);
+                                }
+                                continue;
+                            }
+                        }
+                        // Fallback: full Map parsing
+                        if let Some(mut doc) = simd_parse_row(&val_bytes) {
+                            if doc.get("__class__")
+                                .and_then(|v| v.as_str())
+                                .map(|c| class_hierarchy.contains(c))
+                                .unwrap_or(false)
+                            {
+                                doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(pk).to_string()));
+                                rows.push(doc);
+                            }
+                        }
+                    }
+                }
                 if let Some(a) = alias {
                     Self::apply_alias(&mut rows, a);
                 }
