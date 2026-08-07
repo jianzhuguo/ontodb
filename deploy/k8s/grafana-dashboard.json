@@ -1,0 +1,68 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "OntoDB Dashboard",
+    "tags": ["ontodb", "database"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Query Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(ontodb_queries_total[5m])",
+            "legendFormat": "{{type}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "Query Latency (p99)",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, rate(ontodb_query_duration_seconds_bucket[5m]))",
+            "legendFormat": "p99"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "Connections",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "ontodb_http_connections_active",
+            "legendFormat": "HTTP Active"
+          },
+          {
+            "expr": "ontodb_tcp_connections_active",
+            "legendFormat": "TCP Active"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+      },
+      {
+        "id": 4,
+        "title": "Storage",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "ontodb_sstable_count",
+            "legendFormat": "SSTables"
+          },
+          {
+            "expr": "ontodb_storage_entries",
+            "legendFormat": "Entries"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+      }
+    ],
+    "time": {"from": "now-1h", "to": "now"},
+    "refresh": "10s"
+  }
+}

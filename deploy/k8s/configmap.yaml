@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ontodb-config
+  namespace: ontodb
+  labels:
+    app.kubernetes.io/name: ontodb
+data:
+  # Storage engine configuration
+  STORAGE_DATA_DIR: "/data/ontodb"
+  STORAGE_MEMTABLE_SIZE: "4194304"  # 4MB
+  STORAGE_BLOCK_SIZE: "4096"        # 4KB
+  STORAGE_NUM_LEVELS: "7"
+  STORAGE_COMPRESSION_LEVEL: "3"    # zstd level 3
+  
+  # Server configuration
+  SERVER_LISTEN: "0.0.0.0:6500"
+  SERVER_HTTP: "0.0.0.0:8080"
+  
+  # Rate limiting
+  RATE_LIMIT_ENABLED: "true"
+  RATE_LIMIT_RPM: "60"
+  RATE_LIMIT_BURST: "10"
