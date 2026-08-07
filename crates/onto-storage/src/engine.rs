@@ -35,6 +35,7 @@ fn parse_doc_bytes(bytes: &[u8]) -> Option<serde_json::Map<String, serde_json::V
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
+use parking_lot::RwLock as FairRwLock;
 
 /// Mutable write-path state, protected by RwLock for concurrent read access.
 ///
@@ -68,7 +69,9 @@ struct WriteState {
 pub struct LsmEngine {
     /// Write-path state (memtable, WAL, txn manager).
     /// Read lock for get/scan, write lock for put/delete/flush.
-    write_state: RwLock<WriteState>,
+    /// Uses parking_lot::RwLock for FIFO fairness — prevents writer starvation
+    /// when multiple readers hold concurrent read locks.
+    write_state: FairRwLock<WriteState>,
 
     /// SSTable handle cache (separate Mutex — read path may lazily open files).
     sst_cache: Mutex<HashMap<PathBuf, Arc<SsTable>>>,
@@ -241,7 +244,7 @@ impl LsmEngine {
         };
 
         let engine = LsmEngine {
-            write_state: RwLock::new(pre_engine.write_state),
+            write_state: FairRwLock::new(pre_engine.write_state),
             sst_cache: Mutex::new(pre_engine.sst_cache),
             levels,
             options,
@@ -269,7 +272,7 @@ impl LsmEngine {
         let entry = Entry::put(key.clone(), value.clone(), seq);
 
         let needs_flush = {
-            let mut ws = self.write_state.write().unwrap();
+            let mut ws = self.write_state.write();
             ws.wal.append(&entry)?;
             ws.wal_pending_count += 1;
             // Batch flush: only flush WAL buffer every 64 writes
@@ -309,7 +312,7 @@ impl LsmEngine {
 
         // 2. Check MemTables under read lock (concurrent with other readers).
         {
-            let ws = self.write_state.read().unwrap();
+            let ws = self.write_state.read();
             if let Some((val, _)) = ws.memtable.get(key) {
                 return Ok(Some(val.to_vec()));
             }
@@ -447,7 +450,7 @@ impl LsmEngine {
         // Uses BTreeMap range query via scan_prefix() — O(log n + matches)
         // instead of O(total_entries) full iteration + starts_with filter.
         {
-            let ws = self.write_state.read().unwrap();
+            let ws = self.write_state.read();
 
             // Scan immutable MemTable (overrides SSTables)
             if let Some(ref imm) = ws.immutable_memtable {
@@ -513,7 +516,7 @@ impl LsmEngine {
         let entry = Entry::delete(key.clone(), seq);
 
         let needs_flush = {
-            let mut ws = self.write_state.write().unwrap();
+            let mut ws = self.write_state.write();
             ws.wal.append(&entry)?;
             ws.wal_pending_count += 1;
             // Batch flush: only flush WAL buffer every 64 writes
@@ -536,7 +539,7 @@ impl LsmEngine {
     /// Call this after a batch of writes to ensure all data is persisted.
     pub fn flush(&self) -> Result<()> {
         let needs_flush = {
-            let ws = self.write_state.read().unwrap();
+            let ws = self.write_state.read();
             !ws.memtable.is_empty()
         };
         if needs_flush {
@@ -549,7 +552,7 @@ impl LsmEngine {
     fn flush_memtable(&self) -> Result<()> {
         // Step 1: Swap current MemTable to immutable (brief lock)
         {
-            let mut ws = self.write_state.write().unwrap();
+            let mut ws = self.write_state.write();
             // Flush any pending WAL writes before swapping
             if ws.wal_pending_count > 0 {
                 ws.wal.flush_buf()?;
@@ -563,7 +566,7 @@ impl LsmEngine {
         let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
         let sst_path = self.options.data_dir.join(format!("L0_{}.sst", sst_id));
         let (entries_snapshot, min_key, max_key) = {
-            let ws = self.write_state.read().unwrap();
+            let ws = self.write_state.read();
             if let Some(ref imm) = ws.immutable_memtable {
                 let entries: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = imm
                     .entries()
@@ -612,7 +615,7 @@ impl LsmEngine {
             self.sst_cache.lock().unwrap().insert(sst_path, Arc::new(new_sst));
         }
         {
-            let mut ws = self.write_state.write().unwrap();
+            let mut ws = self.write_state.write();
             ws.immutable_memtable = None;
             self.reset_wal_internal(&mut ws)?;
         }
@@ -831,7 +834,7 @@ impl LsmEngine {
     pub fn begin_txn(&self) -> SeqNo {
         // seq_counter is the NEXT value to assign, so last committed = seq_counter - 1
         let last_seq = self.seq_counter.load(Ordering::Relaxed).saturating_sub(1);
-        self.write_state.write().unwrap().txn_manager.begin(last_seq)
+        self.write_state.write().txn_manager.begin(last_seq)
     }
 
     /// Commits a transaction. Flushes its write buffer to WAL + MemTable.
@@ -849,7 +852,7 @@ impl LsmEngine {
         };
 
         let (writes_with_seq, old_values, index_entries_batch) = {
-            let mut ws = self.write_state.write().unwrap();
+            let mut ws = self.write_state.write();
             let writes = ws.txn_manager.commit(txn_id)?;
 
             let mut writes_with_seq: Vec<(Vec<u8>, WriteOp, SeqNo)> = Vec::with_capacity(writes.len());
@@ -928,7 +931,7 @@ impl LsmEngine {
 
         // ── Phase 3: WAL + MemTable writes (brief write_state) ──
         let needs_flush = {
-            let mut ws = self.write_state.write().unwrap();
+            let mut ws = self.write_state.write();
 
             // Write index entries to WAL + memtable
             for (idx_key, idx_val, idx_seq) in index_entries_batch {
@@ -1003,12 +1006,12 @@ impl LsmEngine {
 
     /// Aborts a transaction. Discards all pending writes.
     pub fn abort_txn(&self, txn_id: SeqNo) -> Result<()> {
-        self.write_state.write().unwrap().txn_manager.abort(txn_id)
+        self.write_state.write().txn_manager.abort(txn_id)
     }
 
     /// Buffers a put operation in a transaction.
     pub fn txn_put(&self, txn_id: SeqNo, key: Key, value: Value) -> Result<()> {
-        self.write_state.write().unwrap()
+        self.write_state.write()
             .txn_manager
             .get_mut(txn_id)
             .ok_or_else(|| onto_core::CoreError::InvalidArgument(
@@ -1020,7 +1023,7 @@ impl LsmEngine {
 
     /// Buffers a delete operation in a transaction.
     pub fn txn_delete(&self, txn_id: SeqNo, key: Key) -> Result<()> {
-        self.write_state.write().unwrap()
+        self.write_state.write()
             .txn_manager
             .get_mut(txn_id)
             .ok_or_else(|| onto_core::CoreError::InvalidArgument(
@@ -1039,7 +1042,7 @@ impl LsmEngine {
     pub fn txn_get(&self, txn_id: SeqNo, key: &[u8]) -> Result<Option<Value>> {
         // 1. Check transaction's own write buffer
         {
-            let ws = self.write_state.read().unwrap();
+            let ws = self.write_state.read();
             if let Some(txn) = ws.txn_manager.get(txn_id) {
                 if let Some(op) = txn.write_buffer_get(key) {
                     return match op {
@@ -1051,7 +1054,7 @@ impl LsmEngine {
         }
 
         // 2-3. Read from storage with snapshot visibility
-        let vis = self.write_state.read().unwrap().txn_manager.visibility_for(txn_id);
+        let vis = self.write_state.read().txn_manager.visibility_for(txn_id);
         self.get_with_visibility(key, &vis)
     }
 
@@ -1062,7 +1065,7 @@ impl LsmEngine {
         prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let (vis, write_buffer) = {
-            let ws = self.write_state.read().unwrap();
+            let ws = self.write_state.read();
             let vis = ws.txn_manager.visibility_for(txn_id);
             let buf: Vec<(Vec<u8>, WriteOp)> = ws.txn_manager.get(txn_id)
                 .map(|t| t.write_buffer_iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -1104,7 +1107,7 @@ impl LsmEngine {
     ) -> Result<Option<Value>> {
         // Check active MemTable — use range query to find visible version
         {
-            let ws = self.write_state.read().unwrap();
+            let ws = self.write_state.read();
             for entry in ws.memtable.get_versions(key) {
                 if vis.is_visible(entry.seq_no) {
                     if entry.is_tombstone() {
@@ -1184,7 +1187,7 @@ impl LsmEngine {
 
     /// Returns the number of active transactions.
     pub fn active_txn_count(&self) -> usize {
-        self.write_state.read().unwrap().txn_manager.active_count()
+        self.write_state.read().txn_manager.active_count()
     }
 
     // =================================================================
@@ -1215,7 +1218,7 @@ impl LsmEngine {
 
         // Phase 2: Persist index entries to WAL + MemTable under a single write lock
         if !all_index_entries.is_empty() {
-            let mut ws = self.write_state.write().unwrap();
+            let mut ws = self.write_state.write();
             for (key, value) in all_index_entries {
                 let seq = self.next_seq();
                 let entry = Entry::put(key.clone(), value.clone(), seq);
@@ -1277,7 +1280,7 @@ impl LsmEngine {
         let seq = self.next_seq();
         let entry = Entry::put(meta_key.clone(), meta_val.clone(), seq);
         {
-            let mut ws = self.write_state.write().unwrap();
+            let mut ws = self.write_state.write();
             ws.wal.append(&entry)?;
             ws.wal.flush_buf()?;
             ws.memtable.put_with_seq(meta_key, meta_val, seq);
@@ -1324,7 +1327,7 @@ impl LsmEngine {
             let meta_key = Self::make_vec_meta_key(class, column);
             let seq = self.next_seq();
             let del_entry = Entry::delete(meta_key.clone(), seq);
-            let mut ws = self.write_state.write().unwrap();
+            let mut ws = self.write_state.write();
             let _ = ws.wal.append(&del_entry);
             let _ = ws.wal.flush_buf();
             ws.memtable.delete_with_seq(meta_key, seq);
@@ -1344,7 +1347,7 @@ impl LsmEngine {
 
     /// Returns engine statistics.
     pub fn stats(&self) -> EngineStats {
-        let ws = self.write_state.read().unwrap();
+        let ws = self.write_state.read();
         let levels = self.levels.lock().unwrap();
         let total_sstables: usize = levels.iter().map(|l| l.len()).sum();
         let total_sst_size: u64 = levels
