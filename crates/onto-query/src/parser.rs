@@ -2515,7 +2515,6 @@ impl QueryParser {
 
     /// Parse CREATE VERTEX TABLE <name> (id STRING, name STRING, ...)
     fn parse_create_vertex_table(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
         let rest = input[20..].trim(); // Skip "CREATE VERTEX TABLE"
         let (name, rest) = Self::parse_word(rest)?;
         let rest = rest.trim();

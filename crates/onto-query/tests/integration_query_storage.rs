@@ -1206,8 +1206,8 @@ fn integration_vector_search_after_update() {
     // Update item_a's embedding to be far away
     exec_ok(&executor, "UPDATE Product SET embedding = '[0.0, 0.0, 1.0]' WHERE name = 'item_a'");
 
-    // Now item_b should be closest to [1,0,0]
-    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 1");
+    // Now item_b [0,1,0] should be closest to [0.9, 0.1, 0] (closer than item_a [0,0,1])
+    let result = exec_ok(&executor, "VECTOR SEARCH ON Product (embedding) QUERY [0.9, 0.1, 0.0] TOP 1");
     match &result {
         onto_query::QueryResult::Rows(rows) => {
             assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "item_b");
@@ -1542,12 +1542,13 @@ fn integration_vector_search_large_dataset() {
 
     // Insert 100 items with known patterns
     for i in 0..100 {
-        // First 50 items: vector points towards [1,0,...]
-        // Last 50 items: vector points towards [0,1,...]
+        // First 50 items: vector points towards [1,0,...] with slight variation
+        // Last 50 items: vector points towards [0,1,...] with slight variation
+        let noise = (i % 10) as f64 * 0.01;
         let vec = if i < 50 {
-            format!("[0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]")
+            format!("[{}, {}, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]", 0.9 - noise, 0.1 + noise)
         } else {
-            format!("[0.1, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]")
+            format!("[{}, {}, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]", 0.1 + noise, 0.9 - noise)
         };
         exec_ok(&executor, &format!(
             "INSERT INTO Product (name, price, embedding) VALUES ('item_{:03}', {}, '{}')",

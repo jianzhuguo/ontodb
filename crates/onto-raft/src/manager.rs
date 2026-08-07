@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 
 use openraft::BasicNode;
 
-use crate::error::RaftError;
 use crate::types::NodeId;
 
 /// Configuration for a Raft node.

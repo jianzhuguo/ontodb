@@ -280,7 +280,7 @@ impl VectorIndexManager {
         let results = index.search(query, over_fetch);
 
         // Filter deleted keys, stale entries, and deduplicate
-        let mut seen = HashSet::new();
+        let mut seen: HashMap<Vec<u8>, usize> = HashMap::new(); // id -> index in filtered
         let mut filtered = Vec::new();
         for r in results {
             if self.deleted_keys.contains(&r.entry.id) {
@@ -291,17 +291,20 @@ impl VectorIndexManager {
             if let Some(stored_vec) = self.doc_vectors.get(&r.entry.id).and_then(|entries| {
                 entries.iter().find(|(c, col, _)| c == class && col == column).map(|(_, _, v)| v)
             }) {
-                if stored_vec.len() == r.entry.vector.len()
-                    && stored_vec.iter().zip(r.entry.vector.iter()).any(|(a, b)| (a - b).abs() > 1e-6)
-                {
+                let is_stale = stored_vec.len() == r.entry.vector.len()
+                    && stored_vec.iter().zip(r.entry.vector.iter()).any(|(a, b)| (a - b).abs() > 1e-6);
+                if is_stale {
                     continue; // Stale entry from old vector
                 }
             }
-            if seen.insert(r.entry.id.clone()) {
-                filtered.push(r);
-                if filtered.len() >= k {
-                    break;
-                }
+            // Deduplicate: if we already have this id, skip (keep first non-stale occurrence)
+            if seen.contains_key(&r.entry.id) {
+                continue;
+            }
+            seen.insert(r.entry.id.clone(), filtered.len());
+            filtered.push(r);
+            if filtered.len() >= k {
+                break;
             }
         }
         Ok(filtered)
@@ -339,7 +342,7 @@ impl VectorIndexManager {
         let results = index.search_filtered(query, over_fetch, &effective_ids);
 
         // Filter stale entries and deduplicate
-        let mut seen = HashSet::new();
+        let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
         let mut filtered = Vec::new();
         for r in results {
             if let Some(stored_vec) = self.doc_vectors.get(&r.entry.id).and_then(|entries| {
@@ -351,11 +354,13 @@ impl VectorIndexManager {
                     continue;
                 }
             }
-            if seen.insert(r.entry.id.clone()) {
-                filtered.push(r);
-                if filtered.len() >= k {
-                    break;
-                }
+            if seen.contains_key(&r.entry.id) {
+                continue;
+            }
+            seen.insert(r.entry.id.clone(), filtered.len());
+            filtered.push(r);
+            if filtered.len() >= k {
+                break;
             }
         }
         Ok(filtered)
