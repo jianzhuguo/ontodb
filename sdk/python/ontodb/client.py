@@ -274,3 +274,175 @@ class OntoDBClient:
         
         data = self._request("POST", "/api/hybrid/query", json=payload)
         return data.get("data", [])
+    
+    # ── Graph Operations ──────────────────────────────────────────
+    
+    def add_vertex(
+        self,
+        vertex_id: str,
+        labels: List[str],
+        properties: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Add a vertex to the graph.
+        
+        Args:
+            vertex_id: Unique vertex ID
+            labels: List of labels (e.g., ["Person", "Employee"])
+            properties: Optional vertex properties
+            
+        Returns:
+            Response with vertex info
+            
+        Example:
+            ```python
+            client.add_vertex("alice", ["Person"], {"name": "Alice", "age": 30})
+            ```
+        """
+        payload = {
+            "id": vertex_id,
+            "labels": labels,
+            "properties": properties or {},
+        }
+        return self._request("POST", "/api/graph/vertex", json=payload)
+    
+    def add_edge(
+        self,
+        edge_id: str,
+        from_id: str,
+        to_id: str,
+        label: str,
+        properties: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Add an edge to the graph.
+        
+        Args:
+            edge_id: Unique edge ID
+            from_id: Source vertex ID
+            to_id: Target vertex ID
+            label: Edge label (e.g., "KNOWS", "WORKS_AT")
+            properties: Optional edge properties
+            
+        Returns:
+            Response with edge info
+            
+        Example:
+            ```python
+            client.add_edge("e1", "alice", "bob", "KNOWS", {"since": 2020})
+            ```
+        """
+        payload = {
+            "id": edge_id,
+            "from": from_id,
+            "to": to_id,
+            "label": label,
+            "properties": properties or {},
+        }
+        return self._request("POST", "/api/graph/edge", json=payload)
+    
+    def get_vertex(self, vertex_id: str) -> Dict[str, Any]:
+        """Get a vertex by ID.
+        
+        Args:
+            vertex_id: Vertex ID to retrieve
+            
+        Returns:
+            Vertex data
+        """
+        return self._request("GET", f"/api/graph/vertex/{vertex_id}")
+    
+    def delete_vertex(self, vertex_id: str) -> Dict[str, Any]:
+        """Delete a vertex and all connected edges.
+        
+        Args:
+            vertex_id: Vertex ID to delete
+            
+        Returns:
+            Deletion confirmation
+        """
+        return self._request("DELETE", f"/api/graph/vertex/{vertex_id}")
+    
+    def get_neighbors(
+        self,
+        vertex_id: str,
+        direction: str = "out",
+        edge_label: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get neighbors of a vertex.
+        
+        Args:
+            vertex_id: Vertex ID
+            direction: "in", "out", or "both"
+            edge_label: Optional filter by edge label
+            
+        Returns:
+            List of neighbor vertices
+        """
+        params = {"direction": direction}
+        if edge_label:
+            params["edge_label"] = edge_label
+        data = self._request("GET", f"/api/graph/neighbors/{vertex_id}", params=params)
+        return data.get("neighbors", [])
+    
+    def graph_traverse(
+        self,
+        start_id: str,
+        direction: str = "out",
+        max_depth: int = 3,
+        edge_label: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Traverse the graph from a starting vertex.
+        
+        Args:
+            start_id: Starting vertex ID
+            direction: "in", "out", or "both"
+            max_depth: Maximum traversal depth
+            edge_label: Optional filter by edge label
+            
+        Returns:
+            Traversal results with vertices and edges
+            
+        Example:
+            ```python
+            result = client.graph_traverse("alice", direction="out", max_depth=2, edge_label="KNOWS")
+            for vertex in result["vertices"]:
+                print(vertex["id"])
+            ```
+        """
+        payload = {
+            "start": start_id,
+            "direction": direction,
+            "max_depth": max_depth,
+        }
+        if edge_label:
+            payload["edge_label"] = edge_label
+        return self._request("POST", "/api/graph/traverse", json=payload)
+    
+    def shortest_path(
+        self,
+        from_id: str,
+        to_id: str,
+        max_depth: int = 10,
+    ) -> Dict[str, Any]:
+        """Find shortest path between two vertices.
+        
+        Args:
+            from_id: Source vertex ID
+            to_id: Target vertex ID
+            max_depth: Maximum path length
+            
+        Returns:
+            Path information
+            
+        Example:
+            ```python
+            path = client.shortest_path("alice", "dave")
+            if path["path"]:
+                print(f"Path length: {path['path']['length']}")
+            ```
+        """
+        payload = {
+            "from": from_id,
+            "to": to_id,
+            "max_depth": max_depth,
+        }
+        return self._request("POST", "/api/graph/shortest-path", json=payload)

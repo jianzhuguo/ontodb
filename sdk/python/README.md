@@ -61,6 +61,49 @@ results = client.hybrid_query(
 )
 ```
 
+## Graph Operations
+
+OntoDB supports property graph operations with vertices, edges, and traversals.
+
+```python
+from ontodb import OntoDBClient
+
+client = OntoDBClient("http://localhost:7912")
+
+# Add vertices
+client.add_vertex("alice", ["Person"], {"name": "Alice", "age": 30})
+client.add_vertex("bob", ["Person"], {"name": "Bob", "age": 25})
+client.add_vertex("acme", ["Company"], {"name": "Acme Corp"})
+
+# Add edges
+client.add_edge("e1", "alice", "bob", "KNOWS", {"since": 2020})
+client.add_edge("e2", "alice", "acme", "WORKS_AT", {"role": "Engineer"})
+
+# Get vertex
+alice = client.get_vertex("alice")
+print(alice)
+
+# Get neighbors
+friends = client.get_neighbors("alice", direction="out", edge_label="KNOWS")
+for friend in friends:
+    print(friend["id"])
+
+# Graph traversal
+result = client.graph_traverse(
+    "alice",
+    direction="out",
+    max_depth=2,
+    edge_label="KNOWS"
+)
+for vertex in result["vertices"]:
+    print(vertex["id"])
+
+# Shortest path
+path = client.shortest_path("alice", "bob")
+if path.get("path"):
+    print(f"Path length: {path['path']['length']}")
+```
+
 ## Authentication
 
 ```python
@@ -117,6 +160,36 @@ Perform vector similarity search.
 #### `hybrid_query(sql_filter, vector_column, query_vector, top_k=10, class_name=None) -> list`
 
 Execute a hybrid SQL + vector search query.
+
+### Graph Operations
+
+#### `add_vertex(vertex_id, labels, properties=None) -> dict`
+
+Add a vertex to the graph.
+
+#### `add_edge(edge_id, from_id, to_id, label, properties=None) -> dict`
+
+Add an edge to the graph.
+
+#### `get_vertex(vertex_id) -> dict`
+
+Get a vertex by ID.
+
+#### `delete_vertex(vertex_id) -> dict`
+
+Delete a vertex and all connected edges.
+
+#### `get_neighbors(vertex_id, direction="out", edge_label=None) -> list`
+
+Get neighbors of a vertex.
+
+#### `graph_traverse(start_id, direction="out", max_depth=3, edge_label=None) -> dict`
+
+Traverse the graph from a starting vertex.
+
+#### `shortest_path(from_id, to_id, max_depth=10) -> dict`
+
+Find shortest path between two vertices.
 
 ## Error Handling
 
