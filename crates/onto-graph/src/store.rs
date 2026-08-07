@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use parking_lot::RwLock as PLRwLock;
 
 use crate::error::GraphError;
-use crate::model::{Edge, PropValue, PropertyMap, Vertex};
+use crate::model::{Edge, PropertyMap, Vertex};
 
 /// Storage mode for the graph store.
 #[derive(Debug, Clone)]
@@ -30,6 +30,7 @@ pub struct GraphStore {
     /// Labels index: label -> set of vertex IDs.
     label_index: PLRwLock<HashMap<String, HashSet<String>>>,
     /// Storage mode.
+    #[allow(dead_code)]
     storage_mode: StorageMode,
 }
 
@@ -386,6 +387,7 @@ impl Default for GraphStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::PropValue;
 
     #[test]
     fn test_vertex_crud() {
