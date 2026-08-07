@@ -57,6 +57,9 @@ struct WriteState {
 
     /// Cache of opened SSTable handles, keyed by file path.
     sst_cache: HashMap<PathBuf, Arc<SsTable>>,
+
+    /// Number of appends since last WAL flush. Batched to reduce syscalls.
+    wal_pending_count: u32,
 }
 
 /// The main LSM-Tree storage engine with MVCC support.
@@ -202,6 +205,7 @@ impl LsmEngine {
                 wal,
                 txn_manager: TxnManager::new(),
                 sst_cache: HashMap::new(),
+                wal_pending_count: 0,
             },
             levels: vec![Vec::new(); options.num_levels],
             options: options.clone(),
@@ -263,7 +267,12 @@ impl LsmEngine {
         let needs_flush = {
             let mut ws = self.write_state.lock().unwrap();
             ws.wal.append(&entry)?;
-            ws.wal.flush_buf()?;
+            ws.wal_pending_count += 1;
+            // Batch flush: only flush WAL buffer every 64 writes
+            if ws.wal_pending_count >= 64 {
+                ws.wal.flush_buf()?;
+                ws.wal_pending_count = 0;
+            }
             ws.memtable.put_with_seq(key, value, seq);
             ws.memtable.size() >= self.options.memtable_size_limit
         };
@@ -505,7 +514,12 @@ impl LsmEngine {
         let needs_flush = {
             let mut ws = self.write_state.lock().unwrap();
             ws.wal.append(&entry)?;
-            ws.wal.flush_buf()?;
+            ws.wal_pending_count += 1;
+            // Batch flush: only flush WAL buffer every 64 writes
+            if ws.wal_pending_count >= 64 {
+                ws.wal.flush_buf()?;
+                ws.wal_pending_count = 0;
+            }
             ws.memtable.delete_with_seq(key, seq);
             ws.memtable.size() >= self.options.memtable_size_limit
         };
@@ -535,6 +549,11 @@ impl LsmEngine {
         // Step 1: Swap current MemTable to immutable (brief lock)
         {
             let mut ws = self.write_state.lock().unwrap();
+            // Flush any pending WAL writes before swapping
+            if ws.wal_pending_count > 0 {
+                ws.wal.flush_buf()?;
+                ws.wal_pending_count = 0;
+            }
             let old_mem = std::mem::replace(&mut ws.memtable, MemTable::new());
             ws.immutable_memtable = Some(old_mem);
         }
