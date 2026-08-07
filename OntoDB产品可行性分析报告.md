@@ -1,6 +1,6 @@
 # OntoDB 产品可行性分析报告
 
-> 版本：v1.23 | 更新日期：2026-08-06
+> 版本：v1.26 | 更新日期：2026-08-07
 > 定位：**100% 自研**，本体语义驱动的多模数据库
 > 技术栈：Rust | 开发平台：Windows | 目标平台：Linux 生产环境
 
@@ -61,6 +61,7 @@ OntoDB 是一个**本体（Ontology）驱动的语义多模数据库**，核心�
 - **B+Tree 磁盘索引（Disk-based）**：4KB 页式存储，Slotted Page 布局，LRU Buffer Pool（单调计数器 O(1) touch），支持点查找 O(log n)、范围扫描（leaf chain）、节点分裂/合并/重平衡，独立 `.idx` 文件持久化，**新增 remove() 操作**（含 leaf/internal 下溢重分布与合并、parent separator 更新、root collapse），支持 `IndexStorageMode`（InMemory/DiskBased/Hybrid 三种模式），引擎启动时自动打开已有磁盘索引文件，`IndexManager` 同步维护内存和磁盘双索引
 - **全局 seq_no**：引擎级序列号确保跨 MemTable flush 的版本顺序正确
 - **HNSW 向量索引**：自研实现，支持 L2/Cosine/InnerProduct 三种距离度量，可配置 M/ef_construction/ef_search 参数，支持增量插入、过滤搜索（本体约束）、持久化元数据到 LSM（`__vec_meta__` 前缀），启动时自动重建索引，事务提交时自动维护向量索引（INSERT/UPDATE/DELETE），搜索时自动过滤已删除条目和过时向量（HNSW 不支持原地更新的补偿机制）
+- **BinaryRow 二进制行格式**：紧凑二进制存储格式（u16 字段数 + 类型标签 + 偏移量索引），支持 Null/Bool/Int/Float/String/Object/Array 七种类型，`BinaryRow::parse` 零拷贝解析，`find_field` 字段查找 O(1)（偏移量直接跳转），`eval_binary_filter` 在原始字节上直接比较（零分配过滤），全部扫描路径集成（seq_scan/index_scan/match/vector_search/analyze），存储层 `parse_doc_bytes` 统一入口 BinaryRow 优先 → JSON fallback
 
 ### 本体引擎详情（P0 推理引擎已完成）
 
@@ -217,6 +218,11 @@ OWL-lite 语义扩展：
 | Block Cache | 每次读取重新解压数据块 | LRU 缓存解压后的数据块（64 blocks/SSTable） | **消除重复解压** | v1.11 |
 | 后台 Compaction | 同步 compaction 阻塞写入路径 | 独立线程异步执行，原子更新 levels | **消除写延迟尖峰** | v1.12 |
 | 本体 Schema 验证 | INSERT 无类型检查 | INSERT/UPDATE 均验证 required + 数据类型 | **数据质量保障** | v1.12 |
+| Filter Pushdown | SeqScan 物化全部行后再 retain 过滤 | scan 阶段即时过滤 + 字节级快速拒绝（跳过 JSON 反序列化） | **-16% 延迟**（100K 行） | v1.24 |
+| CREATE INDEX 自动更新统计 | CREATE INDEX 后需手动 ANALYZE 才生效 | CREATE INDEX 自动刷新 planner stats，索引立即可用于查询优化 | **消除手动 ANALYZE** | v1.24 |
+| BinaryRow 字段查找 | serde_json::from_slice 全量反序列化 → Map::get | BinaryRow::parse + find_field 偏移量直接跳转 | **4.6x** | v1.26 |
+| BinaryRow 过滤求值 | serde_json 反序列化 + Value::as_i64 + 比较 | eval_binary_filter 原始字节上 i64 比较，零分配 | **5.5x** | v1.26 |
+| BinaryRow parse + to_map | serde_json::from_slice | BinaryRow::parse + to_map（二进制优先） | **1.3x** | v1.26 |
 
 ### 4.2 关键路径性能影响分析
 
@@ -259,6 +265,9 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 | MemTable::get() 误匹配前缀键 | `key\x00` 被 `key` 查询命中 | 使用 inclusive range + 精确键匹配 | v1.5 |
 | WAL reset 非原子 | flush 期间 crash 丢失 WAL | write-new-then-rename 原子操作 | v1.8 |
 | WAL replay 损坏后继续 | 长度字段损坏导致全部条目错位 | CRC/长度异常立即停止 | v1.8 |
+| 物化视图 DROP/REFRESH 软删除 | `put(__deleted__)` 标记而非真正删除，存储层累积无效条目 | 改用 `engine.delete()` 写 tombstone，`scan_prefix` 自动过滤 | v1.24 |
+| 物化视图增量刷新 `updated` 死代码 | `updated` 变量声明但从未递增，`old_count` 未使用 | 移除死代码，简化增量差异逻辑 | v1.24 |
+| CTE 清理软删除 | CTE 临时数据用 `put(__deleted__)` 清理，留下垃圾条目 | 改用 `engine.delete()` 真正删除 | v1.24 |
 
 ### 4.4 编译警告清理
 
@@ -426,7 +435,7 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 |--------|--------|------|
 | M3.1 | 语义 RAG | 本体约束下的向量检索，语义感知的上下文组装 |
 | M3.2 | 中文本体支持 | 中文属性名/类名，内置中文嵌入模型 |
-| M3.3 | 分布式支持 | Raft 共识 + 数据分片 |
+| M3.3 | 分布式支持 | Raft 共识 + 数据分片 | **基础架构已完成（v1.25）** |
 | M3.4 | 生产级稳定性 | 完整的 compaction、故障恢复、监控 |
 
 ---
@@ -567,6 +576,10 @@ BTreeIndex::lookup() → BufferPool::fetch() → [touch()] → [evict()]
 | v1.21 | Bloom Filter 确认 | 已集成到 SSTable get()/get_full() 读取路径，1% 误报率 |
 | v1.22 | 推理结果物化缓存 | InferenceCache 缓存 class_hierarchy/property_aliases/inverse_property，CREATE ONTOLOGY 自动失效 |
 | v1.23 | 语义查询优化 | narrow_scan_scope 用 __class__ 过滤 + owl:disjointWith 约束缩小扫描范围 |
+| v1.24 | 物化视图 bug 修复 | DROP/REFRESH/CTE 软删除改 tombstone，移除增量刷新死代码，加强 drop 测试断言 |
+| v1.24 | Filter Pushdown | planner 直接把 filter 推入 SeqScan 节点，executor scan 阶段即时过滤 + 字节级快速拒绝 |
+| v1.24 | CREATE INDEX 自动统计 | 建索引后自动刷新 planner stats，新增 `refresh_index_stats()` 方法 |
+| v1.24 | Benchmark 隔离 | `concurrent_bench` 加 `#[ignore]`，普通 `cargo test` 不再阻塞（从 5min+ 降到 <5s） |
 
 ### 11.3 持久化保障
 
@@ -2007,7 +2020,67 @@ SELECT * FROM Person WHERE __class__ IN ('Employee', 'Manager')
 
 ---
 
-## 三十八、结论与建议
+## 三十八、查询性能基线测试（v1.24）
+
+### 38.1 测试环境
+
+| 项目 | 值 |
+|------|-----|
+| 平台 | Windows (NTFS) |
+| 编译模式 | release (optimized) |
+| 数据量 | 100,000 行（Product 表，3 列：name/price/category） |
+| 测试方法 | `concurrent_bench` — 50 次迭代 × 4 种查询 × 多线程 |
+
+### 38.2 测试结果
+
+| 操作 | 耗时（50次） | 单次查询 | 吞吐量 |
+|------|-------------|----------|--------|
+| Simple SELECT (price > 5000)，单线程 | 17.5s | **~349ms** | ~286K rows/s |
+| 2 线程并发读 | 10.1s | ~201ms | ~497K rows/s |
+| 4 线程并发读 | 8.6s | ~172ms | ~581K rows/s |
+| 8 线程并发读 | 8.8s | ~176ms | ~568K rows/s |
+| 读写锁 speedup（4 线程） | — | — | **1.87x** |
+
+### 38.3 同类数据库对比
+
+| 数据库 | 100K 行全表扫描 | 点查 (key-value) | 定位 |
+|--------|----------------|-----------------|------|
+| **OntoDB** | **~349ms** | ~微秒级(MemTable) | 学术原型 |
+| SQLite | ~5-10ms | ~1-5us | 嵌入式标杆 |
+| RocksDB | N/A (KV) | ~1-5us | LSM 标杆 |
+| DuckDB | ~1-5ms (列式) | N/A | 分析型标杆 |
+| PostgreSQL | ~20-50ms (行式) | ~0.1-1ms (索引) | 通用标杆 |
+
+### 38.4 瓶颈分析
+
+当前查询路径（v1.26，BinaryRow 优先）：
+```
+scan_prefix → 拉全量数据 → BinaryRow::parse（零拷贝） → eval_binary_filter（原始字节比较）→ 仅匹配行 to_map 物化
+                               ↓ BinaryRow 不命中
+                          serde_json::from_slice（JSON fallback）
+```
+
+| 瓶颈 | 影响 | 优化方向 | 状态 |
+|------|------|----------|------|
+| ~~JSON 反序列化~~ | ~~每行 `serde_json::from_slice`，10 万行 = 10 万次 JSON parse~~ | ~~二进制行格式~~ | ✅ v1.26 BinaryRow 已解决（字段查找 4.6x，过滤 5.5x） |
+| HashMap<String, Value> 行格式 | 匹配行仍需物化为 Map，内存分配密集 | P3: 列式或紧凑行格式，延迟物化 | 待实施 |
+| 无索引自动选择 | `price > 5000` 走全表扫描 | 已实现（需 CREATE INDEX + ANALYZE） | ✅ 已完成 |
+
+### 38.5 优化路线图
+
+| 优先级 | 优化 | 预期提升 | 状态 |
+|--------|------|----------|------|
+| ~~P0~~ | ~~Filter Pushdown~~ | ~~2-5x~~ | ✅ 已完成（v1.24，-16%） |
+| ~~P1~~ | ~~索引自动选择~~ | ~~10-100x~~ | ✅ 已完成（v1.24，CREATE INDEX 即时生效） |
+| ~~P2~~ | ~~二进制行格式~~ | ~~3-10x~~ | ✅ 已完成（v1.26，字段查找 4.6x，过滤 5.5x） |
+| P3 | 列式存储 / 向量化执行 | 10-100x | 远期 |
+
+---
+
+## 三十九、结论与建议
+
+> v1.26 更新：新增 BinaryRow 二进制行格式，全部扫描路径集成，字段查找 4.6x / 过滤求值 5.5x 加速，P2 优化完成。
+> v1.24 更新：新增物化视图/CTE 存储清理、Filter Pushdown、CREATE INDEX 自动统计、首次性能基线测试。
 
 ### 核心结论
 
@@ -2016,7 +2089,7 @@ SELECT * FROM Person WHERE __class__ IN ('Employee', 'Manager')
 3. **100% 自研核心引擎是正确策略**：存储引擎、本体引擎、查询引擎、事务引擎必须自主掌控，基础设施（Raft、序列化、压缩）选择性复用
 4. **跨平台无实质风险**：当前 Rust 代码天然跨平台，Windows 开发 → Linux 生产完全可行，CI 双平台构建是最低成本保障
 5. **范围是最大风险**：必须砍掉 80% 的外围功能，聚焦核心
-6. **代码质量持续提升**：319 个测试全部通过（99 lib + 41 integration + 117 storage + 49 ontology + 10 core + 3 server），查询引擎覆盖 Phase 15-26 + P0-P1 全部功能
+6. **代码质量持续提升**：359 个测试全部通过（119 query + 41 integration + 119 storage + 49 ontology + 10 core + 4 raft + 14 sharding + 3 server），查询引擎覆盖 Phase 15-26 + P0-P1 全部功能，分布式基础架构就绪
 7. **查询引擎已具备完整 OLAP 能力**：窗口函数（含下推优化）、CTE、CASE WHEN、子查询、JOIN（Hash/SortMerge/NestedLoop）、EXPLAIN ANALYZE、Plan Cache、ICD、LIMIT OFFSET、UPSERT、11 个内置函数、物化视图增量刷新
 8. **执行架构统一**：所有 DML（SELECT/INSERT/UPDATE/DELETE/MATCH）统一使用 plan-driven 执行，优化器优化对所有查询生效
 9. **多语句事务支持**：BEGIN/COMMIT/ROLLBACK 真正生效，支持原子性多语句操作，MVCC 快照隔离
@@ -2032,8 +2105,15 @@ SELECT * FROM Person WHERE __class__ IN ('Employee', 'Manager')
 19. **TCP 异步并发**：TCP server 从 OS 线程改为 tokio 异步任务，连接追踪 + 查询 metrics，与 HTTP 共享 runtime
 20. **推理结果物化缓存**：InferenceCache 缓存类层级/属性别名/逆属性，命中时跳过 Reasoner 不动点迭代，CREATE ONTOLOGY 自动失效
 21. **语义查询优化**：`narrow_scan_scope` 用 `__class__` 过滤下推 + `owl:disjointWith` 不相交类排除，减少无效扫描
+22. **物化视图与 CTE 存储清理**：DROP/REFRESH/CTE 清理全部改用 `engine.delete()` tombstone，消除 `__deleted__` 软删除导致的存储垃圾累积
+23. **查询性能优化 — Filter Pushdown**：planner 把 WHERE 条件直接推入 SeqScan 节点，executor scan 阶段即时过滤 + 字节级快速拒绝（跳过 JSON 反序列化），100K 行查询延迟降低 16%
+24. **CREATE INDEX 即时生效**：建索引后自动刷新 planner stats，无需手动 ANALYZE，索引立即可用于查询优化
+25. **首次性能基线测试**：release 模式 100K 行全表扫描 ~349ms/查询，4 线程并发读 2x speedup，确认瓶颈在 JSON 反序列化（下一步：二进制行格式）
+26. **Raft 共识层（新 crate `onto-raft`）**：基于 openraft 0.9，实现 `RaftStorage`（Log + StateMachine + Snapshot），4 个测试覆盖 PUT/DELETE/Log/Batch，TCP 传输层待实现
+27. **数据分片（新 crate `onto-sharding`）**：三种分片策略（类级/范围/哈希）、`ShardRouter` 路由器支持 key/scan/range 路由、`ShardManager` 管理分片生命周期（创建/迁移/下线），JSON 持久化，14 个测试全过
+28. **BinaryRow 二进制行格式**：紧凑二进制存储（类型标签+偏移量索引），全部扫描路径集成（seq_scan/index_scan/match/vector_search/analyze），微基准测试字段查找 4.6x、过滤求值 5.5x 加速，P2 优化完成，瓶颈从 JSON 反序列化转移到行物化（下一步：P3 列式/延迟物化）
 
-### 性能基线（v1.8）
+### 性能基线（v1.24，含 Filter Pushdown）
 
 | 组件 | 关键操作 | 复杂度 | 说明 |
 |------|----------|--------|------|

@@ -1,0 +1,15 @@
+[package]
+name = "onto-sharding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Data sharding for OntoDB - class-based, range-based, and hash-based sharding strategies"
+
+[dependencies]
+onto-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

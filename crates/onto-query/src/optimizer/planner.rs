@@ -633,31 +633,27 @@ impl QueryPlanner {
         limit: Option<usize>,
         columns: &SelectColumns,
     ) -> ExecutionPlan {
-        // Start with seq scan
+        // Start with seq scan — push filter directly into the node for scan-time evaluation
         let scan_cost = self.cost_model.seq_scan_cost(stats);
-        let mut current_node = PlanNode::SeqScan {
-            table: table.to_string(),
-            alias: alias.map(|s| s.to_string()),
-            filter: None, // Filter applied separately
-            estimated_rows: scan_cost.rows,
-        };
         let mut current_cost = scan_cost;
 
-        // Apply filter
+        // Estimate filter cost separately for the cost model
         if let Some(filter_expr) = filter {
             let filter_selectivity = self.cost_model.estimate_selectivity(stats, filter_expr);
             let filter_cost = self.cost_model.filter_cost(current_cost.rows, &filter_selectivity);
-            current_node = PlanNode::Filter {
-                input: Box::new(current_node),
-                predicate: filter_expr.clone(),
-                estimated_rows: filter_cost.rows,
-            };
             current_cost = CostEstimate::new(
                 filter_cost.rows,
                 current_cost.io_cost,
                 current_cost.cpu_cost + filter_cost.cpu_cost,
             );
         }
+
+        let mut current_node = PlanNode::SeqScan {
+            table: table.to_string(),
+            alias: alias.map(|s| s.to_string()),
+            filter: filter.clone(),
+            estimated_rows: current_cost.rows,
+        };
 
         // Apply joins - choose between HashJoin and SortMergeJoin
         let ordered_joins = self.reorder_joins(joins);

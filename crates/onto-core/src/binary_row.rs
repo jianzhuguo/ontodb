@@ -189,6 +189,29 @@ impl<'a> BinaryRow<'a> {
         Some(map)
     }
 
+    /// Convert to a `Map` with only the requested columns (plus `__class__` if present).
+    /// Falls back to full `to_map()` when `columns` is empty (SELECT *).
+    /// This avoids converting all fields when only a subset is needed.
+    pub fn to_map_projected(&self, columns: &[String]) -> Option<Map<String, Value>> {
+        if columns.is_empty() {
+            return self.to_map();
+        }
+        let mut map = Map::with_capacity(columns.len() + 1);
+        // Always include __class__ for hierarchy checks downstream
+        if let Some(cls) = self.class_value() {
+            map.insert("__class__".to_string(), Value::String(cls.to_string()));
+        }
+        for col in columns {
+            if col == "__class__" || col.starts_with("__") {
+                continue;
+            }
+            if let Some(val) = self.get_value(col) {
+                map.insert(col.clone(), val);
+            }
+        }
+        Some(map)
+    }
+
     /// Get a field value as a serde_json::Value by name.
     pub fn get_value(&self, name: &str) -> Option<Value> {
         let idx = self.find_field(name)?;

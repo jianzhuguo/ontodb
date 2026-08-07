@@ -274,7 +274,12 @@ async fn handle_client(
                     onto_query::QueryAst::VectorSearch { .. } => "VECTOR_SEARCH",
                     _ => "OTHER",
                 };
-                match executor.execute(&ast) {
+                let result = if onto_query::QueryExecutor::is_read_only_query(&ast) {
+                    executor.execute_read(&ast)
+                } else {
+                    executor.execute(&ast)
+                };
+                match result {
                     Ok(result) => {
                         let elapsed = start.elapsed().as_secs_f64();
                         metrics.record_query(query_type, elapsed, true);
@@ -339,15 +344,22 @@ fn run_repl(executor: &QueryExecutor) -> Result<()> {
 
 fn execute_and_print(executor: &QueryExecutor, input: &str) {
     match QueryParser::parse(input) {
-        Ok(ast) => match executor.execute(&ast) {
-            Ok(result) => {
-                println!("{}", result.format());
-                println!();
+        Ok(ast) => {
+            let result = if onto_query::QueryExecutor::is_read_only_query(&ast) {
+                executor.execute_read(&ast)
+            } else {
+                executor.execute(&ast)
+            };
+            match result {
+                Ok(result) => {
+                    println!("{}", result.format());
+                    println!();
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                }
             }
-            Err(e) => {
-                eprintln!("Error: {}", e);
-            }
-        },
+        }
         Err(e) => {
             eprintln!("Parse error: {}", e);
         }

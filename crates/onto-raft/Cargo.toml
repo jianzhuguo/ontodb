@@ -1,21 +1,20 @@
 [package]
-name = "onto-query"
+name = "onto-raft"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Query engine - SQL parser, semantic extensions, optimizer, and executor for OntoDB"
+description = "Raft consensus layer for OntoDB distributed replication"
 
 [dependencies]
 onto-core = { workspace = true }
 onto-storage = { workspace = true }
-onto-ontology = { workspace = true }
+openraft = { version = "0.9", features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-simd-json = { workspace = true }
-thiserror = { workspace = true }
-anyhow = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
-csv = "1"
+anyhow = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

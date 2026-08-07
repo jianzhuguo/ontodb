@@ -322,7 +322,12 @@ async fn execute_query(
         _ => "OTHER",
     };
 
-    let result = match state.executor.execute(&ast) {
+    let result = if onto_query::QueryExecutor::is_read_only_query(&ast) {
+        state.executor.execute_read(&ast)
+    } else {
+        state.executor.execute(&ast)
+    };
+    let result = match result {
         Ok(r) => r,
         Err(e) => {
             let elapsed = start.elapsed().as_secs_f64();
@@ -399,7 +404,12 @@ async fn sparql_query(
         }
     };
 
-    let result = match state.executor.execute(&ast) {
+    let result = if onto_query::QueryExecutor::is_read_only_query(&ast) {
+        state.executor.execute_read(&ast)
+    } else {
+        state.executor.execute(&ast)
+    };
+    let result = match result {
         Ok(r) => r,
         Err(e) => {
             let elapsed = start.elapsed().as_secs_f64();
@@ -478,7 +488,12 @@ async fn vector_search(
         }
     };
 
-    let result = match state.executor.execute(&ast) {
+    let result = if onto_query::QueryExecutor::is_read_only_query(&ast) {
+        state.executor.execute_read(&ast)
+    } else {
+        state.executor.execute(&ast)
+    };
+    let result = match result {
         Ok(r) => r,
         Err(e) => {
             let elapsed = start.elapsed().as_secs_f64();
@@ -540,7 +555,12 @@ async fn hybrid_query(
         }
     };
 
-    let sql_result = match state.executor.execute(&sql_ast) {
+    let sql_result = if onto_query::QueryExecutor::is_read_only_query(&sql_ast) {
+        state.executor.execute_read(&sql_ast)
+    } else {
+        state.executor.execute(&sql_ast)
+    };
+    let sql_result = match sql_result {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -599,7 +619,12 @@ async fn hybrid_query(
         }
     };
 
-    let vector_result = match state.executor.execute(&vector_ast) {
+    let vector_result = if onto_query::QueryExecutor::is_read_only_query(&vector_ast) {
+        state.executor.execute_read(&vector_ast)
+    } else {
+        state.executor.execute(&vector_ast)
+    };
+    let vector_result = match vector_result {
         Ok(r) => r,
         Err(e) => {
             return (

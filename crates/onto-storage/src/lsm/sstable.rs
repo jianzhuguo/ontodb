@@ -16,6 +16,7 @@ use onto_core::{CoreError, Entry, EntryKind, Result, SeqNo};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Default block cache capacity (number of blocks per SSTable).
 const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 64;
@@ -30,10 +31,17 @@ const FLAG_COMPRESSED: u8 = 0x01;
 /// Block format: [entries...][restart_points...][num_restarts: u32]
 const RESTART_INTERVAL: usize = 16;
 
+/// Interior of SsTable requiring interior mutability (file I/O + block cache).
+struct SsTableInner {
+    file: File,
+    block_cache: BlockCache,
+}
+
 /// An SSTable file on disk.
 pub struct SsTable {
     _path: PathBuf,
-    file: File,
+    /// File handle and block cache, behind a Mutex for `&self` read access.
+    inner: Mutex<SsTableInner>,
     /// Size of the data section.
     _data_size: u64,
     /// Index: last_key -> (offset, size) of each data block.
@@ -42,8 +50,6 @@ pub struct SsTable {
     bloom: Option<BloomFilter>,
     /// Whether data blocks are zstd-compressed.
     compressed: bool,
-    /// LRU block cache for decompressed data blocks.
-    block_cache: BlockCache,
 }
 
 #[derive(Debug, Clone)]
@@ -214,12 +220,14 @@ impl SsTableBuilder {
 
         Ok(SsTable {
             _path: path.as_ref().to_path_buf(),
-            file: read_file,
+            inner: Mutex::new(SsTableInner {
+                file: read_file,
+                block_cache: BlockCache::new(DEFAULT_BLOCK_CACHE_CAPACITY),
+            }),
             _data_size: data_size,
             index: self.block_entries,
             bloom: Some(bloom),
             compressed,
-            block_cache: BlockCache::new(DEFAULT_BLOCK_CACHE_CAPACITY),
         })
     }
 
@@ -290,12 +298,14 @@ impl SsTable {
 
         Ok(SsTable {
             _path: path.as_ref().to_path_buf(),
-            file,
+            inner: Mutex::new(SsTableInner {
+                file,
+                block_cache: BlockCache::new(DEFAULT_BLOCK_CACHE_CAPACITY),
+            }),
             _data_size: index_offset,
             index,
             bloom,
             compressed,
-            block_cache: BlockCache::new(DEFAULT_BLOCK_CACHE_CAPACITY),
         })
     }
 
@@ -307,7 +317,7 @@ impl SsTable {
     /// Note: tombstones (deleted entries) are returned as `Ok(None)` to signal
     /// "key was deleted here, stop searching older SSTables". The engine should
     /// use `get_full` if it needs to distinguish "not found" from "deleted".
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<(Vec<u8>, SeqNo)>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<(Vec<u8>, SeqNo)>> {
         // Check bloom filter first
         if let Some(ref bloom) = self.bloom {
             if !bloom.might_contain(key) {
@@ -332,7 +342,7 @@ impl SsTable {
     /// Gets a value by key with full tombstone awareness.
     /// Returns `Ok(Some((value, seq_no, kind)))` for both Put and Delete entries.
     /// Returns `Ok(None)` only if the key truly doesn't exist in this SSTable.
-    pub fn get_full(&mut self, key: &[u8]) -> Result<Option<(Vec<u8>, SeqNo, EntryKind)>> {
+    pub fn get_full(&self, key: &[u8]) -> Result<Option<(Vec<u8>, SeqNo, EntryKind)>> {
         if let Some(ref bloom) = self.bloom {
             if !bloom.might_contain(key) {
                 return Ok(None);
@@ -355,7 +365,7 @@ impl SsTable {
     }
 
     /// Returns the minimum (first) key in the SSTable by reading the first entry.
-    pub fn first_key(&mut self) -> Result<Vec<u8>> {
+    pub fn first_key(&self) -> Result<Vec<u8>> {
         if self.index.is_empty() {
             return Ok(Vec::new());
         }
@@ -379,7 +389,7 @@ impl SsTable {
     }
 
     /// Returns an iterator over all entries in the SSTable.
-    pub fn iter(&mut self) -> Result<SsTableIterator<'_>> {
+    pub fn iter(&self) -> Result<SsTableIterator<'_>> {
         SsTableIterator::new(self)
     }
 
@@ -404,20 +414,22 @@ impl SsTable {
         Ok(lo)
     }
 
-    fn _read_block(&mut self, entry: &BlockIndexEntry) -> Result<Vec<u8>> {
+    fn _read_block(&self, entry: &BlockIndexEntry) -> Result<Vec<u8>> {
         self.read_block_at(entry.offset, entry.size)
     }
 
-    fn read_block_at(&mut self, offset: u64, size: u64) -> Result<Vec<u8>> {
+    fn read_block_at(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let mut inner = self.inner.lock().unwrap();
+
         // Check block cache first (returns decompressed data)
-        if let Some(cached) = self.block_cache.get(offset) {
+        if let Some(cached) = inner.block_cache.get(offset) {
             return Ok(cached.to_vec());
         }
 
         // Cache miss: read from disk
         let mut buf = vec![0u8; size as usize];
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut buf)?;
+        inner.file.seek(SeekFrom::Start(offset))?;
+        inner.file.read_exact(&mut buf)?;
 
         // Decompress if the SSTable uses compression
         let block_data = if self.compressed {
@@ -428,7 +440,7 @@ impl SsTable {
         };
 
         // Cache the decompressed block
-        self.block_cache.put(offset, block_data.clone());
+        inner.block_cache.put(offset, block_data.clone());
 
         Ok(block_data)
     }
@@ -586,7 +598,7 @@ impl SsTable {
 
 /// Iterator over SSTable entries.
 pub struct SsTableIterator<'a> {
-    table: &'a mut SsTable,
+    table: &'a SsTable,
     block_idx: usize,
     block_data: Vec<u8>,
     restart_start: usize,
@@ -600,7 +612,7 @@ pub struct SsTableIterator<'a> {
 }
 
 impl<'a> SsTableIterator<'a> {
-    fn new(table: &'a mut SsTable) -> Result<Self> {
+    fn new(table: &'a SsTable) -> Result<Self> {
         let mut iter = Self {
             table,
             block_idx: 0,

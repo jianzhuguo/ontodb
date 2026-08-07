@@ -186,6 +186,53 @@ pub enum QueryAst {
     },
 }
 
+impl QueryAst {
+    /// Returns true if this query only reads data and has no write side effects.
+    /// Used to determine lock type: read lock for read-only, write lock for mutations.
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            // Pure reads
+            QueryAst::Select { .. } => true,
+            QueryAst::Match { .. } => true,
+            QueryAst::VectorSearch { .. } => true,
+            QueryAst::Explain { .. } => true,
+
+            // Writes
+            QueryAst::Insert { .. } => false,
+            QueryAst::BatchInsert { .. } => false,
+            QueryAst::InsertSelect { .. } => false,
+            QueryAst::Upsert { .. } => false,
+            QueryAst::Update { .. } => false,
+            QueryAst::Delete { .. } => false,
+            QueryAst::Import { .. } => false,
+
+            // DDL
+            QueryAst::CreateOntology { .. } => false,
+            QueryAst::CreateIndex { .. } => false,
+            QueryAst::CreateCompositeIndex { .. } => false,
+            QueryAst::DropIndex { .. } => false,
+            QueryAst::CreateVectorIndex { .. } => false,
+            QueryAst::DropVectorIndex { .. } => false,
+            QueryAst::CreateMaterializedView { .. } => false,
+            QueryAst::DropMaterializedView { .. } => false,
+            QueryAst::RefreshMaterializedView { .. } => false,
+
+            // Transaction control
+            QueryAst::Begin => false,
+            QueryAst::Commit => false,
+            QueryAst::Rollback => false,
+
+            // ANALYZE writes statistics
+            QueryAst::Analyze { .. } => false,
+
+            // UNION and WITH are conservatively treated as writes
+            // because they can contain INSERT...SELECT or write CTEs
+            QueryAst::Union { .. } => false,
+            QueryAst::With { .. } => false,
+        }
+    }
+}
+
 /// A CTE (Common Table Expression) definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CteDefinition {

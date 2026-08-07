@@ -1,0 +1,12 @@
+services:
+  ontodb:
+    build: .
+    ports:
+      - "8080:8080"   # HTTP API
+      - "6500:6500"   # TCP CLI
+    volumes:
+      - ontodb-data:/data
+    restart: unless-stopped
+
+volumes:
+  ontodb-data:
