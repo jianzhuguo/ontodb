@@ -390,7 +390,7 @@ class OntoDBClient:
         max_depth: int = 3,
         edge_label: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Traverse the graph from a starting vertex.
+        """Traverse the graph from a starting vertex (fast, no path info).
         
         Args:
             start_id: Starting vertex ID
@@ -399,7 +399,7 @@ class OntoDBClient:
             edge_label: Optional filter by edge label
             
         Returns:
-            Traversal results with vertices and edges
+            Traversal results with vertices
             
         Example:
             ```python
@@ -415,6 +415,37 @@ class OntoDBClient:
         }
         if edge_label:
             payload["edge_label"] = edge_label
+        return self._request("POST", "/api/graph/traverse", json=payload)
+    
+    def graph_traverse_with_paths(
+        self,
+        start_id: str,
+        direction: str = "out",
+        max_depth: int = 3,
+    ) -> Dict[str, Any]:
+        """Traverse the graph with path reconstruction (slower, includes paths).
+        
+        Args:
+            start_id: Starting vertex ID
+            direction: "in", "out", or "both"
+            max_depth: Maximum traversal depth
+            
+        Returns:
+            Traversal results with vertices and paths from start to each vertex
+            
+        Example:
+            ```python
+            result = client.graph_traverse_with_paths("alice", direction="out", max_depth=2)
+            for path in result["paths"]:
+                print(f"{' -> '.join(path['vertex_ids'])} (length: {path['length']})")
+            ```
+        """
+        payload = {
+            "start": start_id,
+            "direction": direction,
+            "max_depth": max_depth,
+            "with_paths": True,
+        }
         return self._request("POST", "/api/graph/traverse", json=payload)
     
     def shortest_path(

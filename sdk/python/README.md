@@ -88,7 +88,7 @@ friends = client.get_neighbors("alice", direction="out", edge_label="KNOWS")
 for friend in friends:
     print(friend["id"])
 
-# Graph traversal
+# Graph traversal (fast, no path info)
 result = client.graph_traverse(
     "alice",
     direction="out",
@@ -97,6 +97,11 @@ result = client.graph_traverse(
 )
 for vertex in result["vertices"]:
     print(vertex["id"])
+
+# Graph traversal with path reconstruction (slower, includes paths)
+result = client.graph_traverse_with_paths("alice", direction="out", max_depth=2)
+for path in result["paths"]:
+    print(f"{' -> '.join(path['vertex_ids'])} (length: {path['length']})")
 
 # Shortest path
 path = client.shortest_path("alice", "bob")
@@ -185,7 +190,11 @@ Get neighbors of a vertex.
 
 #### `graph_traverse(start_id, direction="out", max_depth=3, edge_label=None) -> dict`
 
-Traverse the graph from a starting vertex.
+Traverse the graph from a starting vertex (fast, no path info).
+
+#### `graph_traverse_with_paths(start_id, direction="out", max_depth=3) -> dict`
+
+Traverse the graph with path reconstruction (slower, includes paths from start to each vertex).
 
 #### `shortest_path(from_id, to_id, max_depth=10) -> dict`
 
