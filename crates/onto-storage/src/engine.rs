@@ -576,16 +576,21 @@ impl LsmEngine {
         {
             let mut levels = self.levels.lock().unwrap();
             levels[0].push(SsTableInfo {
-                path: sst_path,
+                path: sst_path.clone(),
                 size: metadata.len(),
                 min_key,
                 max_key,
             });
         }
 
-        // Step 4: Clear immutable MemTable + reset WAL (brief lock)
+        // Step 4: Insert SST into cache + clear immutable MemTable + reset WAL (single lock).
+        // The SST must be in sst_cache BEFORE clearing immutable_memtable to prevent
+        // commit_txn's get_from_locked() from missing data in the window between
+        // immutable MT cleared and the next lazy SST open.
+        let new_sst = SsTable::open(&sst_path)?;
         {
             let mut ws = self.write_state.lock().unwrap();
+            ws.sst_cache.insert(sst_path, Arc::new(new_sst));
             ws.immutable_memtable = None;
             self.reset_wal_internal(&mut ws)?;
         }

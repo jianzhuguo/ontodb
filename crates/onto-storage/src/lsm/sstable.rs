@@ -325,8 +325,13 @@ impl SsTable {
             }
         }
 
-        // Find the block that might contain this key
-        let block_idx = self.find_block(key)?;
+        // Find the block that might contain this key.
+        // KeyNotFound means key > all keys in this SST (bloom false positive).
+        let block_idx = match self.find_block(key) {
+            Ok(idx) => idx,
+            Err(CoreError::KeyNotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
 
         // Copy offset/size to avoid holding borrow on self.index
         let block_offset = self.index[block_idx].offset;
@@ -349,7 +354,11 @@ impl SsTable {
             }
         }
 
-        let block_idx = self.find_block(key)?;
+        let block_idx = match self.find_block(key) {
+            Ok(idx) => idx,
+            Err(CoreError::KeyNotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
         let block_offset = self.index[block_idx].offset;
         let block_size = self.index[block_idx].size;
         let block_data = self.read_block_at(block_offset, block_size)?;
