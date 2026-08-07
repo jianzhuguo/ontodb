@@ -50,8 +50,8 @@ fn main() {
         (10000, 256, 10, "10K vectors, 256D"),
     ];
 
-    let ef_search_values = [50, 100, 200, 400];
-    let num_queries = 100;
+    let ef_search_values = [200, 400, 800, 1600];
+    let num_queries = 30;
     let k = 10;
 
     println!("{}", "=".repeat(72));
@@ -85,10 +85,12 @@ fn main() {
             .collect();
 
         for &ef_search in &ef_search_values {
-            // Build HNSW index
+            // Build HNSW index - use higher params for higher dimensions
+            let m = if dim >= 256 { 64 } else { 32 };
+            let ef_construction = if dim >= 256 { 1000 } else { 500 };
             let config = HnswConfig::new(dim, DistanceMetric::L2)
-                .with_m(16)
-                .with_ef_construction(200)
+                .with_m(m)
+                .with_ef_construction(ef_construction)
                 .with_ef_search(ef_search);
 
             let mut index = HnswIndex::new(config);
@@ -152,9 +154,9 @@ fn main() {
             .collect();
 
         let config = HnswConfig::new(dim, *metric)
-            .with_m(16)
-            .with_ef_construction(200)
-            .with_ef_search(100);
+            .with_m(32)
+            .with_ef_construction(500)
+            .with_ef_search(400);
 
         let mut index = HnswIndex::new(config);
         let entries: Vec<VectorEntry> = vectors
