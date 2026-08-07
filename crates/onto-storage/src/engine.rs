@@ -558,14 +558,15 @@ impl LsmEngine {
         };
 
         // Build SSTable from snapshot OUTSIDE the lock (disk I/O)
+        // Use add_owned + into_iter to avoid cloning key/value a second time.
         let mut builder = SsTableBuilder::new();
         builder.set_compression_level(self.options.compression_level);
-        for (key, value, seq_no, kind) in &entries_snapshot {
-            builder.add(&Entry {
-                key: key.clone(),
-                value: value.clone(),
-                seq_no: *seq_no,
-                kind: *kind,
+        for (key, value, seq_no, kind) in entries_snapshot {
+            builder.add_owned(Entry {
+                key,
+                value,
+                seq_no,
+                kind,
             });
         }
         builder.build(&sst_path)?;

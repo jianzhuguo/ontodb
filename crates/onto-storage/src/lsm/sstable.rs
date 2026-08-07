@@ -126,6 +126,34 @@ impl SsTableBuilder {
         }
     }
 
+    /// Adds an entry by taking ownership, avoiding clones for callers that
+    /// no longer need the Entry after this call.
+    pub fn add_owned(&mut self, entry: Entry) {
+        // Record restart point
+        if self.entry_count_in_block % RESTART_INTERVAL == 0 {
+            self.restart_points
+                .push(self.current_block.len() as u32);
+        }
+
+        if self.current_block_first_key.is_empty() {
+            self.current_block_first_key = entry.key.clone();
+        }
+        self.current_block_last_key = entry.key.clone();
+
+        // Encode entry into current block (borrows entry)
+        Self::encode_entry_to(&mut self.current_block, &entry);
+        self.current_block_entries += 1;
+        self.entry_count_in_block += 1;
+
+        // Push key into bloom filter (takes ownership, no clone)
+        self.keys_for_bloom.push(entry.key);
+
+        // Flush block if it's large enough
+        if self.current_block.len() >= 4096 {
+            self.flush_block();
+        }
+    }
+
     /// Flushes the current block to the main data buffer.
     /// Compresses the block with zstd if compression_level > 0.
     fn flush_block(&mut self) {
@@ -606,6 +634,10 @@ impl SsTable {
 }
 
 /// Iterator over SSTable entries.
+///
+/// Zero-copy design: stores byte offsets into the current block instead of
+/// cloning key/value into separate Vecs. `key()` and `value()` return
+/// slices borrowed from `block_data`, avoiding per-entry allocations.
 pub struct SsTableIterator<'a> {
     table: &'a SsTable,
     block_idx: usize,
@@ -613,8 +645,11 @@ pub struct SsTableIterator<'a> {
     restart_start: usize,
     restarts: Vec<usize>,
     pos: usize,
-    current_key: Vec<u8>,
-    current_value: Vec<u8>,
+    // Byte offsets into block_data for the current entry (zero-copy).
+    current_key_start: usize,
+    current_key_end: usize,
+    current_value_start: usize,
+    current_value_end: usize,
     current_seq: SeqNo,
     current_kind: EntryKind,
     valid: bool,
@@ -629,8 +664,10 @@ impl<'a> SsTableIterator<'a> {
             restart_start: 0,
             restarts: Vec::new(),
             pos: 0,
-            current_key: Vec::new(),
-            current_value: Vec::new(),
+            current_key_start: 0,
+            current_key_end: 0,
+            current_value_start: 0,
+            current_value_end: 0,
             current_seq: 0,
             current_kind: EntryKind::Put,
             valid: false,
@@ -689,32 +726,93 @@ impl<'a> SsTableIterator<'a> {
             }
         }
 
-        if let Some((key, value, seq, kind)) =
-            self.table.decode_entry_at(&self.block_data, self.pos)
+        // Decode entry offsets without copying data (zero-copy).
+        if let Some((key_start, key_end, val_start, val_end, seq, kind)) =
+            self.decode_entry_offsets(&self.block_data, self.pos)
         {
             self.current_kind = kind;
-            self.current_key = key;
-            self.current_value = value;
+            self.current_key_start = key_start;
+            self.current_key_end = key_end;
+            self.current_value_start = val_start;
+            self.current_value_end = val_end;
             self.current_seq = seq;
-            self.pos += 4 + self.current_key.len()
-                + 4 + self.current_value.len()
-                + 8 + 1;
+            // Skip past value + seq_no (8) + kind (1)
+            self.pos = val_end + 8 + 1;
             self.valid = true;
         } else {
             self.valid = false;
         }
     }
 
+    /// Decodes entry offsets without allocating (zero-copy).
+    fn decode_entry_offsets(
+        &self,
+        data: &[u8],
+        offset: usize,
+    ) -> Option<(usize, usize, usize, usize, SeqNo, EntryKind)> {
+        let mut pos = offset;
+
+        // key_len
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let key_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        // key
+        if pos + key_len > data.len() {
+            return None;
+        }
+        let key_start = pos;
+        let key_end = pos + key_len;
+        pos = key_end;
+
+        // value_len
+        if pos + 4 > data.len() {
+            return None;
+        }
+        let val_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        // value
+        if pos + val_len > data.len() {
+            return None;
+        }
+        let val_start = pos;
+        let val_end = pos + val_len;
+        pos = val_end;
+
+        // seq_no (8 bytes)
+        if pos + 8 > data.len() {
+            return None;
+        }
+        let seq_no = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+
+        // kind (1 byte)
+        if pos >= data.len() {
+            return None;
+        }
+        let kind = match data[pos] {
+            0 => EntryKind::Put,
+            _ => EntryKind::Delete,
+        };
+
+        Some((key_start, key_end, val_start, val_end, seq_no, kind))
+    }
+
     pub fn is_valid(&self) -> bool {
         self.valid
     }
 
+    /// Returns the current key as a zero-copy slice into the block data.
     pub fn key(&self) -> &[u8] {
-        &self.current_key
+        &self.block_data[self.current_key_start..self.current_key_end]
     }
 
+    /// Returns the current value as a zero-copy slice into the block data.
     pub fn value(&self) -> &[u8] {
-        &self.current_value
+        &self.block_data[self.current_value_start..self.current_value_end]
     }
 
     pub fn seq_no(&self) -> SeqNo {
