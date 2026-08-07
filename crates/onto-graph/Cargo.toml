@@ -21,3 +21,7 @@ rand = { workspace = true }
 [[bench]]
 name = "graph_bench"
 harness = false
+
+[[bench]]
+name = "graph_vector_recall"
+harness = false
