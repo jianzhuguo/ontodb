@@ -3738,9 +3738,9 @@ impl QueryExecutor {
     /// Sorts rows by a column. Tries numeric comparison first, falls back to string.
     fn sort_rows(rows: &mut Vec<Map<String, Value>>, col: &str, ascending: bool) {
         rows.sort_by(|a, b| {
-            let a_val = Self::resolve_column_value(a, col).unwrap_or_default();
-            let b_val = Self::resolve_column_value(b, col).unwrap_or_default();
-            let ord = Self::compare_values(&a_val, &b_val);
+            let a_val = a.get(col);
+            let b_val = b.get(col);
+            let ord = Self::compare_values_direct(a_val, b_val);
             if ascending { ord } else { ord.reverse() }
         });
     }
@@ -4195,6 +4195,39 @@ impl QueryExecutor {
         }
         // Fall back to string comparison
         a.cmp(b)
+    }
+
+    /// Compares two Option<&Value> directly without string conversion.
+    /// Avoids allocations for numeric comparisons.
+    fn compare_values_direct(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+        match (a, b) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(a_val), Some(b_val)) => {
+                match (a_val, b_val) {
+                    (Value::Number(a_n), Value::Number(b_n)) => {
+                        // Direct numeric comparison without string conversion
+                        if let (Some(a_f), Some(b_f)) = (a_n.as_f64(), b_n.as_f64()) {
+                            a_f.partial_cmp(&b_f).unwrap_or(std::cmp::Ordering::Equal)
+                        } else {
+                            a_n.to_string().cmp(&b_n.to_string())
+                        }
+                    }
+                    (Value::String(a_s), Value::String(b_s)) => a_s.cmp(b_s),
+                    (Value::Bool(a_b), Value::Bool(b_b)) => a_b.cmp(b_b),
+                    (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+                    (Value::Null, _) => std::cmp::Ordering::Less,
+                    (_, Value::Null) => std::cmp::Ordering::Greater,
+                    // Mixed types: compare type names for stability
+                    _ => {
+                        let a_str = Self::value_to_sort_key(a_val);
+                        let b_str = Self::value_to_sort_key(b_val);
+                        a_str.cmp(&b_str)
+                    }
+                }
+            }
+        }
     }
 
     // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
