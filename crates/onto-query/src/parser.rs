@@ -184,6 +184,103 @@ pub enum QueryAst {
     Analyze {
         table: String,
     },
+
+    // ── Graph Queries ────────────────────────────────────────────────
+
+    /// CREATE VERTEX TABLE <name> (properties...)
+    CreateVertexTable {
+        name: String,
+        columns: Vec<ColumnDef>,
+    },
+
+    /// CREATE EDGE TABLE <name> (from_table, to_table, properties...)
+    CreateEdgeTable {
+        name: String,
+        from_table: String,
+        to_table: String,
+        columns: Vec<ColumnDef>,
+    },
+
+    /// INSERT VERTEX INTO <table> (id, properties...) VALUES (...)
+    InsertVertex {
+        table: String,
+        id: String,
+        labels: Vec<String>,
+        properties: Vec<(String, LiteralValue)>,
+    },
+
+    /// INSERT EDGE INTO <table> (id, from_id, to_id, properties...) VALUES (...)
+    InsertEdge {
+        table: String,
+        id: String,
+        from_id: String,
+        to_id: String,
+        label: String,
+        properties: Vec<(String, LiteralValue)>,
+    },
+
+    /// GRAPH TRAVERSE FROM <start_id> [IN|OUT|BOTH] [LABEL <label>] [DEPTH <n>] [WHERE ...]
+    GraphTraverse {
+        start_id: String,
+        direction: GraphDirection,
+        edge_label: Option<String>,
+        max_depth: usize,
+        filter: Option<FilterExpr>,
+    },
+
+    /// GRAPH MATCH (<var>: <label>) -[<edge_var>: <edge_label>]-> (<var2>: <label2>) [WHERE ...] RETURN ...
+    GraphMatch {
+        pattern: GraphPattern,
+        filter: Option<FilterExpr>,
+        returns: Vec<String>,
+    },
+
+    /// GRAPH SHORTEST PATH FROM <id1> TO <id2> [MAX DEPTH <n>]
+    GraphShortestPath {
+        from_id: String,
+        to_id: String,
+        max_depth: usize,
+    },
+}
+
+/// Column definition for CREATE TABLE.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnDef {
+    pub name: String,
+    pub col_type: String,
+    pub required: bool,
+}
+
+/// Graph traversal direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GraphDirection {
+    Out,
+    In,
+    Both,
+}
+
+/// Graph pattern for MATCH queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphPattern {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+/// A node in a graph pattern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub variable: String,
+    pub label: Option<String>,
+}
+
+/// An edge in a graph pattern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub variable: Option<String>,
+    pub label: Option<String>,
+    pub from: String,
+    pub to: String,
+    pub direction: GraphDirection,
 }
 
 impl QueryAst {
@@ -229,6 +326,15 @@ impl QueryAst {
             // because they can contain INSERT...SELECT or write CTEs
             QueryAst::Union { .. } => false,
             QueryAst::With { .. } => false,
+
+            // Graph queries
+            QueryAst::CreateVertexTable { .. } => false,
+            QueryAst::CreateEdgeTable { .. } => false,
+            QueryAst::InsertVertex { .. } => false,
+            QueryAst::InsertEdge { .. } => false,
+            QueryAst::GraphTraverse { .. } => true,
+            QueryAst::GraphMatch { .. } => true,
+            QueryAst::GraphShortestPath { .. } => true,
         }
     }
 }
@@ -535,6 +641,20 @@ impl QueryParser {
             Self::parse_delete(input)
         } else if upper.starts_with("MATCH") {
             Self::parse_match(input)
+        } else if upper.starts_with("CREATE VERTEX TABLE") {
+            Self::parse_create_vertex_table(input)
+        } else if upper.starts_with("CREATE EDGE TABLE") {
+            Self::parse_create_edge_table(input)
+        } else if upper.starts_with("INSERT VERTEX") {
+            Self::parse_insert_vertex(input)
+        } else if upper.starts_with("INSERT EDGE") {
+            Self::parse_insert_edge(input)
+        } else if upper.starts_with("GRAPH TRAVERSE") {
+            Self::parse_graph_traverse(input)
+        } else if upper.starts_with("GRAPH MATCH") {
+            Self::parse_graph_match(input)
+        } else if upper.starts_with("GRAPH SHORTEST PATH") {
+            Self::parse_graph_shortest_path(input)
         } else {
             Err(CoreError::InvalidArgument(format!(
                 "unsupported query: {}",
@@ -2389,6 +2509,258 @@ impl QueryParser {
             .find(|c: char| c.is_whitespace() || c == ';' || c == ',')
             .unwrap_or(input.len());
         Ok((input[..end].to_string(), input[end..].trim_start().to_string()))
+    }
+
+    // ── Graph Query Parsers ──────────────────────────────────────────
+
+    /// Parse CREATE VERTEX TABLE <name> (id STRING, name STRING, ...)
+    fn parse_create_vertex_table(input: &str) -> Result<QueryAst> {
+        let upper = input.to_uppercase();
+        let rest = input[20..].trim(); // Skip "CREATE VERTEX TABLE"
+        let (name, rest) = Self::parse_word(rest)?;
+        let rest = rest.trim();
+
+        // Parse column definitions in parentheses
+        if !rest.starts_with('(') {
+            return Err(CoreError::InvalidArgument("expected '(' after table name".to_string()));
+        }
+        let end = rest.find(')').ok_or_else(|| CoreError::InvalidArgument("missing ')'".to_string()))?;
+        let cols_str = rest[1..end].trim();
+
+        let columns = Self::parse_column_defs(cols_str)?;
+
+        Ok(QueryAst::CreateVertexTable { name, columns })
+    }
+
+    /// Parse CREATE EDGE TABLE <name> (FROM <from_table> TO <to_table>, ...)
+    fn parse_create_edge_table(input: &str) -> Result<QueryAst> {
+        let rest = input[18..].trim(); // Skip "CREATE EDGE TABLE"
+        let (name, rest) = Self::parse_word(rest)?;
+        let rest = rest.trim();
+
+        if !rest.starts_with('(') {
+            return Err(CoreError::InvalidArgument("expected '(' after table name".to_string()));
+        }
+        let end = rest.find(')').ok_or_else(|| CoreError::InvalidArgument("missing ')'".to_string()))?;
+        let inner = rest[1..end].trim();
+
+        // Parse FROM and TO clauses
+        let upper_inner = inner.to_uppercase();
+        let from_pos = upper_inner.find("FROM ").ok_or_else(|| CoreError::InvalidArgument("expected FROM".to_string()))?;
+        let to_pos = upper_inner.find(" TO ").ok_or_else(|| CoreError::InvalidArgument("expected TO".to_string()))?;
+
+        let from_table = inner[from_pos + 5..to_pos].trim().to_string();
+        let after_to = inner[to_pos + 4..].trim();
+        let (to_table, cols_str) = Self::parse_word(after_to)?;
+
+        let columns = if cols_str.starts_with(',') {
+            Self::parse_column_defs(cols_str[1..].trim())?
+        } else {
+            vec![]
+        };
+
+        Ok(QueryAst::CreateEdgeTable { name, from_table, to_table, columns })
+    }
+
+    /// Parse INSERT VERTEX INTO <table> (id, labels, props...)
+    fn parse_insert_vertex(input: &str) -> Result<QueryAst> {
+        let rest = input[13..].trim(); // Skip "INSERT VERTEX"
+        let rest = rest.strip_prefix("INTO").ok_or_else(|| CoreError::InvalidArgument("expected INTO".to_string()))?.trim();
+        let (table, rest) = Self::parse_word(rest)?;
+
+        // For simplicity, parse as a structured format
+        // INSERT VERTEX INTO Person SET id = 'alice', labels = ['Person'], name = 'Alice'
+        let upper = rest.to_uppercase();
+        if upper.starts_with("SET") {
+            let props_str = rest[3..].trim();
+            let props = Self::parse_set_assignments(props_str)?;
+
+            // Extract id from properties
+            let id = props.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("id"))
+                .and_then(|(_, v)| match v {
+                    LiteralValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+
+            Ok(QueryAst::InsertVertex {
+                table,
+                id,
+                labels: vec![],
+                properties: props,
+            })
+        } else {
+            Err(CoreError::InvalidArgument("expected SET after table name".to_string()))
+        }
+    }
+
+    /// Parse INSERT EDGE INTO <table> SET ...
+    fn parse_insert_edge(input: &str) -> Result<QueryAst> {
+        let rest = input[12..].trim(); // Skip "INSERT EDGE"
+        let rest = rest.strip_prefix("INTO").ok_or_else(|| CoreError::InvalidArgument("expected INTO".to_string()))?.trim();
+        let (table, rest) = Self::parse_word(rest)?;
+
+        let upper = rest.to_uppercase();
+        if upper.starts_with("SET") {
+            let props_str = rest[3..].trim();
+            let props = Self::parse_set_assignments(props_str)?;
+
+            // Extract required fields
+            let get_str = |key: &str| -> String {
+                props.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .and_then(|(_, v)| match v {
+                        LiteralValue::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            };
+
+            Ok(QueryAst::InsertEdge {
+                table,
+                id: get_str("id"),
+                from_id: get_str("from"),
+                to_id: get_str("to"),
+                label: get_str("label"),
+                properties: props,
+            })
+        } else {
+            Err(CoreError::InvalidArgument("expected SET after table name".to_string()))
+        }
+    }
+
+    /// Parse GRAPH TRAVERSE FROM <id> [IN|OUT|BOTH] [LABEL <label>] [DEPTH <n>]
+    fn parse_graph_traverse(input: &str) -> Result<QueryAst> {
+        let rest = input[15..].trim(); // Skip "GRAPH TRAVERSE"
+        let rest = rest.strip_prefix("FROM").ok_or_else(|| CoreError::InvalidArgument("expected FROM".to_string()))?.trim();
+
+        let (start_id, rest) = Self::parse_word(rest)?;
+        let mut remaining = rest.trim().to_string();
+
+        // Parse direction
+        let mut direction = GraphDirection::Out;
+        let upper = remaining.to_uppercase();
+        if upper.starts_with("IN") && !upper.starts_with("INTO") {
+            direction = GraphDirection::In;
+            remaining = remaining[2..].trim().to_string();
+        } else if upper.starts_with("OUT") {
+            direction = GraphDirection::Out;
+            remaining = remaining[3..].trim().to_string();
+        } else if upper.starts_with("BOTH") {
+            direction = GraphDirection::Both;
+            remaining = remaining[4..].trim().to_string();
+        }
+
+        // Parse LABEL
+        let mut edge_label = None;
+        let upper = remaining.to_uppercase();
+        if upper.starts_with("LABEL") {
+            remaining = remaining[5..].trim().to_string();
+            let (label, r) = Self::parse_word(&remaining)?;
+            edge_label = Some(label);
+            remaining = r.trim().to_string();
+        }
+
+        // Parse DEPTH
+        let mut max_depth = 3; // Default
+        let upper = remaining.to_uppercase();
+        if upper.starts_with("DEPTH") {
+            remaining = remaining[5..].trim().to_string();
+            let (depth_str, r) = Self::parse_word(&remaining)?;
+            max_depth = depth_str.parse().unwrap_or(3);
+            remaining = r.trim().to_string();
+        }
+
+        // Parse optional WHERE
+        let upper = remaining.to_uppercase();
+        let filter = if upper.starts_with("WHERE") {
+            let (f, _) = Self::parse_where(&remaining[5..])?;
+            f
+        } else {
+            None
+        };
+
+        Ok(QueryAst::GraphTraverse {
+            start_id,
+            direction,
+            edge_label,
+            max_depth,
+            filter,
+        })
+    }
+
+    /// Parse GRAPH MATCH pattern
+    fn parse_graph_match(input: &str) -> Result<QueryAst> {
+        // Simplified: GRAPH MATCH (a:Person) -[KNOWS]-> (b:Person) RETURN a.name, b.name
+        let rest = input[11..].trim(); // Skip "GRAPH MATCH"
+
+        // For now, return a simple pattern
+        // Full implementation would parse the graph pattern syntax
+        let returns = if let Some(ret_pos) = rest.to_uppercase().find("RETURN") {
+            rest[ret_pos + 6..].trim()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect()
+        } else {
+            vec![]
+        };
+
+        Ok(QueryAst::GraphMatch {
+            pattern: GraphPattern {
+                nodes: vec![],
+                edges: vec![],
+            },
+            filter: None,
+            returns,
+        })
+    }
+
+    /// Parse GRAPH SHORTEST PATH FROM <id1> TO <id2> [MAX DEPTH <n>]
+    fn parse_graph_shortest_path(input: &str) -> Result<QueryAst> {
+        let rest = input[21..].trim(); // Skip "GRAPH SHORTEST PATH"
+        let rest = rest.strip_prefix("FROM").ok_or_else(|| CoreError::InvalidArgument("expected FROM".to_string()))?.trim();
+
+        let (from_id, rest) = Self::parse_word(rest)?;
+        let rest = rest.trim();
+        let rest = rest.strip_prefix("TO").ok_or_else(|| CoreError::InvalidArgument("expected TO".to_string()))?.trim();
+
+        let (to_id, rest) = Self::parse_word(rest)?;
+        let mut rest = rest.trim();
+
+        // Parse MAX DEPTH
+        let mut max_depth = 10; // Default
+        let upper = rest.to_uppercase();
+        if upper.starts_with("MAX") {
+            rest = rest[3..].trim();
+            if rest.to_uppercase().starts_with("DEPTH") {
+                rest = rest[5..].trim();
+                let (depth_str, _) = Self::parse_word(rest)?;
+                max_depth = depth_str.parse().unwrap_or(10);
+            }
+        }
+
+        Ok(QueryAst::GraphShortestPath { from_id, to_id, max_depth })
+    }
+
+    /// Parse column definitions: "name STRING, age INT, ..."
+    fn parse_column_defs(input: &str) -> Result<Vec<ColumnDef>> {
+        let mut columns = Vec::new();
+        for part in input.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let tokens: Vec<&str> = part.split_whitespace().collect();
+            if tokens.len() >= 2 {
+                columns.push(ColumnDef {
+                    name: tokens[0].to_string(),
+                    col_type: tokens[1].to_string(),
+                    required: tokens.len() > 2 && tokens[2].eq_ignore_ascii_case("REQUIRED"),
+                });
+            }
+        }
+        Ok(columns)
     }
 }
 
