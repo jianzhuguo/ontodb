@@ -263,6 +263,7 @@ fn extract_api_key(request: &Request) -> Option<String> {
 
 /// Information about the authenticated API key.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct KeyInfo {
     pub key: String,
     pub description: String,

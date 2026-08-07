@@ -153,7 +153,7 @@ impl PreLoadEngine {
             if level >= self.levels.len() {
                 continue;
             }
-            let mut sst = SsTable::open(&path)?;
+            let sst = SsTable::open(&path)?;
             let min_key = sst.first_key().unwrap_or_default();
             let max_key = sst.max_key().to_vec();
             let metadata = fs::metadata(&path)?;

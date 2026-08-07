@@ -2633,6 +2633,7 @@ impl QueryExecutor {
     /// without creating a Map<String, Value>. Returns true if the filter is fully resolved
     /// and the row matches. Returns false if the filter can't be resolved at byte level
     /// (caller must fall back to full deserialization).
+    #[allow(dead_code)]
     fn fast_filter_accept(val_bytes: &[u8], filter: &Option<FilterExpr>) -> bool {
         let Some(f) = filter else { return false };
         Self::fast_filter_accept_expr(val_bytes, f)

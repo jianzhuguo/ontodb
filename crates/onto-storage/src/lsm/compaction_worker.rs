@@ -292,7 +292,7 @@ impl CompactionWorker {
         let mut all_entries: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
 
         for sst_info in &ssts_to_compact {
-            let mut sst = SsTable::open(&sst_info.path)?;
+            let sst = SsTable::open(&sst_info.path)?;
             let mut iter = sst.iter()?;
             while iter.is_valid() {
                 all_entries.push((
@@ -306,7 +306,7 @@ impl CompactionWorker {
         }
 
         for sst_info in &next_level_ssts {
-            let mut sst = SsTable::open(&sst_info.path)?;
+            let sst = SsTable::open(&sst_info.path)?;
             let mut iter = sst.iter()?;
             while iter.is_valid() {
                 all_entries.push((

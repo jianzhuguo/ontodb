@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// Node ID type.
 pub type NodeId = u64;
 
-/// Raft type configuration for OntoDB.
+// Raft type configuration for OntoDB.
 openraft::declare_raft_types!(
     pub OntoRaftConfig:
         D = OntoRequest,
