@@ -414,7 +414,8 @@ impl GraphStore {
         max_depth: usize,
         direction: Direction,
     ) -> Vec<u32> {
-        let mut visited = vec![false; self.idx_to_id.read().len()];
+        let num_nodes = self.idx_to_id.read().len();
+        let mut visited = vec![false; num_nodes];
         visited[start_idx as usize] = true;
         let mut queue = VecDeque::new();
         queue.push_back((start_idx, 0usize));
