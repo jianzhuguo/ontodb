@@ -1069,6 +1069,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "onto-graph"
+version = "0.1.0"
+dependencies = [
+ "onto-core",
+ "onto-storage",
+ "parking_lot",
+ "rand",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "onto-ontology"
 version = "0.1.0"
 dependencies = [

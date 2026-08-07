@@ -1,0 +1,23 @@
+[package]
+name = "onto-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Graph data model and traversal engine for OntoDB"
+
+[dependencies]
+onto-core = { workspace = true }
+onto-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "graph_bench"
+harness = false

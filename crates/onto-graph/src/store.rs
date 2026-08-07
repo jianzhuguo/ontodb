@@ -1,0 +1,400 @@
+//! Graph storage - CRUD operations for vertices and edges.
+//!
+//! Uses the underlying LSM-Tree engine for persistence.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
+use parking_lot::RwLock as PLRwLock;
+
+use crate::error::GraphError;
+use crate::model::{Edge, PropValue, PropertyMap, Vertex};
+
+/// In-memory graph store with adjacency list representation.
+pub struct GraphStore {
+    /// Vertices indexed by ID.
+    vertices: PLRwLock<HashMap<String, Vertex>>,
+    /// Outgoing edges indexed by source vertex ID.
+    out_edges: PLRwLock<HashMap<String, Vec<Edge>>>,
+    /// Incoming edges indexed by target vertex ID.
+    in_edges: PLRwLock<HashMap<String, Vec<Edge>>>,
+    /// All edges indexed by ID.
+    edges: PLRwLock<HashMap<String, Edge>>,
+    /// Labels index: label -> set of vertex IDs.
+    label_index: PLRwLock<HashMap<String, HashSet<String>>>,
+}
+
+impl GraphStore {
+    pub fn new() -> Self {
+        Self {
+            vertices: PLRwLock::new(HashMap::new()),
+            out_edges: PLRwLock::new(HashMap::new()),
+            in_edges: PLRwLock::new(HashMap::new()),
+            edges: PLRwLock::new(HashMap::new()),
+            label_index: PLRwLock::new(HashMap::new()),
+        }
+    }
+
+    // ── Vertex CRUD ──────────────────────────────────────────────
+
+    /// Add a vertex to the graph.
+    pub fn add_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
+        let id = vertex.id.clone();
+        let labels = vertex.labels.clone();
+
+        {
+            let mut verts = self.vertices.write();
+            if verts.contains_key(&id) {
+                return Err(GraphError::DuplicateVertex(id));
+            }
+            verts.insert(id.clone(), vertex);
+        }
+
+        // Update label index
+        {
+            let mut idx = self.label_index.write();
+            for label in labels {
+                idx.entry(label).or_insert_with(HashSet::new).insert(id.clone());
+            }
+        }
+
+        // Initialize adjacency lists
+        {
+            let mut out = self.out_edges.write();
+            out.entry(id.clone()).or_insert_with(Vec::new);
+        }
+        {
+            let mut in_e = self.in_edges.write();
+            in_e.entry(id).or_insert_with(Vec::new);
+        }
+
+        Ok(())
+    }
+
+    /// Get a vertex by ID.
+    pub fn get_vertex(&self, id: &str) -> Option<Vertex> {
+        self.vertices.read().get(id).cloned()
+    }
+
+    /// Update vertex properties.
+    pub fn update_vertex(&self, id: &str, properties: PropertyMap) -> Result<(), GraphError> {
+        let mut verts = self.vertices.write();
+        let vertex = verts.get_mut(id).ok_or_else(|| GraphError::VertexNotFound(id.to_string()))?;
+        for (k, v) in properties {
+            vertex.properties.insert(k, v);
+        }
+        Ok(())
+    }
+
+    /// Delete a vertex and all its connected edges.
+    pub fn delete_vertex(&self, id: &str) -> Result<(), GraphError> {
+        let vertex = {
+            let mut verts = self.vertices.write();
+            verts.remove(id).ok_or_else(|| GraphError::VertexNotFound(id.to_string()))?
+        };
+
+        // Remove from label index
+        {
+            let mut idx = self.label_index.write();
+            for label in &vertex.labels {
+                if let Some(set) = idx.get_mut(label) {
+                    set.remove(id);
+                }
+            }
+        }
+
+        // Remove all connected edges
+        {
+            let out = self.out_edges.write().remove(id).unwrap_or_default();
+            let inp = self.in_edges.write().remove(id).unwrap_or_default();
+
+            let mut edges = self.edges.write();
+            for edge in out {
+                edges.remove(&edge.id);
+                // Remove from target's in_edges
+                if let Some(in_list) = self.in_edges.write().get_mut(&edge.to) {
+                    in_list.retain(|e| e.id != edge.id);
+                }
+            }
+            for edge in inp {
+                edges.remove(&edge.id);
+                // Remove from source's out_edges
+                if let Some(out_list) = self.out_edges.write().get_mut(&edge.from) {
+                    out_list.retain(|e| e.id != edge.id);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get vertices by label.
+    pub fn get_vertices_by_label(&self, label: &str) -> Vec<Vertex> {
+        let idx = self.label_index.read();
+        let verts = self.vertices.read();
+
+        idx.get(label)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| verts.get(id).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get all vertices.
+    pub fn get_all_vertices(&self) -> Vec<Vertex> {
+        self.vertices.read().values().cloned().collect()
+    }
+
+    // ── Edge CRUD ────────────────────────────────────────────────
+
+    /// Add an edge to the graph.
+    pub fn add_edge(&self, edge: Edge) -> Result<(), GraphError> {
+        // Verify source and target exist
+        {
+            let verts = self.vertices.read();
+            if !verts.contains_key(&edge.from) {
+                return Err(GraphError::VertexNotFound(edge.from.clone()));
+            }
+            if !verts.contains_key(&edge.to) {
+                return Err(GraphError::VertexNotFound(edge.to.clone()));
+            }
+        }
+
+        let id = edge.id.clone();
+        let from = edge.from.clone();
+        let to = edge.to.clone();
+
+        {
+            let mut edges = self.edges.write();
+            if edges.contains_key(&id) {
+                return Err(GraphError::DuplicateVertex(format!("Edge {}", id)));
+            }
+            edges.insert(id, edge.clone());
+        }
+
+        {
+            let mut out = self.out_edges.write();
+            out.entry(from).or_insert_with(Vec::new).push(edge.clone());
+        }
+        {
+            let mut inp = self.in_edges.write();
+            inp.entry(to).or_insert_with(Vec::new).push(edge);
+        }
+
+        Ok(())
+    }
+
+    /// Get an edge by ID.
+    pub fn get_edge(&self, id: &str) -> Option<Edge> {
+        self.edges.read().get(id).cloned()
+    }
+
+    /// Update edge properties.
+    pub fn update_edge(&self, id: &str, properties: PropertyMap) -> Result<(), GraphError> {
+        let mut edges = self.edges.write();
+        let edge = edges.get_mut(id).ok_or_else(|| GraphError::EdgeNotFound(id.to_string()))?;
+        for (k, v) in properties {
+            edge.properties.insert(k, v);
+        }
+
+        // Also update in adjacency lists
+        let updated = edge.clone();
+        drop(edges);
+
+        let mut out = self.out_edges.write();
+        if let Some(list) = out.get_mut(&updated.from) {
+            if let Some(e) = list.iter_mut().find(|e| e.id == id) {
+                e.properties = updated.properties.clone();
+            }
+        }
+
+        let mut inp = self.in_edges.write();
+        if let Some(list) = inp.get_mut(&updated.to) {
+            if let Some(e) = list.iter_mut().find(|e| e.id == id) {
+                e.properties = updated.properties;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete an edge.
+    pub fn delete_edge(&self, id: &str) -> Result<(), GraphError> {
+        let edge = {
+            let mut edges = self.edges.write();
+            edges.remove(id).ok_or_else(|| GraphError::EdgeNotFound(id.to_string()))?
+        };
+
+        {
+            let mut out = self.out_edges.write();
+            if let Some(list) = out.get_mut(&edge.from) {
+                list.retain(|e| e.id != id);
+            }
+        }
+        {
+            let mut inp = self.in_edges.write();
+            if let Some(list) = inp.get_mut(&edge.to) {
+                list.retain(|e| e.id != id);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get outgoing edges from a vertex.
+    pub fn get_out_edges(&self, vertex_id: &str) -> Vec<Edge> {
+        self.out_edges
+            .read()
+            .get(vertex_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Get incoming edges to a vertex.
+    pub fn get_in_edges(&self, vertex_id: &str) -> Vec<Edge> {
+        self.in_edges
+            .read()
+            .get(vertex_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Get neighbors of a vertex (outgoing direction).
+    pub fn get_neighbors(&self, vertex_id: &str) -> Vec<Vertex> {
+        let verts = self.vertices.read();
+        self.out_edges
+            .read()
+            .get(vertex_id)
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter_map(|e| verts.get(&e.to).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // ── Stats ────────────────────────────────────────────────────
+
+    /// Get vertex count.
+    pub fn vertex_count(&self) -> usize {
+        self.vertices.read().len()
+    }
+
+    /// Get edge count.
+    pub fn edge_count(&self) -> usize {
+        self.edges.read().len()
+    }
+
+    /// Get average degree.
+    pub fn avg_degree(&self) -> f64 {
+        let out = self.out_edges.read();
+        if out.is_empty() {
+            return 0.0;
+        }
+        let total: usize = out.values().map(|v| v.len()).sum();
+        total as f64 / out.len() as f64
+    }
+}
+
+impl Default for GraphStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vertex_crud() {
+        let store = GraphStore::new();
+
+        let v = Vertex::new("v1", vec!["Person".to_string()])
+            .with_property("name", PropValue::String("Alice".to_string()))
+            .with_property("age", PropValue::Int(30));
+
+        store.add_vertex(v).unwrap();
+
+        let retrieved = store.get_vertex("v1").unwrap();
+        assert_eq!(retrieved.id, "v1");
+        assert_eq!(retrieved.labels, vec!["Person"]);
+        assert_eq!(retrieved.properties.get("name").unwrap(), &PropValue::String("Alice".to_string()));
+
+        // Update
+        let mut props = PropertyMap::new();
+        props.insert("age".to_string(), PropValue::Int(31));
+        store.update_vertex("v1", props).unwrap();
+
+        let updated = store.get_vertex("v1").unwrap();
+        assert_eq!(updated.properties.get("age").unwrap(), &PropValue::Int(31));
+
+        // Delete
+        store.delete_vertex("v1").unwrap();
+        assert!(store.get_vertex("v1").is_none());
+    }
+
+    #[test]
+    fn test_edge_crud() {
+        let store = GraphStore::new();
+
+        store.add_vertex(Vertex::new("v1", vec!["Person".to_string()])).unwrap();
+        store.add_vertex(Vertex::new("v2", vec!["Person".to_string()])).unwrap();
+
+        let e = Edge::new("e1", "v1", "v2", "KNOWS")
+            .with_property("since", PropValue::Int(2020));
+
+        store.add_edge(e).unwrap();
+
+        let out = store.get_out_edges("v1");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].label, "KNOWS");
+
+        let inp = store.get_in_edges("v2");
+        assert_eq!(inp.len(), 1);
+
+        // Delete
+        store.delete_edge("e1").unwrap();
+        assert!(store.get_edge("e1").is_none());
+        assert_eq!(store.get_out_edges("v1").len(), 0);
+    }
+
+    #[test]
+    fn test_label_index() {
+        let store = GraphStore::new();
+
+        store.add_vertex(Vertex::new("v1", vec!["Person".to_string()])).unwrap();
+        store.add_vertex(Vertex::new("v2", vec!["Person".to_string()])).unwrap();
+        store.add_vertex(Vertex::new("v3", vec!["Company".to_string()])).unwrap();
+
+        let persons = store.get_vertices_by_label("Person");
+        assert_eq!(persons.len(), 2);
+
+        let companies = store.get_vertices_by_label("Company");
+        assert_eq!(companies.len(), 1);
+    }
+
+    #[test]
+    fn test_delete_vertex_cascades_edges() {
+        let store = GraphStore::new();
+
+        store.add_vertex(Vertex::new("v1", vec![])).unwrap();
+        store.add_vertex(Vertex::new("v2", vec![])).unwrap();
+        store.add_vertex(Vertex::new("v3", vec![])).unwrap();
+
+        store.add_edge(Edge::new("e1", "v1", "v2", "KNOWS")).unwrap();
+        store.add_edge(Edge::new("e2", "v1", "v3", "KNOWS")).unwrap();
+        store.add_edge(Edge::new("e3", "v2", "v3", "KNOWS")).unwrap();
+
+        assert_eq!(store.edge_count(), 3);
+
+        // Delete v1 should remove e1 and e2
+        store.delete_vertex("v1").unwrap();
+        assert_eq!(store.edge_count(), 1);
+        assert!(store.get_edge("e1").is_none());
+        assert!(store.get_edge("e2").is_none());
+        assert!(store.get_edge("e3").is_some());
+    }
+}
