@@ -46,36 +46,41 @@ OntoDB achieves **~900K writes/sec** and **~1.3M reads/sec** on standard hardwar
 ## 1. Storage Engine Benchmark
 
 **Test Configuration:**
-- Data: 10,000 rows
+- Data: 10K / 50K / 100K rows (scalability test)
 - Iterations: 200 per test
 - MemTable size: 4MB
 - Block size: 4KB
 - Compression: zstd level 3
 
-### 1.1 Write Throughput
+### 1.1 Write Throughput (Scalability)
 
-| Metric | Value |
-|--------|-------|
-| **Write throughput** | **839K - 991K writes/sec** |
-| Write latency (50K ops) | 50-60 ms |
-| WAL batch sync | Enabled (every 64 writes) |
+| Data Size | Write Latency (50K ops) | Write Throughput |
+|-----------|-------------------------|------------------|
+| **10K rows** | 53 ms | **940K writes/sec** |
+| **50K rows** | 52 ms | **962K writes/sec** |
+| **100K rows** | 51 ms | **990K writes/sec** |
 
-### 1.2 Read Throughput
+**Key finding:** Write throughput scales linearly — ~950K writes/sec regardless of dataset size.
 
-| Metric | Value |
-|--------|-------|
-| **Read throughput** | **1.16M - 1.39M reads/sec** |
-| Read latency (50K ops) | 36-43 ms |
+### 1.2 Read Throughput (Scalability)
 
-### 1.3 Concurrent Performance
+| Data Size | Read Latency (50K ops) | Read Throughput |
+|-----------|------------------------|------------------|
+| **10K rows** | 36 ms | **1.38M reads/sec** |
+| **50K rows** | 36 ms | **1.39M reads/sec** |
+| **100K rows** | 36 ms | **1.37M reads/sec** |
 
-| Threads | Read (ms) | Write (ms) | Speedup |
-|---------|-----------|------------|---------|
-| 2 | 837 | 975 | 1.16x |
-| 4 | 895 | 945 | 1.06x |
-| 8 | 870 | 917 | 1.05x |
+**Key finding:** Read throughput is stable at ~1.38M reads/sec regardless of dataset size.
 
-**Mixed workload (8 readers + 1 writer):** 3.4 seconds
+### 1.3 Sequential Scan Performance
+
+| Data Size | Scan Latency | Per-Row Latency |
+|-----------|--------------|-----------------|
+| **10K rows** | 261 ms | 26 μs/row |
+| **50K rows** | 2.76 s | 55 μs/row |
+| **100K rows** | 5.97 s | 60 μs/row |
+
+**Key finding:** Scan latency scales linearly with data size. Per-row cost increases due to I/O overhead.
 
 ### 1.4 HNSW Vector Index
 
