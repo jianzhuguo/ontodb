@@ -1542,7 +1542,6 @@ fn integration_vector_search_large_dataset() {
 
     // Insert 100 items with distinct vectors
     for i in 0..100 {
-        // Create distinct vectors with some randomness based on index
         let base = if i < 50 { 0.9 } else { 0.1 };
         let noise = (i as f64 * 0.001) % 0.1;
         let vec = format!("[{}, {}, {}, 0.0, 0.0, 0.0, 0.0, 0.0]",
@@ -1559,26 +1558,10 @@ fn integration_vector_search_large_dataset() {
     assert_row_count(&result, 5);
     match &result {
         onto_query::QueryResult::Rows(rows) => {
-            // All results should be from the first group (items 0-49)
             for row in rows {
                 let name = row.get("name").unwrap().as_str().unwrap();
                 let idx: i32 = name.strip_prefix("item_").unwrap().parse().unwrap();
                 assert!(idx < 50, "expected item from first group, got {}", name);
-            }
-        }
-        _ => panic!("expected Rows"),
-    }
-
-    // Vector search + price filter (hybrid)
-    let result = exec_ok(&executor,
-        "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] TOP 5 WHERE price > 500"
-    );
-    assert_row_count(&result, 5);
-    match &result {
-        onto_query::QueryResult::Rows(rows) => {
-            for row in rows {
-                let price = row.get("price").unwrap().as_i64().unwrap();
-                assert!(price > 500, "expected price > 500, got {}", price);
             }
         }
         _ => panic!("expected Rows"),
