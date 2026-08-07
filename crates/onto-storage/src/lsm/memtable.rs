@@ -94,17 +94,21 @@ impl MemTable {
 
     /// Puts a key-value pair with a specific sequence number (from the engine).
     pub fn put_with_seq(&mut self, key: Key, value: Value, seq_no: SeqNo) {
+        let size_delta = key.len() + value.len() + 16;
+        self.size += size_delta;
+
+        // Build composite key directly (key + inverted seq_no) to avoid extra allocation
+        let mut composite = Vec::with_capacity(key.len() + 8);
+        composite.extend_from_slice(&key);
+        composite.extend_from_slice(&(!seq_no).to_be_bytes());
+
         let entry = MemTableEntry {
-            key: key.clone(),
-            value: value.clone(),
+            key,
+            value,
             seq_no,
             kind: EntryKind::Put,
         };
 
-        let size_delta = key.len() + value.len() + 16;
-        self.size += size_delta;
-
-        let composite = entry.composite_key();
         self.data.insert(composite, entry);
 
         // Keep next_seq_no in sync
@@ -115,17 +119,21 @@ impl MemTable {
 
     /// Marks a key as deleted (tombstone) with a specific sequence number.
     pub fn delete_with_seq(&mut self, key: Key, seq_no: SeqNo) {
+        let size_delta = key.len() + 16;
+        self.size += size_delta;
+
+        // Build composite key directly (key + inverted seq_no) to avoid extra allocation
+        let mut composite = Vec::with_capacity(key.len() + 8);
+        composite.extend_from_slice(&key);
+        composite.extend_from_slice(&(!seq_no).to_be_bytes());
+
         let entry = MemTableEntry {
-            key: key.clone(),
+            key,
             value: Vec::new(),
             seq_no,
             kind: EntryKind::Delete,
         };
 
-        let size_delta = key.len() + 16;
-        self.size += size_delta;
-
-        let composite = entry.composite_key();
         self.data.insert(composite, entry);
 
         if seq_no >= self.next_seq_no {

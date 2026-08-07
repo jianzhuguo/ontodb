@@ -15,6 +15,8 @@ pub struct Wal {
     _path: PathBuf,
     writer: BufWriter<File>,
     offset: u64,
+    /// Reusable buffer for entry serialization to avoid per-write allocation.
+    serialize_buf: Vec<u8>,
 }
 
 impl Wal {
@@ -31,6 +33,7 @@ impl Wal {
             _path: path.as_ref().to_path_buf(),
             writer: BufWriter::new(file),
             offset,
+            serialize_buf: Vec::with_capacity(256),
         })
     }
 
@@ -40,18 +43,20 @@ impl Wal {
     /// `sync()` after a batch of appends to push data to the OS file cache.
     /// Returns the byte offset where the entry was written.
     pub fn append(&mut self, entry: &Entry) -> Result<u64> {
-        let payload = Self::serialize_entry(entry);
-        let crc = crc32fast::hash(&payload);
-        let len = payload.len() as u32;
+        // Reuse serialize buffer to avoid per-write allocation
+        self.serialize_buf.clear();
+        Self::serialize_entry_into(entry, &mut self.serialize_buf);
+        let crc = crc32fast::hash(&self.serialize_buf);
+        let len = self.serialize_buf.len() as u32;
 
         let offset = self.offset;
 
         // Write: [length][crc32][payload]
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&crc.to_le_bytes())?;
-        self.writer.write_all(&payload)?;
+        self.writer.write_all(&self.serialize_buf)?;
 
-        self.offset += 4 + 4 + payload.len() as u64;
+        self.offset += 4 + 4 + self.serialize_buf.len() as u64;
 
         Ok(offset)
     }
@@ -92,7 +97,12 @@ impl Wal {
     /// Serializes an entry to bytes for WAL storage.
     fn serialize_entry(entry: &Entry) -> Vec<u8> {
         let mut buf = Vec::new();
+        Self::serialize_entry_into(entry, &mut buf);
+        buf
+    }
 
+    /// Serializes an entry into an existing buffer (zero-allocation path).
+    fn serialize_entry_into(entry: &Entry, buf: &mut Vec<u8>) {
         // seq_no (8 bytes)
         buf.extend_from_slice(&entry.seq_no.to_le_bytes());
 
@@ -109,8 +119,6 @@ impl Wal {
         // value length (4 bytes) + value
         buf.extend_from_slice(&(entry.value.len() as u32).to_le_bytes());
         buf.extend_from_slice(&entry.value);
-
-        buf
     }
 
     /// Deserializes an entry from WAL bytes.
