@@ -178,6 +178,7 @@ impl<'a> TraversalEngine<'a> {
 
     /// Multi-hop BFS traversal (unified - uses fast BFS internally).
     /// Returns full TraversalResult with paths, vertices, and edges.
+    /// Set `with_paths=true` to enable lazy path reconstruction.
     pub fn traverse_bfs(
         &self,
         start_id: &str,
@@ -217,6 +218,50 @@ impl<'a> TraversalEngine<'a> {
             vertices: result_vertices,
             edges: Vec::new(),
             paths: Vec::new(),
+            visited_count: visited_indices.len(),
+        })
+    }
+
+    /// BFS with lazy path reconstruction.
+    /// Returns TraversalResult with paths built on-demand.
+    pub fn traverse_bfs_with_paths(
+        &self,
+        start_id: &str,
+        max_depth: usize,
+        direction: Direction,
+    ) -> Result<TraversalResult, GraphError> {
+        let start_idx = self.store.get_idx(start_id)
+            .ok_or_else(|| GraphError::VertexNotFound(start_id.to_string()))?;
+
+        // BFS with parent tracking
+        let (visited_indices, parent_map) = self.store.bfs_fast_with_parents(start_idx, max_depth, direction);
+
+        let mut result_vertices = Vec::new();
+        let mut result_paths = Vec::new();
+
+        for &idx in &visited_indices {
+            let vertex_id = self.store.get_id(idx)
+                .ok_or_else(|| GraphError::VertexNotFound(format!("idx {}", idx)))?;
+
+            if let Some(vertex) = self.store.get_vertex(&vertex_id) {
+                // Reconstruct path lazily
+                let path_ids = self.store.reconstruct_path(&parent_map, start_idx, idx);
+                let path_len = if path_ids.len() > 1 { path_ids.len() - 1 } else { 0 };
+
+                result_paths.push(TraversalPath {
+                    vertex_ids: path_ids,
+                    edge_ids: Vec::new(), // Edge IDs not tracked for performance
+                    target: vertex.clone(),
+                    length: path_len,
+                });
+                result_vertices.push(vertex);
+            }
+        }
+
+        Ok(TraversalResult {
+            vertices: result_vertices,
+            edges: Vec::new(),
+            paths: result_paths,
             visited_count: visited_indices.len(),
         })
     }
@@ -578,5 +623,27 @@ mod tests {
         // Who works at Acme?
         let employees = engine.hop("acme", Direction::In, Some("WORKS_AT"), None, None).unwrap();
         assert_eq!(employees.len(), 2);
+    }
+
+    #[test]
+    fn test_traverse_bfs_with_paths() {
+        let store = build_social_graph();
+        let engine = TraversalEngine::new(&store);
+
+        // 2-hop from Alice with path reconstruction
+        let result = engine.traverse_bfs_with_paths("alice", 2, Direction::Out).unwrap();
+        assert_eq!(result.vertices.len(), 4); // Bob, Charlie, Acme, Dave
+        assert_eq!(result.paths.len(), 4);
+
+        // Check paths
+        for path in &result.paths {
+            assert!(!path.vertex_ids.is_empty());
+            assert_eq!(path.vertex_ids[0], "alice"); // All paths start from alice
+        }
+
+        // Find Dave's path (should be length 2)
+        let dave_path = result.paths.iter().find(|p| p.target.id == "dave").unwrap();
+        assert_eq!(dave_path.length, 2);
+        assert_eq!(dave_path.vertex_ids, vec!["alice", "bob", "dave"]);
     }
 }

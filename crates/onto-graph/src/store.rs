@@ -450,6 +450,79 @@ impl GraphStore {
         result
     }
 
+    /// Fast BFS with parent tracking for lazy path reconstruction.
+    /// Returns (visited_nodes, parent_map) where parent_map[node] = parent_node.
+    pub fn bfs_fast_with_parents(
+        &self,
+        start_idx: u32,
+        max_depth: usize,
+        direction: Direction,
+    ) -> (Vec<u32>, Vec<Option<u32>>) {
+        let num_nodes = self.idx_to_id.read().len();
+        let mut visited = vec![false; num_nodes];
+        let mut parent: Vec<Option<u32>> = vec![None; num_nodes];
+        visited[start_idx as usize] = true;
+        let mut queue = VecDeque::new();
+        queue.push_back((start_idx, 0usize));
+        let mut result = Vec::new();
+
+        while let Some((curr, depth)) = queue.pop_front() {
+            if depth > 0 {
+                result.push(curr);
+            }
+            if depth >= max_depth {
+                continue;
+            }
+
+            let neighbors = match direction {
+                Direction::Out => self.get_out_neighbors_idx(curr),
+                Direction::In => self.get_in_neighbors_idx(curr),
+                Direction::Both => {
+                    let mut n = self.get_out_neighbors_idx(curr);
+                    n.extend(self.get_in_neighbors_idx(curr));
+                    n
+                }
+            };
+
+            for (nbr, _) in neighbors {
+                if !visited[nbr as usize] {
+                    visited[nbr as usize] = true;
+                    parent[nbr as usize] = Some(curr);
+                    queue.push_back((nbr, depth + 1));
+                }
+            }
+        }
+
+        (result, parent)
+    }
+
+    /// Reconstruct path from start to target using parent map.
+    pub fn reconstruct_path(
+        &self,
+        parent: &[Option<u32>],
+        start_idx: u32,
+        target_idx: u32,
+    ) -> Vec<String> {
+        let mut path = Vec::new();
+        let mut current = target_idx;
+
+        loop {
+            if let Some(id) = self.get_id(current) {
+                path.push(id);
+            }
+            if current == start_idx {
+                break;
+            }
+            match parent[current as usize] {
+                Some(p) => current = p,
+                None => break, // No path found
+            }
+        }
+
+        path.reverse();
+        path
+    }
+
     // ── Persistence ──────────────────────────────────────────────
 
     /// Export graph data to JSON for persistence.

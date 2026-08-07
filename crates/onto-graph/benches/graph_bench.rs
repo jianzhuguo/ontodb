@@ -134,6 +134,17 @@ fn bench_traversal(store: &GraphStore, num_queries: usize, max_depth: usize) {
     }
     let bfs_fast_time = start.elapsed();
 
+    // BFS with path reconstruction
+    let start = Instant::now();
+    let mut total_path_visited = 0;
+    for _ in 0..num_queries {
+        let vid = format!("v{}", rng.gen_range(0..num_vertices));
+        if let Ok(result) = engine.traverse_bfs_with_paths(&vid, max_depth, Direction::Out) {
+            total_path_visited += result.vertices.len();
+        }
+    }
+    let bfs_path_time = start.elapsed();
+
     println!("  Single-hop: {:.2}s ({:.0} qps), avg_neighbors={:.1}",
         hop1_time.as_secs_f64(), num_queries as f64 / hop1_time.as_secs_f64(),
         total_neighbors as f64 / num_queries as f64);
@@ -143,6 +154,9 @@ fn bench_traversal(store: &GraphStore, num_queries: usize, max_depth: usize) {
     println!("  {}-hop BFS (fast): {:.2}s ({:.0} qps), avg_visited={:.1}",
         max_depth, bfs_fast_time.as_secs_f64(), num_queries as f64 / bfs_fast_time.as_secs_f64(),
         total_fast_visited as f64 / num_queries as f64);
+    println!("  {}-hop BFS (with paths): {:.2}s ({:.0} qps), avg_visited={:.1}",
+        max_depth, bfs_path_time.as_secs_f64(), num_queries as f64 / bfs_path_time.as_secs_f64(),
+        total_path_visited as f64 / num_queries as f64);
 }
 
 fn bench_graph_vector_hybrid(store: &GraphStore, num_queries: usize) {
