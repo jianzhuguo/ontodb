@@ -3765,6 +3765,7 @@ impl QueryExecutor {
         limit: Option<usize>,
     ) -> Result<QueryResult> {
         // Group rows by GROUP BY columns (or single group if no GROUP BY)
+        // Optimized: use value_to_group_key directly instead of resolve_column_value
         let groups: Vec<(String, Vec<&Map<String, Value>>)> = if let Some(gb) = group_by {
             let mut group_map: std::collections::BTreeMap<String, Vec<&Map<String, Value>>> =
                 std::collections::BTreeMap::new();
@@ -3772,10 +3773,7 @@ impl QueryExecutor {
                 let key = gb
                     .columns
                     .iter()
-                    .map(|col| {
-                        Self::resolve_column_value(row, col)
-                            .unwrap_or_else(|| "NULL".to_string())
-                    })
+                    .map(|col| Self::value_to_group_key(row.get(col)))
                     .collect::<Vec<_>>()
                     .join("\x00");
                 group_map.entry(key).or_default().push(row);
@@ -4227,6 +4225,21 @@ impl QueryExecutor {
                     }
                 }
             }
+        }
+    }
+
+    /// Converts an Option<&Value> to a group key string.
+    /// Avoids cloning for strings, uses compact representations for numbers.
+    fn value_to_group_key(val: Option<&Value>) -> String {
+        match val {
+            None => "NULL".to_string(),
+            Some(v) => match v {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+                Value::Null => "NULL".to_string(),
+                _ => v.to_string(),
+            },
         }
     }
 
