@@ -23,3 +23,7 @@ rand = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "lock_contention"
+harness = false

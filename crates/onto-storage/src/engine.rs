@@ -34,27 +34,43 @@ fn parse_doc_bytes(bytes: &[u8]) -> Option<serde_json::Map<String, serde_json::V
 }
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 
-/// The main LSM-Tree storage engine with MVCC support.
-pub struct LsmEngine {
+/// Mutable write-path state, protected by a single Mutex.
+///
+/// Grouping these fields allows the engine to use `&self` for all methods
+/// (interior mutability), so reads never need an outer RwLock.
+/// The lock is held only for fast in-memory operations; I/O-heavy work
+/// (SSTable building) happens outside the lock.
+struct WriteState {
     /// Active MemTable for writes.
     memtable: MemTable,
 
     /// Read-only MemTable waiting to be flushed.
     immutable_memtable: Option<MemTable>,
 
+    /// Write-Ahead Log for durability.
+    wal: Wal,
+
+    /// MVCC transaction manager.
+    txn_manager: TxnManager,
+
+    /// Cache of opened SSTable handles, keyed by file path.
+    sst_cache: HashMap<PathBuf, SsTable>,
+}
+
+/// The main LSM-Tree storage engine with MVCC support.
+///
+/// All methods take `&self` — the engine is `Sync` and can be shared via
+/// `Arc<LsmEngine>` without an outer `RwLock`.  Write-path state lives
+/// behind `Mutex<WriteState>`; index managers behind `RwLock`.
+pub struct LsmEngine {
+    /// Write-path state (memtable, WAL, txn manager, SST cache).
+    write_state: Mutex<WriteState>,
+
     /// SSTables organized by level. Level 0 is newest.
     /// Shared with the background compaction worker via Arc<Mutex>.
     levels: Arc<Mutex<Vec<Vec<SsTableInfo>>>>,
-
-    /// Cache of opened SSTable handles, keyed by file path.
-    /// Avoids re-opening files and re-reading footer/bloom/index on every read.
-    /// Entries are invalidated when compaction replaces SSTable files.
-    sst_cache: Mutex<HashMap<PathBuf, SsTable>>,
-
-    /// Write-Ahead Log for durability.
-    wal: Wal,
 
     /// Engine configuration.
     options: StorageOptions,
@@ -65,14 +81,11 @@ pub struct LsmEngine {
     /// SSTable file ID counter (shared with compaction worker).
     sst_counter: Arc<AtomicU64>,
 
-    /// MVCC transaction manager.
-    txn_manager: TxnManager,
+    /// Secondary index manager (RwLock for concurrent read-path access).
+    index_manager: RwLock<IndexManager>,
 
-    /// Secondary index manager.
-    index_manager: IndexManager,
-
-    /// Vector index manager (HNSW).
-    vector_index_manager: VectorIndexManager,
+    /// Vector index manager — HNSW (RwLock for concurrent read-path access).
+    vector_index_manager: RwLock<VectorIndexManager>,
 
     /// Channel to send flush notifications to the background compaction worker.
     compaction_sender: mpsc::Sender<CompactionMsg>,
@@ -89,11 +102,8 @@ pub struct LsmEngine {
 
 /// Temporary helper for loading WAL + SSTables before spawning the compaction worker.
 struct PreLoadEngine {
-    memtable: MemTable,
-    immutable_memtable: Option<MemTable>,
+    write_state: WriteState,
     levels: Vec<Vec<SsTableInfo>>,
-    sst_cache: HashMap<PathBuf, SsTable>,
-    wal: Wal,
     options: StorageOptions,
     seq_counter: AtomicU64,
     sst_counter: Arc<AtomicU64>,
@@ -109,8 +119,8 @@ impl PreLoadEngine {
         let mut max_seq = 0u64;
         for entry in entries {
             match entry.kind {
-                EntryKind::Put => self.memtable.put_with_seq(entry.key, entry.value, entry.seq_no),
-                EntryKind::Delete => self.memtable.delete_with_seq(entry.key, entry.seq_no),
+                EntryKind::Put => self.write_state.memtable.put_with_seq(entry.key, entry.value, entry.seq_no),
+                EntryKind::Delete => self.write_state.memtable.delete_with_seq(entry.key, entry.seq_no),
             }
             max_seq = max_seq.max(entry.seq_no);
         }
@@ -161,7 +171,7 @@ impl PreLoadEngine {
                     }
                 }
             }
-            self.sst_cache.insert(path.clone(), sst);
+            self.write_state.sst_cache.insert(path.clone(), sst);
             self.levels[level].push(SsTableInfo {
                 path,
                 size: metadata.len(),
@@ -186,11 +196,14 @@ impl LsmEngine {
 
         // Pre-load existing SSTables into a temporary Vec before spawning the worker
         let mut pre_engine = PreLoadEngine {
-            memtable: MemTable::new(),
-            immutable_memtable: None,
+            write_state: WriteState {
+                memtable: MemTable::new(),
+                immutable_memtable: None,
+                wal,
+                txn_manager: TxnManager::new(),
+                sst_cache: HashMap::new(),
+            },
             levels: vec![Vec::new(); options.num_levels],
-            sst_cache: HashMap::new(),
-            wal,
             options: options.clone(),
             seq_counter: AtomicU64::new(0),
             sst_counter: sst_counter.clone(),
@@ -220,18 +233,14 @@ impl LsmEngine {
             }
         };
 
-        let mut engine = LsmEngine {
-            memtable: pre_engine.memtable,
-            immutable_memtable: pre_engine.immutable_memtable,
+        let engine = LsmEngine {
+            write_state: Mutex::new(pre_engine.write_state),
             levels,
-            sst_cache: Mutex::new(pre_engine.sst_cache),
-            wal: pre_engine.wal,
             options,
             seq_counter: pre_engine.seq_counter,
             sst_counter,
-            txn_manager: TxnManager::new(),
-            index_manager,
-            vector_index_manager: VectorIndexManager::new(),
+            index_manager: RwLock::new(index_manager),
+            vector_index_manager: RwLock::new(VectorIndexManager::new()),
             compaction_sender,
             compaction_notif_receiver: std::sync::Mutex::new(compaction_notif_receiver),
             compaction_pending: AtomicBool::new(false),
@@ -247,18 +256,18 @@ impl LsmEngine {
     }
 
     /// Puts a key-value pair.
-    pub fn put(&mut self, key: Key, value: Value) -> Result<()> {
+    pub fn put(&self, key: Key, value: Value) -> Result<()> {
         let seq = self.next_seq();
         let entry = Entry::put(key.clone(), value.clone(), seq);
 
-        // Write to WAL first (durability)
-        self.wal.append(&entry)?;
+        let needs_flush = {
+            let mut ws = self.write_state.lock().unwrap();
+            ws.wal.append(&entry)?;
+            ws.memtable.put_with_seq(key, value, seq);
+            ws.memtable.size() >= self.options.memtable_size_limit
+        };
 
-        // Write to MemTable with engine's global seq_no
-        self.memtable.put_with_seq(key, value, seq);
-
-        // Check if we need to flush
-        if self.memtable.size() >= self.options.memtable_size_limit {
+        if needs_flush {
             self.flush_memtable()?;
         }
 
@@ -269,15 +278,16 @@ impl LsmEngine {
     pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
         self.drain_compaction_notifications();
 
-        // 1. Check active MemTable
-        if let Some((val, _)) = self.memtable.get(key) {
-            return Ok(Some(val.to_vec()));
-        }
-
-        // 2. Check immutable MemTable
-        if let Some(ref imm) = self.immutable_memtable {
-            if let Some((val, _)) = imm.get(key) {
+        // 1-2. Check MemTables (brief lock)
+        {
+            let ws = self.write_state.lock().unwrap();
+            if let Some((val, _)) = ws.memtable.get(key) {
                 return Ok(Some(val.to_vec()));
+            }
+            if let Some(ref imm) = ws.immutable_memtable {
+                if let Some((val, _)) = imm.get(key) {
+                    return Ok(Some(val.to_vec()));
+                }
             }
         }
 
@@ -296,17 +306,19 @@ impl LsmEngine {
             cands
         };
 
-        let mut cache = self.sst_cache.lock().unwrap();
-        for path in &candidates {
-            if !cache.contains_key(path) {
-                let sst = SsTable::open(path)?;
-                cache.insert(path.to_path_buf(), sst);
-            }
-            let sst = cache.get(path).unwrap();
-            match sst.get_full(key)? {
-                Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
-                Some((_, _, EntryKind::Delete)) => return Ok(None),
-                None => continue,
+        {
+            let mut ws = self.write_state.lock().unwrap();
+            for path in &candidates {
+                if !ws.sst_cache.contains_key(path) {
+                    let sst = SsTable::open(path)?;
+                    ws.sst_cache.insert(path.to_path_buf(), sst);
+                }
+                let sst = ws.sst_cache.get(path).unwrap();
+                match sst.get_full(key)? {
+                    Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
+                    Some((_, _, EntryKind::Delete)) => return Ok(None),
+                    None => continue,
+                }
             }
         }
 
@@ -365,15 +377,15 @@ impl LsmEngine {
             paths
         };
 
-        // Scan SSTables (cache locked for entire SSTable scan phase)
+        // Scan SSTables (write_state locked for SSTable cache + scan phase)
         {
-            let mut cache = self.sst_cache.lock().unwrap();
+            let mut ws = self.write_state.lock().unwrap();
             for path in &sst_paths {
-                if !cache.contains_key(path) {
+                if !ws.sst_cache.contains_key(path) {
                     let sst = SsTable::open(path)?;
-                    cache.insert(path.to_path_buf(), sst);
+                    ws.sst_cache.insert(path.to_path_buf(), sst);
                 }
-                let sst = cache.get(path).unwrap();
+                let sst = ws.sst_cache.get(path).unwrap();
                 let mut iter = sst.iter()?;
 
                 while iter.is_valid() && iter.key() < prefix {
@@ -402,11 +414,30 @@ impl LsmEngine {
                     iter.next();
                 }
             }
-        }
 
-        // 2. Scan immutable MemTable (overrides SSTables)
-        if let Some(ref imm) = self.immutable_memtable {
-            for entry in imm.entries() {
+            // 2. Scan immutable MemTable (overrides SSTables)
+            if let Some(ref imm) = ws.immutable_memtable {
+                for entry in imm.entries() {
+                    if !entry.key.starts_with(prefix) {
+                        continue;
+                    }
+                    if is_visible(entry.seq_no) {
+                        let should_update = match seen.get(&entry.key) {
+                            Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
+                            None => true,
+                        };
+                        if should_update {
+                            seen.insert(
+                                entry.key.clone(),
+                                (entry.value.clone(), entry.seq_no, entry.kind),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // 3. Scan active MemTable (overrides everything)
+            for entry in ws.memtable.entries() {
                 if !entry.key.starts_with(prefix) {
                     continue;
                 }
@@ -421,25 +452,6 @@ impl LsmEngine {
                             (entry.value.clone(), entry.seq_no, entry.kind),
                         );
                     }
-                }
-            }
-        }
-
-        // 3. Scan active MemTable (overrides everything)
-        for entry in self.memtable.entries() {
-            if !entry.key.starts_with(prefix) {
-                continue;
-            }
-            if is_visible(entry.seq_no) {
-                let should_update = match seen.get(&entry.key) {
-                    Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
-                    None => true,
-                };
-                if should_update {
-                    seen.insert(
-                        entry.key.clone(),
-                        (entry.value.clone(), entry.seq_no, entry.kind),
-                    );
                 }
             }
         }
@@ -468,14 +480,18 @@ impl LsmEngine {
     }
 
     /// Deletes a key (writes a tombstone).
-    pub fn delete(&mut self, key: Key) -> Result<()> {
+    pub fn delete(&self, key: Key) -> Result<()> {
         let seq = self.next_seq();
         let entry = Entry::delete(key.clone(), seq);
 
-        self.wal.append(&entry)?;
-        self.memtable.delete_with_seq(key, seq);
+        let needs_flush = {
+            let mut ws = self.write_state.lock().unwrap();
+            ws.wal.append(&entry)?;
+            ws.memtable.delete_with_seq(key, seq);
+            ws.memtable.size() >= self.options.memtable_size_limit
+        };
 
-        if self.memtable.size() >= self.options.memtable_size_limit {
+        if needs_flush {
             self.flush_memtable()?;
         }
 
@@ -484,72 +500,76 @@ impl LsmEngine {
 
     /// Manually flushes the current MemTable to an SSTable.
     /// Call this after a batch of writes to ensure all data is persisted.
-    pub fn flush(&mut self) -> Result<()> {
-        if !self.memtable.is_empty() {
+    pub fn flush(&self) -> Result<()> {
+        let needs_flush = {
+            let ws = self.write_state.lock().unwrap();
+            !ws.memtable.is_empty()
+        };
+        if needs_flush {
             self.flush_memtable()?;
         }
         Ok(())
     }
 
     /// Flushes the current MemTable to an SSTable on disk.
-    fn flush_memtable(&mut self) -> Result<()> {
-        // Swap current MemTable to immutable
-        let old_mem = std::mem::replace(&mut self.memtable, MemTable::new());
-        self.immutable_memtable = Some(old_mem);
-
-        // Build SSTable from immutable MemTable
-        if let Some(ref imm) = self.immutable_memtable {
-            let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
-            let sst_path = self.options.data_dir.join(format!("L0_{}.sst", sst_id));
-
-            let mut builder = SsTableBuilder::new();
-            builder.set_compression_level(self.options.compression_level);
-            for entry in imm.entries() {
-                builder.add(&Entry {
-                    key: entry.key.clone(),
-                    value: entry.value.clone(),
-                    seq_no: entry.seq_no,
-                    kind: entry.kind,
-                });
-            }
-
-            builder.build(&sst_path)?;
-
-            let min_key = imm
-                .entries()
-                .next()
-                .map(|e| e.key.clone())
-                .unwrap_or_default();
-            let max_key = imm
-                .entries()
-                .last()
-                .map(|e| e.key.clone())
-                .unwrap_or_default();
-
-            let metadata = fs::metadata(&sst_path)?;
-
-            // Add to shared levels under lock
-            {
-                let mut levels = self.levels.lock().unwrap();
-                levels[0].push(SsTableInfo {
-                    path: sst_path,
-                    size: metadata.len(),
-                    min_key,
-                    max_key,
-                });
-            }
-
-            // Notify the background compaction worker
-            let _ = self.compaction_sender.send(CompactionMsg::Flushed { level: 0 });
+    fn flush_memtable(&self) -> Result<()> {
+        // Step 1: Swap current MemTable to immutable (brief lock)
+        {
+            let mut ws = self.write_state.lock().unwrap();
+            let old_mem = std::mem::replace(&mut ws.memtable, MemTable::new());
+            ws.immutable_memtable = Some(old_mem);
         }
 
-        // Clear immutable MemTable
-        self.immutable_memtable = None;
+        // Step 2: Build SSTable from immutable MemTable (I/O heavy, no lock)
+        let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
+        let sst_path = self.options.data_dir.join(format!("L0_{}.sst", sst_id));
+        let (min_key, max_key) = {
+            let ws = self.write_state.lock().unwrap();
+            if let Some(ref imm) = ws.immutable_memtable {
+                let mut builder = SsTableBuilder::new();
+                builder.set_compression_level(self.options.compression_level);
+                for entry in imm.entries() {
+                    builder.add(&Entry {
+                        key: entry.key.clone(),
+                        value: entry.value.clone(),
+                        seq_no: entry.seq_no,
+                        kind: entry.kind,
+                    });
+                }
+                let min_key = imm.entries().next().map(|e| e.key.clone()).unwrap_or_default();
+                let max_key = imm.entries().last().map(|e| e.key.clone()).unwrap_or_default();
+                // Release lock before disk I/O
+                drop(ws);
 
-        // Reset WAL (we've persisted everything to SSTable)
-        self.reset_wal()?;
+                builder.build(&sst_path)?;
 
-        // Compaction is handled by the background worker �?no synchronous call needed
+                (min_key, max_key)
+            } else {
+                return Ok(());
+            }
+        };
+
+        // Step 3: Add to shared levels (brief lock)
+        let metadata = fs::metadata(&sst_path)?;
+        {
+            let mut levels = self.levels.lock().unwrap();
+            levels[0].push(SsTableInfo {
+                path: sst_path,
+                size: metadata.len(),
+                min_key,
+                max_key,
+            });
+        }
+
+        // Step 4: Clear immutable MemTable + reset WAL (brief lock)
+        {
+            let mut ws = self.write_state.lock().unwrap();
+            ws.immutable_memtable = None;
+            self.reset_wal_internal(&mut ws)?;
+        }
+
+        // Notify the background compaction worker
+        let _ = self.compaction_sender.send(CompactionMsg::Flushed { level: 0 });
 
         Ok(())
     }
@@ -566,7 +586,7 @@ impl LsmEngine {
             return;
         }
 
-        // Drain notifications under the receiver lock only (NOT holding sst_cache).
+        // Drain notifications under the receiver lock only (NOT holding write_state).
         let mut had_compaction = false;
         {
             let receiver = self.compaction_notif_receiver.lock().unwrap();
@@ -580,21 +600,18 @@ impl LsmEngine {
             }
         }
 
-        // Only acquire sst_cache lock if we actually need to clear it.
-        // This keeps the common path (no compaction) lock-free on sst_cache.
+        // Only acquire write_state lock if we actually need to clear the cache.
         if had_compaction {
-            self.sst_cache.lock().unwrap().clear();
+            self.write_state.lock().unwrap().sst_cache.clear();
         }
 
-        // Clear the flag AFTER cache invalidation to ensure correctness:
-        // a concurrent reader that sees compaction_pending=false will see
-        // the cleared cache (both under Acquire/Release ordering).
+        // Clear the flag AFTER cache invalidation to ensure correctness.
         self.compaction_pending.store(false, Ordering::Release);
     }
 
     /// Blocks until all pending background compaction work is complete.
     /// Useful for testing and graceful shutdown.
-    pub fn flush_compaction(&mut self) -> Result<()> {
+    pub fn flush_compaction(&self) -> Result<()> {
         // Drain any pending notifications first
         self.drain_compaction_notifications();
 
@@ -615,11 +632,8 @@ impl LsmEngine {
             }
         }
         drop(receiver);
-        // Clear the entire cache after compaction to ensure no stale handles.
-        // Use the same lock acquisition pattern as drain_compaction_notifications
-        // to avoid double-locking.
         if had_compaction {
-            self.sst_cache.lock().unwrap().clear();
+            self.write_state.lock().unwrap().sst_cache.clear();
         }
         Ok(())
     }
@@ -630,7 +644,7 @@ impl LsmEngine {
     /// 1. Create a new WAL at a temp path
     /// 2. Atomically rename temp �?wal.log
     /// This ensures the WAL is never missing, even if the process crashes mid-reset.
-    fn reset_wal(&mut self) -> Result<()> {
+    fn reset_wal_internal(&self, ws: &mut WriteState) -> Result<()> {
         let wal_path = self.options.data_dir.join("wal.log");
         let tmp_path = self.options.data_dir.join("wal.log.tmp");
 
@@ -645,9 +659,9 @@ impl LsmEngine {
         // Atomically replace the old WAL
         fs::rename(&tmp_path, &wal_path)?;
 
-        self.wal = new_wal;
+        ws.wal = new_wal;
         // Re-open at the final path (rename doesn't update the file handle's path)
-        self.wal = Wal::open(&wal_path)?;
+        ws.wal = Wal::open(&wal_path)?;
 
         Ok(())
     }
@@ -657,21 +671,22 @@ impl LsmEngine {
     }
 
     /// Rebuilds secondary indexes by scanning persisted index entries from SSTables.
-    fn rebuild_indexes(&mut self) -> Result<()> {
+    fn rebuild_indexes(&self) -> Result<()> {
         let index_entries = self.scan_prefix(b"__idx__")?;
         if !index_entries.is_empty() {
-            self.index_manager.rebuild_from_entries(&index_entries);
+            let mut mgr = self.index_manager.write().unwrap();
+            mgr.rebuild_from_entries(&index_entries);
             tracing::info!(
                 "Rebuilt {} index entries across {} indexes",
                 index_entries.len(),
-                self.index_manager.index_count()
+                mgr.index_count()
             );
         }
         Ok(())
     }
 
     /// Rebuilds vector indexes by scanning persisted metadata and document data.
-    fn rebuild_vector_indexes(&mut self) -> Result<()> {
+    fn rebuild_vector_indexes(&self) -> Result<()> {
         let meta_entries = self.scan_prefix(b"__vec_meta__")?;
         if meta_entries.is_empty() {
             return Ok(());
@@ -702,7 +717,7 @@ impl LsmEngine {
 
         // Create the indexes
         for (class, column, dimension, metric, m, ef_construction, ef_search) in &index_configs {
-            let _ = self.vector_index_manager.create_index(
+            let _ = self.vector_index_manager.write().unwrap().create_index(
                 class, column, *dimension, *metric, *m, *ef_construction, *ef_search,
             );
         }
@@ -721,7 +736,7 @@ impl LsmEngine {
                                 .filter_map(|v| v.as_f64().map(|f| f as f32))
                                 .collect();
                             if vec.len() == *dimension {
-                                self.vector_index_manager.index_vector(&pk, class, column, vec);
+                                self.vector_index_manager.write().unwrap().index_vector(&pk, class, column, vec);
                                 count += 1;
                             }
                         }
@@ -751,100 +766,109 @@ impl LsmEngine {
     // ══════════════════════════════════════════════════════════════�?
     /// Begins a new transaction. Returns the transaction ID.
     /// Snapshot is taken at the last committed data point.
-    pub fn begin_txn(&mut self) -> SeqNo {
+    pub fn begin_txn(&self) -> SeqNo {
         // seq_counter is the NEXT value to assign, so last committed = seq_counter - 1
         let last_seq = self.seq_counter.load(Ordering::Relaxed).saturating_sub(1);
-        self.txn_manager.begin(last_seq)
+        self.write_state.lock().unwrap().txn_manager.begin(last_seq)
     }
 
     /// Commits a transaction. Flushes its write buffer to WAL + MemTable.
-    pub fn commit_txn(&mut self, txn_id: SeqNo) -> Result<()> {
-        let writes = self.txn_manager.commit(txn_id)?;
+    pub fn commit_txn(&self, txn_id: SeqNo) -> Result<()> {
+        // Take the writes from the transaction manager (brief lock)
+        let writes = {
+            let mut ws = self.write_state.lock().unwrap();
+            ws.txn_manager.commit(txn_id)?
+        };
 
-        for (key, op) in writes {
-            let seq = self.next_seq();
+        // Process each write under write_state lock.
+        // commit_txn is inherently serial — holding the lock for the duration is fine.
+        let needs_flush = {
+            let mut ws = self.write_state.lock().unwrap();
 
-            // Maintain indexes if any exist for this class
-            let class = Self::extract_class_from_key(&key);
-            let has_indexes = class.as_ref().map_or(false, |c| {
-                !self.index_manager.indexes_for_class(c).is_empty()
-            });
-            let has_vector_indexes = class.as_ref().map_or(false, |c| {
-                self.vector_index_manager.has_any_index(c)
-            });
+            for (key, op) in writes {
+                let seq = self.next_seq();
 
-            match op {
-                WriteOp::Put(value) => {
-                    if has_indexes || has_vector_indexes {
-                        // Deindex the old value first (handles UPDATE case)
-                        if let Some(old_val) = self.get(&key)? {
-                            if let Some(ref old_doc) = parse_doc_bytes(&old_val) {
+                // Maintain indexes if any exist for this class
+                let class = Self::extract_class_from_key(&key);
+                let has_indexes = class.as_ref().map_or(false, |c| {
+                    !self.index_manager.read().unwrap().indexes_for_class(c).is_empty()
+                });
+                let has_vector_indexes = class.as_ref().map_or(false, |c| {
+                    self.vector_index_manager.read().unwrap().has_any_index(c)
+                });
+
+                match op {
+                    WriteOp::Put(value) => {
+                        if has_indexes || has_vector_indexes {
+                            // Deindex the old value first (handles UPDATE case)
+                            if let Some(old_val) = Self::get_from_locked(&ws, key.as_slice())? {
+                                if let Some(ref old_doc) = parse_doc_bytes(&old_val) {
+                                    if let Some(ref c) = class {
+                                        if has_indexes {
+                                            self.index_manager.write().unwrap().deindex_document(c, &key, old_doc);
+                                        }
+                                        if has_vector_indexes {
+                                            self.vector_index_manager.write().unwrap().deindex_vectors(&key);
+                                        }
+                                    }
+                                }
+                            }
+                            // Index the new value and persist index entries
+                            if let Some(ref doc) = parse_doc_bytes(&value) {
                                 if let Some(ref c) = class {
                                     if has_indexes {
-                                        self.index_manager.deindex_document(c, &key, old_doc);
+                                        let index_entries = self.index_manager.write().unwrap().index_document(c, &key, doc);
+                                        for (idx_key, idx_val) in index_entries {
+                                            let idx_seq = self.next_seq();
+                                            let idx_entry = Entry::put(idx_key.clone(), idx_val.clone(), idx_seq);
+                                            ws.wal.append(&idx_entry)?;
+                                            ws.memtable.put_with_seq(idx_key, idx_val, idx_seq);
+                                        }
                                     }
                                     if has_vector_indexes {
-                                        self.vector_index_manager.deindex_vectors(&key);
+                                        self.vector_index_manager.write().unwrap().index_document_vectors(&key, c, doc);
                                     }
                                 }
                             }
                         }
-                        // Index the new value and persist index entries
-                        if let Some(ref doc) = parse_doc_bytes(&value) {
-                            if let Some(ref c) = class {
-                                if has_indexes {
-                                    let index_entries = self.index_manager.index_document(c, &key, doc);
-                                    for (idx_key, idx_val) in index_entries {
-                                        let idx_seq = self.next_seq();
-                                        let idx_entry = Entry::put(idx_key.clone(), idx_val.clone(), idx_seq);
-                                        self.wal.append(&idx_entry)?;
-                                        self.memtable.put_with_seq(idx_key, idx_val, idx_seq);
-                                    }
-                                }
-                                if has_vector_indexes {
-                                    self.vector_index_manager.index_document_vectors(&key, c, doc);
-                                }
-                            }
-                        } else {
-                            // Value deserialization failed — skip indexing
-                        }
-                    }
 
-                    let entry = Entry::put(key.clone(), value.clone(), seq);
-                    self.wal.append(&entry)?;
-                    self.memtable.put_with_seq(key, value, seq);
-                }
-                WriteOp::Delete => {
-                    // For deletes, we need the old value to de-index
-                    if has_indexes || has_vector_indexes {
-                        if let Some(old_val) = self.get(&key)? {
-                            if let Some(ref doc) = parse_doc_bytes(&old_val) {
-                                if let Some(ref c) = class {
-                                    if has_indexes {
-                                        self.index_manager.deindex_document(c, &key, doc);
-                                    }
-                                    if has_vector_indexes {
-                                        self.vector_index_manager.deindex_vectors(&key);
+                        let entry = Entry::put(key.clone(), value.clone(), seq);
+                        ws.wal.append(&entry)?;
+                        ws.memtable.put_with_seq(key, value, seq);
+                    }
+                    WriteOp::Delete => {
+                        if has_indexes || has_vector_indexes {
+                            if let Some(old_val) = Self::get_from_locked(&ws, key.as_slice())? {
+                                if let Some(ref old_doc) = parse_doc_bytes(&old_val) {
+                                    if let Some(ref c) = class {
+                                        if has_indexes {
+                                            self.index_manager.write().unwrap().deindex_document(c, &key, old_doc);
+                                        }
+                                        if has_vector_indexes {
+                                            self.vector_index_manager.write().unwrap().deindex_vectors(&key);
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    let entry = Entry::delete(key.clone(), seq);
-                    self.wal.append(&entry)?;
-                    self.memtable.delete_with_seq(key, seq);
+                        let entry = Entry::delete(key.clone(), seq);
+                        ws.wal.append(&entry)?;
+                        ws.memtable.delete_with_seq(key, seq);
+                    }
                 }
             }
-        }
 
-        // Sync WAL for durability if configured
-        if self.options.sync_wal_on_commit {
-            self.wal.sync()?;
-        }
+            // Sync WAL for durability if configured
+            if self.options.sync_wal_on_commit {
+                ws.wal.sync()?;
+            }
 
-        // Check if we need to flush
-        if self.memtable.size() >= self.options.memtable_size_limit {
+            ws.memtable.size() >= self.options.memtable_size_limit
+        };
+
+        // Flush outside the lock if needed
+        if needs_flush {
             self.flush_memtable()?;
         }
 
@@ -862,14 +886,36 @@ impl LsmEngine {
         }
     }
 
+    /// Gets a value by key from already-locked write state (memtable + SST cache).
+    /// Used by `commit_txn` which holds the write_state lock.
+    fn get_from_locked(ws: &WriteState, key: &[u8]) -> Result<Option<Value>> {
+        if let Some((val, _)) = ws.memtable.get(key) {
+            return Ok(Some(val.to_vec()));
+        }
+        if let Some(ref imm) = ws.immutable_memtable {
+            if let Some((val, _)) = imm.get(key) {
+                return Ok(Some(val.to_vec()));
+            }
+        }
+        for sst in ws.sst_cache.values() {
+            match sst.get_full(key)? {
+                Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
+                Some((_, _, EntryKind::Delete)) => return Ok(None),
+                None => continue,
+            }
+        }
+        Ok(None)
+    }
+
     /// Aborts a transaction. Discards all pending writes.
-    pub fn abort_txn(&mut self, txn_id: SeqNo) -> Result<()> {
-        self.txn_manager.abort(txn_id)
+    pub fn abort_txn(&self, txn_id: SeqNo) -> Result<()> {
+        self.write_state.lock().unwrap().txn_manager.abort(txn_id)
     }
 
     /// Buffers a put operation in a transaction.
-    pub fn txn_put(&mut self, txn_id: SeqNo, key: Key, value: Value) -> Result<()> {
-        self.txn_manager
+    pub fn txn_put(&self, txn_id: SeqNo, key: Key, value: Value) -> Result<()> {
+        self.write_state.lock().unwrap()
+            .txn_manager
             .get_mut(txn_id)
             .ok_or_else(|| onto_core::CoreError::InvalidArgument(
                 format!("transaction {} not found or not active", txn_id),
@@ -879,8 +925,9 @@ impl LsmEngine {
     }
 
     /// Buffers a delete operation in a transaction.
-    pub fn txn_delete(&mut self, txn_id: SeqNo, key: Key) -> Result<()> {
-        self.txn_manager
+    pub fn txn_delete(&self, txn_id: SeqNo, key: Key) -> Result<()> {
+        self.write_state.lock().unwrap()
+            .txn_manager
             .get_mut(txn_id)
             .ok_or_else(|| onto_core::CoreError::InvalidArgument(
                 format!("transaction {} not found or not active", txn_id),
@@ -897,17 +944,20 @@ impl LsmEngine {
     /// 3. Check SSTables (with snapshot visibility)
     pub fn txn_get(&self, txn_id: SeqNo, key: &[u8]) -> Result<Option<Value>> {
         // 1. Check transaction's own write buffer
-        if let Some(txn) = self.txn_manager.get(txn_id) {
-            if let Some(op) = txn.write_buffer_get(key) {
-                return match op {
-                    WriteOp::Put(v) => Ok(Some(v.clone())),
-                    WriteOp::Delete => Ok(None),
-                };
+        {
+            let ws = self.write_state.lock().unwrap();
+            if let Some(txn) = ws.txn_manager.get(txn_id) {
+                if let Some(op) = txn.write_buffer_get(key) {
+                    return match op {
+                        WriteOp::Put(v) => Ok(Some(v.clone())),
+                        WriteOp::Delete => Ok(None),
+                    };
+                }
             }
         }
 
         // 2-3. Read from storage with snapshot visibility
-        let vis = self.txn_manager.visibility_for(txn_id);
+        let vis = self.write_state.lock().unwrap().txn_manager.visibility_for(txn_id);
         self.get_with_visibility(key, &vis)
     }
 
@@ -917,28 +967,31 @@ impl LsmEngine {
         txn_id: SeqNo,
         prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let vis = self.txn_manager.visibility_for(txn_id);
+        let (vis, write_buffer) = {
+            let ws = self.write_state.lock().unwrap();
+            let vis = ws.txn_manager.visibility_for(txn_id);
+            let buf: Vec<(Vec<u8>, WriteOp)> = ws.txn_manager.get(txn_id)
+                .map(|t| t.write_buffer_iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default();
+            (vis, buf)
+        };
 
         // Get base results from storage with visibility filtering
         let mut results = self.scan_prefix_with_visibility(prefix, &vis)?;
 
         // Overlay the transaction's own write buffer
-        if let Some(txn) = self.txn_manager.get(txn_id) {
-            for (key, op) in txn.write_buffer_iter() {
-                if key.starts_with(prefix) {
-                    match op {
-                        WriteOp::Put(value) => {
-                            // Insert or update in results
-                            if let Some(existing) = results.iter_mut().find(|(k, _)| k == key) {
-                                existing.1 = value.clone();
-                            } else {
-                                results.push((key.clone(), value.clone()));
-                            }
+        for (key, op) in &write_buffer {
+            if key.starts_with(prefix) {
+                match op {
+                    WriteOp::Put(value) => {
+                        if let Some(existing) = results.iter_mut().find(|(k, _)| k == key) {
+                            existing.1 = value.clone();
+                        } else {
+                            results.push((key.clone(), value.clone()));
                         }
-                        WriteOp::Delete => {
-                            // Remove from results
-                            results.retain(|(k, _)| k != key);
-                        }
+                    }
+                    WriteOp::Delete => {
+                        results.retain(|(k, _)| k != key);
                     }
                 }
             }
@@ -955,25 +1008,26 @@ impl LsmEngine {
         key: &[u8],
         vis: &crate::mvcc::Visibility,
     ) -> Result<Option<Value>> {
-        // Check active MemTable �?use range query to find visible version
-        for entry in self.memtable.get_versions(key) {
-            if vis.is_visible(entry.seq_no) {
-                if entry.is_tombstone() {
-                    return Ok(None);
-                }
-                return Ok(Some(entry.value.to_vec()));
-            }
-            // If not visible, keep looking for older visible versions
-        }
-
-        // Check immutable MemTable
-        if let Some(ref imm) = self.immutable_memtable {
-            for entry in imm.get_versions(key) {
+        // Check active MemTable — use range query to find visible version
+        {
+            let ws = self.write_state.lock().unwrap();
+            for entry in ws.memtable.get_versions(key) {
                 if vis.is_visible(entry.seq_no) {
                     if entry.is_tombstone() {
                         return Ok(None);
                     }
                     return Ok(Some(entry.value.to_vec()));
+                }
+            }
+            // Check immutable MemTable
+            if let Some(ref imm) = ws.immutable_memtable {
+                for entry in imm.get_versions(key) {
+                    if vis.is_visible(entry.seq_no) {
+                        if entry.is_tombstone() {
+                            return Ok(None);
+                        }
+                        return Ok(Some(entry.value.to_vec()));
+                    }
                 }
             }
         }
@@ -993,13 +1047,13 @@ impl LsmEngine {
             cands
         };
 
-        let mut cache = self.sst_cache.lock().unwrap();
+        let mut ws = self.write_state.lock().unwrap();
         for path in &candidates {
-            if !cache.contains_key(path) {
+            if !ws.sst_cache.contains_key(path) {
                 let sst = SsTable::open(path)?;
-                cache.insert(path.to_path_buf(), sst);
+                ws.sst_cache.insert(path.to_path_buf(), sst);
             }
-            let sst = cache.get(path).unwrap();
+            let sst = ws.sst_cache.get(path).unwrap();
             match sst.get_full(key)? {
                 Some((value, seq, kind)) if vis.is_visible(seq) => {
                     if kind == EntryKind::Delete {
@@ -1025,7 +1079,7 @@ impl LsmEngine {
 
     /// Returns the number of active transactions.
     pub fn active_txn_count(&self) -> usize {
-        self.txn_manager.active_count()
+        self.write_state.lock().unwrap().txn_manager.active_count()
     }
 
     // =================================================================
@@ -1033,8 +1087,8 @@ impl LsmEngine {
     // =================================================================
     /// Creates a secondary index on a class.column.
     /// Automatically backfills existing data for the class.
-    pub fn create_index(&mut self, class: &str, column: &str) -> Result<()> {
-        self.index_manager.create_index(class, column);
+    pub fn create_index(&self, class: &str, column: &str) -> Result<()> {
+        self.index_manager.write().unwrap().create_index(class, column);
 
         // Backfill: scan all existing entries for this class and index them
         let prefix = format!("{}::", class);
@@ -1043,13 +1097,14 @@ impl LsmEngine {
         for (pk, val_bytes) in entries {
             if let Some(doc) = parse_doc_bytes(&val_bytes) {
                 if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
-                    let index_entries = self.index_manager.index_document(class, &pk, &doc);
+                    let index_entries = self.index_manager.write().unwrap().index_document(class, &pk, &doc);
                     // Persist index entries to WAL + MemTable
                     for (key, value) in index_entries {
                         let seq = self.next_seq();
                         let entry = Entry::put(key.clone(), value.clone(), seq);
-                        self.wal.append(&entry)?;
-                        self.memtable.put_with_seq(key, value, seq);
+                        let mut ws = self.write_state.lock().unwrap();
+                        ws.wal.append(&entry)?;
+                        ws.memtable.put_with_seq(key, value, seq);
                     }
                 }
             }
@@ -1059,23 +1114,18 @@ impl LsmEngine {
     }
 
     /// Drops a secondary index.
-    pub fn drop_index(&mut self, class: &str, column: &str) -> bool {
-        self.index_manager.drop_index(class, column)
+    pub fn drop_index(&self, class: &str, column: &str) -> bool {
+        self.index_manager.write().unwrap().drop_index(class, column)
     }
 
     /// Returns true if an index exists on the given class.column.
     pub fn has_index(&self, class: &str, column: &str) -> bool {
-        self.index_manager.has_index(class, column)
+        self.index_manager.read().unwrap().has_index(class, column)
     }
 
-    /// Returns a reference to the index manager.
-    pub fn index_manager(&self) -> &IndexManager {
+    /// Returns a reference to the index manager RwLock.
+    pub fn index_manager(&self) -> &RwLock<IndexManager> {
         &self.index_manager
-    }
-
-    /// Returns a mutable reference to the index manager.
-    pub fn index_manager_mut(&mut self) -> &mut IndexManager {
-        &mut self.index_manager
     }
 
     // =================================================================
@@ -1084,7 +1134,7 @@ impl LsmEngine {
 
     /// Creates a vector index on a class.column with HNSW parameters.
     pub fn create_vector_index(
-        &mut self,
+        &self,
         class: &str,
         column: &str,
         dimension: usize,
@@ -1093,7 +1143,7 @@ impl LsmEngine {
         ef_construction: usize,
         ef_search: usize,
     ) -> Result<()> {
-        self.vector_index_manager
+        self.vector_index_manager.write().unwrap()
             .create_index(class, column, dimension, metric, m, ef_construction, ef_search)?;
 
         // Persist vector index metadata to LSM
@@ -1111,8 +1161,11 @@ impl LsmEngine {
             .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
         let seq = self.next_seq();
         let entry = Entry::put(meta_key.clone(), meta_val.clone(), seq);
-        self.wal.append(&entry)?;
-        self.memtable.put_with_seq(meta_key, meta_val, seq);
+        {
+            let mut ws = self.write_state.lock().unwrap();
+            ws.wal.append(&entry)?;
+            ws.memtable.put_with_seq(meta_key, meta_val, seq);
+        }
 
         // Backfill: scan existing documents and index their vectors
         let prefix = format!("{}::", class);
@@ -1127,7 +1180,7 @@ impl LsmEngine {
                             .filter_map(|v| v.as_f64().map(|f| f as f32))
                             .collect();
                         if vec.len() == dimension {
-                            self.vector_index_manager.index_vector(&pk, class, column, vec);
+                            self.vector_index_manager.write().unwrap().index_vector(&pk, class, column, vec);
                         }
                     }
                 }
@@ -1138,36 +1191,33 @@ impl LsmEngine {
     }
 
     /// Drops a vector index.
-    pub fn drop_vector_index(&mut self, class: &str, column: &str) -> bool {
-        let removed = self.vector_index_manager.drop_index(class, column);
+    pub fn drop_vector_index(&self, class: &str, column: &str) -> bool {
+        let removed = self.vector_index_manager.write().unwrap().drop_index(class, column);
         if removed {
             // Remove persisted metadata
             let meta_key = Self::make_vec_meta_key(class, column);
             let seq = self.next_seq();
             let del_entry = Entry::delete(meta_key.clone(), seq);
-            let _ = self.wal.append(&del_entry);
-            self.memtable.delete_with_seq(meta_key, seq);
+            let mut ws = self.write_state.lock().unwrap();
+            let _ = ws.wal.append(&del_entry);
+            ws.memtable.delete_with_seq(meta_key, seq);
         }
         removed
     }
 
     /// Returns true if a vector index exists on the given class.column.
     pub fn has_vector_index(&self, class: &str, column: &str) -> bool {
-        self.vector_index_manager.has_index(class, column)
+        self.vector_index_manager.read().unwrap().has_index(class, column)
     }
 
-    /// Returns a reference to the vector index manager.
-    pub fn vector_index_manager(&self) -> &VectorIndexManager {
+    /// Returns a reference to the vector index manager RwLock.
+    pub fn vector_index_manager(&self) -> &RwLock<VectorIndexManager> {
         &self.vector_index_manager
-    }
-
-    /// Returns a mutable reference to the vector index manager.
-    pub fn vector_index_manager_mut(&mut self) -> &mut VectorIndexManager {
-        &mut self.vector_index_manager
     }
 
     /// Returns engine statistics.
     pub fn stats(&self) -> EngineStats {
+        let ws = self.write_state.lock().unwrap();
         let levels = self.levels.lock().unwrap();
         let total_sstables: usize = levels.iter().map(|l| l.len()).sum();
         let total_sst_size: u64 = levels
@@ -1177,8 +1227,8 @@ impl LsmEngine {
             .sum();
 
         EngineStats {
-            memtable_size: self.memtable.size(),
-            memtable_entries: self.memtable.len(),
+            memtable_size: ws.memtable.size(),
+            memtable_entries: ws.memtable.len(),
             num_levels: levels.len(),
             total_sstables,
             total_sst_size,
@@ -1198,7 +1248,7 @@ impl LsmEngine {
     /// 4. Write a manifest file listing all copied files
     ///
     /// The backup is a consistent snapshot that can be restored with `restore()`.
-    pub fn backup(&mut self, backup_dir: &Path) -> Result<BackupManifest> {
+    pub fn backup(&self, backup_dir: &Path) -> Result<BackupManifest> {
         // Step 1: Flush MemTable to ensure all data is in SSTables
         self.flush()?;
 
@@ -1331,8 +1381,8 @@ impl LsmEngine {
     }
 
     /// Flushes all disk-based indexes to disk (with fsync).
-    fn flush_disk_indexes(&mut self) -> Result<()> {
-        self.index_manager.flush_disk_indexes();
+    fn flush_disk_indexes(&self) -> Result<()> {
+        self.index_manager.write().unwrap().flush_disk_indexes();
         Ok(())
     }
 }
@@ -1446,7 +1496,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         engine
             .put(b"name".to_vec(), b"alice".to_vec())
@@ -1471,7 +1521,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         engine.put(b"key".to_vec(), b"v1".to_vec()).unwrap();
         engine.put(b"key".to_vec(), b"v2".to_vec()).unwrap();
@@ -1488,7 +1538,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         engine.put(b"key".to_vec(), b"value".to_vec()).unwrap();
         assert!(engine.get(b"key").unwrap().is_some());
@@ -1506,7 +1556,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         // Write enough data to trigger a flush
         for i in 0..20u32 {
@@ -1534,7 +1584,7 @@ mod tests {
                 data_dir: data_dir.clone(),
                 ..Default::default()
             };
-            let mut engine = LsmEngine::open(options).unwrap();
+            let engine = LsmEngine::open(options).unwrap();
             engine
                 .put(b"key1".to_vec(), b"value1".to_vec())
                 .unwrap();
@@ -1550,7 +1600,7 @@ mod tests {
                 data_dir,
                 ..Default::default()
             };
-            let mut engine = LsmEngine::open(options).unwrap();
+            let engine = LsmEngine::open(options).unwrap();
 
             let val = engine.get(b"key1").unwrap();
             assert_eq!(val, Some(b"value1".to_vec()));
@@ -1570,7 +1620,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         // Write enough data to trigger multiple flushes and compaction
         let num_keys = 100u32;
@@ -1617,7 +1667,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         // Write initial data
         for i in 0..50u32 {
@@ -1657,7 +1707,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         // Write data
         for i in 0..50u32 {
@@ -1701,7 +1751,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         // Write data, then delete most of it
         for i in 0..80u32 {
@@ -1748,7 +1798,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         let txn = engine.begin_txn();
         engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).unwrap();
@@ -1766,7 +1816,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         let txn = engine.begin_txn();
         engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).unwrap();
@@ -1782,7 +1832,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         let txn = engine.begin_txn();
         engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).unwrap();
@@ -1801,7 +1851,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         engine.put(b"key".to_vec(), b"v1".to_vec()).unwrap();
 
@@ -1826,7 +1876,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         let txn1 = engine.begin_txn();
         let txn2 = engine.begin_txn();
@@ -1848,7 +1898,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         engine.put(b"key".to_vec(), b"value".to_vec()).unwrap();
 
@@ -1867,7 +1917,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         engine.put(b"user:1".to_vec(), b"alice".to_vec()).unwrap();
         engine.put(b"user:2".to_vec(), b"bob".to_vec()).unwrap();
@@ -1889,7 +1939,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         let txn = engine.begin_txn();
         engine.txn_put(txn, b"key".to_vec(), b"v1".to_vec()).unwrap();
@@ -1908,7 +1958,7 @@ mod tests {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let mut engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).unwrap();
 
         assert_eq!(engine.active_txn_count(), 0);
 
@@ -1937,7 +1987,7 @@ mod tests {
                 memtable_size_limit: 1024 * 1024,
                 ..Default::default()
             };
-            let mut engine = LsmEngine::open(options).unwrap();
+            let engine = LsmEngine::open(options).unwrap();
 
             engine.create_index("Product", "price").unwrap();
 
@@ -1959,13 +2009,13 @@ mod tests {
                 memtable_size_limit: 1024 * 1024,
                 ..Default::default()
             };
-            let mut engine = LsmEngine::open(options).unwrap();
+            let engine = LsmEngine::open(options).unwrap();
 
             // Index should exist after restart
             assert!(engine.has_index("Product", "price"), "index should persist across restart");
 
             // Index should be functional: lookup by value
-            let pkeys = engine.index_manager_mut().lookup_eq(
+            let pkeys = engine.index_manager().write().unwrap().lookup_eq(
                 "Product",
                 "price",
                 &serde_json::json!(999),
@@ -1974,7 +2024,7 @@ mod tests {
             assert_eq!(pkeys.unwrap().len(), 1);
 
             // Range scan should also work
-            let pkeys = engine.index_manager_mut().lookup_range(
+            let pkeys = engine.index_manager().write().unwrap().lookup_range(
                 "Product",
                 "price",
                 Some(&serde_json::json!(500)),
@@ -1998,7 +2048,7 @@ mod tests {
                 memtable_size_limit: 1024 * 1024,
                 ..Default::default()
             };
-            let mut engine = LsmEngine::open(options).unwrap();
+            let engine = LsmEngine::open(options).unwrap();
 
             engine.put(b"key1".to_vec(), b"value1".to_vec()).unwrap();
             engine.put(b"key2".to_vec(), b"value2".to_vec()).unwrap();
@@ -2035,7 +2085,7 @@ mod tests {
                 memtable_size_limit: 1024 * 1024,
                 ..Default::default()
             };
-            let mut engine = LsmEngine::open(options).unwrap();
+            let engine = LsmEngine::open(options).unwrap();
 
             assert_eq!(engine.get(b"key1").unwrap(), Some(b"value1".to_vec()));
             assert_eq!(engine.get(b"key2").unwrap(), Some(b"value2".to_vec()));

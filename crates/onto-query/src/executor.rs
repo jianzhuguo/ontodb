@@ -513,10 +513,79 @@ impl QueryExecutor {
     /// Supports all query types including subqueries, CTEs, materialized views,
     /// expressions, and transactions.
     pub fn execute(&self, ast: &QueryAst) -> Result<QueryResult> {
-        let mut engine = self.engine.write().map_err(|e| {
+        // For simple DML (INSERT/UPDATE/DELETE) without an active multi-statement txn,
+        // use a short write lock that's only held during the commit phase.
+        // This allows concurrent reads to proceed during query planning and execution.
+        let active_txn = *self.active_txn.lock().unwrap();
+        let is_simple_dml = active_txn.is_none() && matches!(
+            ast,
+            QueryAst::Insert { .. }
+                | QueryAst::BatchInsert { .. }
+                | QueryAst::Update { .. }
+                | QueryAst::Delete { .. }
+                | QueryAst::Upsert { .. }
+        );
+
+        if is_simple_dml {
+            return self.execute_dml_short_lock(ast);
+        }
+
+        // For DDL, transactions, and complex queries, use a read lock
+        // (all LsmEngine methods take &self via interior mutability)
+        let engine = self.engine.read().map_err(|e| {
             CoreError::Custom(format!("engine lock poisoned: {}", e))
         })?;
-        self.execute_write_with_engine(ast, &mut engine)
+        self.execute_write_with_engine(ast, &engine)
+    }
+
+    /// Executes a simple DML statement (INSERT/UPDATE/DELETE) with minimal write lock scope.
+    /// The write lock is only held during transaction begin + commit, not during query planning/execution.
+    fn execute_dml_short_lock(&self, ast: &QueryAst) -> Result<QueryResult> {
+        let start_time = std::time::Instant::now();
+
+        // Phase 1: Begin transaction (brief read lock — interior mutability handles the rest)
+        let txn_id = {
+            let engine = self.engine.read().map_err(|e| {
+                CoreError::Custom(format!("engine lock poisoned: {}", e))
+            })?;
+            engine.begin_txn()
+        };
+
+        // Phase 2: Execute query
+        let result = {
+            let engine = self.engine.read().map_err(|e| {
+                CoreError::Custom(format!("engine lock poisoned: {}", e))
+            })?;
+            self.execute_in_txn_with_plan(ast, &engine, txn_id, None)
+        };
+
+        // Phase 3: Commit or abort
+        {
+            let engine = self.engine.read().map_err(|e| {
+                CoreError::Custom(format!("engine lock poisoned: {}", e))
+            })?;
+            match &result {
+                Ok(_) => { engine.commit_txn(txn_id)?; }
+                Err(_) => { let _ = engine.abort_txn(txn_id); }
+            }
+        }
+
+        let elapsed = start_time.elapsed();
+        if elapsed > self.config.query_timeout {
+            return Err(CoreError::Custom(format!(
+                "query timeout: exceeded {} seconds",
+                self.config.query_timeout.as_secs()
+            )));
+        }
+
+        let elapsed_us = elapsed.as_micros() as u64;
+        {
+            let mut stats = self.runtime_stats.lock().unwrap();
+            stats.total_queries += 1;
+            stats.total_time_us += elapsed_us;
+        }
+
+        result
     }
 
     /// Executes a read-only query with a read lock, allowing concurrent SELECT execution.
@@ -531,7 +600,7 @@ impl QueryExecutor {
     }
 
     /// Write-path execution: acquires write lock, handles timeout+stats+transactions.
-    fn execute_write_with_engine(&self, ast: &QueryAst, engine: &mut LsmEngine) -> Result<QueryResult> {
+    fn execute_write_with_engine(&self, ast: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
         let start_time = std::time::Instant::now();
 
         let result = self.execute_with_engine_inner(ast, engine);
@@ -672,7 +741,7 @@ impl QueryExecutor {
     /// Lock-free execution dispatch. Called by execute_write_with_engine and execute_select_read.
     /// Does NOT acquire any engine lock — the caller must hold one.
     /// Recursive callers (explain, CTE, union, filters) call this directly.
-    fn execute_with_engine_inner(&self, ast: &QueryAst, engine: &mut LsmEngine) -> Result<QueryResult> {
+    fn execute_with_engine_inner(&self, ast: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
         match ast {
             QueryAst::Explain { query } => {
                 // EXPLAIN: generate and return the execution plan
@@ -993,7 +1062,7 @@ impl QueryExecutor {
     /// Executes a query using the plan-driven execution engine.
     /// This is the Phase 24 architecture: the executor walks the PlanNode tree
     /// instead of re-implementing optimization logic independently.
-    pub fn execute_plan(&self, plan: &ExecutionPlan, engine: &mut LsmEngine) -> Result<QueryResult> {
+    pub fn execute_plan(&self, plan: &ExecutionPlan, engine: &LsmEngine) -> Result<QueryResult> {
         let rows = self.execute_plan_node(&plan.root, engine)?;
         self.check_memory_budget(&rows)?;
         Ok(QueryResult::Rows(rows))
@@ -1048,10 +1117,10 @@ impl QueryExecutor {
     }
 
     /// Recursively executes a PlanNode and returns the result rows.
-    fn execute_plan_node(&self, node: &PlanNode, engine: &mut LsmEngine) -> Result<Vec<Map<String, Value>>> {
+    fn execute_plan_node(&self, node: &PlanNode, engine: &LsmEngine) -> Result<Vec<Map<String, Value>>> {
         match node {
             PlanNode::SeqScan { table, alias, filter, .. } => {
-                self.plan_seq_scan(engine, table, alias.as_deref(), filter)
+                self.plan_seq_scan(engine, table, alias.as_deref(), filter, None)
             }
             PlanNode::IndexScan { table, alias, index_column, filter, .. } => {
                 self.plan_index_scan(engine, table, alias.as_deref(), index_column, filter)
@@ -1069,13 +1138,22 @@ impl QueryExecutor {
                 Ok(rows)
             }
             PlanNode::Projection { input, columns, .. } => {
-                // Get the raw rows from the child node (before projection)
-                let raw_rows = self.execute_plan_node(input, engine)?;
                 // Check if there are aggregates or expressions that need all columns
                 let has_aggregates = Self::columns_have_aggregates(columns);
                 let has_expr = match columns {
                     SelectColumns::Columns(items) => items.iter().any(|item| matches!(item, SelectItem::Expression(_))),
                     _ => false,
+                };
+                // Only push column projection down when there are no aggregates/expressions
+                // (aggregates and expressions may reference columns not in the SELECT list)
+                let raw_rows = if !has_aggregates && !has_expr {
+                    if let PlanNode::SeqScan { table, alias, filter, .. } = input.as_ref() {
+                        self.plan_seq_scan(engine, table, alias.as_deref(), filter, Some(columns))?
+                    } else {
+                        self.execute_plan_node(input, engine)?
+                    }
+                } else {
+                    self.execute_plan_node(input, engine)?
                 };
                 if has_aggregates {
                     // Aggregation handles projection in post-processing; pass through raw rows
@@ -1183,10 +1261,11 @@ impl QueryExecutor {
     /// Plan-driven sequential scan with optional filter.
     fn plan_seq_scan(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         table: &str,
         alias: Option<&str>,
         filter: &Option<FilterExpr>,
+        projected_columns: Option<&SelectColumns>,
     ) -> Result<Vec<Map<String, Value>>> {
         // Check CTE tables first
         let cte_prefix = format!("__cte_{}::", table.to_lowercase());
@@ -1229,6 +1308,30 @@ impl QueryExecutor {
         // Pre-extract simple filter column names for fast byte-level rejection.
         let fast_filter_cols = Self::extract_fast_filter_columns(filter);
 
+        // Extract projected column names for selective BinaryRow conversion.
+        let proj_cols: Vec<String> = match projected_columns {
+            Some(SelectColumns::Columns(items)) => {
+                let mut cols = Vec::with_capacity(items.len() + 4);
+                for item in items {
+                    match item {
+                        SelectItem::Column(col) => {
+                            let real = if let Some(pos) = col.find(" as ") { &col[..pos] } else { col.as_str() };
+                            let name = real.split('.').last().unwrap_or(real).to_string();
+                            if !cols.contains(&name) { cols.push(name); }
+                        }
+                        SelectItem::Aggregate(a) => {
+                            if let Some(ref alias) = a.alias {
+                                if !cols.contains(alias) { cols.push(alias.clone()); }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                cols
+            }
+            _ => Vec::new(),
+        };
+
         let mut rows = Vec::new();
         for scan_class in &scan_classes {
             let prefix = format!("{}::", scan_class);
@@ -1259,7 +1362,7 @@ impl QueryExecutor {
                             }
                         }
                     }
-                    if let Some(mut doc) = brow.to_map() {
+                    if let Some(mut doc) = brow.to_map_projected(&proj_cols) {
                         doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
                         rows.push(doc);
                     }
@@ -1300,7 +1403,7 @@ impl QueryExecutor {
     /// Plan-driven index scan.
     fn plan_index_scan(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         table: &str,
         alias: Option<&str>,
         index_column: &str,
@@ -1335,22 +1438,24 @@ impl QueryExecutor {
         }
 
         // Fallback to full scan
-        self.plan_seq_scan(engine, table, alias, filter)
+        self.plan_seq_scan(engine, table, alias, filter, None)
     }
 
     /// Plan-driven index lookup (point query).
     fn plan_index_lookup(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         table: &str,
         alias: Option<&str>,
         index_column: &str,
         key: &LiteralValue,
     ) -> Result<Vec<Map<String, Value>>> {
         if engine.has_index(table, index_column) {
-            let index_mgr = engine.index_manager_mut();
             let json_val = Self::literal_to_json_static(key);
-            let pkeys = index_mgr.lookup_eq(table, index_column, &json_val).unwrap_or_default();
+            let pkeys = {
+                let mut index_mgr = engine.index_manager().write().unwrap();
+                index_mgr.lookup_eq(table, index_column, &json_val).unwrap_or_default()
+            };
             let mut rows = Self::fetch_rows_by_pks(engine, &pkeys)?;
             if let Some(a) = alias {
                 Self::apply_alias(&mut rows, a);
@@ -1363,7 +1468,7 @@ impl QueryExecutor {
     /// Plan-driven vector search.
     fn plan_vector_search(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         table: &str,
         column: &str,
         query_vector: &[f32],
@@ -1390,9 +1495,9 @@ impl QueryExecutor {
                     }
                 }
             }
-            engine.vector_index_manager().search_filtered(table, column, query_vector, top_k, &allowed_ids)?
+            engine.vector_index_manager().read().unwrap().search_filtered(table, column, query_vector, top_k, &allowed_ids)?
         } else {
-            engine.vector_index_manager().search(table, column, query_vector, top_k)?
+            engine.vector_index_manager().read().unwrap().search(table, column, query_vector, top_k)?
         };
 
         let mut rows = Vec::new();
@@ -1716,7 +1821,7 @@ impl QueryExecutor {
     /// then x type B. This means scanning for class A should include all subclasses.
     ///
     /// If no ontology is defined for the class, returns only the original class.
-    fn get_class_hierarchy(&self, engine: &mut LsmEngine, table: &str) -> HashSet<String> {
+    fn get_class_hierarchy(&self, engine: &LsmEngine, table: &str) -> HashSet<String> {
         // Check cache first
         {
             let cache = self.inference_cache.lock().unwrap();
@@ -1753,7 +1858,7 @@ impl QueryExecutor {
     }
 
     /// Returns classes that are disjoint with the given class.
-    fn get_disjoint_classes(&self, engine: &mut LsmEngine, class: &str) -> HashSet<String> {
+    fn get_disjoint_classes(&self, engine: &LsmEngine, class: &str) -> HashSet<String> {
         let mut disjoint = HashSet::new();
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         for (_key, val_bytes) in entries {
@@ -1779,7 +1884,7 @@ impl QueryExecutor {
     /// Exclude classes that are disjoint with the targeted classes.
     fn narrow_scan_scope(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         table: &str,
         filter: &Option<FilterExpr>,
         class_hierarchy: &HashSet<String>,
@@ -1859,7 +1964,7 @@ impl QueryExecutor {
 
     /// Executes EXPLAIN: generates and returns the execution plan.
     /// If ANALYZE mode, also executes the query and measures actual time.
-    fn execute_explain(&self, query: &QueryAst, engine: &mut LsmEngine) -> Result<QueryResult> {
+    fn execute_explain(&self, query: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
         let plan = self.planner.read().unwrap().plan(query)?;
         let description = plan.describe();
 
@@ -1896,7 +2001,7 @@ impl QueryExecutor {
     /// Executes ANALYZE: collects table statistics for query optimization.
     /// Scans the table, counts rows, and collects column-level statistics.
     /// Uses class hierarchy expansion to include subclass documents.
-    fn execute_analyze(&self, table: &str, engine: &mut LsmEngine) -> Result<QueryResult> {
+    fn execute_analyze(&self, table: &str, engine: &LsmEngine) -> Result<QueryResult> {
         let class_hierarchy = self.get_class_hierarchy(engine, table);
         let mut row_count = 0u64;
         let mut column_stats: std::collections::HashMap<String, ColumnStats> = std::collections::HashMap::new();
@@ -2106,7 +2211,7 @@ impl QueryExecutor {
 
     /// Refreshes planner stats for a table after index creation/deletion.
     /// Scans the table to collect row count and index info, then updates the planner.
-    fn refresh_index_stats(&self, engine: &mut LsmEngine, table: &str) {
+    fn refresh_index_stats(&self, engine: &LsmEngine, table: &str) {
         let class_hierarchy = self.get_class_hierarchy(engine, table);
         let mut row_count: u64 = 0;
         let mut column_stats: HashMap<String, ColumnStats> = HashMap::new();
@@ -2169,7 +2274,7 @@ impl QueryExecutor {
     fn execute_plan_node_read(&self, node: &PlanNode, engine: &LsmEngine) -> Result<Vec<Map<String, Value>>> {
         match node {
             PlanNode::SeqScan { table, alias, filter, .. } => {
-                self.plan_seq_scan_read(engine, table, alias.as_deref(), filter)
+                self.plan_seq_scan_read(engine, table, alias.as_deref(), filter, None)
             }
             PlanNode::IndexScan { table, alias, index_column, filter, .. } => {
                 self.plan_index_scan_read(engine, table, alias.as_deref(), index_column, filter)
@@ -2186,11 +2291,20 @@ impl QueryExecutor {
                 Ok(rows)
             }
             PlanNode::Projection { input, columns, .. } => {
-                let raw_rows = self.execute_plan_node_read(input, engine)?;
                 let has_aggregates = Self::columns_have_aggregates(columns);
                 let has_expr = match columns {
                     SelectColumns::Columns(items) => items.iter().any(|item| matches!(item, SelectItem::Expression(_))),
                     _ => false,
+                };
+                // Only push column projection down when there are no aggregates/expressions
+                let raw_rows = if !has_aggregates && !has_expr {
+                    if let PlanNode::SeqScan { table, alias, filter, .. } = input.as_ref() {
+                        self.plan_seq_scan_read(engine, table, alias.as_deref(), filter, Some(columns))?
+                    } else {
+                        self.execute_plan_node_read(input, engine)?
+                    }
+                } else {
+                    self.execute_plan_node_read(input, engine)?
                 };
                 if has_aggregates {
                     Ok(raw_rows)
@@ -2280,19 +2394,47 @@ impl QueryExecutor {
     }
 
     /// Read-only sequential scan with &LsmEngine.
+    /// When `projected_columns` is Some, only those columns are converted from BinaryRow,
+    /// avoiding the cost of deserializing all fields.
     fn plan_seq_scan_read(
         &self,
         engine: &LsmEngine,
         table: &str,
         alias: Option<&str>,
         filter: &Option<FilterExpr>,
+        projected_columns: Option<&SelectColumns>,
     ) -> Result<Vec<Map<String, Value>>> {
         let class_hierarchy = self.get_class_hierarchy_read(engine, table);
 
         // Pre-extract simple filter column names for fast byte-level rejection.
-        // For a filter like `price > 5000`, we can extract the "price" field from
-        // raw JSON bytes and compare without full deserialization.
         let fast_filter_cols = Self::extract_fast_filter_columns(filter);
+
+        // Extract projected column names for selective BinaryRow conversion.
+        // This avoids converting ALL fields when only a subset is needed.
+        let proj_cols: Vec<String> = match projected_columns {
+            Some(SelectColumns::Columns(items)) => {
+                let mut cols = Vec::with_capacity(items.len() + 4);
+                for item in items {
+                    match item {
+                        SelectItem::Column(col) => {
+                            // Strip " as alias" suffix
+                            let real = if let Some(pos) = col.find(" as ") { &col[..pos] } else { col.as_str() };
+                            // Strip "table." prefix
+                            let name = real.split('.').last().unwrap_or(real).to_string();
+                            if !cols.contains(&name) { cols.push(name); }
+                        }
+                        SelectItem::Aggregate(a) => {
+                            if let Some(ref alias) = a.alias {
+                                if !cols.contains(alias) { cols.push(alias.clone()); }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                cols
+            }
+            _ => Vec::new(), // SELECT * — use full to_map()
+        };
 
         let mut rows = Vec::new();
         for scan_class in &class_hierarchy {
@@ -2315,6 +2457,7 @@ impl QueryExecutor {
                             Some(true) => {}
                             Some(false) => continue,
                             None => {
+                                // Filter can't be evaluated from BinaryRow alone — need full map
                                 if let Some(mut doc) = brow.to_map() {
                                     if !self.eval_filter_read(engine, &doc, f) { continue; }
                                     doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
@@ -2324,7 +2467,8 @@ impl QueryExecutor {
                             }
                         }
                     }
-                    if let Some(mut doc) = brow.to_map() {
+                    // Use projected conversion when column list is available
+                    if let Some(mut doc) = brow.to_map_projected(&proj_cols) {
                         doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
                         rows.push(doc);
                     }
@@ -2654,7 +2798,7 @@ impl QueryExecutor {
             }
         }
 
-        self.plan_seq_scan_read(engine, table, alias, filter)
+        self.plan_seq_scan_read(engine, table, alias, filter, None)
     }
 
     /// Read-only index lookup with &LsmEngine.
@@ -2667,7 +2811,7 @@ impl QueryExecutor {
         key: &LiteralValue,
     ) -> Result<Vec<Map<String, Value>>> {
         if engine.has_index(table, index_column) {
-            let index_mgr = engine.index_manager();
+            let index_mgr = engine.index_manager().read().unwrap();
             let json_val = Self::literal_to_json_static(key);
             let pkeys = index_mgr.lookup_eq_read(table, index_column, &json_val).unwrap_or_default();
             let mut rows = Self::fetch_rows_by_pks_read(engine, &pkeys)?;
@@ -2703,7 +2847,7 @@ impl QueryExecutor {
             return None;
         }
 
-        let index_mgr = engine.index_manager();
+        let index_mgr = engine.index_manager().read().unwrap();
 
         let pkeys: Vec<Vec<u8>> = match filter {
             FilterExpr::Eq(_, val) => {
@@ -2797,9 +2941,9 @@ impl QueryExecutor {
                     }
                 }
             }
-            engine.vector_index_manager().search_filtered(table, column, query_vector, top_k, &allowed_ids)?
+            engine.vector_index_manager().read().unwrap().search_filtered(table, column, query_vector, top_k, &allowed_ids)?
         } else {
-            engine.vector_index_manager().search(table, column, query_vector, top_k)?
+            engine.vector_index_manager().read().unwrap().search(table, column, query_vector, top_k)?
         };
 
         let mut rows = Vec::new();
@@ -2906,9 +3050,9 @@ impl QueryExecutor {
                     }
                 }
             }
-            engine.vector_index_manager().search_filtered(class, column, query_vector, top_k, &allowed_ids)?
+            engine.vector_index_manager().read().unwrap().search_filtered(class, column, query_vector, top_k, &allowed_ids)?
         } else {
-            engine.vector_index_manager().search(class, column, query_vector, top_k)?
+            engine.vector_index_manager().read().unwrap().search(class, column, query_vector, top_k)?
         };
 
         let mut rows = Vec::new();
@@ -3214,7 +3358,7 @@ impl QueryExecutor {
         &self,
         ctes: &[crate::parser::CteDefinition],
         query: &QueryAst,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         _recursive: bool,
     ) -> Result<QueryResult> {
         // Materialize each CTE: execute the query and store results under a temp key
@@ -3258,7 +3402,7 @@ impl QueryExecutor {
     fn execute_in_txn_with_plan(
         &self,
         ast: &QueryAst,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         txn_id: u64,
         cached_plan: Option<&ExecutionPlan>,
     ) -> Result<QueryResult> {
@@ -3315,7 +3459,7 @@ impl QueryExecutor {
     }
 
     /// Executes a statement within an existing transaction.
-    fn execute_in_txn(&self, ast: &QueryAst, engine: &mut LsmEngine, txn_id: u64) -> Result<QueryResult> {
+    fn execute_in_txn(&self, ast: &QueryAst, engine: &LsmEngine, txn_id: u64) -> Result<QueryResult> {
         match ast {
             QueryAst::Insert {
                 class,
@@ -3548,7 +3692,7 @@ impl QueryExecutor {
     }
 
     /// Executes UNION [ALL] by running both queries and merging results.
-    fn execute_union(&self, engine: &mut LsmEngine, left: &QueryAst, right: &QueryAst, all: bool) -> Result<QueryResult> {
+    fn execute_union(&self, engine: &LsmEngine, left: &QueryAst, right: &QueryAst, all: bool) -> Result<QueryResult> {
         let left_result = self.execute_with_engine_inner(left, engine)?;
         let right_result = self.execute_with_engine_inner(right, engine)?;
 
@@ -3612,7 +3756,7 @@ impl QueryExecutor {
     /// Executes aggregation: GROUP BY + aggregate functions + HAVING.
     fn execute_aggregation(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         columns: &SelectColumns,
         rows: &[Map<String, Value>],
         group_by: Option<&crate::parser::GroupByClause>,
@@ -4059,7 +4203,7 @@ impl QueryExecutor {
 
     fn execute_insert_txn(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         txn_id: u64,
         class: &str,
         columns: &[String],
@@ -4093,7 +4237,7 @@ impl QueryExecutor {
     /// All rows are inserted within the given transaction for atomicity.
     fn execute_import(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         txn_id: u64,
         class: &str,
         file_path: &str,
@@ -4115,7 +4259,7 @@ impl QueryExecutor {
     /// First row is treated as header (column names).
     fn execute_import_csv(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         txn_id: u64,
         class: &str,
         content: &str,
@@ -4213,7 +4357,7 @@ impl QueryExecutor {
     /// Supports: array of objects `[{...}, {...}]` or JSON Lines (one object per line).
     fn execute_import_json(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         txn_id: u64,
         class: &str,
         content: &str,
@@ -4232,7 +4376,7 @@ impl QueryExecutor {
     /// Imports from a JSON array: `[{"col1": "val1"}, ...]`
     fn execute_import_json_array(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         txn_id: u64,
         class: &str,
         content: &str,
@@ -4257,7 +4401,7 @@ impl QueryExecutor {
     /// Imports from JSON Lines format (one JSON object per line).
     fn execute_import_json_lines(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         txn_id: u64,
         class: &str,
         content: &str,
@@ -4291,7 +4435,7 @@ impl QueryExecutor {
     /// Imports a single JSON object as a row.
     fn import_json_object(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         txn_id: u64,
         class: &str,
         obj: &serde_json::Value,
@@ -4341,7 +4485,7 @@ impl QueryExecutor {
 
     fn execute_match_txn(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         _txn_id: u64,
         _variable: &str,
         class: &str,
@@ -4384,7 +4528,7 @@ impl QueryExecutor {
     /// 3. Fetch full documents for the results
     fn execute_vector_search_txn(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         txn_id: u64,
         class: &str,
         column: &str,
@@ -4439,11 +4583,11 @@ impl QueryExecutor {
                 }
             }
 
-            engine.vector_index_manager().search_filtered(
+            engine.vector_index_manager().read().unwrap().search_filtered(
                 class, column, query_vector, top_k, &allowed_ids,
             )?
         } else {
-            engine.vector_index_manager().search(
+            engine.vector_index_manager().read().unwrap().search(
                 class, column, query_vector, top_k,
             )?
         };
@@ -4509,7 +4653,7 @@ impl QueryExecutor {
     /// Tries to use an index for a single (non-AND/OR) predicate.
     /// Returns Some(primary_keys) if index was used, None otherwise.
     fn try_index_scan_single(
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         class: &str,
         filter: &FilterExpr,
     ) -> Result<Option<Vec<Vec<u8>>>> {
@@ -4531,7 +4675,7 @@ impl QueryExecutor {
             return Ok(None);
         }
 
-        let index_mgr = engine.index_manager_mut();
+        let mut index_mgr = engine.index_manager().write().unwrap();
 
         let pkeys: Vec<Vec<u8>> = match filter {
             FilterExpr::Eq(_, val) => {
@@ -4737,7 +4881,7 @@ impl QueryExecutor {
 
     /// Fetches rows by their primary keys (plan-driven path, no txn).
     fn fetch_rows_by_pks(
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         pkeys: &[Vec<u8>],
     ) -> Result<Vec<Map<String, Value>>> {
         let mut rows = Vec::new();
@@ -4762,14 +4906,14 @@ impl QueryExecutor {
         }
     }
 
-    fn matches_filter(&self, engine: &mut LsmEngine, doc: &Map<String, Value>, filter: &Option<FilterExpr>) -> bool {
+    fn matches_filter(&self, engine: &LsmEngine, doc: &Map<String, Value>, filter: &Option<FilterExpr>) -> bool {
         match filter {
             None => true,
             Some(expr) => self.eval_filter(engine, doc, expr),
         }
     }
 
-    fn eval_filter(&self, engine: &mut LsmEngine, doc: &Map<String, Value>, expr: &FilterExpr) -> bool {
+    fn eval_filter(&self, engine: &LsmEngine, doc: &Map<String, Value>, expr: &FilterExpr) -> bool {
         match expr {
             FilterExpr::Eq(col, val) => {
                 doc.get(col).map_or(false, |v| {
@@ -4893,7 +5037,7 @@ impl QueryExecutor {
     /// Checks if a document's __class__ value matches a target class using ontology reasoning.
     /// Returns true if the document's class equals the target or is in the class hierarchy
     /// (i.e., the document's class is a subclass of the target).
-    fn class_value_matches(&self, engine: &mut LsmEngine, v: &Value, lit: &LiteralValue) -> bool {
+    fn class_value_matches(&self, engine: &LsmEngine, v: &Value, lit: &LiteralValue) -> bool {
         match (v, lit) {
             (Value::String(doc_class), LiteralValue::String(target_class)) => {
                 if doc_class == target_class {
@@ -4912,7 +5056,7 @@ impl QueryExecutor {
     ///
     /// For example, if `reportsTo` has subproperty `worksUnder` and equivalent property `supervisedBy`,
     /// then `get_property_aliases(engine, "reportsTo")` returns `{"reportsTo", "worksUnder", "supervisedBy"}`.
-    fn get_property_aliases(&self, engine: &mut LsmEngine, property: &str) -> HashSet<String> {
+    fn get_property_aliases(&self, engine: &LsmEngine, property: &str) -> HashSet<String> {
         // Check cache first
         {
             let cache = self.inference_cache.lock().unwrap();
@@ -4963,7 +5107,7 @@ impl QueryExecutor {
     /// Implements PrpInv (inverse property inference).
     ///
     /// For example, if `reportsTo` has inverse `manages`, returns `Some("manages")`.
-    fn get_inverse_property(&self, engine: &mut LsmEngine, property: &str) -> Option<String> {
+    fn get_inverse_property(&self, engine: &LsmEngine, property: &str) -> Option<String> {
         // Check cache first
         {
             let cache = self.inference_cache.lock().unwrap();
@@ -5002,7 +5146,7 @@ impl QueryExecutor {
 
     /// Checks if a property is transitive.
     #[allow(dead_code)]
-    fn is_transitive_property(&self, engine: &mut LsmEngine, property: &str) -> bool {
+    fn is_transitive_property(&self, engine: &LsmEngine, property: &str) -> bool {
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         for (_key, val_bytes) in entries {
             if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
@@ -5015,7 +5159,7 @@ impl QueryExecutor {
     }
 
     /// Checks if a property is symmetric.
-    fn is_symmetric_property(&self, engine: &mut LsmEngine, property: &str) -> bool {
+    fn is_symmetric_property(&self, engine: &LsmEngine, property: &str) -> bool {
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         for (_key, val_bytes) in entries {
             if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
@@ -5036,7 +5180,7 @@ impl QueryExecutor {
     /// Then `transitive_closure(engine, "alice", "ancestor")` returns {"bob", "charlie"}.
     fn transitive_closure(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         start_id: &str,
         property: &str,
     ) -> HashSet<String> {
@@ -5083,7 +5227,7 @@ impl QueryExecutor {
     /// 4. Symmetric property match (PrpSymp)
     fn property_value_matches(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         doc: &Map<String, Value>,
         col: &str,
         val: &LiteralValue,
@@ -5227,7 +5371,7 @@ impl QueryExecutor {
         &self,
         expr: &ValueExpr,
         row: &Map<String, Value>,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
     ) -> Result<Value> {
         match expr {
             ValueExpr::Column(col) => {
@@ -5495,7 +5639,7 @@ impl QueryExecutor {
     /// Returns Ok(()) if valid, Err with a descriptive message if not.
     fn validate_document(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         class: &str,
         doc: &Map<String, Value>,
     ) -> Result<()> {
@@ -5551,7 +5695,7 @@ impl QueryExecutor {
     /// someValuesFrom, allValuesFrom.
     fn validate_restrictions(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         ontology: &onto_ontology::Ontology,
         class_def: &onto_ontology::Class,
         doc: &Map<String, Value>,
@@ -5681,7 +5825,7 @@ impl QueryExecutor {
     /// Checks if a document with the given ID is an instance of the specified class.
     fn is_instance_of_class(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         doc_id: &str,
         required_class: &str,
     ) -> Result<bool> {
@@ -5709,7 +5853,7 @@ impl QueryExecutor {
     /// If class A is disjoint with class B, no instance can be of both types.
     fn validate_disjointness(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         ontology: &onto_ontology::Ontology,
         class: &str,
         doc: &Map<String, Value>,
@@ -6067,7 +6211,7 @@ mod tests {
         insert_row(&executor, "Product", "MacBook", 1999);
 
         // Flush to ensure data is in SSTables
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6086,7 +6230,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
 
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price > 900").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6107,7 +6251,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
 
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT * FROM Product LIMIT 2").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6126,7 +6270,7 @@ mod tests {
         insert_row(&executor, "Customer", "Alice", 0);
         insert_row(&executor, "Product", "iPad", 799);
 
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Should only return Products
         let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
@@ -6152,7 +6296,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
 
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'iPhone'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6180,7 +6324,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
 
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("DELETE FROM Product WHERE name = 'iPhone'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6208,7 +6352,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
 
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("MATCH (p: Product) WHERE price > 900 RETURN name, price").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6227,7 +6371,7 @@ mod tests {
     fn test_update_no_match() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'Galaxy'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6243,7 +6387,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 999);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Update all rows with price 999
         let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE price = 999").unwrap();
@@ -6266,7 +6410,7 @@ mod tests {
     fn test_update_multiple_fields() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("UPDATE Product SET name = 'iPhone 15', price = 1099 WHERE name = 'iPhone'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6292,7 +6436,7 @@ mod tests {
     fn test_delete_no_match() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("DELETE FROM Product WHERE name = 'Galaxy'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6316,7 +6460,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Delete all with price < 1000
         let ast = QueryParser::parse("DELETE FROM Product WHERE price < 1000").unwrap();
@@ -6343,7 +6487,7 @@ mod tests {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Delete all (no WHERE)
         let ast = QueryParser::parse("DELETE FROM Product").unwrap();
@@ -6452,11 +6596,11 @@ mod tests {
         let (executor, _dir) = setup();
 
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Insert more, flush again
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Both should be visible
         let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
@@ -6472,12 +6616,12 @@ mod tests {
         let (executor, _dir) = setup();
 
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Update
         let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'iPhone'").unwrap();
         executor.execute(&ast).unwrap();
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Verify after flush
         let ast = QueryParser::parse("SELECT price FROM Product WHERE name = 'iPhone'").unwrap();
@@ -6518,7 +6662,7 @@ mod tests {
         insert_order(&executor, "iPad", 5);
         insert_order(&executor, "iPhone", 1);
 
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // JOIN: Product p JOIN Order o ON p.name = o.product_id
         let ast = QueryParser::parse(
@@ -6544,7 +6688,7 @@ mod tests {
         insert_order(&executor, "iPad", 5);
         insert_order(&executor, "iPhone", 1);
 
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // JOIN with WHERE filter on right table
         let ast = QueryParser::parse(
@@ -6570,7 +6714,7 @@ mod tests {
         insert_order(&executor, "iPad", 5);
         insert_order(&executor, "iPhone", 1);
 
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id LIMIT 2"
@@ -6593,7 +6737,7 @@ mod tests {
         // Order references non-existent product
         insert_order(&executor, "Galaxy", 1);
 
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id"
@@ -6614,7 +6758,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_order(&executor, "iPhone", 3);
 
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // SELECT * with JOIN should return all columns from both tables
         let ast = QueryParser::parse(
@@ -6640,7 +6784,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT COUNT(*) FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6659,7 +6803,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT SUM(price) as total, AVG(price) as avg_price FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6680,7 +6824,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT MIN(price) as min_p, MAX(price) as max_p FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6743,7 +6887,7 @@ mod tests {
         };
         executor.execute(&ast).unwrap();
 
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // GROUP BY category with COUNT and SUM
         let ast = QueryParser::parse(
@@ -6793,7 +6937,7 @@ mod tests {
             };
             executor.execute(&ast).unwrap();
         }
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // GROUP BY category HAVING COUNT(*) > 1
         let ast = QueryParser::parse(
@@ -6831,7 +6975,7 @@ mod tests {
             };
             executor.execute(&ast).unwrap();
         }
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT category, COUNT(*) as cnt FROM Item GROUP BY category LIMIT 2"
@@ -6853,7 +6997,7 @@ mod tests {
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name, price FROM Product ORDER BY price").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6874,7 +7018,7 @@ mod tests {
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name, price FROM Product ORDER BY price DESC").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6895,7 +7039,7 @@ mod tests {
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product ORDER BY price DESC LIMIT 2").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6930,7 +7074,7 @@ mod tests {
             };
             executor.execute(&ast).unwrap();
         }
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // GROUP BY + ORDER BY total DESC
         let ast = QueryParser::parse(
@@ -6957,7 +7101,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPhone", 999); // duplicate
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT DISTINCT name, price FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6978,7 +7122,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "iMac", 1299);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product WHERE name LIKE 'i%'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -6996,7 +7140,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook Pro", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product WHERE name LIKE '%Pro'").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7015,7 +7159,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "iMac", 1299);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // i_ade should NOT match (underscore is exactly one char)
         let ast = QueryParser::parse("SELECT name FROM Product WHERE name LIKE 'iP_d'").unwrap();
@@ -7038,7 +7182,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "AirPods", 249);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price BETWEEN 500 AND 1500").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7059,7 +7203,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "AirPods", 249);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product WHERE name IN ('iPhone', 'MacBook', 'AirPods')").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7077,7 +7221,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product WHERE price IN (799, 1999)").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7104,7 +7248,7 @@ mod tests {
             values: vec![LiteralValue::String("Widget".to_string()), LiteralValue::Int(49)],
         };
         executor.execute(&ast).unwrap();
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT name FROM Product UNION SELECT name FROM Item"
@@ -7129,7 +7273,7 @@ mod tests {
             values: vec![LiteralValue::String("iPhone".to_string()), LiteralValue::Int(999)],
         };
         executor.execute(&ast).unwrap();
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // UNION ALL keeps duplicates
         let ast = QueryParser::parse(
@@ -7164,7 +7308,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Subquery: select names where price > 900
         let ast = QueryParser::parse(
@@ -7183,7 +7327,7 @@ mod tests {
     fn test_subquery_no_match() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Subquery returns empty set
         let ast = QueryParser::parse(
@@ -7212,7 +7356,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "AirPods", 249);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Range query: price > 500 鈥?should use index
         let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price > 500").unwrap();
@@ -7235,7 +7379,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "AirPods", 249);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product WHERE price < 500").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7259,7 +7403,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "AirPods", 249);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price BETWEEN 700 AND 1000").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7281,7 +7425,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // >=
         let ast = QueryParser::parse("SELECT name FROM Product WHERE price >= 999").unwrap();
@@ -7315,7 +7459,7 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
         insert_row(&executor, "Product", "AirPods", 249);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT name FROM Product WHERE price IN (249, 1999)").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7337,7 +7481,7 @@ mod tests {
         executor.execute(&ast).unwrap();
 
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Verify index works for original price
         let ast = QueryParser::parse("SELECT name FROM Product WHERE price = 999").unwrap();
@@ -7380,7 +7524,7 @@ mod tests {
 
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Delete iPhone
         let ast = QueryParser::parse("DELETE FROM Product WHERE name = 'iPhone'").unwrap();
@@ -7412,7 +7556,7 @@ mod tests {
 
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Move iPhone from 999 to 599
         let ast = QueryParser::parse("UPDATE Product SET price = 599 WHERE name = 'iPhone'").unwrap();
@@ -7485,7 +7629,7 @@ mod tests {
         };
         executor.execute(&ast).unwrap();
 
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Vector search: find 2 nearest to [1.0, 0.0, 0.0]
         let ast = QueryParser::parse(
@@ -7535,7 +7679,7 @@ mod tests {
             };
             executor.execute(&ast).unwrap();
         }
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Vector search with filter: only "animal" category
         let ast = QueryParser::parse(
@@ -7613,7 +7757,7 @@ mod tests {
                 ],
             };
             executor.execute(&ast).unwrap();
-            engine.write().unwrap().flush().unwrap();
+            engine.read().unwrap().flush().unwrap();
         }
 
         // Reopen and verify vector index is rebuilt
@@ -7629,7 +7773,7 @@ mod tests {
             assert!(engine.has_vector_index("Product", "embedding"));
 
             // Search should work with rebuilt index
-            let results = engine.vector_index_manager().search(
+            let results = engine.vector_index_manager().read().unwrap().search(
                 "Product", "embedding", &[1.0, 0.0, 0.0], 1,
             ).unwrap();
             assert_eq!(results.len(), 1);
@@ -7644,7 +7788,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT name, CASE WHEN price > 1000 THEN 'expensive' ELSE 'affordable' END FROM Product"
@@ -7671,7 +7815,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse(
             "WITH expensive AS (SELECT * FROM Product WHERE price > 900) SELECT * FROM expensive"
@@ -7693,7 +7837,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT name, ROW_NUMBER() OVER (ORDER BY price DESC) FROM Product"
@@ -7717,7 +7861,7 @@ mod tests {
     fn test_explain_analyze() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("EXPLAIN SELECT * FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7740,7 +7884,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Create materialized view
         let ast = QueryParser::parse(
@@ -7767,7 +7911,7 @@ mod tests {
     fn test_materialized_view_drop() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Create
         let ast = QueryParser::parse(
@@ -7799,7 +7943,7 @@ mod tests {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Create materialized view
         let ast = QueryParser::parse(
@@ -7816,7 +7960,7 @@ mod tests {
 
         // Add a new product
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Refresh the materialized view
         let ast = QueryParser::parse("REFRESH MATERIALIZED VIEW expensive_mv").unwrap();
@@ -7852,7 +7996,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("ANALYZE Product").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -7874,7 +8018,7 @@ mod tests {
     fn test_plan_cache_integration() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // First query - plan cache miss
         let ast = QueryParser::parse("SELECT * FROM Product WHERE price > 500").unwrap();
@@ -7894,7 +8038,7 @@ mod tests {
     fn test_composite_index_create() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // Create composite index
         let ast = QueryParser::parse("CREATE INDEX ON Product (name, price)").unwrap();
@@ -7922,7 +8066,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         insert_row(&executor, "Product", "iPad", 799);
         insert_row(&executor, "Product", "MacBook", 1999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // AND condition: price > 800 AND price < 1500
         // Should use index for price > 800, then filter price < 1500
@@ -7945,7 +8089,7 @@ mod tests {
     fn test_runtime_stats_tracking() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let before = executor.runtime_stats().total_queries;
 
@@ -7969,7 +8113,7 @@ mod tests {
         for i in 0..5 {
             insert_row(&executor, "Product", &format!("item{}", i), i * 100);
         }
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         // LIMIT 2 OFFSET 2 should skip first 2, return next 2
         let ast = QueryParser::parse("SELECT name FROM Product ORDER BY price LIMIT 2 OFFSET 2").unwrap();
@@ -7986,7 +8130,7 @@ mod tests {
     fn test_offset_beyond_data() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT * FROM Product LIMIT 10 OFFSET 100").unwrap();
         let result = executor.execute(&ast).unwrap();
@@ -8028,7 +8172,7 @@ mod tests {
     fn test_coalesce_function() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT COALESCE(name, 'unknown') FROM Product"
@@ -8047,7 +8191,7 @@ mod tests {
     fn test_concat_function() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse(
             "SELECT CONCAT(name, ' - ', 'Premium') FROM Product"
@@ -8066,7 +8210,7 @@ mod tests {
     fn test_upper_lower_functions() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
-        executor.engine.write().unwrap().flush().unwrap();
+        executor.engine.read().unwrap().flush().unwrap();
 
         let ast = QueryParser::parse("SELECT UPPER(name) FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();

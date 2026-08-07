@@ -154,16 +154,17 @@ impl VectorIndexManager {
         column: &str,
         vector: Vec<f32>,
     ) {
-        // If this key was previously deleted, un-delete it
-        self.deleted_keys.remove(doc_key);
-
         let key = IndexKey {
             class: class.to_string(),
             column: column.to_string(),
         };
 
-        // Remove from deleted_keys if re-indexing after update
-        self.deleted_keys.remove(doc_key);
+        // If this key was previously deleted AND is being re-inserted (not updated),
+        // un-delete it. For UPDATE, deindex_vectors already removed doc_vectors,
+        // so we keep deleted_keys to filter stale HNSW entries until the next compaction.
+        if !self.doc_vectors.contains_key(doc_key) {
+            self.deleted_keys.remove(doc_key);
+        }
 
         // Track the vector for this document
         self.doc_vectors

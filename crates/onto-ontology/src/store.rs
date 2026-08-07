@@ -26,14 +26,14 @@ impl OntologyStore {
         let value = serde_json::to_vec(ontology)
             .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
 
-        let mut engine = self.engine.write().map_err(|e| {
+        let engine = self.engine.read().map_err(|e| {
             onto_core::CoreError::Custom(format!("engine lock poisoned: {}", e))
         })?;
         engine.put(key, value)
     }
 
     /// Saves an ontology using an already-acquired engine reference.
-    pub fn save_with_engine(&self, engine: &mut LsmEngine, ontology: &Ontology) -> Result<()> {
+    pub fn save_with_engine(&self, engine: &LsmEngine, ontology: &Ontology) -> Result<()> {
         let key = Self::make_key(&ontology.name);
         let value = serde_json::to_vec(ontology)
             .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
@@ -44,7 +44,7 @@ impl OntologyStore {
     pub fn load(&self, name: &str) -> Result<Option<Ontology>> {
         let key = Self::make_key(name);
 
-        let mut engine = self.engine.write().map_err(|e| {
+        let engine = self.engine.read().map_err(|e| {
             onto_core::CoreError::Custom(format!("engine lock poisoned: {}", e))
         })?;
         match engine.get(&key)? {
@@ -58,7 +58,7 @@ impl OntologyStore {
     }
 
     /// Loads an ontology using an already-acquired engine reference.
-    pub fn load_with_engine(&self, engine: &mut LsmEngine, name: &str) -> Result<Option<Ontology>> {
+    pub fn load_with_engine(&self, engine: &LsmEngine, name: &str) -> Result<Option<Ontology>> {
         let key = Self::make_key(name);
         match engine.get(&key)? {
             Some(bytes) => {
@@ -73,7 +73,7 @@ impl OntologyStore {
     /// Deletes an ontology by name.
     pub fn delete(&self, name: &str) -> Result<()> {
         let key = Self::make_key(name);
-        let mut engine = self.engine.write().map_err(|e| {
+        let engine = self.engine.read().map_err(|e| {
             onto_core::CoreError::Custom(format!("engine lock poisoned: {}", e))
         })?;
         engine.delete(key)
@@ -83,7 +83,7 @@ impl OntologyStore {
     /// Scans all stored ontologies and returns the first one containing the class.
     pub fn find_ontology_for_class(
         &self,
-        engine: &mut LsmEngine,
+        engine: &LsmEngine,
         class_name: &str,
     ) -> Result<Option<Ontology>> {
         let entries = engine.scan_prefix(ONTOLOGY_PREFIX)?;

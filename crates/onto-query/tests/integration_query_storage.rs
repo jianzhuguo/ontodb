@@ -1281,7 +1281,7 @@ fn integration_vector_index_recovery_after_restart() {
         assert!(engine.has_vector_index("Product", "embedding"));
 
         // Search should work with rebuilt index
-        let results = engine.vector_index_manager().search(
+        let results = engine.vector_index_manager().read().unwrap().search(
             "Product", "embedding", &[1.0, 0.0, 0.0], 1,
         ).unwrap();
         assert_eq!(results.len(), 1);
