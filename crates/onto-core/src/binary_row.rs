@@ -19,6 +19,7 @@
 //! - Array: [len: u32 LE] [element_count: u32 LE] [elements...]
 
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::convert::TryInto;
 
 // Type tags
@@ -36,6 +37,8 @@ pub struct BinaryRow<'a> {
     num_fields: u16,
     /// Per-field: (name_len, type_tag, name_offset, value_offset)
     fields: Vec<FieldMeta>,
+    /// O(1) field name → index lookup, built during parse().
+    name_index: HashMap<&'a str, usize>,
 }
 
 struct FieldMeta {
@@ -110,7 +113,17 @@ impl<'a> BinaryRow<'a> {
             value_offset += value_size;
         }
 
-        Some(BinaryRow { data, num_fields: num_fields as u16, fields })
+        // Build name → index map for O(1) field lookup
+        let mut name_index = HashMap::with_capacity(num_fields);
+        for (i, fm) in fields.iter().enumerate() {
+            let start = fm.name_offset;
+            let end = start + fm.name_len as usize;
+            if let Ok(name) = std::str::from_utf8(&data[start..end]) {
+                name_index.insert(name, i);
+            }
+        }
+
+        Some(BinaryRow { data, num_fields: num_fields as u16, fields, name_index })
     }
 
     /// Number of fields in this row.
@@ -151,14 +164,9 @@ impl<'a> BinaryRow<'a> {
         (fm.type_tag, &self.data[fm.value_offset..fm.value_offset + size])
     }
 
-    /// Find a field by name. Returns its index, or None.
+    /// Find a field by name. Returns its index, or None. O(1) via pre-built HashMap.
     pub fn find_field(&self, name: &str) -> Option<usize> {
-        for i in 0..self.num_fields as usize {
-            if self.field_name(i) == name {
-                return Some(i);
-            }
-        }
-        None
+        self.name_index.get(name).copied()
     }
 
     /// Get the `__class__` field value as a string, if present.

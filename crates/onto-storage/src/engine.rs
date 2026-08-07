@@ -279,20 +279,7 @@ impl LsmEngine {
     pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
         self.drain_compaction_notifications();
 
-        // 1-2. Check MemTables (brief lock)
-        {
-            let ws = self.write_state.lock().unwrap();
-            if let Some((val, _)) = ws.memtable.get(key) {
-                return Ok(Some(val.to_vec()));
-            }
-            if let Some(ref imm) = ws.immutable_memtable {
-                if let Some((val, _)) = imm.get(key) {
-                    return Ok(Some(val.to_vec()));
-                }
-            }
-        }
-
-        // 3. Check SSTables (newest to oldest)
+        // 1. Collect candidate SST paths from levels (brief lock).
         let candidates = {
             let levels = self.levels.lock().unwrap();
             let mut cands = Vec::new();
@@ -307,10 +294,21 @@ impl LsmEngine {
             cands
         };
 
-        // Snapshot SST handles from cache (brief lock — open + clone Arc)
-        // Then iterate outside the lock.
+        // 2. Check MemTables + snapshot SST handles in a single write_state lock.
         let sst_handles: Vec<Arc<SsTable>> = {
             let mut ws = self.write_state.lock().unwrap();
+
+            // Check MemTables first (in-memory, fast path)
+            if let Some((val, _)) = ws.memtable.get(key) {
+                return Ok(Some(val.to_vec()));
+            }
+            if let Some(ref imm) = ws.immutable_memtable {
+                if let Some((val, _)) = imm.get(key) {
+                    return Ok(Some(val.to_vec()));
+                }
+            }
+
+            // Snapshot SST handles from cache (open missing ones lazily)
             candidates.iter().filter_map(|path| {
                 if !ws.sst_cache.contains_key(path) {
                     let sst = SsTable::open(path).ok()?;
@@ -320,6 +318,7 @@ impl LsmEngine {
             }).collect()
         };
 
+        // 3. Iterate SST handles outside the lock (I/O-heavy).
         for sst in &sst_handles {
             match sst.get_full(key)? {
                 Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
@@ -614,22 +613,25 @@ impl LsmEngine {
         }
 
         // Drain notifications under the receiver lock only (NOT holding write_state).
-        let mut had_compaction = false;
+        let mut evicted_paths: Vec<PathBuf> = Vec::new();
         {
             let receiver = self.compaction_notif_receiver.lock().unwrap();
             while let Ok(notif) = receiver.try_recv() {
                 match notif {
-                    CompactionNotification::Compacted { .. } => {
-                        had_compaction = true;
+                    CompactionNotification::Compacted { evicted_paths: paths } => {
+                        evicted_paths.extend(paths);
                     }
                     CompactionNotification::FlushDone => {}
                 }
             }
         }
 
-        // Only acquire write_state lock if we actually need to clear the cache.
-        if had_compaction {
-            self.write_state.lock().unwrap().sst_cache.clear();
+        // Selectively remove only the evicted SST paths from the cache.
+        if !evicted_paths.is_empty() {
+            let mut ws = self.write_state.lock().unwrap();
+            for path in &evicted_paths {
+                ws.sst_cache.remove(path);
+            }
         }
 
         // Clear the flag AFTER cache invalidation to ensure correctness.
@@ -644,12 +646,12 @@ impl LsmEngine {
 
         let _ = self.compaction_sender.send(CompactionMsg::FlushAndNotify);
         let receiver = self.compaction_notif_receiver.lock().unwrap();
-        let mut had_compaction = false;
+        let mut evicted_paths: Vec<PathBuf> = Vec::new();
         loop {
             match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(CompactionNotification::FlushDone) => break,
-                Ok(CompactionNotification::Compacted { .. }) => {
-                    had_compaction = true;
+                Ok(CompactionNotification::Compacted { evicted_paths: paths }) => {
+                    evicted_paths.extend(paths);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     tracing::warn!("flush_compaction timed out waiting for FlushDone");
@@ -659,8 +661,11 @@ impl LsmEngine {
             }
         }
         drop(receiver);
-        if had_compaction {
-            self.write_state.lock().unwrap().sst_cache.clear();
+        if !evicted_paths.is_empty() {
+            let mut ws = self.write_state.lock().unwrap();
+            for path in &evicted_paths {
+                ws.sst_cache.remove(path);
+            }
         }
         Ok(())
     }
