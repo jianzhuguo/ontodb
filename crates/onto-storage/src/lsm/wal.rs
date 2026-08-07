@@ -36,8 +36,8 @@ impl Wal {
 
     /// Appends an entry to the WAL.
     ///
-    /// Writes to the OS buffer (flush) but does NOT fsync for performance.
-    /// Call `sync()` if you need durability guarantees beyond OS buffering.
+    /// Writes to the BufWriter but does NOT flush. Call `flush_buf()` or
+    /// `sync()` after a batch of appends to push data to the OS file cache.
     /// Returns the byte offset where the entry was written.
     pub fn append(&mut self, entry: &Entry) -> Result<u64> {
         let payload = Self::serialize_entry(entry);
@@ -51,13 +51,35 @@ impl Wal {
         self.writer.write_all(&crc.to_le_bytes())?;
         self.writer.write_all(&payload)?;
 
-        // Flush BufWriter to OS file cache (not fsync, just ensures data
-        // leaves the process buffer). Survives process crash on most OSes.
-        self.writer.flush()?;
-
         self.offset += 4 + 4 + payload.len() as u64;
 
         Ok(offset)
+    }
+
+    /// Appends multiple entries to the WAL with a single flush.
+    /// More efficient than calling `append()` in a loop (one flush instead of N).
+    pub fn append_batch(&mut self, entries: &[Entry]) -> Result<()> {
+        for entry in entries {
+            let payload = Self::serialize_entry(entry);
+            let crc = crc32fast::hash(&payload);
+            let len = payload.len() as u32;
+
+            self.writer.write_all(&len.to_le_bytes())?;
+            self.writer.write_all(&crc.to_le_bytes())?;
+            self.writer.write_all(&payload)?;
+
+            self.offset += 4 + 4 + payload.len() as u64;
+        }
+        // Single flush for the entire batch
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Flushes the BufWriter to the OS file cache (not fsync).
+    /// Call after a batch of `append()` calls to push buffered data out.
+    pub fn flush_buf(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        Ok(())
     }
 
     /// Flushes buffered writes to disk (fsync).

@@ -263,6 +263,7 @@ impl LsmEngine {
         let needs_flush = {
             let mut ws = self.write_state.lock().unwrap();
             ws.wal.append(&entry)?;
+            ws.wal.flush_buf()?;
             ws.memtable.put_with_seq(key, value, seq);
             ws.memtable.size() >= self.options.memtable_size_limit
         };
@@ -505,6 +506,7 @@ impl LsmEngine {
         let needs_flush = {
             let mut ws = self.write_state.lock().unwrap();
             ws.wal.append(&entry)?;
+            ws.wal.flush_buf()?;
             ws.memtable.delete_with_seq(key, seq);
             ws.memtable.size() >= self.options.memtable_size_limit
         };
@@ -742,11 +744,11 @@ impl LsmEngine {
             );
         }
 
-        // Backfill vectors from document data
+        // Backfill vectors from document data (batch insert under single lock)
         for (class, column, dimension, _, _, _, _) in &index_configs {
             let prefix = format!("{}::", class);
             let entries = self.scan_prefix(prefix.as_bytes())?;
-            let mut count = 0usize;
+            let mut vectors: Vec<(Vec<u8>, String, String, Vec<f32>)> = Vec::new();
             for (pk, val_bytes) in entries {
                 if let Some(doc) = parse_doc_bytes(&val_bytes) {
                     if doc.get("__class__").and_then(|v| v.as_str()) == Some(class.as_str()) {
@@ -756,12 +758,19 @@ impl LsmEngine {
                                 .filter_map(|v| v.as_f64().map(|f| f as f32))
                                 .collect();
                             if vec.len() == *dimension {
-                                self.vector_index_manager.write().unwrap().index_vector(&pk, class, column, vec);
-                                count += 1;
+                                vectors.push((pk, class.clone(), column.clone(), vec));
                             }
                         }
                     }
                 }
+            }
+            let count = vectors.len();
+            if !vectors.is_empty() {
+                let batch_refs: Vec<(Vec<u8>, &str, &str, Vec<f32>)> = vectors
+                    .iter()
+                    .map(|(pk, c, col, v)| (pk.clone(), c.as_str(), col.as_str(), v.clone()))
+                    .collect();
+                self.vector_index_manager.write().unwrap().index_vector_batch(&batch_refs);
             }
             tracing::info!(
                 "Rebuilt vector index on {}.{} ({} vectors)",
@@ -904,6 +913,8 @@ impl LsmEngine {
                     }
                 }
             }
+
+            ws.wal.flush_buf()?;
 
             if self.options.sync_wal_on_commit {
                 ws.wal.sync()?;
@@ -1172,6 +1183,7 @@ impl LsmEngine {
                 ws.wal.append(&entry)?;
                 ws.memtable.put_with_seq(key, value, seq);
             }
+            ws.wal.flush_buf()?;
         }
 
         Ok(())
@@ -1228,13 +1240,15 @@ impl LsmEngine {
         {
             let mut ws = self.write_state.lock().unwrap();
             ws.wal.append(&entry)?;
+            ws.wal.flush_buf()?;
             ws.memtable.put_with_seq(meta_key, meta_val, seq);
         }
 
-        // Backfill: scan existing documents and index their vectors
+        // Backfill: scan existing documents, collect vectors, then batch insert under single lock
         let prefix = format!("{}::", class);
         let entries = self.scan_prefix(prefix.as_bytes())?;
 
+        let mut vectors: Vec<(Vec<u8>, Vec<f32>)> = Vec::new();
         for (pk, val_bytes) in entries {
             if let Some(doc) = parse_doc_bytes(&val_bytes) {
                 if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
@@ -1244,11 +1258,20 @@ impl LsmEngine {
                             .filter_map(|v| v.as_f64().map(|f| f as f32))
                             .collect();
                         if vec.len() == dimension {
-                            self.vector_index_manager.write().unwrap().index_vector(&pk, class, column, vec);
+                            vectors.push((pk, vec));
                         }
                     }
                 }
             }
+        }
+
+        // Batch insert under single write lock (not per-document)
+        if !vectors.is_empty() {
+            let batch_refs: Vec<(Vec<u8>, &str, &str, Vec<f32>)> = vectors
+                .iter()
+                .map(|(pk, v)| (pk.clone(), class, column, v.clone()))
+                .collect();
+            self.vector_index_manager.write().unwrap().index_vector_batch(&batch_refs);
         }
 
         Ok(())
@@ -1264,6 +1287,7 @@ impl LsmEngine {
             let del_entry = Entry::delete(meta_key.clone(), seq);
             let mut ws = self.write_state.lock().unwrap();
             let _ = ws.wal.append(&del_entry);
+            let _ = ws.wal.flush_buf();
             ws.memtable.delete_with_seq(meta_key, seq);
         }
         removed

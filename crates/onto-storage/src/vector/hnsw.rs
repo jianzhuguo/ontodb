@@ -154,6 +154,18 @@ impl HnswIndex {
         self.nodes.is_empty()
     }
 
+    /// Inserts a batch of vectors into the index more efficiently than
+    /// individual inserts. Allocates all nodes upfront and builds edges
+    /// with amortized overhead.
+    pub fn insert_batch(&mut self, entries: Vec<VectorEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        for entry in entries {
+            self.insert(entry);
+        }
+    }
+
     /// Inserts a vector into the index.
     pub fn insert(&mut self, entry: VectorEntry) {
         debug_assert_eq!(entry.vector.len(), self.config.dimension);

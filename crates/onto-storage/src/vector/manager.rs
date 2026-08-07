@@ -146,6 +146,43 @@ impl VectorIndexManager {
         self.indexes.len()
     }
 
+    /// Indexes a batch of vectors under a single lock acquisition.
+    /// More efficient than calling `index_vector()` in a loop for bulk operations.
+    pub fn index_vector_batch(
+        &mut self,
+        vectors: &[(Vec<u8>, &str, &str, Vec<f32>)],
+    ) {
+        // Group by (class, column) for batch HNSW insert
+        let mut by_index: HashMap<IndexKey, Vec<(Vec<u8>, Vec<f32>)>> = HashMap::new();
+        for (doc_key, class, column, vector) in vectors {
+            // Un-delete if this is a new document (not an update)
+            if !self.doc_vectors.contains_key(doc_key) {
+                self.deleted_keys.remove(doc_key);
+            }
+
+            let key = IndexKey {
+                class: class.to_string(),
+                column: column.to_string(),
+            };
+            by_index.entry(key).or_insert_with(Vec::new).push((doc_key.clone(), vector.clone()));
+            // Track doc_vectors
+            self.doc_vectors
+                .entry(doc_key.clone())
+                .or_insert_with(Vec::new)
+                .push((class.to_string(), column.to_string(), vector.clone()));
+        }
+
+        for (idx_key, vecs) in by_index {
+            if let Some(index) = self.indexes.get_mut(&idx_key) {
+                let batch: Vec<VectorEntry> = vecs
+                    .into_iter()
+                    .map(|(id, vector)| VectorEntry { id, vector })
+                    .collect();
+                index.insert_batch(batch);
+            }
+        }
+    }
+
     /// Indexes a vector for a document. Called during INSERT/UPDATE.
     pub fn index_vector(
         &mut self,
