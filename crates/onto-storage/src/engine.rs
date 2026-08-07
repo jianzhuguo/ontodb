@@ -56,7 +56,7 @@ struct WriteState {
     txn_manager: TxnManager,
 
     /// Cache of opened SSTable handles, keyed by file path.
-    sst_cache: HashMap<PathBuf, SsTable>,
+    sst_cache: HashMap<PathBuf, Arc<SsTable>>,
 }
 
 /// The main LSM-Tree storage engine with MVCC support.
@@ -171,7 +171,7 @@ impl PreLoadEngine {
                     }
                 }
             }
-            self.write_state.sst_cache.insert(path.clone(), sst);
+            self.write_state.sst_cache.insert(path.clone(), Arc::new(sst));
             self.levels[level].push(SsTableInfo {
                 path,
                 size: metadata.len(),
@@ -306,19 +306,28 @@ impl LsmEngine {
             cands
         };
 
-        {
+        // Snapshot SST handles from cache; open missing ones outside the lock
+        let sst_handles: Vec<Arc<SsTable>> = {
             let mut ws = self.write_state.lock().unwrap();
+            let mut handles = Vec::with_capacity(candidates.len());
             for path in &candidates {
-                if !ws.sst_cache.contains_key(path) {
-                    let sst = SsTable::open(path)?;
-                    ws.sst_cache.insert(path.to_path_buf(), sst);
+                if let Some(sst) = ws.sst_cache.get(path) {
+                    handles.push(Arc::clone(sst));
+                } else {
+                    let sst = Arc::new(SsTable::open(path)?);
+                    ws.sst_cache.insert(path.to_path_buf(), Arc::clone(&sst));
+                    handles.push(sst);
                 }
-                let sst = ws.sst_cache.get(path).unwrap();
-                match sst.get_full(key)? {
-                    Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
-                    Some((_, _, EntryKind::Delete)) => return Ok(None),
-                    None => continue,
-                }
+            }
+            handles
+        };
+
+        // Iterate outside the lock
+        for sst in &sst_handles {
+            match sst.get_full(key)? {
+                Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
+                Some((_, _, EntryKind::Delete)) => return Ok(None),
+                None => continue,
             }
         }
 
@@ -377,45 +386,58 @@ impl LsmEngine {
             paths
         };
 
-        // Scan SSTables (write_state locked for SSTable cache + scan phase)
-        {
+        // Step 1: Snapshot SST handles from cache (brief lock — open missing files outside)
+        let sst_handles: Vec<Arc<SsTable>> = {
             let mut ws = self.write_state.lock().unwrap();
+            let mut handles = Vec::with_capacity(sst_paths.len());
             for path in &sst_paths {
-                if !ws.sst_cache.contains_key(path) {
-                    let sst = SsTable::open(path)?;
-                    ws.sst_cache.insert(path.to_path_buf(), sst);
-                }
-                let sst = ws.sst_cache.get(path).unwrap();
-                let mut iter = sst.iter()?;
-
-                while iter.is_valid() && iter.key() < prefix {
-                    iter.next();
-                }
-
-                while iter.is_valid() {
-                    if !iter.key().starts_with(prefix) {
-                        break;
-                    }
-                    let key = iter.key().to_vec();
-                    let value = iter.value().to_vec();
-                    let seq = iter.seq_no();
-                    let kind = iter.kind();
-
-                    if is_visible(seq) {
-                        let should_update = match seen.get(&key) {
-                            Some((_, existing_seq, _)) => seq > *existing_seq,
-                            None => true,
-                        };
-                        if should_update {
-                            seen.insert(key, (value, seq, kind));
-                        }
-                    }
-
-                    iter.next();
+                if let Some(sst) = ws.sst_cache.get(path) {
+                    handles.push(Arc::clone(sst));
+                } else {
+                    let sst = Arc::new(SsTable::open(path)?);
+                    ws.sst_cache.insert(path.to_path_buf(), Arc::clone(&sst));
+                    handles.push(sst);
                 }
             }
+            handles
+        };
 
-            // 2. Scan immutable MemTable (overrides SSTables)
+        // Step 2: Scan SSTables OUTSIDE the lock (I/O-heavy)
+        for sst in &sst_handles {
+            let mut iter = sst.iter()?;
+
+            while iter.is_valid() && iter.key() < prefix {
+                iter.next();
+            }
+
+            while iter.is_valid() {
+                if !iter.key().starts_with(prefix) {
+                    break;
+                }
+                let key = iter.key().to_vec();
+                let value = iter.value().to_vec();
+                let seq = iter.seq_no();
+                let kind = iter.kind();
+
+                if is_visible(seq) {
+                    let should_update = match seen.get(&key) {
+                        Some((_, existing_seq, _)) => seq > *existing_seq,
+                        None => true,
+                    };
+                    if should_update {
+                        seen.insert(key, (value, seq, kind));
+                    }
+                }
+
+                iter.next();
+            }
+        }
+
+        // Step 3: Scan MemTables (brief lock — in-memory, fast)
+        {
+            let ws = self.write_state.lock().unwrap();
+
+            // Scan immutable MemTable (overrides SSTables)
             if let Some(ref imm) = ws.immutable_memtable {
                 for entry in imm.entries() {
                     if !entry.key.starts_with(prefix) {
@@ -436,7 +458,7 @@ impl LsmEngine {
                 }
             }
 
-            // 3. Scan active MemTable (overrides everything)
+            // Scan active MemTable (overrides everything)
             for entry in ws.memtable.entries() {
                 if !entry.key.starts_with(prefix) {
                     continue;
@@ -1047,13 +1069,24 @@ impl LsmEngine {
             cands
         };
 
-        let mut ws = self.write_state.lock().unwrap();
-        for path in &candidates {
-            if !ws.sst_cache.contains_key(path) {
-                let sst = SsTable::open(path)?;
-                ws.sst_cache.insert(path.to_path_buf(), sst);
+        // Snapshot SST handles from cache (brief lock)
+        let sst_handles: Vec<Arc<SsTable>> = {
+            let mut ws = self.write_state.lock().unwrap();
+            let mut handles = Vec::with_capacity(candidates.len());
+            for path in &candidates {
+                if let Some(sst) = ws.sst_cache.get(path) {
+                    handles.push(Arc::clone(sst));
+                } else {
+                    let sst = Arc::new(SsTable::open(path)?);
+                    ws.sst_cache.insert(path.to_path_buf(), Arc::clone(&sst));
+                    handles.push(sst);
+                }
             }
-            let sst = ws.sst_cache.get(path).unwrap();
+            handles
+        };
+
+        // Iterate outside the lock
+        for sst in &sst_handles {
             match sst.get_full(key)? {
                 Some((value, seq, kind)) if vis.is_visible(seq) => {
                     if kind == EntryKind::Delete {
