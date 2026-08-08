@@ -256,6 +256,9 @@ pub struct QueryExecutor {
     /// Graph store for unified entity anchor (relational ↔ graph sync).
     /// Optional for backward compatibility.
     graph: Option<Arc<onto_graph::GraphStore>>,
+    /// Triple store for persistent RDF triples (SPO/POS/OSP indexes).
+    /// Optional for backward compatibility.
+    triple_store: Option<Arc<onto_ontology::TripleStore>>,
     /// Query planner for optimization (wrapped for interior mutability).
     planner: std::sync::RwLock<QueryPlanner>,
     /// Query result cache.
@@ -354,6 +357,7 @@ impl QueryExecutor {
             engine,
             ontology_store,
             graph: None,
+            triple_store: None,
             planner: std::sync::RwLock::new(QueryPlanner::new()),
             query_cache: Arc::new(Mutex::new(QueryCache::new(1000, Duration::from_secs(60)))),
             plan_cache: Arc::new(Mutex::new(PlanCache::new(500))),
@@ -368,6 +372,12 @@ impl QueryExecutor {
     /// Set the graph store for unified entity anchor (relational ↔ graph sync).
     pub fn with_graph(mut self, graph: Arc<onto_graph::GraphStore>) -> Self {
         self.graph = Some(graph);
+        self
+    }
+
+    /// Set the triple store for persistent RDF triples.
+    pub fn with_triple_store(mut self, triple_store: Arc<onto_ontology::TripleStore>) -> Self {
+        self.triple_store = Some(triple_store);
         self
     }
 
@@ -4575,6 +4585,25 @@ impl QueryExecutor {
         if let Some(ref graph) = self.graph {
             if let Some(entity_id) = onto_core::EntityId::from_lsm_key(&key) {
                 let _ = graph.upsert_vertex_from_entity(&entity_id, &[class.to_string()]);
+            }
+        }
+
+        // Persist triples to triple store
+        if let Some(ref triple_store) = self.triple_store {
+            if let Ok(pk) = std::str::from_utf8(&key) {
+                // (entity, rdf:type, class)
+                let _ = triple_store.add_triple(pk, "rdf:type", class);
+                // (entity, prop, value) for each column
+                for (col, val) in columns.iter().zip(values.iter()) {
+                    let json_val = self.literal_to_json(val);
+                    if let Some(s) = json_val.as_str() {
+                        let _ = triple_store.add_triple(pk, col, s);
+                    } else if let Some(n) = json_val.as_number() {
+                        let _ = triple_store.add_triple(pk, col, &n.to_string());
+                    } else if let Some(b) = json_val.as_bool() {
+                        let _ = triple_store.add_triple(pk, col, &b.to_string());
+                    }
+                }
             }
         }
 

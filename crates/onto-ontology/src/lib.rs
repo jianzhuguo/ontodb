@@ -8,6 +8,7 @@ pub mod rdf;
 pub mod reasoner;
 pub mod rules;
 pub mod store;
+pub mod triple_store;
 
 pub use model::{
     AssertionValue, Class, ClassType, DataType, Individual, Literal, Ontology, Property,
@@ -18,3 +19,4 @@ pub use rdf::{RdfError, RdfTerm, RdfTriple, TurtleParser, to_jsonld, to_ntriples
 pub use reasoner::{DerivationStep, InferenceError, Reasoner, ReasoningResult};
 pub use rules::{Rule, RuleId};
 pub use store::OntologyStore;
+pub use triple_store::TripleStore;

@@ -178,9 +178,11 @@ fn main() -> Result<()> {
     let engine = Arc::new(LsmEngine::open(options)?);
     let ontology_store = OntologyStore::new(Arc::clone(&engine));
     let graph_store = Arc::new(onto_graph::GraphStore::new());
+    let triple_store = Arc::new(onto_ontology::TripleStore::new(Arc::clone(&engine)));
     let executor = Arc::new(
         QueryExecutor::new(Arc::clone(&engine), ontology_store)
             .with_graph(graph_store.clone())
+            .with_triple_store(triple_store)
     );
 
     if args.interactive {
