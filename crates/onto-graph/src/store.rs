@@ -150,7 +150,7 @@ impl GraphStore {
 
     /// Get a vertex by ID.
     pub fn get_vertex(&self, id: &str) -> Option<Vertex> {
-        self.vertices.write().get(id).cloned()
+        self.vertices.read().get(id).cloned()
     }
 
     /// Update vertex properties.
@@ -259,21 +259,21 @@ impl GraphStore {
 
     /// Get vertices by label.
     pub fn get_vertices_by_label(&self, label: &str) -> Vec<Vertex> {
-        let idx = self.label_index.write();
-        let verts = self.vertices.write();
+        // Collect IDs under label_index lock, then release before acquiring vertices lock
+        let ids: Vec<String> = {
+            let idx = self.label_index.read();
+            idx.get(label).cloned().unwrap_or_default().into_iter().collect()
+        };
 
-        idx.get(label)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| verts.get(id).cloned())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let verts = self.vertices.read();
+        ids.iter()
+            .filter_map(|id| verts.get(id).cloned())
+            .collect()
     }
 
     /// Get all vertices.
     pub fn get_all_vertices(&self) -> Vec<Vertex> {
-        self.vertices.write().values().cloned().collect()
+        self.vertices.read().values().cloned().collect()
     }
 
     // ── Edge CRUD ────────────────────────────────────────────────
@@ -282,7 +282,7 @@ impl GraphStore {
     pub fn add_edge(&self, edge: Edge) -> Result<(), GraphError> {
         // Verify source and target exist
         {
-            let verts = self.vertices.write();
+            let verts = self.vertices.read();
             if !verts.contains_key(&edge.from) {
                 return Err(GraphError::VertexNotFound(edge.from.clone()));
             }
@@ -335,7 +335,7 @@ impl GraphStore {
 
     /// Get an edge by ID.
     pub fn get_edge(&self, id: &str) -> Option<Edge> {
-        self.edges.write().get(id).cloned()
+        self.edges.read().get(id).cloned()
     }
 
     /// Update edge properties.
@@ -427,17 +427,17 @@ impl GraphStore {
 
     /// Get vertex count.
     pub fn vertex_count(&self) -> usize {
-        self.vertices.write().len()
+        self.vertices.read().len()
     }
 
     /// Get edge count.
     pub fn edge_count(&self) -> usize {
-        self.edges.write().len()
+        self.edges.read().len()
     }
 
     /// Get average degree.
     pub fn avg_degree(&self) -> f64 {
-        let out = self.out_edges.write();
+        let out = self.out_edges.read();
         if out.is_empty() {
             return 0.0;
         }
@@ -447,22 +447,22 @@ impl GraphStore {
 
     /// Get integer index for a vertex ID.
     pub fn get_idx(&self, id: &str) -> Option<u32> {
-        self.id_to_idx.write().get(id).copied()
+        self.id_to_idx.read().get(id).copied()
     }
 
     /// Get vertex ID from integer index.
     pub fn get_id(&self, idx: u32) -> Option<String> {
-        self.idx_to_id.write().get(idx as usize).cloned()
+        self.idx_to_id.read().get(idx as usize).cloned()
     }
 
     /// Get outgoing neighbors using integer indices (fast path).
     pub fn get_out_neighbors_idx(&self, idx: u32) -> Vec<(u32, u32)> {
-        self.adj_out.write().get(idx as usize).cloned().unwrap_or_default()
+        self.adj_out.read().get(idx as usize).cloned().unwrap_or_default()
     }
 
     /// Get incoming neighbors using integer indices (fast path).
     pub fn get_in_neighbors_idx(&self, idx: u32) -> Vec<(u32, u32)> {
-        self.adj_in.write().get(idx as usize).cloned().unwrap_or_default()
+        self.adj_in.read().get(idx as usize).cloned().unwrap_or_default()
     }
 
     /// Fast BFS using integer indices (no string allocations during traversal).
@@ -472,7 +472,7 @@ impl GraphStore {
         max_depth: usize,
         direction: Direction,
     ) -> Vec<u32> {
-        let num_nodes = self.idx_to_id.write().len();
+        let num_nodes = self.idx_to_id.read().len();
         if start_idx as usize >= num_nodes {
             return Vec::new();
         }
@@ -519,7 +519,7 @@ impl GraphStore {
         max_depth: usize,
         direction: Direction,
     ) -> (Vec<u32>, Vec<Option<u32>>) {
-        let num_nodes = self.idx_to_id.write().len();
+        let num_nodes = self.idx_to_id.read().len();
         if start_idx as usize >= num_nodes {
             return (Vec::new(), vec![None; num_nodes]);
         }
@@ -591,8 +591,8 @@ impl GraphStore {
 
     /// Export graph data to JSON for persistence.
     pub fn export_json(&self) -> String {
-        let vertices: Vec<Vertex> = self.vertices.write().values().cloned().collect();
-        let edges: Vec<Edge> = self.edges.write().values().cloned().collect();
+        let vertices: Vec<Vertex> = self.vertices.read().values().cloned().collect();
+        let edges: Vec<Edge> = self.edges.read().values().cloned().collect();
 
         serde_json::to_string(&serde_json::json!({
             "vertices": vertices,
