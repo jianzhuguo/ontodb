@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "vector_recall"
 harness = false
+
+[[bench]]
+name = "batch_import"
+harness = false
