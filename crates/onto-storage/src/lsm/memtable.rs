@@ -85,14 +85,13 @@ impl MemTable {
         };
 
         let composite = entry.composite_key();
-        // Subtract old entry size if overwriting
-        if let Some(old) = self.data.get(&composite) {
-            self.size = self.size.saturating_sub(old.key.len() + old.value.len() + 16);
+        let size_delta = key.len() + value.len() + 16;
+        // insert() returns the old value if key existed
+        if let Some(old) = self.data.insert(composite, entry) {
+            let old_delta = old.key.len() + old.value.len() + 16;
+            self.size = self.size.saturating_sub(old_delta);
         }
-        let size_delta = key.len() + value.len() + 16; // key + value + overhead
         self.size += size_delta;
-
-        self.data.insert(composite, entry);
 
         seq_no
     }
@@ -104,13 +103,6 @@ impl MemTable {
         composite.extend_from_slice(&key);
         composite.extend_from_slice(&(!seq_no).to_be_bytes());
 
-        // Subtract old entry size if overwriting
-        if let Some(old) = self.data.get(&composite) {
-            self.size = self.size.saturating_sub(old.key.len() + old.value.len() + 16);
-        }
-        let size_delta = key.len() + value.len() + 16;
-        self.size += size_delta;
-
         let entry = MemTableEntry {
             key,
             value,
@@ -118,7 +110,14 @@ impl MemTable {
             kind: EntryKind::Put,
         };
 
-        self.data.insert(composite, entry);
+        // insert() returns the old value if key existed — use it to update size atomically
+        let size_delta = entry.key.len() + entry.value.len() + 16;
+        if let Some(old) = self.data.insert(composite, entry) {
+            // Overwrite: subtract old size, add new size (net = size_delta - old_delta)
+            let old_delta = old.key.len() + old.value.len() + 16;
+            self.size = self.size.saturating_sub(old_delta);
+        }
+        self.size += size_delta;
 
         // Keep next_seq_no in sync
         if seq_no >= self.next_seq_no {

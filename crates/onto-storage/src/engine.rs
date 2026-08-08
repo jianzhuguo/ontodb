@@ -34,9 +34,9 @@ fn parse_doc_bytes(bytes: &[u8]) -> Option<serde_json::Map<String, serde_json::V
 }
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
-use parking_lot::{Mutex, RwLock as FairRwLock};
+use parking_lot::RwLock as FairRwLock;
 
 /// Mutable write-path state, protected by RwLock for concurrent read access.
 ///
@@ -101,7 +101,7 @@ pub struct LsmEngine {
 
     /// Channel to receive compaction notifications (for cache invalidation).
     /// Wrapped in Mutex because mpsc::Receiver is not Sync.
-    compaction_notif_receiver: Mutex<mpsc::Receiver<CompactionNotification>>,
+    compaction_notif_receiver: std::sync::Mutex<mpsc::Receiver<CompactionNotification>>,
 
     /// Fast flag: set by the notification drain when a compaction notification arrives.
     /// Cleared after the sst_cache is invalidated.
@@ -310,7 +310,7 @@ impl LsmEngine {
 
         // 1. Collect candidate SST paths from levels (brief lock).
         let candidates = {
-            let levels = self.levels.lock();
+            let levels = self.levels.lock().unwrap();
             let mut cands = Vec::new();
             for level in levels.iter() {
                 for sst_info in level.iter().rev() {
@@ -338,7 +338,7 @@ impl LsmEngine {
 
         // 3. Snapshot SST handles from cache (may lazily open files).
         let sst_handles: Vec<Arc<SsTable>> = {
-            let mut cache = self.sst_cache.lock();
+            let mut cache = self.sst_cache.lock().unwrap();
             candidates.iter().filter_map(|path| {
                 if !cache.contains_key(path) {
                     let sst = SsTable::open(path).ok()?;
@@ -392,7 +392,7 @@ impl LsmEngine {
 
         // Collect SSTable paths under lock, then release
         let sst_paths: Vec<PathBuf> = {
-            let levels = self.levels.lock();
+            let levels = self.levels.lock().unwrap();
             let mut paths = Vec::new();
             for level in levels.iter().rev() {
                 for sst_info in level.iter() {
@@ -414,7 +414,7 @@ impl LsmEngine {
 
         // Step 1: Snapshot SST handles from cache (brief lock — open missing files outside)
         let sst_handles: Vec<Arc<SsTable>> = {
-            let mut cache = self.sst_cache.lock();
+            let mut cache = self.sst_cache.lock().unwrap();
             let mut handles = Vec::with_capacity(sst_paths.len());
             for path in &sst_paths {
                 if let Some(sst) = cache.get(path) {
@@ -610,7 +610,7 @@ impl LsmEngine {
         // Step 3: Add to shared levels (brief lock)
         let metadata = fs::metadata(&sst_path)?;
         {
-            let mut levels = self.levels.lock();
+            let mut levels = self.levels.lock().unwrap();
             levels[0].push(SsTableInfo {
                 path: sst_path.clone(),
                 size: metadata.len(),
@@ -625,7 +625,7 @@ impl LsmEngine {
         // immutable MT cleared and the next lazy SST open.
         let new_sst = SsTable::open(&sst_path)?;
         {
-            self.sst_cache.lock().insert(sst_path, Arc::new(new_sst));
+            self.sst_cache.lock().unwrap().insert(sst_path, Arc::new(new_sst));
         }
         {
             let mut ws = self.write_state.write();
@@ -654,7 +654,7 @@ impl LsmEngine {
         // Drain notifications under the receiver lock only (NOT holding write_state).
         let mut evicted_paths: Vec<PathBuf> = Vec::new();
         {
-            let receiver = self.compaction_notif_receiver.lock();
+            let receiver = self.compaction_notif_receiver.lock().unwrap();
             while let Ok(notif) = receiver.try_recv() {
                 match notif {
                     CompactionNotification::Compacted { evicted_paths: paths } => {
@@ -667,7 +667,7 @@ impl LsmEngine {
 
         // Selectively remove only the evicted SST paths from the cache.
         if !evicted_paths.is_empty() {
-            let mut cache = self.sst_cache.lock();
+            let mut cache = self.sst_cache.lock().unwrap();
             for path in &evicted_paths {
                 cache.remove(path);
             }
@@ -684,7 +684,7 @@ impl LsmEngine {
         self.drain_compaction_notifications();
 
         let _ = self.compaction_sender.send(CompactionMsg::FlushAndNotify);
-        let receiver = self.compaction_notif_receiver.lock();
+        let receiver = self.compaction_notif_receiver.lock().unwrap();
         let mut evicted_paths: Vec<PathBuf> = Vec::new();
         loop {
             match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
@@ -701,7 +701,7 @@ impl LsmEngine {
         }
         drop(receiver);
         if !evicted_paths.is_empty() {
-            let mut cache = self.sst_cache.lock();
+            let mut cache = self.sst_cache.lock().unwrap();
             for path in &evicted_paths {
                 cache.remove(path);
             }
@@ -860,7 +860,7 @@ impl LsmEngine {
         // ── Phase 1: Take writes, assign sequence numbers, read old values ──
         // Snapshot SST cache BEFORE acquiring write_state lock to avoid nested lock deadlock.
         let sst_cache_snapshot: HashMap<PathBuf, Arc<SsTable>> = {
-            let cache = self.sst_cache.lock();
+            let cache = self.sst_cache.lock().unwrap();
             cache.clone()
         };
 
@@ -1149,7 +1149,7 @@ impl LsmEngine {
 
         // Check SSTables (newest to oldest)
         let candidates: Vec<PathBuf> = {
-            let levels = self.levels.lock();
+            let levels = self.levels.lock().unwrap();
             let mut cands = Vec::new();
             for level in levels.iter() {
                 for sst_info in level.iter().rev() {
@@ -1164,7 +1164,7 @@ impl LsmEngine {
 
         // Snapshot SST handles from cache (brief lock)
         let sst_handles: Vec<Arc<SsTable>> = {
-            let mut cache = self.sst_cache.lock();
+            let mut cache = self.sst_cache.lock().unwrap();
             let mut handles = Vec::with_capacity(candidates.len());
             for path in &candidates {
                 if let Some(sst) = cache.get(path) {
@@ -1372,7 +1372,7 @@ impl LsmEngine {
     /// Returns engine statistics.
     pub fn stats(&self) -> EngineStats {
         let ws = self.write_state.read();
-        let levels = self.levels.lock();
+        let levels = self.levels.lock().unwrap();
         let total_sstables: usize = levels.iter().map(|l| l.len()).sum();
         let total_sst_size: u64 = levels
             .iter()
@@ -1424,7 +1424,7 @@ impl LsmEngine {
         };
 
         // Step 4: Copy SSTable files
-        let levels = self.levels.lock();
+        let levels = self.levels.lock().unwrap();
         let mut sst_paths: Vec<PathBuf> = Vec::new();
         for level in levels.iter() {
             for info in level.iter() {
@@ -1566,7 +1566,7 @@ impl LsmEngine {
         };
 
         // Copy only SSTables modified since the last backup
-        let levels = self.levels.lock();
+        let levels = self.levels.lock().unwrap();
         let mut sst_paths: Vec<PathBuf> = Vec::new();
         for level in levels.iter() {
             for info in level.iter() {
