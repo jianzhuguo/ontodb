@@ -5,6 +5,7 @@
 //! - TCP server (accepts multiple CLI connections)
 //! - HTTP server (RESTful API with auth, rate limiting, and Prometheus metrics)
 
+pub mod admin;
 mod auth;
 pub mod audit;
 mod http;
@@ -252,7 +253,14 @@ async fn run_http_server(
         }
     });
 
-    let app = http::build_router_with_auth(state, auth_state.clone(), rate_limiter);
+    // Admin API (requires Admin permission via existing auth middleware)
+    let admin_state = admin::AdminState {
+        auth: auth_state.clone(),
+        config_path: api_keys_file.clone(),
+        metrics: state.metrics.clone(),
+    };
+
+    let app = http::build_router_with_auth(state, auth_state.clone(), rate_limiter, admin_state);
 
     println!("HTTP API server listening on {}", addr);
     println!();

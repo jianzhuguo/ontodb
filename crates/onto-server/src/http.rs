@@ -7,7 +7,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use onto_query::{QueryAst, QueryExecutor, QueryParser};
@@ -225,8 +225,18 @@ pub fn build_router_with_auth(
     state: AppState,
     auth_state: crate::auth::AuthState,
     rate_limiter: crate::rate_limit::RateLimiter,
+    admin_state: crate::admin::AdminState,
 ) -> Router {
     use axum::middleware;
+
+    // Admin sub-router with its own state
+    let admin_routes = Router::new()
+        .route("/api/admin/keys", get(crate::admin::list_keys).post(crate::admin::add_key))
+        .route("/api/admin/keys/:key", put(crate::admin::update_key).delete(crate::admin::delete_key))
+        .route("/api/admin/keys/:key/ips", get(crate::admin::list_ips).post(crate::admin::add_ips))
+        .route("/api/admin/keys/:key/ips", delete(crate::admin::remove_ip))
+        .route("/api/admin/reload", post(crate::admin::force_reload))
+        .with_state(admin_state);
 
     Router::new()
         // Health check and metrics (no auth required)
@@ -259,6 +269,8 @@ pub fn build_router_with_auth(
         .route("/api/openapi.json", get(openapi_spec))
         .route("/console", get(web_console))
         .route("/", get(web_console))
+        // Merge admin routes (after main routes to avoid conflicts)
+        .merge(admin_routes)
         // Apply rate limiting middleware
         .layer(middleware::from_fn_with_state(
             rate_limiter,

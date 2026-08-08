@@ -489,7 +489,7 @@ pub struct KeyInfo {
 }
 
 /// Check if a client IP matches an allowed entry (exact match or CIDR).
-fn ip_matches(client_ip: &str, allowed: &str) -> bool {
+pub fn ip_matches(client_ip: &str, allowed: &str) -> bool {
     // Exact match
     if client_ip == allowed {
         return true;
