@@ -33,6 +33,9 @@ pub enum OntoRequest {
     Delete { key: Vec<u8> },
     /// Batch of operations.
     Batch { ops: Vec<OntoRequest> },
+    /// Configuration change (API keys + IP whitelist).
+    /// The full config JSON is replicated to all nodes via Raft log.
+    ConfigChange { config_json: Vec<u8> },
 }
 
 /// Response type from the Raft state machine.

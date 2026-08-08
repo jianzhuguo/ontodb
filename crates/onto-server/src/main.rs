@@ -253,11 +253,32 @@ async fn run_http_server(
         }
     });
 
+    // Shared config store for cross-node config sync (Raft integration)
+    let config_store = onto_raft::SharedConfigStore::new(api_keys_file.clone());
+    config_store.load_from_disk();
+
+    // Register callback: when config changes, reload AuthState in-memory
+    let auth_for_callback = auth_state.clone();
+    config_store.on_change(Box::new(move |json_bytes: &[u8]| {
+        // Parse the new config
+        if let Ok(config) = serde_json::from_slice::<auth::AuthConfig>(json_bytes) {
+            // Update AuthState keys in-memory
+            let mut keys = std::collections::HashMap::new();
+            for k in &config.keys {
+                keys.insert(k.key.clone(), (k.description.clone(), k.permission.clone(), k.rate_limit, k.allowed_ips.clone()));
+            }
+            // AuthState uses parking_lot::RwLock, so we can update it directly
+            *auth_for_callback.keys.write() = keys;
+            tracing::info!("AuthState updated from config change ({} keys)", config.keys.len());
+        }
+    }));
+
     // Admin API (requires Admin permission via existing auth middleware)
     let admin_state = admin::AdminState {
         auth: auth_state.clone(),
         config_path: api_keys_file.clone(),
         metrics: state.metrics.clone(),
+        config_store: Some(config_store.clone()),
     };
 
     let app = http::build_router_with_auth(state, auth_state.clone(), rate_limiter, admin_state);

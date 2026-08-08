@@ -117,7 +117,7 @@ impl Default for IpWhitelistConfig {
 pub struct AuthState {
     /// Map of API key -> (description, permission, rate_limit, allowed_ips)
     /// Wrapped in RwLock for hot-reload without server restart.
-    keys: Arc<parking_lot::RwLock<HashMap<String, (String, Permission, Option<u32>, Option<Vec<String>>)>>>,
+    pub keys: Arc<parking_lot::RwLock<HashMap<String, (String, Permission, Option<u32>, Option<Vec<String>>)>>>,
     /// Whether auth is enabled.
     pub enabled: bool,
     /// Metrics counters for auth events.
@@ -229,6 +229,51 @@ impl AuthState {
         *self.last_modified.write() = Some(mod_time);
 
         eprintln!("Auth config reloaded from {} ({} keys)", path.display(), config.keys.len());
+        true
+    }
+
+    /// Force reload config from disk, ignoring modification time check.
+    /// Use this for the /api/admin/reload endpoint.
+    pub fn force_reload(&self) -> bool {
+        let path = match &self.config_path {
+            Some(p) => p.clone(),
+            None => return false,
+        };
+
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Auth force_reload failed to read {}: {}", path.display(), e);
+                return false;
+            }
+        };
+
+        let config: AuthConfig = match serde_json::from_str(&data) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Auth force_reload failed to parse {}: {}", path.display(), e);
+                return false;
+            }
+        };
+
+        let mut new_keys = HashMap::new();
+        for key_config in &config.keys {
+            new_keys.insert(
+                key_config.key.clone(),
+                (key_config.description.clone(), key_config.permission.clone(), key_config.rate_limit, key_config.allowed_ips.clone()),
+            );
+        }
+
+        *self.keys.write() = new_keys;
+
+        // Update modification time
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if let Ok(mod_time) = meta.modified() {
+                *self.last_modified.write() = Some(mod_time);
+            }
+        }
+
+        eprintln!("Auth config force-reloaded from {} ({} keys)", path.display(), config.keys.len());
         true
     }
 

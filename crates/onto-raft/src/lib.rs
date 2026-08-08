@@ -13,8 +13,10 @@ pub mod store;
 pub mod network;
 pub mod error;
 pub mod manager;
+pub mod config_sync;
 
 pub use types::OntoRaft;
 pub use store::OntoRaftStore;
 pub use error::RaftError;
 pub use manager::RaftNodeManager;
+pub use config_sync::{SharedConfigStore, ConfigChangeResult};

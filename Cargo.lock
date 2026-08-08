@@ -1136,6 +1136,7 @@ dependencies = [
  "onto-core",
  "onto-storage",
  "openraft",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",

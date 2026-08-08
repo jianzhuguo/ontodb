@@ -73,6 +73,11 @@ impl OntoRaftStore {
                 }
                 OntoResponse::Success(Some(format!("{} ops applied", count)))
             }
+            OntoRequest::ConfigChange { config_json } => {
+                // Store config in the KV store under a reserved key
+                self.sm_data.insert(b"__config__".to_vec(), config_json);
+                OntoResponse::Success(Some("config applied".to_string()))
+            }
         }
     }
 }

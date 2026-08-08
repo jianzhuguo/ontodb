@@ -1,4 +1,4 @@
-﻿//! Admin API for managing API keys and IP whitelists at runtime.
+//! Admin API for managing API keys and IP whitelists at runtime.
 //!
 //! Endpoints (require Admin permission):
 //! - GET    /api/admin/keys              鈥?List all API keys (masked)
@@ -23,12 +23,15 @@ use serde_json::json;
 use crate::auth::{AuthConfig, AuthState, Permission};
 use crate::metrics::SharedMetrics;
 
-/// Admin API state 鈥?holds references to auth config file and auth state.
+/// Admin API state — holds references to auth config file and auth state.
 #[derive(Clone)]
 pub struct AdminState {
     pub auth: AuthState,
     pub config_path: Option<PathBuf>,
     pub metrics: SharedMetrics,
+    /// Shared config store for cross-node sync (Raft integration).
+    /// When set, config changes are replicated via Raft log.
+    pub config_store: Option<onto_raft::SharedConfigStore>,
 }
 
 /// Request body for creating/updating an API key.
@@ -310,7 +313,8 @@ pub async fn remove_ip(
 pub async fn force_reload(
     axum::extract::State(state): axum::extract::State<AdminState>,
 ) -> impl IntoResponse {
-    let changed = state.auth.reload();
+    // Use force_reload to bypass modification time check
+    let changed = state.auth.force_reload();
     audit_log(&state, "force_reload", &format!("changed={}", changed));
     (StatusCode::OK, Json(json!({"success": true, "config_changed": changed})))
 }
@@ -324,9 +328,19 @@ fn load_config(state: &AdminState) -> Result<AuthConfig, String> {
 }
 
 fn save_config(state: &AdminState, config: &AuthConfig) -> Result<(), String> {
-    let path = state.config_path.as_ref().ok_or("no config file path configured")?;
     let json = serde_json::to_string_pretty(config).map_err(|e| format!("serialization error: {}", e))?;
-    std::fs::write(path, json).map_err(|e| format!("failed to write config: {}", e))
+
+    // If SharedConfigStore is available, use it (handles disk + Raft replication)
+    if let Some(ref store) = state.config_store {
+        store.apply(json.as_bytes())?;
+        tracing::info!("Config saved via SharedConfigStore (Raft replication if active)");
+    } else {
+        // Fallback: direct file write
+        let path = state.config_path.as_ref().ok_or("no config file path configured")?;
+        std::fs::write(path, &json).map_err(|e| format!("failed to write config: {}", e))?;
+    }
+
+    Ok(())
 }
 
 fn apply_config_to_state(state: &AdminState, config: &AuthConfig) {

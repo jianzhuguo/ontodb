@@ -28,6 +28,9 @@ pub struct OntoStateMachine {
 
     /// Snapshot bytes (latest).
     snapshot: Option<Vec<u8>>,
+
+    /// Shared config store for cross-node config synchronization.
+    pub config_store: Option<crate::config_sync::SharedConfigStore>,
 }
 
 impl OntoStateMachine {
@@ -37,7 +40,14 @@ impl OntoStateMachine {
             last_applied: None,
             last_membership: StoredMembership::default(),
             snapshot: None,
+            config_store: None,
         }
+    }
+
+    /// Set the shared config store for config sync.
+    pub fn with_config_store(mut self, store: crate::config_sync::SharedConfigStore) -> Self {
+        self.config_store = Some(store);
+        self
     }
 
     /// Apply a single request to the state machine.
@@ -56,13 +66,25 @@ impl OntoStateMachine {
                 for op in ops {
                     responses.push(self.apply_request(op));
                 }
-                // Check if any op failed
                 for resp in &responses {
                     if matches!(resp, OntoResponse::Error(_)) {
                         return resp.clone();
                     }
                 }
                 OntoResponse::Success(Some(format!("{} operations applied", responses.len())))
+            }
+            OntoRequest::ConfigChange { config_json } => {
+                // Apply config change to the shared config store
+                if let Some(ref store) = self.config_store {
+                    match store.apply(&config_json) {
+                        Ok(()) => OntoResponse::Success(Some("config applied via Raft".to_string())),
+                        Err(e) => OntoResponse::Error(e),
+                    }
+                } else {
+                    // No config store — just store the raw JSON
+                    self.data.insert(b"__config__".to_vec(), config_json);
+                    OntoResponse::Success(Some("config stored (no shared store)".to_string()))
+                }
             }
         }
     }
