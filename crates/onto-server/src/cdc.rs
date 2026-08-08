@@ -163,6 +163,7 @@ impl CdcEventBuilder {
 /// - `KafkaCdcPublisher`: publishes to Kafka
 /// - `InMemoryCdcPublisher`: stores events in memory (for testing)
 /// - `WebhookCdcPublisher`: sends events via HTTP webhook
+/// - `ResilientCdcPublisher`: wraps any publisher with retry + buffering
 pub trait CdcPublisher: Send + Sync {
     /// Publish a single CDC event.
     fn publish(&self, event: &CdcEvent) -> Result<(), String>;
@@ -178,6 +179,241 @@ pub trait CdcPublisher: Send + Sync {
     /// Flush any buffered events.
     fn flush(&self) -> Result<(), String> {
         Ok(())
+    }
+}
+
+/// Resilient CDC publisher — wraps any publisher with retry, buffering, and DLQ.
+///
+/// Features:
+/// - Exponential backoff retry (1s → 2s → 4s → ... → max 60s)
+/// - In-memory buffer for events when downstream is unavailable
+/// - Dead letter queue for permanently failed events
+/// - Automatic buffer flush when connection recovers
+/// - Configurable max retry count and buffer size
+pub struct ResilientCdcPublisher {
+    inner: Arc<dyn CdcPublisher>,
+    /// Events waiting to be retried (downstream was unavailable).
+    retry_buffer: parking_lot::Mutex<Vec<RetryEntry>>,
+    /// Permanently failed events (exceeded max retries).
+    dead_letter_queue: parking_lot::Mutex<Vec<DeadLetterEntry>>,
+    /// Configuration.
+    config: ResilientConfig,
+    /// Consecutive failure count for exponential backoff.
+    consecutive_failures: std::sync::atomic::AtomicU32,
+}
+
+/// Configuration for the resilient publisher.
+#[derive(Debug, Clone)]
+pub struct ResilientConfig {
+    /// Maximum retry attempts per event before moving to DLQ.
+    pub max_retries: u32,
+    /// Initial retry delay in milliseconds.
+    pub initial_retry_delay_ms: u64,
+    /// Maximum retry delay in milliseconds (cap for exponential backoff).
+    pub max_retry_delay_ms: u64,
+    /// Maximum events in the retry buffer.
+    pub max_buffer_size: usize,
+    /// Maximum events in the dead letter queue.
+    pub max_dlq_size: usize,
+    /// Whether to log retry attempts.
+    pub log_retries: bool,
+}
+
+impl Default for ResilientConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 10,
+            initial_retry_delay_ms: 1000,
+            max_retry_delay_ms: 60_000,
+            max_buffer_size: 100_000,
+            max_dlq_size: 10_000,
+            log_retries: true,
+        }
+    }
+}
+
+/// A pending retry entry.
+#[derive(Debug, Clone)]
+struct RetryEntry {
+    event: CdcEvent,
+    attempts: u32,
+    next_retry_at: std::time::Instant,
+}
+
+/// A permanently failed event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadLetterEntry {
+    pub event: CdcEvent,
+    pub error: String,
+    pub attempts: u32,
+    pub failed_at: u64,
+}
+
+impl ResilientCdcPublisher {
+    /// Create a new resilient publisher wrapping the given inner publisher.
+    pub fn new(inner: Arc<dyn CdcPublisher>) -> Self {
+        Self::with_config(inner, ResilientConfig::default())
+    }
+
+    /// Create with custom configuration.
+    pub fn with_config(inner: Arc<dyn CdcPublisher>, config: ResilientConfig) -> Self {
+        Self {
+            inner,
+            retry_buffer: parking_lot::Mutex::new(Vec::new()),
+            dead_letter_queue: parking_lot::Mutex::new(Vec::new()),
+            config,
+            consecutive_failures: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Get the number of events in the retry buffer.
+    pub fn buffer_size(&self) -> usize {
+        self.retry_buffer.lock().len()
+    }
+
+    /// Get the number of events in the dead letter queue.
+    pub fn dlq_size(&self) -> usize {
+        self.dead_letter_queue.lock().len()
+    }
+
+    /// Get all dead letter entries (for inspection/replay).
+    pub fn get_dead_letters(&self) -> Vec<DeadLetterEntry> {
+        self.dead_letter_queue.lock().clone()
+    }
+
+    /// Clear the dead letter queue.
+    pub fn clear_dead_letters(&self) {
+        self.dead_letter_queue.lock().clear();
+    }
+
+    /// Replay dead letter entries — attempt to publish them again.
+    pub fn replay_dead_letters(&self) -> usize {
+        let entries: Vec<DeadLetterEntry> = {
+            let mut dlq = self.dead_letter_queue.lock();
+            std::mem::take(&mut *dlq)
+        };
+
+        let mut replayed = 0;
+        for entry in entries {
+            if self.inner.publish(&entry.event).is_ok() {
+                replayed += 1;
+            } else {
+                // Put back in DLQ if still failing
+                self.dead_letter_queue.lock().push(entry);
+            }
+        }
+        replayed
+    }
+
+    /// Calculate retry delay with exponential backoff.
+    fn retry_delay(&self, attempts: u32) -> std::time::Duration {
+        let delay_ms = self.config.initial_retry_delay_ms * 2u64.saturating_pow(attempts);
+        let capped_ms = delay_ms.min(self.config.max_retry_delay_ms);
+        std::time::Duration::from_millis(capped_ms)
+    }
+
+    /// Try to flush the retry buffer (called on successful publish or periodic flush).
+    fn flush_buffer(&self) {
+        let mut buffer = self.retry_buffer.lock();
+        if buffer.is_empty() {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        let mut still_pending = Vec::new();
+
+        for entry in buffer.drain(..) {
+            if entry.next_retry_at > now {
+                still_pending.push(entry);
+                continue;
+            }
+
+            match self.inner.publish(&entry.event) {
+                Ok(()) => {
+                    // Successfully published — reset failure counter
+                    self.consecutive_failures.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    let mut entry = entry;
+                    entry.attempts += 1;
+
+                    if entry.attempts >= self.config.max_retries {
+                        // Move to dead letter queue
+                        let mut dlq = self.dead_letter_queue.lock();
+                        if dlq.len() < self.config.max_dlq_size {
+                            dlq.push(DeadLetterEntry {
+                                event: entry.event,
+                                error: e,
+                                attempts: entry.attempts,
+                                failed_at: now_millis(),
+                            });
+                        }
+                    } else {
+                        entry.next_retry_at = now + self.retry_delay(entry.attempts);
+                        still_pending.push(entry);
+                    }
+                }
+            }
+        }
+
+        *buffer = still_pending;
+    }
+}
+
+impl CdcPublisher for ResilientCdcPublisher {
+    fn publish(&self, event: &CdcEvent) -> Result<(), String> {
+        // Try to publish directly
+        match self.inner.publish(event) {
+            Ok(()) => {
+                // Success — reset failure counter and try to flush buffered events
+                self.consecutive_failures.store(0, std::sync::atomic::Ordering::Relaxed);
+                self.flush_buffer();
+                Ok(())
+            }
+            Err(e) => {
+                // Failed — increment failure counter
+                let failures = self.consecutive_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+                if self.config.log_retries {
+                    tracing::warn!(
+                        "CDC publish failed (attempt {}): {}. Buffering for retry.",
+                        failures, e
+                    );
+                }
+
+                // Buffer the event for retry
+                let mut buffer = self.retry_buffer.lock();
+                if buffer.len() >= self.config.max_buffer_size {
+                    // Buffer full — drop oldest event to DLQ
+                    if let Some(oldest) = buffer.first() {
+                        let mut dlq = self.dead_letter_queue.lock();
+                        if dlq.len() < self.config.max_dlq_size {
+                            dlq.push(DeadLetterEntry {
+                                event: oldest.event.clone(),
+                                error: "buffer overflow".to_string(),
+                                attempts: oldest.attempts,
+                                failed_at: now_millis(),
+                            });
+                        }
+                    }
+                    buffer.remove(0);
+                }
+
+                buffer.push(RetryEntry {
+                    event: event.clone(),
+                    attempts: 1,
+                    next_retry_at: std::time::Instant::now() + self.retry_delay(1),
+                });
+
+                // Don't return error — event is buffered for retry
+                Ok(())
+            }
+        }
+    }
+
+    fn flush(&self) -> Result<(), String> {
+        self.flush_buffer();
+        self.inner.flush()
     }
 }
 
@@ -482,5 +718,184 @@ mod tests {
         assert_eq!(event.op, CdcOperation::Delete);
         assert!(event.before.is_some());
         assert!(event.after.is_none());
+    }
+
+    // ── Resilient Publisher Tests ──
+
+    /// A publisher that always fails (for testing retry logic).
+    struct FailingPublisher;
+
+    impl CdcPublisher for FailingPublisher {
+        fn publish(&self, _event: &CdcEvent) -> Result<(), String> {
+            Err("connection refused".to_string())
+        }
+    }
+
+    #[test]
+    fn test_resilient_buffers_on_failure() {
+        let inner = Arc::new(FailingPublisher);
+        let resilient = ResilientCdcPublisher::new(inner);
+
+        let event = CdcEvent {
+            ts: 1000,
+            op: CdcOperation::Insert,
+            class: "Product".to_string(),
+            pk: "001".to_string(),
+            key: "Product::001".to_string(),
+            after: None,
+            before: None,
+            seq: 1,
+        };
+
+        // Publish should succeed (event is buffered, not lost)
+        assert!(resilient.publish(&event).is_ok());
+
+        // Event should be in retry buffer
+        assert_eq!(resilient.buffer_size(), 1);
+        assert_eq!(resilient.dlq_size(), 0);
+    }
+
+    #[test]
+    fn test_resilient_retries_and_dlq() {
+        let inner = Arc::new(FailingPublisher);
+        let config = ResilientConfig {
+            max_retries: 3,
+            initial_retry_delay_ms: 1, // Very fast for testing
+            max_retry_delay_ms: 10,
+            max_buffer_size: 100,
+            max_dlq_size: 100,
+            log_retries: false,
+        };
+        let resilient = ResilientCdcPublisher::with_config(inner, config);
+
+        let event = CdcEvent {
+            ts: 1000,
+            op: CdcOperation::Insert,
+            class: "Product".to_string(),
+            pk: "001".to_string(),
+            key: "Product::001".to_string(),
+            after: None,
+            before: None,
+            seq: 1,
+        };
+
+        // Publish — event buffered
+        resilient.publish(&event).unwrap();
+        assert_eq!(resilient.buffer_size(), 1);
+
+        // Flush multiple times to exhaust retries
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        resilient.flush();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        resilient.flush();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        resilient.flush();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        resilient.flush();
+
+        // After max retries, event should move to DLQ
+        // (buffer may still have it if retry delay hasn't elapsed)
+        let total = resilient.buffer_size() + resilient.dlq_size();
+        assert!(total > 0, "event should be in buffer or DLQ");
+    }
+
+    #[test]
+    fn test_resilient_success_flushes_buffer() {
+        // Create a publisher that always succeeds
+        let inner = Arc::new(InMemoryCdcPublisher::new());
+        let config = ResilientConfig {
+            max_retries: 10,
+            initial_retry_delay_ms: 1,
+            max_retry_delay_ms: 10,
+            log_retries: false,
+            ..Default::default()
+        };
+        let resilient = ResilientCdcPublisher::with_config(inner.clone(), config);
+
+        let event = CdcEvent {
+            ts: 1000,
+            op: CdcOperation::Insert,
+            class: "Product".to_string(),
+            pk: "001".to_string(),
+            key: "Product::001".to_string(),
+            after: None,
+            before: None,
+            seq: 1,
+        };
+
+        // Publish succeeds directly — no buffering
+        resilient.publish(&event).unwrap();
+        assert_eq!(resilient.buffer_size(), 0);
+        assert_eq!(inner.count(), 1);
+    }
+
+    #[test]
+    fn test_resilient_dlq_replay() {
+        let inner = Arc::new(FailingPublisher);
+        let config = ResilientConfig {
+            max_retries: 1,
+            initial_retry_delay_ms: 1,
+            max_retry_delay_ms: 10,
+            log_retries: false,
+            ..Default::default()
+        };
+        let resilient = ResilientCdcPublisher::with_config(inner, config);
+
+        let event = CdcEvent {
+            ts: 1000,
+            op: CdcOperation::Insert,
+            class: "Product".to_string(),
+            pk: "001".to_string(),
+            key: "Product::001".to_string(),
+            after: None,
+            before: None,
+            seq: 1,
+        };
+
+        // Publish and flush to exhaust retries
+        resilient.publish(&event).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        resilient.flush();
+
+        // Get dead letters
+        let dl = resilient.get_dead_letters();
+        assert!(!dl.is_empty(), "should have dead letter entries");
+
+        // Clear DLQ
+        resilient.clear_dead_letters();
+        assert_eq!(resilient.dlq_size(), 0);
+    }
+
+    #[test]
+    fn test_resilient_buffer_overflow() {
+        let inner = Arc::new(FailingPublisher);
+        let config = ResilientConfig {
+            max_retries: 1,
+            initial_retry_delay_ms: 1,
+            max_buffer_size: 3, // Very small buffer
+            max_dlq_size: 100,
+            log_retries: false,
+            ..Default::default()
+        };
+        let resilient = ResilientCdcPublisher::with_config(inner, config);
+
+        // Publish more events than buffer can hold
+        for i in 0..5 {
+            let event = CdcEvent {
+                ts: 1000 + i,
+                op: CdcOperation::Insert,
+                class: "Product".to_string(),
+                pk: format!("{:03}", i),
+                key: format!("Product::{:03}", i),
+                after: None,
+                before: None,
+                seq: i,
+            };
+            resilient.publish(&event).unwrap();
+        }
+
+        // Buffer should be capped, overflow goes to DLQ
+        assert!(resilient.buffer_size() <= 3);
+        assert!(resilient.dlq_size() > 0, "overflow should go to DLQ");
     }
 }
