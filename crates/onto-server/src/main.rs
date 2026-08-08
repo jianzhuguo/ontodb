@@ -89,6 +89,18 @@ struct Args {
     #[arg(long, env = "MYSQL_LISTEN")]
     mysql: Option<String>,
 
+    /// Enable CDC (Change Data Capture) and publish to Kafka
+    #[arg(long, env = "CDC_ENABLED")]
+    cdc_enabled: bool,
+
+    /// Kafka bootstrap servers for CDC (comma-separated)
+    #[arg(long, default_value = "localhost:9092", env = "CDC_KAFKA_BROKERS")]
+    cdc_kafka_brokers: String,
+
+    /// Kafka topic for CDC events
+    #[arg(long, default_value = "ontodb-cdc", env = "CDC_TOPIC")]
+    cdc_topic: String,
+
     /// Raft node ID for distributed replication
     #[arg(long, env = "RAFT_NODE_ID")]
     raft_node_id: Option<u64>,
