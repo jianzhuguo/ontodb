@@ -4,12 +4,15 @@
 //! - Storage key/value types
 //! - Error types
 //! - Core traits for storage engines
+//! - Unified entity identity (EntityId)
 
 pub mod binary_row;
+pub mod entity;
 pub mod error;
 pub mod types;
 pub mod value;
 
+pub use entity::EntityId;
 pub use error::{CoreError, Result};
 pub use types::{Bytes, Entry, EntryKind, Key, SeqNo, Timestamp, Value};
 pub use value::OntoValue;
