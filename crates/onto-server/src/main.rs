@@ -10,6 +10,7 @@ mod auth;
 pub mod audit;
 mod http;
 mod metrics;
+pub mod mysqlwire;
 pub mod pgwire;
 mod rate_limit;
 pub mod tls;
@@ -82,6 +83,10 @@ struct Args {
     /// PG wire protocol listen address (enables PostgreSQL compatibility)
     #[arg(long, env = "PGWIRE_LISTEN")]
     pgwire: Option<String>,
+
+    /// MySQL protocol listen address (enables MySQL compatibility)
+    #[arg(long, env = "MYSQL_LISTEN")]
+    mysql: Option<String>,
 
     /// Raft node ID for distributed replication
     #[arg(long, env = "RAFT_NODE_ID")]
@@ -224,6 +229,9 @@ fn main() -> Result<()> {
         let has_pgwire = args.pgwire.is_some();
         let pgwire_addr = args.pgwire.unwrap_or_default();
 
+        let has_mysql = args.mysql.is_some();
+        let mysql_addr = args.mysql.unwrap_or_default();
+
         let has_raft = args.raft_node_id.is_some() && args.raft_listen.is_some();
 
         if has_raft {
@@ -259,6 +267,7 @@ fn main() -> Result<()> {
                 };
 
                 let pg_auth = auth_config.clone();
+                let mysql_auth = auth_config.clone();
                 let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), onto_core::CoreError>> + Send>>> = vec![
                     Box::pin(run_http_server(&http_addr, executor.clone(), auth_config, rate_limit_config, metrics.clone(), audit_config, args.raft_node_id, args.api_keys_file.clone(), args.cors_origins.clone(), tls_config, graph_store.clone())),
                     Box::pin(run_tcp_server(&args.listen, executor.clone(), metrics.clone())),
@@ -269,6 +278,14 @@ fn main() -> Result<()> {
                     let m = metrics.clone();
                     futs.push(Box::pin(async move {
                         pgwire::run_pgwire_server(&pgwire_addr, exec, m, pg_auth).await.map_err(|e| onto_core::CoreError::Custom(e.to_string()))
+                    }));
+                }
+
+                if has_mysql {
+                    let exec = executor.clone();
+                    let m = metrics.clone();
+                    futs.push(Box::pin(async move {
+                        mysqlwire::run_mysql_server(&mysql_addr, exec, m, mysql_auth).await.map_err(|e| onto_core::CoreError::Custom(e.to_string()))
                     }));
                 }
 
@@ -287,7 +304,7 @@ fn main() -> Result<()> {
                 // the process manager (systemd/Docker) restart the whole service,
                 // rather than running in a degraded state.
                 let (res, idx, remaining) = futures::future::select_all(futs).await;
-                let server_names = ["HTTP", "TCP", "PGWire", "Raft"];
+                let server_names = ["HTTP", "TCP", "PGWire", "MySQL", "Raft"];
                 let failed_name = server_names.get(idx).unwrap_or(&"Unknown");
                 match &res {
                     Ok(()) => tracing::info!("Server {} exited gracefully", failed_name),
