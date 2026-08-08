@@ -6,9 +6,12 @@
 //! - HTTP server (RESTful API with auth, rate limiting, and Prometheus metrics)
 
 mod auth;
+pub mod audit;
 mod http;
 mod metrics;
+pub mod pgwire;
 mod rate_limit;
+pub mod tls;
 
 use auth::{AuthConfig, AuthState, Permission};
 use clap::Parser;
@@ -65,6 +68,30 @@ struct Args {
     /// Disable rate limiting
     #[arg(long, env = "RATE_LIMIT_DISABLED")]
     no_rate_limit: bool,
+
+    /// Enable query audit logging
+    #[arg(long, env = "AUDIT_ENABLED")]
+    audit: bool,
+
+    /// Audit log directory
+    #[arg(long, default_value = "audit_logs", env = "AUDIT_LOG_DIR")]
+    audit_dir: PathBuf,
+
+    /// PG wire protocol listen address (enables PostgreSQL compatibility)
+    #[arg(long, env = "PGWIRE_LISTEN")]
+    pgwire: Option<String>,
+
+    /// Raft node ID for distributed replication
+    #[arg(long, env = "RAFT_NODE_ID")]
+    raft_node_id: Option<u64>,
+
+    /// Raft listen address for inter-node communication
+    #[arg(long, env = "RAFT_LISTEN")]
+    raft_listen: Option<String>,
+
+    /// Raft peer nodes (format: id=addr,id=addr)
+    #[arg(long, env = "RAFT_PEERS")]
+    raft_peers: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -107,19 +134,61 @@ fn main() -> Result<()> {
             burst_size: args.burst_size,
         };
 
+        // Create audit config
+        let audit_config = audit::AuditConfig {
+            enabled: args.audit,
+            log_dir: args.audit_dir.clone(),
+            ..Default::default()
+        };
+
+        if args.audit {
+            println!("Audit logging enabled: {:?}", args.audit_dir);
+        }
+
         let has_http = args.http.is_some();
         let http_addr = args.http.unwrap_or_default();
 
+        let has_pgwire = args.pgwire.is_some();
+        let pgwire_addr = args.pgwire.unwrap_or_default();
+
+        let has_raft = args.raft_node_id.is_some() && args.raft_listen.is_some();
+
+        if has_raft {
+            println!("Raft node {} enabled, listening on {}", args.raft_node_id.unwrap(), args.raft_listen.as_deref().unwrap());
+            if let Some(ref peers) = args.raft_peers {
+                println!("  Peers: {}", peers);
+            }
+        }
+
         if has_http {
-            // Run both HTTP and TCP servers concurrently
             rt.block_on(async {
-                tokio::select! {
-                    res = run_http_server(&http_addr, executor.clone(), auth_config, rate_limit_config, metrics.clone()) => res,
-                    res = run_tcp_server(&args.listen, executor, metrics) => res,
+                let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), onto_core::CoreError>> + Send>>> = vec![
+                    Box::pin(run_http_server(&http_addr, executor.clone(), auth_config, rate_limit_config, metrics.clone(), audit_config, args.raft_node_id)),
+                    Box::pin(run_tcp_server(&args.listen, executor.clone(), metrics.clone())),
+                ];
+
+                if has_pgwire {
+                    let exec = executor.clone();
+                    let m = metrics.clone();
+                    futs.push(Box::pin(async move {
+                        pgwire::run_pgwire_server(&pgwire_addr, exec, m).await.map_err(|e| onto_core::CoreError::Custom(e.to_string()))
+                    }));
                 }
+
+                if has_raft {
+                    let raft_addr = args.raft_listen.clone().unwrap();
+                    let node_id = args.raft_node_id.unwrap();
+                    let peers = args.raft_peers.clone().unwrap_or_default();
+                    futs.push(Box::pin(async move {
+                        run_raft_node(node_id, &raft_addr, &peers).await
+                    }));
+                }
+
+                // Run all futures concurrently
+                let (res, _, _) = futures::future::select_all(futs).await;
+                res
             })?;
         } else {
-            // TCP only
             rt.block_on(run_tcp_server(&args.listen, executor, metrics))?;
         }
     }
@@ -155,10 +224,14 @@ async fn run_http_server(
     auth_config: AuthConfig,
     rate_limit_config: RateLimitConfig,
     metrics: Arc<metrics::Metrics>,
+    audit_config: audit::AuditConfig,
+    raft_node_id: Option<u64>,
 ) -> Result<()> {
-    let state = http::AppState { executor, metrics };
+    let graph = Arc::new(onto_graph::GraphStore::new());
+    let audit = Arc::new(audit::AuditLogger::new(audit_config));
+    let state = http::AppState { executor, metrics, graph, audit, raft_node_id };
     let auth_state = AuthState::new(&auth_config).with_metrics(state.metrics.clone());
-    let rate_limiter = RateLimiter::new(rate_limit_config.clone());
+    let rate_limiter = RateLimiter::new(rate_limit_config.clone()).with_metrics(state.metrics.clone());
 
     // Spawn background task to clean up stale rate limit buckets every 5 minutes
     let limiter_cleanup = rate_limiter.clone();
@@ -209,6 +282,43 @@ async fn run_http_server(
         .map_err(|e| onto_core::CoreError::Io(e))?;
     axum::serve(listener, app).await
         .map_err(|e| onto_core::CoreError::Custom(format!("HTTP server error: {}", e)))?;
+    Ok(())
+}
+
+/// Runs a Raft consensus node for distributed replication.
+async fn run_raft_node(
+    node_id: u64,
+    listen_addr: &str,
+    peers_str: &str,
+) -> Result<()> {
+    use onto_raft::RaftNodeManager;
+
+    // Parse peer list: "2=127.0.0.1:9001,3=127.0.0.1:9002"
+    let mut initial_members = std::collections::BTreeMap::new();
+    if !peers_str.is_empty() {
+        for pair in peers_str.split(',') {
+            let parts: Vec<&str> = pair.trim().split('=').collect();
+            if parts.len() == 2 {
+                let id: u64 = parts[0].trim().parse()
+                    .map_err(|_| onto_core::CoreError::Custom(format!("invalid peer ID: {}", parts[0])))?;
+                initial_members.insert(id, parts[1].trim().to_string());
+            }
+        }
+    }
+
+    let config = onto_raft::manager::RaftNodeConfig {
+        node_id,
+        listen_addr: listen_addr.to_string(),
+        initial_members,
+    };
+
+    let manager = RaftNodeManager::new(config);
+    println!("Raft cluster config:\n{}", manager.export_config());
+
+    // Start Raft TCP server
+    let server = onto_raft::network::RaftTcpServer::new(listen_addr);
+    server.start().await.map_err(|e| onto_core::CoreError::Custom(e.to_string()))?;
+
     Ok(())
 }
 

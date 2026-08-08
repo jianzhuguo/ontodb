@@ -1,0 +1,116 @@
+groups:
+  - name: ontodb
+    rules:
+      # ── 服务可用性 ──
+      - alert: OntoDBDown
+        expr: up{job="ontodb"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OntoDB is down"
+          description: "OntoDB has been unreachable for more than 1 minute."
+
+      - alert: OntoDBHighMemory
+        expr: ontodb_memory_usage_bytes > 1.5e9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OntoDB memory usage > 1.5GB"
+          description: "Process RSS is {{ $value | humanizeBytes }}. Consider increasing limits or investigating."
+
+      - alert: OntoDBHighOpenFDs
+        expr: ontodb_open_file_descriptors > 800
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Open file descriptors > 800"
+          description: "{{ $value }} file descriptors open. Risk of hitting OS limit."
+
+      # ── 查询性能 ──
+      - alert: OntoDBHighErrorRate
+        expr: rate(ontodb_query_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Query error rate > 0.1/s"
+          description: "Error rate is {{ $value | printf \"%.2f\" }}/s. Check logs for details."
+
+      - alert: OntoDBHighLatency
+        expr: histogram_quantile(0.95, rate(ontodb_query_duration_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 query latency > 2s"
+          description: "p95 latency is {{ $value | printf \"%.2f\" }}s. Check for slow queries or resource pressure."
+
+      - alert: OntoDBSlowQueries
+        expr: rate(ontodb_slow_queries_total[5m]) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow query rate > 0.5/s"
+          description: "{{ $value | printf \"%.2f\" }} slow queries per second."
+
+      # ── 存储 ──
+      - alert: OntoDBHighDiskUsage
+        expr: ontodb_disk_usage_bytes > 10e9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk usage > 10GB"
+          description: "OntoDB using {{ $value | humanizeBytes }} disk. Consider cleanup or expansion."
+
+      - alert: OntoDBCompactionBacklog
+        expr: ontodb_compaction_pending > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Compaction backlog > 5 tasks"
+          description: "{{ $value }} pending compactions. Write performance may degrade."
+
+      # ── 安全 ──
+      - alert: OntoDBAuthFailureSpike
+        expr: rate(ontodb_auth_failures_total[5m]) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Auth failure spike > 1/s"
+          description: "{{ $value | printf \"%.2f\" }} auth failures per second. Possible brute force attempt."
+
+      - alert: OntoDBRateLimitHit
+        expr: rate(ontodb_rate_limited_total[5m]) > 2
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Rate limiting active > 2/s"
+          description: "{{ $value | printf \"%.2f\" }} requests per second are being rate limited."
+
+      # ── Raft ──
+      - alert: OntoDBRaftLogLag
+        expr: ontodb_raft_log_lag > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Raft log lag > 1000 entries"
+          description: "Follower is {{ $value }} entries behind leader. Check network or node health."
+
+      # ── 备份 ──
+      - alert: OntoDBBackupStale
+        expr: (time() - ontodb_last_backup_timestamp) > 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "No backup in 24 hours"
+          description: "Last backup was {{ $value | humanizeDuration }} ago."

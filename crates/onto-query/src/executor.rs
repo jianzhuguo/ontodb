@@ -381,6 +381,20 @@ impl QueryExecutor {
         self.engine.backup(backup_dir)
     }
 
+    /// Creates an incremental backup — only files modified since the given time.
+    pub fn backup_incremental(
+        &self,
+        backup_dir: &std::path::Path,
+        since: &std::time::SystemTime,
+    ) -> Result<onto_storage::BackupManifest> {
+        self.engine.backup_incremental(backup_dir, since)
+    }
+
+    /// Verifies a backup's integrity (file existence + checksums).
+    pub fn verify_backup(backup_dir: &std::path::Path) -> Result<()> {
+        onto_storage::LsmEngine::verify_backup(backup_dir)
+    }
+
     /// Flushes the MemTable to SSTable on disk.
     pub fn flush(&self) -> Result<()> {
         self.engine.flush()

@@ -31,6 +31,7 @@ services:
     ports:
       - "${ONTODB_HTTP_PORT:-7912}:7912"   # HTTP API
       - "${ONTODB_TCP_PORT:-7913}:7913"    # TCP CLI
+      - "${ONTODB_PG_PORT:-5432}:5432"     # PG wire protocol
     volumes:
       - ontodb-data:/data/ontodb
       - ontodb-backup:/data/backup
@@ -43,6 +44,7 @@ services:
       - "--api-keys-file=/etc/ontodb/api_keys.json"
       - "--rate-limit=${ONTODB_RATE_LIMIT:-300}"
       - "--burst-size=${ONTODB_BURST_SIZE:-50}"
+      - "--pgwire=0.0.0.0:5432"
     deploy:
       resources:
         limits:
@@ -101,11 +103,79 @@ services:
       - "${PROMETHEUS_PORT:-9090}:9090"
     volumes:
       - ./deploy/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
       - prometheus-data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.retention.time=30d"
       - "--storage.tsdb.retention.size=5GB"
+    networks:
+      - ontodb-net
+
+  # ── Alertmanager ────────────────────────────────────────────
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: ontodb-alertmanager
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./deploy/monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+    networks:
+      - ontodb-net
+
+  # ── Node Exporter (OS metrics: CPU, disk, network) ─────────
+  node-exporter:
+    image: prom/node-exporter:v1.8.1
+    container_name: ontodb-node-exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+    networks:
+      - ontodb-net
+
+  # ── 钉钉告警适配器 ────────────────────────────────────────
+  dingtalk:
+    image: timonwong/prometheus-webhook-dingtalk:v2.1.0
+    container_name: ontodb-dingtalk
+    restart: unless-stopped
+    ports:
+      - "8060:8060"
+    environment:
+      - GIN_MODE=release
+    volumes:
+      - ./deploy/monitoring/dingtalk-config.yml:/etc/prometheus-webhook-dingtalk/config.yml:ro
+    command:
+      - "--config.file=/etc/prometheus-webhook-dingtalk/config.yml"
+    depends_on:
+      - alertmanager
+    networks:
+      - ontodb-net
+
+  # ── 企业微信告警适配器 ────────────────────────────────────
+  wechat-webhook:
+    image: k8simage/wechat-webhook:v1.0
+    container_name: ontodb-wechat
+    restart: unless-stopped
+    ports:
+      - "8061:80"
+    environment:
+      - CORP_ID=${WECHAT_CORP_ID:-}
+      - CORP_SECRET=${WECHAT_CORP_SECRET:-}
+      - AGENT_ID=${WECHAT_AGENT_ID:-}
+      - TO_USER=${WECHAT_TO_USER:-@all}
+    depends_on:
+      - alertmanager
     networks:
       - ontodb-net
 
@@ -119,6 +189,8 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
       - ./deploy/monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/ontodb.json:ro
+      - ./deploy/monitoring/grafana-sql-dashboard.json:/var/lib/grafana/dashboards/ontodb-sql.json:ro
+      - ./deploy/monitoring/grafana-node-dashboard.json:/var/lib/grafana/dashboards/ontodb-node.json:ro
       - ./deploy/monitoring/grafana-datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
       - ./deploy/monitoring/grafana-dashboard-provider.yml:/etc/grafana/provisioning/dashboards/provider.yml:ro
     environment:

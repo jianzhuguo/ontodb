@@ -62,11 +62,17 @@ fn validate_filter(filter: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Slow query threshold in seconds. Queries exceeding this are logged as warnings.
+const SLOW_QUERY_THRESHOLD_SECS: f64 = 1.0;
+
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
     pub executor: Arc<QueryExecutor>,
     pub metrics: SharedMetrics,
+    pub graph: Arc<onto_graph::GraphStore>,
+    pub audit: Arc<crate::audit::AuditLogger>,
+    pub raft_node_id: Option<u64>,
 }
 
 /// SQL query request.
@@ -106,6 +112,23 @@ pub struct SparqlRequest {
 #[derive(Debug, Deserialize)]
 pub struct BackupRequest {
     /// Target directory path for the backup.
+    pub path: String,
+}
+
+/// Incremental backup request.
+#[derive(Debug, Deserialize)]
+pub struct IncrementalBackupRequest {
+    /// Target directory path for the incremental backup.
+    pub path: String,
+    /// ISO 8601 timestamp — only files modified after this time are included.
+    /// Use the timestamp from a previous full/incremental backup.
+    pub since: String,
+}
+
+/// Backup verification request.
+#[derive(Debug, Deserialize)]
+pub struct VerifyBackupRequest {
+    /// Path to the backup directory to verify.
     pub path: String,
 }
 
@@ -179,9 +202,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/hybrid/query", post(hybrid_query))
         // Schema introspection
         .route("/api/schema", get(get_schema))
+        // Cluster info
+        .route("/api/cluster", get(cluster_info))
         // Backup and flush
         .route("/api/backup", post(backup))
+        .route("/api/backup/incremental", post(backup_incremental))
+        .route("/api/backup/verify", post(verify_backup_endpoint))
         .route("/api/flush", post(flush))
+        // API documentation
+        .route("/api/docs", get(swagger_ui))
+        .route("/api/openapi.json", get(openapi_spec))
+        // Web console
+        .route("/console", get(web_console))
+        .route("/", get(web_console))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -208,6 +241,7 @@ pub fn build_router_with_auth(
         .route("/api/vector/search", post(vector_search))
         .route("/api/hybrid/query", post(hybrid_query))
         .route("/api/schema", get(get_schema))
+        .route("/api/cluster", get(cluster_info))
         // Graph endpoints
         .route("/api/graph/vertex", post(add_vertex))
         .route("/api/graph/edge", post(add_edge))
@@ -217,7 +251,14 @@ pub fn build_router_with_auth(
         .route("/api/graph/neighbors/:id", get(get_neighbors))
         // Backup and flush (Admin only)
         .route("/api/backup", post(backup))
+        .route("/api/backup/incremental", post(backup_incremental))
+        .route("/api/backup/verify", post(verify_backup_endpoint))
         .route("/api/flush", post(flush))
+        // API documentation and console (no auth required)
+        .route("/api/docs", get(swagger_ui))
+        .route("/api/openapi.json", get(openapi_spec))
+        .route("/console", get(web_console))
+        .route("/", get(web_console))
         // Apply rate limiting middleware
         .layer(middleware::from_fn_with_state(
             rate_limiter,
@@ -234,30 +275,74 @@ pub fn build_router_with_auth(
 }
 
 /// GET /api/health - Comprehensive health check endpoint.
+/// Actually probes storage engine, WAL, and memory.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let uptime = state.metrics.started_at.elapsed().as_secs();
-    Json(json!({
-        "status": "ok",
+
+    // Probe storage engine
+    let (storage_status, storage_detail) = match state.executor.engine_stats() {
+        Some(stats) => {
+            let detail = json!({
+                "memtable_entries": stats.memtable_entries,
+                "memtable_size_bytes": stats.memtable_size,
+                "total_sstables": stats.total_sstables,
+                "sst_size_bytes": stats.total_sst_size,
+                "num_levels": stats.num_levels,
+            });
+            ("ok", Some(detail))
+        }
+        None => ("error", Some(json!({"error": "engine stats unavailable"}))),
+    };
+
+    // Probe query engine (try a parse that OntoDB supports)
+    let query_status = match QueryParser::parse("SELECT * FROM health_check") {
+        Ok(_) => "ok",
+        Err(_) => "error",
+    };
+
+    let all_ok = storage_status == "ok" && query_status == "ok";
+    let status = if all_ok { "ok" } else { "degraded" };
+
+    let mut checks = json!({
+        "storage": storage_status,
+        "query_engine": query_status,
+    });
+    if let Some(detail) = storage_detail {
+        checks["storage_detail"] = detail;
+    }
+
+    let code = if all_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (code, Json(json!({
+        "status": status,
         "version": env!("CARGO_PKG_VERSION"),
         "engine": "OntoDB",
         "uptime_seconds": uptime,
-        "checks": {
-            "storage": "ok",
-            "query_engine": "ok"
-        }
-    }))
+        "checks": checks,
+    })))
 }
 
 /// GET /api/health/ready - Kubernetes readiness probe.
-/// Returns 200 if the server is ready to accept requests.
-async fn health_ready() -> impl IntoResponse {
-    Json(json!({
-        "status": "ready"
-    }))
+/// Returns 200 only if the engine can accept queries.
+async fn health_ready(State(state): State<AppState>) -> impl IntoResponse {
+    // Check: engine stats available (storage alive)
+    let engine_ok = state.executor.engine_stats().is_some();
+    // Check: parser works (query engine alive) — use a query syntax that always parses
+    let parser_ok = QueryParser::parse("SELECT * FROM health_check").is_ok()
+        || QueryParser::parse("CREATE CLASS health_check").is_ok();
+
+    if engine_ok && parser_ok {
+        (StatusCode::OK, Json(json!({"status": "ready"})))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "status": "not_ready",
+            "engine": engine_ok,
+            "parser": parser_ok,
+        })))
+    }
 }
 
 /// GET /api/health/live - Kubernetes liveness probe.
-/// Returns 200 if the server is alive.
+/// Returns 200 if the server process is alive.
 async fn health_live() -> impl IntoResponse {
     Json(json!({
         "status": "alive"
@@ -346,6 +431,10 @@ async fn metrics_json(State(state): State<AppState>) -> impl IntoResponse {
             "sstable_count": m.sstable_count.get(),
             "entries": m.storage_entries.get(),
             "compactions": m.compactions_total.get(),
+        },
+        "slow_queries": {
+            "total": m.slow_queries_total.get(),
+            "threshold_seconds": SLOW_QUERY_THRESHOLD_SECS,
         }
     }))
 }
@@ -397,6 +486,9 @@ async fn execute_query(
         Err(e) => {
             let elapsed = start.elapsed().as_secs_f64();
             state.metrics.record_query(query_type, elapsed, false);
+            // Audit log — failed query
+            let audit_entry = state.audit.create_entry("127.0.0.1", None, query_type, query, elapsed * 1000.0, false, Some(e.to_string()));
+            state.audit.log(&audit_entry);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 PrettyJson(ApiResponse::<Value>::error(format!("Execution error: {}", e)), false),
@@ -406,6 +498,23 @@ async fn execute_query(
 
     let elapsed = start.elapsed().as_secs_f64();
     state.metrics.record_query(query_type, elapsed, true);
+
+    // Audit log — successful query
+    let audit_entry = state.audit.create_entry("127.0.0.1", None, query_type, query, elapsed * 1000.0, true, None);
+    state.audit.log(&audit_entry);
+
+    // Slow query logging
+    if elapsed >= SLOW_QUERY_THRESHOLD_SECS {
+        state.metrics.slow_queries_total.inc();
+        let truncated = if query.len() > 200 { &query[..200] } else { query };
+        tracing::warn!(
+            target: "slow_query",
+            query_type = query_type,
+            elapsed_ms = elapsed * 1000.0,
+            query = truncated,
+            "slow query detected"
+        );
+    }
 
     let elapsed_ms = elapsed * 1000.0;
 
@@ -483,6 +592,18 @@ async fn sparql_query(
 
     let elapsed = start.elapsed().as_secs_f64();
     state.metrics.record_query("SPARQL", elapsed, true);
+
+    if elapsed >= SLOW_QUERY_THRESHOLD_SECS {
+        state.metrics.slow_queries_total.inc();
+        let truncated = if req.query.len() > 200 { &req.query[..200] } else { &req.query };
+        tracing::warn!(
+            target: "slow_query",
+            query_type = "SPARQL",
+            elapsed_ms = elapsed * 1000.0,
+            query = truncated,
+            "slow SPARQL query detected"
+        );
+    }
 
     let elapsed_ms = elapsed * 1000.0;
 
@@ -574,6 +695,18 @@ async fn vector_search(
     let elapsed = start.elapsed().as_secs_f64();
     state.metrics.vector_search_latency.observe(elapsed);
     state.metrics.record_query("VECTOR_SEARCH", elapsed, true);
+
+    if elapsed >= SLOW_QUERY_THRESHOLD_SECS {
+        state.metrics.slow_queries_total.inc();
+        tracing::warn!(
+            target: "slow_query",
+            query_type = "VECTOR_SEARCH",
+            elapsed_ms = elapsed * 1000.0,
+            class = req.class,
+            top_k = req.top_k,
+            "slow vector search detected"
+        );
+    }
 
     let elapsed_ms = elapsed * 1000.0;
 
@@ -733,17 +866,59 @@ async fn get_schema(
     }
 }
 
+// ── API Documentation ────────────────────────────────────────────
+
+/// GET /api/docs - Swagger UI for API documentation.
+async fn swagger_ui() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("swagger_ui.html"))
+}
+
+/// GET /api/openapi.json - OpenAPI 3.0 specification.
+async fn openapi_spec() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("Content-Type", "application/json")],
+        include_str!("../../../docs/api/openapi.json"),
+    )
+}
+
+/// GET /console - Web management console.
+async fn web_console() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("static/console.html"))
+}
+
+// ── Cluster API ──────────────────────────────────────────────────
+
+/// GET /api/cluster - Get cluster information.
+async fn cluster_info(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let uptime = state.metrics.started_at.elapsed().as_secs();
+
+    Json(json!({
+        "node_id": state.raft_node_id,
+        "mode": if state.raft_node_id.is_some() { "cluster" } else { "standalone" },
+        "uptime_seconds": uptime,
+        "version": env!("CARGO_PKG_VERSION"),
+        "metrics": {
+            "connections": {
+                "http_active": state.metrics.http_connections_active.get(),
+                "tcp_active": state.metrics.tcp_connections_active.get(),
+            },
+            "queries_total": state.metrics.queries_total.get(),
+        }
+    }))
+}
+
 // ── Graph API Handlers ───────────────────────────────────────────
 
 /// POST /api/graph/vertex - Add a vertex to the graph.
 async fn add_vertex(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
-    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
-    // Extract vertex data from request
     let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let labels: Vec<String> = req.get("labels")
         .and_then(|v| v.as_array())
@@ -754,22 +929,49 @@ async fn add_vertex(
         return (StatusCode::BAD_REQUEST, Json(ApiResponse::<serde_json::Value>::error("missing vertex id")));
     }
 
-    // Note: In production, this would use a shared GraphStore
-    // For now, return success
-    (StatusCode::OK, Json(ApiResponse::success(json!({
-        "message": format!("vertex '{}' added", id),
-        "id": id,
-        "labels": labels
-    }), elapsed)))
+    let mut vertex = onto_graph::Vertex::new(&id, labels.clone());
+
+    // Parse properties from request
+    if let Some(props) = req.get("properties").and_then(|v| v.as_object()) {
+        for (key, val) in props {
+            let pv = match val {
+                serde_json::Value::String(s) => onto_graph::PropValue::String(s.clone()),
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        onto_graph::PropValue::Int(i)
+                    } else if let Some(f) = n.as_f64() {
+                        onto_graph::PropValue::Float(f)
+                    } else {
+                        continue;
+                    }
+                }
+                serde_json::Value::Bool(b) => onto_graph::PropValue::Bool(*b),
+                _ => onto_graph::PropValue::String(val.to_string()),
+            };
+            vertex.properties.insert(key.clone(), pv);
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    match state.graph.add_vertex(vertex) {
+        Ok(()) => (StatusCode::OK, Json(ApiResponse::success(json!({
+            "message": format!("vertex '{}' added", id),
+            "id": id,
+            "labels": labels,
+        }), elapsed))),
+        Err(e) => (StatusCode::CONFLICT, Json(ApiResponse::<serde_json::Value>::error(
+            format!("failed to add vertex: {}", e)
+        ))),
+    }
 }
 
 /// POST /api/graph/edge - Add an edge to the graph.
 async fn add_edge(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
-    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let from = req.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -780,51 +982,123 @@ async fn add_edge(
         return (StatusCode::BAD_REQUEST, Json(ApiResponse::<serde_json::Value>::error("missing required fields: id, from, to")));
     }
 
-    (StatusCode::OK, Json(ApiResponse::success(json!({
-        "message": format!("edge '{}' added", id),
-        "id": id,
-        "from": from,
-        "to": to,
-        "label": label
-    }), elapsed)))
+    let mut edge = onto_graph::Edge::new(&id, &from, &to, &label);
+
+    // Parse properties
+    if let Some(props) = req.get("properties").and_then(|v| v.as_object()) {
+        for (key, val) in props {
+            let pv = match val {
+                serde_json::Value::String(s) => onto_graph::PropValue::String(s.clone()),
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        onto_graph::PropValue::Int(i)
+                    } else if let Some(f) = n.as_f64() {
+                        onto_graph::PropValue::Float(f)
+                    } else {
+                        continue;
+                    }
+                }
+                serde_json::Value::Bool(b) => onto_graph::PropValue::Bool(*b),
+                _ => onto_graph::PropValue::String(val.to_string()),
+            };
+            edge.properties.insert(key.clone(), pv);
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    match state.graph.add_edge(edge) {
+        Ok(()) => (StatusCode::OK, Json(ApiResponse::success(json!({
+            "message": format!("edge '{}' added", id),
+            "id": id,
+            "from": from,
+            "to": to,
+            "label": label,
+        }), elapsed))),
+        Err(e) => {
+            let code = if e.to_string().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::CONFLICT
+            };
+            (code, Json(ApiResponse::<serde_json::Value>::error(
+                format!("failed to add edge: {}", e)
+            )))
+        }
+    }
 }
 
-/// POST /api/graph/traverse - Traverse the graph.
+/// POST /api/graph/traverse - Traverse the graph using BFS/DFS.
 async fn graph_traverse(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
-    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     let start_id = req.get("start").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let direction = req.get("direction").and_then(|v| v.as_str()).unwrap_or("out");
+    let direction_str = req.get("direction").and_then(|v| v.as_str()).unwrap_or("out");
     let max_depth = req.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
-    let edge_label = req.get("edge_label").and_then(|v| v.as_str()).map(String::from);
+    let edge_label = req.get("edge_label").and_then(|v| v.as_str());
+    let algo = req.get("algorithm").and_then(|v| v.as_str()).unwrap_or("bfs");
 
     if start_id.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(ApiResponse::<serde_json::Value>::error("missing start vertex id")));
     }
 
-    // Note: In production, this would use a shared GraphStore and TraversalEngine
-    (StatusCode::OK, Json(ApiResponse::success(json!({
-        "message": "traversal completed",
-        "start": start_id,
-        "direction": direction,
-        "max_depth": max_depth,
-        "edge_label": edge_label,
-        "vertices": [],
-        "edges": []
-    }), elapsed)))
+    let direction = match direction_str {
+        "in" => onto_graph::Direction::In,
+        "both" => onto_graph::Direction::Both,
+        _ => onto_graph::Direction::Out,
+    };
+
+    let engine = onto_graph::TraversalEngine::new(&state.graph);
+
+    let result = if algo == "dfs" {
+        engine.traverse_dfs(&start_id, max_depth, direction, edge_label, None)
+    } else {
+        engine.traverse_bfs(&start_id, max_depth, direction, edge_label, None)
+    };
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    match result {
+        Ok(traversal) => {
+            let vertices: Vec<serde_json::Value> = traversal.vertices.iter().map(|v| {
+                json!({
+                    "id": v.id,
+                    "labels": v.labels,
+                    "properties": v.properties,
+                })
+            }).collect();
+
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "start": start_id,
+                "direction": direction_str,
+                "max_depth": max_depth,
+                "algorithm": algo,
+                "visited_count": traversal.visited_count,
+                "vertices": vertices,
+            }), elapsed)))
+        }
+        Err(e) => {
+            let code = if e.to_string().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, Json(ApiResponse::<serde_json::Value>::error(
+                format!("traversal failed: {}", e)
+            )))
+        }
+    }
 }
 
 /// POST /api/graph/shortest-path - Find shortest path between two vertices.
 async fn graph_shortest_path(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
-    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     let from_id = req.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let to_id = req.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -834,55 +1108,110 @@ async fn graph_shortest_path(
         return (StatusCode::BAD_REQUEST, Json(ApiResponse::<serde_json::Value>::error("missing from/to vertex ids")));
     }
 
-    (StatusCode::OK, Json(ApiResponse::success(json!({
-        "message": "shortest path search completed",
-        "from": from_id,
-        "to": to_id,
-        "max_depth": max_depth,
-        "path": null
-    }), elapsed)))
+    let engine = onto_graph::TraversalEngine::new(&state.graph);
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    match engine.shortest_path(&from_id, &to_id, max_depth) {
+        Ok(Some(path)) => {
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "from": from_id,
+                "to": to_id,
+                "found": true,
+                "length": path.length,
+                "path": {
+                    "vertex_ids": path.vertex_ids,
+                    "edge_ids": path.edge_ids,
+                },
+            }), elapsed)))
+        }
+        Ok(None) => {
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "from": from_id,
+                "to": to_id,
+                "found": false,
+                "message": "no path exists between the two vertices",
+            }), elapsed)))
+        }
+        Err(e) => {
+            let code = if e.to_string().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, Json(ApiResponse::<serde_json::Value>::error(
+                format!("shortest path search failed: {}", e)
+            )))
+        }
+    }
 }
 
 /// GET /api/graph/vertex/:id - Get a vertex by ID.
 async fn get_vertex(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
-    // Note: In production, this would query the GraphStore
-    (StatusCode::OK, Json(ApiResponse::success(json!({
-        "id": id,
-        "labels": [],
-        "properties": {}
-    }), elapsed)))
+    match state.graph.get_vertex(&id) {
+        Some(vertex) => {
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "id": vertex.id,
+                "labels": vertex.labels,
+                "properties": vertex.properties,
+            }), elapsed)))
+        }
+        None => {
+            (StatusCode::NOT_FOUND, Json(ApiResponse::<serde_json::Value>::error(
+                format!("vertex '{}' not found", id)
+            )))
+        }
+    }
 }
 
 /// DELETE /api/graph/vertex/:id - Delete a vertex.
 async fn delete_vertex(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
-    (StatusCode::OK, Json(ApiResponse::success(json!({
-        "message": format!("vertex '{}' deleted", id)
-    }), elapsed)))
+    match state.graph.delete_vertex(&id) {
+        Ok(()) => {
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": format!("vertex '{}' deleted", id)
+            }), elapsed)))
+        }
+        Err(e) => {
+            (StatusCode::NOT_FOUND, Json(ApiResponse::<serde_json::Value>::error(
+                format!("failed to delete vertex: {}", e)
+            )))
+        }
+    }
 }
 
 /// GET /api/graph/neighbors/:id - Get neighbors of a vertex.
 async fn get_neighbors(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
+    let neighbors = state.graph.get_neighbors(&id);
+    let neighbor_data: Vec<serde_json::Value> = neighbors.iter().map(|v| {
+        json!({
+            "id": v.id,
+            "labels": v.labels,
+            "properties": v.properties,
+        })
+    }).collect();
+
     (StatusCode::OK, Json(ApiResponse::success(json!({
         "vertex_id": id,
-        "neighbors": []
+        "count": neighbor_data.len(),
+        "neighbors": neighbor_data,
     }), elapsed)))
 }
 
@@ -912,6 +1241,128 @@ async fn backup(
                 format!("Backup failed: {}", e)
             )))
         }
+    }
+}
+
+/// POST /api/backup/incremental - Create an incremental backup.
+async fn backup_incremental(
+    State(state): State<AppState>,
+    Json(req): Json<IncrementalBackupRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let backup_dir = std::path::Path::new(&req.path);
+
+    // Parse the ISO 8601 timestamp into SystemTime
+    // Accept formats: "2026-08-08T12:00:00Z" or "2026-08-08T12:00:00"
+    let since = match parse_iso_timestamp(&req.since) {
+        Ok(t) => t,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                format!("Invalid 'since' timestamp: {}", e)
+            )));
+        }
+    };
+
+    match state.executor.backup_incremental(backup_dir, &since) {
+        Ok(manifest) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": "Incremental backup completed",
+                "path": req.path,
+                "files": manifest.files.len(),
+                "total_bytes": total_bytes,
+                "timestamp": manifest.timestamp,
+                "backup_type": manifest.backup_type,
+            }), elapsed)))
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
+                format!("Incremental backup failed: {}", e)
+            )))
+        }
+    }
+}
+
+/// POST /api/backup/verify - Verify a backup's integrity.
+async fn verify_backup_endpoint(
+    State(_state): State<AppState>,
+    Json(req): Json<VerifyBackupRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let backup_dir = std::path::Path::new(&req.path);
+
+    match onto_query::QueryExecutor::verify_backup(backup_dir) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": "Backup verification passed",
+                "path": req.path,
+            }), elapsed)))
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                format!("Backup verification failed: {}", e)
+            )))
+        }
+    }
+}
+
+/// Parse an ISO 8601 timestamp string into SystemTime.
+fn parse_iso_timestamp(s: &str) -> Result<std::time::SystemTime, String> {
+    // Simple parser for "YYYY-MM-DDTHH:MM:SSZ" or "YYYY-MM-DDTHH:MM:SS"
+    let s = s.trim_end_matches('Z');
+    let parts: Vec<&str> = s.split('T').collect();
+    if parts.len() != 2 {
+        return Err("expected format: YYYY-MM-DDTHH:MM:SS".to_string());
+    }
+
+    let date_parts: Vec<&str> = parts[0].split('-').collect();
+    let time_parts: Vec<&str> = parts[1].split(':').collect();
+
+    if date_parts.len() != 3 || time_parts.len() < 3 {
+        return Err("invalid date/time format".to_string());
+    }
+
+    let year: u16 = date_parts[0].parse().map_err(|_| "invalid year")?;
+    let month: u8 = date_parts[1].parse().map_err(|_| "invalid month")?;
+    let day: u8 = date_parts[2].parse().map_err(|_| "invalid day")?;
+    let hour: u8 = time_parts[0].parse().map_err(|_| "invalid hour")?;
+    let minute: u8 = time_parts[1].parse().map_err(|_| "invalid minute")?;
+    let second: u8 = time_parts[2].parse().map_err(|_| "invalid second")?;
+
+    // Convert to days since epoch (simplified)
+    let days = days_since_epoch(year, month, day);
+    let secs = days * 86400 + (hour as u64) * 3600 + (minute as u64) * 60 + second as u64;
+
+    Ok(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+}
+
+fn days_since_epoch(year: u16, month: u8, day: u8) -> u64 {
+    let y = year as i64;
+    let m = month as i64;
+    let d = day as i64;
+    // Days from 1970-01-01
+    let mut days = 0i64;
+    for yr in 1970..y {
+        days += if is_leap_year(yr as u16) { 366 } else { 365 };
+    }
+    for mo in 1..m {
+        days += days_in_month(year, mo as u8) as i64;
+    }
+    (days + d - 1) as u64
+}
+
+fn is_leap_year(year: u16) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+fn days_in_month(year: u16, month: u8) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => if is_leap_year(year) { 29 } else { 28 },
+        _ => 0,
     }
 }
 

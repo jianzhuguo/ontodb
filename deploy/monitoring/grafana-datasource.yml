@@ -7,3 +7,15 @@ datasources:
     url: http://prometheus:9090
     isDefault: true
     editable: false
+
+  - name: OntoDB
+    type: postgres
+    access: proxy
+    url: ontodb:5432
+    jsonData:
+      dbname: ontodb
+      sslmode: disable
+      maxOpenConns: 10
+      maxIdleConns: 5
+      connMaxLifetime: 14400
+    editable: true

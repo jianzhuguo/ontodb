@@ -1,0 +1,13 @@
+[book]
+title = "OntoDB Documentation"
+authors = ["OntoDB Team"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/ontodb/ontodb"

@@ -8,11 +8,12 @@ COPY Cargo.toml Cargo.lock ./
 # Create skeleton src for each crate so `cargo build` can resolve deps
 RUN mkdir -p crates/onto-core/src crates/onto-storage/src crates/onto-ontology/src \
             crates/onto-query/src crates/onto-raft/src crates/onto-sharding/src \
-            crates/onto-server/src crates/onto-cli/src crates/onto-graph/src && \
+            crates/onto-server/src crates/onto-cli/src crates/onto-graph/src \
+            crates/onto-enterprise/src && \
     touch crates/onto-core/src/lib.rs crates/onto-storage/src/lib.rs \
           crates/onto-ontology/src/lib.rs crates/onto-query/src/lib.rs \
           crates/onto-raft/src/lib.rs crates/onto-sharding/src/lib.rs \
-          crates/onto-graph/src/lib.rs && \
+          crates/onto-graph/src/lib.rs crates/onto-enterprise/src/lib.rs && \
     echo "fn main() {}" > crates/onto-server/src/main.rs && \
     echo "fn main() {}" > crates/onto-cli/src/main.rs && \
     cargo build --release --bin ontodb-server --bin ontodb-cli 2>/dev/null || true
@@ -53,7 +54,7 @@ RUN mkdir -p /data/ontodb /data/backup /etc/ontodb && \
     chown -R ontodb:ontodb /data /etc/ontodb
 
 VOLUME ["/data/ontodb", "/data/backup"]
-EXPOSE 7912 7913
+EXPOSE 7912 7913 5432
 
 # Health check: probe the readiness endpoint every 30s
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

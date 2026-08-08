@@ -58,6 +58,11 @@ pub struct ApiKeyConfig {
     /// Optional rate limit override (requests per minute). None = use default.
     #[serde(default)]
     pub rate_limit: Option<u32>,
+    /// Optional IP whitelist. If set, only these IPs can use this key.
+    /// Supports exact IPs ("192.168.1.1") and CIDR notation ("10.0.0.0/8").
+    /// Empty or absent = no IP restriction.
+    #[serde(default)]
+    pub allowed_ips: Option<Vec<String>>,
 }
 
 /// Authentication configuration.
@@ -81,15 +86,43 @@ impl Default for AuthConfig {
     }
 }
 
+/// IP whitelist configuration for the entire server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpWhitelistConfig {
+    /// Whether IP whitelisting is enabled.
+    pub enabled: bool,
+    /// Global allowed IPs (applies to all requests, before API key check).
+    /// Supports exact IPs and CIDR notation.
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
+    /// Allow localhost (127.0.0.1 and ::1) when whitelist is enabled.
+    #[serde(default = "default_true")]
+    pub allow_localhost: bool,
+}
+
+fn default_true() -> bool { true }
+
+impl Default for IpWhitelistConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_ips: Vec::new(),
+            allow_localhost: true,
+        }
+    }
+}
+
 /// Shared authentication state.
 #[derive(Clone)]
 pub struct AuthState {
-    /// Map of API key -> (description, permission, rate_limit)
-    keys: Arc<HashMap<String, (String, Permission, Option<u32>)>>,
+    /// Map of API key -> (description, permission, rate_limit, allowed_ips)
+    keys: Arc<HashMap<String, (String, Permission, Option<u32>, Option<Vec<String>>)>>,
     /// Whether auth is enabled.
     pub enabled: bool,
     /// Metrics counters for auth events.
     pub metrics: Option<crate::metrics::SharedMetrics>,
+    /// Global IP whitelist configuration.
+    pub ip_whitelist: IpWhitelistConfig,
 }
 
 impl AuthState {
@@ -103,6 +136,7 @@ impl AuthState {
                     key_config.description.clone(),
                     key_config.permission.clone(),
                     key_config.rate_limit,
+                    key_config.allowed_ips.clone(),
                 ),
             );
         }
@@ -110,7 +144,14 @@ impl AuthState {
             keys: Arc::new(keys),
             enabled: config.enabled,
             metrics: None,
+            ip_whitelist: IpWhitelistConfig::default(),
         }
+    }
+
+    /// Set IP whitelist configuration.
+    pub fn with_ip_whitelist(mut self, config: IpWhitelistConfig) -> Self {
+        self.ip_whitelist = config;
+        self
     }
 
     /// Set metrics for auth event tracking.
@@ -120,14 +161,55 @@ impl AuthState {
     }
 
     /// Validate an API key and return its permission level.
-    pub fn validate(&self, key: &str) -> Option<(String, Permission, Option<u32>)> {
+    pub fn validate(&self, key: &str) -> Option<(String, Permission, Option<u32>, Option<Vec<String>>)> {
         self.keys.get(key).cloned()
+    }
+
+    /// Check if a client IP is allowed by the global IP whitelist.
+    pub fn is_ip_allowed(&self, client_ip: &str) -> bool {
+        if !self.ip_whitelist.enabled {
+            return true; // whitelist disabled, allow all
+        }
+
+        // Check localhost bypass
+        if self.ip_whitelist.allow_localhost && (client_ip == "127.0.0.1" || client_ip == "::1" || client_ip.starts_with("127.")) {
+            return true;
+        }
+
+        // Check global whitelist
+        if self.ip_whitelist.allowed_ips.is_empty() {
+            return true; // no IPs configured = allow all
+        }
+
+        for allowed in &self.ip_whitelist.allowed_ips {
+            if ip_matches(client_ip, allowed) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Check if a client IP is allowed for a specific API key.
+    pub fn is_ip_allowed_for_key(&self, key: &str, client_ip: &str) -> bool {
+        if let Some((_, _, _, Some(ref allowed_ips))) = self.keys.get(key) {
+            if allowed_ips.is_empty() {
+                return true; // empty list = no restriction
+            }
+            for allowed in allowed_ips {
+                if ip_matches(client_ip, allowed) {
+                    return true;
+                }
+            }
+            return false; // key has IP restriction and client IP doesn't match
+        }
+        true // no per-key restriction
     }
 
     /// Get the rate limit for a specific key, or None if not configured.
     #[allow(dead_code)]
     pub fn get_rate_limit(&self, key: &str) -> Option<u32> {
-        self.keys.get(key).and_then(|(_, _, limit)| *limit)
+        self.keys.get(key).and_then(|(_, _, limit, _)| *limit)
     }
 }
 
@@ -140,6 +222,20 @@ pub async fn auth_middleware(
     request: Request,
     next: Next,
 ) -> impl IntoResponse {
+    // Extract client IP (from X-Forwarded-For or socket addr)
+    let client_ip = extract_client_ip(&request);
+
+    // Check global IP whitelist (before auth)
+    if !auth.is_ip_allowed(&client_ip) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "error": format!("IP {} is not in the server whitelist", client_ip)
+            })),
+        ).into_response();
+    }
+
     // Skip auth if disabled
     if !auth.enabled {
         return next.run(request).await;
@@ -177,7 +273,7 @@ pub async fn auth_middleware(
     };
 
     // Validate the key
-    let (description, permission, rate_limit) = match auth.validate(&key) {
+    let (description, permission, rate_limit, _allowed_ips) = match auth.validate(&key) {
         Some(info) => info,
         None => {
             if let Some(ref metrics) = auth.metrics {
@@ -193,6 +289,20 @@ pub async fn auth_middleware(
                 .into_response();
         }
     };
+
+    // Check per-key IP restriction
+    if !auth.is_ip_allowed_for_key(&key, &client_ip) {
+        if let Some(ref metrics) = auth.metrics {
+            metrics.auth_failures.inc();
+        }
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "error": format!("IP {} is not allowed for this API key", client_ip)
+            })),
+        ).into_response();
+    }
 
     // Check permission for this endpoint
     let method = request.method().as_str();
@@ -227,6 +337,27 @@ pub async fn auth_middleware(
     });
 
     next.run(request).await
+}
+
+/// Extract client IP from request headers (X-Forwarded-For) or default.
+fn extract_client_ip(request: &Request) -> String {
+    // Try X-Forwarded-For first (for proxied requests)
+    if let Some(forwarded) = request.headers().get("X-Forwarded-For") {
+        if let Ok(val) = forwarded.to_str() {
+            // Take the first IP (original client)
+            if let Some(first) = val.split(',').next() {
+                return first.trim().to_string();
+            }
+        }
+    }
+    // Try X-Real-IP
+    if let Some(real_ip) = request.headers().get("X-Real-IP") {
+        if let Ok(val) = real_ip.to_str() {
+            return val.trim().to_string();
+        }
+    }
+    // Default to unknown (will be allowed if whitelist is disabled)
+    "unknown".to_string()
 }
 
 /// Extract API key from request headers.
@@ -269,4 +400,55 @@ pub struct KeyInfo {
     pub description: String,
     pub permission: Permission,
     pub rate_limit: Option<u32>,
+}
+
+/// Check if a client IP matches an allowed entry (exact match or CIDR).
+fn ip_matches(client_ip: &str, allowed: &str) -> bool {
+    // Exact match
+    if client_ip == allowed {
+        return true;
+    }
+
+    // CIDR match (e.g., "10.0.0.0/8", "192.168.1.0/24")
+    if let Some((subnet, prefix_len)) = allowed.split_once('/') {
+        if let Ok(prefix) = prefix_len.parse::<u32>() {
+            return cidr_match(client_ip, subnet, prefix);
+        }
+    }
+
+    false
+}
+
+/// Check if an IPv4 address is within a CIDR range.
+fn cidr_match(client_ip: &str, subnet: &str, prefix_len: u32) -> bool {
+    let client = parse_ipv4(client_ip);
+    let network = parse_ipv4(subnet);
+
+    match (client, network) {
+        (Some(c), Some(n)) => {
+            if prefix_len == 0 {
+                return true;
+            }
+            let mask = !0u32 << (32 - prefix_len);
+            (c & mask) == (n & mask)
+        }
+        _ => false,
+    }
+}
+
+/// Parse an IPv4 address string into a u32.
+fn parse_ipv4(ip: &str) -> Option<u32> {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut result = 0u32;
+    for part in parts {
+        let octet: u32 = part.parse().ok()?;
+        if octet > 255 {
+            return None;
+        }
+        result = (result << 8) | octet;
+    }
+    Some(result)
 }

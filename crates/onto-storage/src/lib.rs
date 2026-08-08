@@ -22,3 +22,6 @@ pub use mvcc::{TxnManager, Transaction, TxnStatus, WriteOp};
 pub use options::StorageOptions;
 pub use vector::{DistanceMetric, HnswConfig, HnswIndex, VectorEntry, SearchResult, VectorIndexManager};
 pub use vector::distance;
+
+#[cfg(test)]
+mod fuzz_tests;

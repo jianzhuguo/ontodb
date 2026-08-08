@@ -1,0 +1,195 @@
+{
+  "id": null,
+  "uid": "ontodb-sql",
+  "title": "OntoDB SQL Explorer",
+  "tags": ["ontodb", "sql", "data"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "table",
+        "type": "query",
+        "datasource": { "type": "postgres", "uid": "ontodb" },
+        "query": "SELECT DISTINCT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name",
+        "refresh": 2,
+        "multi": false,
+        "includeAll": true,
+        "allValue": "*",
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Schema — All Classes",
+      "type": "table",
+      "datasource": { "type": "postgres", "uid": "ontodb" },
+      "targets": [
+        {
+          "rawSql": "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "table_name", "desc": false }]
+      }
+    },
+    {
+      "id": 2,
+      "title": "Row Counts per Table",
+      "type": "bargauge",
+      "datasource": { "type": "postgres", "uid": "ontodb" },
+      "targets": [
+        {
+          "rawSql": "SELECT schemaname || '.' || relname AS table_name, n_live_tup AS row_count FROM pg_stat_user_tables ORDER BY n_live_tup DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 1000, "color": "yellow" },
+              { "value": 10000, "color": "red" }
+            ]
+          }
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Query: Browse Table Data",
+      "description": "Use the $table variable to select a table. Modify the SQL below as needed.",
+      "type": "table",
+      "datasource": { "type": "postgres", "uid": "ontodb" },
+      "targets": [
+        {
+          "rawSql": "SELECT * FROM \"$table\" LIMIT 100",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "footer": { "show": true, "reducer": ["count"] }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Custom SQL Query",
+      "description": "Edit this panel's SQL to run any query against OntoDB.",
+      "type": "table",
+      "datasource": { "type": "postgres", "uid": "ontodb" },
+      "targets": [
+        {
+          "rawSql": "SELECT id, name, price FROM Product WHERE price > 100 ORDER BY price DESC LIMIT 50",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 18 },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "footer": { "show": true, "reducer": ["count", "sum"] }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Time Series Example",
+      "description": "If your data has a timestamp column, use($__time) to enable time series visualization.",
+      "type": "timeseries",
+      "datasource": { "type": "postgres", "uid": "ontodb" },
+      "targets": [
+        {
+          "rawSql": "SELECT created_at AS time, COUNT(*) AS count FROM events GROUP BY created_at ORDER BY created_at",
+          "format": "time_series",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "pointSize": 5
+          }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Aggregation Example",
+      "description": "GROUP BY with aggregates — edit the SQL for your schema.",
+      "type": "piechart",
+      "datasource": { "type": "postgres", "uid": "ontodb" },
+      "targets": [
+        {
+          "rawSql": "SELECT category, COUNT(*) AS count FROM Product GROUP BY category ORDER BY count DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "legend": { "displayMode": "table", "placement": "right" }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Top N by Value",
+      "type": "barchart",
+      "datasource": { "type": "postgres", "uid": "ontodb" },
+      "targets": [
+        {
+          "rawSql": "SELECT name, price FROM Product ORDER BY price DESC LIMIT 10",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "showValue": "auto"
+      }
+    }
+  ],
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": ""
+}

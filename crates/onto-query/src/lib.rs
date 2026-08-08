@@ -12,6 +12,8 @@ pub mod sparql;
 mod concurrent_bench;
 #[cfg(test)]
 mod binary_row_bench;
+#[cfg(test)]
+mod fuzz_tests;
 
 pub use cache::{PlanCache, QueryCache, CacheStats};
 pub use executor::{QueryExecutor, QueryResult};

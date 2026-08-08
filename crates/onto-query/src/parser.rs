@@ -934,6 +934,10 @@ impl QueryParser {
             .find("VALUES")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'VALUES'".to_string()))?;
 
+        if values_pos < into_pos + 4 {
+            return Err(CoreError::InvalidArgument("malformed INSERT: 'VALUES' appears before 'INTO'".to_string()));
+        }
+
         let header = input[into_pos + 4..values_pos].trim();
         let values_str = input[values_pos + 6..].trim();
 

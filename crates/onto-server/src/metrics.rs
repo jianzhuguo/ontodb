@@ -178,6 +178,60 @@ pub struct Metrics {
     /// Compaction count.
     pub compactions_total: AtomicCounter,
 
+    // ── Slow query metrics ──
+    /// Queries exceeding the slow query threshold.
+    pub slow_queries_total: AtomicCounter,
+
+    // ── System resource metrics ──
+    /// Process memory usage in bytes (RSS).
+    pub memory_usage_bytes: AtomicCounter,
+    /// Number of open file descriptors.
+    pub open_file_descriptors: AtomicCounter,
+
+    // ── Storage engine details ──
+    /// WAL file size in bytes.
+    pub wal_size_bytes: AtomicCounter,
+    /// MemTable size in bytes.
+    pub memtable_size_bytes: AtomicCounter,
+    /// Total disk usage in bytes.
+    pub disk_usage_bytes: AtomicCounter,
+
+    // ── Cache metrics ──
+    /// Block cache hits.
+    pub block_cache_hits_total: AtomicCounter,
+    /// Block cache misses.
+    pub block_cache_misses_total: AtomicCounter,
+    /// Block cache evictions.
+    pub block_cache_evictions_total: AtomicCounter,
+
+    // ── Transaction metrics ──
+    /// Currently active transactions.
+    pub active_transactions: AtomicCounter,
+
+    // ── WAL metrics ──
+    /// Total WAL writes.
+    pub wal_writes_total: AtomicCounter,
+    /// WAL sync latency histogram.
+    pub wal_sync_latency: Histogram,
+
+    // ── Compaction metrics ──
+    /// Pending compaction tasks.
+    pub compaction_pending: AtomicCounter,
+    /// Compaction latency histogram.
+    pub compaction_latency: Histogram,
+
+    // ── Backup metrics ──
+    /// Last backup timestamp (Unix seconds).
+    pub last_backup_timestamp: AtomicCounter,
+    /// Last backup size in bytes.
+    pub last_backup_size_bytes: AtomicCounter,
+
+    // ── Raft metrics ──
+    /// Raft state: 0=follower, 1=leader, 2=candidate, 3=standalone.
+    pub raft_state: AtomicCounter,
+    /// Raft log lag (entries behind leader).
+    pub raft_log_lag: AtomicCounter,
+
     // ── Server info ──
     /// Server start time.
     pub started_at: Instant,
@@ -209,6 +263,24 @@ impl Metrics {
             sstable_count: AtomicCounter::new(),
             storage_entries: AtomicCounter::new(),
             compactions_total: AtomicCounter::new(),
+            slow_queries_total: AtomicCounter::new(),
+            memory_usage_bytes: AtomicCounter::new(),
+            open_file_descriptors: AtomicCounter::new(),
+            wal_size_bytes: AtomicCounter::new(),
+            memtable_size_bytes: AtomicCounter::new(),
+            disk_usage_bytes: AtomicCounter::new(),
+            block_cache_hits_total: AtomicCounter::new(),
+            block_cache_misses_total: AtomicCounter::new(),
+            block_cache_evictions_total: AtomicCounter::new(),
+            active_transactions: AtomicCounter::new(),
+            wal_writes_total: AtomicCounter::new(),
+            wal_sync_latency: Histogram::new_latency(),
+            compaction_pending: AtomicCounter::new(),
+            compaction_latency: Histogram::new_latency(),
+            last_backup_timestamp: AtomicCounter::new(),
+            last_backup_size_bytes: AtomicCounter::new(),
+            raft_state: AtomicCounter::new(),
+            raft_log_lag: AtomicCounter::new(),
             started_at: Instant::now(),
         }
     }
@@ -411,6 +483,84 @@ impl Metrics {
             "ontodb_compactions_total {}\n",
             self.compactions_total.get()
         ));
+
+        // ── System resources ──
+        output.push_str("# HELP ontodb_memory_usage_bytes Process memory usage (RSS)\n");
+        output.push_str("# TYPE ontodb_memory_usage_bytes gauge\n");
+        output.push_str(&format!("ontodb_memory_usage_bytes {}\n", self.memory_usage_bytes.get()));
+
+        output.push_str("# HELP ontodb_open_file_descriptors Open file descriptors\n");
+        output.push_str("# TYPE ontodb_open_file_descriptors gauge\n");
+        output.push_str(&format!("ontodb_open_file_descriptors {}\n", self.open_file_descriptors.get()));
+
+        // ── Storage engine details ──
+        output.push_str("# HELP ontodb_wal_size_bytes WAL file size\n");
+        output.push_str("# TYPE ontodb_wal_size_bytes gauge\n");
+        output.push_str(&format!("ontodb_wal_size_bytes {}\n", self.wal_size_bytes.get()));
+
+        output.push_str("# HELP ontodb_memtable_size_bytes MemTable size\n");
+        output.push_str("# TYPE ontodb_memtable_size_bytes gauge\n");
+        output.push_str(&format!("ontodb_memtable_size_bytes {}\n", self.memtable_size_bytes.get()));
+
+        output.push_str("# HELP ontodb_disk_usage_bytes Total disk usage\n");
+        output.push_str("# TYPE ontodb_disk_usage_bytes gauge\n");
+        output.push_str(&format!("ontodb_disk_usage_bytes {}\n", self.disk_usage_bytes.get()));
+
+        // ── Cache ──
+        output.push_str("# HELP ontodb_block_cache_hits_total Block cache hits\n");
+        output.push_str("# TYPE ontodb_block_cache_hits_total counter\n");
+        output.push_str(&format!("ontodb_block_cache_hits_total {}\n", self.block_cache_hits_total.get()));
+
+        output.push_str("# HELP ontodb_block_cache_misses_total Block cache misses\n");
+        output.push_str("# TYPE ontodb_block_cache_misses_total counter\n");
+        output.push_str(&format!("ontodb_block_cache_misses_total {}\n", self.block_cache_misses_total.get()));
+
+        output.push_str("# HELP ontodb_block_cache_evictions_total Block cache evictions\n");
+        output.push_str("# TYPE ontodb_block_cache_evictions_total counter\n");
+        output.push_str(&format!("ontodb_block_cache_evictions_total {}\n", self.block_cache_evictions_total.get()));
+
+        // ── Transactions ──
+        output.push_str("# HELP ontodb_active_transactions Active MVCC transactions\n");
+        output.push_str("# TYPE ontodb_active_transactions gauge\n");
+        output.push_str(&format!("ontodb_active_transactions {}\n", self.active_transactions.get()));
+
+        // ── WAL ──
+        output.push_str("# HELP ontodb_wal_writes_total Total WAL writes\n");
+        output.push_str("# TYPE ontodb_wal_writes_total counter\n");
+        output.push_str(&format!("ontodb_wal_writes_total {}\n", self.wal_writes_total.get()));
+
+        output.push_str(&self.wal_sync_latency.to_prometheus(
+            "ontodb_wal_sync_duration_seconds",
+            "WAL fsync latency",
+        ));
+
+        // ── Compaction ──
+        output.push_str("# HELP ontodb_compaction_pending Pending compaction tasks\n");
+        output.push_str("# TYPE ontodb_compaction_pending gauge\n");
+        output.push_str(&format!("ontodb_compaction_pending {}\n", self.compaction_pending.get()));
+
+        output.push_str(&self.compaction_latency.to_prometheus(
+            "ontodb_compaction_duration_seconds",
+            "Compaction latency",
+        ));
+
+        // ── Backup ──
+        output.push_str("# HELP ontodb_last_backup_timestamp Last backup Unix timestamp\n");
+        output.push_str("# TYPE ontodb_last_backup_timestamp gauge\n");
+        output.push_str(&format!("ontodb_last_backup_timestamp {}\n", self.last_backup_timestamp.get()));
+
+        output.push_str("# HELP ontodb_last_backup_size_bytes Last backup size\n");
+        output.push_str("# TYPE ontodb_last_backup_size_bytes gauge\n");
+        output.push_str(&format!("ontodb_last_backup_size_bytes {}\n", self.last_backup_size_bytes.get()));
+
+        // ── Raft ──
+        output.push_str("# HELP ontodb_raft_state Raft state (0=follower, 1=leader, 2=candidate, 3=standalone)\n");
+        output.push_str("# TYPE ontodb_raft_state gauge\n");
+        output.push_str(&format!("ontodb_raft_state {}\n", self.raft_state.get()));
+
+        output.push_str("# HELP ontodb_raft_log_lag Raft log entries behind leader\n");
+        output.push_str("# TYPE ontodb_raft_log_lag gauge\n");
+        output.push_str(&format!("ontodb_raft_log_lag {}\n", self.raft_log_lag.get()));
 
         output
     }

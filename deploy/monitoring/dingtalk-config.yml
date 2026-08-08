@@ -1,0 +1,29 @@
+## Prometheus Webhook DingTalk 配置
+## 文档: https://github.com/timonwong/prometheus-webhook-dingtalk
+
+targets:
+  ops:
+    url: https://oapi.dingtalk.com/robot/send?access_token=${DINGTALK_ACCESS_TOKEN}
+    secret: ${DINGTALK_SECRET}
+    message:
+      # 告警消息模板
+      title: '{{ template "ding.link.title" . }}'
+      text: '{{ template "ding.link.content" . }}'
+
+    # 消息模板
+templates:
+  - title: '{{ template "ding.link.title" . }}'
+    text: |
+      {{ $externalURL := .ExternalURL }}
+      {{ range .Alerts }}
+      ### [{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Labels.severity | toUpper }}{{ end }}] {{ .Annotations.summary }}
+
+      **告警详情:**
+      - 告警名称: {{ .Labels.alertname }}
+      - 严重程度: {{ .Labels.severity }}
+      - 告警描述: {{ .Annotations.description }}
+      - 开始时间: {{ .StartsAt.Format "2006-01-02 15:04:05" }}
+      {{ if .EndsAt }}- 结束时间: {{ .EndsAt.Format "2006-01-02 15:04:05" }}{{ end }}
+
+      [查看详情]({{ $externalURL }})
+      {{ end }}

@@ -19,3 +19,4 @@ csv = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rand = { workspace = true }

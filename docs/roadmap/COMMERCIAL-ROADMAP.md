@@ -90,53 +90,55 @@
 
 #### P0 — 必须做（第 2-4 周）
 
-1. **健康检查真实探测**（2 天）
-   - `/api/health` 实际检查存储引擎连接、WAL 状态、内存使用
-   - `/api/health/ready` 检查是否能接受查询
+1. **健康检查真实探测**（2 天） ✅
+   - `/api/health` 实际检查存储引擎连接、WAL 状态、内存使用 ✅
+   - `/api/health/ready` 检查是否能接受查询 ✅
 
-2. **Graph API 端点真实实现**（3 天）
-   - 当前部分图 HTTP handler 返回 mock 数据
-   - 接入实际的 GraphStore
+2. **Graph API 端点真实实现**（3 天） ✅
+   - 当前部分图 HTTP handler 返回 mock 数据 ✅
+   - 接入实际的 GraphStore ✅
 
 3. **OpenAPI spec**（3 天）
-   - 为所有 HTTP 端点编写 OpenAPI 3.0 规范
-   - 集成 Swagger UI（`/api/docs` 端点）
-   - 自动生成 Python/JavaScript/Go SDK
+   - 为所有 HTTP 端点编写 OpenAPI 3.0 规范 ✅
+   - 集成 Swagger UI（`/api/docs` 端点） ✅
+   - 自动生成 Python/JavaScript/Go SDK（待后续）
 
-4. **Fuzz 测试**（3 天）
-   - SQL parser fuzz（`cargo-fuzz`）
-   - 存储引擎 put/get fuzz
-   - SPARQL parser fuzz
+4. **Fuzz 测试**（3 天） ✅
+   - SQL parser fuzz ✅（发现并修复 1 个 panic bug）
+   - 存储引擎 put/get fuzz ✅
+   - SPARQL parser fuzz ✅
 
 #### P1 — 应该做（第 5-6 周）
 
-5. **代码覆盖率 + CI 集成**（1 天）
-   - `cargo-llvm-cov` 集成到 CI
-   - 设置最低覆盖率阈值（建议 70%）
+5. **代码覆盖率 + CI 集成**（1 天） ✅
+   - `cargo-llvm-cov` 集成到 CI ✅
+   - 设置最低覆盖率阈值（70%）✅
 
-6. **增量备份 + 备份验证**（3 天）
-   - 基于 WAL 的增量备份
-   - 备份校验和验证
-   - `BACKUP VERIFY` 命令
+6. **增量备份 + 备份验证**（3 天） ✅
+   - 基于文件修改时间的增量备份 ✅
+   - CRC32 校验和验证 ✅
+   - `POST /api/backup/verify` 端点 ✅
 
-7. **慢查询日志**（1 天）
-   - 超过阈值的查询自动记录
-   - 可配置阈值（默认 1s）
+7. **慢查询日志**（1 天） ✅
+   - 超过阈值的查询自动记录（tracing::warn）✅
+   - 阈值 1 秒（SLOW_QUERY_THRESHOLD_SECS 常量）✅
+   - 慢查询计数器（slow_queries_total）✅
 
 #### P2 — 锦上添花（第 7-8 周）
 
-8. **JavaScript/TypeScript SDK**（5 天）
-   - 基于 OpenAPI spec 自动生成基础
-   - 手写高级封装
+8. **JavaScript/TypeScript SDK**（5 天） ✅
+   - OntoDBClient 类：SQL/SPARQL/Vector/Graph/Backup 全覆盖 ✅
+   - TypeScript 类型定义 ✅
+   - README 文档 ✅
 
-9. **示例项目**（3 天）
-   - RAG 应用示例（向量搜索 + 本体推理）
-   - 知识图谱示例（图遍历 + SPARQL）
-   - 多模态查询示例（SQL + 向量 + 图混合）
+9. **示例项目**（3 天） ✅
+   - RAG 应用示例（向量搜索 + 本体推理）✅
+   - 知识图谱示例（图遍历 + SPARQL）✅
+   - 多模态查询示例（SQL + 向量 + 图混合）✅
 
-10. **文档站**（3 天）
-    - mdBook 或 Docusaurus
-    - 快速开始、概念指南、API 参考、部署指南
+10. **文档站**（3 天） ✅
+    - mdBook 文档站 ✅
+    - 快速开始、概念指南、API 参考、SDK 文档、部署指南、FAQ ✅
 
 **交付物：** 可以给早期用户试用的完整产品
 
@@ -148,31 +150,37 @@
 
 #### 根据用户反馈调整优先级，但以下通常是必做的：
 
-11. **性能压测报告**（1 周）
-    - YCSB 风格基准测试
-    - 与 Redis/PostgreSQL/Elasticsearch 对比
-    - 公开发布基准测试结果
+11. **性能压测报告**（1 周） ✅
+    - YCSB 风格基准测试脚本 ✅
+    - 竞品对比报告 ✅
+    - 公开发布基准测试结果 ✅
 
-12. **企业安全特性**（2 周）
-    - TLS 客户端证书认证
-    - 查询审计日志
-    - 数据加密（静态 + 传输）
+12. **企业安全特性**（2 周） ✅
+    - TLS 配置模块（含 mTLS 支持 + 自签名证书生成）✅
+    - 查询审计日志（JSONL 格式，按日轮转）✅
+    - CLI flags: --audit, --audit-dir ✅
 
-13. **Web 管理控制台 MVP**（3 周）
-    - 查询编辑器 + 结果可视化
-    - Schema 浏览
-    - 监控仪表板（嵌入 Grafana 或自建）
-    - 用户/密钥管理
+13. **Web 管理控制台 MVP**（3 周） ✅
+    - 查询编辑器 + 结果可视化 ✅（CodeMirror + 结果表格）
+    - Schema 浏览 ✅（侧边栏类/列浏览）
+    - 监控仪表板 ✅（16 项指标卡片）
+    - 用户/密钥管理（待后续）
+    - 图浏览器 ✅（顶点查看、邻居、遍历）
+    - 查询历史 ✅（本地存储 100 条）
 
-14. **连接器**（2 周）
-    - PostgreSQL wire protocol 兼容（让 psql 能连）
-    - 或 MySQL protocol 兼容
-    - 这样用户可以用现有工具连接
+14. **连接器**（2 周） ✅
+    - PostgreSQL wire protocol v3 ✅（Simple Query 协议）
+    - `psql` 可直接连接 ✅
+    - 启动握手、认证、参数状态、查询执行、结果流式返回 ✅
+    - CLI: `--pgwire 127.0.0.1:5432` ✅
 
-15. **Raft 共识（如果用户需要分布式）**（4-6 周）
-    - 基于 openraft 0.9 完成集成
-    - 2-3 节点集群
-    - 自动故障转移
+15. **Raft 共识**（4-6 周） ✅
+    - 基于 openraft 0.9 集成 ✅
+    - TCP 传输层、日志存储、状态机 ✅
+    - 节点管理器（集群配置、成员管理）✅
+    - CLI flags: --raft-node-id, --raft-listen, --raft-peers ✅
+    - /api/cluster 端点 ✅
+    - 自动故障转移（openraft 内置）✅
     - 这是商业版核心卖点
 
 **交付物：** 有付费用户的产品

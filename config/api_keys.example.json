@@ -5,19 +5,22 @@
       "key": "CHANGE_ME_ADMIN_KEY_HERE",
       "description": "Admin key with full access",
       "permission": "Admin",
-      "rate_limit": 120
+      "rate_limit": 120,
+      "allowed_ips": ["127.0.0.1", "10.0.0.0/8"]
     },
     {
       "key": "CHANGE_ME_READONLY_KEY_HERE",
       "description": "Read-only access for dashboards",
       "permission": "ReadOnly",
-      "rate_limit": 30
+      "rate_limit": 30,
+      "allowed_ips": []
     },
     {
       "key": "CHANGE_ME_APP_KEY_HERE",
       "description": "Application read-write access",
       "permission": "ReadWrite",
-      "rate_limit": 60
+      "rate_limit": 60,
+      "allowed_ips": ["192.168.1.0/24", "172.16.0.0/12"]
     }
   ],
   "default_permission": "ReadOnly"

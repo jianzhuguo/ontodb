@@ -96,6 +96,8 @@ pub struct RateLimiter {
     buckets: Arc<Mutex<HashMap<String, TokenBucket>>>,
     /// Configuration.
     config: RateLimitConfig,
+    /// Metrics counter for rate-limited requests.
+    pub metrics: Option<crate::metrics::SharedMetrics>,
 }
 
 impl RateLimiter {
@@ -103,7 +105,14 @@ impl RateLimiter {
         Self {
             buckets: Arc::new(Mutex::new(HashMap::new())),
             config,
+            metrics: None,
         }
+    }
+
+    /// Set metrics for rate limit tracking.
+    pub fn with_metrics(mut self, metrics: crate::metrics::SharedMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Remove token buckets that haven't been accessed in the given duration.
@@ -168,9 +177,12 @@ pub async fn rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> impl IntoResponse {
-    // Skip rate limiting for health check endpoints
+    // Skip rate limiting for health check and metrics endpoints
     let path = request.uri().path();
-    if path == "/api/health" || path == "/api/health/ready" || path == "/api/health/live" {
+    if path == "/api/health" || path == "/api/health/ready" || path == "/api/health/live"
+        || path == "/metrics" || path == "/api/metrics"
+        || path == "/api/docs" || path == "/api/openapi.json"
+        || path == "/console" || path == "/" {
         return next.run(request).await;
     }
 
@@ -208,18 +220,24 @@ pub async fn rate_limit_middleware(
             );
             response
         }
-        Err(retry_after) => (
-            StatusCode::TOO_MANY_REQUESTS,
-            [
-                ("Retry-After", retry_after.as_secs().to_string()),
-                ("X-RateLimit-Limit", "0".to_string()),
-                ("X-RateLimit-Remaining", "0".to_string()),
-            ],
-            Json(json!({
-                "success": false,
-                "error": format!("Rate limit exceeded. Retry after {} seconds", retry_after.as_secs())
-            })),
-        )
-            .into_response(),
+        Err(retry_after) => {
+            // Increment rate limit counter in metrics
+            if let Some(ref metrics) = limiter.metrics {
+                metrics.rate_limited_total.inc();
+            }
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    ("Retry-After", retry_after.as_secs().to_string()),
+                    ("X-RateLimit-Limit", "0".to_string()),
+                    ("X-RateLimit-Remaining", "0".to_string()),
+                ],
+                Json(json!({
+                    "success": false,
+                    "error": format!("Rate limit exceeded. Retry after {} seconds", retry_after.as_secs())
+                })),
+            )
+                .into_response()
+        }
     }
 }

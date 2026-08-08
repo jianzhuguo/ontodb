@@ -1400,6 +1400,8 @@ impl LsmEngine {
         let mut manifest = BackupManifest {
             timestamp: chrono_timestamp(),
             files: Vec::new(),
+            backup_type: "full".to_string(),
+            base_timestamp: None,
         };
 
         // Step 4: Copy SSTable files
@@ -1416,11 +1418,13 @@ impl LsmEngine {
             let fname = sst_path.file_name().unwrap().to_str().unwrap();
             let dest = backup_dir.join(fname);
             fs::copy(sst_path, &dest)?;
-            let size = fs::metadata(&dest)?.len();
+            let data = fs::read(&dest)?;
+            let checksum = crc32fast::hash(&data);
             manifest.files.push(BackupFile {
                 name: fname.to_string(),
-                size,
+                size: data.len() as u64,
                 file_type: BackupFileType::SSTable,
+                checksum,
             });
         }
 
@@ -1429,11 +1433,13 @@ impl LsmEngine {
         if wal_path.exists() {
             let dest = backup_dir.join("wal.log");
             fs::copy(&wal_path, &dest)?;
-            let size = fs::metadata(&dest)?.len();
+            let data = fs::read(&dest)?;
+            let checksum = crc32fast::hash(&data);
             manifest.files.push(BackupFile {
                 name: "wal.log".to_string(),
-                size,
+                size: data.len() as u64,
                 file_type: BackupFileType::Wal,
+                checksum,
             });
         }
 
@@ -1447,11 +1453,13 @@ impl LsmEngine {
                     let fname = path.file_name().unwrap().to_str().unwrap();
                     let dest = idx_backup_dir.join(fname);
                     fs::copy(&path, &dest)?;
-                    let size = fs::metadata(&dest)?.len();
+                    let data = fs::read(&dest)?;
+                    let checksum = crc32fast::hash(&data);
                     manifest.files.push(BackupFile {
                         name: format!("indexes/{}", fname),
-                        size,
+                        size: data.len() as u64,
                         file_type: BackupFileType::Index,
+                        checksum,
                     });
                 }
             }
@@ -1515,6 +1523,171 @@ impl LsmEngine {
         Ok(manifest)
     }
 
+    /// Creates an incremental backup — only copies files modified since the given timestamp.
+    ///
+    /// This is much faster than a full backup when only a few SSTables have changed.
+    /// The `since` parameter should be the timestamp from a previous full or incremental backup.
+    ///
+    /// The incremental backup always includes the WAL file (for point-in-time recovery).
+    pub fn backup_incremental(&self, backup_dir: &Path, since: &std::time::SystemTime) -> Result<BackupManifest> {
+        self.flush()?;
+        self.flush_disk_indexes()?;
+
+        fs::create_dir_all(backup_dir)?;
+        let idx_backup_dir = backup_dir.join("indexes");
+        fs::create_dir_all(&idx_backup_dir)?;
+
+        let since_modified = *since;
+
+        let mut manifest = BackupManifest {
+            timestamp: chrono_timestamp(),
+            files: Vec::new(),
+            backup_type: "incremental".to_string(),
+            base_timestamp: None,
+        };
+
+        // Copy only SSTables modified since the last backup
+        let levels = self.levels.lock().unwrap();
+        let mut sst_paths: Vec<PathBuf> = Vec::new();
+        for level in levels.iter() {
+            for info in level.iter() {
+                sst_paths.push(info.path.clone());
+            }
+        }
+        drop(levels);
+
+        for sst_path in &sst_paths {
+            let meta = fs::metadata(sst_path)?;
+            if let Ok(modified) = meta.modified() {
+                if modified > since_modified {
+                    let fname = sst_path.file_name().unwrap().to_str().unwrap();
+                    let dest = backup_dir.join(fname);
+                    fs::copy(sst_path, &dest)?;
+                    let data = fs::read(&dest)?;
+                    let checksum = crc32fast::hash(&data);
+                    manifest.files.push(BackupFile {
+                        name: fname.to_string(),
+                        size: data.len() as u64,
+                        file_type: BackupFileType::SSTable,
+                        checksum,
+                    });
+                }
+            }
+        }
+
+        // Always copy WAL (needed for PITR)
+        let wal_path = self.options.data_dir.join("wal.log");
+        if wal_path.exists() {
+            let dest = backup_dir.join("wal.log");
+            fs::copy(&wal_path, &dest)?;
+            let data = fs::read(&dest)?;
+            let checksum = crc32fast::hash(&data);
+            manifest.files.push(BackupFile {
+                name: "wal.log".to_string(),
+                size: data.len() as u64,
+                file_type: BackupFileType::Wal,
+                checksum,
+            });
+        }
+
+        // Copy modified index files
+        let idx_dir = self.options.data_dir.join("indexes");
+        if idx_dir.exists() {
+            for entry in fs::read_dir(&idx_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("idx") {
+                    if let Ok(meta) = fs::metadata(&path) {
+                        if let Ok(modified) = meta.modified() {
+                            if modified > since_modified {
+                                let fname = path.file_name().unwrap().to_str().unwrap();
+                                let dest = idx_backup_dir.join(fname);
+                                fs::copy(&path, &dest)?;
+                                let data = fs::read(&dest)?;
+                                let checksum = crc32fast::hash(&data);
+                                manifest.files.push(BackupFile {
+                                    name: format!("indexes/{}", fname),
+                                    size: data.len() as u64,
+                                    file_type: BackupFileType::Index,
+                                    checksum,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Write manifest
+        let manifest_json = serde_json::to_string_pretty(&manifest)
+            .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
+        fs::write(backup_dir.join("manifest.json"), manifest_json)?;
+
+        tracing::info!(
+            "Incremental backup completed: {} new/modified files, {} bytes total",
+            manifest.files.len(),
+            manifest.files.iter().map(|f| f.size).sum::<u64>()
+        );
+
+        Ok(manifest)
+    }
+
+    /// Verifies a backup's integrity by checking all files exist and checksums match.
+    ///
+    /// Returns `Ok(())` if all checks pass, or an error describing what's wrong.
+    pub fn verify_backup(backup_dir: &Path) -> Result<()> {
+        let manifest_path = backup_dir.join("manifest.json");
+        if !manifest_path.exists() {
+            return Err(onto_core::CoreError::Custom("manifest.json not found in backup directory".to_string()));
+        }
+
+        let manifest_bytes = fs::read(&manifest_path)?;
+        let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
+
+        let mut errors: Vec<String> = Vec::new();
+
+        for file in &manifest.files {
+            let path = backup_dir.join(&file.name);
+
+            // Check file exists
+            if !path.exists() {
+                errors.push(format!("missing file: {}", file.name));
+                continue;
+            }
+
+            // Check file size
+            let meta = fs::metadata(&path)?;
+            if meta.len() != file.size {
+                errors.push(format!(
+                    "size mismatch for {}: expected {} bytes, found {} bytes",
+                    file.name, file.size, meta.len()
+                ));
+                continue;
+            }
+
+            // Check checksum (skip if 0 — backward compat with old manifests)
+            if file.checksum != 0 {
+                let data = fs::read(&path)?;
+                let actual_checksum = crc32fast::hash(&data);
+                if actual_checksum != file.checksum {
+                    errors.push(format!(
+                        "checksum mismatch for {}: expected {:#010x}, found {:#010x}",
+                        file.name, file.checksum, actual_checksum
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            tracing::info!("Backup verification passed: {} files OK", manifest.files.len());
+            Ok(())
+        } else {
+            let msg = format!("Backup verification failed:\n  {}", errors.join("\n  "));
+            Err(onto_core::CoreError::Custom(msg))
+        }
+    }
+
     /// Flushes all disk-based indexes to disk (with fsync).
     fn flush_disk_indexes(&self) -> Result<()> {
         self.index_manager.write().unwrap().flush_disk_indexes();
@@ -1539,6 +1712,16 @@ pub struct BackupManifest {
     pub timestamp: String,
     /// List of files included in the backup.
     pub files: Vec<BackupFile>,
+    /// Backup type: "full" or "incremental".
+    #[serde(default = "default_backup_type")]
+    pub backup_type: String,
+    /// For incremental backups: ISO 8601 timestamp of the base backup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_timestamp: Option<String>,
+}
+
+fn default_backup_type() -> String {
+    "full".to_string()
 }
 
 /// A single file in a backup.
@@ -1550,6 +1733,9 @@ pub struct BackupFile {
     pub size: u64,
     /// Type of file.
     pub file_type: BackupFileType,
+    /// CRC32 checksum of the file content.
+    #[serde(default)]
+    pub checksum: u32,
 }
 
 /// Type of backed-up file.
