@@ -14,6 +14,7 @@ mod metrics;
 pub mod mysqlwire;
 pub mod pgwire;
 mod rate_limit;
+pub mod security_audit;
 pub mod tls;
 
 use auth::{AuthConfig, AuthState, Permission};
@@ -89,6 +90,10 @@ struct Args {
     #[arg(long, env = "MYSQL_LISTEN")]
     mysql: Option<String>,
 
+    /// Run security audit and exit (does not start server)
+    #[arg(long)]
+    security_audit: bool,
+
     /// Enable CDC (Change Data Capture) and publish to Kafka
     #[arg(long, env = "CDC_ENABLED")]
     cdc_enabled: bool,
@@ -159,6 +164,26 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+
+    // Run security audit if requested
+    if args.security_audit {
+        let target = security_audit::AuditTarget {
+            auth_enabled: args.auth,
+            api_keys_count: 0, // Will be updated after loading config
+            tls_enabled: args.tls_cert.is_some() && args.tls_key.is_some(),
+            tls_min_version: args.tls_min_version.clone(),
+            rate_limiting_enabled: !args.no_rate_limit,
+            audit_logging_enabled: args.audit,
+            cors_origins: args.cors_origins.clone(),
+            has_default_credentials: false, // Would need to check actual config
+            pgwire_enabled: args.pgwire.is_some(),
+            mysql_enabled: args.mysql.is_some(),
+            exposed_ports: vec![],
+        };
+        let result = security_audit::run_security_audit(&target);
+        println!("{}", security_audit::format_report(&result));
+        std::process::exit(if result.score >= 80 { 0 } else { 1 });
+    }
 
     let tier = onto_enterprise::current_tier();
     let features = onto_enterprise::enabled_features();

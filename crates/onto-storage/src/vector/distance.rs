@@ -1,7 +1,7 @@
 //! Distance metrics for vector similarity search.
 
 /// Distance metric used for vector comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DistanceMetric {
     /// Euclidean (L2) distance. Lower is more similar.
     L2,

@@ -41,6 +41,8 @@ rcgen = "0.13"
 x509-parser = "0.16"
 # Cryptographic hashing (audit integrity chain)
 sha2 = "0.10"
+# Date/time for security audit timestamps
+chrono = "0.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }

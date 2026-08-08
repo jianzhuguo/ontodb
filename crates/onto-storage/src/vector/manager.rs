@@ -157,6 +157,56 @@ impl VectorIndexManager {
         self.indexes.len()
     }
 
+    /// Save all HNSW graph structures to bytes for persistence.
+    ///
+    /// Returns a map of (class, column) -> serialized HnswIndex bytes.
+    pub fn save_all_graphs(&self) -> HashMap<(String, String), Vec<u8>> {
+        let mut result = HashMap::new();
+        for (key, index) in &self.indexes {
+            if let Ok(bytes) = index.save_to_bytes() {
+                result.insert((key.class.clone(), key.column.clone()), bytes);
+            }
+        }
+        result
+    }
+
+    /// Save a single HNSW graph structure to bytes.
+    pub fn save_graph(&self, class: &str, column: &str) -> Option<Vec<u8>> {
+        let key = IndexKey {
+            class: class.to_string(),
+            column: column.to_string(),
+        };
+        self.indexes.get(&key)?.save_to_bytes().ok()
+    }
+
+    /// Load an HNSW graph structure from bytes.
+    pub fn load_graph(&mut self, class: &str, column: &str, data: &[u8]) -> Result<()> {
+        let index = HnswIndex::load_from_bytes(data)
+            .map_err(|e| CoreError::InvalidArgument(format!("Failed to load HNSW graph: {}", e)))?;
+
+        let key = IndexKey {
+            class: class.to_string(),
+            column: column.to_string(),
+        };
+
+        // Update config metadata from loaded index
+        let config = index.config();
+        let meta = VectorIndexMeta {
+            class: class.to_string(),
+            column: column.to_string(),
+            dimension: config.dimension,
+            metric: config.metric,
+            m: config.m,
+            ef_construction: config.ef_construction,
+            ef_search: config.ef_search,
+        };
+
+        self.indexes.insert(key.clone(), index);
+        self.metadata.insert(key, meta);
+
+        Ok(())
+    }
+
     /// Indexes a batch of vectors under a single lock acquisition.
     /// More efficient than calling `index_vector()` in a loop for bulk operations.
     pub fn index_vector_batch(

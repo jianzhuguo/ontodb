@@ -14,7 +14,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::cmp::Ordering;
 
 /// A vector entry in the HNSW index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VectorEntry {
     pub id: Vec<u8>,
     pub vector: Vec<f32>,
@@ -28,7 +28,7 @@ pub struct SearchResult {
 }
 
 /// Configuration for the HNSW index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HnswConfig {
     pub dimension: usize,
     pub metric: DistanceMetric,
@@ -77,7 +77,7 @@ impl HnswConfig {
 }
 
 /// A node in the HNSW graph.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct HnswNode {
     entry: VectorEntry,
     /// Neighbors at each layer.
@@ -144,6 +144,15 @@ impl Ord for MaxEntry {
     }
 }
 
+/// Serializable snapshot of an HNSW index.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HnswSnapshot {
+    config: HnswConfig,
+    nodes: Vec<HnswNode>,
+    entry_point: Option<usize>,
+    max_layer: usize,
+}
+
 /// HNSW index for approximate nearest neighbor search.
 pub struct HnswIndex {
     config: HnswConfig,
@@ -166,6 +175,41 @@ impl HnswIndex {
             visited: parking_lot::RwLock::new(Vec::new()),
             visited_gen: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Save the HNSW index to bytes (for persistence).
+    ///
+    /// Captures the full graph structure (nodes, neighbors, entry point)
+    /// so the index can be restored without re-inserting all vectors.
+    pub fn save_to_bytes(&self) -> Result<Vec<u8>, String> {
+        let snapshot = HnswSnapshot {
+            config: self.config.clone(),
+            nodes: self.nodes.clone(),
+            entry_point: self.entry_point,
+            max_layer: self.max_layer,
+        };
+        serde_json::to_vec(&snapshot).map_err(|e| format!("Failed to serialize HNSW index: {}", e))
+    }
+
+    /// Load an HNSW index from bytes.
+    ///
+    /// Restores the full graph structure, avoiding the need to re-insert vectors.
+    pub fn load_from_bytes(data: &[u8]) -> Result<Self, String> {
+        let snapshot: HnswSnapshot = serde_json::from_slice(data)
+            .map_err(|e| format!("Failed to deserialize HNSW index: {}", e))?;
+
+        Ok(Self {
+            config: snapshot.config,
+            nodes: snapshot.nodes,
+            entry_point: snapshot.entry_point,
+            max_layer: snapshot.max_layer,
+            visited: parking_lot::RwLock::new(Vec::new()),
+            visited_gen: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    pub fn config(&self) -> &HnswConfig {
+        &self.config
     }
 
     pub fn len(&self) -> usize {

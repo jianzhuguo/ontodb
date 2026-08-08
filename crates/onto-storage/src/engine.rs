@@ -796,6 +796,9 @@ impl LsmEngine {
     }
 
     /// Rebuilds vector indexes by scanning persisted metadata and document data.
+    ///
+    /// First tries to load persisted HNSW graph structures (fast path).
+    /// Falls back to rebuilding from document data if graph structures not found.
     fn rebuild_vector_indexes(&self) -> Result<()> {
         let meta_entries = self.scan_prefix(b"__vec_meta__")?;
         if meta_entries.is_empty() {
@@ -825,15 +828,46 @@ impl LsmEngine {
             }
         }
 
-        // Create the indexes
+        // Try to load persisted HNSW graph structures first (fast path)
+        let graph_entries = self.scan_prefix(b"__vec_graph__")?;
+        let mut loaded_graphs: std::collections::HashMap<String, &[u8]> = std::collections::HashMap::new();
+        for (key, val_bytes) in &graph_entries {
+            if let Ok(key_str) = std::str::from_utf8(key) {
+                if let Some(graph_key) = key_str.strip_prefix("__vec_graph__") {
+                    loaded_graphs.insert(graph_key.to_string(), val_bytes.as_slice());
+                }
+            }
+        }
+
+        // Create the indexes and try to load graph structures
         for (class, column, dimension, metric, m, ef_construction, ef_search) in &index_configs {
+            let graph_key = format!("{}_{}", class, column);
+
+            if let Some(graph_data) = loaded_graphs.get(&graph_key) {
+                // Fast path: load HNSW graph structure directly
+                match self.vector_index_manager.write().unwrap().load_graph(class, column, graph_data) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Loaded vector index graph for {}.{} ({} vectors, fast restore)",
+                            class, column,
+                            self.vector_index_manager.read().unwrap()
+                                .index_meta(class, column)
+                                .map(|m| m.dimension)
+                                .unwrap_or(0)
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load HNSW graph for {}.{}, falling back to rebuild: {}", class, column, e);
+                    }
+                }
+            }
+
+            // Slow path: create empty index and backfill from documents
             let _ = self.vector_index_manager.write().unwrap().create_index(
                 class, column, *dimension, *metric, *m, *ef_construction, *ef_search,
             );
-        }
 
-        // Backfill vectors from document data (batch insert under single lock)
-        for (class, column, dimension, _, _, _, _) in &index_configs {
             let prefix = format!("{}::", class);
             let entries = self.scan_prefix(prefix.as_bytes())?;
             let mut vectors: Vec<(Vec<u8>, String, String, Vec<f32>)> = Vec::new();
@@ -860,6 +894,18 @@ impl LsmEngine {
                     .collect();
                 self.vector_index_manager.write().unwrap().index_vector_batch(&batch_refs);
             }
+
+            // Persist the rebuilt HNSW graph structure for next restart
+            if let Some(graph_bytes) = self.vector_index_manager.read().unwrap().save_graph(class, column) {
+                let graph_key = format!("__vec_graph__{}_{}", class, column);
+                let seq = self.next_seq();
+                let entry = Entry::put(graph_key.clone().into_bytes(), graph_bytes, seq);
+                let mut ws = self.write_state.write();
+                let _ = ws.wal.append(&entry);
+                let _ = ws.wal.flush_buf();
+                ws.memtable.put_with_seq(graph_key.into_bytes(), Vec::new(), seq);
+            }
+
             tracing::info!(
                 "Rebuilt vector index on {}.{} ({} vectors)",
                 class, column, count
@@ -1391,6 +1437,17 @@ impl LsmEngine {
             self.vector_index_manager.write().unwrap().index_vector_batch(&batch_refs);
         }
 
+        // Persist the HNSW graph structure for fast restart
+        if let Some(graph_bytes) = self.vector_index_manager.read().unwrap().save_graph(class, column) {
+            let graph_key = format!("__vec_graph__{}_{}", class, column);
+            let seq = self.next_seq();
+            let entry = Entry::put(graph_key.clone().into_bytes(), graph_bytes, seq);
+            let mut ws = self.write_state.write();
+            let _ = ws.wal.append(&entry);
+            let _ = ws.wal.flush_buf();
+            ws.memtable.put_with_seq(graph_key.into_bytes(), Vec::new(), seq);
+        }
+
         Ok(())
     }
 
@@ -1412,6 +1469,16 @@ impl LsmEngine {
                 return false;
             }
             ws.memtable.delete_with_seq(meta_key, seq);
+
+            // Remove persisted graph structure
+            let graph_key = format!("__vec_graph__{}_{}", class, column);
+            let seq2 = self.next_seq();
+            let del_entry2 = Entry::delete(graph_key.clone().into_bytes(), seq2);
+            if let Err(e) = ws.wal.append(&del_entry2) {
+                tracing::error!("Failed to write WAL entry for vector graph drop: {}", e);
+            }
+            ws.wal.flush_buf().ok();
+            ws.memtable.delete_with_seq(graph_key.into_bytes(), seq2);
         }
         removed
     }
