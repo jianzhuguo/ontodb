@@ -7,6 +7,7 @@ description = "Query engine - SQL parser, semantic extensions, optimizer, and ex
 
 [dependencies]
 onto-core = { workspace = true }
+onto-graph = { workspace = true }
 onto-storage = { workspace = true }
 onto-ontology = { workspace = true }
 serde = { workspace = true }

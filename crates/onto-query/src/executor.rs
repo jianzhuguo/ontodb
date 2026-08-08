@@ -253,6 +253,9 @@ impl Default for QueryConfig {
 pub struct QueryExecutor {
     engine: Arc<LsmEngine>,
     ontology_store: OntologyStore,
+    /// Graph store for unified entity anchor (relational ↔ graph sync).
+    /// Optional for backward compatibility.
+    graph: Option<Arc<onto_graph::GraphStore>>,
     /// Query planner for optimization (wrapped for interior mutability).
     planner: std::sync::RwLock<QueryPlanner>,
     /// Query result cache.
@@ -350,6 +353,7 @@ impl QueryExecutor {
         Self {
             engine,
             ontology_store,
+            graph: None,
             planner: std::sync::RwLock::new(QueryPlanner::new()),
             query_cache: Arc::new(Mutex::new(QueryCache::new(1000, Duration::from_secs(60)))),
             plan_cache: Arc::new(Mutex::new(PlanCache::new(500))),
@@ -359,6 +363,12 @@ impl QueryExecutor {
             config,
             inference_cache: Mutex::new(InferenceCache::default()),
         }
+    }
+
+    /// Set the graph store for unified entity anchor (relational ↔ graph sync).
+    pub fn with_graph(mut self, graph: Arc<onto_graph::GraphStore>) -> Self {
+        self.graph = Some(graph);
+        self
     }
 
     /// Get runtime execution statistics.
@@ -3921,6 +3931,11 @@ impl QueryExecutor {
                 let mut deleted = 0usize;
                 for row in &rows {
                     if let Some(Value::String(pk)) = row.get("__pk__") {
+                        // Sync to graph store (unified entity anchor)
+                        if let Some(ref graph) = self.graph {
+                            let entity_id = onto_core::EntityId::new(class, pk);
+                            let _ = graph.delete_vertex_by_entity(&entity_id);
+                        }
                         engine.txn_delete(txn_id, pk.as_bytes().to_vec())?;
                         deleted += 1;
                     }
@@ -4556,6 +4571,13 @@ impl QueryExecutor {
 
         let value = doc_to_storage_bytes(&doc);
 
+        // Sync to graph store (unified entity anchor)
+        if let Some(ref graph) = self.graph {
+            if let Some(entity_id) = onto_core::EntityId::from_lsm_key(&key) {
+                let _ = graph.upsert_vertex_from_entity(&entity_id, &[class.to_string()]);
+            }
+        }
+
         engine.txn_put(txn_id, key, value)?;
         Ok(QueryResult::Success("1 row inserted".to_string()))
     }
@@ -4611,7 +4633,15 @@ impl QueryExecutor {
             ImportFormat::Json => self.parse_json_to_entries(class, &content)?,
         };
 
-        let count = entries.len();
+        // Sync to graph store before batch insert
+        if let Some(ref graph) = self.graph {
+            for (key, _) in &entries {
+                if let Some(entity_id) = onto_core::EntityId::from_lsm_key(key) {
+                    let _ = graph.upsert_vertex_from_entity(&entity_id, &[class.to_string()]);
+                }
+            }
+        }
+
         let imported = engine.put_batch(entries)?;
         let elapsed = start.elapsed();
 

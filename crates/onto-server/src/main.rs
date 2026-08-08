@@ -177,7 +177,11 @@ fn main() -> Result<()> {
 
     let engine = Arc::new(LsmEngine::open(options)?);
     let ontology_store = OntologyStore::new(Arc::clone(&engine));
-    let executor = Arc::new(QueryExecutor::new(Arc::clone(&engine), ontology_store));
+    let graph_store = Arc::new(onto_graph::GraphStore::new());
+    let executor = Arc::new(
+        QueryExecutor::new(Arc::clone(&engine), ontology_store)
+            .with_graph(graph_store.clone())
+    );
 
     if args.interactive {
         run_repl(&executor)?;
@@ -254,7 +258,7 @@ fn main() -> Result<()> {
 
                 let pg_auth = auth_config.clone();
                 let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), onto_core::CoreError>> + Send>>> = vec![
-                    Box::pin(run_http_server(&http_addr, executor.clone(), auth_config, rate_limit_config, metrics.clone(), audit_config, args.raft_node_id, args.api_keys_file.clone(), args.cors_origins.clone(), tls_config)),
+                    Box::pin(run_http_server(&http_addr, executor.clone(), auth_config, rate_limit_config, metrics.clone(), audit_config, args.raft_node_id, args.api_keys_file.clone(), args.cors_origins.clone(), tls_config, graph_store.clone())),
                     Box::pin(run_tcp_server(&args.listen, executor.clone(), metrics.clone())),
                 ];
 
@@ -404,8 +408,8 @@ async fn run_http_server(
     api_keys_file: Option<PathBuf>,
     cors_origins: String,
     tls_config: Option<tls::TlsConfig>,
+    graph: Arc<onto_graph::GraphStore>,
 ) -> Result<()> {
-    let graph = Arc::new(onto_graph::GraphStore::new());
     let audit = Arc::new(audit::AuditLogger::new(audit_config));
     let state = http::AppState { executor, metrics, graph, audit, raft_node_id };
     let auth_state = AuthState::new(&auth_config).with_metrics(state.metrics.clone());
