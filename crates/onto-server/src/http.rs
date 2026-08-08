@@ -499,8 +499,8 @@ async fn execute_query(
             let elapsed = start.elapsed().as_secs_f64();
             state.metrics.record_query(query_type, elapsed, false);
             // Audit log — failed query
-            let audit_entry = state.audit.create_entry("127.0.0.1", None, query_type, query, elapsed * 1000.0, false, Some(e.to_string()));
-            state.audit.log(&audit_entry);
+            let audit_entry = state.audit.create_query_entry("127.0.0.1", None, query_type, query, elapsed * 1000.0, false, Some(e.to_string()));
+            state.audit.log(audit_entry);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 PrettyJson(ApiResponse::<Value>::error(format!("Execution error: {}", e)), false),
@@ -512,8 +512,8 @@ async fn execute_query(
     state.metrics.record_query(query_type, elapsed, true);
 
     // Audit log — successful query
-    let audit_entry = state.audit.create_entry("127.0.0.1", None, query_type, query, elapsed * 1000.0, true, None);
-    state.audit.log(&audit_entry);
+    let audit_entry = state.audit.create_query_entry("127.0.0.1", None, query_type, query, elapsed * 1000.0, true, None);
+    state.audit.log(audit_entry);
 
     // Slow query logging
     if elapsed >= SLOW_QUERY_THRESHOLD_SECS {

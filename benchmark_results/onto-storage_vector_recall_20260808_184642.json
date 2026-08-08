@@ -1,0 +1,11 @@
+{
+  "name": "onto-storage_vector_recall",
+  "crate": "onto-storage",
+  "bench_file": "vector_recall",
+  "timestamp": "20260808_184642",
+  "duration_ms": 260500,
+  "metrics": [],
+  "raw_output": "========================================================================\n  OntoDB HNSW Vector Search Recall Rate Benchmark\n========================================================================\n\n--- 1K vectors, 64D ---\n\n  ef_search=200: recall@10 = 1.0000  (100.0%)  avg_latency = 220.173\u00b5s\n  ef_search=400: recall@10 = 1.0000  (100.0%)  avg_latency = 352.59\u00b5s\n  ef_search=800: recall@10 = 1.0000  (100.0%)  avg_latency = 628.07\u00b5s\n  ef_search=1600: recall@10 = 1.0000  (100.0%)  avg_latency = 853.526\u00b5s\n\n--- 5K vectors, 128D ---\n\n  ef_search=200: recall@10 = 1.0000  (100.0%)  avg_latency = 628.6\u00b5s\n  ef_search=400: recall@10 = 1.0000  (100.0%)  avg_latency = 1.039586ms\n  ef_search=800: recall@10 = 1.0000  (100.0%)  avg_latency = 1.58812ms\n  ef_search=1600: recall@10 = 1.0000  (100.0%)  avg_latency = 2.635216ms\n\n--- 10K vectors, 256D ---\n\n  ef_search=200: recall@10 = 0.9967  (99.7%)  avg_latency = 3.23076ms\n  ef_search=400: recall@10 = 1.0000  (100.0%)  avg_latency = 4.28989ms\n  ef_search=800: recall@10 = 1.0000  (100.0%)  avg_latency = 5.223ms\n  ef_search=1600: recall@10 = 1.0000  (100.0%)  avg_latency = 7.60891ms\n\n--- Metric Comparison (5K vectors, 128D) ---\n\n  L2: recall@10 = 1.0000  (100.0%)  avg_latency = 1.04708ms\n  Cosine: recall@10 = 1.0000  (100.0%)  avg_latency = 1.350096ms\n\n========================================================================\n  Benchmark complete.\n========================================================================\n   Compiling onto-storage v0.1.0 (E:\\ontodb\\crates\\onto-storage)\n    Finished `bench` profile [optimized] target(s) in 4.69s\n     Running benches\\vector_recall.rs (target\\release\\deps\\vector_recall-aee72eb9ff8a0ad8.exe)\n",
+  "success": true,
+  "error": null
+}

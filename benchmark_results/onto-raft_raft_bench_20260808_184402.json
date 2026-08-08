@@ -1,0 +1,108 @@
+{
+  "name": "onto-raft_raft_bench",
+  "crate": "onto-raft",
+  "bench_file": "raft_bench",
+  "timestamp": "20260808_184402",
+  "duration_ms": 1330,
+  "metrics": [
+    {
+      "name": "log_append_1000",
+      "value": 554970.0,
+      "unit": "ops/sec",
+      "raw_line": "1000 entries:   1.80ms (    554970 ops/sec)"
+    },
+    {
+      "name": "log_append_10000",
+      "value": 608280.0,
+      "unit": "ops/sec",
+      "raw_line": "10000 entries:  16.44ms (    608280 ops/sec)"
+    },
+    {
+      "name": "log_append_50000",
+      "value": 595113.0,
+      "unit": "ops/sec",
+      "raw_line": "50000 entries:  84.02ms (    595113 ops/sec)"
+    },
+    {
+      "name": "log_read_1000",
+      "value": 665956.0,
+      "unit": "ops/sec",
+      "raw_line": "1000 entries:   1.50ms (    665956 ops/sec)"
+    },
+    {
+      "name": "log_read_10000",
+      "value": 610311.0,
+      "unit": "ops/sec",
+      "raw_line": "10000 entries:  16.39ms (    610311 ops/sec)"
+    },
+    {
+      "name": "log_read_50000",
+      "value": 561300.0,
+      "unit": "ops/sec",
+      "raw_line": "50000 entries:  89.08ms (    561300 ops/sec)"
+    },
+    {
+      "name": "state_machine_apply_1000",
+      "value": 950480.0,
+      "unit": "ops/sec",
+      "raw_line": "1000 entries:   1.05ms (    950480 ops/sec)"
+    },
+    {
+      "name": "state_machine_apply_10000",
+      "value": 1109287.0,
+      "unit": "ops/sec",
+      "raw_line": "10000 entries:   9.01ms (   1109287 ops/sec)"
+    },
+    {
+      "name": "state_machine_apply_50000",
+      "value": 1096054.0,
+      "unit": "ops/sec",
+      "raw_line": "50000 entries:  45.62ms (   1096054 ops/sec)"
+    },
+    {
+      "name": "log_read_10000",
+      "value": 515501.0,
+      "unit": "ops/sec",
+      "raw_line": "10000 entries:  19.40ms (    515501 ops/sec)"
+    },
+    {
+      "name": "log_read_10000",
+      "value": 555466.0,
+      "unit": "ops/sec",
+      "raw_line": "10000 entries:  18.00ms (    555466 ops/sec)"
+    },
+    {
+      "name": "log_read_10000",
+      "value": 515310.0,
+      "unit": "ops/sec",
+      "raw_line": "10000 entries:  19.41ms (    515310 ops/sec)"
+    },
+    {
+      "name": "batch_apply_100",
+      "value": 964057.0,
+      "unit": "ops/sec",
+      "raw_line": "batch_size=100, 1000 batches: 103.73ms (    964057 ops/sec)"
+    },
+    {
+      "name": "snapshot_build_1000",
+      "value": 0.0077,
+      "unit": "ms",
+      "raw_line": "1000 entries:   7.70\u00b5s (snapshot size: 0 KB)"
+    },
+    {
+      "name": "snapshot_build_10000",
+      "value": 0.0024,
+      "unit": "ms",
+      "raw_line": "10000 entries:   2.40\u00b5s (snapshot size: 0 KB)"
+    },
+    {
+      "name": "snapshot_build_50000",
+      "value": 0.0035,
+      "unit": "ms",
+      "raw_line": "50000 entries:   3.50\u00b5s (snapshot size: 0 KB)"
+    }
+  ],
+  "raw_output": "\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n           OntoDB Raft Storage Micro-Benchmarks\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n\n\u2500\u2500 Benchmark 1: Log Append Throughput \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    1000 entries:   1.80ms (    554970 ops/sec)\n   10000 entries:  16.44ms (    608280 ops/sec)\n   50000 entries:  84.02ms (    595113 ops/sec)\n\n\u2500\u2500 Benchmark 2: Log Read Throughput \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    1000 entries:   1.50ms (    665956 ops/sec)\n   10000 entries:  16.39ms (    610311 ops/sec)\n   50000 entries:  89.08ms (    561300 ops/sec)\n\n\u2500\u2500 Benchmark 3: State Machine Apply Throughput \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    1000 entries:   1.05ms (    950480 ops/sec)\n   10000 entries:   9.01ms (   1109287 ops/sec)\n   50000 entries:  45.62ms (   1096054 ops/sec)\n\n\u2500\u2500 Benchmark 4: Batch Apply Performance \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  batch_size= 10, 1000 batches:  10.67ms (    936838 ops/sec)\n  batch_size= 50, 1000 batches:  55.21ms (    905648 ops/sec)\n  batch_size=100, 1000 batches: 103.73ms (    964057 ops/sec)\n\n\u2500\u2500 Benchmark 5: Snapshot Build Performance \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    1000 entries:   7.70\u00b5s (snapshot size: 0 KB)\n   10000 entries:   2.40\u00b5s (snapshot size: 0 KB)\n   50000 entries:   3.50\u00b5s (snapshot size: 0 KB)\n\n\u2500\u2500 Benchmark 6: Restart Recovery \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    1000 entries: write=  1.01ms, recover= 12.80\u00b5s\n   10000 entries: write= 10.19ms, recover=  7.00\u00b5s\n   50000 entries: write= 47.48ms, recover=  8.00\u00b5s\n\n\u2500\u2500 Benchmark 7: Concurrent Log Writes \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  1 threads,  10000 entries:  19.40ms (    515501 ops/sec)\n  2 threads,  10000 entries:  18.00ms (    555466 ops/sec)\n  4 threads,  10000 entries:  19.41ms (    515310 ops/sec)\n\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\n  Benchmark complete.\n\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\nwarning: unused imports: `Deserialize` and `Serialize`\n  --> crates\\onto-raft\\src\\persistent_store.rs:23:13\n   |\n23 | use serde::{Deserialize, Serialize};\n   |             ^^^^^^^^^^^  ^^^^^^^^^\n   |\n   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default\n\nwarning: unused variable: `key`\n   --> crates\\onto-raft\\src\\persistent_store.rs:598:22\n    |\n598 |         if let Some((key, data)) = entries.last() {\n    |                      ^^^ help: if this is intentional, prefix it with an underscore: `_key`\n    |\n    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default\n\nwarning: constant `RAFT_META_PREFIX` is never used\n  --> crates\\onto-raft\\src\\persistent_store.rs:28:7\n   |\n28 | const RAFT_META_PREFIX: &[u8] = b\"__raft_meta__\";\n   |       ^^^^^^^^^^^^^^^^\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: constant `KEY_COMMITTED` is never used\n  --> crates\\onto-raft\\src\\persistent_store.rs:34:7\n   |\n34 | const KEY_COMMITTED: &[u8] = b\"__raft_meta__committed\";\n   |       ^^^^^^^^^^^^^\n\nwarning: `onto-raft` (lib) generated 4 warnings (run `cargo fix --lib -p onto-raft` to apply 2 suggestions)\nwarning: unused import: `RaftSnapshotBuilder`\n  --> crates\\onto-raft\\benches\\raft_bench.rs:15:40\n   |\n15 | use openraft::storage::{RaftLogReader, RaftSnapshotBuilder, RaftStorage};\n   |                                        ^^^^^^^^^^^^^^^^^^^\n   |\n   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default\n\nwarning: `onto-raft` (bench \"raft_bench\") generated 1 warning (run `cargo fix --bench \"raft_bench\" -p onto-raft` to apply 1 suggestion)\n    Finished `bench` profile [optimized] target(s) in 0.23s\n     Running benches\\raft_bench.rs (target\\release\\deps\\raft_bench-cf2195958d1f1f12.exe)\n",
+  "success": true,
+  "error": null
+}

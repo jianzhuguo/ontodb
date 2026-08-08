@@ -155,7 +155,10 @@ impl RaftStateMachine<OntoRaftConfig> for OntoStateMachine {
             self.data = data;
         }
         self.last_applied = meta.last_log_id;
-        self.last_membership = StoredMembership::new(meta.last_log_id, meta.last_membership.clone());
+        self.last_membership = StoredMembership::new(
+            meta.last_log_id,
+            meta.last_membership.membership().clone(),
+        );
         self.snapshot = Some(snapshot);
         Ok(())
     }
@@ -222,7 +225,10 @@ impl RaftStateMachine<OntoRaftConfig> for &mut OntoStateMachine {
             self.data = data;
         }
         self.last_applied = meta.last_log_id;
-        self.last_membership = StoredMembership::new(meta.last_log_id, meta.last_membership.clone());
+        self.last_membership = StoredMembership::new(
+            meta.last_log_id,
+            meta.last_membership.membership().clone(),
+        );
         self.snapshot = Some(snapshot);
         Ok(())
     }

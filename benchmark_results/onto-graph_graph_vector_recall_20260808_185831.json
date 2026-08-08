@@ -1,0 +1,11 @@
+{
+  "name": "onto-graph_graph_vector_recall",
+  "crate": "onto-graph",
+  "bench_file": "graph_vector_recall",
+  "timestamp": "20260808_185831",
+  "duration_ms": 10640,
+  "metrics": [],
+  "raw_output": "========================================================================\n  Graph-Enhanced Vector Recall Test\n  n=5000, dim=64, k=10, avg_degree=10\n========================================================================\n\nGraph: 5000 vertices, 52501 edges\nBuilding HNSW index (low ef_search for imperfect recall)...\n\n--- Pure Vector Search ---\nRecall@10: 87.67%\nAvg latency: 134.33\u00b5s\n\n--- Graph-Enhanced (1 hop) ---\nRecall@10: 88.33%\nAvg latency: 908.62\u00b5s\n\n--- Graph-Enhanced (2 hops) ---\nRecall@10: 94.67%\nAvg latency: 3.6782ms\n\n========================================================================\n  Summary\n========================================================================\n  Pure Vector:       87.67%\n  Graph+Vector 1hop: 88.33%\n  Graph+Vector 2hop: 94.67%\n\n  >> 1-hop graph expansion improved recall by 0.67%\n  >> 2-hop graph expansion improved recall by 7.00%\n   Compiling onto-graph v0.1.0 (E:\\ontodb\\crates\\onto-graph)\nwarning: unused import: `PropValue`\n --> crates\\onto-graph\\benches\\graph_vector_recall.rs:6:44\n  |\n6 | use onto_graph::{GraphStore, Vertex, Edge, PropValue, TraversalEngine, Direction};\n  |                                            ^^^^^^^^^\n  |\n  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default\n\nwarning: `onto-graph` (bench \"graph_vector_recall\") generated 1 warning (run `cargo fix --bench \"graph_vector_recall\" -p onto-graph` to apply 1 suggestion)\n    Finished `bench` profile [optimized] target(s) in 6.71s\n     Running benches\\graph_vector_recall.rs (target\\release\\deps\\graph_vector_recall-1c216ea293427df4.exe)\n",
+  "success": true,
+  "error": null
+}

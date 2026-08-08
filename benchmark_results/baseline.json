@@ -1,0 +1,232 @@
+{
+  "timestamp": "2026-08-08T18:58:42.295476",
+  "results": {
+    "onto-storage_lock_contention": {
+      "metrics": [
+        {
+          "name": "write_throughput_50000",
+          "value": 1017555.0,
+          "unit": "ops/sec",
+          "raw_line": "50000 writes: 49.1374ms  (1017555 writes/sec)"
+        },
+        {
+          "name": "read_throughput_50000",
+          "value": 1352097.0,
+          "unit": "ops/sec",
+          "raw_line": "50000 reads:  36.9796ms  (1352097 reads/sec)"
+        }
+      ],
+      "duration_ms": 143724
+    },
+    "onto-storage_vector_recall": {
+      "metrics": [],
+      "duration_ms": 260500
+    },
+    "onto-raft_raft_bench": {
+      "metrics": [
+        {
+          "name": "log_append_1000",
+          "value": 586270.0,
+          "unit": "ops/sec",
+          "raw_line": "1000 entries:   1.71ms (    586270 ops/sec)"
+        },
+        {
+          "name": "log_append_10000",
+          "value": 605188.0,
+          "unit": "ops/sec",
+          "raw_line": "10000 entries:  16.52ms (    605188 ops/sec)"
+        },
+        {
+          "name": "log_append_50000",
+          "value": 617700.0,
+          "unit": "ops/sec",
+          "raw_line": "50000 entries:  80.95ms (    617700 ops/sec)"
+        },
+        {
+          "name": "log_read_1000",
+          "value": 661901.0,
+          "unit": "ops/sec",
+          "raw_line": "1000 entries:   1.51ms (    661901 ops/sec)"
+        },
+        {
+          "name": "log_read_10000",
+          "value": 626617.0,
+          "unit": "ops/sec",
+          "raw_line": "10000 entries:  15.96ms (    626617 ops/sec)"
+        },
+        {
+          "name": "log_read_50000",
+          "value": 566455.0,
+          "unit": "ops/sec",
+          "raw_line": "50000 entries:  88.27ms (    566455 ops/sec)"
+        },
+        {
+          "name": "state_machine_apply_1000",
+          "value": 993937.0,
+          "unit": "ops/sec",
+          "raw_line": "1000 entries:   1.01ms (    993937 ops/sec)"
+        },
+        {
+          "name": "state_machine_apply_10000",
+          "value": 1182271.0,
+          "unit": "ops/sec",
+          "raw_line": "10000 entries:   8.46ms (   1182271 ops/sec)"
+        },
+        {
+          "name": "state_machine_apply_50000",
+          "value": 1112053.0,
+          "unit": "ops/sec",
+          "raw_line": "50000 entries:  44.96ms (   1112053 ops/sec)"
+        },
+        {
+          "name": "log_read_10000",
+          "value": 490280.0,
+          "unit": "ops/sec",
+          "raw_line": "10000 entries:  20.40ms (    490280 ops/sec)"
+        },
+        {
+          "name": "log_read_10000",
+          "value": 537461.0,
+          "unit": "ops/sec",
+          "raw_line": "10000 entries:  18.61ms (    537461 ops/sec)"
+        },
+        {
+          "name": "log_read_10000",
+          "value": 523125.0,
+          "unit": "ops/sec",
+          "raw_line": "10000 entries:  19.12ms (    523125 ops/sec)"
+        },
+        {
+          "name": "batch_apply_100",
+          "value": 948192.0,
+          "unit": "ops/sec",
+          "raw_line": "batch_size=100, 1000 batches: 105.46ms (    948192 ops/sec)"
+        },
+        {
+          "name": "snapshot_build_1000",
+          "value": 0.0031,
+          "unit": "ms",
+          "raw_line": "1000 entries:   3.10\u00b5s (snapshot size: 0 KB)"
+        },
+        {
+          "name": "snapshot_build_10000",
+          "value": 0.0024,
+          "unit": "ms",
+          "raw_line": "10000 entries:   2.40\u00b5s (snapshot size: 0 KB)"
+        },
+        {
+          "name": "snapshot_build_50000",
+          "value": 0.0038,
+          "unit": "ms",
+          "raw_line": "50000 entries:   3.80\u00b5s (snapshot size: 0 KB)"
+        }
+      ],
+      "duration_ms": 1324
+    },
+    "onto-ontology_ontology_bench": {
+      "metrics": [
+        {
+          "name": "small_(4_classes,_4_props)",
+          "value": 0.005887,
+          "unit": "ms",
+          "raw_line": "  Small (4 classes, 4 props): 5.887\u00b5s"
+        },
+        {
+          "name": "big_(100_classes,_200_props)",
+          "value": 0.361236,
+          "unit": "ms",
+          "raw_line": "  Big (100 classes, 200 props): 361.236\u00b5s"
+        },
+        {
+          "name": "huge_(500_classes,_1000_props)",
+          "value": 1.739367,
+          "unit": "ms",
+          "raw_line": "  Huge (500 classes, 1000 props): 1.739367ms"
+        },
+        {
+          "name": "mega_(2000_classes,_5000_props)",
+          "value": 8.996998,
+          "unit": "ms",
+          "raw_line": "  Mega (2000 classes, 5000 props): 8.996998ms"
+        },
+        {
+          "name": "get_all_subclasses_(depth=3,_40_classes,_39_subs)",
+          "value": 0.016126,
+          "unit": "ms",
+          "raw_line": "  get_all_subclasses (depth=3, 40 classes, 39 subs): 16.126\u00b5s"
+        },
+        {
+          "name": "get_all_subclasses_(depth=5,_364_classes,_363_subs)",
+          "value": 0.125749,
+          "unit": "ms",
+          "raw_line": "  get_all_subclasses (depth=5, 364 classes, 363 subs): 125.749\u00b5s"
+        },
+        {
+          "name": "get_all_subclasses_(depth=7,_3280_classes,_3279_subs)",
+          "value": 1.383273,
+          "unit": "ms",
+          "raw_line": "  get_all_subclasses (depth=7, 3280 classes, 3279 subs): 1.383273ms"
+        },
+        {
+          "name": "get_class_properties_(depth=7)",
+          "value": 0.001377,
+          "unit": "ms",
+          "raw_line": "  get_class_properties (depth=7): 1.377\u00b5s"
+        },
+        {
+          "name": "get_all_subclasses_(depth=10,_2047_classes,_2046_subs)",
+          "value": 0.965842,
+          "unit": "ms",
+          "raw_line": "  get_all_subclasses (depth=10, 2047 classes, 2046 subs): 965.842\u00b5s"
+        },
+        {
+          "name": "get_class_properties_(depth=10)",
+          "value": 0.001785,
+          "unit": "ms",
+          "raw_line": "  get_class_properties (depth=10): 1.785\u00b5s"
+        },
+        {
+          "name": "get_all_subclasses_(10_diamonds\u00d7depth5,_111_classes,_110_subs)",
+          "value": 0.034359,
+          "unit": "ms",
+          "raw_line": "  get_all_subclasses (10 diamonds\u00d7depth5, 111 classes, 110 subs): 34.359\u00b5s"
+        },
+        {
+          "name": "get_all_subclasses_(50_diamonds\u00d7depth5,_551_classes,_550_subs)",
+          "value": 0.171656,
+          "unit": "ms",
+          "raw_line": "  get_all_subclasses (50 diamonds\u00d7depth5, 551 classes, 550 subs): 171.656\u00b5s"
+        },
+        {
+          "name": "get_all_subclasses_(20_diamonds\u00d7depth10,_421_classes,_420_subs)",
+          "value": 0.121364,
+          "unit": "ms",
+          "raw_line": "  get_all_subclasses (20 diamonds\u00d7depth10, 421 classes, 420 subs): 121.364\u00b5s"
+        },
+        {
+          "name": "get_all_subclasses_(mesh_5\u00d720\u00d7fan3,_101_classes,_100_subs)",
+          "value": 0.058325,
+          "unit": "ms",
+          "raw_line": "  get_all_subclasses (mesh 5\u00d720\u00d7fan3, 101 classes, 100 subs): 58.325\u00b5s"
+        },
+        {
+          "name": "get_all_subclasses_(mesh_8\u00d730\u00d7fan5,_241_classes,_240_subs)",
+          "value": 0.152025,
+          "unit": "ms",
+          "raw_line": "  get_all_subclasses (mesh 8\u00d730\u00d7fan5, 241 classes, 240 subs): 152.025\u00b5s"
+        },
+        {
+          "name": "get_all_subclasses_(mesh_10\u00d750\u00d7fan5,_501_classes,_500_subs)",
+          "value": 0.31117500000000003,
+          "unit": "ms",
+          "raw_line": "  get_all_subclasses (mesh 10\u00d750\u00d7fan5, 501 classes, 500 subs): 311.175\u00b5s"
+        }
+      ],
+      "duration_ms": 313940
+    },
+    "onto-graph_graph_vector_recall": {
+      "metrics": [],
+      "duration_ms": 10640
+    }
+  }
+}

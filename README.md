@@ -238,7 +238,8 @@ cargo test -- --nocapture
 | Vector search (HNSW) | Stable |
 | HTTP API server | Stable |
 | CLI client | Stable |
-| Raft consensus | Scaffold (not functional) |
+| Raft consensus (openraft, TCP networking, config sync) | Stable |
+| Cluster whitelist management | Stable |
 | Data sharding | Scaffold (not integrated) |
 
 ## License

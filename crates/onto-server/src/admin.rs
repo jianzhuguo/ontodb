@@ -30,8 +30,11 @@ pub struct AdminState {
     pub config_path: Option<PathBuf>,
     pub metrics: SharedMetrics,
     /// Shared config store for cross-node sync (Raft integration).
-    /// When set, config changes are replicated via Raft log.
     pub config_store: Option<onto_raft::SharedConfigStore>,
+    /// Cluster whitelist manager for cross-node validation.
+    pub cluster_manager: Option<onto_raft::ClusterWhitelistManager>,
+    /// Audit logger for writing admin operations to audit file.
+    pub audit: Option<std::sync::Arc<crate::audit::AuditLogger>>,
 }
 
 /// Request body for creating/updating an API key.
@@ -70,6 +73,9 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/api/admin/keys/{key}/ips", get(list_ips).post(add_ips))
         .route("/api/admin/keys/{key}/ips/{ip}", delete(remove_ip))
         .route("/api/admin/reload", post(force_reload))
+        .route("/api/admin/cluster/validate", get(validate_cluster))
+        .route("/api/admin/cluster/sync", post(sync_cluster))
+        .route("/api/admin/cluster/nodes", get(list_cluster_nodes))
         .with_state(state)
 }
 
@@ -319,6 +325,59 @@ pub async fn force_reload(
     (StatusCode::OK, Json(json!({"success": true, "config_changed": changed})))
 }
 
+/// GET /api/admin/cluster/validate — Validate cluster whitelist consistency.
+async fn validate_cluster(
+    axum::extract::State(state): axum::extract::State<AdminState>,
+) -> impl IntoResponse {
+    let manager = match &state.cluster_manager {
+        Some(m) => m,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"success": false, "error": "cluster mode not enabled"}))),
+    };
+
+    let result = manager.validate_cluster_whitelist();
+    audit_log(&state, "cluster_validate", &format!("consistent={}", result.all_consistent));
+    (StatusCode::OK, Json(json!({"success": true, "validation": result})))
+}
+
+/// POST /api/admin/cluster/sync — Force sync whitelists to all cluster nodes.
+async fn sync_cluster(
+    axum::extract::State(state): axum::extract::State<AdminState>,
+) -> impl IntoResponse {
+    let manager = match &state.cluster_manager {
+        Some(m) => m,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"success": false, "error": "cluster mode not enabled"}))),
+    };
+
+    // Auto-add all peer IPs to whitelist
+    let nodes = manager.get_nodes();
+    let result = manager.sync_peer_ips();
+    audit_log(&state, "cluster_sync", &format!("nodes={}", nodes.len()));
+
+    (StatusCode::OK, Json(json!({"success": true, "nodes": nodes.len(), "sync_result": result})))
+}
+
+/// GET /api/admin/cluster/nodes — List cluster nodes.
+async fn list_cluster_nodes(
+    axum::extract::State(state): axum::extract::State<AdminState>,
+) -> impl IntoResponse {
+    let manager = match &state.cluster_manager {
+        Some(m) => m,
+        None => return (StatusCode::OK, Json(json!({"success": true, "mode": "standalone", "nodes": []}))),
+    };
+
+    let nodes = manager.get_nodes();
+    let node_list: Vec<serde_json::Value> = nodes.iter().map(|(id, addr)| {
+        json!({"id": id, "addr": addr})
+    }).collect();
+
+    (StatusCode::OK, Json(json!({
+        "success": true,
+        "mode": "cluster",
+        "self_id": manager.self_id(),
+        "nodes": node_list,
+    })))
+}
+
 // 鈹€鈹€ Helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 fn load_config(state: &AdminState) -> Result<AuthConfig, String> {
@@ -370,12 +429,36 @@ fn mask_key(key: &str) -> String {
     }
 }
 
-fn audit_log(_state: &AdminState, action: &str, detail: &str) {
+/// Extract client IP from request (X-Forwarded-For or X-Real-IP).
+fn extract_client_ip_from_state() -> String {
+    // In admin handlers we don't have direct access to request headers,
+    // so we use "admin-api" as the source identifier.
+    // The actual client IP is logged at the middleware level.
+    "admin-api".to_string()
+}
+
+fn audit_log(state: &AdminState, action: &str, detail: &str) {
+    // Always log to tracing
     tracing::warn!(
         target: "audit",
         action = action,
         detail = detail,
         "admin operation"
     );
+
+    // Write to audit file if logger is available
+    if let Some(ref logger) = state.audit {
+        let client_ip = extract_client_ip_from_state();
+        // We don't have the API key here, but we know it's an Admin key
+        let entry = logger.create_admin_entry(
+            &client_ip,
+            None,
+            action,
+            detail,
+            true,
+            None,
+        );
+        logger.log(entry);
+    }
 }
 

@@ -16,6 +16,7 @@ onto-ontology = { workspace = true }
 onto-query = { workspace = true }
 onto-graph = { workspace = true }
 onto-raft = { workspace = true }
+onto-enterprise = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -29,6 +30,33 @@ tower-http = { version = "0.5", features = ["cors", "trace"] }
 bytes = "1"
 futures = "0.3"
 parking_lot = "0.12"
+# TLS support
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Certificate generation
+rcgen = "0.13"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+default = []
+
+# === Enterprise Standard ===
+enterprise-standard = ["onto-enterprise/enterprise-standard"]
+
+# === Enterprise Gov/Finance ===
+enterprise-gov = ["onto-enterprise/enterprise-gov"]
+
+# === Individual features (for fine-grained control) ===
+cluster = ["onto-enterprise/cluster"]
+sharding = ["onto-enterprise/sharding"]
+security = ["onto-enterprise/security"]
+encryption = ["onto-enterprise/encryption"]
+backup = ["onto-enterprise/backup"]
+observability = ["onto-enterprise/observability"]
+audit-retention = ["onto-enterprise/audit-retention"]
+crc-validation = ["onto-enterprise/crc-validation"]
+rolling-upgrade = ["onto-enterprise/rolling-upgrade"]

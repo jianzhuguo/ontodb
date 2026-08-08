@@ -3,6 +3,10 @@ FROM rust:1.82-bookworm AS builder
 
 WORKDIR /app
 
+# Build arguments for edition selection
+# Usage: docker build --build-arg FEATURES="--features enterprise-gov" .
+ARG FEATURES=""
+
 # 1. Cache dependency build: copy only manifests + lock first
 COPY Cargo.toml Cargo.lock ./
 # Create skeleton src for each crate so `cargo build` can resolve deps
@@ -16,16 +20,16 @@ RUN mkdir -p crates/onto-core/src crates/onto-storage/src crates/onto-ontology/s
           crates/onto-graph/src/lib.rs crates/onto-enterprise/src/lib.rs && \
     echo "fn main() {}" > crates/onto-server/src/main.rs && \
     echo "fn main() {}" > crates/onto-cli/src/main.rs && \
-    cargo build --release --bin ontodb-server --bin ontodb-cli 2>/dev/null || true
+    cargo build --release --bin ontodb-server --bin ontodb-cli ${FEATURES} 2>/dev/null || true
 
 # 2. Copy real source and rebuild (only changed layers recompile)
 COPY crates/ crates/
 RUN touch crates/onto-server/src/main.rs crates/onto-cli/src/main.rs && \
-    cargo build --release --bin ontodb-server --bin ontodb-cli
+    cargo build --release --bin ontodb-server --bin ontodb-cli ${FEATURES}
 
 # 3. Run tests during build (optional, controlled by build arg)
 ARG RUN_TESTS=false
-RUN if [ "$RUN_TESTS" = "true" ]; then cargo test --workspace; fi
+RUN if [ "$RUN_TESTS" = "true" ]; then cargo test --workspace ${FEATURES}; fi
 
 # ── Runtime stage ────────────────────────────────────────────
 FROM debian:bookworm-slim

@@ -17,6 +17,7 @@ pub mod tls;
 use auth::{AuthConfig, AuthState, Permission};
 use clap::Parser;
 use onto_core::Result;
+use onto_enterprise::ProductTier;
 use onto_ontology::OntologyStore;
 use onto_query::{QueryExecutor, QueryParser};
 use onto_storage::{LsmEngine, StorageOptions};
@@ -93,12 +94,45 @@ struct Args {
     /// Raft peer nodes (format: id=addr,id=addr)
     #[arg(long, env = "RAFT_PEERS")]
     raft_peers: Option<String>,
+
+    // === Enterprise Gov/Finance options ===
+    /// Enable storage encryption (Gov/Finance edition only)
+    #[arg(long, env = "ENCRYPTION_ENABLED")]
+    encryption_enabled: bool,
+
+    /// Master key file path for encryption (Gov/Finance edition only)
+    #[arg(long, env = "ENCRYPTION_MASTER_KEY_FILE")]
+    master_key_file: Option<PathBuf>,
+
+    /// Master key from environment variable (Gov/Finance edition only)
+    #[arg(long, env = "ENCRYPTION_MASTER_KEY_ENV")]
+    master_key_env: Option<String>,
+
+    /// Audit retention days (Gov/Finance edition only, default 180 per 等保2.0)
+    #[arg(long, default_value = "180", env = "AUDIT_RETENTION_DAYS")]
+    audit_retention_days: u64,
+
+    /// Disable audit log compression (Gov/Finance edition only)
+    #[arg(long, env = "AUDIT_NO_COMPRESS")]
+    audit_no_compress: bool,
+
+    /// Enterprise config file path (JSON format)
+    #[arg(long, env = "ENTERPRISE_CONFIG_FILE")]
+    enterprise_config: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+
+    let tier = onto_enterprise::current_tier();
+    let features = onto_enterprise::enabled_features();
+
+    // Initialize enterprise features first (before args are moved)
+    let enterprise_config = build_enterprise_config(&args, tier);
+    let enterprise_features = onto_enterprise::EnterpriseFeatures::init(&enterprise_config)
+        .map_err(|e| onto_core::CoreError::Custom(format!("Enterprise features init failed: {}", e)))?;
 
     let options = StorageOptions {
         data_dir: args.data_dir,
@@ -107,7 +141,23 @@ fn main() -> Result<()> {
     };
 
     println!("OntoDB v{}", env!("CARGO_PKG_VERSION"));
+    println!("Edition: {:?}", tier);
+    if !features.is_empty() {
+        println!("Enterprise features: {}", features.join(", "));
+    }
     println!("Data directory: {:?}", options.data_dir);
+
+    // Log enterprise feature status
+    #[cfg(feature = "encryption")]
+    if enterprise_features.encryption.is_some() {
+        println!("Storage encryption: ENABLED (AES-256-GCM)");
+    }
+
+    #[cfg(feature = "audit-retention")]
+    if let Some(ref audit) = enterprise_features.audit_retention {
+        let status = audit.status();
+        println!("Audit retention: ENABLED ({} days)", status.retention_days);
+    }
 
     let engine = Arc::new(LsmEngine::open(options)?);
     let ontology_store = OntologyStore::new(Arc::clone(&engine));
@@ -198,6 +248,59 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Build enterprise configuration from command line arguments.
+/// For Open Source edition, returns default config (features disabled).
+/// For Gov/Finance edition, configures encryption and audit retention.
+fn build_enterprise_config(args: &Args, tier: ProductTier) -> onto_enterprise::EnterpriseConfig {
+    // Start with default config based on tier
+    let mut config = if tier == ProductTier::EnterpriseGov {
+        onto_enterprise::default_gov_config()
+    } else {
+        onto_enterprise::EnterpriseConfig::default()
+    };
+    
+    // Override with command line arguments for Gov/Finance edition
+    if tier == ProductTier::EnterpriseGov {
+        // Configure encryption
+        #[cfg(feature = "encryption")]
+        {
+            config.encryption.storage_encryption = args.encryption_enabled;
+            if let Some(ref key_file) = args.master_key_file {
+                config.encryption.master_key_source = onto_enterprise::encryption::KeySource::File(
+                    key_file.to_string_lossy().to_string()
+                );
+            } else if let Some(ref env_var) = args.master_key_env {
+                config.encryption.master_key_source = onto_enterprise::encryption::KeySource::Env(
+                    env_var.clone()
+                );
+            }
+        }
+        
+        // Configure audit retention
+        #[cfg(feature = "audit-retention")]
+        {
+            config.audit_retention.enabled = args.audit || tier == ProductTier::EnterpriseGov;
+            config.audit_retention.log_dir = args.audit_dir.clone();
+            config.audit_retention.retention_days = args.audit_retention_days;
+            config.audit_retention.compress_rotated = !args.audit_no_compress;
+        }
+    }
+    
+    // Load from config file if specified
+    if let Some(ref config_path) = args.enterprise_config {
+        if let Ok(content) = std::fs::read_to_string(config_path) {
+            if let Ok(file_config) = serde_json::from_str::<onto_enterprise::EnterpriseConfig>(&content) {
+                config = file_config;
+                tracing::info!("Loaded enterprise config from {:?}", config_path);
+            } else {
+                tracing::warn!("Failed to parse enterprise config file: {:?}", config_path);
+            }
+        }
+    }
+    
+    config
+}
+
 /// Loads authentication configuration from file or creates default.
 fn load_auth_config(file_path: Option<&std::path::Path>) -> Result<AuthConfig> {
     if let Some(path) = file_path {
@@ -279,6 +382,8 @@ async fn run_http_server(
         config_path: api_keys_file.clone(),
         metrics: state.metrics.clone(),
         config_store: Some(config_store.clone()),
+        cluster_manager: None,
+        audit: None, // Audit logger is already in AppState
     };
 
     let app = http::build_router_with_auth(state, auth_state.clone(), rate_limiter, admin_state);

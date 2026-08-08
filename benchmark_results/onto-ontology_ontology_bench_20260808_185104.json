@@ -1,0 +1,108 @@
+{
+  "name": "onto-ontology_ontology_bench",
+  "crate": "onto-ontology",
+  "bench_file": "ontology_bench",
+  "timestamp": "20260808_185104",
+  "duration_ms": 313940,
+  "metrics": [
+    {
+      "name": "small_(4_classes,_4_props)",
+      "value": 0.005887,
+      "unit": "ms",
+      "raw_line": "  Small (4 classes, 4 props): 5.887\u00b5s"
+    },
+    {
+      "name": "big_(100_classes,_200_props)",
+      "value": 0.361236,
+      "unit": "ms",
+      "raw_line": "  Big (100 classes, 200 props): 361.236\u00b5s"
+    },
+    {
+      "name": "huge_(500_classes,_1000_props)",
+      "value": 1.739367,
+      "unit": "ms",
+      "raw_line": "  Huge (500 classes, 1000 props): 1.739367ms"
+    },
+    {
+      "name": "mega_(2000_classes,_5000_props)",
+      "value": 8.996998,
+      "unit": "ms",
+      "raw_line": "  Mega (2000 classes, 5000 props): 8.996998ms"
+    },
+    {
+      "name": "get_all_subclasses_(depth=3,_40_classes,_39_subs)",
+      "value": 0.016126,
+      "unit": "ms",
+      "raw_line": "  get_all_subclasses (depth=3, 40 classes, 39 subs): 16.126\u00b5s"
+    },
+    {
+      "name": "get_all_subclasses_(depth=5,_364_classes,_363_subs)",
+      "value": 0.125749,
+      "unit": "ms",
+      "raw_line": "  get_all_subclasses (depth=5, 364 classes, 363 subs): 125.749\u00b5s"
+    },
+    {
+      "name": "get_all_subclasses_(depth=7,_3280_classes,_3279_subs)",
+      "value": 1.383273,
+      "unit": "ms",
+      "raw_line": "  get_all_subclasses (depth=7, 3280 classes, 3279 subs): 1.383273ms"
+    },
+    {
+      "name": "get_class_properties_(depth=7)",
+      "value": 0.001377,
+      "unit": "ms",
+      "raw_line": "  get_class_properties (depth=7): 1.377\u00b5s"
+    },
+    {
+      "name": "get_all_subclasses_(depth=10,_2047_classes,_2046_subs)",
+      "value": 0.965842,
+      "unit": "ms",
+      "raw_line": "  get_all_subclasses (depth=10, 2047 classes, 2046 subs): 965.842\u00b5s"
+    },
+    {
+      "name": "get_class_properties_(depth=10)",
+      "value": 0.001785,
+      "unit": "ms",
+      "raw_line": "  get_class_properties (depth=10): 1.785\u00b5s"
+    },
+    {
+      "name": "get_all_subclasses_(10_diamonds\u00d7depth5,_111_classes,_110_subs)",
+      "value": 0.034359,
+      "unit": "ms",
+      "raw_line": "  get_all_subclasses (10 diamonds\u00d7depth5, 111 classes, 110 subs): 34.359\u00b5s"
+    },
+    {
+      "name": "get_all_subclasses_(50_diamonds\u00d7depth5,_551_classes,_550_subs)",
+      "value": 0.171656,
+      "unit": "ms",
+      "raw_line": "  get_all_subclasses (50 diamonds\u00d7depth5, 551 classes, 550 subs): 171.656\u00b5s"
+    },
+    {
+      "name": "get_all_subclasses_(20_diamonds\u00d7depth10,_421_classes,_420_subs)",
+      "value": 0.121364,
+      "unit": "ms",
+      "raw_line": "  get_all_subclasses (20 diamonds\u00d7depth10, 421 classes, 420 subs): 121.364\u00b5s"
+    },
+    {
+      "name": "get_all_subclasses_(mesh_5\u00d720\u00d7fan3,_101_classes,_100_subs)",
+      "value": 0.058325,
+      "unit": "ms",
+      "raw_line": "  get_all_subclasses (mesh 5\u00d720\u00d7fan3, 101 classes, 100 subs): 58.325\u00b5s"
+    },
+    {
+      "name": "get_all_subclasses_(mesh_8\u00d730\u00d7fan5,_241_classes,_240_subs)",
+      "value": 0.152025,
+      "unit": "ms",
+      "raw_line": "  get_all_subclasses (mesh 8\u00d730\u00d7fan5, 241 classes, 240 subs): 152.025\u00b5s"
+    },
+    {
+      "name": "get_all_subclasses_(mesh_10\u00d750\u00d7fan5,_501_classes,_500_subs)",
+      "value": 0.31117500000000003,
+      "unit": "ms",
+      "raw_line": "  get_all_subclasses (mesh 10\u00d750\u00d7fan5, 501 classes, 500 subs): 311.175\u00b5s"
+    }
+  ],
+  "raw_output": "========================================================================\n  OntoDB Ontology Performance Benchmark v2\n========================================================================\n\n\u2500\u2500\u2500 1. Ontology Parsing \u2500\u2500\u2500\n  Small (4 classes, 4 props): 5.887\u00b5s/parse\n  Big (100 classes, 200 props): 361.236\u00b5s/parse\n  Huge (500 classes, 1000 props): 1.739367ms/parse\n  Mega (2000 classes, 5000 props): 8.996998ms/parse\n\n\u2500\u2500\u2500 2. Reasoning Engine (single fact) \u2500\u2500\u2500\n  Tree depth=3, width=3: 3 inferred, 2 iters, 7.565\u00b5s/reason\n  Tree depth=5, width=3: 5 inferred, 2 iters, 13.848\u00b5s/reason\n  Tree depth=7, width=2: 7 inferred, 2 iters, 26.501\u00b5s/reason\n  Wide 100 classes: 1 inferred, 2 iters, 3.14\u00b5s/reason\n  Wide 500 classes: 1 inferred, 2 iters, 3.637\u00b5s/reason\n  Wide 1000 classes: 1 inferred, 2 iters, 4.3\u00b5s/reason\n  Wide 2000 classes: 1 inferred, 2 iters, 5.341\u00b5s/reason\n\n\u2500\u2500\u2500 3. Reasoning Engine (batch facts / \u4e09\u5143\u7ec4\u6279\u91cf\u63a8\u7406) \u2500\u2500\u2500\n  Realistic ontology, 24 input facts: 46 inferred, 2 iters, 134.162\u00b5s/reason\n  50 classes, 1000 entities: 1000 inferred, 2 iters, 2.23991ms/reason\n  50 classes, 5000 entities: 5000 inferred, 2 iters, 13.20652ms/reason\n  50 classes, 10000 entities: 10000 inferred, 2 iters, 33.52327ms/reason\n\n\u2500\u2500\u2500 4. Class Hierarchy Queries \u2500\u2500\u2500\n  get_all_subclasses (depth=3, 40 classes, 39 subs): 16.126\u00b5s/query\n  is_subclass_of (depth=3): 80ns/query\n  get_class_properties (depth=3): 628ns/query\n\n  get_all_subclasses (depth=5, 364 classes, 363 subs): 125.749\u00b5s/query\n  is_subclass_of (depth=5): 139ns/query\n  get_class_properties (depth=5): 858ns/query\n\n  get_all_subclasses (depth=7, 3280 classes, 3279 subs): 1.383273ms/query\n  is_subclass_of (depth=7): 206ns/query\n  get_class_properties (depth=7): 1.377\u00b5s/query\n\n  get_all_subclasses (depth=10, 2047 classes, 2046 subs): 965.842\u00b5s/query\n  is_subclass_of (depth=10): 326ns/query\n  get_class_properties (depth=10): 1.785\u00b5s/query\n\n  get_all_subclasses (10 diamonds\u00d7depth5, 111 classes, 110 subs): 34.359\u00b5s/query\n  get_all_subclasses (50 diamonds\u00d7depth5, 551 classes, 550 subs): 171.656\u00b5s/query\n  get_all_subclasses (20 diamonds\u00d7depth10, 421 classes, 420 subs): 121.364\u00b5s/query\n  get_all_subclasses (mesh 5\u00d720\u00d7fan3, 101 classes, 100 subs): 58.325\u00b5s/query\n  get_all_subclasses (mesh 8\u00d730\u00d7fan5, 241 classes, 240 subs): 152.025\u00b5s/query\n  get_all_subclasses (mesh 10\u00d750\u00d7fan5, 501 classes, 500 subs): 311.175\u00b5s/query\n\n\u2500\u2500\u2500 5. Property Inference (transitive/symmetric/inverse) \u2500\u2500\u2500\n  251 input facts (100 ancestor+50 friend+50 inverse): 5204 inferred, 8 iters, 81.850622ms/reason\n  50-node transitive chain: 1225 inferred (expected 1225), 7 iters, 9.876223ms/reason\n  100-node transitive chain: 4950 inferred (expected 4950), 8 iters, 78.649077ms/reason\n  200-node transitive chain: 19900 inferred (expected 19900), 9 iters, 622.547308ms/reason\n\n========================================================================\n  Benchmark complete.\n========================================================================\n   Compiling onto-ontology v0.1.0 (E:\\ontodb\\crates\\onto-ontology)\nwarning: function `fmt_duration` is never used\n   --> crates\\onto-ontology\\benches\\ontology_bench.rs:152:4\n    |\n152 | fn fmt_duration(d: std::time::Duration) -> String {\n    |    ^^^^^^^^^^^^\n    |\n    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: `onto-ontology` (bench \"ontology_bench\") generated 1 warning\n    Finished `bench` profile [optimized] target(s) in 13.09s\n     Running benches\\ontology_bench.rs (target\\release\\deps\\ontology_bench-64cd21b210ae7f7f.exe)\n",
+  "success": true,
+  "error": null
+}

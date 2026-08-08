@@ -19,3 +19,8 @@ parking_lot = "0.12"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+futures = "0.3"
+
+[[bench]]
+name = "raft_bench"
+harness = false

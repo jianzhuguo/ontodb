@@ -1,0 +1,169 @@
+name: Performance Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      
+      - name: Run benchmarks
+        run: |
+          python scripts/benchmark_automation.py --report --compare
+      
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: benchmark_results/
+          retention-days: 30
+      
+      - name: Download baseline
+        uses: actions/download-artifact@v4
+        if: github.event_name == 'pull_request'
+        with:
+          name: benchmark-baseline
+          path: benchmark_results/baseline-artifact/
+        continue-on-error: true
+      
+      - name: Comment PR with benchmark results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            // Find the latest report
+            const resultsDir = 'benchmark_results';
+            const files = fs.readdirSync(resultsDir)
+              .filter(f => f.startsWith('benchmark_report_') && f.endsWith('.md'))
+              .sort()
+              .reverse();
+            
+            if (files.length === 0) {
+              console.log('No benchmark report found');
+              return;
+            }
+            
+            const reportPath = path.join(resultsDir, files[0]);
+            const report = fs.readFileSync(reportPath, 'utf8');
+            
+            // Truncate if too long for PR comment
+            const maxLength = 60000;
+            const truncatedReport = report.length > maxLength 
+              ? report.substring(0, maxLength) + '\n\n... (truncated)'
+              : report;
+            
+            // Find existing benchmark comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const benchmarkComment = comments.find(c => 
+              c.body.includes('## OntoDB Performance Benchmark Report')
+            );
+            
+            const body = `## 📊 Performance Benchmark Results
+            
+            ${truncatedReport}
+            
+            ---
+            *Automated benchmark run by [benchmark_automation.py](scripts/benchmark_automation.py)*`;
+            
+            if (benchmarkComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: benchmarkComment.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body,
+              });
+            }
+      
+      - name: Check for regressions
+        if: github.event_name == 'pull_request'
+        run: |
+          # Check if any critical regressions were detected
+          if grep -q "CRITICAL" benchmark_results/benchmark_report_*.md; then
+            echo "::error::Critical performance regressions detected!"
+            exit 1
+          fi
+
+  save-baseline:
+    name: Save Baseline
+    runs-on: ubuntu-latest
+    needs: benchmark
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      
+      - name: Run benchmarks and save baseline
+        run: |
+          python scripts/benchmark_automation.py --baseline --report
+      
+      - name: Upload baseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-baseline
+          path: |
+            benchmark_results/baseline.json
+            benchmark_results/benchmark_report_*.md
+          retention-days: 90
