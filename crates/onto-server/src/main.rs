@@ -8,6 +8,7 @@
 pub mod admin;
 mod auth;
 pub mod audit;
+pub mod cdc;
 mod http;
 mod metrics;
 pub mod mysqlwire;

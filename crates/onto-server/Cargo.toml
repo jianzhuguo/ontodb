@@ -64,3 +64,7 @@ observability = ["onto-enterprise/observability"]
 audit-retention = ["onto-enterprise/audit-retention"]
 crc-validation = ["onto-enterprise/crc-validation"]
 rolling-upgrade = ["onto-enterprise/rolling-upgrade"]
+
+# === CDC (Change Data Capture) ===
+cdc-kafka = []    # Enable Kafka CDC publisher (requires rdkafka)
+cdc-webhook = []  # Enable Webhook CDC publisher (requires reqwest)
