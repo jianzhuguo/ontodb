@@ -1,8 +1,13 @@
 //! Graph storage - CRUD operations for vertices and edges.
 //!
 //! Supports both in-memory and persistent storage via LSM engine.
+//!
+//! Persistence key format:
+//! - `__graph_v__{vertex_id}` → serialized Vertex
+//! - `__graph_e__{edge_id}` → serialized Edge
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use parking_lot::RwLock;
 
 use onto_core::EntityId;
@@ -11,16 +16,11 @@ use crate::error::GraphError;
 use crate::model::{Edge, PropertyMap, Vertex};
 use crate::traversal::Direction;
 
-/// Storage mode for the graph store.
-#[derive(Debug, Clone)]
-pub enum StorageMode {
-    /// In-memory only (no persistence).
-    Memory,
-    /// Persistent storage using LSM engine.
-    Persistent { data_dir: String },
-}
+/// Key prefixes for graph persistence in LSM engine.
+const GRAPH_VERTEX_PREFIX: &str = "__graph_v__";
+const GRAPH_EDGE_PREFIX: &str = "__graph_e__";
 
-/// In-memory graph store with adjacency list representation.
+/// In-memory graph store with optional LSM persistence.
 pub struct GraphStore {
     /// Vertices indexed by ID.
     vertices: RwLock<HashMap<String, Vertex>>,
@@ -32,9 +32,8 @@ pub struct GraphStore {
     edges: RwLock<HashMap<String, Edge>>,
     /// Labels index: label -> set of vertex IDs.
     label_index: RwLock<HashMap<String, HashSet<String>>>,
-    /// Storage mode.
-    #[allow(dead_code)]
-    storage_mode: StorageMode,
+    /// Optional LSM engine for persistence.
+    engine: Option<Arc<onto_storage::LsmEngine>>,
     /// Internal integer ID mapping for fast traversal.
     /// Maps string ID -> integer index.
     id_to_idx: RwLock<HashMap<String, u32>>,
@@ -55,7 +54,7 @@ impl GraphStore {
             in_edges: RwLock::new(HashMap::new()),
             edges: RwLock::new(HashMap::new()),
             label_index: RwLock::new(HashMap::new()),
-            storage_mode: StorageMode::Memory,
+            engine: None,
             id_to_idx: RwLock::new(HashMap::new()),
             idx_to_id: RwLock::new(Vec::new()),
             adj_out: RwLock::new(Vec::new()),
@@ -64,21 +63,114 @@ impl GraphStore {
         }
     }
 
-    /// Create a new persistent graph store.
-    pub fn new_persistent(data_dir: &str) -> Self {
+    /// Create a new persistent graph store backed by an LSM engine.
+    ///
+    /// Data is persisted to the engine with `__graph_v__` and `__graph_e__` prefixes.
+    /// Call `load_from_engine()` after creation to restore data from disk.
+    pub fn with_engine(engine: Arc<onto_storage::LsmEngine>) -> Self {
         Self {
             vertices: RwLock::new(HashMap::new()),
             out_edges: RwLock::new(HashMap::new()),
             in_edges: RwLock::new(HashMap::new()),
             edges: RwLock::new(HashMap::new()),
             label_index: RwLock::new(HashMap::new()),
-            storage_mode: StorageMode::Persistent { data_dir: data_dir.to_string() },
+            engine: Some(engine),
             id_to_idx: RwLock::new(HashMap::new()),
             idx_to_id: RwLock::new(Vec::new()),
             adj_out: RwLock::new(Vec::new()),
             adj_in: RwLock::new(Vec::new()),
             edge_index: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Whether this store has persistence enabled.
+    pub fn is_persistent(&self) -> bool {
+        self.engine.is_some()
+    }
+
+    /// Load graph data from the LSM engine.
+    ///
+    /// Call this once after `with_engine()` to restore persisted state.
+    /// Rebuilds all in-memory indexes (adjacency lists, label index, etc.).
+    pub fn load_from_engine(&self) -> Result<(), GraphError> {
+        let engine = match &self.engine {
+            Some(e) => e,
+            None => return Ok(()), // No persistence, nothing to load
+        };
+
+        // Load vertices
+        let vertex_entries = engine.scan_prefix(GRAPH_VERTEX_PREFIX.as_bytes())
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        for (_key, value) in &vertex_entries {
+            if let Ok(vertex) = serde_json::from_slice::<Vertex>(value) {
+                let id = vertex.id.clone();
+                let labels = vertex.labels.clone();
+
+                // Insert into vertices map
+                self.vertices.write().insert(id.clone(), vertex);
+
+                // Update label index
+                {
+                    let mut idx = self.label_index.write();
+                    for label in &labels {
+                        idx.entry(label.clone()).or_insert_with(HashSet::new).insert(id.clone());
+                    }
+                }
+
+                // Create integer index
+                self.get_or_create_idx(&id);
+            }
+        }
+
+        // Load edges
+        let edge_entries = engine.scan_prefix(GRAPH_EDGE_PREFIX.as_bytes())
+            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+
+        for (_key, value) in &edge_entries {
+            if let Ok(edge) = serde_json::from_slice::<Edge>(value) {
+                let from_id = edge.from.clone();
+                let to_id = edge.to.clone();
+                let edge_id = edge.id.clone();
+
+                // Insert into edges map
+                self.edges.write().insert(edge_id.clone(), edge.clone());
+
+                // Update adjacency lists
+                {
+                    let mut out = self.out_edges.write();
+                    out.entry(from_id.clone()).or_insert_with(Vec::new).push(edge.clone());
+                }
+                {
+                    let mut inp = self.in_edges.write();
+                    inp.entry(to_id.clone()).or_insert_with(Vec::new).push(edge);
+                }
+
+                // Update integer adjacency lists
+                let from_idx = self.get_or_create_idx(&from_id);
+                let to_idx = self.get_or_create_idx(&to_id);
+                let edge_idx = {
+                    let mut ei = self.edge_index.write();
+                    let idx = ei.len() as u32;
+                    ei.push((from_idx, to_idx, edge_id));
+                    idx
+                };
+                {
+                    let mut adj_out = self.adj_out.write();
+                    if (from_idx as usize) < adj_out.len() {
+                        adj_out[from_idx as usize].push((to_idx, edge_idx));
+                    }
+                }
+                {
+                    let mut adj_in = self.adj_in.write();
+                    if (to_idx as usize) < adj_in.len() {
+                        adj_in[to_idx as usize].push((from_idx, edge_idx));
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Get or create integer index for a vertex ID.
@@ -109,12 +201,61 @@ impl GraphStore {
         idx
     }
 
+    // ── Persistence Helpers ──────────────────────────────────────
+
+    /// Persist a vertex to the LSM engine.
+    fn persist_vertex(&self, vertex: &Vertex) -> Result<(), GraphError> {
+        if let Some(ref engine) = self.engine {
+            let key = format!("{}{}", GRAPH_VERTEX_PREFIX, vertex.id);
+            let value = serde_json::to_vec(vertex)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            engine.put(key.into_bytes(), value)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Remove a vertex from the LSM engine.
+    fn unpersist_vertex(&self, id: &str) -> Result<(), GraphError> {
+        if let Some(ref engine) = self.engine {
+            let key = format!("{}{}", GRAPH_VERTEX_PREFIX, id);
+            engine.delete(key.into_bytes())
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Persist an edge to the LSM engine.
+    fn persist_edge(&self, edge: &Edge) -> Result<(), GraphError> {
+        if let Some(ref engine) = self.engine {
+            let key = format!("{}{}", GRAPH_EDGE_PREFIX, edge.id);
+            let value = serde_json::to_vec(edge)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            engine.put(key.into_bytes(), value)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Remove an edge from the LSM engine.
+    fn unpersist_edge(&self, id: &str) -> Result<(), GraphError> {
+        if let Some(ref engine) = self.engine {
+            let key = format!("{}{}", GRAPH_EDGE_PREFIX, id);
+            engine.delete(key.into_bytes())
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     // ── Vertex CRUD ──────────────────────────────────────────────
 
     /// Add a vertex to the graph.
     pub fn add_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
         let id = vertex.id.clone();
         let labels = vertex.labels.clone();
+
+        // Persist to LSM engine before updating in-memory state
+        self.persist_vertex(&vertex)?;
 
         {
             let mut verts = self.vertices.write();
@@ -160,6 +301,12 @@ impl GraphStore {
         for (k, v) in properties {
             vertex.properties.insert(k, v);
         }
+        let updated = vertex.clone();
+        drop(verts);
+
+        // Persist updated vertex
+        self.persist_vertex(&updated)?;
+
         Ok(())
     }
 
@@ -169,6 +316,9 @@ impl GraphStore {
             let mut verts = self.vertices.write();
             verts.remove(id).ok_or_else(|| GraphError::VertexNotFound(id.to_string()))?
         };
+
+        // Unpersist vertex from LSM engine
+        self.unpersist_vertex(id)?;
 
         // Remove from label index
         {
@@ -196,11 +346,13 @@ impl GraphStore {
                 out_eids.push(edge.id.clone());
                 out_neighbors.push((edge.to.clone(), edge.id.clone()));
                 edges.remove(&edge.id);
+                let _ = self.unpersist_edge(&edge.id);
             }
             for edge in inp {
                 in_eids.push(edge.id.clone());
                 in_neighbors.push((edge.from.clone(), edge.id.clone()));
                 edges.remove(&edge.id);
+                let _ = self.unpersist_edge(&edge.id);
             }
             (out_neighbors, in_neighbors, out_eids, in_eids)
         };
@@ -291,6 +443,9 @@ impl GraphStore {
             }
         }
 
+        // Persist to LSM engine before updating in-memory state
+        self.persist_edge(&edge)?;
+
         let id = edge.id.clone();
         let from = edge.from.clone();
         let to = edge.to.clone();
@@ -373,6 +528,9 @@ impl GraphStore {
             let mut edges = self.edges.write();
             edges.remove(id).ok_or_else(|| GraphError::EdgeNotFound(id.to_string()))?
         };
+
+        // Unpersist from LSM engine
+        self.unpersist_edge(id)?;
 
         {
             let mut out = self.out_edges.write();
@@ -1064,5 +1222,123 @@ mod tests {
 
         let categories = store.get_entities_by_class("Category");
         assert_eq!(categories.len(), 1);
+    }
+
+    // ── Persistence Tests ──
+
+    #[test]
+    fn test_graph_persistence() {
+        use onto_storage::{LsmEngine, StorageOptions};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 4 * 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
+
+        // Create graph and add data
+        {
+            let store = GraphStore::with_engine(engine.clone());
+            store.add_vertex(Vertex::new("v1", vec!["Person".to_string()])).unwrap();
+            store.add_vertex(Vertex::new("v2", vec!["Person".to_string()])).unwrap();
+            store.add_edge(Edge::new("e1", "v1", "v2", "knows")).unwrap();
+        }
+
+        // Reload from engine
+        {
+            let store = GraphStore::with_engine(engine.clone());
+            store.load_from_engine().unwrap();
+
+            // Verify vertices
+            assert!(store.get_vertex("v1").is_some());
+            assert!(store.get_vertex("v2").is_some());
+            assert_eq!(store.vertex_count(), 2);
+
+            // Verify edges
+            assert!(store.get_edge("e1").is_some());
+            assert_eq!(store.edge_count(), 1);
+
+            // Verify adjacency
+            let out = store.get_out_edges("v1");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].id, "e1");
+        }
+    }
+
+    #[test]
+    fn test_graph_persistence_with_entity_id() {
+        use onto_storage::{LsmEngine, StorageOptions};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 4 * 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
+
+        let product = EntityId::new("Product", "001");
+        let category = EntityId::new("Category", "electronics");
+
+        // Create graph and add relationships
+        {
+            let store = GraphStore::with_engine(engine.clone());
+            store.add_relationship(&product, &category, "belongs_to").unwrap();
+        }
+
+        // Reload from engine
+        {
+            let store = GraphStore::with_engine(engine.clone());
+            store.load_from_engine().unwrap();
+
+            // Verify entity exists
+            assert!(store.has_entity(&product));
+            assert!(store.has_entity(&category));
+
+            // Verify relationship
+            let neighbors = store.get_entity_neighbors(&product, Direction::Out, Some("belongs_to"));
+            assert_eq!(neighbors.len(), 1);
+            assert_eq!(neighbors[0], category);
+        }
+    }
+
+    #[test]
+    fn test_graph_persistence_delete() {
+        use onto_storage::{LsmEngine, StorageOptions};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 4 * 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
+
+        // Create, then delete
+        {
+            let store = GraphStore::with_engine(engine.clone());
+            store.add_vertex(Vertex::new("v1", vec!["Person".to_string()])).unwrap();
+            store.add_vertex(Vertex::new("v2", vec!["Person".to_string()])).unwrap();
+            store.add_edge(Edge::new("e1", "v1", "v2", "knows")).unwrap();
+
+            // Delete v1 (should cascade e1)
+            store.delete_vertex("v1").unwrap();
+        }
+
+        // Reload - v1 and e1 should be gone, v2 should remain
+        {
+            let store = GraphStore::with_engine(engine.clone());
+            store.load_from_engine().unwrap();
+
+            assert!(store.get_vertex("v1").is_none());
+            assert!(store.get_vertex("v2").is_some());
+            assert_eq!(store.vertex_count(), 1);
+            assert_eq!(store.edge_count(), 0);
+        }
     }
 }
