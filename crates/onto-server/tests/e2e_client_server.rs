@@ -105,8 +105,22 @@ fn start_test_server() -> (u16, thread::JoinHandle<()>) {
         }
     });
 
-    // Give the server a moment to start
-    thread::sleep(Duration::from_millis(100));
+    // Wait for server to be ready by retrying connection (up to 5 seconds)
+    let addr = format!("127.0.0.1:{}", port);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpStream::connect(&addr) {
+            Ok(stream) => {
+                // Server is ready, drop the test connection
+                drop(stream);
+                break;
+            }
+            Err(_) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("Server failed to start within 5 seconds: {}", e),
+        }
+    }
 
     (port, handle)
 }

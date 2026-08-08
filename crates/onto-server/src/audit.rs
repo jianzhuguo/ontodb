@@ -96,13 +96,10 @@ impl Default for AuditConfig {
 
 /// SHA256 hash of data, returned as hex string.
 fn sha256_hex(data: &[u8]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    // Use a simple but deterministic hash for the integrity chain.
-    // For production, consider using the `sha2` crate for true SHA256.
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
 }
 
 /// Compute the entry hash from all fields except `entry_hash`.
@@ -218,12 +215,13 @@ impl AuditLogger {
             return;
         }
 
-        // Set integrity chain
+        // Set integrity chain — hold lock atomically for prev_hash read + update
         {
-            let last = self.last_hash.lock().unwrap();
+            let mut last = self.last_hash.lock().unwrap();
             entry.prev_hash = last.clone();
+            entry.entry_hash = compute_entry_hash(&entry);
+            *last = entry.entry_hash.clone();
         }
-        entry.entry_hash = compute_entry_hash(&entry);
 
         // Rotate if needed
         self.rotate_if_needed();
@@ -235,12 +233,6 @@ impl AuditLogger {
                 let _ = writeln!(f, "{}", json);
                 let _ = f.flush();
             }
-        }
-
-        // Update last hash
-        {
-            let mut last = self.last_hash.lock().unwrap();
-            *last = entry.entry_hash.clone();
         }
     }
 
@@ -389,7 +381,12 @@ fn truncate(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         text.to_string()
     } else {
-        format!("{}...", &text[..max_len])
+        // Find a valid UTF-8 boundary at or before max_len
+        let mut end = max_len;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &text[..end])
     }
 }
 

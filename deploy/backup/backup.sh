@@ -15,6 +15,36 @@ RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-7}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BACKUP_PATH="${BACKUP_DIR}/${TIMESTAMP}"
 
+# Alertmanager URL for failure notifications (optional)
+ALERTMANAGER_URL="${ALERTMANAGER_URL:-http://alertmanager:9093}"
+
+# Send failure notification to alertmanager
+send_alert() {
+  local severity="$1"
+  local summary="$2"
+  local description="$3"
+  
+  if [ -n "${ALERTMANAGER_URL}" ]; then
+    curl -sf -X POST "${ALERTMANAGER_URL}/api/v2/alerts" \
+      -H "Content-Type: application/json" \
+      -d "[{
+        \"labels\": {
+          \"alertname\": \"BackupFailure\",
+          \"severity\": \"${severity}\",
+          \"instance\": \"ontodb-backup\"
+        },
+        \"annotations\": {
+          \"summary\": \"${summary}\",
+          \"description\": \"${description}\"
+        },
+        \"startsAt\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+      }]" 2>/dev/null || true
+  fi
+}
+
+# Trap errors and send notification
+trap 'send_alert "critical" "OntoDB backup failed" "Backup script encountered an error at ${TIMESTAMP}"' ERR
+
 echo "=== OntoDB Backup: ${TIMESTAMP} ==="
 
 # 1. Trigger backup via API
@@ -38,6 +68,24 @@ fi
 FILE_COUNT=$(find "${BACKUP_PATH}" -type f | wc -l)
 echo "Backup contains ${FILE_COUNT} files"
 
+if [ "${FILE_COUNT}" -eq 0 ]; then
+  echo "ERROR: Backup directory is empty"
+  exit 1
+fi
+
+# 3. Generate integrity manifest (checksums of all backup files)
+echo "Generating integrity manifest..."
+MANIFEST="${BACKUP_PATH}/.backup_manifest"
+(cd "${BACKUP_PATH}" && find . -type f ! -name '.backup_manifest' -exec sha256sum {} \;) > "${MANIFEST}"
+MANIFEST_ENTRIES=$(wc -l < "${MANIFEST}")
+echo "Manifest contains ${MANIFEST_ENTRIES} checksums"
+
+# Verify manifest is non-empty
+if [ "${MANIFEST_ENTRIES}" -eq 0 ]; then
+  echo "ERROR: Failed to generate integrity manifest"
+  exit 1
+fi
+
 # 3. Prune old backups
 echo "Pruning backups older than ${RETENTION_DAYS} days..."
 PRUNED=0
@@ -47,14 +95,37 @@ for dir in "${BACKUP_DIR}"/*/; do
   # Only prune directories matching the timestamp pattern
   if echo "${dir_name}" | grep -qE '^[0-9]{8}_[0-9]{6}$'; then
     # Check if directory is older than retention period
-    find "${dir}" -maxdepth 0 -mtime +${RETENTION_DAYS} -type d | while read old_dir; do
+    # Use a temporary file to capture find output (avoids pipe subshell variable loss)
+    tmpfile=$(mktemp)
+    find "${dir}" -maxdepth 0 -mtime +${RETENTION_DAYS} -type d > "$tmpfile"
+    while IFS= read -r old_dir; do
+      [ -n "$old_dir" ] || continue
       echo "Removing old backup: ${old_dir}"
       rm -rf "${old_dir}"
       PRUNED=$((PRUNED + 1))
-    done
+    done < "$tmpfile"
+    rm -f "$tmpfile"
   fi
 done
 
 echo "=== Backup completed successfully ==="
 echo "  Path: ${BACKUP_PATH}"
 echo "  Files: ${FILE_COUNT}"
+
+# Send success notification (optional)
+if [ -n "${ALERTMANAGER_URL}" ]; then
+  curl -sf -X POST "${ALERTMANAGER_URL}/api/v2/alerts" \
+    -H "Content-Type: application/json" \
+    -d "[{
+      \"labels\": {
+        \"alertname\": \"BackupSuccess\",
+        \"severity\": \"info\",
+        \"instance\": \"ontodb-backup\"
+      },
+      \"annotations\": {
+        \"summary\": \"OntoDB backup completed\",
+        \"description\": \"Backup ${TIMESTAMP}: ${FILE_COUNT} files\"
+      },
+      \"startsAt\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+    }]" 2>/dev/null || true
+fi

@@ -53,12 +53,24 @@ pub enum Restriction {
 }
 
 /// A literal value used in restrictions and assertions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Literal {
     String(String),
     Int(i64),
     Float(#[serde(with = "ordered_f64")] f64),
     Bool(bool),
+}
+
+impl PartialEq for Literal {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Literal::String(a), Literal::String(b)) => a == b,
+            (Literal::Int(a), Literal::Int(b)) => a == b,
+            (Literal::Float(a), Literal::Float(b)) => a.to_bits() == b.to_bits(),
+            (Literal::Bool(a), Literal::Bool(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// Wrapper to allow `Eq` on `f64` by treating bitwise-equal values as equal.
@@ -270,15 +282,29 @@ impl Ontology {
         if child == parent {
             return true;
         }
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(child.to_string());
+        self.is_subclass_of_inner(child, parent, &mut visited)
+    }
 
+    fn is_subclass_of_inner(
+        &self,
+        child: &str,
+        parent: &str,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> bool {
         if let Some(class) = self.classes.get(child) {
             for superclass in &class.superclasses {
-                if self.is_subclass_of(superclass, parent) {
+                if superclass == parent {
                     return true;
+                }
+                if visited.insert(superclass.clone()) {
+                    if self.is_subclass_of_inner(superclass, parent, visited) {
+                        return true;
+                    }
                 }
             }
         }
-
         false
     }
 

@@ -41,18 +41,27 @@ impl OntoRaftNetwork {
             })
     }
 
+    /// Connection timeout for Raft RPCs (30 seconds).
+    const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Send a serialized request and receive a response via TCP.
     async fn send_rpc<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
         &self,
         request: &Req,
     ) -> Result<Resp, NetworkError> {
         let addr = self.target_addr().await?;
-        let mut stream = TcpStream::connect(&addr).await.map_err(|e| {
-            NetworkError::new(&std::io::Error::new(
+        let mut stream = tokio::time::timeout(Self::RPC_TIMEOUT, TcpStream::connect(&addr))
+            .await
+            .map_err(|_| NetworkError::new(&std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("connection to {} timed out", addr),
+            )))?
+            .map_err(|e| NetworkError::new(&std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 format!("failed to connect to {}: {}", addr, e),
-            ))
-        })?;
+            )))?;
+
+        stream.set_nodelay(true).ok();
 
         // Serialize request
         let req_bytes = serde_json::to_vec(request).map_err(|e| {
@@ -72,6 +81,15 @@ impl OntoRaftNetwork {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await.map_err(|e| NetworkError::new(&e))?;
         let resp_len = u32::from_be_bytes(len_buf) as usize;
+
+        // Enforce message size limit (16 MB)
+        const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+        if resp_len > MAX_MESSAGE_SIZE {
+            return Err(NetworkError::new(&std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("response too large: {} bytes (max {})", resp_len, MAX_MESSAGE_SIZE),
+            )));
+        }
 
         // Read response data
         let mut resp_buf = vec![0u8; resp_len];
@@ -173,6 +191,13 @@ async fn handle_raft_connection(
             Err(e) => return Err(e.into()),
         }
         let req_len = u32::from_be_bytes(len_buf) as usize;
+
+        // Enforce message size limit (16 MB)
+        const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+        if req_len > MAX_MESSAGE_SIZE {
+            tracing::warn!("Rejected oversized Raft message: {} bytes", req_len);
+            break;
+        }
 
         // Read request data
         let mut req_buf = vec![0u8; req_len];

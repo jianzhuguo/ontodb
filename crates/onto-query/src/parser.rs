@@ -8,6 +8,86 @@
 use onto_core::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 
+/// Find a substring case-insensitively (ASCII only).
+/// Returns the byte position in `haystack` where `needle` first occurs,
+/// or None if not found. This avoids `to_uppercase()` index misalignment
+/// with non-ASCII characters.
+fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let needle_upper: Vec<u8> = needle.bytes().map(|b| b.to_ascii_uppercase()).collect();
+    let hay_bytes = haystack.as_bytes();
+    let nlen = needle_upper.len();
+    if hay_bytes.len() < nlen {
+        return None;
+    }
+    'outer: for i in 0..=hay_bytes.len() - nlen {
+        for j in 0..nlen {
+            if hay_bytes[i + j].to_ascii_uppercase() != needle_upper[j] {
+                continue 'outer;
+            }
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// Check if `s` starts with `prefix` case-insensitively (ASCII only).
+/// Avoids allocating a new String via `to_uppercase()`.
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()]
+        .iter()
+        .zip(prefix.as_bytes())
+        .all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
+}
+
+/// Check if `s` ends with `suffix` case-insensitively (ASCII only).
+fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
+    s.len() >= suffix.len() && s.as_bytes()[s.len() - suffix.len()..]
+        .iter()
+        .zip(suffix.as_bytes())
+        .all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
+}
+
+/// Case-insensitive (ASCII) version of `find_unquoted`.
+/// Searches for `needle` in `haystack` while skipping quoted strings,
+/// using ASCII case-insensitive matching. Returns the byte offset of
+/// the first unquoted match, or None.
+fn find_unquoted_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    let needle_upper: Vec<u8> = needle.bytes().map(|b| b.to_ascii_uppercase()).collect();
+    let nlen = needle_upper.len();
+    if nlen == 0 || haystack.len() < nlen {
+        return None;
+    }
+    let hay_bytes = haystack.as_bytes();
+    let mut in_quote: Option<u8> = None;
+    let mut i = 0;
+    while i + nlen <= hay_bytes.len() {
+        let c = hay_bytes[i];
+        if let Some(q) = in_quote {
+            if c == q {
+                in_quote = None;
+            }
+        } else if c == b'\'' || c == b'"' {
+            in_quote = Some(c);
+        } else {
+            let mut matched = true;
+            for j in 0..nlen {
+                if hay_bytes[i + j].to_ascii_uppercase() != needle_upper[j] {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// File format for IMPORT command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImportFormat {
@@ -33,6 +113,15 @@ pub enum QueryAst {
         class: String,
         columns: Vec<String>,
         rows: Vec<Vec<LiteralValue>>,
+    },
+
+    /// INSERT INTO <class> (...) VALUES (...), (...), ... ON CONFLICT DO UPDATE SET ... (batch upsert)
+    BatchUpsert {
+        class: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<LiteralValue>>,
+        conflict_column: String,
+        assignments: Vec<(String, LiteralValue)>,
     },
 
     /// INSERT INTO <class> (...) SELECT ... (insert from query)
@@ -306,6 +395,7 @@ impl QueryAst {
             // Writes
             QueryAst::Insert { .. } => false,
             QueryAst::BatchInsert { .. } => false,
+            QueryAst::BatchUpsert { .. } => false,
             QueryAst::InsertSelect { .. } => false,
             QueryAst::Upsert { .. } => false,
             QueryAst::Update { .. } => false,
@@ -608,72 +698,73 @@ impl QueryParser {
             return Err(CoreError::InvalidArgument("empty query".to_string()));
         }
 
-        let upper = input.to_uppercase();
+        // Use case-insensitive prefix matching without allocating a new string
+        let starts_with = |kw: &str| find_ignore_ascii_case(input, kw) == Some(0);
 
-        if upper.starts_with("EXPLAIN") {
+        if starts_with("EXPLAIN") {
             Self::parse_explain(input)
-        } else if upper.starts_with("WITH") {
+        } else if starts_with("WITH") {
             Self::parse_with(input)
-        } else if upper.starts_with("CREATE ONTOLOGY") {
+        } else if starts_with("CREATE ONTOLOGY") {
             Ok(QueryAst::CreateOntology {
                 sql: input.to_string(),
             })
-        } else if upper.starts_with("CREATE VECTOR INDEX") {
+        } else if starts_with("CREATE VECTOR INDEX") {
             Self::parse_create_vector_index(input)
-        } else if upper.starts_with("DROP VECTOR INDEX") {
+        } else if starts_with("DROP VECTOR INDEX") {
             Self::parse_drop_vector_index(input)
-        } else if upper.starts_with("VECTOR SEARCH") {
+        } else if starts_with("VECTOR SEARCH") {
             Self::parse_vector_search(input)
-        } else if upper.starts_with("CREATE MATERIALIZED VIEW") {
+        } else if starts_with("CREATE MATERIALIZED VIEW") {
             Self::parse_create_materialized_view(input)
-        } else if upper.starts_with("DROP MATERIALIZED VIEW") {
+        } else if starts_with("DROP MATERIALIZED VIEW") {
             Self::parse_drop_materialized_view(input)
-        } else if upper.starts_with("REFRESH MATERIALIZED VIEW") {
+        } else if starts_with("REFRESH MATERIALIZED VIEW") {
             Self::parse_refresh_materialized_view(input)
-        } else if upper.starts_with("CREATE INDEX") {
+        } else if starts_with("CREATE INDEX") {
             Self::parse_create_index(input)
-        } else if upper.starts_with("DROP INDEX") {
+        } else if starts_with("DROP INDEX") {
             Self::parse_drop_index(input)
-        } else if upper.starts_with("ANALYZE") {
+        } else if starts_with("ANALYZE") {
             Self::parse_analyze(input)
-        } else if upper.starts_with("BEGIN") {
+        } else if starts_with("BEGIN") {
             Ok(QueryAst::Begin)
-        } else if upper.starts_with("COMMIT") {
+        } else if starts_with("COMMIT") {
             Ok(QueryAst::Commit)
-        } else if upper.starts_with("ROLLBACK") {
+        } else if starts_with("ROLLBACK") {
             Ok(QueryAst::Rollback)
-        } else if upper.starts_with("IMPORT") {
+        } else if starts_with("IMPORT") {
             Self::parse_import(input)
-        } else if upper.starts_with("INSERT") {
+        } else if starts_with("INSERT") {
             Self::parse_insert(input)
-        } else if upper.starts_with("SELECT") {
+        } else if starts_with("SELECT") {
             let ast = Self::parse_select(input)?;
             Self::try_wrap_union(input, ast)
-        } else if upper.starts_with("UPDATE") {
+        } else if starts_with("UPDATE") {
             Self::parse_update(input)
-        } else if upper.starts_with("DELETE") {
+        } else if starts_with("DELETE") {
             Self::parse_delete(input)
-        } else if upper.starts_with("MATCH") {
+        } else if starts_with("MATCH") {
             Self::parse_match(input)
-        } else if upper.starts_with("CREATE VERTEX TABLE") {
+        } else if starts_with("CREATE VERTEX TABLE") {
             Self::parse_create_vertex_table(input)
-        } else if upper.starts_with("CREATE EDGE TABLE") {
+        } else if starts_with("CREATE EDGE TABLE") {
             Self::parse_create_edge_table(input)
-        } else if upper.starts_with("INSERT VERTEX") {
+        } else if starts_with("INSERT VERTEX") {
             Self::parse_insert_vertex(input)
-        } else if upper.starts_with("INSERT EDGE") {
+        } else if starts_with("INSERT EDGE") {
             Self::parse_insert_edge(input)
-        } else if upper.starts_with("GRAPH TRAVERSE") {
+        } else if starts_with("GRAPH TRAVERSE") {
             Self::parse_graph_traverse(input)
-        } else if upper.starts_with("GRAPH MATCH") {
+        } else if starts_with("GRAPH MATCH") {
             Self::parse_graph_match(input)
-        } else if upper.starts_with("GRAPH SHORTEST PATH") {
+        } else if starts_with("GRAPH SHORTEST PATH") {
             Self::parse_graph_shortest_path(input)
-        } else if upper.starts_with("BACKUP") {
+        } else if starts_with("BACKUP") {
             Self::parse_backup(input)
-        } else if upper.starts_with("RESTORE") {
+        } else if starts_with("RESTORE") {
             Self::parse_restore(input)
-        } else if upper.starts_with("FLUSH") {
+        } else if starts_with("FLUSH") {
             Ok(QueryAst::Flush)
         } else {
             Err(CoreError::InvalidArgument(format!(
@@ -685,10 +776,9 @@ impl QueryParser {
 
     /// Parses EXPLAIN <query>
     fn parse_explain(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-        let query_start = if upper.starts_with("EXPLAIN ANALYZE") {
+        let query_start = if find_ignore_ascii_case(input, "EXPLAIN ANALYZE") == Some(0) {
             14
-        } else if upper.starts_with("EXPLAIN") {
+        } else if find_ignore_ascii_case(input, "EXPLAIN") == Some(0) {
             7
         } else {
             return Err(CoreError::InvalidArgument("expected EXPLAIN".to_string()));
@@ -709,8 +799,7 @@ impl QueryParser {
 
     /// Parses WITH [RECURSIVE] <cte_name> AS (<query>) <main_query>
     fn parse_with(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-        if !upper.starts_with("WITH") {
+        if find_ignore_ascii_case(input, "WITH") != Some(0) {
             return Err(CoreError::InvalidArgument("expected WITH".to_string()));
         }
 
@@ -718,7 +807,7 @@ impl QueryParser {
         let mut recursive = false;
 
         // Check for RECURSIVE keyword
-        if remaining.to_uppercase().starts_with("RECURSIVE") {
+        if remaining.len() >= 9 && remaining[..9].eq_ignore_ascii_case("RECURSIVE") {
             recursive = true;
             remaining = remaining[9..].trim();
         }
@@ -726,22 +815,19 @@ impl QueryParser {
         let mut ctes = Vec::new();
 
         loop {
-            let remaining_upper = remaining.to_uppercase();
-
             // Parse CTE name
-            let as_pos = remaining_upper.find(" AS ")
+            let as_pos = find_ignore_ascii_case(remaining, " AS ")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'AS' after CTE name".to_string()))?;
 
             let name_part = remaining[..as_pos].trim();
             remaining = remaining[as_pos + 4..].trim();
 
-            // Parse optional column aliases
-            let (name, columns) = if name_part.starts_with('(') {
-                let close = name_part.find(')')
-                    .ok_or_else(|| CoreError::InvalidArgument("expected ')' in CTE column list".to_string()));
-                let close = close?;
-                let cte_name = name_part[1..close].trim().to_string();
-                let cols_str = &name_part[1..close];
+            // Parse optional column aliases: "cte_name(col1, col2)" or just "cte_name"
+            let (name, columns) = if let Some(paren_start) = name_part.find('(') {
+                let close = name_part.rfind(')')
+                    .ok_or_else(|| CoreError::InvalidArgument("expected ')' in CTE column list".to_string()))?;
+                let cte_name = name_part[..paren_start].trim().to_string();
+                let cols_str = &name_part[paren_start + 1..close];
                 let cols: Vec<String> = cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
                 (cte_name, cols)
             } else {
@@ -807,11 +893,10 @@ impl QueryParser {
     /// Checks for UNION [ALL] in the input and wraps the first SELECT in a Union node.
     /// Returns the original AST if no UNION is found.
     fn try_wrap_union(input: &str, left: QueryAst) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
         // Find UNION that's not inside parentheses
         let mut depth = 0i32;
         let mut in_quote: Option<char> = None;
-        let bytes = upper.as_bytes();
+        let bytes = input.as_bytes();
         let mut i = 0;
 
         while i + 5 <= bytes.len() {
@@ -824,9 +909,9 @@ impl QueryParser {
                 depth += 1;
             } else if c == ')' {
                 depth -= 1;
-            } else if depth == 0 && bytes[i..].starts_with(b"UNION") {
+            } else if depth == 0 && find_ignore_ascii_case(&input[i..], "UNION") == Some(0) {
                 let after = &input[i + 5..].trim_start();
-                let (all, rest) = if after.to_uppercase().starts_with("ALL") {
+                let (all, rest) = if find_ignore_ascii_case(after, "ALL") == Some(0) {
                     (true, after[3..].trim())
                 } else {
                     (false, after.trim())
@@ -876,13 +961,11 @@ impl QueryParser {
 
     /// Parses IMPORT INTO <class> FROM CSV/JSON '<file_path>'
     fn parse_import(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-
         // IMPORT INTO <class> FROM <format> '<path>'
-        let into_pos = upper.find("INTO")
+        let into_pos = find_ignore_ascii_case(input, "INTO")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'INTO' after IMPORT".to_string()))?;
 
-        let from_pos = upper.find(" FROM ")
+        let from_pos = find_ignore_ascii_case(input, " FROM ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'FROM' in IMPORT".to_string()))?;
 
         let class = input[into_pos + 4..from_pos].trim().to_string();
@@ -891,11 +974,11 @@ impl QueryParser {
         }
 
         let after_from = input[from_pos + 6..].trim();
-        let after_from_upper = after_from.to_uppercase();
+        let starts_with = |kw: &str| find_ignore_ascii_case(after_from, kw) == Some(0);
 
-        let format = if after_from_upper.starts_with("CSV") {
+        let format = if starts_with("CSV") {
             ImportFormat::Csv
-        } else if after_from_upper.starts_with("JSON") {
+        } else if starts_with("JSON") {
             ImportFormat::Json
         } else {
             return Err(CoreError::InvalidArgument("expected CSV or JSON after FROM".to_string()));
@@ -914,14 +997,11 @@ impl QueryParser {
     }
 
     fn parse_insert(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-
-        let into_pos = upper
-            .find("INTO")
+        let into_pos = find_ignore_ascii_case(input, "INTO")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'INTO'".to_string()))?;
 
         // Check if this is INSERT INTO ... SELECT
-        let select_pos = Self::find_unquoted(&upper, " SELECT ");
+        let select_pos = Self::find_unquoted(input, " SELECT ");
         if let Some(sp) = select_pos {
             let header = input[into_pos + 4..sp].trim();
             let (class, columns) = Self::parse_insert_header(header)?;
@@ -930,8 +1010,7 @@ impl QueryParser {
             return Ok(QueryAst::InsertSelect { class, columns, query: Box::new(query) });
         }
 
-        let values_pos = upper
-            .find("VALUES")
+        let values_pos = find_ignore_ascii_case(input, "VALUES")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'VALUES'".to_string()))?;
 
         if values_pos < into_pos + 4 {
@@ -944,13 +1023,11 @@ impl QueryParser {
         let (class, columns) = Self::parse_insert_header(header)?;
 
         // Check for ON CONFLICT (UPSERT)
-        let on_conflict_upper = values_str.to_uppercase();
-        let (values_str, upsert_info) = if let Some(oc_pos) = Self::find_unquoted(&on_conflict_upper, " ON CONFLICT ") {
+        let (values_str, upsert_info) = if let Some(oc_pos) = find_unquoted_ignore_ascii_case(values_str, " ON CONFLICT ") {
             let vals_part = &values_str[..oc_pos];
             let conflict_part = &values_str[oc_pos + 13..].trim();
             // Parse: (col) DO UPDATE SET col1 = val1, col2 = val2
-            let conflict_upper = conflict_part.to_uppercase();
-            let do_update_pos = conflict_upper.find(" DO UPDATE SET ")
+            let do_update_pos = find_ignore_ascii_case(conflict_part, " DO UPDATE SET ")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'DO UPDATE SET' after ON CONFLICT".to_string()))?;
             let conflict_col = conflict_part[..do_update_pos].trim();
             let conflict_col = conflict_col.trim_start_matches('(').trim_end_matches(')').trim().to_string();
@@ -984,14 +1061,24 @@ impl QueryParser {
                 }
             }
             if let Some((conflict_col, assignments)) = upsert_info {
-                // Upsert with batch - use first row for now
-                Ok(QueryAst::Upsert {
-                    class,
-                    columns,
-                    values: rows.into_iter().next().unwrap_or_default(),
-                    conflict_column: conflict_col,
-                    assignments,
-                })
+                // Upsert with batch — return BatchUpsert for multiple rows
+                if rows.len() == 1 {
+                    Ok(QueryAst::Upsert {
+                        class,
+                        columns,
+                        values: rows.into_iter().next().unwrap_or_default(),
+                        conflict_column: conflict_col,
+                        assignments,
+                    })
+                } else {
+                    Ok(QueryAst::BatchUpsert {
+                        class,
+                        columns,
+                        rows,
+                        conflict_column: conflict_col,
+                        assignments,
+                    })
+                }
             } else {
                 Ok(QueryAst::BatchInsert { class, columns, rows })
             }
@@ -1068,16 +1155,15 @@ impl QueryParser {
     }
 
     fn parse_select(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-
-        let from_pos = upper
-            .find(" FROM ")
+        // Use find_unquoted_ignore_ascii_case to skip FROM inside quoted strings
+        let from_pos = find_unquoted_ignore_ascii_case(input, " FROM ")
+            .or_else(|| find_unquoted_ignore_ascii_case(input, "\nFROM "))
             .ok_or_else(|| CoreError::InvalidArgument("expected 'FROM'".to_string()))?;
 
         let after_select = input[6..from_pos].trim(); // After "SELECT"
 
         // Check for DISTINCT keyword
-        let (distinct, cols_str) = if after_select.to_uppercase().starts_with("DISTINCT") {
+        let (distinct, cols_str) = if starts_with_ignore_ascii_case(after_select, "DISTINCT") {
             (true, after_select[8..].trim())
         } else {
             (false, after_select)
@@ -1098,7 +1184,7 @@ impl QueryParser {
         let (joins, rest) = Self::parse_joins(&rest)?;
 
         // Parse optional WHERE
-        let (filter, rest) = if rest.to_uppercase().starts_with("WHERE") {
+        let (filter, rest) = if starts_with_ignore_ascii_case(&rest, "WHERE") {
             let rest = rest[5..].trim();
             Self::parse_where(rest)?
         } else {
@@ -1106,9 +1192,9 @@ impl QueryParser {
         };
 
         // Parse optional GROUP BY
-        let rest_upper = rest.to_uppercase();
-        let (group_by, rest) = if rest_upper.trim_start().starts_with("GROUP BY") {
-            let pos = Self::find_unquoted(&rest_upper, "GROUP BY")
+        let rest_trimmed = rest.trim_start();
+        let (group_by, rest) = if starts_with_ignore_ascii_case(rest_trimmed, "GROUP BY") {
+            let pos = find_unquoted_ignore_ascii_case(&rest, "GROUP BY")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'GROUP BY'".to_string()))?;
             let rest = rest[pos + 8..].trim();
             let (cols_str, rest) = Self::consume_until_keywords(rest, &["HAVING", "ORDER BY", "LIMIT"]);
@@ -1123,9 +1209,9 @@ impl QueryParser {
         };
 
         // Parse optional HAVING
-        let rest_upper = rest.to_uppercase();
-        let (having, rest) = if rest_upper.trim_start().starts_with("HAVING") {
-            let pos = Self::find_unquoted(&rest_upper, "HAVING")
+        let rest_trimmed = rest.trim_start();
+        let (having, rest) = if starts_with_ignore_ascii_case(rest_trimmed, "HAVING") {
+            let pos = find_unquoted_ignore_ascii_case(&rest, "HAVING")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'HAVING'".to_string()))?;
             let rest = rest[pos + 6..].trim();
             Self::parse_where(rest)?
@@ -1134,19 +1220,17 @@ impl QueryParser {
         };
 
         // Parse optional ORDER BY (multi-column)
-        let rest_upper = rest.to_uppercase();
-        let rest = rest; // reborrow
-        let (order_by, rest) = if rest_upper.trim_start().starts_with("ORDER BY") {
-            let start = Self::find_unquoted(&rest_upper, "ORDER BY")
+        let rest_trimmed = rest.trim_start();
+        let (order_by, rest) = if starts_with_ignore_ascii_case(rest_trimmed, "ORDER BY") {
+            let start = find_unquoted_ignore_ascii_case(&rest, "ORDER BY")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'ORDER BY'".to_string()))?;
             let (ob_str, rest) = Self::consume_until_keywords(rest[start + 8..].trim(), &["LIMIT", "OFFSET"]);
             let mut order_cols = Vec::new();
             for part in Self::split_quoted(ob_str.trim(), ',') {
                 let part = part.trim();
-                let part_upper = part.to_uppercase();
-                let (col, ascending) = if part_upper.ends_with(" DESC") {
+                let (col, ascending) = if part.len() >= 5 && part[part.len() - 5..].eq_ignore_ascii_case(" DESC") {
                     (part[..part.len() - 5].trim().to_string(), false)
-                } else if part_upper.ends_with(" ASC") {
+                } else if part.len() >= 4 && part[part.len() - 4..].eq_ignore_ascii_case(" ASC") {
                     (part[..part.len() - 4].trim().to_string(), true)
                 } else {
                     (part.to_string(), true)
@@ -1161,9 +1245,9 @@ impl QueryParser {
         };
 
         // Parse optional LIMIT
-        let rest_upper = rest.to_uppercase();
-        let (limit, offset, _rest) = if rest_upper.trim_start().starts_with("LIMIT") {
-            let start = Self::find_unquoted(&rest_upper, "LIMIT")
+        let rest_trimmed = rest.trim_start();
+        let (limit, offset, _rest) = if starts_with_ignore_ascii_case(rest_trimmed, "LIMIT") {
+            let start = find_unquoted_ignore_ascii_case(&rest, "LIMIT")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'LIMIT'".to_string()))?;
             let after_limit = rest[start + 5..].trim();
             // Parse limit number (may be followed by OFFSET or end)
@@ -1172,8 +1256,8 @@ impl QueryParser {
                 .parse::<usize>()
                 .map_err(|_| CoreError::InvalidArgument("invalid LIMIT".to_string()))?;
             // Check for OFFSET
-            let after_upper = after_num.to_uppercase();
-            if after_upper.trim_start().starts_with("OFFSET") {
+            let after_trimmed = after_num.trim_start();
+            if starts_with_ignore_ascii_case(after_trimmed, "OFFSET") {
                 let offset_str = after_num[6..].trim();
                 let offset_val = offset_str
                     .parse::<usize>()
@@ -1204,24 +1288,23 @@ impl QueryParser {
     /// Parses `FROM <table> [AS <alias>]` and returns (table, alias, rest).
     fn parse_from_clause(input: &str) -> Result<(String, Option<String>, String)> {
         let (table, rest) = Self::parse_word(input)?;
-        let rest_upper = rest.to_uppercase();
 
-        if rest_upper.starts_with("AS") {
+        if starts_with_ignore_ascii_case(&rest, "AS") {
             let rest = rest[2..].trim();
             let (alias, rest) = Self::parse_word(rest)?;
             Ok((table, Some(alias), rest))
         } else if !rest.is_empty()
-            && !rest_upper.starts_with("WHERE")
-            && !rest_upper.starts_with("JOIN")
-            && !rest_upper.starts_with("LEFT")
-            && !rest_upper.starts_with("RIGHT")
-            && !rest_upper.starts_with("FULL")
-            && !rest_upper.starts_with("INNER")
-            && !rest_upper.starts_with("ON")
-            && !rest_upper.starts_with("GROUP")
-            && !rest_upper.starts_with("HAVING")
-            && !rest_upper.starts_with("ORDER")
-            && !rest_upper.starts_with("LIMIT")
+            && !starts_with_ignore_ascii_case(&rest, "WHERE")
+            && !starts_with_ignore_ascii_case(&rest, "JOIN")
+            && !starts_with_ignore_ascii_case(&rest, "LEFT")
+            && !starts_with_ignore_ascii_case(&rest, "RIGHT")
+            && !starts_with_ignore_ascii_case(&rest, "FULL")
+            && !starts_with_ignore_ascii_case(&rest, "INNER")
+            && !starts_with_ignore_ascii_case(&rest, "ON")
+            && !starts_with_ignore_ascii_case(&rest, "GROUP")
+            && !starts_with_ignore_ascii_case(&rest, "HAVING")
+            && !starts_with_ignore_ascii_case(&rest, "ORDER")
+            && !starts_with_ignore_ascii_case(&rest, "LIMIT")
         {
             // Implicit alias: FROM Product p
             let (alias, rest) = Self::parse_word(&rest)?;
@@ -1237,21 +1320,24 @@ impl QueryParser {
         let mut rest = input.to_string();
 
         loop {
-            let upper = rest.to_uppercase().trim().to_string();
+            let trimmed = rest.trim();
 
             // Detect join type
-            let (join_type, skip_len) = if upper.starts_with("LEFT JOIN") || upper.starts_with("LEFT OUTER JOIN") {
-                let len = if upper.starts_with("LEFT OUTER JOIN") { 15 } else { 10 };
-                (JoinType::Left, len)
-            } else if upper.starts_with("RIGHT JOIN") || upper.starts_with("RIGHT OUTER JOIN") {
-                let len = if upper.starts_with("RIGHT OUTER JOIN") { 16 } else { 11 };
-                (JoinType::Right, len)
-            } else if upper.starts_with("FULL JOIN") || upper.starts_with("FULL OUTER JOIN") {
-                let len = if upper.starts_with("FULL OUTER JOIN") { 15 } else { 10 };
-                (JoinType::Full, len)
-            } else if upper.starts_with("INNER JOIN") {
+            let (join_type, skip_len) = if starts_with_ignore_ascii_case(trimmed, "LEFT OUTER JOIN") {
+                (JoinType::Left, 15)
+            } else if starts_with_ignore_ascii_case(trimmed, "LEFT JOIN") {
+                (JoinType::Left, 10)
+            } else if starts_with_ignore_ascii_case(trimmed, "RIGHT OUTER JOIN") {
+                (JoinType::Right, 16)
+            } else if starts_with_ignore_ascii_case(trimmed, "RIGHT JOIN") {
+                (JoinType::Right, 11)
+            } else if starts_with_ignore_ascii_case(trimmed, "FULL OUTER JOIN") {
+                (JoinType::Full, 15)
+            } else if starts_with_ignore_ascii_case(trimmed, "FULL JOIN") {
+                (JoinType::Full, 10)
+            } else if starts_with_ignore_ascii_case(trimmed, "INNER JOIN") {
                 (JoinType::Inner, 11)
-            } else if upper.starts_with("JOIN") {
+            } else if starts_with_ignore_ascii_case(trimmed, "JOIN") {
                 (JoinType::Inner, 4)
             } else {
                 break;
@@ -1264,8 +1350,7 @@ impl QueryParser {
             let (table, alias, after_table) = Self::parse_from_clause(after_join)?;
 
             // Parse ON
-            let upper_after = after_table.to_uppercase();
-            if !upper_after.starts_with("ON") {
+            if !starts_with_ignore_ascii_case(&after_table, "ON") {
                 return Err(CoreError::InvalidArgument(
                     "expected 'ON' after JOIN table".to_string(),
                 ));
@@ -1305,20 +1390,20 @@ impl QueryParser {
             if part.is_empty() {
                 continue;
             }
-            let upper = part.to_uppercase();
-
             // Check for CASE WHEN expression
-            if upper.starts_with("CASE ") || upper.starts_with("CASE\n") {
+            if starts_with_ignore_ascii_case(part, "CASE ") || starts_with_ignore_ascii_case(part, "CASE\n") {
                 let case_expr = Self::parse_case_when(part)?;
                 // Check for alias after END
-                let end_upper = part.to_uppercase();
-                let end_pos = end_upper.find(" END").unwrap_or(part.len());
-                let after_end = part[end_pos + 4..].trim();
-                let expr = if after_end.to_uppercase().starts_with("AS ") {
-                    let _alias = after_end[3..].trim().to_string();
-                    // Store with alias info — we'll wrap in a named expression
-                    SelectItem::Expression(case_expr)
+                let expr = if let Some(end_pos) = find_ignore_ascii_case(part, " END") {
+                    let after_end = part[end_pos + 4..].trim();
+                    if starts_with_ignore_ascii_case(after_end, "AS ") {
+                        let _alias = after_end[3..].trim().to_string();
+                        SelectItem::Expression(case_expr)
+                    } else {
+                        SelectItem::Expression(case_expr)
+                    }
                 } else {
+                    // No END found — treat the whole expression as-is
                     SelectItem::Expression(case_expr)
                 };
                 items.push(expr);
@@ -1326,7 +1411,7 @@ impl QueryParser {
             }
 
             // Check for window functions: ROW_NUMBER(), RANK(), etc. with OVER
-            if Self::contains_window_function(&upper) {
+            if Self::contains_window_function(part) {
                 let window_expr = Self::parse_window_function(part)?;
                 items.push(SelectItem::WindowFunction(window_expr));
                 continue;
@@ -1336,7 +1421,7 @@ impl QueryParser {
             let builtin_funcs = ["COALESCE", "NULLIF", "CONCAT", "SUBSTRING", "UPPER", "LOWER", "NOW", "LENGTH", "TRIM", "ABS", "ROUND"];
             let mut is_builtin = false;
             for func_name in &builtin_funcs {
-                if upper.starts_with(func_name) && part.len() > func_name.len() && part.as_bytes()[func_name.len()] == b'(' {
+                if starts_with_ignore_ascii_case(part, func_name) && part.len() > func_name.len() && part.as_bytes()[func_name.len()] == b'(' {
                     let value_expr = Self::parse_value_expr(part)?;
                     items.push(SelectItem::Expression(value_expr));
                     is_builtin = true;
@@ -1348,15 +1433,15 @@ impl QueryParser {
             }
 
             // Check for aggregate functions: COUNT, SUM, AVG, MIN, MAX
-            let func = if upper.starts_with("COUNT(") {
+            let func = if starts_with_ignore_ascii_case(part, "COUNT(") {
                 Some(AggregateFunc::Count)
-            } else if upper.starts_with("SUM(") {
+            } else if starts_with_ignore_ascii_case(part, "SUM(") {
                 Some(AggregateFunc::Sum)
-            } else if upper.starts_with("AVG(") {
+            } else if starts_with_ignore_ascii_case(part, "AVG(") {
                 Some(AggregateFunc::Avg)
-            } else if upper.starts_with("MIN(") {
+            } else if starts_with_ignore_ascii_case(part, "MIN(") {
                 Some(AggregateFunc::Min)
-            } else if upper.starts_with("MAX(") {
+            } else if starts_with_ignore_ascii_case(part, "MAX(") {
                 Some(AggregateFunc::Max)
             } else {
                 None
@@ -1372,7 +1457,7 @@ impl QueryParser {
 
                 // Check for alias: ... AS alias
                 let after = part[close + 1..].trim();
-                let alias = if after.to_uppercase().starts_with("AS") {
+                let alias = if starts_with_ignore_ascii_case(after, "AS") {
                     Some(after[2..].trim().to_string())
                 } else if !after.is_empty() {
                     Some(after.to_string())
@@ -1385,7 +1470,7 @@ impl QueryParser {
                 // Regular column, possibly with alias
                 // Handle: `name`, `p.name`, `name as n`
                 let (col, alias_part) = if let Some(as_pos) =
-                    Self::find_unquoted(&upper, " AS ")
+                    find_unquoted_ignore_ascii_case(part, " AS ")
                 {
                     (part[..as_pos].trim(), Some(part[as_pos + 4..].trim()))
                 } else {
@@ -1405,18 +1490,18 @@ impl QueryParser {
     }
 
     /// Check if the expression contains a window function (has OVER keyword).
-    fn contains_window_function(upper: &str) -> bool {
+    fn contains_window_function(input: &str) -> bool {
         // Window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, etc.
         // Must have OVER keyword after the function call
         let window_funcs = ["ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD", 
                            "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE"];
         for func in &window_funcs {
-            if upper.contains(func) && upper.contains(" OVER ") {
+            if find_ignore_ascii_case(input, func).is_some() && find_ignore_ascii_case(input, " OVER ").is_some() {
                 return true;
             }
         }
         // Also check for aggregate OVER (e.g., SUM(x) OVER (...))
-        if upper.contains(") OVER ") || upper.contains(")OVER ") {
+        if find_ignore_ascii_case(input, ") OVER ").is_some() || find_ignore_ascii_case(input, ")OVER ").is_some() {
             return true;
         }
         false
@@ -1424,10 +1509,8 @@ impl QueryParser {
 
     /// Parse a window function expression.
     fn parse_window_function(input: &str) -> Result<WindowExpr> {
-        let upper = input.to_uppercase();
-        
         // Find OVER keyword
-        let over_pos = Self::find_unquoted(&upper, " OVER ")
+        let over_pos = find_unquoted_ignore_ascii_case(input, " OVER ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'OVER' in window function".to_string()))?;
         
         let func_part = input[..over_pos].trim();
@@ -1443,7 +1526,7 @@ impl QueryParser {
         let after_over = &input[over_pos + 6..];
         let close_paren = Self::find_matching_paren(after_over)?;
         let after = after_over[close_paren + 1..].trim();
-        let alias = if after.to_uppercase().starts_with("AS") {
+        let alias = if starts_with_ignore_ascii_case(after, "AS") {
             Some(after[2..].trim().to_string())
         } else if !after.is_empty() {
             Some(after.to_string())
@@ -1456,15 +1539,13 @@ impl QueryParser {
 
     /// Parse window function name and argument.
     fn parse_window_func_name(input: &str) -> Result<(WindowFunc, Option<String>)> {
-        let upper = input.to_uppercase();
-        
         // Find the opening parenthesis
         let open = input.find('(')
             .ok_or_else(|| CoreError::InvalidArgument("expected '(' in window function".to_string()))?;
         let close = input.rfind(')')
             .ok_or_else(|| CoreError::InvalidArgument("expected ')' in window function".to_string()))?;
-        
-        let func_name = &upper[..open];
+
+        let func_name = &input[..open];
         let arg_str = input[open + 1..close].trim();
         let arg = if arg_str.is_empty() || arg_str == "*" {
             None
@@ -1472,21 +1553,34 @@ impl QueryParser {
             Some(arg_str.to_string())
         };
 
-        let func = match func_name {
-            "ROW_NUMBER" => WindowFunc::RowNumber,
-            "RANK" => WindowFunc::Rank,
-            "DENSE_RANK" => WindowFunc::DenseRank,
-            "LAG" => WindowFunc::Lag,
-            "LEAD" => WindowFunc::Lead,
-            "FIRST_VALUE" => WindowFunc::FirstValue,
-            "LAST_VALUE" => WindowFunc::LastValue,
-            "NTH_VALUE" => WindowFunc::NthValue,
-            "SUM" => WindowFunc::Sum,
-            "AVG" => WindowFunc::Avg,
-            "MIN" => WindowFunc::Min,
-            "MAX" => WindowFunc::Max,
-            "COUNT" => WindowFunc::Count,
-            _ => return Err(CoreError::InvalidArgument(format!("unknown window function: {}", func_name))),
+        let func = if func_name.eq_ignore_ascii_case("ROW_NUMBER") {
+            WindowFunc::RowNumber
+        } else if func_name.eq_ignore_ascii_case("RANK") {
+            WindowFunc::Rank
+        } else if func_name.eq_ignore_ascii_case("DENSE_RANK") {
+            WindowFunc::DenseRank
+        } else if func_name.eq_ignore_ascii_case("LAG") {
+            WindowFunc::Lag
+        } else if func_name.eq_ignore_ascii_case("LEAD") {
+            WindowFunc::Lead
+        } else if func_name.eq_ignore_ascii_case("FIRST_VALUE") {
+            WindowFunc::FirstValue
+        } else if func_name.eq_ignore_ascii_case("LAST_VALUE") {
+            WindowFunc::LastValue
+        } else if func_name.eq_ignore_ascii_case("NTH_VALUE") {
+            WindowFunc::NthValue
+        } else if func_name.eq_ignore_ascii_case("SUM") {
+            WindowFunc::Sum
+        } else if func_name.eq_ignore_ascii_case("AVG") {
+            WindowFunc::Avg
+        } else if func_name.eq_ignore_ascii_case("MIN") {
+            WindowFunc::Min
+        } else if func_name.eq_ignore_ascii_case("MAX") {
+            WindowFunc::Max
+        } else if func_name.eq_ignore_ascii_case("COUNT") {
+            WindowFunc::Count
+        } else {
+            return Err(CoreError::InvalidArgument(format!("unknown window function: {}", func_name)));
         };
 
         Ok((func, arg))
@@ -1507,29 +1601,26 @@ impl QueryParser {
         let mut order_by = Vec::new();
         let mut frame = None;
 
-        let upper = input.to_uppercase();
-
         // Parse PARTITION BY
-        if let Some(pb_pos) = Self::find_unquoted(&upper, "PARTITION BY") {
+        if let Some(pb_pos) = find_unquoted_ignore_ascii_case(input, "PARTITION BY") {
             let pb_str = &input[pb_pos + 12..].trim();
             let (pb_cols, remaining) = Self::consume_until_keywords(pb_str, &["ORDER BY", "ROWS", "RANGE"]);
             partition_by = pb_cols.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             
             // Parse ORDER BY from remaining
-            let remaining_upper = remaining.to_uppercase();
-            if remaining_upper.starts_with("ORDER BY") {
+            if starts_with_ignore_ascii_case(remaining, "ORDER BY") {
                 let ob_str = &remaining[8..].trim();
                 order_by = Self::parse_window_order_by(ob_str)?;
             }
-        } else if upper.starts_with("ORDER BY") {
+        } else if starts_with_ignore_ascii_case(input, "ORDER BY") {
             let ob_str = &input[8..].trim();
             order_by = Self::parse_window_order_by(ob_str)?;
         }
 
         // Parse frame specification
-        if let Some(rows_pos) = Self::find_unquoted(&upper, "ROWS") {
+        if let Some(rows_pos) = find_unquoted_ignore_ascii_case(input, "ROWS") {
             frame = Some(Self::parse_window_frame(&input[rows_pos..], WindowFrameType::Rows)?);
-        } else if let Some(range_pos) = Self::find_unquoted(&upper, "RANGE") {
+        } else if let Some(range_pos) = find_unquoted_ignore_ascii_case(input, "RANGE") {
             frame = Some(Self::parse_window_frame(&input[range_pos..], WindowFrameType::Range)?);
         }
 
@@ -1546,10 +1637,9 @@ impl QueryParser {
             if part.is_empty() {
                 continue;
             }
-            let upper = part.to_uppercase();
-            let (col, ascending) = if upper.ends_with(" DESC") {
+            let (col, ascending) = if ends_with_ignore_ascii_case(part, " DESC") {
                 (part[..part.len() - 5].trim().to_string(), false)
-            } else if upper.ends_with(" ASC") {
+            } else if ends_with_ignore_ascii_case(part, " ASC") {
                 (part[..part.len() - 4].trim().to_string(), true)
             } else {
                 (part.to_string(), true)
@@ -1562,15 +1652,13 @@ impl QueryParser {
 
     /// Parse window frame specification.
     fn parse_window_frame(input: &str, frame_type: WindowFrameType) -> Result<WindowFrame> {
-        let upper = input.to_uppercase();
-        
         // Parse: ROWS BETWEEN <start> AND <end>
-        let between_pos = Self::find_unquoted(&upper, "BETWEEN")
+        let between_pos = find_unquoted_ignore_ascii_case(input, "BETWEEN")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'BETWEEN' in window frame".to_string()))?;
         let frame_str = &input[between_pos + 7..].trim();
 
         // Find AND separator
-        let and_pos = Self::find_unquoted(&frame_str.to_uppercase(), " AND ")
+        let and_pos = find_ignore_ascii_case(&frame_str, " AND ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'AND' in window frame".to_string()))?;
 
         let start_str = frame_str[..and_pos].trim();
@@ -1584,26 +1672,25 @@ impl QueryParser {
 
     /// Parse a window frame bound.
     fn parse_frame_bound(input: &str) -> Result<WindowFrameBound> {
-        let upper = input.trim().to_uppercase();
-        match upper.as_str() {
-            "UNBOUNDED PRECEDING" => Ok(WindowFrameBound::UnboundedPreceding),
-            "UNBOUNDED FOLLOWING" => Ok(WindowFrameBound::UnboundedFollowing),
-            "CURRENT ROW" => Ok(WindowFrameBound::CurrentRow),
-            _ => {
-                if upper.ends_with("PRECEDING") {
-                    let n_str = upper[..upper.len() - 9].trim();
-                    let n = n_str.parse::<u64>()
-                        .map_err(|_| CoreError::InvalidArgument("invalid frame bound".to_string()))?;
-                    Ok(WindowFrameBound::Preceding(n))
-                } else if upper.ends_with("FOLLOWING") {
-                    let n_str = upper[..upper.len() - 9].trim();
-                    let n = n_str.parse::<u64>()
-                        .map_err(|_| CoreError::InvalidArgument("invalid frame bound".to_string()))?;
-                    Ok(WindowFrameBound::Following(n))
-                } else {
-                    Err(CoreError::InvalidArgument(format!("invalid frame bound: {}", input)))
-                }
-            }
+        let input = input.trim();
+        if input.eq_ignore_ascii_case("UNBOUNDED PRECEDING") {
+            Ok(WindowFrameBound::UnboundedPreceding)
+        } else if input.eq_ignore_ascii_case("UNBOUNDED FOLLOWING") {
+            Ok(WindowFrameBound::UnboundedFollowing)
+        } else if input.eq_ignore_ascii_case("CURRENT ROW") {
+            Ok(WindowFrameBound::CurrentRow)
+        } else if input.len() >= 9 && input[input.len() - 9..].eq_ignore_ascii_case("PRECEDING") {
+            let n_str = input[..input.len() - 9].trim();
+            let n = n_str.parse::<u64>()
+                .map_err(|_| CoreError::InvalidArgument("invalid frame bound".to_string()))?;
+            Ok(WindowFrameBound::Preceding(n))
+        } else if input.len() >= 9 && input[input.len() - 9..].eq_ignore_ascii_case("FOLLOWING") {
+            let n_str = input[..input.len() - 9].trim();
+            let n = n_str.parse::<u64>()
+                .map_err(|_| CoreError::InvalidArgument("invalid frame bound".to_string()))?;
+            Ok(WindowFrameBound::Following(n))
+        } else {
+            Err(CoreError::InvalidArgument(format!("invalid frame bound: {}", input)))
         }
     }
 
@@ -1624,11 +1711,10 @@ impl QueryParser {
 
     /// Consumes input until a keyword is found. Returns (consumed, remaining).
     fn consume_until_keywords<'a>(input: &'a str, keywords: &[&str]) -> (String, &'a str) {
-        let upper = input.to_uppercase();
         let mut earliest = input.len();
 
         for kw in keywords {
-            if let Some(pos) = Self::find_unquoted(&upper, kw) {
+            if let Some(pos) = find_unquoted_ignore_ascii_case(input, kw) {
                 if pos < earliest {
                     earliest = pos;
                 }
@@ -1642,9 +1728,7 @@ impl QueryParser {
 
     /// Parses: CREATE INDEX ON <class> (<column>) or CREATE INDEX ON <class> (<col1>, <col2>)
     fn parse_create_index(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-        let on_pos = upper
-            .find(" ON ")
+        let on_pos = find_ignore_ascii_case(input, " ON ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after CREATE INDEX".to_string()))?;
         let rest = input[on_pos + 4..].trim();
 
@@ -1680,9 +1764,7 @@ impl QueryParser {
 
     /// Parses: DROP INDEX ON <class> (<column>)
     fn parse_drop_index(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-        let on_pos = upper
-            .find(" ON ")
+        let on_pos = find_ignore_ascii_case(input, " ON ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after DROP INDEX".to_string()))?;
         let rest = input[on_pos + 4..].trim();
 
@@ -1706,9 +1788,7 @@ impl QueryParser {
 
     /// Parses: CREATE VECTOR INDEX ON <class> (<column>) METRIC <metric> DIMENSION <dim> [M <m>] [EF_CONSTRUCTION <ef>] [EF_SEARCH <ef>]
     fn parse_create_vector_index(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-        let on_pos = upper
-            .find(" ON ")
+        let on_pos = find_ignore_ascii_case(input, " ON ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after CREATE VECTOR INDEX".to_string()))?;
         let rest = input[on_pos + 4..].trim();
 
@@ -1728,10 +1808,10 @@ impl QueryParser {
             ));
         }
 
-        let after_paren = rest[paren_close + 1..].trim().to_uppercase();
+        let after_paren = rest[paren_close + 1..].trim();
 
         // Parse METRIC
-        let metric = if let Some(pos) = after_paren.find("METRIC") {
+        let metric = if let Some(pos) = find_ignore_ascii_case(after_paren, "METRIC") {
             let metric_str = after_paren[pos + 6..].trim();
             let end = metric_str.find(|c: char| c.is_whitespace()).unwrap_or(metric_str.len());
             metric_str[..end].to_lowercase()
@@ -1740,7 +1820,7 @@ impl QueryParser {
         };
 
         // Parse DIMENSION
-        let dimension = if let Some(pos) = after_paren.find("DIMENSION") {
+        let dimension = if let Some(pos) = find_ignore_ascii_case(after_paren, "DIMENSION") {
             let dim_str = after_paren[pos + 9..].trim();
             let end = dim_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(dim_str.len());
             dim_str[..end].parse::<usize>()
@@ -1750,7 +1830,7 @@ impl QueryParser {
         };
 
         // Parse optional M
-        let m = if let Some(pos) = after_paren.find(" M ") {
+        let m = if let Some(pos) = find_ignore_ascii_case(after_paren, " M ") {
             let m_str = after_paren[pos + 3..].trim();
             let end = m_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(m_str.len());
             m_str[..end].parse::<usize>().unwrap_or(16)
@@ -1759,7 +1839,7 @@ impl QueryParser {
         };
 
         // Parse optional EF_CONSTRUCTION
-        let ef_construction = if let Some(pos) = after_paren.find("EF_CONSTRUCTION") {
+        let ef_construction = if let Some(pos) = find_ignore_ascii_case(after_paren, "EF_CONSTRUCTION") {
             let ef_str = after_paren[pos + 15..].trim();
             let end = ef_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(ef_str.len());
             ef_str[..end].parse::<usize>().unwrap_or(200)
@@ -1768,7 +1848,7 @@ impl QueryParser {
         };
 
         // Parse optional EF_SEARCH
-        let ef_search = if let Some(pos) = after_paren.find("EF_SEARCH") {
+        let ef_search = if let Some(pos) = find_ignore_ascii_case(after_paren, "EF_SEARCH") {
             let ef_str = after_paren[pos + 9..].trim();
             let end = ef_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(ef_str.len());
             ef_str[..end].parse::<usize>().unwrap_or(100)
@@ -1789,9 +1869,7 @@ impl QueryParser {
 
     /// Parses: DROP VECTOR INDEX ON <class> (<column>)
     fn parse_drop_vector_index(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-        let on_pos = upper
-            .find(" ON ")
+        let on_pos = find_ignore_ascii_case(input, " ON ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after DROP VECTOR INDEX".to_string()))?;
         let rest = input[on_pos + 4..].trim();
 
@@ -1815,9 +1893,7 @@ impl QueryParser {
 
     /// Parses: VECTOR SEARCH ON <class> (<column>) QUERY [v1, v2, ...] TOP <k> [WHERE ...]
     fn parse_vector_search(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-        let on_pos = upper
-            .find(" ON ")
+        let on_pos = find_ignore_ascii_case(input, " ON ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after VECTOR SEARCH".to_string()))?;
         let rest = input[on_pos + 4..].trim();
 
@@ -1840,9 +1916,7 @@ impl QueryParser {
         let after_paren = rest[paren_close + 1..].trim();
 
         // Parse QUERY keyword
-        let upper_after = after_paren.to_uppercase();
-        let query_pos = upper_after
-            .find("QUERY")
+        let query_pos = find_ignore_ascii_case(after_paren, "QUERY")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'QUERY' in VECTOR SEARCH".to_string()))?;
         let after_query = after_paren[query_pos + 5..].trim();
 
@@ -1861,11 +1935,9 @@ impl QueryParser {
             .map_err(|_| CoreError::InvalidArgument("invalid vector element".to_string()))?;
 
         let after_vec = after_query[bracket_close + 1..].trim();
-        let upper_after_vec = after_vec.to_uppercase();
 
         // Parse TOP <k>
-        let top_pos = upper_after_vec
-            .find("TOP")
+        let top_pos = find_ignore_ascii_case(after_vec, "TOP")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'TOP' in VECTOR SEARCH".to_string()))?;
         let after_top = after_vec[top_pos + 3..].trim();
         let (top_str, remaining) = Self::parse_word(after_top)?;
@@ -1874,7 +1946,7 @@ impl QueryParser {
             .map_err(|_| CoreError::InvalidArgument("invalid TOP value".to_string()))?;
 
         // Parse optional WHERE
-        let filter = if remaining.to_uppercase().starts_with("WHERE") {
+        let filter = if starts_with_ignore_ascii_case(&remaining, "WHERE") {
             Self::parse_where(remaining[5..].trim())?.0
         } else {
             None
@@ -1890,9 +1962,7 @@ impl QueryParser {
     }
 
     fn parse_update(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-        let set_pos = upper
-            .find(" SET ")
+        let set_pos = find_ignore_ascii_case(input, " SET ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'SET'".to_string()))?;
 
         let class = input[6..set_pos].trim().to_string();
@@ -1969,15 +2039,13 @@ impl QueryParser {
     }
 
     fn parse_delete(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-        let from_pos = upper
-            .find("FROM")
+        let from_pos = find_ignore_ascii_case(input, "FROM")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'FROM'".to_string()))?;
 
         let rest = input[from_pos + 4..].trim();
         let (class, rest) = Self::parse_word(rest)?;
 
-        let filter = if rest.to_uppercase().starts_with("WHERE") {
+        let filter = if starts_with_ignore_ascii_case(&rest, "WHERE") {
             Self::parse_where(rest[5..].trim())?.0
         } else {
             None
@@ -2011,15 +2079,14 @@ impl QueryParser {
         let after = rest[close + 1..].trim();
 
         // Parse optional WHERE
-        let (filter, after) = if after.to_uppercase().starts_with("WHERE") {
+        let (filter, after) = if starts_with_ignore_ascii_case(after, "WHERE") {
             Self::parse_where(after[5..].trim())?
         } else {
             (None, after.to_string())
         };
 
         // Parse RETURN
-        let after_upper = after.to_uppercase();
-        if !after_upper.starts_with("RETURN") {
+        if !starts_with_ignore_ascii_case(&after, "RETURN") {
             return Err(CoreError::InvalidArgument(
                 "expected 'RETURN' in MATCH".to_string(),
             ));
@@ -2069,12 +2136,9 @@ impl QueryParser {
     fn parse_where(input: &str) -> Result<(Option<FilterExpr>, String)> {
         let input = input.trim();
 
-        // Try keyword operators first: EXISTS, LIKE, BETWEEN, IN, IS NULL, NOT
-        let upper = input.to_uppercase();
-
         // Check for NOT (expr)
-        if upper.starts_with("NOT ") || upper.starts_with("NOT(") {
-            let not_len = if upper.starts_with("NOT(") { 4 } else { 4 };
+        if starts_with_ignore_ascii_case(input, "NOT ") || starts_with_ignore_ascii_case(input, "NOT(") {
+            let not_len = if starts_with_ignore_ascii_case(input, "NOT(") { 4 } else { 4 };
             let rest = input[not_len..].trim();
             if rest.starts_with('(') {
                 // Find matching closing paren
@@ -2103,8 +2167,8 @@ impl QueryParser {
         }
 
         // Check for EXISTS (SELECT ...)
-        if upper.starts_with("EXISTS") || upper.starts_with("NOT EXISTS") {
-            let (exists_start, is_not) = if upper.starts_with("NOT EXISTS") {
+        if starts_with_ignore_ascii_case(input, "EXISTS") || starts_with_ignore_ascii_case(input, "NOT EXISTS") {
+            let (exists_start, is_not) = if starts_with_ignore_ascii_case(input, "NOT EXISTS") {
                 (10, true)
             } else {
                 (6, false)
@@ -2139,15 +2203,14 @@ impl QueryParser {
         }
 
         // Check for IS NULL / IS NOT NULL: column IS [NOT] NULL
-        if let Some(is_pos) = Self::find_unquoted(&upper, " IS ") {
+        if let Some(is_pos) = find_unquoted_ignore_ascii_case(input, " IS ") {
             let col = input[..is_pos].trim().to_string();
             let rest = input[is_pos + 4..].trim();
-            let rest_upper = rest.to_uppercase();
-            if rest_upper.starts_with("NOT NULL") {
+            if starts_with_ignore_ascii_case(rest, "NOT NULL") {
                 let remaining = rest[8..].trim();
                 let expr = FilterExpr::IsNotNull(col);
                 return Self::wrap_chain(expr, remaining);
-            } else if rest_upper.starts_with("NULL") {
+            } else if starts_with_ignore_ascii_case(rest, "NULL") {
                 let remaining = rest[4..].trim();
                 let expr = FilterExpr::IsNull(col);
                 return Self::wrap_chain(expr, remaining);
@@ -2155,7 +2218,7 @@ impl QueryParser {
         }
 
         // Check for LIKE: column LIKE 'pattern'
-        if let Some(like_pos) = Self::find_unquoted(&upper, " LIKE ") {
+        if let Some(like_pos) = find_unquoted_ignore_ascii_case(input, " LIKE ") {
             let col = input[..like_pos].trim().to_string();
             let rest = input[like_pos + 6..].trim();
             let (pattern, remaining) = Self::extract_quoted_or_word(rest);
@@ -2164,12 +2227,11 @@ impl QueryParser {
         }
 
         // Check for BETWEEN: column BETWEEN low AND high
-        if let Some(between_pos) = Self::find_unquoted(&upper, " BETWEEN ") {
+        if let Some(between_pos) = find_unquoted_ignore_ascii_case(input, " BETWEEN ") {
             let col = input[..between_pos].trim().to_string();
             let rest = input[between_pos + 9..].trim();
-            let rest_upper = rest.to_uppercase();
 
-            if let Some(and_pos) = Self::find_unquoted(&rest_upper, " AND ") {
+            if let Some(and_pos) = find_unquoted_ignore_ascii_case(rest, " AND ") {
                 let low_str = rest[..and_pos].trim();
                 let high_rest = rest[and_pos + 5..].trim();
                 let (high_str, remaining) = Self::extract_quoted_or_word(high_rest);
@@ -2181,7 +2243,7 @@ impl QueryParser {
         }
 
         // Check for IN: column IN (val1, val2, ...) or column IN (SELECT ...)
-        if let Some(in_pos) = Self::find_unquoted(&upper, " IN ") {
+        if let Some(in_pos) = find_unquoted_ignore_ascii_case(input, " IN ") {
             let col = input[..in_pos].trim().to_string();
             let rest = input[in_pos + 4..].trim();
             if rest.starts_with('(') {
@@ -2203,7 +2265,7 @@ impl QueryParser {
                     let remaining = rest[close + 1..].trim();
 
                     // Check if it's a subquery
-                    if inner.to_uppercase().starts_with("SELECT") {
+                    if starts_with_ignore_ascii_case(inner, "SELECT") {
                         let subquery = Self::parse(inner)?;
                         let expr = FilterExpr::InSubquery(col, Box::new(subquery));
                         return Self::wrap_chain(expr, remaining);
@@ -2250,15 +2312,14 @@ impl QueryParser {
     /// Wraps an expression with AND/OR if the remaining text starts with AND/OR.
     fn wrap_chain(expr: FilterExpr, remaining: &str) -> Result<(Option<FilterExpr>, String)> {
         let remaining = remaining.trim();
-        let rem_upper = remaining.to_uppercase();
-        if rem_upper.starts_with("AND ") {
+        if starts_with_ignore_ascii_case(remaining, "AND ") {
             let rest_after = &remaining[4..];
             let (right, final_rest) = Self::parse_where(rest_after)?;
             if let Some(right_expr) = right {
                 return Ok((Some(FilterExpr::And(Box::new(expr), Box::new(right_expr))), final_rest));
             }
             return Ok((Some(expr), final_rest));
-        } else if rem_upper.starts_with("OR ") {
+        } else if starts_with_ignore_ascii_case(remaining, "OR ") {
             let rest_after = &remaining[3..];
             let (right, final_rest) = Self::parse_where(rest_after)?;
             if let Some(right_expr) = right {
@@ -2290,13 +2351,12 @@ impl QueryParser {
 
     /// Parse CREATE MATERIALIZED VIEW <name> AS <query>
     fn parse_create_materialized_view(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-        if !upper.starts_with("CREATE MATERIALIZED VIEW") {
+        if !starts_with_ignore_ascii_case(input, "CREATE MATERIALIZED VIEW") {
             return Err(CoreError::InvalidArgument("expected CREATE MATERIALIZED VIEW".to_string()));
         }
 
         let rest = input[24..].trim();
-        let as_pos = rest.to_uppercase().find(" AS ")
+        let as_pos = find_ignore_ascii_case(rest, " AS ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'AS' in CREATE MATERIALIZED VIEW".to_string()))?;
 
         let name = rest[..as_pos].trim().to_string();
@@ -2311,8 +2371,7 @@ impl QueryParser {
 
     /// Parse DROP MATERIALIZED VIEW <name>
     fn parse_drop_materialized_view(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-        if !upper.starts_with("DROP MATERIALIZED VIEW") {
+        if !starts_with_ignore_ascii_case(input, "DROP MATERIALIZED VIEW") {
             return Err(CoreError::InvalidArgument("expected DROP MATERIALIZED VIEW".to_string()));
         }
 
@@ -2322,8 +2381,7 @@ impl QueryParser {
 
     /// Parse REFRESH MATERIALIZED VIEW <name>
     fn parse_refresh_materialized_view(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-        if !upper.starts_with("REFRESH MATERIALIZED VIEW") {
+        if !starts_with_ignore_ascii_case(input, "REFRESH MATERIALIZED VIEW") {
             return Err(CoreError::InvalidArgument("expected REFRESH MATERIALIZED VIEW".to_string()));
         }
 
@@ -2333,8 +2391,7 @@ impl QueryParser {
 
     /// Parses a CASE WHEN ... THEN ... ELSE ... END expression.
     fn parse_case_when(input: &str) -> Result<ValueExpr> {
-        let upper = input.to_uppercase();
-        if !upper.starts_with("CASE ") && !upper.starts_with("CASE\n") {
+        if !starts_with_ignore_ascii_case(input, "CASE ") && !starts_with_ignore_ascii_case(input, "CASE\n") {
             return Err(CoreError::InvalidArgument("expected CASE".to_string()));
         }
 
@@ -2343,14 +2400,14 @@ impl QueryParser {
         let mut else_expr: Option<Box<ValueExpr>> = None;
 
         loop {
-            let rem_upper = remaining.to_uppercase().trim().to_string();
+            let remaining_trimmed = remaining.trim();
 
-            if rem_upper.starts_with("WHEN ") || rem_upper.starts_with("WHEN\n") {
+            if starts_with_ignore_ascii_case(remaining_trimmed, "WHEN ") || starts_with_ignore_ascii_case(remaining_trimmed, "WHEN\n") {
                 // Find THEN keyword
-                let then_pos = Self::find_unquoted(&rem_upper, " THEN ")
+                let then_pos = find_unquoted_ignore_ascii_case(remaining_trimmed, " THEN ")
                     .ok_or_else(|| CoreError::InvalidArgument("expected THEN after WHEN".to_string()))?;
-                let cond_str = remaining[5..then_pos].trim();
-                remaining = remaining[then_pos + 6..].trim();
+                let cond_str = remaining_trimmed[5..then_pos].trim();
+                remaining = remaining_trimmed[then_pos + 6..].trim();
 
                 // Parse condition as filter expression
                 let (cond, _) = Self::parse_where(cond_str)?;
@@ -2366,12 +2423,12 @@ impl QueryParser {
                 if let Some(cond_expr) = cond {
                     when_branches.push((cond_expr, value));
                 }
-            } else if rem_upper.starts_with("ELSE ") || rem_upper.starts_with("ELSE\n") {
-                remaining = remaining[5..].trim();
+            } else if starts_with_ignore_ascii_case(remaining_trimmed, "ELSE ") || starts_with_ignore_ascii_case(remaining_trimmed, "ELSE\n") {
+                remaining = remaining_trimmed[5..].trim();
                 let (value_str, rest) = Self::consume_until_keywords(remaining, &["END"]);
                 else_expr = Some(Box::new(Self::parse_value_expr(&value_str)?));
                 remaining = rest;
-            } else if rem_upper.starts_with("END") {
+            } else if starts_with_ignore_ascii_case(remaining_trimmed, "END") {
                 break;
             } else {
                 return Err(CoreError::InvalidArgument(format!(
@@ -2390,15 +2447,14 @@ impl QueryParser {
     /// Parses a value expression: column reference, literal, CASE WHEN, arithmetic, function, or scalar subquery.
     fn parse_value_expr(input: &str) -> Result<ValueExpr> {
         let input = input.trim();
-        let upper = input.to_uppercase();
 
         // CASE WHEN
-        if upper.starts_with("CASE ") {
+        if starts_with_ignore_ascii_case(input, "CASE ") {
             return Self::parse_case_when(input);
         }
 
         // Scalar subquery: (SELECT ...)
-        if input.starts_with('(') && upper[1..].trim_start().starts_with("SELECT") {
+        if input.starts_with('(') && starts_with_ignore_ascii_case(input[1..].trim_start(), "SELECT") {
             let subquery = Self::parse_subquery(input)?;
             return Ok(ValueExpr::ScalarSubquery(Box::new(subquery)));
         }
@@ -2406,7 +2462,7 @@ impl QueryParser {
         // Built-in function: FUNC(args...)
         let func_names = ["COALESCE", "NULLIF", "CONCAT", "SUBSTRING", "UPPER", "LOWER", "NOW", "LENGTH", "TRIM", "ABS", "ROUND"];
         for func_name in &func_names {
-            if upper.starts_with(func_name) && input.len() > func_name.len() && input.as_bytes()[func_name.len()] == b'(' {
+            if starts_with_ignore_ascii_case(input, func_name) && input.len() > func_name.len() && input.as_bytes()[func_name.len()] == b'(' {
                 // Find matching closing paren
                 let open = func_name.len();
                 let close = Self::find_matching_paren_simple(&input[open..])? + open;
@@ -2485,8 +2541,7 @@ impl QueryParser {
 
     /// Parses ANALYZE <table>
     fn parse_analyze(input: &str) -> Result<QueryAst> {
-        let upper = input.to_uppercase();
-        if !upper.starts_with("ANALYZE") {
+        if !starts_with_ignore_ascii_case(input, "ANALYZE") {
             return Err(CoreError::InvalidArgument("expected ANALYZE".to_string()));
         }
         let table = input[7..].trim().to_string();
@@ -2568,9 +2623,8 @@ impl QueryParser {
         let inner = rest[1..end].trim();
 
         // Parse FROM and TO clauses
-        let upper_inner = inner.to_uppercase();
-        let from_pos = upper_inner.find("FROM ").ok_or_else(|| CoreError::InvalidArgument("expected FROM".to_string()))?;
-        let to_pos = upper_inner.find(" TO ").ok_or_else(|| CoreError::InvalidArgument("expected TO".to_string()))?;
+        let from_pos = find_ignore_ascii_case(inner, "FROM ").ok_or_else(|| CoreError::InvalidArgument("expected FROM".to_string()))?;
+        let to_pos = find_ignore_ascii_case(inner, " TO ").ok_or_else(|| CoreError::InvalidArgument("expected TO".to_string()))?;
 
         let from_table = inner[from_pos + 5..to_pos].trim().to_string();
         let after_to = inner[to_pos + 4..].trim();
@@ -2593,8 +2647,7 @@ impl QueryParser {
 
         // For simplicity, parse as a structured format
         // INSERT VERTEX INTO Person SET id = 'alice', labels = ['Person'], name = 'Alice'
-        let upper = rest.to_uppercase();
-        if upper.starts_with("SET") {
+        if starts_with_ignore_ascii_case(&rest, "SET") {
             let props_str = rest[3..].trim();
             let props = Self::parse_set_assignments(props_str)?;
 
@@ -2624,8 +2677,7 @@ impl QueryParser {
         let rest = rest.strip_prefix("INTO").ok_or_else(|| CoreError::InvalidArgument("expected INTO".to_string()))?.trim();
         let (table, rest) = Self::parse_word(rest)?;
 
-        let upper = rest.to_uppercase();
-        if upper.starts_with("SET") {
+        if starts_with_ignore_ascii_case(&rest, "SET") {
             let props_str = rest[3..].trim();
             let props = Self::parse_set_assignments(props_str)?;
 
@@ -2663,22 +2715,20 @@ impl QueryParser {
 
         // Parse direction
         let mut direction = GraphDirection::Out;
-        let upper = remaining.to_uppercase();
-        if upper.starts_with("IN") && !upper.starts_with("INTO") {
+        if starts_with_ignore_ascii_case(&remaining, "IN") && !starts_with_ignore_ascii_case(&remaining, "INTO") {
             direction = GraphDirection::In;
             remaining = remaining[2..].trim().to_string();
-        } else if upper.starts_with("OUT") {
+        } else if starts_with_ignore_ascii_case(&remaining, "OUT") {
             direction = GraphDirection::Out;
             remaining = remaining[3..].trim().to_string();
-        } else if upper.starts_with("BOTH") {
+        } else if starts_with_ignore_ascii_case(&remaining, "BOTH") {
             direction = GraphDirection::Both;
             remaining = remaining[4..].trim().to_string();
         }
 
         // Parse LABEL
         let mut edge_label = None;
-        let upper = remaining.to_uppercase();
-        if upper.starts_with("LABEL") {
+        if starts_with_ignore_ascii_case(&remaining, "LABEL") {
             remaining = remaining[5..].trim().to_string();
             let (label, r) = Self::parse_word(&remaining)?;
             edge_label = Some(label);
@@ -2687,8 +2737,7 @@ impl QueryParser {
 
         // Parse DEPTH
         let mut max_depth = 3; // Default
-        let upper = remaining.to_uppercase();
-        if upper.starts_with("DEPTH") {
+        if starts_with_ignore_ascii_case(&remaining, "DEPTH") {
             remaining = remaining[5..].trim().to_string();
             let (depth_str, r) = Self::parse_word(&remaining)?;
             max_depth = depth_str.parse().unwrap_or(3);
@@ -2696,8 +2745,7 @@ impl QueryParser {
         }
 
         // Parse optional WHERE
-        let upper = remaining.to_uppercase();
-        let filter = if upper.starts_with("WHERE") {
+        let filter = if starts_with_ignore_ascii_case(&remaining, "WHERE") {
             let (f, _) = Self::parse_where(&remaining[5..])?;
             f
         } else {
@@ -2720,7 +2768,7 @@ impl QueryParser {
 
         // For now, return a simple pattern
         // Full implementation would parse the graph pattern syntax
-        let returns = if let Some(ret_pos) = rest.to_uppercase().find("RETURN") {
+        let returns = if let Some(ret_pos) = find_ignore_ascii_case(rest, "RETURN") {
             rest[ret_pos + 6..].trim()
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -2753,10 +2801,9 @@ impl QueryParser {
 
         // Parse MAX DEPTH
         let mut max_depth = 10; // Default
-        let upper = rest.to_uppercase();
-        if upper.starts_with("MAX") {
+        if starts_with_ignore_ascii_case(rest, "MAX") {
             rest = rest[3..].trim();
-            if rest.to_uppercase().starts_with("DEPTH") {
+            if starts_with_ignore_ascii_case(rest, "DEPTH") {
                 rest = rest[5..].trim();
                 let (depth_str, _) = Self::parse_word(rest)?;
                 max_depth = depth_str.parse().unwrap_or(10);

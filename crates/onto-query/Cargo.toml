@@ -15,6 +15,7 @@ simd-json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+parking_lot = "0.12"
 csv = "1"
 
 [dev-dependencies]

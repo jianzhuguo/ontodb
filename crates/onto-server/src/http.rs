@@ -14,7 +14,7 @@ use onto_query::{QueryAst, QueryExecutor, QueryParser};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::metrics::SharedMetrics;
@@ -47,23 +47,90 @@ fn validate_filter(filter: &str) -> Result<(), String> {
     if filter.contains(';') {
         return Err("filter must not contain semicolons".into());
     }
-    // Reject dangerous SQL keywords (case-insensitive)
+    // Reject comment sequences
+    if filter.contains("/*") || filter.contains("*/") {
+        return Err("filter must not contain block comments".into());
+    }
+    if filter.contains("--") {
+        return Err("filter must not contain line comments".into());
+    }
+    // Reject dangerous SQL keywords (case-insensitive, word-boundary aware)
     let upper = filter.to_uppercase();
     let forbidden = [
-        "DROP ", "DELETE ", "INSERT ", "UPDATE ", "UNION ",
-        "ALTER ", "CREATE ", "TRUNCATE ", "EXEC ", "EXECUTE ",
-        "-- ", "/*", "*/",
+        "DROP", "DELETE", "INSERT", "UPDATE", "UNION",
+        "ALTER", "CREATE", "TRUNCATE", "EXEC", "EXECUTE",
+        "SLEEP", "BENCHMARK", "LOAD_FILE", "INTO OUTFILE",
+        "PG_SLEEP", "INFORMATION_SCHEMA",
     ];
     for kw in &forbidden {
-        if upper.contains(kw) {
-            return Err(format!("filter must not contain '{}'", kw.trim()));
+        // Check for keyword preceded by start/non-alnum and followed by non-alnum
+        let mut search_start = 0;
+        while let Some(pos) = upper[search_start..].find(kw) {
+            let abs_pos = search_start + pos;
+            let before_ok = abs_pos == 0
+                || !upper.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
+            let end_pos = abs_pos + kw.len();
+            let after_ok = end_pos >= upper.len()
+                || !upper.as_bytes()[end_pos].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return Err(format!("filter must not contain '{}'", kw));
+            }
+            search_start = abs_pos + 1;
         }
     }
     Ok(())
 }
 
+/// Validates a SQL identifier (class name, column name) to prevent injection.
+/// Only allows alphanumeric characters, underscores, and dots (for qualified names).
+fn validate_identifier(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 128 {
+        return Err("identifier must be 1-128 characters".into());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+        return Err(format!(
+            "invalid identifier '{}': only alphanumeric, underscore, and dot allowed",
+            name
+        ));
+    }
+    if name.starts_with('.') || name.ends_with('.') || name.contains("..") {
+        return Err(format!("invalid identifier '{}': malformed dot usage", name));
+    }
+    Ok(())
+}
+
+/// Validates a backup path to prevent path traversal attacks.
+fn validate_backup_path(path: &str) -> Result<std::path::PathBuf, String> {
+    if path.is_empty() {
+        return Err("backup path must not be empty".into());
+    }
+    let p = std::path::Path::new(path);
+    for component in p.components() {
+        if let std::path::Component::ParentDir = component {
+            return Err("backup path must not contain '..'".into());
+        }
+    }
+    if !p.is_absolute() {
+        return Err("backup path must be absolute".into());
+    }
+    Ok(p.to_path_buf())
+}
+
 /// Slow query threshold in seconds. Queries exceeding this are logged as warnings.
 const SLOW_QUERY_THRESHOLD_SECS: f64 = 1.0;
+
+/// Safely truncate a UTF-8 string to at most `max_bytes` bytes.
+/// Returns the original string if it's already short enough.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 /// Shared application state.
 #[derive(Clone)]
@@ -181,9 +248,46 @@ impl<T: Serialize> ApiResponse<T> {
     }
 }
 
+/// Builds a CORS layer from a comma-separated origins string.
+/// Empty string = same-origin only (no CORS headers).
+/// "*" = allow all origins (NOT recommended for production).
+fn build_cors_layer(origins: &str) -> CorsLayer {
+    if origins.trim() == "*" {
+        tracing::warn!("CORS: allowing ALL origins — do NOT use in production");
+        // Use Any origin without credentials (not permissive() which allows credentials)
+        CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PUT, axum::http::Method::DELETE])
+            .allow_headers(tower_http::cors::Any)
+            .allow_credentials(false)
+    } else if origins.trim().is_empty() {
+        // Same-origin only — no cross-origin requests allowed
+        CorsLayer::new()
+            .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PUT, axum::http::Method::DELETE])
+            .allow_headers(tower_http::cors::Any)
+    } else {
+        let allowed: Vec<axum::http::HeaderValue> = origins
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        tracing::info!("CORS: allowing origins: {:?}", allowed);
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(allowed))
+            .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PUT, axum::http::Method::DELETE])
+            .allow_headers(tower_http::cors::Any)
+    }
+}
+
 /// Builds the HTTP router with all API endpoints (no auth).
 #[allow(dead_code)]
-pub fn build_router(state: AppState) -> Router {
+pub fn build_router(state: AppState, cors_origins: &str) -> Router {
+    use axum::extract::DefaultBodyLimit;
+
+    // Max request body size: 64 MB
+    const MAX_BODY_SIZE: usize = 64 * 1024 * 1024;
+
     Router::new()
         // Health check
         .route("/api/health", get(health))
@@ -215,7 +319,8 @@ pub fn build_router(state: AppState) -> Router {
         // Web console
         .route("/console", get(web_console))
         .route("/", get(web_console))
-        .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+        .layer(build_cors_layer(cors_origins))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -226,6 +331,7 @@ pub fn build_router_with_auth(
     auth_state: crate::auth::AuthState,
     rate_limiter: crate::rate_limit::RateLimiter,
     admin_state: crate::admin::AdminState,
+    cors_origins: &str,
 ) -> Router {
     use axum::middleware;
 
@@ -281,9 +387,28 @@ pub fn build_router_with_auth(
             auth_state,
             crate::auth::auth_middleware,
         ))
-        .layer(CorsLayer::permissive())
+        .layer(build_cors_layer(cors_origins))
+        .layer(axum::middleware::from_fn(security_headers_middleware))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Middleware that adds security headers to all responses.
+async fn security_headers_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    headers.insert("x-frame-options", "DENY".parse().unwrap());
+    headers.insert("x-xss-protection", "1; mode=block".parse().unwrap());
+    headers.insert("referrer-policy", "strict-origin-when-cross-origin".parse().unwrap());
+    headers.insert(
+        "content-security-policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'".parse().unwrap(),
+    );
+    response
 }
 
 /// GET /api/health - Comprehensive health check endpoint.
@@ -462,9 +587,11 @@ async fn metrics_json(State(state): State<AppState>) -> impl IntoResponse {
 /// ```
 async fn execute_query(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<QueryRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+    let client_ip = addr.ip().to_string();
 
     let query = req.query.trim_end_matches(';').trim();
     let ast = match QueryParser::parse(query) {
@@ -499,7 +626,7 @@ async fn execute_query(
             let elapsed = start.elapsed().as_secs_f64();
             state.metrics.record_query(query_type, elapsed, false);
             // Audit log — failed query
-            let audit_entry = state.audit.create_query_entry("127.0.0.1", None, query_type, query, elapsed * 1000.0, false, Some(e.to_string()));
+            let audit_entry = state.audit.create_query_entry(&client_ip, None, query_type, query, elapsed * 1000.0, false, Some(e.to_string()));
             state.audit.log(audit_entry);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -512,13 +639,13 @@ async fn execute_query(
     state.metrics.record_query(query_type, elapsed, true);
 
     // Audit log — successful query
-    let audit_entry = state.audit.create_query_entry("127.0.0.1", None, query_type, query, elapsed * 1000.0, true, None);
+    let audit_entry = state.audit.create_query_entry(&client_ip, None, query_type, query, elapsed * 1000.0, true, None);
     state.audit.log(audit_entry);
 
     // Slow query logging
     if elapsed >= SLOW_QUERY_THRESHOLD_SECS {
         state.metrics.slow_queries_total.inc();
-        let truncated = if query.len() > 200 { &query[..200] } else { query };
+        let truncated = truncate_utf8(query, 200);
         tracing::warn!(
             target: "slow_query",
             query_type = query_type,
@@ -607,7 +734,7 @@ async fn sparql_query(
 
     if elapsed >= SLOW_QUERY_THRESHOLD_SECS {
         state.metrics.slow_queries_total.inc();
-        let truncated = if req.query.len() > 200 { &req.query[..200] } else { &req.query };
+        let truncated = truncate_utf8(&req.query, 200);
         tracing::warn!(
             target: "slow_query",
             query_type = "SPARQL",
@@ -650,6 +777,20 @@ async fn vector_search(
     Json(req): Json<VectorSearchRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+
+    // Validate identifiers to prevent injection
+    if let Err(e) = validate_identifier(&req.class) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!("Invalid class name: {}", e))),
+        );
+    }
+    if let Err(e) = validate_identifier(&req.column) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!("Invalid column name: {}", e))),
+        );
+    }
 
     // Build VECTOR SEARCH query
     let filter_clause = if let Some(f) = &req.filter {
@@ -753,6 +894,22 @@ async fn hybrid_query(
     Json(req): Json<HybridQueryRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+
+    // Validate identifiers to prevent injection
+    if let Err(e) = validate_identifier(&req.vector_column) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!("Invalid vector_column: {}", e))),
+        );
+    }
+    if let Some(ref c) = req.class {
+        if let Err(e) = validate_identifier(c) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!("Invalid class name: {}", e))),
+            );
+        }
+    }
 
     // Step 1: Execute the SQL filter query
     let sql_query = req.sql_filter.trim_end_matches(';').trim();
@@ -1233,9 +1390,17 @@ async fn backup(
     Json(req): Json<BackupRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
-    let backup_dir = std::path::Path::new(&req.path);
+    let backup_dir = match validate_backup_path(&req.path) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!("Invalid backup path: {}", e))),
+            );
+        }
+    };
 
-    match state.executor.backup(backup_dir) {
+    match state.executor.backup(&backup_dir) {
         Ok(manifest) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
@@ -1262,7 +1427,15 @@ async fn backup_incremental(
     Json(req): Json<IncrementalBackupRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
-    let backup_dir = std::path::Path::new(&req.path);
+    let backup_dir = match validate_backup_path(&req.path) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!("Invalid backup path: {}", e))),
+            );
+        }
+    };
 
     // Parse the ISO 8601 timestamp into SystemTime
     // Accept formats: "2026-08-08T12:00:00Z" or "2026-08-08T12:00:00"
@@ -1275,7 +1448,7 @@ async fn backup_incremental(
         }
     };
 
-    match state.executor.backup_incremental(backup_dir, &since) {
+    match state.executor.backup_incremental(&backup_dir, &since) {
         Ok(manifest) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
@@ -1302,9 +1475,17 @@ async fn verify_backup_endpoint(
     Json(req): Json<VerifyBackupRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
-    let backup_dir = std::path::Path::new(&req.path);
+    let backup_dir = match validate_backup_path(&req.path) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!("Invalid backup path: {}", e))),
+            );
+        }
+    };
 
-    match onto_query::QueryExecutor::verify_backup(backup_dir) {
+    match onto_query::QueryExecutor::verify_backup(&backup_dir) {
         Ok(()) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             (StatusCode::OK, Json(ApiResponse::success(json!({

@@ -24,6 +24,9 @@ pub type OntoRaft = openraft::Raft<OntoRaftConfig>;
 /// Log entry type.
 pub type OntoEntry = openraft::Entry<OntoRaftConfig>;
 
+/// Maximum nesting depth for Batch operations to prevent stack overflow.
+const MAX_BATCH_DEPTH: usize = 10;
+
 /// Request type for Raft state machine operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OntoRequest {
@@ -36,6 +39,37 @@ pub enum OntoRequest {
     /// Configuration change (API keys + IP whitelist).
     /// The full config JSON is replicated to all nodes via Raft log.
     ConfigChange { config_json: Vec<u8> },
+}
+
+impl OntoRequest {
+    /// Returns the maximum nesting depth of this request (for Batch recursion).
+    pub fn depth(&self) -> usize {
+        match self {
+            OntoRequest::Batch { ops } => {
+                1 + ops.iter().map(|op| op.depth()).max().unwrap_or(0)
+            }
+            _ => 1,
+        }
+    }
+
+    /// Returns true if this request exceeds the maximum allowed nesting depth.
+    pub fn exceeds_max_depth(&self) -> bool {
+        self.depth() > MAX_BATCH_DEPTH
+    }
+
+    /// Flatten nested batches into a single-level batch.
+    pub fn flatten(self) -> Vec<OntoRequest> {
+        match self {
+            OntoRequest::Batch { ops } => {
+                let mut flat = Vec::new();
+                for op in ops {
+                    flat.extend(op.flatten());
+                }
+                flat
+            }
+            other => vec![other],
+        }
+    }
 }
 
 /// Response type from the Raft state machine.

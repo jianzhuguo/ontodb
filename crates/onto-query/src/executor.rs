@@ -363,7 +363,7 @@ impl QueryExecutor {
 
     /// Get runtime execution statistics.
     pub fn runtime_stats(&self) -> RuntimeStats {
-        self.runtime_stats.lock().unwrap().clone()
+        self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Get engine storage statistics (SSTable count, total entries, etc.).
@@ -402,28 +402,28 @@ impl QueryExecutor {
 
     /// Get a reference to the query planner.
     pub fn planner(&self) -> std::sync::RwLockReadGuard<'_, QueryPlanner> {
-        self.planner.read().unwrap()
+        self.planner.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get a mutable reference to the query planner (for updating stats).
     pub fn planner_mut(&self) -> std::sync::RwLockWriteGuard<'_, QueryPlanner> {
-        self.planner.write().unwrap()
+        self.planner.write().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get query cache statistics.
     pub fn query_cache_stats(&self) -> crate::cache::CacheStats {
-        self.query_cache.lock().unwrap().stats().clone()
+        self.query_cache.lock().unwrap_or_else(|e| e.into_inner()).stats().clone()
     }
 
     /// Get plan cache statistics.
     pub fn plan_cache_stats(&self) -> crate::cache::CacheStats {
-        self.plan_cache.lock().unwrap().stats().clone()
+        self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).stats().clone()
     }
 
     /// Clear all caches.
     pub fn clear_caches(&self) {
-        self.query_cache.lock().unwrap().clear();
-        self.plan_cache.lock().unwrap().clear();
+        self.query_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Returns schema introspection data: all ontologies, classes, properties, and indexes.
@@ -510,24 +510,20 @@ impl QueryExecutor {
 
     /// Returns the active transaction ID, if any.
     pub fn active_txn_id(&self) -> Option<onto_core::SeqNo> {
-        *self.active_txn.lock().unwrap()
+        *self.active_txn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Returns true if a multi-statement transaction is active.
     pub fn in_transaction(&self) -> bool {
-        self.active_txn.lock().unwrap().is_some()
+        self.active_txn.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     /// Classifies whether a query is read-only (can use a read lock).
-    /// Returns true for SELECT, EXPLAIN, ANALYZE, MATCH, VectorSearch.
+    /// Returns true for SELECT, EXPLAIN, MATCH, VectorSearch, and graph queries.
+    /// Note: Union and With are conservatively treated as writes because they
+    /// can contain INSERT...SELECT or write CTEs.
     pub fn is_read_only_query(ast: &QueryAst) -> bool {
-        matches!(ast,
-            QueryAst::Select { .. }
-            | QueryAst::Explain { .. }
-            | QueryAst::Analyze { .. }
-            | QueryAst::Match { .. }
-            | QueryAst::VectorSearch { .. }
-        )
+        ast.is_read_only()
     }
 
     /// Executes a query with a write lock (default path, full feature support).
@@ -537,11 +533,12 @@ impl QueryExecutor {
         // For simple DML (INSERT/UPDATE/DELETE) without an active multi-statement txn,
         // use a short write lock that's only held during the commit phase.
         // This allows concurrent reads to proceed during query planning and execution.
-        let active_txn = *self.active_txn.lock().unwrap();
+        let active_txn = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
         let is_simple_dml = active_txn.is_none() && matches!(
             ast,
             QueryAst::Insert { .. }
                 | QueryAst::BatchInsert { .. }
+                | QueryAst::BatchUpsert { .. }
                 | QueryAst::Update { .. }
                 | QueryAst::Delete { .. }
                 | QueryAst::Upsert { .. }
@@ -585,7 +582,7 @@ impl QueryExecutor {
 
         let elapsed_us = elapsed.as_micros() as u64;
         {
-            let mut stats = self.runtime_stats.lock().unwrap();
+            let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
             stats.total_queries += 1;
             stats.total_time_us += elapsed_us;
         }
@@ -618,7 +615,7 @@ impl QueryExecutor {
 
         let elapsed_us = elapsed.as_micros() as u64;
         {
-            let mut stats = self.runtime_stats.lock().unwrap();
+            let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
             stats.total_queries += 1;
             stats.total_time_us += elapsed_us;
             if let QueryAst::Select { from, .. } = ast {
@@ -639,16 +636,16 @@ impl QueryExecutor {
                 // Check plan cache first
                 let cached_plan = {
                     let ast_hash = Self::hash_ast(ast);
-                    let cached = self.plan_cache.lock().unwrap().get(ast_hash);
+                    let cached = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).get(ast_hash);
                     if cached.is_some() {
-                        self.runtime_stats.lock().unwrap().plan_cache_hits += 1;
+                        self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner()).plan_cache_hits += 1;
                         cached
                     } else {
                         let plan = self.planner.read().unwrap().plan(ast);
                         if let Ok(ref p) = plan {
-                            self.plan_cache.lock().unwrap().insert(ast_hash, p.clone());
+                            self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(ast_hash, p.clone());
                         }
-                        self.runtime_stats.lock().unwrap().plan_cache_misses += 1;
+                        self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner()).plan_cache_misses += 1;
                         plan.ok()
                     }
                 };
@@ -741,7 +738,7 @@ impl QueryExecutor {
 
         let elapsed_us = elapsed.as_micros() as u64;
         {
-            let mut stats = self.runtime_stats.lock().unwrap();
+            let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
             stats.total_queries += 1;
             stats.total_time_us += elapsed_us;
             if let QueryAst::Select { from, .. } = ast {
@@ -776,7 +773,7 @@ impl QueryExecutor {
                 let ontology = onto_ontology::OntologyParser::parse(sql)?;
                 self.ontology_store.save_with_engine(engine, &ontology)?;
                 // Invalidate inference cache on ontology changes
-                self.inference_cache.lock().unwrap().clear();
+                self.inference_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 Ok(QueryResult::Success(format!(
                     "Ontology '{}' created with {} classes and {} properties",
                     ontology.name,
@@ -978,7 +975,7 @@ impl QueryExecutor {
                 }
             }
             QueryAst::Begin => {
-                let mut txn = self.active_txn.lock().unwrap();
+                let mut txn = self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
                 if txn.is_some() {
                     return Err(CoreError::InvalidArgument(
                         "transaction already active (use COMMIT or ROLLBACK first)".to_string()
@@ -989,7 +986,7 @@ impl QueryExecutor {
                 Ok(QueryResult::Success(format!("Transaction started (txn_id={})", txn_id)))
             }
             QueryAst::Commit => {
-                let mut txn = self.active_txn.lock().unwrap();
+                let mut txn = self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
                 match txn.take() {
                     Some(txn_id) => {
                         engine.commit_txn(txn_id)?;
@@ -1001,7 +998,7 @@ impl QueryExecutor {
                 }
             }
             QueryAst::Rollback => {
-                let mut txn = self.active_txn.lock().unwrap();
+                let mut txn = self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
                 match txn.take() {
                     Some(txn_id) => {
                         engine.abort_txn(txn_id)?;
@@ -1040,17 +1037,17 @@ impl QueryExecutor {
                 // For SELECT queries, check plan cache first
                 let cached_plan = if matches!(ast, QueryAst::Select { .. }) {
                     let ast_hash = Self::hash_ast(ast);
-                    let cached = self.plan_cache.lock().unwrap().get(ast_hash);
+                    let cached = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).get(ast_hash);
                     if cached.is_some() {
-                        self.runtime_stats.lock().unwrap().plan_cache_hits += 1;
+                        self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner()).plan_cache_hits += 1;
                         cached
                     } else {
                         // Plan cache miss - generate and cache plan
                         let plan = self.planner.read().unwrap().plan(ast);
                         if let Ok(ref p) = plan {
-                            self.plan_cache.lock().unwrap().insert(ast_hash, p.clone());
+                            self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(ast_hash, p.clone());
                         }
-                        self.runtime_stats.lock().unwrap().plan_cache_misses += 1;
+                        self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner()).plan_cache_misses += 1;
                         plan.ok()
                     }
                 } else {
@@ -1058,7 +1055,7 @@ impl QueryExecutor {
                 };
 
                 // Check if there's an active multi-statement transaction
-                let active_txn_id = *self.active_txn.lock().unwrap();
+                let active_txn_id = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(txn_id) = active_txn_id {
                     // Use the active transaction (writes are buffered until COMMIT)
                     self.execute_in_txn_with_plan(ast, engine, txn_id, cached_plan.as_ref())
@@ -1524,8 +1521,8 @@ impl QueryExecutor {
         if engine.has_index(table, index_column) {
             let json_val = Self::literal_to_json_static(key);
             let pkeys = {
-                let mut index_mgr = engine.index_manager().write().unwrap();
-                index_mgr.lookup_eq(table, index_column, &json_val).unwrap_or_default()
+                let index_mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+                index_mgr.lookup_eq_read(table, index_column, &json_val).unwrap_or_default()
             };
             let mut rows = Self::fetch_rows_by_pks(engine, &pkeys)?;
             if let Some(a) = alias {
@@ -1566,9 +1563,9 @@ impl QueryExecutor {
                     }
                 }
             }
-            engine.vector_index_manager().read().unwrap().search_filtered(table, column, query_vector, top_k, &allowed_ids)?
+            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search_filtered(table, column, query_vector, top_k, &allowed_ids)?
         } else {
-            engine.vector_index_manager().read().unwrap().search(table, column, query_vector, top_k)?
+            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search(table, column, query_vector, top_k)?
         };
 
         let mut rows = Vec::new();
@@ -1895,7 +1892,7 @@ impl QueryExecutor {
     fn get_class_hierarchy(&self, engine: &LsmEngine, table: &str) -> HashSet<String> {
         // Check cache first
         {
-            let cache = self.inference_cache.lock().unwrap();
+            let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.class_hierarchy.get(table) {
                 return cached.clone();
             }
@@ -1921,7 +1918,7 @@ impl QueryExecutor {
 
         // Store in cache
         {
-            let mut cache = self.inference_cache.lock().unwrap();
+            let mut cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
             cache.class_hierarchy.insert(table.to_string(), classes.clone());
         }
 
@@ -2034,19 +2031,24 @@ impl QueryExecutor {
     }
 
     /// Executes EXPLAIN: generates and returns the execution plan.
-    /// If ANALYZE mode, also executes the query and measures actual time.
+    /// Only executes the query for read-only queries (SELECT, etc.).
+    /// DML queries (INSERT/UPDATE/DELETE) return the plan without execution.
     fn execute_explain(&self, query: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
         let plan = self.planner.read().unwrap().plan(query)?;
         let description = plan.describe();
 
-        // Check if this is EXPLAIN ANALYZE (the query is the inner query)
-        let start = std::time::Instant::now();
-        let actual_result = self.execute_with_engine_inner(query, engine);
-        let elapsed = start.elapsed();
-
-        let actual_rows = match &actual_result {
-            Ok(QueryResult::Rows(rows)) => rows.len(),
-            _ => 0,
+        // Only execute for read-only queries; DML should not be executed in EXPLAIN
+        let (actual_rows, elapsed_ms) = if Self::is_read_only_query(query) {
+            let start = std::time::Instant::now();
+            let actual_result = self.execute_with_engine_inner(query, engine);
+            let elapsed = start.elapsed();
+            let rows = match &actual_result {
+                Ok(QueryResult::Rows(rows)) => rows.len(),
+                _ => 0,
+            };
+            (rows, elapsed.as_secs_f64() * 1000.0)
+        } else {
+            (0, 0.0)
         };
 
         let plan_json = json!({
@@ -2057,7 +2059,7 @@ impl QueryExecutor {
                 "cpu": plan.cost.cpu_cost,
                 "estimated_rows": plan.cost.rows,
                 "actual_rows": actual_rows,
-                "actual_time_ms": elapsed.as_secs_f64() * 1000.0,
+                "actual_time_ms": elapsed_ms,
             },
             "uses_index": plan.uses_index,
             "is_sorted": plan.is_sorted,
@@ -2129,12 +2131,12 @@ impl QueryExecutor {
 
         // Update runtime stats with table row counts
         {
-            let mut stats = self.runtime_stats.lock().unwrap();
+            let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
             stats.table_row_counts.insert(table.to_string(), row_count);
         }
 
         // Update planner statistics for future query optimization
-        self.planner.write().unwrap().update_stats(table.to_string(), planner_stats.clone());
+        self.planner.write().unwrap_or_else(|e| e.into_inner()).update_stats(table.to_string(), planner_stats.clone());
 
         let mut result_rows = Vec::new();
         let mut summary = Map::new();
@@ -2171,6 +2173,7 @@ impl QueryExecutor {
         let start = std::time::Instant::now();
         let actual_result = self.execute_select_read(query, engine);
         let elapsed = start.elapsed();
+        let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
 
         let actual_rows = match &actual_result {
             Ok(QueryResult::Rows(rows)) => rows.len(),
@@ -2185,7 +2188,7 @@ impl QueryExecutor {
                 "cpu": plan.cost.cpu_cost,
                 "estimated_rows": plan.cost.rows,
                 "actual_rows": actual_rows,
-                "actual_time_ms": elapsed.as_secs_f64() * 1000.0,
+                "actual_time_ms": elapsed_ms,
             },
             "uses_index": plan.uses_index,
             "is_sorted": plan.is_sorted,
@@ -2250,10 +2253,10 @@ impl QueryExecutor {
         }
 
         {
-            let mut stats = self.runtime_stats.lock().unwrap();
+            let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
             stats.table_row_counts.insert(table.to_string(), row_count);
         }
-        self.planner.write().unwrap().update_stats(table.to_string(), planner_stats.clone());
+        self.planner.write().unwrap_or_else(|e| e.into_inner()).update_stats(table.to_string(), planner_stats.clone());
 
         let mut result_rows = Vec::new();
         let mut summary = Map::new();
@@ -2331,7 +2334,7 @@ impl QueryExecutor {
             }
         }
 
-        self.planner.write().unwrap().update_stats(table.to_string(), planner_stats);
+        self.planner.write().unwrap_or_else(|e| e.into_inner()).update_stats(table.to_string(), planner_stats);
     }
 
     /// Read-only plan execution with &LsmEngine.
@@ -2822,7 +2825,7 @@ impl QueryExecutor {
                         }
                         LiteralValue::String(s) => {
                             if let Some(field_str) = Self::parse_json_string(raw) {
-                                return field_str == s;
+                                return field_str == *s;
                             }
                         }
                         LiteralValue::Bool(b) => {
@@ -2915,14 +2918,40 @@ impl QueryExecutor {
     }
 
     /// Parses a raw JSON string value (with quotes) and returns the inner content.
-    fn parse_json_string<'a>(raw: &'a [u8]) -> Option<&'a str> {
+    fn parse_json_string(raw: &[u8]) -> Option<String> {
         let s = std::str::from_utf8(raw).ok()?;
         let s = s.trim();
-        if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-            Some(&s[1..s.len()-1])
-        } else {
-            None
+        if !s.starts_with('"') || !s.ends_with('"') || s.len() < 2 {
+            return None;
         }
+        let inner = &s[1..s.len()-1];
+        // Handle JSON escape sequences
+        let mut result = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next()? {
+                    '"' => result.push('"'),
+                    '\\' => result.push('\\'),
+                    '/' => result.push('/'),
+                    'n' => result.push('\n'),
+                    'r' => result.push('\r'),
+                    't' => result.push('\t'),
+                    'b' => result.push('\u{0008}'),
+                    'f' => result.push('\u{000C}'),
+                    'u' => {
+                        // Parse 4 hex digits
+                        let hex: String = chars.by_ref().take(4).collect();
+                        let code = u32::from_str_radix(&hex, 16).ok()?;
+                        result.push(char::from_u32(code)?);
+                    }
+                    _ => return None,
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        Some(result)
     }
 
     /// Converts a LiteralValue to f64 for numeric comparison.
@@ -2982,7 +3011,7 @@ impl QueryExecutor {
         key: &LiteralValue,
     ) -> Result<Vec<Map<String, Value>>> {
         if engine.has_index(table, index_column) {
-            let index_mgr = engine.index_manager().read().unwrap();
+            let index_mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
             let json_val = Self::literal_to_json_static(key);
             let pkeys = index_mgr.lookup_eq_read(table, index_column, &json_val).unwrap_or_default();
             let mut rows = Self::fetch_rows_by_pks_read(engine, &pkeys)?;
@@ -3018,7 +3047,7 @@ impl QueryExecutor {
             return None;
         }
 
-        let index_mgr = engine.index_manager().read().unwrap();
+        let index_mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
 
         let pkeys: Vec<Vec<u8>> = match filter {
             FilterExpr::Eq(_, val) => {
@@ -3112,9 +3141,9 @@ impl QueryExecutor {
                     }
                 }
             }
-            engine.vector_index_manager().read().unwrap().search_filtered(table, column, query_vector, top_k, &allowed_ids)?
+            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search_filtered(table, column, query_vector, top_k, &allowed_ids)?
         } else {
-            engine.vector_index_manager().read().unwrap().search(table, column, query_vector, top_k)?
+            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search(table, column, query_vector, top_k)?
         };
 
         let mut rows = Vec::new();
@@ -3221,9 +3250,9 @@ impl QueryExecutor {
                     }
                 }
             }
-            engine.vector_index_manager().read().unwrap().search_filtered(class, column, query_vector, top_k, &allowed_ids)?
+            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search_filtered(class, column, query_vector, top_k, &allowed_ids)?
         } else {
-            engine.vector_index_manager().read().unwrap().search(class, column, query_vector, top_k)?
+            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search(class, column, query_vector, top_k)?
         };
 
         let mut rows = Vec::new();
@@ -3319,7 +3348,7 @@ impl QueryExecutor {
     /// Read-only class hierarchy lookup (no mutation needed).
     fn get_class_hierarchy_read(&self, engine: &LsmEngine, table: &str) -> HashSet<String> {
         {
-            let cache = self.inference_cache.lock().unwrap();
+            let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.class_hierarchy.get(table) {
                 return cached.clone();
             }
@@ -3349,7 +3378,7 @@ impl QueryExecutor {
         }
 
         {
-            let mut cache = self.inference_cache.lock().unwrap();
+            let mut cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
             cache.class_hierarchy.insert(table.to_string(), classes.clone());
         }
 
@@ -3480,7 +3509,7 @@ impl QueryExecutor {
     /// Read-only property aliases lookup (subproperty/equivalent property).
     fn get_property_aliases_read(&self, engine: &LsmEngine, property: &str) -> HashSet<String> {
         {
-            let cache = self.inference_cache.lock().unwrap();
+            let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.property_aliases.get(property) {
                 return cached.clone();
             }
@@ -3516,7 +3545,7 @@ impl QueryExecutor {
         }
 
         {
-            let mut cache = self.inference_cache.lock().unwrap();
+            let mut cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
             cache.property_aliases.insert(property.to_string(), aliases.clone());
         }
 
@@ -3740,6 +3769,60 @@ impl QueryExecutor {
                 }
                 // No conflict - insert normally
                 self.execute_insert_txn(engine, txn_id, class, columns, values)
+            }
+            QueryAst::BatchUpsert {
+                class,
+                columns,
+                rows,
+                conflict_column,
+                assignments,
+            } => {
+                let mut total = 0;
+                for row in rows {
+                    // Check if a row with the conflict column value already exists
+                    let conflict_val = columns.iter().position(|c| c == conflict_column)
+                        .and_then(|pos| row.get(pos));
+                    if let Some(val) = conflict_val {
+                        let prefix = format!("{}::", class);
+                        let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
+                        let mut existing_key: Option<Vec<u8>> = None;
+                        for (key, val_bytes) in &entries {
+                            if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
+                                    if let Some(existing_val) = doc.get(conflict_column) {
+                                        let matches = match (existing_val, val) {
+                                            (serde_json::Value::String(s), crate::parser::LiteralValue::String(l)) => s == l,
+                                            (serde_json::Value::Number(n), crate::parser::LiteralValue::Int(l)) => n.as_i64() == Some(*l),
+                                            _ => false,
+                                        };
+                                        if matches {
+                                            existing_key = Some(key.clone());
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(key) = existing_key {
+                            // Update existing row
+                            if let Ok(Some(val_bytes)) = engine.txn_get(txn_id, &key) {
+                                if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(&val_bytes) {
+                                    for (col, assign_val) in assignments {
+                                        doc.insert(col.clone(), self.literal_to_json(assign_val));
+                                    }
+                                    let new_value = doc_to_storage_bytes(&doc);
+                                    engine.txn_put(txn_id, key, new_value)?;
+                                    total += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    // No conflict - insert normally
+                    self.execute_insert_txn(engine, txn_id, class, columns, row)?;
+                    total += 1;
+                }
+                Ok(QueryResult::Success(format!("{} row(s) inserted/updated (batch upsert)", total)))
             }
             QueryAst::Import { class, file_path, format } => {
                 self.execute_import(engine, txn_id, class, file_path, *format)
@@ -4824,11 +4907,11 @@ impl QueryExecutor {
                 }
             }
 
-            engine.vector_index_manager().read().unwrap().search_filtered(
+            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search_filtered(
                 class, column, query_vector, top_k, &allowed_ids,
             )?
         } else {
-            engine.vector_index_manager().read().unwrap().search(
+            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search(
                 class, column, query_vector, top_k,
             )?
         };
@@ -4916,20 +4999,20 @@ impl QueryExecutor {
             return Ok(None);
         }
 
-        let mut index_mgr = engine.index_manager().write().unwrap();
+        let index_mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
 
         let pkeys: Vec<Vec<u8>> = match filter {
             FilterExpr::Eq(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                index_mgr.lookup_eq(class, &col, &json_val).unwrap_or_default()
+                index_mgr.lookup_eq_read(class, &col, &json_val).unwrap_or_default()
             }
             FilterExpr::Gt(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                index_mgr.lookup_gt(class, &col, &json_val).unwrap_or_default()
+                index_mgr.lookup_gt_read(class, &col, &json_val).unwrap_or_default()
             }
             FilterExpr::Lt(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                index_mgr.lookup_lt(class, &col, &json_val).unwrap_or_default()
+                index_mgr.lookup_lt_read(class, &col, &json_val).unwrap_or_default()
             }
             FilterExpr::Gte(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
@@ -4953,14 +5036,14 @@ impl QueryExecutor {
                 let low_json = Self::literal_to_json_static(low);
                 let high_json = Self::literal_to_json_static(high);
                 index_mgr
-                    .lookup_range(class, &col, Some(&low_json), Some(&high_json))
+                    .lookup_range_read(class, &col, Some(&low_json), Some(&high_json))
                     .unwrap_or_default()
             }
             FilterExpr::In(_, values) => {
                 let mut all_pkeys = Vec::new();
                 for val in values {
                     let json_val = Self::literal_to_json_static(val);
-                    if let Some(pks) = index_mgr.lookup_eq(class, &col, &json_val) {
+                    if let Some(pks) = index_mgr.lookup_eq_read(class, &col, &json_val) {
                         all_pkeys.extend(pks);
                     }
                 }
@@ -5300,7 +5383,7 @@ impl QueryExecutor {
     fn get_property_aliases(&self, engine: &LsmEngine, property: &str) -> HashSet<String> {
         // Check cache first
         {
-            let cache = self.inference_cache.lock().unwrap();
+            let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.property_aliases.get(property) {
                 return cached.clone();
             }
@@ -5337,7 +5420,7 @@ impl QueryExecutor {
 
         // Store in cache
         {
-            let mut cache = self.inference_cache.lock().unwrap();
+            let mut cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
             cache.property_aliases.insert(property.to_string(), aliases.clone());
         }
 
@@ -5351,7 +5434,7 @@ impl QueryExecutor {
     fn get_inverse_property(&self, engine: &LsmEngine, property: &str) -> Option<String> {
         // Check cache first
         {
-            let cache = self.inference_cache.lock().unwrap();
+            let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.inverse_property.get(property) {
                 return cached.clone();
             }
@@ -5378,7 +5461,7 @@ impl QueryExecutor {
 
         // Store in cache
         {
-            let mut cache = self.inference_cache.lock().unwrap();
+            let mut cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
             cache.inverse_property.insert(property.to_string(), result.clone());
         }
 
@@ -8014,7 +8097,7 @@ mod tests {
             assert!(engine.has_vector_index("Product", "embedding"));
 
             // Search should work with rebuilt index
-            let results = engine.vector_index_manager().read().unwrap().search(
+            let results = engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search(
                 "Product", "embedding", &[1.0, 0.0, 0.0], 1,
             ).unwrap();
             assert_eq!(results.len(), 1);

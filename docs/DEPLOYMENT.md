@@ -161,9 +161,6 @@ curl -H "X-API-Key: your-admin-secret-key-here" \
   http://localhost:7912/api/query \
   -d '{"query": "SELECT * FROM Product"}'
 
-# 3. Query parameter
-curl "http://localhost:7912/api/query?api_key=your-admin-secret-key-here" \
-  -d '{"query": "SELECT * FROM Product"}'
 ```
 
 ---

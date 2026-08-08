@@ -152,8 +152,16 @@ impl TlsConfig {
             WebPkiClientVerifier::no_client_auth()
         };
 
-        // Build server config with secure defaults
-        let config = ServerConfig::builder()
+        // Build server config with protocol version based on min_tls_version
+        let versions: &[&rustls::SupportedProtocolVersion] = match self.min_tls_version {
+            TlsVersion::Tls13 => &[&rustls::version::TLS13],
+            TlsVersion::Tls12 => &[&rustls::version::TLS12, &rustls::version::TLS13],
+        };
+        let config = ServerConfig::builder_with_provider(
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+        )
+            .with_protocol_versions(versions)
+            .map_err(|e| format!("Failed to set TLS protocol versions: {}", e))?
             .with_client_cert_verifier(client_verifier)
             .with_single_cert(cert_chain, key)
             .map_err(|e| format!("Failed to build TLS server config: {}", e))?;
@@ -177,7 +185,16 @@ impl TlsConfig {
             }
         }
 
-        let mut config = ClientConfig::builder()
+        let versions: &[&rustls::SupportedProtocolVersion] = match self.min_tls_version {
+            TlsVersion::Tls13 => &[&rustls::version::TLS13],
+            TlsVersion::Tls12 => &[&rustls::version::TLS12, &rustls::version::TLS13],
+        };
+
+        let mut config = ClientConfig::builder_with_provider(
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+        )
+            .with_protocol_versions(versions)
+            .map_err(|e| format!("Failed to set TLS protocol versions: {}", e))?
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
@@ -196,17 +213,21 @@ impl TlsConfig {
 
         // Parse the first certificate to get expiry info
         let cert = &certs[0];
-        let der = &cert.as_ref();
+        let der = cert.as_ref();
 
-        // Use x509-parser or simple DER parsing
-        // For now, return basic info
+        let subject = extract_subject_from_der(der).unwrap_or_else(|| "unknown".to_string());
+        let issuer = extract_issuer_from_der(der).unwrap_or_else(|| "unknown".to_string());
+        
+        let (not_before, not_after, is_expired, days_until_expiry) = 
+            extract_cert_validity(der).unwrap_or_else(|| (String::new(), String::new(), false, None));
+
         Ok(CertExpiryInfo {
-            subject: extract_subject_from_der(der).unwrap_or_else(|| "unknown".to_string()),
-            issuer: extract_issuer_from_der(der).unwrap_or_else(|| "unknown".to_string()),
-            not_before: String::new(),
-            not_after: String::new(),
-            is_expired: false,
-            days_until_expiry: None,
+            subject,
+            issuer,
+            not_before,
+            not_after,
+            is_expired,
+            days_until_expiry,
         })
     }
 }
@@ -324,27 +345,71 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
     Err(format!("No private key found in {:?}", path))
 }
 
-/// Extract subject from DER-encoded certificate (simple parser).
+/// Extract subject from DER-encoded certificate using x509-parser.
 fn extract_subject_from_der(der: &[u8]) -> Option<String> {
-    // Look for common OID patterns in DER
-    // This is a simplified parser - for production, use x509-parser crate
-    if der.len() < 10 {
-        return None;
-    }
-    // Try to find CN= pattern in the DER data
-    let der_str = String::from_utf8_lossy(der);
-    if let Some(start) = der_str.find("CN=") {
-        let rest = &der_str[start + 3..];
-        if let Some(end) = rest.find(|c: char| c == ',' || c == '\0' || c == '/') {
-            return Some(rest[..end].to_string());
+    use x509_parser::prelude::*;
+    match X509Certificate::from_der(der) {
+        Ok((_, cert)) => {
+            // Try to get CN (Common Name) from subject
+            if let Some(cn) = cert.subject().iter_common_name().next() {
+                if let Ok(name) = cn.as_str() {
+                    return Some(name.to_string());
+                }
+            }
+            // Fallback: get the full subject string
+            Some(cert.subject().to_string())
         }
+        Err(_) => None,
     }
-    Some("OntoDB Server".to_string())
 }
 
-/// Extract issuer from DER-encoded certificate (simple parser).
+/// Extract issuer from DER-encoded certificate using x509-parser.
 fn extract_issuer_from_der(der: &[u8]) -> Option<String> {
-    extract_subject_from_der(der)
+    use x509_parser::prelude::*;
+    match X509Certificate::from_der(der) {
+        Ok((_, cert)) => {
+            // Try to get CN (Common Name) from issuer
+            if let Some(cn) = cert.issuer().iter_common_name().next() {
+                if let Ok(name) = cn.as_str() {
+                    return Some(name.to_string());
+                }
+            }
+            // Fallback: get the full issuer string
+            Some(cert.issuer().to_string())
+        }
+        Err(_) => None,
+    }
+}
+
+/// Extract certificate validity period from DER-encoded certificate.
+fn extract_cert_validity(der: &[u8]) -> Option<(String, String, bool, Option<u64>)> {
+    use x509_parser::prelude::*;
+    use x509_parser::time::ASN1Time;
+    
+    match X509Certificate::from_der(der) {
+        Ok((_, cert)) => {
+            let not_before = cert.validity().not_before.to_string();
+            let not_after = cert.validity().not_after.to_string();
+            
+            // Check if expired
+            let now = ASN1Time::now();
+            let is_expired = cert.validity().not_after < now;
+            
+            // Calculate days until expiry
+            let days_until_expiry = if is_expired {
+                Some(0)
+            } else {
+                // Approximate days remaining
+                let remaining = cert.validity().not_after.to_string();
+                // Parse the date and calculate difference
+                // For simplicity, we'll return None if we can't calculate
+                None
+            };
+            
+            Some((not_before, not_after, is_expired, days_until_expiry))
+        }
+        Err(_) => None,
+    }
 }
 
 /// TLS configuration for HTTP redirect (HTTP -> HTTPS).

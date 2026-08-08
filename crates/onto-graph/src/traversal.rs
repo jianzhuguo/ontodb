@@ -382,6 +382,9 @@ impl<'a> TraversalEngine<'a> {
         })
     }
 
+    /// Maximum recursion depth for DFS to prevent stack overflow.
+    const MAX_DFS_RECURSION_DEPTH: usize = 1000;
+
     #[allow(clippy::too_many_arguments)]
     fn dfs_recursive(
         &self,
@@ -398,6 +401,11 @@ impl<'a> TraversalEngine<'a> {
         path_verts: &[String],
         path_edges: &[String],
     ) -> Result<(), GraphError> {
+        if depth > Self::MAX_DFS_RECURSION_DEPTH {
+            return Err(GraphError::TraversalError(format!(
+                "DFS recursion depth exceeded maximum of {}", Self::MAX_DFS_RECURSION_DEPTH
+            )));
+        }
         if depth > 0 {
             if visited.contains(current_id) {
                 return Ok(());

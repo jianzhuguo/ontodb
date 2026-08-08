@@ -202,18 +202,13 @@ impl RaftStateMachine<OntoRaftConfig> for &mut OntoStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        OntoStateMachine {
-            data: self.data.clone(),
-            last_applied: self.last_applied,
-            last_membership: self.last_membership.clone(),
-            snapshot: None,
-        }
+        (**self).get_snapshot_builder().await
     }
 
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Cursor<Vec<u8>>, StorageError<u64>> {
-        Ok(Cursor::new(Vec::new()))
+        (**self).begin_receiving_snapshot().await
     }
 
     async fn install_snapshot(
@@ -221,33 +216,12 @@ impl RaftStateMachine<OntoRaftConfig> for &mut OntoStateMachine {
         meta: &SnapshotMeta<u64, openraft::BasicNode>,
         snapshot: Vec<u8>,
     ) -> Result<(), StorageError<u64>> {
-        if let Ok(data) = serde_json::from_slice::<BTreeMap<Vec<u8>, Vec<u8>>>(&snapshot) {
-            self.data = data;
-        }
-        self.last_applied = meta.last_log_id;
-        self.last_membership = StoredMembership::new(
-            meta.last_log_id,
-            meta.last_membership.membership().clone(),
-        );
-        self.snapshot = Some(snapshot);
-        Ok(())
+        (**self).install_snapshot(meta, snapshot).await
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<OntoRaftConfig>>, StorageError<u64>> {
-        if let Some(ref data) = self.snapshot {
-            let meta = SnapshotMeta {
-                last_log_id: self.last_applied,
-                last_membership: self.last_membership.clone(),
-                snapshot_id: format!("{:?}", self.last_applied),
-            };
-            Ok(Some(Snapshot {
-                meta,
-                snapshot: Box::new(Cursor::new(data.clone())),
-            }))
-        } else {
-            Ok(None)
-        }
+        (**self).get_current_snapshot().await
     }
 }

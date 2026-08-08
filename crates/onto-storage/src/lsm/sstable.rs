@@ -16,7 +16,7 @@ use onto_core::{CoreError, Entry, EntryKind, Result, SeqNo};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 /// Default block cache capacity (number of blocks per SSTable).
 const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 64;
@@ -50,6 +50,9 @@ pub struct SsTable {
     bloom: Option<BloomFilter>,
     /// Whether data blocks are zstd-compressed.
     compressed: bool,
+    /// Cached first key (minimum key) in this SSTable.
+    /// Loaded once at open() to avoid repeated disk I/O.
+    cached_first_key: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +249,9 @@ impl SsTableBuilder {
         let read_file = File::open(path.as_ref())?;
         let compressed = self.compression_level > 0;
 
+        // Cache the first key (minimum key) for fast access
+        let cached_first_key = self.keys_for_bloom.first().cloned().unwrap_or_default();
+
         Ok(SsTable {
             _path: path.as_ref().to_path_buf(),
             inner: Mutex::new(SsTableInner {
@@ -256,6 +262,7 @@ impl SsTableBuilder {
             index: self.block_entries,
             bloom: Some(bloom),
             compressed,
+            cached_first_key,
         })
     }
 
@@ -324,6 +331,37 @@ impl SsTable {
         file.read_exact(&mut index_data)?;
         let index = Self::decode_index(&index_data);
 
+        // Cache the first key to avoid repeated disk I/O
+        let cached_first_key = if index.is_empty() {
+            Vec::new()
+        } else {
+            // Read first block to get the first key
+            let offset = index[0].offset;
+            let size = index[0].size;
+            file.seek(SeekFrom::Start(offset))?;
+            let mut block_data = vec![0u8; size as usize];
+            file.read_exact(&mut block_data)?;
+            
+            // Decompress if needed
+            let block = if compressed {
+                zstd::decode_all(&block_data[..]).unwrap_or(block_data)
+            } else {
+                block_data
+            };
+            
+            // Decode first key
+            if block.len() < 4 {
+                Vec::new()
+            } else {
+                let key_len = u32::from_le_bytes(block[0..4].try_into().unwrap()) as usize;
+                if block.len() < 4 + key_len {
+                    Vec::new()
+                } else {
+                    block[4..4 + key_len].to_vec()
+                }
+            }
+        };
+
         Ok(SsTable {
             _path: path.as_ref().to_path_buf(),
             inner: Mutex::new(SsTableInner {
@@ -334,6 +372,7 @@ impl SsTable {
             index,
             bloom,
             compressed,
+            cached_first_key,
         })
     }
 
@@ -401,23 +440,10 @@ impl SsTable {
             .unwrap_or(&[])
     }
 
-    /// Returns the minimum (first) key in the SSTable by reading the first entry.
+    /// Returns the minimum (first) key in the SSTable.
+    /// Uses cached value from initialization to avoid disk I/O.
     pub fn first_key(&self) -> Result<Vec<u8>> {
-        if self.index.is_empty() {
-            return Ok(Vec::new());
-        }
-        let offset = self.index[0].offset;
-        let size = self.index[0].size;
-        let block = self.read_block_at(offset, size)?;
-        // Decode the first entry's key from the block
-        if block.len() < 4 {
-            return Ok(Vec::new());
-        }
-        let key_len = u32::from_le_bytes(block[0..4].try_into().unwrap()) as usize;
-        if block.len() < 4 + key_len {
-            return Ok(Vec::new());
-        }
-        Ok(block[4..4 + key_len].to_vec())
+        Ok(self.cached_first_key.clone())
     }
 
     /// Returns the number of data blocks.
@@ -456,7 +482,7 @@ impl SsTable {
     }
 
     fn read_block_at(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
 
         // Check block cache first (returns decompressed data)
         if let Some(cached) = inner.block_cache.get(offset) {

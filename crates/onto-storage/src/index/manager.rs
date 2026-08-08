@@ -471,8 +471,11 @@ impl IndexManager {
             serde_json::Value::String(s) => s.as_bytes().to_vec(),
             serde_json::Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
-                    // Encode as zero-padded 20-digit string for correct sort order
-                    format!("{:020}", i).into_bytes()
+                    // Encode with offset to ensure correct sort order for negative values
+                    // i64 range: -9223372036854775808..=9223372036854775807
+                    // Add offset to shift all values to non-negative range
+                    let offset_i = (i as i128 + 9223372036854775808i128) as u128;
+                    format!("{:020}", offset_i).into_bytes()
                 } else if let Some(f) = n.as_f64() {
                     format!("{:020.10}", f).into_bytes()
                 } else {

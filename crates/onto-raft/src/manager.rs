@@ -73,7 +73,10 @@ impl RaftNodeManager {
                     "addr": node.addr,
                 })
             }).collect::<Vec<_>>(),
-        })).unwrap_or_default()
+        })).unwrap_or_else(|e| {
+            tracing::error!("Failed to serialize Raft config: {}", e);
+            "{}".to_string()
+        })
     }
 }
 

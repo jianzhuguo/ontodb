@@ -10,7 +10,7 @@
 
 use super::distance::{distance, DistanceMetric};
 use rand::Rng;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::cmp::Ordering;
 
 /// A vector entry in the HNSW index.
@@ -204,16 +204,13 @@ impl HnswIndex {
 
         let Some(ep) = self.entry_point else { return };
 
-        // Borrow the vector without cloning - we only read it
-        let query_ptr = self.nodes[idx].entry.vector.as_ptr();
-        let query_len = self.nodes[idx].entry.vector.len();
-        // SAFETY: we only read the vector, and it stays valid as long as nodes exist
-        let query = unsafe { std::slice::from_raw_parts(query_ptr, query_len) };
+        // Clone the vector to avoid dangling pointer from Vec reallocation
+        let query = self.nodes[idx].entry.vector.clone();
 
         // === Phase 1: Find entry point at each layer ===
         let mut curr = ep;
         for layer in (level + 1..=self.max_layer).rev() {
-            curr = self.search_layer_greedy(query, curr, layer);
+            curr = self.search_layer_greedy(&query, curr, layer);
         }
 
         // === Phase 2: Connect at layers 0..=min(level, max_layer) ===
@@ -222,10 +219,10 @@ impl HnswIndex {
             let m = if layer == 0 { self.config.m_max0 } else { self.config.m };
 
             // Find nearest neighbors at this layer
-            let candidates = self.search_layer_beam(query, curr, ef_c, layer);
+            let candidates = self.search_layer_beam(&query, curr, ef_c, layer);
 
             // Select M nearest neighbors
-            let selected = self.select_nearest(query, &candidates, m);
+            let selected = self.select_nearest(&query, &candidates, m);
 
             // Connect bidirectional edges
             self.connect_bidirectional(idx, &selected, layer);
@@ -313,7 +310,7 @@ impl HnswIndex {
         // Phase 1: Greedy search from top layer to layer 1
         let mut curr = ep;
         for layer in (1..=self.max_layer).rev() {
-            curr = self.search_layer_greedy(query, curr, layer);
+            curr = self.search_layer_greedy(&query, curr, layer);
         }
 
         // Phase 2: Beam search at layer 0
@@ -353,7 +350,7 @@ impl HnswIndex {
 
         let mut curr = ep;
         for layer in (1..=self.max_layer).rev() {
-            curr = self.search_layer_greedy(query, curr, layer);
+            curr = self.search_layer_greedy(&query, curr, layer);
         }
 
         let candidates = self.search_layer_beam(query, curr, ef, 0);
@@ -406,15 +403,9 @@ impl HnswIndex {
         let mut results = BinaryHeap::new();
         results.push(MaxEntry { idx: entry, dist: entry_dist });
 
-        // Reuse visited bitmap (thread-safe interior mutability)
-        let gen = self.visited_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        {
-            let mut visited = self.visited.write();
-            if visited.len() < self.nodes.len() {
-                visited.resize(self.nodes.len(), 0);
-            }
-            visited[entry] = gen;
-        }
+        // Use local HashSet for visited tracking (avoids lock contention in hot loop)
+        let mut visited = HashSet::new();
+        visited.insert(entry);
 
         while let Some(curr) = candidates.pop() {
             // Get the farthest result distance
@@ -433,12 +424,8 @@ impl HnswIndex {
             };
             for i in 0..nbrs_len {
                 let nbr = self.nodes[curr.idx].neighbors[layer][i];
-                {
-                    let mut visited = self.visited.write();
-                    if visited[nbr] == gen {
-                        continue;
-                    }
-                    visited[nbr] = gen;
+                if !visited.insert(nbr) {
+                    continue;
                 }
 
                 let d = distance(query, &self.nodes[nbr].entry.vector, self.config.metric);

@@ -119,6 +119,22 @@ struct Args {
     /// Enterprise config file path (JSON format)
     #[arg(long, env = "ENTERPRISE_CONFIG_FILE")]
     enterprise_config: Option<PathBuf>,
+
+    /// Allowed CORS origins (comma-separated). Use "*" for all origins (NOT recommended for production).
+    #[arg(long, default_value = "", env = "CORS_ORIGINS")]
+    cors_origins: String,
+
+    /// TLS certificate file path (PEM format). Enables HTTPS when both cert and key are provided.
+    #[arg(long, env = "TLS_CERT_PATH")]
+    tls_cert: Option<PathBuf>,
+
+    /// TLS private key file path (PEM format). Enables HTTPS when both cert and key are provided.
+    #[arg(long, env = "TLS_KEY_PATH")]
+    tls_key: Option<PathBuf>,
+
+    /// Minimum TLS version: "1.2" or "1.3" (default: "1.2")
+    #[arg(long, default_value = "1.2", env = "TLS_MIN_VERSION")]
+    tls_min_version: String,
 }
 
 fn main() -> Result<()> {
@@ -213,8 +229,32 @@ fn main() -> Result<()> {
 
         if has_http {
             rt.block_on(async {
+                // Build TLS config if cert and key are provided
+                let tls_config = match (&args.tls_cert, &args.tls_key) {
+                    (Some(cert), Some(key)) => {
+                        let min_version = match args.tls_min_version.as_str() {
+                            "1.3" => tls::TlsVersion::Tls13,
+                            _ => tls::TlsVersion::Tls12,
+                        };
+                        let config = tls::TlsConfig::new(cert.clone(), key.clone())
+                            .with_min_version(min_version);
+                        println!("TLS enabled: cert={:?}, key={:?}, min_version={}", cert, key, args.tls_min_version);
+                        Some(config)
+                    }
+                    (Some(_), None) => {
+                        eprintln!("Warning: --tls-cert provided without --tls-key, TLS disabled");
+                        None
+                    }
+                    (None, Some(_)) => {
+                        eprintln!("Warning: --tls-key provided without --tls-cert, TLS disabled");
+                        None
+                    }
+                    _ => None,
+                };
+
+                let pg_auth = auth_config.clone();
                 let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), onto_core::CoreError>> + Send>>> = vec![
-                    Box::pin(run_http_server(&http_addr, executor.clone(), auth_config, rate_limit_config, metrics.clone(), audit_config, args.raft_node_id, args.api_keys_file.clone())),
+                    Box::pin(run_http_server(&http_addr, executor.clone(), auth_config, rate_limit_config, metrics.clone(), audit_config, args.raft_node_id, args.api_keys_file.clone(), args.cors_origins.clone(), tls_config)),
                     Box::pin(run_tcp_server(&args.listen, executor.clone(), metrics.clone())),
                 ];
 
@@ -222,7 +262,7 @@ fn main() -> Result<()> {
                     let exec = executor.clone();
                     let m = metrics.clone();
                     futs.push(Box::pin(async move {
-                        pgwire::run_pgwire_server(&pgwire_addr, exec, m).await.map_err(|e| onto_core::CoreError::Custom(e.to_string()))
+                        pgwire::run_pgwire_server(&pgwire_addr, exec, m, pg_auth).await.map_err(|e| onto_core::CoreError::Custom(e.to_string()))
                     }));
                 }
 
@@ -235,8 +275,25 @@ fn main() -> Result<()> {
                     }));
                 }
 
-                // Run all futures concurrently
-                let (res, _, _) = futures::future::select_all(futs).await;
+                // Run all servers concurrently. If any server fails, log the error
+                // and initiate graceful shutdown of all servers. This is intentional:
+                // for a database server, it's safer to shut down completely and let
+                // the process manager (systemd/Docker) restart the whole service,
+                // rather than running in a degraded state.
+                let (res, idx, remaining) = futures::future::select_all(futs).await;
+                let server_names = ["HTTP", "TCP", "PGWire", "Raft"];
+                let failed_name = server_names.get(idx).unwrap_or(&"Unknown");
+                match &res {
+                    Ok(()) => tracing::info!("Server {} exited gracefully", failed_name),
+                    Err(e) => tracing::error!("Server {} failed: {} — initiating shutdown", failed_name, e),
+                }
+                // Give remaining servers a brief window to finish in-flight requests
+                let shutdown_timeout = std::time::Duration::from_secs(5);
+                let _ = tokio::time::timeout(shutdown_timeout, async {
+                    for fut in remaining {
+                        let _ = fut.await;
+                    }
+                }).await;
                 res
             })?;
         } else {
@@ -288,12 +345,26 @@ fn build_enterprise_config(args: &Args, tier: ProductTier) -> onto_enterprise::E
     
     // Load from config file if specified
     if let Some(ref config_path) = args.enterprise_config {
-        if let Ok(content) = std::fs::read_to_string(config_path) {
-            if let Ok(file_config) = serde_json::from_str::<onto_enterprise::EnterpriseConfig>(&content) {
-                config = file_config;
-                tracing::info!("Loaded enterprise config from {:?}", config_path);
-            } else {
-                tracing::warn!("Failed to parse enterprise config file: {:?}", config_path);
+        match std::fs::read_to_string(config_path) {
+            Ok(content) => {
+                match serde_json::from_str::<onto_enterprise::EnterpriseConfig>(&content) {
+                    Ok(file_config) => {
+                        config = file_config;
+                        tracing::info!("Loaded enterprise config from {:?}", config_path);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to parse enterprise config file {:?}: {}. Using defaults.",
+                            config_path, e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to read enterprise config file {:?}: {}. Using defaults.",
+                    config_path, e
+                );
             }
         }
     }
@@ -331,6 +402,8 @@ async fn run_http_server(
     audit_config: audit::AuditConfig,
     raft_node_id: Option<u64>,
     api_keys_file: Option<PathBuf>,
+    cors_origins: String,
+    tls_config: Option<tls::TlsConfig>,
 ) -> Result<()> {
     let graph = Arc::new(onto_graph::GraphStore::new());
     let audit = Arc::new(audit::AuditLogger::new(audit_config));
@@ -383,10 +456,10 @@ async fn run_http_server(
         metrics: state.metrics.clone(),
         config_store: Some(config_store.clone()),
         cluster_manager: None,
-        audit: None, // Audit logger is already in AppState
+        audit: Some(state.audit.clone()),
     };
 
-    let app = http::build_router_with_auth(state, auth_state.clone(), rate_limiter, admin_state);
+    let app = http::build_router_with_auth(state, auth_state.clone(), rate_limiter, admin_state, &cors_origins);
 
     println!("HTTP API server listening on {}", addr);
     println!();
@@ -408,7 +481,6 @@ async fn run_http_server(
         println!("  Provide key via:");
         println!("    - Authorization: Bearer <key>");
         println!("    - X-API-Key: <key>");
-        println!("    - ?api_key=<key> (query parameter)");
     } else {
         println!("Authentication: DISABLED");
     }
@@ -421,10 +493,24 @@ async fn run_http_server(
         println!("Rate limiting: DISABLED");
     }
 
-    let listener = tokio::net::TcpListener::bind(addr).await
-        .map_err(|e| onto_core::CoreError::Io(e))?;
-    axum::serve(listener, app).await
-        .map_err(|e| onto_core::CoreError::Custom(format!("HTTP server error: {}", e)))?;
+    if let Some(tls) = tls_config {
+        // TLS-enabled HTTPS server
+        let server_config = tls.build_server_config()
+            .map_err(|e| onto_core::CoreError::Custom(format!("TLS config error: {}", e)))?;
+        let addr: std::net::SocketAddr = addr.parse()
+            .map_err(|e| onto_core::CoreError::Custom(format!("Invalid address '{}': {}", addr, e)))?;
+        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
+        axum_server::bind_rustls(addr, rustls_config)
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .await
+            .map_err(|e| onto_core::CoreError::Custom(format!("HTTPS server error: {}", e)))?;
+    } else {
+        // Plain HTTP server (no TLS)
+        let listener = tokio::net::TcpListener::bind(addr).await
+            .map_err(|e| onto_core::CoreError::Io(e))?;
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await
+            .map_err(|e| onto_core::CoreError::Custom(format!("HTTP server error: {}", e)))?;
+    }
     Ok(())
 }
 
@@ -465,10 +551,17 @@ async fn run_raft_node(
     Ok(())
 }
 
+/// Maximum concurrent TCP connections.
+const MAX_TCP_CONNECTIONS: usize = 256;
+
+/// Maximum line size for TCP protocol (1 MB).
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+
 /// Runs the async TCP server, accepting client connections.
 async fn run_tcp_server(addr: &str, executor: Arc<QueryExecutor>, metrics: Arc<metrics::Metrics>) -> Result<()> {
     let listener = TcpListener::bind(addr).await
         .map_err(|e| onto_core::CoreError::Io(e))?;
+    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_CONNECTIONS));
 
     println!("Listening on {}", addr);
     println!("Connect with: ontodb-cli {}", addr);
@@ -476,6 +569,11 @@ async fn run_tcp_server(addr: &str, executor: Arc<QueryExecutor>, metrics: Arc<m
     loop {
         let (stream, _peer_addr) = listener.accept().await
             .map_err(|e| onto_core::CoreError::Io(e))?;
+
+        let permit = match conn_semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
 
         let executor = Arc::clone(&executor);
         let metrics = Arc::clone(&metrics);
@@ -487,8 +585,10 @@ async fn run_tcp_server(addr: &str, executor: Arc<QueryExecutor>, metrics: Arc<m
                 eprintln!("Client error: {}", e);
             }
             metrics.tcp_connections_active.dec();
+            drop(permit);
         });
     }
+    Ok(())
 }
 
 /// Handles a single client connection asynchronously.
@@ -517,6 +617,12 @@ async fn handle_client(
             .map_err(|e| onto_core::CoreError::Io(e))?;
         if n == 0 {
             break;
+        }
+
+        if line.len() > MAX_LINE_BYTES {
+            writer.write_all(b"ERR: line too long (max 1MB)\n\0").await?;
+            line.clear();
+            continue;
         }
 
         let input = line.trim();

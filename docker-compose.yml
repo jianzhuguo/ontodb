@@ -29,9 +29,9 @@ services:
     container_name: ontodb
     restart: unless-stopped
     ports:
-      - "${ONTODB_HTTP_PORT:-7912}:7912"   # HTTP API
-      - "${ONTODB_TCP_PORT:-7913}:7913"    # TCP CLI
-      - "${ONTODB_PG_PORT:-5432}:5432"     # PG wire protocol
+      - "127.0.0.1:${ONTODB_HTTP_PORT:-7912}:7912"   # HTTP API
+      - "127.0.0.1:${ONTODB_TCP_PORT:-7913}:7913"    # TCP CLI
+      - "127.0.0.1:${ONTODB_PG_PORT:-5432}:5432"     # PG wire protocol
     volumes:
       - ontodb-data:/data/ontodb
       - ontodb-backup:/data/backup
@@ -45,6 +45,7 @@ services:
       - "--rate-limit=${ONTODB_RATE_LIMIT:-300}"
       - "--burst-size=${ONTODB_BURST_SIZE:-50}"
       - "--pgwire=0.0.0.0:5432"
+      - "--cors-origins=${CORS_ORIGINS:-}"
     deploy:
       resources:
         limits:
@@ -100,7 +101,7 @@ services:
     container_name: ontodb-prometheus
     restart: unless-stopped
     ports:
-      - "${PROMETHEUS_PORT:-9090}:9090"
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
     volumes:
       - ./deploy/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./deploy/monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
@@ -118,11 +119,13 @@ services:
     container_name: ontodb-alertmanager
     restart: unless-stopped
     ports:
-      - "9093:9093"
+      - "127.0.0.1:9093:9093"
     volumes:
-      - ./deploy/monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-    command:
-      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - ./deploy/monitoring/alertmanager.yml.template:/etc/alertmanager/alertmanager.yml.template:ro
+    environment:
+      - ALERT_EMAIL=${ALERT_EMAIL:?Set ALERT_EMAIL in .env}
+      - SMTP_AUTH_PASSWORD=${SMTP_AUTH_PASSWORD:?Set SMTP_AUTH_PASSWORD in .env}
+    entrypoint: ["/bin/sh", "-c", "envsubst < /etc/alertmanager/alertmanager.yml.template > /tmp/alertmanager.yml && exec /bin/alertmanager --config.file=/tmp/alertmanager.yml"]
     networks:
       - ontodb-net
 
@@ -132,7 +135,7 @@ services:
     container_name: ontodb-node-exporter
     restart: unless-stopped
     ports:
-      - "9100:9100"
+      - "127.0.0.1:9100:9100"
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
@@ -150,7 +153,7 @@ services:
     container_name: ontodb-dingtalk
     restart: unless-stopped
     ports:
-      - "8060:8060"
+      - "127.0.0.1:8060:8060"
     environment:
       - GIN_MODE=release
     volumes:
@@ -168,7 +171,7 @@ services:
     container_name: ontodb-wechat
     restart: unless-stopped
     ports:
-      - "8061:80"
+      - "127.0.0.1:8061:80"
     environment:
       - CORP_ID=${WECHAT_CORP_ID:-}
       - CORP_SECRET=${WECHAT_CORP_SECRET:-}
@@ -185,7 +188,7 @@ services:
     container_name: ontodb-grafana
     restart: unless-stopped
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./deploy/monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/ontodb.json:ro
@@ -194,7 +197,8 @@ services:
       - ./deploy/monitoring/grafana-datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
       - ./deploy/monitoring/grafana-dashboard-provider.yml:/etc/grafana/provisioning/dashboards/provider.yml:ro
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # SECURITY: Change this password in .env before deploying!
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
       GF_USERS_ALLOW_SIGN_UP: "false"
     depends_on:
       - prometheus

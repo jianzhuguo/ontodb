@@ -84,10 +84,14 @@ impl MemTable {
             kind: EntryKind::Put,
         };
 
+        let composite = entry.composite_key();
+        // Subtract old entry size if overwriting
+        if let Some(old) = self.data.get(&composite) {
+            self.size = self.size.saturating_sub(old.key.len() + old.value.len() + 16);
+        }
         let size_delta = key.len() + value.len() + 16; // key + value + overhead
         self.size += size_delta;
 
-        let composite = entry.composite_key();
         self.data.insert(composite, entry);
 
         seq_no
@@ -95,13 +99,17 @@ impl MemTable {
 
     /// Puts a key-value pair with a specific sequence number (from the engine).
     pub fn put_with_seq(&mut self, key: Key, value: Value, seq_no: SeqNo) {
-        let size_delta = key.len() + value.len() + 16;
-        self.size += size_delta;
-
         // Build composite key directly (key + inverted seq_no) to avoid extra allocation
         let mut composite = Vec::with_capacity(key.len() + 8);
         composite.extend_from_slice(&key);
         composite.extend_from_slice(&(!seq_no).to_be_bytes());
+
+        // Subtract old entry size if overwriting
+        if let Some(old) = self.data.get(&composite) {
+            self.size = self.size.saturating_sub(old.key.len() + old.value.len() + 16);
+        }
+        let size_delta = key.len() + value.len() + 16;
+        self.size += size_delta;
 
         let entry = MemTableEntry {
             key,

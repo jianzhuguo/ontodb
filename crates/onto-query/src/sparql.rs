@@ -352,7 +352,7 @@ impl SparqlParser {
         let mut variables = Vec::new();
         for token in after_select.split_whitespace() {
             let token = token.trim();
-            if token.starts_with('?') {
+            if token.starts_with('?') || token.starts_with('$') {
                 variables.push(token[1..].to_string());
             } else if token.to_uppercase() == "WHERE" {
                 break;
@@ -829,50 +829,163 @@ impl SparqlParser {
     /// Parses ORDER BY clause.
     fn parse_order_by(&self, input: &str) -> Result<(SparqlOrderBy, String), String> {
         let input = input.trim();
-        let upper = input.to_uppercase();
 
-        if !upper.starts_with("ORDER BY") {
+        if !input.len() >= 8 || !input[..8].eq_ignore_ascii_case("ORDER BY") {
             return Err("Missing ORDER BY".to_string());
         }
 
         let after = input[8..].trim();
         let mut terms = Vec::new();
-        let mut remaining = after;
+        let mut pos = 0;
 
-        for token in after.split_whitespace() {
-            let token_upper = token.to_uppercase();
-            if token_upper == "LIMIT" || token_upper == "OFFSET" {
+        while pos < after.len() {
+            let remaining = after[pos..].trim_start();
+            let skip_ws = after.len() - pos - remaining.len();
+            pos += skip_ws;
+
+            if remaining.is_empty() {
                 break;
             }
 
-            if token.starts_with('?') || token.starts_with("DESC") || token.starts_with("ASC") {
-                let (term, _) = self.parse_order_by_term(token)?;
+            // Stop at LIMIT/OFFSET keywords (case-insensitive, ASCII only, word boundary)
+            if (remaining.len() >= 5 && remaining[..5].eq_ignore_ascii_case("LIMIT")
+                && (remaining.len() == 5 || !remaining.as_bytes()[5].is_ascii_alphanumeric()))
+                || (remaining.len() >= 6 && remaining[..6].eq_ignore_ascii_case("OFFSET")
+                    && (remaining.len() == 6 || !remaining.as_bytes()[6].is_ascii_alphanumeric()))
+            {
+                break;
+            }
+
+            // Parse the next ORDER BY term
+            if remaining.starts_with('?') {
+                // Simple variable: ?x
+                let end = remaining[1..].find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .map(|i| i + 1)
+                    .unwrap_or(remaining.len());
+                let var = remaining[1..end].trim().to_string();
+                terms.push(OrderByTerm { variable: var, ascending: true });
+                pos += end;
+            } else if (remaining.len() >= 4 && remaining[..4].eq_ignore_ascii_case("DESC"))
+                || (remaining.len() >= 3 && remaining[..3].eq_ignore_ascii_case("ASC")
+                    && (remaining.len() == 3 || !remaining.as_bytes()[3].is_ascii_alphanumeric()))
+            {
+                let (term, consumed) = self.parse_order_by_term(remaining)?;
                 terms.push(term);
-                remaining = &remaining[token.len()..];
+                pos += consumed;
+            } else if remaining.starts_with('(') {
+                // Parenthesized expression: (expression) — extract inner as variable
+                let mut depth = 0;
+                let mut end = remaining.len();
+                for (i, c) in remaining.char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let expr = remaining[1..end].trim().to_string();
+                terms.push(OrderByTerm { variable: expr, ascending: true });
+                pos += end + 1;
             } else {
-                remaining = &remaining[token.len()..];
+                // Function call or bare expression: take until whitespace
+                let end = remaining.find(char::is_whitespace).unwrap_or(remaining.len());
+                let token = remaining[..end].to_string();
+                terms.push(OrderByTerm { variable: token, ascending: true });
+                pos += end;
             }
         }
 
-        Ok((SparqlOrderBy { terms }, remaining.to_string()))
+        Ok((SparqlOrderBy { terms }, after[pos..].to_string()))
     }
 
     /// Parses a single ORDER BY term.
-    fn parse_order_by_term(&self, input: &str) -> Result<(OrderByTerm, String), String> {
-        let input = input.trim();
+    /// Returns (term, consumed_bytes) where consumed_bytes is the number of bytes consumed from the original input.
+    fn parse_order_by_term(&self, input: &str) -> Result<(OrderByTerm, usize), String> {
+        let trimmed = input.trim();
+        let leading_ws = input.len() - input.trim_start().len();
 
-        if input.to_uppercase().starts_with("DESC") || input.to_uppercase().starts_with("ASC") {
-            let ascending = input.to_uppercase().starts_with("ASC");
-            let start = input.find('(').unwrap_or(0);
-            let end = input.find(')').unwrap_or(input.len());
-            let var = input[start+1..end].trim().trim_start_matches('?').to_string();
-            Ok((OrderByTerm { variable: var, ascending }, input[end+1..].to_string()))
-        } else if input.starts_with('?') {
-            let var = input[1..].split_whitespace().next().unwrap_or("").to_string();
-            let var_len = var.len();
-            Ok((OrderByTerm { variable: var, ascending: true }, input[var_len+1..].to_string()))
+        let is_desc = trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("DESC")
+            && (trimmed.len() == 4 || !trimmed.as_bytes()[4].is_ascii_alphanumeric());
+        let is_asc = trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("ASC")
+            && (trimmed.len() == 3 || !trimmed.as_bytes()[3].is_ascii_alphanumeric());
+
+        if is_desc || is_asc {
+            let ascending = is_asc;
+            let kw_len = if is_asc { 3 } else { 4 };
+            // Find matching parenthesis pair for expressions like DESC(?x)
+            if let Some(start) = trimmed.find('(') {
+                // Track parenthesis depth to find matching close
+                let mut depth = 0;
+                let mut end = trimmed.len();
+                for (i, c) in trimmed[start..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = start + i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let var = trimmed[start+1..end].trim().trim_start_matches('?').to_string();
+                let consumed = if end + 1 < trimmed.len() {
+                    leading_ws + end + 1
+                } else {
+                    leading_ws + trimmed.len()
+                };
+                Ok((OrderByTerm { variable: var, ascending }, consumed))
+            } else {
+                // Bare ASC/DESC without parens — treat the next word as the variable
+                let after_kw = &trimmed[kw_len..];
+                let after_trimmed = after_kw.trim_start();
+                let ws_after_kw = after_kw.len() - after_trimmed.len();
+                let var_start = if after_trimmed.starts_with('?') { 1 } else { 0 };
+                let var_end = after_trimmed[var_start..]
+                    .find(char::is_whitespace)
+                    .unwrap_or(after_trimmed[var_start..].len());
+                let var = after_trimmed[var_start..var_start + var_end].to_string();
+                let consumed = leading_ws + kw_len + ws_after_kw + var_start + var_end;
+                Ok((OrderByTerm { variable: var, ascending }, consumed))
+            }
+        } else if trimmed.starts_with('?') {
+            let var = trimmed[1..].split_whitespace().next().unwrap_or("").to_string();
+            let consumed = leading_ws + 1 + var.len();
+            Ok((OrderByTerm { variable: var, ascending: true }, consumed))
+        } else if trimmed.starts_with('(') {
+            // Parenthesized expression
+            let mut depth = 0;
+            let mut end = trimmed.len();
+            for (i, c) in trimmed.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let expr = trimmed[1..end].trim().to_string();
+            let consumed = leading_ws + end + 1;
+            Ok((OrderByTerm { variable: expr, ascending: true }, consumed))
         } else {
-            Err(format!("Cannot parse ORDER BY term: {}", input))
+            // Function call or bare expression
+            let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+            let token = trimmed[..end].to_string();
+            let consumed = leading_ws + end;
+            Ok((OrderByTerm { variable: token, ascending: true }, consumed))
         }
     }
 
@@ -1092,7 +1205,7 @@ impl SparqlParser {
             }
             (PatternTerm::Variable(_), PatternTerm::Iri(pred_iri), PatternTerm::Literal(lit)) => {
                 let prop_name = extract_local_name(pred_iri);
-                Some(format!("\"{}\" = '{}'", prop_name, lit.replace('\'', "''")))
+                Some(format!("\"{}\" = '{}'", prop_name, escape_sql_string(lit)))
             }
             (PatternTerm::Variable(_), PatternTerm::Iri(pred_iri), PatternTerm::Iri(obj_iri)) => {
                 let prop_name = extract_local_name(pred_iri);
@@ -1144,7 +1257,19 @@ impl SparqlParser {
                 Some(format!("\"{}\" <= {}", var, val))
             }
             SparqlFilter::Regex(var, pattern) => {
-                Some(format!("\"{}\" LIKE '%{}%'", var, pattern.replace('\'', "''")))
+                let like_patterns = regex_to_like(pattern);
+                if like_patterns.is_empty() {
+                    return None;
+                }
+                // Handle alternation: generate OR conditions for each branch
+                let conds: Vec<String> = like_patterns.iter()
+                    .map(|p| format!("\"{}\" LIKE '{}' ESCAPE '\\'", var, escape_sql_string(p)))
+                    .collect();
+                if conds.len() == 1 {
+                    Some(conds.into_iter().next().unwrap())
+                } else {
+                    Some(format!("({})", conds.join(" OR ")))
+                }
             }
             SparqlFilter::Bound(var) => {
                 Some(format!("\"{}\" IS NOT NULL", var))
@@ -1208,7 +1333,7 @@ impl SparqlParser {
     /// Converts a pattern term to SQL value.
     fn term_to_sql_value(&self, term: &PatternTerm) -> Option<String> {
         match term {
-            PatternTerm::Literal(s) => Some(format!("'{}'", s.replace('\'', "''"))),
+            PatternTerm::Literal(s) => Some(format!("'{}'", escape_sql_string(s))),
             PatternTerm::Iri(i) => Some(format!("'{}'", extract_local_name(i))),
             _ => None,
         }
@@ -1226,6 +1351,120 @@ fn extract_local_name(iri: &str) -> String {
     } else {
         iri.to_string()
     }
+}
+
+/// Escape a string for safe inclusion in a SQL string literal.
+/// Handles single quotes, backslashes, null bytes, and other special characters.
+fn escape_sql_string(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\'' => escaped.push_str("''"),
+            '\\' => escaped.push_str("\\\\"),
+            '\0' => escaped.push_str("\\0"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+/// Converts a SPARQL regex pattern to a SQL LIKE pattern.
+/// Handles common regex constructs: ^ → prefix match, $ → suffix match,
+/// .* → % wildcard, . → _ single char.
+/// Returns a vector of LIKE patterns (one per alternation branch).
+fn regex_to_like(pattern: &str) -> Vec<String> {
+    let has_start_anchor = pattern.starts_with('^');
+    let has_end_anchor = pattern.ends_with('$');
+    let inner = pattern
+        .trim_start_matches('^')
+        .trim_end_matches('$');
+
+    // Split on top-level alternation (|) to handle OR patterns
+    let branches = split_alternation(inner);
+
+    branches.iter().map(|branch| {
+        // Check for complex regex metacharacters that can't be expressed in LIKE
+        let has_complex = branch.contains("\\") || branch.contains("[") || branch.contains("{")
+            || branch.contains("(") || branch.contains("+")
+            || branch.contains("?");
+
+        if has_complex {
+            // Fall back to substring match for complex patterns
+            return format!("%{}%", branch);
+        }
+
+        // Convert simple regex to LIKE pattern
+        let mut like = String::new();
+        if !has_start_anchor {
+            like.push('%');
+        }
+
+        let mut chars = branch.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '.' => {
+                    if chars.peek() == Some(&'*') {
+                        chars.next();
+                        like.push('%');
+                    } else {
+                        like.push('_');
+                    }
+                }
+                '%' | '_' => {
+                    // Escape LIKE wildcards in the literal parts
+                    like.push('\\');
+                    like.push(c);
+                }
+                _ => like.push(c),
+            }
+        }
+
+        if !has_end_anchor {
+            like.push('%');
+        }
+
+        like
+    }).collect()
+}
+
+/// Split a regex pattern on top-level alternation (|) operators.
+/// Respects parentheses — only splits at the top level.
+fn split_alternation(pattern: &str) -> Vec<String> {
+    let mut branches = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+
+    for c in pattern.chars() {
+        match c {
+            '(' | '[' | '{' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                current.push(c);
+            }
+            '|' if depth == 0 => {
+                branches.push(current.clone());
+                current.clear();
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+    if !current.is_empty() {
+        branches.push(current);
+    }
+
+    if branches.is_empty() {
+        branches.push(pattern.to_string());
+    }
+
+    branches
 }
 
 /// Formats query results as SPARQL JSON.

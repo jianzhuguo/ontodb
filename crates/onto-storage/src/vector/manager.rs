@@ -59,6 +59,17 @@ impl VectorIndexManager {
         }
     }
 
+    /// Compact the deleted_keys set by removing entries that are no longer
+    /// in doc_vectors (i.e., the document has been fully removed).
+    pub fn compact_deleted_keys(&mut self) {
+        self.deleted_keys.retain(|k| self.doc_vectors.contains_key(k));
+    }
+
+    /// Returns the number of tombstoned keys.
+    pub fn deleted_keys_count(&self) -> usize {
+        self.deleted_keys.len()
+    }
+
     /// Creates a new vector index for a class.column.
     pub fn create_index(
         &mut self,

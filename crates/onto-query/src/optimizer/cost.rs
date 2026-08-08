@@ -129,6 +129,8 @@ pub struct CostModel {
     pub like_selectivity: f64,
     /// Selectivity for IN predicates (per value).
     pub in_selectivity_per_value: f64,
+    /// Join selectivity (default: 10%).
+    pub join_selectivity: f64,
 }
 
 impl Default for CostModel {
@@ -146,6 +148,7 @@ impl Default for CostModel {
             range_selectivity: 0.333,   // 1/3 by default
             like_selectivity: 0.1,      // 10% by default
             in_selectivity_per_value: 0.05, // 5% per value
+            join_selectivity: 0.1,      // 10% by default
         }
     }
 }
@@ -217,7 +220,7 @@ impl CostModel {
         // Build hash table on smaller side
         let build_cost = std::cmp::min(left.rows, right.rows) as f64 * self.hash_probe_cpu;
         let probe_cost = std::cmp::max(left.rows, right.rows) as f64 * self.hash_probe_cpu;
-        let rows = (left.rows as f64 * right.rows as f64 * 0.1) as u64; // Assume 10% join selectivity
+        let rows = (left.rows as f64 * right.rows as f64 * self.join_selectivity) as u64;
         let io_cost = left.io_cost + right.io_cost;
         let cpu_cost = build_cost + probe_cost;
         CostEstimate::new(rows, io_cost, cpu_cost)
@@ -247,8 +250,8 @@ impl CostModel {
         // Merge cost: O(n + m) linear scan
         let merge_cost = (left.rows + right.rows) as f64 * self.compare_cpu;
 
-        // Output rows: assume 10% join selectivity
-        let rows = (left.rows as f64 * right.rows as f64 * 0.1) as u64;
+        // Output rows: use configurable join selectivity
+        let rows = (left.rows as f64 * right.rows as f64 * self.join_selectivity) as u64;
         let io_cost = left.io_cost + right.io_cost;
         let cpu_cost = left_sort + right_sort + merge_cost;
 

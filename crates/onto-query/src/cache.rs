@@ -5,7 +5,7 @@
 
 use crate::optimizer::ExecutionPlan;
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,8 @@ pub struct CachedResult {
     pub ttl: Duration,
     /// Number of times this cache entry was hit.
     pub hit_count: u64,
+    /// Last access time for LRU eviction.
+    pub last_accessed: Instant,
 }
 
 impl CachedResult {
@@ -38,6 +40,8 @@ pub struct CachedPlan {
     pub cached_at: Instant,
     /// Number of times this cache entry was hit.
     pub hit_count: u64,
+    /// Last access time for LRU eviction.
+    pub last_accessed: Instant,
 }
 
 /// Cache key based on query hash.
@@ -76,17 +80,24 @@ impl CacheStats {
 }
 
 /// Query result cache with LRU eviction.
+///
+/// Uses a BTreeMap<counter, hash> for O(log n) eviction (finding the
+/// minimum counter is `first_key_value()` on a sorted tree).
 pub struct QueryCache {
     /// Cached results indexed by query hash.
     entries: HashMap<u64, CachedResult>,
+    /// Sorted access order: counter → hash. Eviction picks the smallest counter.
+    access_order: BTreeMap<u64, u64>,
+    /// Reverse map: hash → current counter (for updating on access).
+    hash_to_counter: HashMap<u64, u64>,
+    /// Monotonically increasing counter.
+    counter: u64,
     /// Maximum number of entries.
     max_size: usize,
     /// Default TTL for cache entries.
     default_ttl: Duration,
     /// Cache statistics.
     stats: CacheStats,
-    /// Access order for LRU eviction.
-    access_order: Vec<u64>,
 }
 
 impl QueryCache {
@@ -94,10 +105,12 @@ impl QueryCache {
     pub fn new(max_size: usize, default_ttl: Duration) -> Self {
         Self {
             entries: HashMap::with_capacity(max_size),
+            access_order: BTreeMap::new(),
+            hash_to_counter: HashMap::with_capacity(max_size),
+            counter: 0,
             max_size,
             default_ttl,
             stats: CacheStats::default(),
-            access_order: Vec::with_capacity(max_size),
         }
     }
 
@@ -105,13 +118,19 @@ impl QueryCache {
     pub fn get(&mut self, query_hash: u64) -> Option<Vec<Map<String, Value>>> {
         self.stats.lookups += 1;
 
-        if let Some(entry) = self.entries.get(&query_hash) {
+        if let Some(entry) = self.entries.get_mut(&query_hash) {
             if entry.is_valid() {
                 self.stats.hits += 1;
-                // Update access order
-                self.access_order.retain(|&h| h != query_hash);
-                self.access_order.push(query_hash);
-                return Some(entry.rows.clone());
+                entry.last_accessed = Instant::now();
+                let rows = entry.rows.clone();
+                // Inline touch to avoid double mutable borrow
+                if let Some(old_counter) = self.hash_to_counter.remove(&query_hash) {
+                    self.access_order.remove(&old_counter);
+                }
+                self.counter += 1;
+                self.access_order.insert(self.counter, query_hash);
+                self.hash_to_counter.insert(query_hash, self.counter);
+                return Some(rows);
             }
         }
 
@@ -126,15 +145,17 @@ impl QueryCache {
             self.evict_lru();
         }
 
+        let now = Instant::now();
         let entry = CachedResult {
             rows,
-            cached_at: Instant::now(),
+            cached_at: now,
             ttl: self.default_ttl,
             hit_count: 0,
+            last_accessed: now,
         };
 
         self.entries.insert(query_hash, entry);
-        self.access_order.push(query_hash);
+        self.touch(query_hash);
         self.stats.size = self.entries.len();
     }
 
@@ -149,15 +170,17 @@ impl QueryCache {
             self.evict_lru();
         }
 
+        let now = Instant::now();
         let entry = CachedResult {
             rows,
-            cached_at: Instant::now(),
+            cached_at: now,
             ttl,
             hit_count: 0,
+            last_accessed: now,
         };
 
         self.entries.insert(query_hash, entry);
-        self.access_order.push(query_hash);
+        self.touch(query_hash);
         self.stats.size = self.entries.len();
     }
 
@@ -173,6 +196,7 @@ impl QueryCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.access_order.clear();
+        self.hash_to_counter.clear();
         self.stats.size = 0;
     }
 
@@ -181,27 +205,47 @@ impl QueryCache {
         &self.stats
     }
 
-    /// Evict the least recently used entry.
+    /// Evict the least recently used entry. O(log n) via BTreeMap.
     fn evict_lru(&mut self) {
-        if let Some(oldest_hash) = self.access_order.first().cloned() {
-            self.entries.remove(&oldest_hash);
-            self.access_order.retain(|&h| h != oldest_hash);
-            self.stats.evictions += 1;
-            self.stats.size = self.entries.len();
+        // The smallest counter in the BTreeMap is the LRU entry
+        if let Some((&_counter, &victim_hash)) = self.access_order.first_key_value() {
+            self.access_order.pop_first();
+            self.hash_to_counter.remove(&victim_hash);
+            if self.entries.remove(&victim_hash).is_some() {
+                self.stats.evictions += 1;
+                self.stats.size = self.entries.len();
+            }
         }
+    }
+
+    /// Records a page access. O(log n) operation.
+    fn touch(&mut self, hash: u64) {
+        // Remove old counter from BTreeMap if present
+        if let Some(old_counter) = self.hash_to_counter.remove(&hash) {
+            self.access_order.remove(&old_counter);
+        }
+        self.counter += 1;
+        self.access_order.insert(self.counter, hash);
+        self.hash_to_counter.insert(hash, self.counter);
     }
 }
 
-/// Execution plan cache.
+/// Execution plan cache with O(log n) LRU eviction.
+///
+/// Uses a BTreeMap<counter, hash> for O(log n) eviction.
 pub struct PlanCache {
     /// Cached plans indexed by normalized query hash.
     entries: HashMap<u64, CachedPlan>,
+    /// Sorted access order: counter → hash.
+    access_order: BTreeMap<u64, u64>,
+    /// Reverse map: hash → current counter.
+    hash_to_counter: HashMap<u64, u64>,
+    /// Monotonically increasing counter.
+    counter: u64,
     /// Maximum number of entries.
     max_size: usize,
     /// Cache statistics.
     stats: CacheStats,
-    /// Access order for LRU eviction.
-    access_order: Vec<u64>,
 }
 
 impl PlanCache {
@@ -209,9 +253,11 @@ impl PlanCache {
     pub fn new(max_size: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(max_size),
+            access_order: BTreeMap::new(),
+            hash_to_counter: HashMap::with_capacity(max_size),
+            counter: 0,
             max_size,
             stats: CacheStats::default(),
-            access_order: Vec::with_capacity(max_size),
         }
     }
 
@@ -219,11 +265,18 @@ impl PlanCache {
     pub fn get(&mut self, query_hash: u64) -> Option<ExecutionPlan> {
         self.stats.lookups += 1;
 
-        if let Some(entry) = self.entries.get(&query_hash) {
+        if let Some(entry) = self.entries.get_mut(&query_hash) {
             self.stats.hits += 1;
-            self.access_order.retain(|&h| h != query_hash);
-            self.access_order.push(query_hash);
-            return Some(entry.plan.clone());
+            entry.last_accessed = Instant::now();
+            let plan = entry.plan.clone();
+            // Inline touch to avoid double mutable borrow
+            if let Some(old_counter) = self.hash_to_counter.remove(&query_hash) {
+                self.access_order.remove(&old_counter);
+            }
+            self.counter += 1;
+            self.access_order.insert(self.counter, query_hash);
+            self.hash_to_counter.insert(query_hash, self.counter);
+            return Some(plan);
         }
 
         self.stats.misses += 1;
@@ -236,14 +289,16 @@ impl PlanCache {
             self.evict_lru();
         }
 
+        let now = Instant::now();
         let entry = CachedPlan {
             plan,
-            cached_at: Instant::now(),
+            cached_at: now,
             hit_count: 0,
+            last_accessed: now,
         };
 
         self.entries.insert(query_hash, entry);
-        self.access_order.push(query_hash);
+        self.touch(query_hash);
         self.stats.size = self.entries.len();
     }
 
@@ -251,6 +306,7 @@ impl PlanCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.access_order.clear();
+        self.hash_to_counter.clear();
         self.stats.size = 0;
     }
 
@@ -259,14 +315,27 @@ impl PlanCache {
         &self.stats
     }
 
-    /// Evict the least recently used entry.
+    /// Evict the least recently used entry. O(log n) via BTreeMap.
     fn evict_lru(&mut self) {
-        if let Some(oldest_hash) = self.access_order.first().cloned() {
-            self.entries.remove(&oldest_hash);
-            self.access_order.retain(|&h| h != oldest_hash);
-            self.stats.evictions += 1;
-            self.stats.size = self.entries.len();
+        if let Some((&_counter, &victim_hash)) = self.access_order.first_key_value() {
+            self.access_order.pop_first();
+            self.hash_to_counter.remove(&victim_hash);
+            if self.entries.remove(&victim_hash).is_some() {
+                self.stats.evictions += 1;
+                self.stats.size = self.entries.len();
+            }
         }
+    }
+
+    /// Records a page access. O(log n) operation.
+    fn touch(&mut self, hash: u64) {
+        // Remove old counter from BTreeMap if present
+        if let Some(old_counter) = self.hash_to_counter.remove(&hash) {
+            self.access_order.remove(&old_counter);
+        }
+        self.counter += 1;
+        self.access_order.insert(self.counter, hash);
+        self.hash_to_counter.insert(hash, self.counter);
     }
 }
 

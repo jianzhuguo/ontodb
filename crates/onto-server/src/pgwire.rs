@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use onto_query::{QueryAst, QueryExecutor, QueryParser};
+use crate::auth::{AuthConfig, AuthState};
 
 /// PostgreSQL protocol version: 3.0
 const PROTOCOL_VERSION: u32 = 196608; // 3 << 16 | 0
@@ -37,28 +38,46 @@ const TERMINATE_MSG: u8 = b'X';
 /// Transaction status indicators
 const TXN_IDLE: u8 = b'I';
 
+/// Maximum concurrent PG Wire connections.
+const MAX_PGWIRE_CONNECTIONS: usize = 128;
+
+/// Maximum message size for PG Wire protocol (16 MB).
+const MAX_PGWIRE_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
 /// Run the PG wire protocol server.
 pub async fn run_pgwire_server(
     addr: &str,
     executor: Arc<QueryExecutor>,
     metrics: Arc<crate::metrics::Metrics>,
+    auth_config: AuthConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let auth = AuthState::new(&auth_config);
+    let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_PGWIRE_CONNECTIONS));
     println!("PG wire protocol listening on {}", addr);
     println!("Connect with: psql -h 127.0.0.1 -p {} -d ontodb", addr.split(':').last().unwrap_or("5432"));
 
     loop {
         let (stream, peer) = listener.accept().await?;
+
+        // Enforce connection limit
+        let permit = match conn_semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break Ok(()),
+        };
+
         let executor = Arc::clone(&executor);
         let metrics = Arc::clone(&metrics);
+        let auth = auth.clone();
         metrics.tcp_connections_total.inc();
         metrics.tcp_connections_active.inc();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_pgwire_client(stream, &executor).await {
+            if let Err(e) = handle_pgwire_client(stream, &executor, &auth).await {
                 eprintln!("PG wire client error ({}): {}", peer, e);
             }
             metrics.tcp_connections_active.dec();
+            drop(permit);
         });
     }
 }
@@ -67,6 +86,7 @@ pub async fn run_pgwire_server(
 async fn handle_pgwire_client(
     mut stream: TcpStream,
     executor: &QueryExecutor,
+    auth: &AuthState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = BytesMut::with_capacity(8192);
 
@@ -107,24 +127,81 @@ async fn handle_pgwire_client(
 
         // Parse startup parameters (null-terminated key-value pairs)
         let params_data = &buf[8..len];
-        let _params = parse_startup_params(params_data);
+        let params = parse_startup_params(params_data);
         buf.advance(len);
+
+        // Step 2: Authenticate
+        if auth.enabled {
+            // Request cleartext password
+            let mut auth_req = BytesMut::new();
+            auth_req.put_u8(AUTH_OK);
+            auth_req.put_u32(8); // length
+            auth_req.put_i32(3); // AuthenticationCleartextPassword
+            stream.write_all(&auth_req).await?;
+
+            // Read password message
+            let password = loop {
+                let n = stream.read_buf(&mut buf).await?;
+                if n == 0 {
+                    return Ok(());
+                }
+                if buf.len() < 5 {
+                    continue;
+                }
+                let msg_type = buf[0];
+                let msg_len = (&buf[1..5]).get_u32() as usize;
+                if buf.len() < msg_len + 1 {
+                    continue;
+                }
+                if msg_type == b'p' {
+                    // PasswordMessage: the password is null-terminated
+                    let pw_bytes = buf[5..msg_len + 1].to_vec();
+                    let pw = std::str::from_utf8(&pw_bytes)
+                        .unwrap_or("")
+                        .trim_end_matches('\0');
+                    buf.advance(msg_len + 1);
+                    break pw.to_string();
+                } else {
+                    buf.advance(msg_len + 1);
+                }
+            };
+
+            // Validate password as API key
+            if auth.validate(&password).is_none() {
+                let mut err_msg = BytesMut::new();
+                err_msg.put_u8(ERROR_RESPONSE);
+                // Build error fields
+                let err_body = b"SFATAL\0C28P01\0Mauthentication failed\0\0";
+                err_msg.put_u32(4 + err_body.len() as u32);
+                err_msg.extend_from_slice(err_body);
+                stream.write_all(&err_msg).await?;
+                return Ok(());
+            }
+        }
+        // Send AuthenticationOk
+        let mut auth_msg = BytesMut::new();
+        auth_msg.put_u8(AUTH_OK);
+        auth_msg.put_u32(8); // length
+        auth_msg.put_i32(0); // auth type = OK
+        stream.write_all(&auth_msg).await?;
         break;
     }
-
-    // Step 2: Send AuthenticationOk
-    let mut auth_msg = BytesMut::new();
-    auth_msg.put_u8(AUTH_OK);
-    auth_msg.put_u32(8); // length
-    auth_msg.put_i32(0); // auth type = OK
-    stream.write_all(&auth_msg).await?;
 
     // Step 3: Send BackendKeyData (process_id, secret_key)
     let mut key_msg = BytesMut::new();
     key_msg.put_u8(BACKEND_KEY);
     key_msg.put_u32(12); // length
     key_msg.put_i32(std::process::id() as i32);
-    key_msg.put_i32(12345); // dummy secret key
+    // Generate a per-connection secret using time + port + counter for cancel request validation
+    static SECRET_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let counter = SECRET_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let time_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let port = stream.peer_addr().map(|a| a.port() as u32).unwrap_or(0);
+    let secret: i32 = (time_seed ^ port ^ counter ^ (std::process::id() << 16)) as i32;
+    key_msg.put_i32(secret);
     stream.write_all(&key_msg).await?;
 
     // Step 4: Send ParameterStatus messages
@@ -149,6 +226,11 @@ async fn handle_pgwire_client(
         while buf.len() >= 5 {
             let msg_type = buf[0];
             let msg_len = (&buf[1..5]).get_u32() as usize;
+
+            // Enforce message size limit
+            if msg_len > MAX_PGWIRE_MESSAGE_SIZE {
+                return Err(format!("PG wire message too large: {} bytes (max {})", msg_len, MAX_PGWIRE_MESSAGE_SIZE).into());
+            }
 
             if buf.len() < msg_len + 1 {
                 break; // incomplete message

@@ -103,7 +103,6 @@ Three permission levels:
 Pass keys via:
 - `Authorization: Bearer <key>` header
 - `X-API-Key: <key>` header
-- `?api_key=<key>` query parameter
 
 ## Backup & Restore
 

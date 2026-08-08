@@ -73,29 +73,33 @@ impl PersistentRaftStore {
     fn load_metadata(&mut self) {
         // Load vote
         if let Ok(Some(data)) = self.engine.get(KEY_VOTE) {
-            if let Ok(vote) = serde_json::from_slice::<Vote<NodeId>>(&data) {
-                self.vote = Some(vote);
+            match serde_json::from_slice::<Vote<NodeId>>(&data) {
+                Ok(vote) => self.vote = Some(vote),
+                Err(e) => tracing::error!("Failed to deserialize Raft vote metadata: {}", e),
             }
         }
 
         // Load last applied
         if let Ok(Some(data)) = self.engine.get(KEY_LAST_APPLIED) {
-            if let Ok(log_id) = serde_json::from_slice::<Option<LogId<NodeId>>>(&data) {
-                self.last_applied = log_id;
+            match serde_json::from_slice::<Option<LogId<NodeId>>>(&data) {
+                Ok(log_id) => self.last_applied = log_id,
+                Err(e) => tracing::error!("Failed to deserialize last_applied metadata: {}", e),
             }
         }
 
         // Load membership
         if let Ok(Some(data)) = self.engine.get(KEY_MEMBERSHIP) {
-            if let Ok(membership) = serde_json::from_slice::<StoredMembership<NodeId, openraft::BasicNode>>(&data) {
-                self.last_membership = membership;
+            match serde_json::from_slice::<StoredMembership<NodeId, openraft::BasicNode>>(&data) {
+                Ok(membership) => self.last_membership = membership,
+                Err(e) => tracing::error!("Failed to deserialize Raft membership metadata: {}", e),
             }
         }
 
         // Load purged
         if let Ok(Some(data)) = self.engine.get(KEY_PURGED) {
-            if let Ok(log_id) = serde_json::from_slice::<Option<LogId<NodeId>>>(&data) {
-                self.purged = log_id;
+            match serde_json::from_slice::<Option<LogId<NodeId>>>(&data) {
+                Ok(log_id) => self.purged = log_id,
+                Err(e) => tracing::error!("Failed to deserialize purged metadata: {}", e),
             }
         }
 
@@ -213,8 +217,8 @@ impl RaftLogReader<OntoRaftConfig> for PersistentRaftStore {
                     }
                 }
                 Ok(None) => {
-                    // No more entries in this range
-                    break;
+                    // Entry missing (purged or gap) — skip but continue scanning
+                    continue;
                 }
                 Err(e) => {
                     return Err(StorageError::IO {
@@ -334,9 +338,11 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
     where
         I: IntoIterator<Item = Entry<OntoRaftConfig>> + openraft::OptionalSend,
     {
-        for entry in entries {
+        // Collect entries first to write them in a single batch, then flush once
+        let entry_list: Vec<_> = entries.into_iter().collect();
+        for entry in &entry_list {
             let key = Self::log_key(entry.log_id.index);
-            let data = serde_json::to_vec(&entry).map_err(|e| StorageError::IO {
+            let data = serde_json::to_vec(entry).map_err(|e| StorageError::IO {
                 source: openraft::StorageIOError::new(
                     openraft::ErrorSubject::LogIndex(entry.log_id.index),
                     openraft::ErrorVerb::Write,
@@ -352,6 +358,14 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
                 ),
             })?;
         }
+        // Flush WAL to ensure all entries are durable before returning
+        self.engine.flush().map_err(|e| StorageError::IO {
+            source: openraft::StorageIOError::new(
+                openraft::ErrorSubject::Logs,
+                openraft::ErrorVerb::Write,
+                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+            ),
+        })?;
         Ok(())
     }
 
@@ -494,31 +508,42 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
 
-        // Parse and install state machine data
-        if let Ok(sm_data) = serde_json::from_slice::<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>(&data) {
-            // Clear existing SM data and install new
-            let existing = self.engine.scan_prefix(RAFT_SM_PREFIX).map_err(|e| StorageError::IO {
+        // Parse and install state machine data atomically
+        let sm_data: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+            serde_json::from_slice(&data).map_err(|e| StorageError::IO {
+                source: openraft::StorageIOError::new(
+                    openraft::ErrorSubject::Snapshot(None),
+                    openraft::ErrorVerb::Write,
+                    &std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+                ),
+            })?;
+
+        // Write new SM data first (before deleting old data)
+        for (key, value) in &sm_data {
+            let sm_key = Self::sm_key(key);
+            self.engine.put(sm_key, value.clone()).map_err(|e| StorageError::IO {
                 source: openraft::StorageIOError::new(
                     openraft::ErrorSubject::Snapshot(None),
                     openraft::ErrorVerb::Write,
                     &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
                 ),
             })?;
+        }
 
-            for (key, _) in existing {
+        // Now delete old SM data that's not in the new snapshot
+        let new_keys: std::collections::HashSet<Vec<u8>> = sm_data.keys().cloned().collect();
+        let existing = self.engine.scan_prefix(RAFT_SM_PREFIX).map_err(|e| StorageError::IO {
+            source: openraft::StorageIOError::new(
+                openraft::ErrorSubject::Snapshot(None),
+                openraft::ErrorVerb::Write,
+                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+            ),
+        })?;
+
+        for (key, _) in existing {
+            let raw_key = key[RAFT_SM_PREFIX.len()..].to_vec();
+            if !new_keys.contains(&raw_key) {
                 let _ = self.engine.delete(key);
-            }
-
-            // Write new SM data
-            for (key, value) in sm_data {
-                let sm_key = Self::sm_key(&key);
-                self.engine.put(sm_key, value).map_err(|e| StorageError::IO {
-                    source: openraft::StorageIOError::new(
-                        openraft::ErrorSubject::Snapshot(None),
-                        openraft::ErrorVerb::Write,
-                        &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
-                    ),
-                })?;
             }
         }
 

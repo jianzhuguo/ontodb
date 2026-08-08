@@ -186,16 +186,17 @@ pub async fn rate_limit_middleware(
         return next.run(request).await;
     }
 
-    // Get the API key from extensions (set by auth middleware) or use IP
+    // Get the API key from extensions (set by auth middleware) or use anonymous
+    // Note: X-Forwarded-For is not trusted here as it can be spoofed by clients.
+    // Use the trusted X-Real-IP header (set by reverse proxy) or fall back to "anonymous".
     let key = request
         .extensions()
         .get::<crate::auth::KeyInfo>()
         .map(|info| info.key.clone())
         .unwrap_or_else(|| {
-            // Fall back to IP address
             request
                 .headers()
-                .get("X-Forwarded-For")
+                .get("X-Real-IP")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "anonymous".to_string())
@@ -209,15 +210,11 @@ pub async fn rate_limit_middleware(
 
     match limiter.check(&key, custom_rpm).await {
         Ok(remaining) => {
-            let info = limiter.get_info(&key).await;
             let mut response = next.run(request).await;
             let headers = response.headers_mut();
-            headers.insert("X-RateLimit-Limit", info.limit.into());
+            headers.insert("X-RateLimit-Limit", limiter.config.default_rpm.into());
             headers.insert("X-RateLimit-Remaining", remaining.into());
-            headers.insert(
-                "X-RateLimit-Reset",
-                info.reset_after.as_secs().into(),
-            );
+            headers.insert("X-RateLimit-Reset", 0u64.into());
             response
         }
         Err(retry_after) => {

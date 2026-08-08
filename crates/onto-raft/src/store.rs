@@ -21,8 +21,6 @@ use crate::types::{NodeId, OntoRaftConfig, OntoRequest, OntoResponse};
 pub struct OntoRaftStore {
     /// Persisted vote.
     vote: Option<Vote<NodeId>>,
-    /// Committed log id.
-    committed: Option<LogId<NodeId>>,
     /// Log entries indexed by log index.
     log: BTreeMap<u64, Entry<OntoRaftConfig>>,
     /// Last purged log id.
@@ -43,7 +41,6 @@ impl OntoRaftStore {
     pub fn new() -> Self {
         Self {
             vote: None,
-            committed: None,
             log: BTreeMap::new(),
             purged: None,
             sm_data: BTreeMap::new(),
@@ -150,7 +147,6 @@ impl RaftStorage<OntoRaftConfig> for OntoRaftStore {
         // For in-memory store, return a clone
         OntoRaftStore {
             vote: self.vote,
-            committed: self.committed,
             log: self.log.clone(),
             purged: self.purged,
             sm_data: self.sm_data.clone(),
@@ -221,7 +217,6 @@ impl RaftStorage<OntoRaftConfig> for OntoRaftStore {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         OntoRaftStore {
             vote: self.vote,
-            committed: self.committed,
             log: self.log.clone(),
             purged: self.purged,
             sm_data: self.sm_data.clone(),

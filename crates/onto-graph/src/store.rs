@@ -85,7 +85,11 @@ impl GraphStore {
         if let Some(&idx) = map.get(id) {
             return idx;
         }
-        let idx = map.len() as u32;
+        let len = map.len();
+        let idx: u32 = len.try_into().unwrap_or_else(|_| {
+            tracing::error!("Vertex index overflow: {} vertices exceed u32::MAX", len);
+            u32::MAX
+        });
         map.insert(id.to_string(), idx);
         drop(map);
 
@@ -174,25 +178,64 @@ impl GraphStore {
             }
         }
 
-        // Remove all connected edges
-        {
+        // Remove all connected edges (string-keyed)
+        // Collect edge info first, then clean up neighbor lists separately to avoid deadlock
+        let connected_edges: Vec<(String, String, bool)> = {
             let out = self.out_edges.write().remove(id).unwrap_or_default();
             let inp = self.in_edges.write().remove(id).unwrap_or_default();
 
+            let mut all_edges = Vec::new();
             let mut edges = self.edges.write();
             for edge in out {
                 edges.remove(&edge.id);
-                // Remove from target's in_edges
-                if let Some(in_list) = self.in_edges.write().get_mut(&edge.to) {
-                    in_list.retain(|e| e.id != edge.id);
-                }
+                all_edges.push((edge.id.clone(), edge.to.clone(), true));
             }
             for edge in inp {
                 edges.remove(&edge.id);
-                // Remove from source's out_edges
-                if let Some(out_list) = self.out_edges.write().get_mut(&edge.from) {
-                    out_list.retain(|e| e.id != edge.id);
+                all_edges.push((edge.id.clone(), edge.from.clone(), false));
+            }
+            all_edges
+        };
+
+        // Clean up neighbor adjacency lists (separate lock scope to avoid deadlock)
+        for (edge_id, neighbor_id, is_outgoing) in &connected_edges {
+            if *is_outgoing {
+                if let Some(in_list) = self.in_edges.write().get_mut(neighbor_id.as_str()) {
+                    in_list.retain(|e| &e.id != edge_id);
                 }
+            } else {
+                if let Some(out_list) = self.out_edges.write().get_mut(neighbor_id.as_str()) {
+                    out_list.retain(|e| &e.id != edge_id);
+                }
+            }
+        }
+
+        // Clean up integer adjacency lists
+        if let Some(&idx) = self.id_to_idx.read().get(id) {
+            let idx = idx as usize;
+            // Clear adjacency lists for this vertex
+            {
+                let mut adj_out = self.adj_out.write();
+                if idx < adj_out.len() {
+                    adj_out[idx].clear();
+                }
+            }
+            {
+                let mut adj_in = self.adj_in.write();
+                if idx < adj_in.len() {
+                    adj_in[idx].clear();
+                }
+            }
+            // Remove edges from edge_index that reference this vertex
+            {
+                let mut ei = self.edge_index.write();
+                ei.retain(|(from, to, _)| *from as usize != idx && *to as usize != idx);
+            }
+            // Remove from ID mapping
+            self.id_to_idx.write().remove(id);
+            let mut ids = self.idx_to_id.write();
+            if idx < ids.len() {
+                ids[idx] = String::new(); // tombstone
             }
         }
 
@@ -415,6 +458,9 @@ impl GraphStore {
         direction: Direction,
     ) -> Vec<u32> {
         let num_nodes = self.idx_to_id.read().len();
+        if start_idx as usize >= num_nodes {
+            return Vec::new();
+        }
         let mut visited = vec![false; num_nodes];
         visited[start_idx as usize] = true;
         let mut queue = VecDeque::new();
@@ -459,6 +505,9 @@ impl GraphStore {
         direction: Direction,
     ) -> (Vec<u32>, Vec<Option<u32>>) {
         let num_nodes = self.idx_to_id.read().len();
+        if start_idx as usize >= num_nodes {
+            return (Vec::new(), vec![None; num_nodes]);
+        }
         let mut visited = vec![false; num_nodes];
         let mut parent: Vec<Option<u32>> = vec![None; num_nodes];
         visited[start_idx as usize] = true;

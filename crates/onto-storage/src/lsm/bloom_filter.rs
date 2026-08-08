@@ -18,9 +18,9 @@ impl BloomFilter {
     /// - `fp_rate`: Desired false positive rate (e.g., 0.01 for 1%).
     pub fn new(expected_items: usize, fp_rate: f64) -> Self {
         // Optimal number of bits: -n * ln(p) / (ln(2)^2)
-        let num_bits = Self::optimal_bits(expected_items, fp_rate);
+        let num_bits = Self::optimal_bits(expected_items, fp_rate).max(64);
         // Optimal number of hash functions: (m/n) * ln(2)
-        let num_hashes = Self::optimal_hashes(num_bits, expected_items);
+        let num_hashes = Self::optimal_hashes(num_bits, expected_items).max(1);
 
         let num_u64 = (num_bits + 63) / 64;
         Self {
@@ -128,6 +128,9 @@ impl BloomFilter {
     }
 
     fn optimal_hashes(m: usize, n: usize) -> usize {
+        if n == 0 {
+            return 1;
+        }
         ((m as f64 / n as f64) * std::f64::consts::LN_2).ceil() as usize
     }
 }

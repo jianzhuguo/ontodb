@@ -10,7 +10,7 @@
 //! - prp-symp: symmetric property inference
 
 use crate::model::{Ontology, Triple};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Identifies which rule produced an inference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -245,6 +245,15 @@ impl Rule for PrpInv {
         facts: &HashSet<Triple>,
         new_facts: &[Triple],
     ) -> Vec<Triple> {
+        // Pre-compute reverse index: inverse_of target -> list of property names
+        // This avoids O(facts × properties) full scan
+        let mut reverse_index: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (name, prop_def) in &ontology.properties {
+            if let Some(ref inverse) = prop_def.inverse_of {
+                reverse_index.entry(inverse.as_str()).or_default().push(name);
+            }
+        }
+
         let mut inferred = Vec::new();
         let source: Vec<&Triple> = if new_facts.is_empty() {
             facts.iter().collect()
@@ -255,6 +264,7 @@ impl Rule for PrpInv {
             if fact.predicate == "rdf:type" {
                 continue;
             }
+            // Check if this property has a direct inverse
             if let Some(prop_def) = ontology.properties.get(&fact.predicate) {
                 if let Some(ref inverse) = prop_def.inverse_of {
                     let t = Triple::new(&fact.object, inverse, &fact.subject);
@@ -263,10 +273,10 @@ impl Rule for PrpInv {
                     }
                 }
             }
-            // Also check if any property has this predicate as its inverse
-            for (_name, prop_def) in &ontology.properties {
-                if prop_def.inverse_of.as_deref() == Some(fact.predicate.as_str()) {
-                    let t = Triple::new(&fact.object, &prop_def.name, &fact.subject);
+            // Check reverse index for properties that have this predicate as their inverse
+            if let Some(inverse_props) = reverse_index.get(fact.predicate.as_str()) {
+                for &prop_name in inverse_props {
+                    let t = Triple::new(&fact.object, prop_name, &fact.subject);
                     if !facts.contains(&t) {
                         inferred.push(t);
                     }

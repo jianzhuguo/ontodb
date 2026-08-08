@@ -283,8 +283,23 @@ impl TurtleParser {
                     let object = if obj.starts_with('<') && obj.ends_with('>') {
                         RdfTerm::Iri(obj[1..obj.len()-1].to_string())
                     } else if obj.starts_with('"') {
-                        let end_quote = obj.rfind('"').unwrap_or(obj.len());
-                        let value = obj[1..end_quote].to_string();
+                        // Find the closing quote, handling escaped quotes (\")
+                        let mut end_quote = obj.len();
+                        let bytes = obj.as_bytes();
+                        let mut i = 1;
+                        while i < bytes.len() {
+                            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                                i += 2; // skip escaped character
+                                continue;
+                            }
+                            if bytes[i] == b'"' {
+                                end_quote = i;
+                                break;
+                            }
+                            i += 1;
+                        }
+                        let raw_value = &obj[1..end_quote];
+                        let value = unescape_turtle_string(raw_value);
                         let rest = obj[end_quote+1..].trim();
                         let (language, datatype) = if rest.starts_with('@') {
                             (Some(rest[1..].to_string()), None)
@@ -370,6 +385,33 @@ impl TurtleParser {
             _ => DataType::String, // Default to string for unknown types
         }
     }
+}
+
+/// Unescapes a Turtle string literal, handling \n, \t, \\, \", etc.
+fn unescape_turtle_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => result.push('"'),
+                Some('\\') => result.push('\\'),
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('t') => result.push('\t'),
+                Some('b') => result.push('\u{0008}'),
+                Some('f') => result.push('\u{000C}'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Exports an ontology to N-Triples format.

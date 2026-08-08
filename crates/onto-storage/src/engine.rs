@@ -34,8 +34,9 @@ fn parse_doc_bytes(bytes: &[u8]) -> Option<serde_json::Map<String, serde_json::V
 }
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
-use parking_lot::RwLock as FairRwLock;
+use std::sync::{mpsc, Arc, RwLock};
+use std::thread::JoinHandle;
+use parking_lot::{Mutex, RwLock as FairRwLock};
 
 /// Mutable write-path state, protected by RwLock for concurrent read access.
 ///
@@ -100,12 +101,15 @@ pub struct LsmEngine {
 
     /// Channel to receive compaction notifications (for cache invalidation).
     /// Wrapped in Mutex because mpsc::Receiver is not Sync.
-    compaction_notif_receiver: std::sync::Mutex<mpsc::Receiver<CompactionNotification>>,
+    compaction_notif_receiver: Mutex<mpsc::Receiver<CompactionNotification>>,
 
     /// Fast flag: set by the notification drain when a compaction notification arrives.
     /// Cleared after the sst_cache is invalidated.
     /// Allows the common path (no compaction) to skip sst_cache lock acquisition.
     compaction_pending: AtomicBool,
+
+    /// Handle to the background compaction worker thread for graceful shutdown.
+    worker_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Temporary helper for loading WAL + SSTables before spawning the compaction worker.
@@ -253,8 +257,9 @@ impl LsmEngine {
             index_manager: RwLock::new(index_manager),
             vector_index_manager: RwLock::new(VectorIndexManager::new()),
             compaction_sender,
-            compaction_notif_receiver: std::sync::Mutex::new(compaction_notif_receiver),
+            compaction_notif_receiver: Mutex::new(compaction_notif_receiver),
             compaction_pending: AtomicBool::new(false),
+            worker_handle: Mutex::new(Some(_worker_handle)),
         };
 
         // Rebuild secondary indexes from persisted index entries
@@ -283,6 +288,9 @@ impl LsmEngine {
             // Batch flush: only flush WAL buffer every 64 writes
             if ws.wal_pending_count >= 64 {
                 ws.wal.flush_buf()?;
+                if self.options.sync_wal_on_commit {
+                    ws.wal.sync()?;
+                }
                 ws.wal_pending_count = 0;
             }
             ws.memtable.put_with_seq(key, value, seq);
@@ -302,7 +310,7 @@ impl LsmEngine {
 
         // 1. Collect candidate SST paths from levels (brief lock).
         let candidates = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock();
             let mut cands = Vec::new();
             for level in levels.iter() {
                 for sst_info in level.iter().rev() {
@@ -330,7 +338,7 @@ impl LsmEngine {
 
         // 3. Snapshot SST handles from cache (may lazily open files).
         let sst_handles: Vec<Arc<SsTable>> = {
-            let mut cache = self.sst_cache.lock().unwrap();
+            let mut cache = self.sst_cache.lock();
             candidates.iter().filter_map(|path| {
                 if !cache.contains_key(path) {
                     let sst = SsTable::open(path).ok()?;
@@ -384,7 +392,7 @@ impl LsmEngine {
 
         // Collect SSTable paths under lock, then release
         let sst_paths: Vec<PathBuf> = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock();
             let mut paths = Vec::new();
             for level in levels.iter().rev() {
                 for sst_info in level.iter() {
@@ -406,7 +414,7 @@ impl LsmEngine {
 
         // Step 1: Snapshot SST handles from cache (brief lock — open missing files outside)
         let sst_handles: Vec<Arc<SsTable>> = {
-            let mut cache = self.sst_cache.lock().unwrap();
+            let mut cache = self.sst_cache.lock();
             let mut handles = Vec::with_capacity(sst_paths.len());
             for path in &sst_paths {
                 if let Some(sst) = cache.get(path) {
@@ -602,7 +610,7 @@ impl LsmEngine {
         // Step 3: Add to shared levels (brief lock)
         let metadata = fs::metadata(&sst_path)?;
         {
-            let mut levels = self.levels.lock().unwrap();
+            let mut levels = self.levels.lock();
             levels[0].push(SsTableInfo {
                 path: sst_path.clone(),
                 size: metadata.len(),
@@ -617,7 +625,7 @@ impl LsmEngine {
         // immutable MT cleared and the next lazy SST open.
         let new_sst = SsTable::open(&sst_path)?;
         {
-            self.sst_cache.lock().unwrap().insert(sst_path, Arc::new(new_sst));
+            self.sst_cache.lock().insert(sst_path, Arc::new(new_sst));
         }
         {
             let mut ws = self.write_state.write();
@@ -646,7 +654,7 @@ impl LsmEngine {
         // Drain notifications under the receiver lock only (NOT holding write_state).
         let mut evicted_paths: Vec<PathBuf> = Vec::new();
         {
-            let receiver = self.compaction_notif_receiver.lock().unwrap();
+            let receiver = self.compaction_notif_receiver.lock();
             while let Ok(notif) = receiver.try_recv() {
                 match notif {
                     CompactionNotification::Compacted { evicted_paths: paths } => {
@@ -659,7 +667,7 @@ impl LsmEngine {
 
         // Selectively remove only the evicted SST paths from the cache.
         if !evicted_paths.is_empty() {
-            let mut cache = self.sst_cache.lock().unwrap();
+            let mut cache = self.sst_cache.lock();
             for path in &evicted_paths {
                 cache.remove(path);
             }
@@ -676,7 +684,7 @@ impl LsmEngine {
         self.drain_compaction_notifications();
 
         let _ = self.compaction_sender.send(CompactionMsg::FlushAndNotify);
-        let receiver = self.compaction_notif_receiver.lock().unwrap();
+        let receiver = self.compaction_notif_receiver.lock();
         let mut evicted_paths: Vec<PathBuf> = Vec::new();
         loop {
             match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
@@ -693,7 +701,7 @@ impl LsmEngine {
         }
         drop(receiver);
         if !evicted_paths.is_empty() {
-            let mut cache = self.sst_cache.lock().unwrap();
+            let mut cache = self.sst_cache.lock();
             for path in &evicted_paths {
                 cache.remove(path);
             }
@@ -722,9 +730,9 @@ impl LsmEngine {
         // Atomically replace the old WAL
         fs::rename(&tmp_path, &wal_path)?;
 
+        // The file handle still points to the same inode after rename,
+        // so new_wal is valid at the final path. No need to re-open.
         ws.wal = new_wal;
-        // Re-open at the final path (rename doesn't update the file handle's path)
-        ws.wal = Wal::open(&wal_path)?;
 
         Ok(())
     }
@@ -852,7 +860,7 @@ impl LsmEngine {
         // ── Phase 1: Take writes, assign sequence numbers, read old values ──
         // Snapshot SST cache BEFORE acquiring write_state lock to avoid nested lock deadlock.
         let sst_cache_snapshot: HashMap<PathBuf, Arc<SsTable>> = {
-            let cache = self.sst_cache.lock().unwrap();
+            let cache = self.sst_cache.lock();
             cache.clone()
         };
 
@@ -1045,21 +1053,25 @@ impl LsmEngine {
     /// 2. Check MemTable (with snapshot visibility)
     /// 3. Check SSTables (with snapshot visibility)
     pub fn txn_get(&self, txn_id: SeqNo, key: &[u8]) -> Result<Option<Value>> {
-        // 1. Check transaction's own write buffer
-        {
+        // Atomically check write buffer and construct visibility snapshot
+        let (buffer_result, vis) = {
             let ws = self.write_state.read();
-            if let Some(txn) = ws.txn_manager.get(txn_id) {
-                if let Some(op) = txn.write_buffer_get(key) {
-                    return match op {
-                        WriteOp::Put(v) => Ok(Some(v.clone())),
-                        WriteOp::Delete => Ok(None),
-                    };
-                }
-            }
+            let buffer_result = ws.txn_manager.get(txn_id).and_then(|txn| {
+                txn.write_buffer_get(key).map(|op| match op {
+                    WriteOp::Put(v) => Some(v.clone()),
+                    WriteOp::Delete => None,
+                })
+            });
+            let vis = ws.txn_manager.visibility_for(txn_id);
+            (buffer_result, vis)
+        };
+
+        // 1. Check transaction's own write buffer
+        if let Some(result) = buffer_result {
+            return Ok(result);
         }
 
         // 2-3. Read from storage with snapshot visibility
-        let vis = self.write_state.read().txn_manager.visibility_for(txn_id);
         self.get_with_visibility(key, &vis)
     }
 
@@ -1079,27 +1091,28 @@ impl LsmEngine {
         };
 
         // Get base results from storage with visibility filtering
-        let mut results = self.scan_prefix_with_visibility(prefix, &vis)?;
+        let base_results = self.scan_prefix_with_visibility(prefix, &vis)?;
+
+        // Use HashMap for O(1) lookups during write buffer overlay
+        let mut results_map: std::collections::HashMap<Vec<u8>, Vec<u8>> = 
+            base_results.into_iter().collect();
 
         // Overlay the transaction's own write buffer
         for (key, op) in &write_buffer {
             if key.starts_with(prefix) {
                 match op {
                     WriteOp::Put(value) => {
-                        if let Some(existing) = results.iter_mut().find(|(k, _)| k == key) {
-                            existing.1 = value.clone();
-                        } else {
-                            results.push((key.clone(), value.clone()));
-                        }
+                        results_map.insert(key.clone(), value.clone());
                     }
                     WriteOp::Delete => {
-                        results.retain(|(k, _)| k != key);
+                        results_map.remove(key);
                     }
                 }
             }
         }
 
-        // Sort by key
+        // Convert to sorted Vec
+        let mut results: Vec<(Vec<u8>, Vec<u8>)> = results_map.into_iter().collect();
         results.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(results)
     }
@@ -1136,7 +1149,7 @@ impl LsmEngine {
 
         // Check SSTables (newest to oldest)
         let candidates: Vec<PathBuf> = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock();
             let mut cands = Vec::new();
             for level in levels.iter() {
                 for sst_info in level.iter().rev() {
@@ -1151,7 +1164,7 @@ impl LsmEngine {
 
         // Snapshot SST handles from cache (brief lock)
         let sst_handles: Vec<Arc<SsTable>> = {
-            let mut cache = self.sst_cache.lock().unwrap();
+            let mut cache = self.sst_cache.lock();
             let mut handles = Vec::with_capacity(candidates.len());
             for path in &candidates {
                 if let Some(sst) = cache.get(path) {
@@ -1333,8 +1346,14 @@ impl LsmEngine {
             let seq = self.next_seq();
             let del_entry = Entry::delete(meta_key.clone(), seq);
             let mut ws = self.write_state.write();
-            let _ = ws.wal.append(&del_entry);
-            let _ = ws.wal.flush_buf();
+            if let Err(e) = ws.wal.append(&del_entry) {
+                tracing::error!("Failed to write WAL entry for vector index drop: {}", e);
+                return false;
+            }
+            if let Err(e) = ws.wal.flush_buf() {
+                tracing::error!("Failed to flush WAL for vector index drop: {}", e);
+                return false;
+            }
             ws.memtable.delete_with_seq(meta_key, seq);
         }
         removed
@@ -1353,7 +1372,7 @@ impl LsmEngine {
     /// Returns engine statistics.
     pub fn stats(&self) -> EngineStats {
         let ws = self.write_state.read();
-        let levels = self.levels.lock().unwrap();
+        let levels = self.levels.lock();
         let total_sstables: usize = levels.iter().map(|l| l.len()).sum();
         let total_sst_size: u64 = levels
             .iter()
@@ -1405,7 +1424,7 @@ impl LsmEngine {
         };
 
         // Step 4: Copy SSTable files
-        let levels = self.levels.lock().unwrap();
+        let levels = self.levels.lock();
         let mut sst_paths: Vec<PathBuf> = Vec::new();
         for level in levels.iter() {
             for info in level.iter() {
@@ -1547,7 +1566,7 @@ impl LsmEngine {
         };
 
         // Copy only SSTables modified since the last backup
-        let levels = self.levels.lock().unwrap();
+        let levels = self.levels.lock();
         let mut sst_paths: Vec<PathBuf> = Vec::new();
         for level in levels.iter() {
             for info in level.iter() {

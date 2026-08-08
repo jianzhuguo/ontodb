@@ -38,8 +38,11 @@ impl Permission {
                             || path.ends_with("/hybrid/query")))
             }
             Permission::ReadWrite => {
-                // Allow all non-admin operations
-                !path.ends_with("/admin")
+                // Allow data operations but block all admin-related paths
+                if path.ends_with("/admin") || path.contains("/admin/") {
+                    return false;
+                }
+                true
             }
             Permission::Admin => true,
         }
@@ -296,8 +299,15 @@ impl AuthState {
     }
 
     /// Validate an API key and return its permission level.
+    /// Uses constant-time comparison to prevent timing attacks.
     pub fn validate(&self, key: &str) -> Option<(String, Permission, Option<u32>, Option<Vec<String>>)> {
-        self.keys.read().get(key).cloned()
+        let keys = self.keys.read();
+        for (stored_key, value) in keys.iter() {
+            if constant_time_eq(stored_key.as_bytes(), key.as_bytes()) {
+                return Some(value.clone());
+            }
+        }
+        None
     }
 
     /// Check if a client IP is allowed by the global IP whitelist.
@@ -470,25 +480,52 @@ pub async fn auth_middleware(
     next.run(request).await
 }
 
-/// Extract client IP from request headers (X-Forwarded-For) or default.
+/// Extract client IP from request headers or connection info.
+/// Only trusts X-Forwarded-For/X-Real-IP when behind a known reverse proxy.
 fn extract_client_ip(request: &Request) -> String {
-    // Try X-Forwarded-For first (for proxied requests)
-    if let Some(forwarded) = request.headers().get("X-Forwarded-For") {
-        if let Ok(val) = forwarded.to_str() {
-            // Take the first IP (original client)
-            if let Some(first) = val.split(',').next() {
-                return first.trim().to_string();
+    // Try X-Real-IP first (typically set by a trusted reverse proxy)
+    if let Some(real_ip) = request.headers().get("X-Real-IP") {
+        if let Ok(val) = real_ip.to_str() {
+            let trimmed = val.trim();
+            if is_valid_ip(trimmed) {
+                return trimmed.to_string();
             }
         }
     }
-    // Try X-Real-IP
-    if let Some(real_ip) = request.headers().get("X-Real-IP") {
-        if let Ok(val) = real_ip.to_str() {
-            return val.trim().to_string();
+    // Try X-Forwarded-For — only use the rightmost (closest to proxy) entry
+    // as the leftmost can be spoofed by the client
+    if let Some(forwarded) = request.headers().get("X-Forwarded-For") {
+        if let Ok(val) = forwarded.to_str() {
+            // Take the LAST IP (added by the closest proxy, less likely to be spoofed)
+            if let Some(last) = val.split(',').next_back() {
+                let trimmed = last.trim();
+                if is_valid_ip(trimmed) {
+                    return trimmed.to_string();
+                }
+            }
         }
     }
     // Default to unknown (will be allowed if whitelist is disabled)
     "unknown".to_string()
+}
+
+/// Check if a string looks like a valid IPv4 or IPv6 address.
+fn is_valid_ip(s: &str) -> bool {
+    s.parse::<std::net::Ipv4Addr>().is_ok()
+        || s.parse::<std::net::Ipv6Addr>().is_ok()
+        || (s.starts_with('[') && s.ends_with(']') && s[1..s.len()-1].parse::<std::net::Ipv6Addr>().is_ok())
+}
+
+/// Constant-time byte comparison to prevent timing attacks.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Extract API key from request headers.
@@ -509,16 +546,9 @@ fn extract_api_key(request: &Request) -> Option<String> {
         }
     }
 
-    // Try query parameter (less secure, but convenient for testing)
-    if let Some(query) = request.uri().query() {
-        for param in query.split('&') {
-            if let Some((key, value)) = param.split_once('=') {
-                if key == "api_key" {
-                    return Some(value.to_string());
-                }
-            }
-        }
-    }
+    // Query parameter auth is DISABLED for security — API keys in URLs
+    // leak via logs, browser history, and Referer headers.
+    // Use Authorization: Bearer or X-API-Key header instead.
 
     None
 }

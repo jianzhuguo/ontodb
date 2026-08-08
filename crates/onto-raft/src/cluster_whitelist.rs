@@ -135,8 +135,19 @@ impl ClusterWhitelistManager {
 
             for (_, addr) in new_nodes {
                 // Extract IP from "ip:port" format
-                let ip = addr.split(':').next().unwrap_or(addr);
-                let ip_cidr = format!("{}/32", ip);
+                // IPv6 addresses are in brackets: "[::1]:9000"
+                let ip = if addr.starts_with('[') {
+                    // IPv6: extract from "[ip]:port"
+                    addr.split(']').next()
+                        .map(|s| &s[1..])
+                        .unwrap_or(addr)
+                } else {
+                    // IPv4: extract from "ip:port"
+                    addr.split(':').next().unwrap_or(addr)
+                };
+                // Use /128 for IPv6, /32 for IPv4
+                let prefix_len = if ip.contains(':') { 128 } else { 32 };
+                let ip_cidr = format!("{}/{}", ip, prefix_len);
 
                 // Check if already present (exact or CIDR match)
                 let already_present = ips.iter().any(|existing| {
@@ -171,7 +182,7 @@ impl ClusterWhitelistManager {
 
         // Get current node's config hash
         let local_config = self.config_store.get_json();
-        let local_hash = format!("{:x}", md5_hash(&local_config));
+        let local_hash = format!("{:x}", config_hash(&local_config));
         let local_config: serde_json::Value = serde_json::from_slice(&local_config).unwrap_or_default();
         let local_ips = extract_all_ips(&local_config);
 
@@ -231,12 +242,13 @@ impl ClusterWhitelistManager {
     }
 
     /// Check if a node is reachable via TCP.
+    /// NOTE: Currently compares local config only. In production, this should
+    /// fetch the remote node's config via an HTTP/RPC health endpoint.
     async fn check_node(&self, addr: &str) -> (bool, String, HashSet<String>) {
         let reachable = check_tcp_reachable(addr).await;
-        // For config hash, we compare local config only (remote fetch requires HTTP client)
-        // In production, this would use the Raft network or a dedicated health endpoint
+        // TODO: Fetch remote node's config via HTTP health endpoint for real comparison
         let local_config = self.config_store.get_json();
-        let hash = format!("{:x}", md5_hash(&local_config));
+        let hash = format!("{:x}", config_hash(&local_config));
         let ips = extract_all_ips(&serde_json::from_slice(&local_config).unwrap_or_default());
         (reachable, hash, ips)
     }
@@ -255,7 +267,7 @@ impl ClusterWhitelistManager {
     pub fn validate_cluster_whitelist(&self) -> ValidationResult {
         let nodes = self.nodes.read().clone();
         let local_config = self.config_store.get_json();
-        let local_hash = format!("{:x}", md5_hash(&local_config));
+        let local_hash = format!("{:x}", config_hash(&local_config));
         let local_config_val: serde_json::Value = serde_json::from_slice(&local_config).unwrap_or_default();
         let local_ips = extract_all_ips(&local_config_val);
 
@@ -370,13 +382,14 @@ fn parse_ipv4(ip: &str) -> Option<u32> {
     Some(result)
 }
 
-/// Simple MD5 hash (using std hash, not cryptographic).
-fn md5_hash(data: &[u8]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    hasher.finish()
+/// Deterministic config hash using FNV-1a (consistent across processes).
+fn config_hash(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+    for byte in data {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+    }
+    hash
 }
 
 /// Simple TCP connectivity check.

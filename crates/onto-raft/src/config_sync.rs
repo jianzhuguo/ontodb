@@ -54,16 +54,13 @@ impl SharedConfigStore {
     }
 
     /// Apply a new config (from Raft replication or local change).
-    /// Writes to disk and notifies all listeners.
+    /// Writes to disk first, then updates in-memory and notifies listeners.
     pub fn apply(&self, config_json: &[u8]) -> Result<(), String> {
         // Validate JSON
         serde_json::from_slice::<serde_json::Value>(config_json)
             .map_err(|e| format!("invalid config JSON: {}", e))?;
 
-        // Update in-memory
-        *self.config_json.write() = config_json.to_vec();
-
-        // Persist to disk
+        // Persist to disk first (fail-fast before updating in-memory state)
         if let Some(ref path) = self.file_path {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -71,6 +68,9 @@ impl SharedConfigStore {
             std::fs::write(path, config_json)
                 .map_err(|e| format!("failed to write config: {}", e))?;
         }
+
+        // Update in-memory (only after successful disk write)
+        *self.config_json.write() = config_json.to_vec();
 
         // Notify listeners
         for cb in self.on_change.read().iter() {

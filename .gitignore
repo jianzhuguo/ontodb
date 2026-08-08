@@ -29,3 +29,8 @@ config/api_keys.json
 *.pem
 *.key
 *.crt
+
+# Alertmanager config (contains SMTP credentials)
+deploy/monitoring/alertmanager.yml
+deploy/monitoring/.env.alerting
+deploy/monitoring/alertmanager.yml.template

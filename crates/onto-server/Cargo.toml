@@ -37,6 +37,10 @@ tokio-rustls = "0.26"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 # Certificate generation
 rcgen = "0.13"
+# X.509 certificate parsing
+x509-parser = "0.16"
+# Cryptographic hashing (audit integrity chain)
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }

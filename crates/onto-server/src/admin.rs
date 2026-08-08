@@ -120,8 +120,11 @@ pub async fn add_key(
     // Validate IPs if provided
     if let Some(ref ips) = req.allowed_ips {
         for ip in ips {
-            if !crate::auth::ip_matches("127.0.0.1", ip) && !ip.contains('/') && ip.parse::<std::net::Ipv4Addr>().is_err() {
-                // Basic validation 鈥?not a valid IP or CIDR
+            if !is_valid_ip_or_cidr(ip) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"success": false, "error": format!("invalid IP or CIDR: '{}'", ip)})),
+                );
             }
         }
     }
@@ -257,6 +260,10 @@ pub async fn add_ips(
         Some(k) => k,
         None => return (StatusCode::NOT_FOUND, Json(json!({"success": false, "error": "key not found"}))),
     };
+
+    if !is_valid_ip_or_cidr(&req.ip) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"success": false, "error": "invalid IP or CIDR format"})));
+    }
 
     let ips = key.allowed_ips.get_or_insert_with(Vec::new);
     if ips.contains(&req.ip) {
@@ -410,6 +417,22 @@ fn apply_config_to_state(state: &AdminState, config: &AuthConfig) {
     }
     // Access the auth state's internal RwLock
     state.auth.reload();
+}
+
+/// Validate that a string is a valid IPv4/IPv6 address or CIDR notation.
+fn is_valid_ip_or_cidr(s: &str) -> bool {
+    if let Some((ip, prefix)) = s.split_once('/') {
+        // CIDR notation: validate IP and prefix length
+        if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+            return prefix.parse::<u32>().map_or(false, |p| p <= 32);
+        }
+        if ip.parse::<std::net::Ipv6Addr>().is_ok() {
+            return prefix.parse::<u32>().map_or(false, |p| p <= 128);
+        }
+        return false;
+    }
+    // Plain IP address
+    s.parse::<std::net::Ipv4Addr>().is_ok() || s.parse::<std::net::Ipv6Addr>().is_ok()
 }
 
 fn parse_permission(s: &str) -> Option<Permission> {

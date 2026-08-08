@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
+use parking_lot::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -128,7 +129,7 @@ impl CompactionWorker {
                     // Keep compacting until no more is needed
                     loop {
                         let score = {
-                            let levels = self.levels.lock().unwrap();
+                            let levels = self.levels.lock();
                             let mut best = 0.0f64;
                             for level in 0..levels.len() - 1 {
                                 let s = self.compaction_score(&levels, level);
@@ -177,7 +178,7 @@ impl CompactionWorker {
 
         // Find the level with the highest compaction score
         let (best_level, best_score) = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock();
             let mut best_level = None;
             let mut best_score = 0.0f64;
 
@@ -235,7 +236,7 @@ impl CompactionWorker {
     fn compact_level(&mut self, level: usize) -> Result<()> {
         // Step 1: Snapshot SSTables to compact (don't remove from levels yet)
         let (ssts_to_compact, compact_min, compact_max) = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock();
             if level >= levels.len() - 1 {
                 return Ok(());
             }
@@ -273,7 +274,7 @@ impl CompactionWorker {
         // Step 2: Find overlapping SSTables in level N+1 (snapshot, don't remove)
         let next_level = level + 1;
         let next_level_ssts: Vec<SsTableInfo> = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock();
             levels[next_level]
                 .iter()
                 .filter(|sst_info| {
@@ -325,7 +326,7 @@ impl CompactionWorker {
         // Step 5: Deduplicate + tombstone cleanup
         // Snapshot levels once to avoid per-entry lock acquisition in the loop
         let (deepest_level, levels_snapshot) = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock();
             (levels.len() - 1, levels.clone())
         };
 
@@ -407,23 +408,9 @@ impl CompactionWorker {
             });
         }
 
-        // Step 7: Collect evicted paths for notification and deferred deletion
-        let mut evicted_paths = Vec::new();
-        for sst_info in &ssts_to_compact {
-            self.sst_cache.remove(&sst_info.path);
-            evicted_paths.push(sst_info.path.clone());
-            self.pending_deletions.push(sst_info.path.clone());
-        }
-        for sst_info in &next_level_ssts {
-            self.sst_cache.remove(&sst_info.path);
-            evicted_paths.push(sst_info.path.clone());
-            self.pending_deletions.push(sst_info.path.clone());
-        }
-
-        // Step 8: Atomically update shared levels under lock
-        // Remove old SSTables and add new ones in a single critical section
-        {
-            let mut levels = self.levels.lock().unwrap();
+        // Step 7+8: Atomically update levels, evict cache, and schedule deletions under lock
+        let evicted_paths = {
+            let mut levels = self.levels.lock();
 
             // Remove compacted SSTables from current level
             let compact_paths: std::collections::HashSet<PathBuf> =
@@ -438,7 +425,21 @@ impl CompactionWorker {
             // Add new merged SSTables
             levels[next_level].extend(new_ssts);
             levels[next_level].sort_by(|a, b| a.min_key.cmp(&b.min_key));
-        }
+
+            // Evict cache entries and schedule deletions inside the same critical section
+            let mut evicted = Vec::new();
+            for sst_info in &ssts_to_compact {
+                self.sst_cache.remove(&sst_info.path);
+                evicted.push(sst_info.path.clone());
+                self.pending_deletions.push(sst_info.path.clone());
+            }
+            for sst_info in &next_level_ssts {
+                self.sst_cache.remove(&sst_info.path);
+                evicted.push(sst_info.path.clone());
+                self.pending_deletions.push(sst_info.path.clone());
+            }
+            evicted
+        };
 
         // Notify the engine about evicted SSTable paths for cache invalidation
         if let Some(ref sender) = self.notif_sender {

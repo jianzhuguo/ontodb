@@ -370,8 +370,58 @@ impl DiskPage {
 
     // ── Entry removal ────────────────────────────────────────────
 
+    /// Defragments the page by compacting the data region.
+    /// Reclaims fragmented space left by removed entries.
+    /// Safe to call after any sequence of insert/remove operations.
+    pub fn defrag(&mut self) {
+        let header = match self.header() {
+            Some(h) => h,
+            None => return,
+        };
+        if header.num_entries == 0 {
+            // Reset data_start to page end
+            let mut h = header;
+            h.data_start = PAGE_SIZE as u16;
+            h.free_size = (PAGE_SIZE - HEADER_SIZE) as u16;
+            self.set_header(&h);
+            return;
+        }
+
+        // Collect all live entries and their slot metadata
+        let num = header.num_entries;
+        let mut entries: Vec<(Vec<u8>, u16)> = Vec::with_capacity(num as usize);
+        for i in 0..num {
+            if let (Some(entry_data), Some((_, key_len))) =
+                (self.entry_data(i), self.read_slot(i))
+            {
+                entries.push((entry_data.to_vec(), key_len));
+            }
+        }
+
+        // Rewrite entries contiguously from the end of the page
+        let mut write_pos = PAGE_SIZE;
+        for (entry_data, key_len) in entries.iter().rev() {
+            write_pos -= entry_data.len();
+            self.data[write_pos..write_pos + entry_data.len()].copy_from_slice(entry_data);
+        }
+
+        // Update slots to point to new positions
+        let mut pos = write_pos;
+        for (i, (entry_data, key_len)) in entries.iter().enumerate() {
+            self.write_slot(i as u16, pos as u16, *key_len);
+            pos += entry_data.len();
+        }
+
+        // Update header
+        let mut h = header;
+        h.data_start = write_pos as u16;
+        let used = HEADER_SIZE + (num as usize) * SLOT_SIZE + (PAGE_SIZE - write_pos);
+        h.free_size = (PAGE_SIZE - used) as u16;
+        self.set_header(&h);
+    }
+
     /// Removes the entry at slot position `slot_pos`.
-    /// Does NOT reclaim space (defrag needed later). Shifts slots left.
+    /// Shifts slots left. Auto-defrags when fragmentation exceeds 25% of usable space.
     pub fn remove_entry(&mut self, slot_pos: u16) -> Result<()> {
         let mut header = self.header().ok_or_else(|| {
             onto_core::CoreError::Corruption("invalid page header".into())
@@ -381,8 +431,11 @@ impl DiskPage {
             return Err(onto_core::CoreError::InvalidArgument("slot out of bounds".into()));
         }
 
-        // Read the entry from the slot
+        // Read the entry from the slot and compute its size before shifting
         let (_entry_offset, _key_len) = self.read_slot(slot_pos).unwrap();
+        let entry_size = self.entry_data(slot_pos)
+            .map(|d| d.len())
+            .unwrap_or(0);
 
         // Shift slots left
         let num = header.num_entries;
@@ -392,8 +445,14 @@ impl DiskPage {
         }
 
         header.num_entries -= 1;
-        // Note: we don't reclaim data space immediately (would need compaction)
+        header.free_size = header.free_size.saturating_add((entry_size + SLOT_SIZE) as u16);
         self.set_header(&header);
+
+        // Auto-defrag when fragmented space exceeds 25% of usable page capacity
+        let usable = (PAGE_SIZE - HEADER_SIZE) as u16;
+        if header.free_size > usable / 4 && header.num_entries > 0 {
+            self.defrag();
+        }
 
         Ok(())
     }
@@ -634,6 +693,9 @@ pub struct IndexMeta {
 }
 
 impl IndexMeta {
+    /// Maximum length for class and column names (stored as u8, max 255 bytes).
+    const MAX_NAME_LEN: usize = 255;
+
     /// Encodes metadata into a 4KB page buffer.
     pub fn encode(&self, buf: &mut [u8; PAGE_SIZE]) {
         buf[0..4].copy_from_slice(INDEX_MAGIC);
@@ -644,14 +706,19 @@ impl IndexMeta {
 
         let class_bytes = self.class.as_bytes();
         let column_bytes = self.column.as_bytes();
-        buf[20] = class_bytes.len() as u8;
-        buf[21..21 + class_bytes.len()].copy_from_slice(class_bytes);
-        let col_offset = 21 + class_bytes.len();
-        buf[col_offset] = column_bytes.len() as u8;
-        buf[col_offset + 1..col_offset + 1 + column_bytes.len()].copy_from_slice(column_bytes);
+        
+        // Validate name lengths to prevent silent truncation
+        let class_len = class_bytes.len().min(Self::MAX_NAME_LEN);
+        let col_len = column_bytes.len().min(Self::MAX_NAME_LEN);
+        
+        buf[20] = class_len as u8;
+        buf[21..21 + class_len].copy_from_slice(&class_bytes[..class_len]);
+        let col_offset = 21 + class_len;
+        buf[col_offset] = col_len as u8;
+        buf[col_offset + 1..col_offset + 1 + col_len].copy_from_slice(&column_bytes[..col_len]);
 
         // Zero the rest
-        let end = col_offset + 1 + column_bytes.len();
+        let end = col_offset + 1 + col_len;
         if end < PAGE_SIZE {
             buf[end..].fill(0);
         }
@@ -750,7 +817,16 @@ impl BufferPool {
             let offset = (page_id as u64) * (PAGE_SIZE as u64);
             // Try to read; if beyond file end, use blank page
             if file.seek(SeekFrom::Start(offset)).is_ok() {
-                let _ = file.read_exact(&mut data); // ignore EOF for sparse files
+                match file.read_exact(&mut data) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        // Beyond file end — blank page is expected for sparse files
+                    }
+                    Err(e) => {
+                        // Real I/O error — log but don't crash; page will be zeros
+                        tracing::error!("I/O error reading page {}: {}", page_id, e);
+                    }
+                }
             }
 
             if self.cache.len() >= self.capacity {

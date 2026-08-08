@@ -769,14 +769,6 @@ curl -X POST http://127.0.0.1:7912/api/query \
   -d '{"query": "SELECT * FROM Product"}'
 ```
 
-#### 3. Query Parameter (Less Secure)
-
-```bash
-curl -X POST "http://127.0.0.1:7912/api/query?api_key=your-secret-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "SELECT * FROM Product"}'
-```
-
 ### Authentication Errors
 
 ```json
