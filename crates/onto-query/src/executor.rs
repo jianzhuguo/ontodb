@@ -381,6 +381,248 @@ impl QueryExecutor {
         self
     }
 
+    /// Get the graph store reference (if configured).
+    pub fn graph_store(&self) -> Option<&Arc<onto_graph::GraphStore>> {
+        self.graph.as_ref()
+    }
+
+    /// Get the triple store reference (if configured).
+    pub fn triple_store(&self) -> Option<&Arc<onto_ontology::TripleStore>> {
+        self.triple_store.as_ref()
+    }
+
+    // ── Query Fusion: Vector + Graph + Relational ──
+
+    /// Enrich vector search results with graph neighbors.
+    ///
+    /// For each vector search result, also returns the graph neighbors
+    /// (related entities) with their relational attributes.
+    pub fn vector_search_with_neighbors(
+        &self,
+        class: &str,
+        column: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        edge_label: Option<&str>,
+        _max_depth: usize,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let results = self.plan_vector_search(&self.engine, class, column, query_vector, top_k, &None)?;
+
+        let Some(ref graph) = self.graph else {
+            return Ok(results); // No graph store, return vector results only
+        };
+
+        let mut enriched = Vec::new();
+        for mut row in results {
+            // Get entity ID from the row
+            if let Some(pk) = row.get("__pk__").and_then(|v| v.as_str()) {
+                let entity_id = onto_core::EntityId::new(class, pk);
+
+                // Get graph neighbors
+                let neighbors = graph.get_entity_neighbors(
+                    &entity_id,
+                    onto_graph::Direction::Out,
+                    edge_label,
+                );
+
+                // Fetch relational attributes for each neighbor
+                let mut neighbor_data = Vec::new();
+                for neighbor_id in &neighbors {
+                    if let Ok(Some(val_bytes)) = self.engine.get(&neighbor_id.to_lsm_key()) {
+                        if let Some(doc) = storage_bytes_to_doc(&val_bytes) {
+                            neighbor_data.push(serde_json::json!({
+                                "entity": neighbor_id.to_string(),
+                                "class": neighbor_id.class(),
+                                "properties": doc,
+                            }));
+                        }
+                    }
+                }
+
+                row.insert("_neighbors".to_string(), serde_json::json!(neighbor_data));
+                row.insert("_neighbor_count".to_string(), serde_json::json!(neighbors.len()));
+            }
+            enriched.push(row);
+        }
+
+        Ok(enriched)
+    }
+
+    /// Enrich graph traversal results with relational attributes.
+    ///
+    /// Starting from an entity, traverses the graph and returns all visited
+    /// entities with their full relational attributes.
+    pub fn graph_traverse_with_attributes(
+        &self,
+        start_class: &str,
+        start_pk: &str,
+        direction: onto_graph::Direction,
+        edge_label: Option<&str>,
+        _max_depth: usize,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let Some(ref graph) = self.graph else {
+            return Ok(Vec::new());
+        };
+
+        let start_id = onto_core::EntityId::new(start_class, start_pk);
+        let neighbors = graph.get_entity_neighbors(&start_id, direction, edge_label);
+
+        let mut results = Vec::new();
+
+        // Add the start entity itself
+        if let Ok(Some(val_bytes)) = self.engine.get(&start_id.to_lsm_key()) {
+            if let Some(mut doc) = storage_bytes_to_doc(&val_bytes) {
+                doc.insert("_depth".to_string(), serde_json::json!(0));
+                doc.insert("_entity".to_string(), serde_json::json!(start_id.to_string()));
+                results.push(doc);
+            }
+        }
+
+        // Add neighbors with their attributes
+        for neighbor_id in &neighbors {
+            if let Ok(Some(val_bytes)) = self.engine.get(&neighbor_id.to_lsm_key()) {
+                if let Some(mut doc) = storage_bytes_to_doc(&val_bytes) {
+                    doc.insert("_depth".to_string(), serde_json::json!(1));
+                    doc.insert("_entity".to_string(), serde_json::json!(neighbor_id.to_string()));
+                    results.push(doc);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Hybrid query: vector search + graph traversal + relational filtering.
+    ///
+    /// 1. Vector search to find similar entities
+    /// 2. For each result, traverse graph to find related entities
+    /// 3. Apply relational filter to all entities
+    /// 4. Return unified results
+    pub fn hybrid_vector_graph_query(
+        &self,
+        class: &str,
+        vector_column: &str,
+        query_vector: &[f32],
+        top_k: usize,
+        graph_edge_label: Option<&str>,
+        graph_depth: usize,
+        relational_filter: Option<&FilterExpr>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        // Step 1: Vector search
+        let vector_results = self.plan_vector_search(
+            &self.engine, class, vector_column, query_vector, top_k, &None,
+        )?;
+
+        let Some(ref graph) = self.graph else {
+            return Ok(vector_results);
+        };
+
+        let mut all_entities: Vec<(String, Map<String, Value>)> = Vec::new();
+
+        // Step 2: For each vector result, get graph neighbors
+        for row in &vector_results {
+            if let Some(pk) = row.get("__pk__").and_then(|v| v.as_str()) {
+                let entity_id = onto_core::EntityId::new(class, pk);
+                all_entities.push((entity_id.to_string(), row.clone()));
+
+                if graph_depth > 0 {
+                    let neighbors = graph.get_entity_neighbors(
+                        &entity_id,
+                        onto_graph::Direction::Out,
+                        graph_edge_label,
+                    );
+
+                    for neighbor_id in &neighbors {
+                        if let Ok(Some(val_bytes)) = self.engine.get(&neighbor_id.to_lsm_key()) {
+                            if let Some(mut doc) = storage_bytes_to_doc(&val_bytes) {
+                                doc.insert("_source_entity".to_string(), serde_json::json!(entity_id.to_string()));
+                                doc.insert("_relation".to_string(), serde_json::json!(graph_edge_label.unwrap_or("related")));
+                                all_entities.push((neighbor_id.to_string(), doc));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step 3: Apply relational filter if provided
+        let filtered: Vec<Map<String, Value>> = if let Some(filter) = relational_filter {
+            all_entities.into_iter()
+                .filter(|(_, doc)| self.eval_filter(&self.engine, doc, filter))
+                .map(|(_, doc)| doc)
+                .collect()
+        } else {
+            all_entities.into_iter().map(|(_, doc)| doc).collect()
+        };
+
+        Ok(filtered)
+    }
+
+    /// Query triple store and return results as rows.
+    ///
+    /// Supports SPO, POS, OSP query patterns based on which components are provided.
+    pub fn query_triples(
+        &self,
+        subject: Option<&str>,
+        predicate: Option<&str>,
+        object: Option<&str>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let Some(ref triple_store) = self.triple_store else {
+            return Ok(Vec::new());
+        };
+
+        let triples = match (subject, predicate, object) {
+            (Some(s), Some(p), Some(o)) => {
+                // Check existence
+                if triple_store.contains(s, p, o).unwrap_or(false) {
+                    vec![onto_ontology::triple_store::Triple::new(s, p, o)]
+                } else {
+                    vec![]
+                }
+            }
+            (Some(s), Some(p), None) => {
+                // SPO query
+                let objects = triple_store.lookup_spo(s, p).unwrap_or_default();
+                objects.into_iter().map(|o| onto_ontology::triple_store::Triple::new(s, p, o)).collect()
+            }
+            (Some(s), None, None) => {
+                // S query
+                let pairs = triple_store.lookup_s(s).unwrap_or_default();
+                pairs.into_iter().map(|(p, o)| onto_ontology::triple_store::Triple::new(s, p, o)).collect()
+            }
+            (None, Some(p), Some(o)) => {
+                // POS query
+                let subjects = triple_store.lookup_pos(p, o).unwrap_or_default();
+                subjects.into_iter().map(|s| onto_ontology::triple_store::Triple::new(s, p, o)).collect()
+            }
+            (None, Some(p), None) => {
+                // P query
+                let pairs = triple_store.lookup_p(p).unwrap_or_default();
+                pairs.into_iter().map(|(s, o)| onto_ontology::triple_store::Triple::new(s, p, o)).collect()
+            }
+            (None, None, Some(o)) => {
+                // O query
+                let pairs = triple_store.lookup_o(o).unwrap_or_default();
+                pairs.into_iter().map(|(s, p)| onto_ontology::triple_store::Triple::new(s, p, o)).collect()
+            }
+            _ => {
+                // Get all triples
+                triple_store.get_all_triples().unwrap_or_default()
+            }
+        };
+
+        // Convert to rows
+        let rows: Vec<Map<String, Value>> = triples.into_iter().map(|t| {
+            let mut row = Map::new();
+            row.insert("subject".to_string(), serde_json::json!(t.subject));
+            row.insert("predicate".to_string(), serde_json::json!(t.predicate));
+            row.insert("object".to_string(), serde_json::json!(t.object));
+            row
+        }).collect();
+
+        Ok(rows)
+    }
+
     /// Get runtime execution statistics.
     pub fn runtime_stats(&self) -> RuntimeStats {
         self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner()).clone()
