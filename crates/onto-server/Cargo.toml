@@ -28,6 +28,7 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 bytes = "1"
 futures = "0.3"
+parking_lot = "0.12"
 
 [dev-dependencies]
 tempfile = { workspace = true }

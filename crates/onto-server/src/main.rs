@@ -163,7 +163,7 @@ fn main() -> Result<()> {
         if has_http {
             rt.block_on(async {
                 let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), onto_core::CoreError>> + Send>>> = vec![
-                    Box::pin(run_http_server(&http_addr, executor.clone(), auth_config, rate_limit_config, metrics.clone(), audit_config, args.raft_node_id)),
+                    Box::pin(run_http_server(&http_addr, executor.clone(), auth_config, rate_limit_config, metrics.clone(), audit_config, args.raft_node_id, args.api_keys_file.clone())),
                     Box::pin(run_tcp_server(&args.listen, executor.clone(), metrics.clone())),
                 ];
 
@@ -226,11 +226,20 @@ async fn run_http_server(
     metrics: Arc<metrics::Metrics>,
     audit_config: audit::AuditConfig,
     raft_node_id: Option<u64>,
+    api_keys_file: Option<PathBuf>,
 ) -> Result<()> {
     let graph = Arc::new(onto_graph::GraphStore::new());
     let audit = Arc::new(audit::AuditLogger::new(audit_config));
     let state = http::AppState { executor, metrics, graph, audit, raft_node_id };
     let auth_state = AuthState::new(&auth_config).with_metrics(state.metrics.clone());
+
+    // Enable hot-reload for auth config file (check every 10 seconds)
+    if let Some(ref api_keys_path) = api_keys_file {
+        let auth_state_for_reload = auth_state.clone().with_config_path(api_keys_path.clone());
+        auth_state_for_reload.start_reload_watcher(10);
+        eprintln!("Auth config hot-reload enabled (checking every 10s): {:?}", api_keys_path);
+    }
+
     let rate_limiter = RateLimiter::new(rate_limit_config.clone()).with_metrics(state.metrics.clone());
 
     // Spawn background task to clean up stale rate limit buckets every 5 minutes

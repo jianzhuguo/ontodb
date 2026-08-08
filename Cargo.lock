@@ -1159,6 +1159,7 @@ dependencies = [
  "onto-query",
  "onto-raft",
  "onto-storage",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",

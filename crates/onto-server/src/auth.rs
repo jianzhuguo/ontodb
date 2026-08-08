@@ -112,17 +112,22 @@ impl Default for IpWhitelistConfig {
     }
 }
 
-/// Shared authentication state.
+/// Shared authentication state with hot-reload support.
 #[derive(Clone)]
 pub struct AuthState {
     /// Map of API key -> (description, permission, rate_limit, allowed_ips)
-    keys: Arc<HashMap<String, (String, Permission, Option<u32>, Option<Vec<String>>)>>,
+    /// Wrapped in RwLock for hot-reload without server restart.
+    keys: Arc<parking_lot::RwLock<HashMap<String, (String, Permission, Option<u32>, Option<Vec<String>>)>>>,
     /// Whether auth is enabled.
     pub enabled: bool,
     /// Metrics counters for auth events.
     pub metrics: Option<crate::metrics::SharedMetrics>,
-    /// Global IP whitelist configuration.
-    pub ip_whitelist: IpWhitelistConfig,
+    /// Global IP whitelist configuration (hot-reloadable).
+    pub ip_whitelist: Arc<parking_lot::RwLock<IpWhitelistConfig>>,
+    /// Path to the config file for hot-reload.
+    config_path: Option<std::path::PathBuf>,
+    /// Last known modification time of the config file.
+    last_modified: Arc<parking_lot::RwLock<Option<std::time::SystemTime>>>,
 }
 
 impl AuthState {
@@ -141,17 +146,102 @@ impl AuthState {
             );
         }
         Self {
-            keys: Arc::new(keys),
+            keys: Arc::new(parking_lot::RwLock::new(keys)),
             enabled: config.enabled,
             metrics: None,
-            ip_whitelist: IpWhitelistConfig::default(),
+            ip_whitelist: Arc::new(parking_lot::RwLock::new(IpWhitelistConfig::default())),
+            config_path: None,
+            last_modified: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 
     /// Set IP whitelist configuration.
-    pub fn with_ip_whitelist(mut self, config: IpWhitelistConfig) -> Self {
-        self.ip_whitelist = config;
+    pub fn with_ip_whitelist(self, config: IpWhitelistConfig) -> Self {
+        *self.ip_whitelist.write() = config;
         self
+    }
+
+    /// Set the config file path for hot-reload.
+    pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
+        self.config_path = Some(path);
+        self
+    }
+
+    /// Reload configuration from disk. Returns true if config changed.
+    pub fn reload(&self) -> bool {
+        let path = match &self.config_path {
+            Some(p) => p.clone(),
+            None => return false,
+        };
+
+        // Check modification time
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        let mod_time = match meta.modified() {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+
+        // Skip if unchanged
+        {
+            let last = self.last_modified.read();
+            if let Some(prev) = *last {
+                if mod_time <= prev {
+                    return false;
+                }
+            }
+        }
+
+        // Read and parse config
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Auth reload failed to read {}: {}", path.display(), e);
+                return false;
+            }
+        };
+
+        let config: AuthConfig = match serde_json::from_str(&data) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Auth reload failed to parse {}: {}", path.display(), e);
+                return false;
+            }
+        };
+
+        // Update keys
+        let mut new_keys = HashMap::new();
+        for key_config in &config.keys {
+            new_keys.insert(
+                key_config.key.clone(),
+                (
+                    key_config.description.clone(),
+                    key_config.permission.clone(),
+                    key_config.rate_limit,
+                    key_config.allowed_ips.clone(),
+                ),
+            );
+        }
+
+        *self.keys.write() = new_keys;
+        *self.last_modified.write() = Some(mod_time);
+
+        eprintln!("Auth config reloaded from {} ({} keys)", path.display(), config.keys.len());
+        true
+    }
+
+    /// Start a background task that watches the config file for changes.
+    /// Checks every `interval` seconds. Returns a JoinHandle.
+    pub fn start_reload_watcher(self, interval_secs: u64) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            loop {
+                timer.tick().await;
+                self.reload();
+            }
+        })
     }
 
     /// Set metrics for auth event tracking.
@@ -162,54 +252,50 @@ impl AuthState {
 
     /// Validate an API key and return its permission level.
     pub fn validate(&self, key: &str) -> Option<(String, Permission, Option<u32>, Option<Vec<String>>)> {
-        self.keys.get(key).cloned()
+        self.keys.read().get(key).cloned()
     }
 
     /// Check if a client IP is allowed by the global IP whitelist.
     pub fn is_ip_allowed(&self, client_ip: &str) -> bool {
-        if !self.ip_whitelist.enabled {
-            return true; // whitelist disabled, allow all
-        }
-
-        // Check localhost bypass
-        if self.ip_whitelist.allow_localhost && (client_ip == "127.0.0.1" || client_ip == "::1" || client_ip.starts_with("127.")) {
+        let wl = self.ip_whitelist.read();
+        if !wl.enabled {
             return true;
         }
-
-        // Check global whitelist
-        if self.ip_whitelist.allowed_ips.is_empty() {
-            return true; // no IPs configured = allow all
+        if wl.allow_localhost && (client_ip == "127.0.0.1" || client_ip == "::1" || client_ip.starts_with("127.")) {
+            return true;
         }
-
-        for allowed in &self.ip_whitelist.allowed_ips {
+        if wl.allowed_ips.is_empty() {
+            return true;
+        }
+        for allowed in &wl.allowed_ips {
             if ip_matches(client_ip, allowed) {
                 return true;
             }
         }
-
         false
     }
 
     /// Check if a client IP is allowed for a specific API key.
     pub fn is_ip_allowed_for_key(&self, key: &str, client_ip: &str) -> bool {
-        if let Some((_, _, _, Some(ref allowed_ips))) = self.keys.get(key) {
+        let keys = self.keys.read();
+        if let Some((_, _, _, Some(ref allowed_ips))) = keys.get(key) {
             if allowed_ips.is_empty() {
-                return true; // empty list = no restriction
+                return true;
             }
             for allowed in allowed_ips {
                 if ip_matches(client_ip, allowed) {
                     return true;
                 }
             }
-            return false; // key has IP restriction and client IP doesn't match
+            return false;
         }
-        true // no per-key restriction
+        true
     }
 
     /// Get the rate limit for a specific key, or None if not configured.
     #[allow(dead_code)]
     pub fn get_rate_limit(&self, key: &str) -> Option<u32> {
-        self.keys.get(key).and_then(|(_, _, limit, _)| *limit)
+        self.keys.read().get(key).and_then(|(_, _, limit, _)| *limit)
     }
 }
 
