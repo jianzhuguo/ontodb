@@ -3,7 +3,7 @@
 //! Supports both in-memory and persistent storage via LSM engine.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use parking_lot::RwLock as PLRwLock;
+use parking_lot::RwLock;
 
 use onto_core::EntityId;
 
@@ -23,61 +23,61 @@ pub enum StorageMode {
 /// In-memory graph store with adjacency list representation.
 pub struct GraphStore {
     /// Vertices indexed by ID.
-    vertices: PLRwLock<HashMap<String, Vertex>>,
+    vertices: RwLock<HashMap<String, Vertex>>,
     /// Outgoing edges indexed by source vertex ID.
-    out_edges: PLRwLock<HashMap<String, Vec<Edge>>>,
+    out_edges: RwLock<HashMap<String, Vec<Edge>>>,
     /// Incoming edges indexed by target vertex ID.
-    in_edges: PLRwLock<HashMap<String, Vec<Edge>>>,
+    in_edges: RwLock<HashMap<String, Vec<Edge>>>,
     /// All edges indexed by ID.
-    edges: PLRwLock<HashMap<String, Edge>>,
+    edges: RwLock<HashMap<String, Edge>>,
     /// Labels index: label -> set of vertex IDs.
-    label_index: PLRwLock<HashMap<String, HashSet<String>>>,
+    label_index: RwLock<HashMap<String, HashSet<String>>>,
     /// Storage mode.
     #[allow(dead_code)]
     storage_mode: StorageMode,
     /// Internal integer ID mapping for fast traversal.
     /// Maps string ID -> integer index.
-    id_to_idx: PLRwLock<HashMap<String, u32>>,
+    id_to_idx: RwLock<HashMap<String, u32>>,
     /// Maps integer index -> string ID.
-    idx_to_id: PLRwLock<Vec<String>>,
+    idx_to_id: RwLock<Vec<String>>,
     /// Adjacency list using integer indices: idx -> list of (neighbor_idx, edge_idx).
-    adj_out: PLRwLock<Vec<Vec<(u32, u32)>>>,
-    adj_in: PLRwLock<Vec<Vec<(u32, u32)>>>,
+    adj_out: RwLock<Vec<Vec<(u32, u32)>>>,
+    adj_in: RwLock<Vec<Vec<(u32, u32)>>>,
     /// Edge index -> (from_idx, to_idx, edge_id).
-    edge_index: PLRwLock<Vec<(u32, u32, String)>>,
+    edge_index: RwLock<Vec<(u32, u32, String)>>,
 }
 
 impl GraphStore {
     pub fn new() -> Self {
         Self {
-            vertices: PLRwLock::new(HashMap::new()),
-            out_edges: PLRwLock::new(HashMap::new()),
-            in_edges: PLRwLock::new(HashMap::new()),
-            edges: PLRwLock::new(HashMap::new()),
-            label_index: PLRwLock::new(HashMap::new()),
+            vertices: RwLock::new(HashMap::new()),
+            out_edges: RwLock::new(HashMap::new()),
+            in_edges: RwLock::new(HashMap::new()),
+            edges: RwLock::new(HashMap::new()),
+            label_index: RwLock::new(HashMap::new()),
             storage_mode: StorageMode::Memory,
-            id_to_idx: PLRwLock::new(HashMap::new()),
-            idx_to_id: PLRwLock::new(Vec::new()),
-            adj_out: PLRwLock::new(Vec::new()),
-            adj_in: PLRwLock::new(Vec::new()),
-            edge_index: PLRwLock::new(Vec::new()),
+            id_to_idx: RwLock::new(HashMap::new()),
+            idx_to_id: RwLock::new(Vec::new()),
+            adj_out: RwLock::new(Vec::new()),
+            adj_in: RwLock::new(Vec::new()),
+            edge_index: RwLock::new(Vec::new()),
         }
     }
 
     /// Create a new persistent graph store.
     pub fn new_persistent(data_dir: &str) -> Self {
         Self {
-            vertices: PLRwLock::new(HashMap::new()),
-            out_edges: PLRwLock::new(HashMap::new()),
-            in_edges: PLRwLock::new(HashMap::new()),
-            edges: PLRwLock::new(HashMap::new()),
-            label_index: PLRwLock::new(HashMap::new()),
+            vertices: RwLock::new(HashMap::new()),
+            out_edges: RwLock::new(HashMap::new()),
+            in_edges: RwLock::new(HashMap::new()),
+            edges: RwLock::new(HashMap::new()),
+            label_index: RwLock::new(HashMap::new()),
             storage_mode: StorageMode::Persistent { data_dir: data_dir.to_string() },
-            id_to_idx: PLRwLock::new(HashMap::new()),
-            idx_to_id: PLRwLock::new(Vec::new()),
-            adj_out: PLRwLock::new(Vec::new()),
-            adj_in: PLRwLock::new(Vec::new()),
-            edge_index: PLRwLock::new(Vec::new()),
+            id_to_idx: RwLock::new(HashMap::new()),
+            idx_to_id: RwLock::new(Vec::new()),
+            adj_out: RwLock::new(Vec::new()),
+            adj_in: RwLock::new(Vec::new()),
+            edge_index: RwLock::new(Vec::new()),
         }
     }
 
@@ -150,7 +150,7 @@ impl GraphStore {
 
     /// Get a vertex by ID.
     pub fn get_vertex(&self, id: &str) -> Option<Vertex> {
-        self.vertices.read().get(id).cloned()
+        self.vertices.write().get(id).cloned()
     }
 
     /// Update vertex properties.
@@ -180,42 +180,57 @@ impl GraphStore {
             }
         }
 
-        // Remove all connected edges (string-keyed)
-        // Collect edge info first, then clean up neighbor lists separately to avoid deadlock
-        let connected_edges: Vec<(String, String, bool)> = {
+        // Collect outgoing and incoming edges, remove them from the edges map,
+        // and build neighbor cleanup lists — all under a single lock scope.
+        let (outgoing_neighbors, incoming_neighbors, outgoing_edge_ids, incoming_edge_ids) = {
             let out = self.out_edges.write().remove(id).unwrap_or_default();
             let inp = self.in_edges.write().remove(id).unwrap_or_default();
 
-            let mut all_edges = Vec::new();
+            let mut out_neighbors: Vec<(String, String)> = Vec::new(); // (neighbor_id, edge_id)
+            let mut in_neighbors: Vec<(String, String)> = Vec::new();
+            let mut out_eids: Vec<String> = Vec::new();
+            let mut in_eids: Vec<String> = Vec::new();
+
             let mut edges = self.edges.write();
             for edge in out {
+                out_eids.push(edge.id.clone());
+                out_neighbors.push((edge.to.clone(), edge.id.clone()));
                 edges.remove(&edge.id);
-                all_edges.push((edge.id.clone(), edge.to.clone(), true));
             }
             for edge in inp {
+                in_eids.push(edge.id.clone());
+                in_neighbors.push((edge.from.clone(), edge.id.clone()));
                 edges.remove(&edge.id);
-                all_edges.push((edge.id.clone(), edge.from.clone(), false));
             }
-            all_edges
+            (out_neighbors, in_neighbors, out_eids, in_eids)
         };
 
-        // Clean up neighbor adjacency lists (separate lock scope to avoid deadlock)
-        for (edge_id, neighbor_id, is_outgoing) in &connected_edges {
-            if *is_outgoing {
-                if let Some(in_list) = self.in_edges.write().get_mut(neighbor_id.as_str()) {
+        // Clean up neighbor adjacency lists — single lock acquisition per neighbor
+        // For outgoing edges: remove from neighbor's in_edges
+        {
+            let mut in_map = self.in_edges.write();
+            for (neighbor_id, edge_id) in &outgoing_neighbors {
+                if let Some(in_list) = in_map.get_mut(neighbor_id.as_str()) {
                     in_list.retain(|e| &e.id != edge_id);
                 }
-            } else {
-                if let Some(out_list) = self.out_edges.write().get_mut(neighbor_id.as_str()) {
+            }
+        }
+        // For incoming edges: remove from neighbor's out_edges
+        {
+            let mut out_map = self.out_edges.write();
+            for (neighbor_id, edge_id) in &incoming_neighbors {
+                if let Some(out_list) = out_map.get_mut(neighbor_id.as_str()) {
                     out_list.retain(|e| &e.id != edge_id);
                 }
             }
         }
 
         // Clean up integer adjacency lists
-        if let Some(&idx) = self.id_to_idx.read().get(id) {
+        // First, get the idx under a short lock scope
+        let maybe_idx = self.id_to_idx.write().get(id).copied();
+
+        if let Some(idx) = maybe_idx {
             let idx = idx as usize;
-            // Clear adjacency lists for this vertex
             {
                 let mut adj_out = self.adj_out.write();
                 if idx < adj_out.len() {
@@ -228,16 +243,14 @@ impl GraphStore {
                     adj_in[idx].clear();
                 }
             }
-            // Remove edges from edge_index that reference this vertex
             {
                 let mut ei = self.edge_index.write();
                 ei.retain(|(from, to, _)| *from as usize != idx && *to as usize != idx);
             }
-            // Remove from ID mapping
             self.id_to_idx.write().remove(id);
             let mut ids = self.idx_to_id.write();
             if idx < ids.len() {
-                ids[idx] = String::new(); // tombstone
+                ids[idx] = String::new();
             }
         }
 
@@ -246,8 +259,8 @@ impl GraphStore {
 
     /// Get vertices by label.
     pub fn get_vertices_by_label(&self, label: &str) -> Vec<Vertex> {
-        let idx = self.label_index.read();
-        let verts = self.vertices.read();
+        let idx = self.label_index.write();
+        let verts = self.vertices.write();
 
         idx.get(label)
             .map(|ids| {
@@ -260,7 +273,7 @@ impl GraphStore {
 
     /// Get all vertices.
     pub fn get_all_vertices(&self) -> Vec<Vertex> {
-        self.vertices.read().values().cloned().collect()
+        self.vertices.write().values().cloned().collect()
     }
 
     // ── Edge CRUD ────────────────────────────────────────────────
@@ -269,7 +282,7 @@ impl GraphStore {
     pub fn add_edge(&self, edge: Edge) -> Result<(), GraphError> {
         // Verify source and target exist
         {
-            let verts = self.vertices.read();
+            let verts = self.vertices.write();
             if !verts.contains_key(&edge.from) {
                 return Err(GraphError::VertexNotFound(edge.from.clone()));
             }
@@ -322,7 +335,7 @@ impl GraphStore {
 
     /// Get an edge by ID.
     pub fn get_edge(&self, id: &str) -> Option<Edge> {
-        self.edges.read().get(id).cloned()
+        self.edges.write().get(id).cloned()
     }
 
     /// Update edge properties.
@@ -380,7 +393,7 @@ impl GraphStore {
     /// Get outgoing edges from a vertex.
     pub fn get_out_edges(&self, vertex_id: &str) -> Vec<Edge> {
         self.out_edges
-            .read()
+            .write()
             .get(vertex_id)
             .cloned()
             .unwrap_or_default()
@@ -389,7 +402,7 @@ impl GraphStore {
     /// Get incoming edges to a vertex.
     pub fn get_in_edges(&self, vertex_id: &str) -> Vec<Edge> {
         self.in_edges
-            .read()
+            .write()
             .get(vertex_id)
             .cloned()
             .unwrap_or_default()
@@ -397,9 +410,9 @@ impl GraphStore {
 
     /// Get neighbors of a vertex (outgoing direction).
     pub fn get_neighbors(&self, vertex_id: &str) -> Vec<Vertex> {
-        let verts = self.vertices.read();
+        let verts = self.vertices.write();
         self.out_edges
-            .read()
+            .write()
             .get(vertex_id)
             .map(|edges| {
                 edges
@@ -414,17 +427,17 @@ impl GraphStore {
 
     /// Get vertex count.
     pub fn vertex_count(&self) -> usize {
-        self.vertices.read().len()
+        self.vertices.write().len()
     }
 
     /// Get edge count.
     pub fn edge_count(&self) -> usize {
-        self.edges.read().len()
+        self.edges.write().len()
     }
 
     /// Get average degree.
     pub fn avg_degree(&self) -> f64 {
-        let out = self.out_edges.read();
+        let out = self.out_edges.write();
         if out.is_empty() {
             return 0.0;
         }
@@ -434,22 +447,22 @@ impl GraphStore {
 
     /// Get integer index for a vertex ID.
     pub fn get_idx(&self, id: &str) -> Option<u32> {
-        self.id_to_idx.read().get(id).copied()
+        self.id_to_idx.write().get(id).copied()
     }
 
     /// Get vertex ID from integer index.
     pub fn get_id(&self, idx: u32) -> Option<String> {
-        self.idx_to_id.read().get(idx as usize).cloned()
+        self.idx_to_id.write().get(idx as usize).cloned()
     }
 
     /// Get outgoing neighbors using integer indices (fast path).
     pub fn get_out_neighbors_idx(&self, idx: u32) -> Vec<(u32, u32)> {
-        self.adj_out.read().get(idx as usize).cloned().unwrap_or_default()
+        self.adj_out.write().get(idx as usize).cloned().unwrap_or_default()
     }
 
     /// Get incoming neighbors using integer indices (fast path).
     pub fn get_in_neighbors_idx(&self, idx: u32) -> Vec<(u32, u32)> {
-        self.adj_in.read().get(idx as usize).cloned().unwrap_or_default()
+        self.adj_in.write().get(idx as usize).cloned().unwrap_or_default()
     }
 
     /// Fast BFS using integer indices (no string allocations during traversal).
@@ -459,7 +472,7 @@ impl GraphStore {
         max_depth: usize,
         direction: Direction,
     ) -> Vec<u32> {
-        let num_nodes = self.idx_to_id.read().len();
+        let num_nodes = self.idx_to_id.write().len();
         if start_idx as usize >= num_nodes {
             return Vec::new();
         }
@@ -506,7 +519,7 @@ impl GraphStore {
         max_depth: usize,
         direction: Direction,
     ) -> (Vec<u32>, Vec<Option<u32>>) {
-        let num_nodes = self.idx_to_id.read().len();
+        let num_nodes = self.idx_to_id.write().len();
         if start_idx as usize >= num_nodes {
             return (Vec::new(), vec![None; num_nodes]);
         }
@@ -578,8 +591,8 @@ impl GraphStore {
 
     /// Export graph data to JSON for persistence.
     pub fn export_json(&self) -> String {
-        let vertices: Vec<Vertex> = self.vertices.read().values().cloned().collect();
-        let edges: Vec<Edge> = self.edges.read().values().cloned().collect();
+        let vertices: Vec<Vertex> = self.vertices.write().values().cloned().collect();
+        let edges: Vec<Edge> = self.edges.write().values().cloned().collect();
 
         serde_json::to_string(&serde_json::json!({
             "vertices": vertices,
