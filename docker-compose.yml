@@ -1,12 +1,165 @@
+# OntoDB Production Deployment
+#
+# Usage:
+#   1. Copy and edit the environment file:
+#      cp .env.example .env
+#   2. Generate API keys:
+#      cp config/api_keys.example.json config/api_keys.json
+#      # Edit config/api_keys.json with real keys
+#   3. Start all services:
+#      docker compose up -d
+#   4. Verify:
+#      curl http://localhost:7912/api/health
+#
+# Services included:
+#   - ontodb:      Database server
+#   - nginx:       TLS reverse proxy
+#   - prometheus:  Metrics collection
+#   - grafana:     Monitoring dashboards
+#   - backup:      Scheduled backup (daily)
+
 services:
+  # ── OntoDB Server ──────────────────────────────────────────
   ontodb:
-    build: .
-    ports:
-      - "7912:7912"   # HTTP API
-      - "7913:7913"   # TCP CLI
-    volumes:
-      - ontodb-data:/data
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        RUN_TESTS: "false"
+    container_name: ontodb
     restart: unless-stopped
+    ports:
+      - "${ONTODB_HTTP_PORT:-7912}:7912"   # HTTP API
+      - "${ONTODB_TCP_PORT:-7913}:7913"    # TCP CLI
+    volumes:
+      - ontodb-data:/data/ontodb
+      - ontodb-backup:/data/backup
+      - ./config/api_keys.json:/etc/ontodb/api_keys.json:ro
+    command:
+      - "--data-dir=/data/ontodb"
+      - "--http=0.0.0.0:7912"
+      - "--listen=0.0.0.0:7913"
+      - "--auth"
+      - "--api-keys-file=/etc/ontodb/api_keys.json"
+      - "--rate-limit=${ONTODB_RATE_LIMIT:-300}"
+      - "--burst-size=${ONTODB_BURST_SIZE:-50}"
+    deploy:
+      resources:
+        limits:
+          memory: ${ONTODB_MEMORY_LIMIT:-2g}
+          cpus: "${ONTODB_CPU_LIMIT:-2.0}"
+        reservations:
+          memory: 256m
+          cpus: "0.25"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7912/api/health/live"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    networks:
+      - ontodb-net
+
+  # ── Nginx TLS Reverse Proxy ────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ontodb-nginx
+    restart: unless-stopped
+    ports:
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      ontodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+    networks:
+      - ontodb-net
+
+  # ── Prometheus Metrics ─────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: ontodb-prometheus
+    restart: unless-stopped
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./deploy/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--storage.tsdb.retention.size=5GB"
+    networks:
+      - ontodb-net
+
+  # ── Grafana Dashboards ─────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: ontodb-grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/ontodb.json:ro
+      - ./deploy/monitoring/grafana-datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
+      - ./deploy/monitoring/grafana-dashboard-provider.yml:/etc/grafana/provisioning/dashboards/provider.yml:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on:
+      - prometheus
+    networks:
+      - ontodb-net
+
+  # ── Scheduled Backup ───────────────────────────────────────
+  # Runs backup daily at 03:00, keeps last 7 days
+  backup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ontodb-backup
+    restart: "no"
+    volumes:
+      - ontodb-data:/data/ontodb:ro
+      - ontodb-backup:/data/backup
+      - ./deploy/backup/backup.sh:/usr/local/bin/backup.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/backup.sh"]
+    environment:
+      BACKUP_RETENTION_DAYS: "${BACKUP_RETENTION_DAYS:-7}"
+    depends_on:
+      ontodb:
+        condition: service_healthy
+    networks:
+      - ontodb-net
 
 volumes:
   ontodb-data:
+    driver: local
+  ontodb-backup:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+networks:
+  ontodb-net:
+    driver: bridge

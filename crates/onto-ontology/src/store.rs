@@ -41,7 +41,7 @@ impl OntologyStore {
         let key = Self::make_key(name);
         match self.engine.get(&key)? {
             Some(bytes) => {
-                let ontology: Ontology = serde_json::from_slice(&bytes)
+                let ontology = Ontology::from_json_slice(&bytes)
                     .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
                 Ok(Some(ontology))
             }
@@ -54,7 +54,7 @@ impl OntologyStore {
         let key = Self::make_key(name);
         match engine.get(&key)? {
             Some(bytes) => {
-                let ontology: Ontology = serde_json::from_slice(&bytes)
+                let ontology = Ontology::from_json_slice(&bytes)
                     .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
                 Ok(Some(ontology))
             }
@@ -77,7 +77,7 @@ impl OntologyStore {
     ) -> Result<Option<Ontology>> {
         let entries = engine.scan_prefix(ONTOLOGY_PREFIX)?;
         for (_key, val_bytes) in entries {
-            if let Ok(ontology) = serde_json::from_slice::<Ontology>(&val_bytes) {
+            if let Ok(ontology) = Ontology::from_json_slice(&val_bytes) {
                 if ontology.classes.contains_key(class_name) {
                     return Ok(Some(ontology));
                 }

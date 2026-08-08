@@ -14,6 +14,12 @@ pub struct Ontology {
     pub name: String,
     pub classes: HashMap<String, Class>,
     pub properties: HashMap<String, Property>,
+    /// Reverse index: parent class → direct children. Rebuilt by `rebuild_indexes()`.
+    #[serde(skip)]
+    children_of: HashMap<String, Vec<String>>,
+    /// Reverse index: class → classes that declare it as equivalent. Rebuilt by `rebuild_indexes()`.
+    #[serde(skip)]
+    equiv_of: HashMap<String, Vec<String>>,
 }
 
 /// OWL-lite class type.
@@ -184,12 +190,55 @@ impl Ontology {
             name: name.into(),
             classes: HashMap::new(),
             properties: HashMap::new(),
+            children_of: HashMap::new(),
+            equiv_of: HashMap::new(),
         }
     }
 
-    /// Adds a class to the ontology.
+    /// Adds a class to the ontology and updates reverse indexes.
     pub fn add_class(&mut self, class: Class) {
+        // Update children_of reverse index
+        for parent in &class.superclasses {
+            self.children_of
+                .entry(parent.clone())
+                .or_default()
+                .push(class.name.clone());
+        }
+        // Update equiv_of reverse index (bidirectional)
+        for equiv in &class.equivalent_classes {
+            self.equiv_of
+                .entry(equiv.clone())
+                .or_default()
+                .push(class.name.clone());
+        }
         self.classes.insert(class.name.clone(), class);
+    }
+
+    /// Rebuilds reverse indexes after deserialization or bulk class modification.
+    pub fn rebuild_indexes(&mut self) {
+        self.children_of.clear();
+        self.equiv_of.clear();
+        for (name, class) in &self.classes {
+            for parent in &class.superclasses {
+                self.children_of
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(name.clone());
+            }
+            for equiv in &class.equivalent_classes {
+                self.equiv_of
+                    .entry(equiv.clone())
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+    }
+
+    /// Deserializes an Ontology from JSON bytes and rebuilds reverse indexes.
+    pub fn from_json_slice(bytes: &[u8]) -> std::result::Result<Self, serde_json::Error> {
+        let mut ontology: Ontology = serde_json::from_slice(bytes)?;
+        ontology.rebuild_indexes();
+        Ok(ontology)
     }
 
     /// Adds a property to the ontology.
@@ -276,11 +325,11 @@ impl Ontology {
             return;
         }
 
-        // Add direct subclasses
-        for (name, class) in &self.classes {
-            if class.superclasses.contains(&class_name.to_string()) {
-                if result.insert(name.clone()) {
-                    self.collect_subclasses(name, result, visited);
+        // Add direct subclasses via reverse index
+        if let Some(children) = self.children_of.get(class_name) {
+            for child in children {
+                if result.insert(child.clone()) {
+                    self.collect_subclasses(child, result, visited);
                 }
             }
         }
@@ -294,11 +343,11 @@ impl Ontology {
             }
         }
 
-        // Check reverse equivalence: other classes that declare class_name as equivalent
-        for (name, class) in &self.classes {
-            if class.equivalent_classes.contains(&class_name.to_string()) {
-                if result.insert(name.clone()) {
-                    self.collect_subclasses(name, result, visited);
+        // Add classes that declare class_name as equivalent (via reverse index)
+        if let Some(equivs) = self.equiv_of.get(class_name) {
+            for equiv in equivs {
+                if result.insert(equiv.clone()) {
+                    self.collect_subclasses(equiv, result, visited);
                 }
             }
         }

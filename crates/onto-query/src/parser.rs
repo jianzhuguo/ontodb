@@ -241,6 +241,15 @@ pub enum QueryAst {
         to_id: String,
         max_depth: usize,
     },
+
+    /// BACKUP TO '<path>' — Create a full snapshot backup
+    Backup { path: String },
+
+    /// RESTORE FROM '<path>' — Restore from a backup snapshot
+    Restore { path: String },
+
+    /// FLUSH — Flush MemTable to SSTable
+    Flush,
 }
 
 /// Column definition for CREATE TABLE.
@@ -335,6 +344,11 @@ impl QueryAst {
             QueryAst::GraphTraverse { .. } => true,
             QueryAst::GraphMatch { .. } => true,
             QueryAst::GraphShortestPath { .. } => true,
+
+            // Backup/Restore/Flush
+            QueryAst::Backup { .. } => false,
+            QueryAst::Restore { .. } => false,
+            QueryAst::Flush => false,
         }
     }
 }
@@ -655,6 +669,12 @@ impl QueryParser {
             Self::parse_graph_match(input)
         } else if upper.starts_with("GRAPH SHORTEST PATH") {
             Self::parse_graph_shortest_path(input)
+        } else if upper.starts_with("BACKUP") {
+            Self::parse_backup(input)
+        } else if upper.starts_with("RESTORE") {
+            Self::parse_restore(input)
+        } else if upper.starts_with("FLUSH") {
+            Ok(QueryAst::Flush)
         } else {
             Err(CoreError::InvalidArgument(format!(
                 "unsupported query: {}",
@@ -2742,6 +2762,37 @@ impl QueryParser {
         Ok(QueryAst::GraphShortestPath { from_id, to_id, max_depth })
     }
 
+    /// Parses BACKUP TO '<path>'
+    fn parse_backup(input: &str) -> Result<QueryAst> {
+        let rest = input[6..].trim(); // Skip "BACKUP"
+        let rest = rest.strip_prefix("TO").ok_or_else(|| {
+            CoreError::InvalidArgument("expected BACKUP TO '<path>'".to_string())
+        })?.trim();
+        let path = Self::extract_quoted_path(rest)?;
+        Ok(QueryAst::Backup { path })
+    }
+
+    /// Parses RESTORE FROM '<path>'
+    fn parse_restore(input: &str) -> Result<QueryAst> {
+        let rest = input[7..].trim(); // Skip "RESTORE"
+        let rest = rest.strip_prefix("FROM").ok_or_else(|| {
+            CoreError::InvalidArgument("expected RESTORE FROM '<path>'".to_string())
+        })?.trim();
+        let path = Self::extract_quoted_path(rest)?;
+        Ok(QueryAst::Restore { path })
+    }
+
+    /// Extracts a quoted path string from the input (supports single and double quotes).
+    fn extract_quoted_path(input: &str) -> Result<String> {
+        let trimmed = input.trim();
+        let quote_pos = trimmed.find('\'').or_else(|| trimmed.find('"'))
+            .ok_or_else(|| CoreError::InvalidArgument("expected quoted path".to_string()))?;
+        let quote_char = trimmed.as_bytes()[quote_pos] as char;
+        let end = trimmed[quote_pos + 1..].find(quote_char)
+            .ok_or_else(|| CoreError::InvalidArgument("unterminated path string".to_string()))?;
+        Ok(trimmed[quote_pos + 1..quote_pos + 1 + end].to_string())
+    }
+
     /// Parse column definitions: "name STRING, age INT, ..."
     fn parse_column_defs(input: &str) -> Result<Vec<ColumnDef>> {
         let mut columns = Vec::new();
@@ -2815,5 +2866,48 @@ mod tests {
             }
             _ => panic!("expected CreateOntology"),
         }
+    }
+
+    #[test]
+    fn test_parse_backup() {
+        let ast = QueryParser::parse("BACKUP TO '/tmp/backup'").unwrap();
+        match ast {
+            QueryAst::Backup { path } => assert_eq!(path, "/tmp/backup"),
+            _ => panic!("expected Backup"),
+        }
+    }
+
+    #[test]
+    fn test_parse_backup_double_quotes() {
+        let ast = QueryParser::parse("BACKUP TO \"/data/backup\"").unwrap();
+        match ast {
+            QueryAst::Backup { path } => assert_eq!(path, "/data/backup"),
+            _ => panic!("expected Backup"),
+        }
+    }
+
+    #[test]
+    fn test_parse_backup_missing_path() {
+        assert!(QueryParser::parse("BACKUP TO").is_err());
+    }
+
+    #[test]
+    fn test_parse_restore() {
+        let ast = QueryParser::parse("RESTORE FROM '/tmp/backup'").unwrap();
+        match ast {
+            QueryAst::Restore { path } => assert_eq!(path, "/tmp/backup"),
+            _ => panic!("expected Restore"),
+        }
+    }
+
+    #[test]
+    fn test_parse_restore_missing_from() {
+        assert!(QueryParser::parse("RESTORE '/tmp/backup'").is_err());
+    }
+
+    #[test]
+    fn test_parse_flush() {
+        let ast = QueryParser::parse("FLUSH").unwrap();
+        assert!(matches!(ast, QueryAst::Flush));
     }
 }

@@ -22,3 +22,10 @@ desktop.ini
 # Test data
 *.sst
 *.wal
+
+# Secrets — NEVER commit these
+.env
+config/api_keys.json
+*.pem
+*.key
+*.crt

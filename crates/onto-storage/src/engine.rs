@@ -266,6 +266,11 @@ impl LsmEngine {
         Ok(engine)
     }
 
+    /// Returns the data directory path.
+    pub fn data_dir(&self) -> PathBuf {
+        self.options.data_dir.clone()
+    }
+
     /// Puts a key-value pair.
     pub fn put(&self, key: Key, value: Value) -> Result<()> {
         let seq = self.next_seq();

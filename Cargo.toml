@@ -10,6 +10,7 @@ members = [
     "crates/onto-server",
     "crates/onto-cli",
     "crates/onto-graph",
+    "crates/onto-enterprise",
 ]
 
 [workspace.package]
@@ -27,7 +28,8 @@ onto-storage  = { path = "crates/onto-storage" }
 onto-ontology = { path = "crates/onto-ontology" }
 onto-query    = { path = "crates/onto-query" }
 onto-raft     = { path = "crates/onto-raft" }
-onto-graph    = { path = "crates/onto-graph" }
+onto-graph     = { path = "crates/onto-graph" }
+onto-enterprise = { path = "crates/onto-enterprise" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

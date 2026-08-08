@@ -34,7 +34,16 @@ pub enum RuleId {
 /// An inference rule that operates on an ontology and a set of known triples.
 pub trait Rule: Send + Sync {
     fn id(&self) -> RuleId;
-    fn apply(&self, ontology: &Ontology, facts: &HashSet<Triple>) -> Vec<Triple>;
+    /// Apply the rule. `facts` is the full known set; `new_facts` is the subset
+    /// added in the previous iteration (empty on first call).
+    /// Rules that can be incremental should extend only from `new_facts`;
+    /// others can fall back to scanning `facts`.
+    fn apply(
+        &self,
+        ontology: &Ontology,
+        facts: &HashSet<Triple>,
+        new_facts: &[Triple],
+    ) -> Vec<Triple>;
 }
 
 /// Cax-sco: Subclass type propagation.
@@ -47,24 +56,32 @@ impl Rule for CaxSco {
         RuleId::CaxSco
     }
 
-    fn apply(&self, ontology: &Ontology, facts: &HashSet<Triple>) -> Vec<Triple> {
+    fn apply(
+        &self,
+        ontology: &Ontology,
+        facts: &HashSet<Triple>,
+        new_facts: &[Triple],
+    ) -> Vec<Triple> {
         let mut inferred = Vec::new();
-        for fact in facts {
-            if fact.predicate == "rdf:type" {
-                let _subclasses = ontology.get_all_subclasses(&fact.object);
-                // fact.subject is of type fact.object (or a subclass)
-                // Propagate to all superclasses of fact.object
-                let superclasses = ontology.get_all_superclasses(&fact.object);
-                for sup in &superclasses {
-                    let t = Triple::type_of(&fact.subject, sup);
-                    if !facts.contains(&t) {
-                        inferred.push(t);
-                    }
+        // Incremental: only process new rdf:type facts
+        let source: Vec<&Triple> = if new_facts.is_empty() {
+            facts.iter().collect()
+        } else {
+            new_facts
+                .iter()
+                .filter(|t| t.predicate == "rdf:type")
+                .collect()
+        };
+        for fact in source {
+            if fact.predicate != "rdf:type" {
+                continue;
+            }
+            let superclasses = ontology.get_all_superclasses(&fact.object);
+            for sup in &superclasses {
+                let t = Triple::type_of(&fact.subject, sup);
+                if !facts.contains(&t) {
+                    inferred.push(t);
                 }
-                // Also propagate: if x type A, and A has subclasses that are
-                // equivalent to A, those are already handled by CaxEqc.
-                // But if x is of a subclass of A, x is also of A — handled by
-                // checking if fact.object is a subclass of something.
             }
         }
         inferred
@@ -81,16 +98,30 @@ impl Rule for CaxEqc {
         RuleId::CaxEqc
     }
 
-    fn apply(&self, ontology: &Ontology, facts: &HashSet<Triple>) -> Vec<Triple> {
+    fn apply(
+        &self,
+        ontology: &Ontology,
+        facts: &HashSet<Triple>,
+        new_facts: &[Triple],
+    ) -> Vec<Triple> {
         let mut inferred = Vec::new();
-        for fact in facts {
-            if fact.predicate == "rdf:type" {
-                if let Some(class) = ontology.classes.get(&fact.object) {
-                    for equiv in &class.equivalent_classes {
-                        let t = Triple::type_of(&fact.subject, equiv);
-                        if !facts.contains(&t) {
-                            inferred.push(t);
-                        }
+        let source: Vec<&Triple> = if new_facts.is_empty() {
+            facts.iter().collect()
+        } else {
+            new_facts
+                .iter()
+                .filter(|t| t.predicate == "rdf:type")
+                .collect()
+        };
+        for fact in source {
+            if fact.predicate != "rdf:type" {
+                continue;
+            }
+            if let Some(class) = ontology.classes.get(&fact.object) {
+                for equiv in &class.equivalent_classes {
+                    let t = Triple::type_of(&fact.subject, equiv);
+                    if !facts.contains(&t) {
+                        inferred.push(t);
                     }
                 }
             }
@@ -109,13 +140,22 @@ impl Rule for PrpSpo {
         RuleId::PrpSpo
     }
 
-    fn apply(&self, ontology: &Ontology, facts: &HashSet<Triple>) -> Vec<Triple> {
+    fn apply(
+        &self,
+        ontology: &Ontology,
+        facts: &HashSet<Triple>,
+        new_facts: &[Triple],
+    ) -> Vec<Triple> {
         let mut inferred = Vec::new();
-        for fact in facts {
+        let source: Vec<&Triple> = if new_facts.is_empty() {
+            facts.iter().collect()
+        } else {
+            new_facts.iter().filter(|t| t.predicate != "rdf:type").collect()
+        };
+        for fact in source {
             if fact.predicate == "rdf:type" {
                 continue;
             }
-            // Walk up the subproperty chain
             collect_superproperties(ontology, &fact.predicate, &mut |super_prop| {
                 let t = Triple::new(&fact.subject, super_prop, &fact.object);
                 if !facts.contains(&t) {
@@ -160,9 +200,19 @@ impl Rule for PrpEqp {
         RuleId::PrpEqp
     }
 
-    fn apply(&self, ontology: &Ontology, facts: &HashSet<Triple>) -> Vec<Triple> {
+    fn apply(
+        &self,
+        ontology: &Ontology,
+        facts: &HashSet<Triple>,
+        new_facts: &[Triple],
+    ) -> Vec<Triple> {
         let mut inferred = Vec::new();
-        for fact in facts {
+        let source: Vec<&Triple> = if new_facts.is_empty() {
+            facts.iter().collect()
+        } else {
+            new_facts.iter().filter(|t| t.predicate != "rdf:type").collect()
+        };
+        for fact in source {
             if fact.predicate == "rdf:type" {
                 continue;
             }
@@ -189,9 +239,19 @@ impl Rule for PrpInv {
         RuleId::PrpInv
     }
 
-    fn apply(&self, ontology: &Ontology, facts: &HashSet<Triple>) -> Vec<Triple> {
+    fn apply(
+        &self,
+        ontology: &Ontology,
+        facts: &HashSet<Triple>,
+        new_facts: &[Triple],
+    ) -> Vec<Triple> {
         let mut inferred = Vec::new();
-        for fact in facts {
+        let source: Vec<&Triple> = if new_facts.is_empty() {
+            facts.iter().collect()
+        } else {
+            new_facts.iter().filter(|t| t.predicate != "rdf:type").collect()
+        };
+        for fact in source {
             if fact.predicate == "rdf:type" {
                 continue;
             }
@@ -220,6 +280,10 @@ impl Rule for PrpInv {
 /// Prp-trp: Transitive property closure.
 ///
 /// If `x P y` and `y P z` and `P` is transitive, then `x P z`.
+///
+/// Incremental optimization: on iterations after the first, only extend
+/// from new facts. For each new (a, b), look up all (b, c) in the full set
+/// to infer (a, c), and all (z, a) to infer (z, b).
 pub struct PrpTrp;
 
 impl Rule for PrpTrp {
@@ -227,43 +291,107 @@ impl Rule for PrpTrp {
         RuleId::PrpTrp
     }
 
-    fn apply(&self, ontology: &Ontology, facts: &HashSet<Triple>) -> Vec<Triple> {
+    fn apply(
+        &self,
+        ontology: &Ontology,
+        facts: &HashSet<Triple>,
+        new_facts: &[Triple],
+    ) -> Vec<Triple> {
         let mut inferred = Vec::new();
 
-        // Group facts by predicate
-        let mut by_predicate: std::collections::HashMap<&str, Vec<(&str, &str)>> =
-            std::collections::HashMap::new();
-        for fact in facts {
-            if fact.predicate == "rdf:type" {
-                continue;
+        if new_facts.is_empty() {
+            // First iteration: full scan (same as before)
+            let mut by_predicate: std::collections::HashMap<&str, Vec<(&str, &str)>> =
+                std::collections::HashMap::new();
+            for fact in facts {
+                if fact.predicate == "rdf:type" {
+                    continue;
+                }
+                by_predicate
+                    .entry(&fact.predicate)
+                    .or_default()
+                    .push((&fact.subject, &fact.object));
             }
-            by_predicate
-                .entry(&fact.predicate)
-                .or_default()
-                .push((&fact.subject, &fact.object));
-        }
-
-        for (pred, pairs) in &by_predicate {
-            if let Some(prop_def) = ontology.properties.get(*pred) {
-                if prop_def.is_transitive {
-                    // For each (a, b) and (b, c), infer (a, c)
-                    let obj_set: std::collections::HashMap<&str, Vec<&str>> = {
-                        let mut m: std::collections::HashMap<&str, Vec<&str>> =
+            for (pred, pairs) in &by_predicate {
+                if let Some(prop_def) = ontology.properties.get(*pred) {
+                    if prop_def.is_transitive {
+                        let mut obj_map: std::collections::HashMap<&str, Vec<&str>> =
                             std::collections::HashMap::new();
                         for (s, o) in pairs {
-                            m.entry(*s).or_default().push(*o);
+                            obj_map.entry(*s).or_default().push(*o);
                         }
-                        m
-                    };
-                    for (a, b) in pairs {
-                        if let Some(c_list) = obj_set.get(b) {
-                            for c in c_list {
-                                if a != c {
-                                    let t = Triple::new(*a, *pred, *c);
-                                    if !facts.contains(&t) {
-                                        inferred.push(t);
+                        for (a, b) in pairs {
+                            if let Some(c_list) = obj_map.get(b) {
+                                for c in c_list {
+                                    if a != c {
+                                        let t = Triple::new(*a, *pred, *c);
+                                        if !facts.contains(&t) {
+                                            inferred.push(t);
+                                        }
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Incremental: only extend from new facts
+            // Build obj_map and subj_map from FULL facts for lookup
+            let mut transitive_preds = HashSet::new();
+            for (name, prop_def) in &ontology.properties {
+                if prop_def.is_transitive {
+                    transitive_preds.insert(name.as_str());
+                }
+            }
+            if transitive_preds.is_empty() {
+                return inferred;
+            }
+
+            // Build lookup indexes from full facts (only transitive predicates)
+            let mut obj_map: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new(); // subject -> [objects]
+            let mut subj_map: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new(); // object -> [subjects]
+            for fact in facts.iter() {
+                if transitive_preds.contains(fact.predicate.as_str()) {
+                    obj_map
+                        .entry(fact.subject.as_str())
+                        .or_default()
+                        .push(fact.object.as_str());
+                    subj_map
+                        .entry(fact.object.as_str())
+                        .or_default()
+                        .push(fact.subject.as_str());
+                }
+            }
+
+            for fact in new_facts {
+                if !transitive_preds.contains(fact.predicate.as_str()) {
+                    continue;
+                }
+                let pred = &fact.predicate;
+                let a = &fact.subject;
+                let b = &fact.object;
+
+                // Forward: (a, b) + (b, c) -> (a, c)
+                if let Some(c_list) = obj_map.get(b.as_str()) {
+                    for c in c_list {
+                        if a.as_str() != *c {
+                            let t = Triple::new(a.as_str(), pred.as_str(), *c);
+                            if !facts.contains(&t) {
+                                inferred.push(t);
+                            }
+                        }
+                    }
+                }
+                // Backward: (z, a) + (a, b) -> (z, b)
+                if let Some(z_list) = subj_map.get(a.as_str()) {
+                    for z in z_list {
+                        if *z != b.as_str() {
+                            let t = Triple::new(*z, pred.as_str(), b.as_str());
+                            if !facts.contains(&t) {
+                                inferred.push(t);
                             }
                         }
                     }
@@ -284,9 +412,19 @@ impl Rule for PrpSymp {
         RuleId::PrpSymp
     }
 
-    fn apply(&self, ontology: &Ontology, facts: &HashSet<Triple>) -> Vec<Triple> {
+    fn apply(
+        &self,
+        ontology: &Ontology,
+        facts: &HashSet<Triple>,
+        new_facts: &[Triple],
+    ) -> Vec<Triple> {
         let mut inferred = Vec::new();
-        for fact in facts {
+        let source: Vec<&Triple> = if new_facts.is_empty() {
+            facts.iter().collect()
+        } else {
+            new_facts.iter().filter(|t| t.predicate != "rdf:type").collect()
+        };
+        for fact in source {
             if fact.predicate == "rdf:type" {
                 continue;
             }
@@ -360,9 +498,8 @@ mod tests {
             .collect();
 
         let rule = CaxSco;
-        let inferred = rule.apply(&onto, &facts);
+        let inferred = rule.apply(&onto, &facts, &[]);
 
-        // alice Employee -> alice Person, alice Thing
         assert!(inferred.contains(&Triple::type_of("alice", "Person")));
         assert!(inferred.contains(&Triple::type_of("alice", "Thing")));
     }
@@ -375,7 +512,7 @@ mod tests {
             .collect();
 
         let rule = CaxSco;
-        let inferred = rule.apply(&onto, &facts);
+        let inferred = rule.apply(&onto, &facts, &[]);
 
         assert!(inferred.contains(&Triple::type_of("bob", "Employee")));
         assert!(inferred.contains(&Triple::type_of("bob", "Person")));
@@ -390,7 +527,7 @@ mod tests {
             .collect();
 
         let rule = CaxEqc;
-        let inferred = rule.apply(&onto, &facts);
+        let inferred = rule.apply(&onto, &facts, &[]);
 
         assert!(inferred.contains(&Triple::type_of("alice", "Worker")));
     }
@@ -403,7 +540,7 @@ mod tests {
             .collect();
 
         let rule = PrpInv;
-        let inferred = rule.apply(&onto, &facts);
+        let inferred = rule.apply(&onto, &facts, &[]);
 
         assert!(inferred.contains(&Triple::new("bob", "manages", "alice")));
     }
@@ -419,7 +556,7 @@ mod tests {
         .collect();
 
         let rule = PrpTrp;
-        let inferred = rule.apply(&onto, &facts);
+        let inferred = rule.apply(&onto, &facts, &[]);
 
         assert!(inferred.contains(&Triple::new("alice", "ancestor", "charlie")));
     }
@@ -432,9 +569,8 @@ mod tests {
             .collect();
 
         let rule = PrpTrp;
-        let inferred = rule.apply(&onto, &facts);
+        let inferred = rule.apply(&onto, &facts, &[]);
 
-        // Should not create self-loops
         assert!(!inferred.contains(&Triple::new("alice", "ancestor", "alice")));
     }
 
@@ -446,7 +582,7 @@ mod tests {
             .collect();
 
         let rule = PrpSymp;
-        let inferred = rule.apply(&onto, &facts);
+        let inferred = rule.apply(&onto, &facts, &[]);
 
         assert!(inferred.contains(&Triple::new("bob", "friendOf", "alice")));
     }
@@ -459,9 +595,8 @@ mod tests {
             .collect();
 
         let rule = PrpSpo;
-        let inferred = rule.apply(&onto, &facts);
+        let inferred = rule.apply(&onto, &facts, &[]);
 
-        // worksUnder subPropertyOf reportsTo
         assert!(inferred.contains(&Triple::new("alice", "reportsTo", "bob")));
     }
 
@@ -478,7 +613,7 @@ mod tests {
             .collect();
 
         let rule = PrpEqp;
-        let inferred = rule.apply(&onto, &facts);
+        let inferred = rule.apply(&onto, &facts, &[]);
 
         assert!(inferred.contains(&Triple::new("alice", "emailAddress", "a@b.com")));
     }

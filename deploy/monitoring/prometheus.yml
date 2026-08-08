@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "ontodb"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["ontodb:7912"]
+        labels:
+          service: "ontodb"
+          environment: "production"

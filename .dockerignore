@@ -1,0 +1,14 @@
+target/
+.git/
+.github/
+docs/
+benches/
+test_data/
+*.md
+*.docx
+*.txt
+*.py
+.env
+.env.*
+deploy/
+sdk/

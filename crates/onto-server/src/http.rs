@@ -102,6 +102,13 @@ pub struct SparqlRequest {
     pub query: String,
 }
 
+/// Backup request.
+#[derive(Debug, Deserialize)]
+pub struct BackupRequest {
+    /// Target directory path for the backup.
+    pub path: String,
+}
+
 /// Hybrid query request: combines SQL filter with vector search.
 #[derive(Debug, Deserialize)]
 pub struct HybridQueryRequest {
@@ -172,6 +179,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/hybrid/query", post(hybrid_query))
         // Schema introspection
         .route("/api/schema", get(get_schema))
+        // Backup and flush
+        .route("/api/backup", post(backup))
+        .route("/api/flush", post(flush))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -205,6 +215,9 @@ pub fn build_router_with_auth(
         .route("/api/graph/shortest-path", post(graph_shortest_path))
         .route("/api/graph/vertex/:id", get(get_vertex).delete(delete_vertex))
         .route("/api/graph/neighbors/:id", get(get_neighbors))
+        // Backup and flush (Admin only)
+        .route("/api/backup", post(backup))
+        .route("/api/flush", post(flush))
         // Apply rate limiting middleware
         .layer(middleware::from_fn_with_state(
             rate_limiter,
@@ -871,4 +884,55 @@ async fn get_neighbors(
         "vertex_id": id,
         "neighbors": []
     }), elapsed)))
+}
+
+/// POST /api/backup - Create a full snapshot backup.
+async fn backup(
+    State(state): State<AppState>,
+    Json(req): Json<BackupRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let backup_dir = std::path::Path::new(&req.path);
+
+    match state.executor.backup(backup_dir) {
+        Ok(manifest) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": "Backup completed",
+                "path": req.path,
+                "files": manifest.files.len(),
+                "total_bytes": total_bytes,
+                "timestamp": manifest.timestamp,
+            }), elapsed)))
+        }
+        Err(e) => {
+            let _elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
+                format!("Backup failed: {}", e)
+            )))
+        }
+    }
+}
+
+/// POST /api/flush - Flush MemTable to SSTable.
+async fn flush(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    match state.executor.flush() {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": "MemTable flushed to SSTable"
+            }), elapsed)))
+        }
+        Err(e) => {
+            let _elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
+                format!("Flush failed: {}", e)
+            )))
+        }
+    }
 }

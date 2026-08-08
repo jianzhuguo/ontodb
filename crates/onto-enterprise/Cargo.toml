@@ -1,0 +1,23 @@
+[package]
+name = "onto-enterprise"
+version = "0.1.0"
+edition = "2021"
+license = "BUSL-1.1"
+authors = ["OntoDB Team"]
+description = "OntoDB Enterprise features — clustering, security, backup, observability"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = []
+cluster = []
+sharding = []
+security = []
+backup = []
+observability = []

@@ -1,0 +1,138 @@
+{
+  "id": null,
+  "uid": "ontodb-main",
+  "title": "OntoDB Dashboard",
+  "tags": ["ontodb", "database"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Query Rate",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(ontodb_queries_total[5m])",
+          "legendFormat": "{{type}}",
+          "datasource": { "type": "prometheus", "uid": "" }
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Query Latency",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(ontodb_query_duration_seconds_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(ontodb_query_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(ontodb_query_duration_seconds_bucket[5m]))",
+          "legendFormat": "p99"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Active Connections",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "ontodb_http_connections_active",
+          "legendFormat": "HTTP"
+        },
+        {
+          "expr": "ontodb_tcp_connections_active",
+          "legendFormat": "TCP"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "fillOpacity": 20 }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Storage",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "ontodb_sstable_count",
+          "legendFormat": "SSTables"
+        },
+        {
+          "expr": "ontodb_storage_entries",
+          "legendFormat": "Entries"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Auth Attempts",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "rate(ontodb_auth_attempts_total[5m])",
+          "legendFormat": "auth/s"
+        },
+        {
+          "expr": "rate(ontodb_rate_limited_total[5m])",
+          "legendFormat": "rate-limited/s"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Compactions",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "ontodb_compactions_total",
+          "legendFormat": "Total"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      }
+    }
+  ],
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s"
+}

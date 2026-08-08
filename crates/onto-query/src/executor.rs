@@ -371,10 +371,19 @@ impl QueryExecutor {
         Some(self.engine.stats())
     }
 
-    /// Access the engine for benchmarks and tests.
-    #[cfg(test)]
-    pub(crate) fn engine(&self) -> &onto_storage::LsmEngine {
+    /// Access the underlying storage engine.
+    pub fn engine(&self) -> &onto_storage::LsmEngine {
         &self.engine
+    }
+
+    /// Creates a full snapshot backup to the given directory.
+    pub fn backup(&self, backup_dir: &std::path::Path) -> Result<onto_storage::BackupManifest> {
+        self.engine.backup(backup_dir)
+    }
+
+    /// Flushes the MemTable to SSTable on disk.
+    pub fn flush(&self) -> Result<()> {
+        self.engine.flush()
     }
 
     /// Get a reference to the query planner.
@@ -410,7 +419,7 @@ impl QueryExecutor {
         let mut ontologies = Vec::new();
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         for (_key, val_bytes) in entries {
-            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
                 let mut classes = serde_json::Map::new();
                 for (name, class) in &ontology.classes {
                     let mut class_info = serde_json::Map::new();
@@ -988,6 +997,30 @@ impl QueryExecutor {
                         "no active transaction to roll back".to_string()
                     )),
                 }
+            }
+            QueryAst::Backup { path } => {
+                let backup_dir = std::path::Path::new(path);
+                let manifest = engine.backup(backup_dir)?;
+                Ok(QueryResult::Success(format!(
+                    "Backup completed: {} files, {} bytes total → {}",
+                    manifest.files.len(),
+                    manifest.files.iter().map(|f| f.size).sum::<u64>(),
+                    path
+                )))
+            }
+            QueryAst::Restore { path } => {
+                let backup_dir = std::path::Path::new(path);
+                let data_dir = engine.data_dir();
+                let manifest = onto_storage::LsmEngine::restore(backup_dir, &data_dir)?;
+                Ok(QueryResult::Success(format!(
+                    "Restore completed: {} files restored from {}",
+                    manifest.files.len(),
+                    path
+                )))
+            }
+            QueryAst::Flush => {
+                engine.flush()?;
+                Ok(QueryResult::Success("MemTable flushed to SSTable".to_string()))
             }
             _ => {
                 // For SELECT queries, check plan cache first
@@ -1886,7 +1919,7 @@ impl QueryExecutor {
         let mut disjoint = HashSet::new();
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         for (_key, val_bytes) in entries {
-            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
                 if let Some(class_def) = ontology.classes.get(class) {
                     for d in &class_def.disjoint_with {
                         disjoint.insert(d.clone());
@@ -3284,7 +3317,7 @@ impl QueryExecutor {
         // Scan ontologies directly (read-only)
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         for (_key, val_bytes) in entries {
-            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
                 if ontology.classes.contains_key(table) {
                     let reasoner = Reasoner::new(ontology.clone());
                     let probe_triple = onto_ontology::Triple::type_of("__probe__", table);
@@ -3444,7 +3477,7 @@ impl QueryExecutor {
 
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         for (_key, val_bytes) in entries {
-            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
                 if let Some(prop_def) = ontology.properties.get(property) {
                     for equiv in &prop_def.equivalent_properties {
                         aliases.insert(equiv.clone());
@@ -5264,7 +5297,7 @@ impl QueryExecutor {
 
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         for (_key, val_bytes) in entries {
-            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
                 if let Some(prop_def) = ontology.properties.get(property) {
                     for equiv in &prop_def.equivalent_properties {
                         aliases.insert(equiv.clone());
@@ -5313,7 +5346,7 @@ impl QueryExecutor {
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         let mut result = None;
         for (_key, val_bytes) in entries {
-            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
                 if let Some(prop_def) = ontology.properties.get(property) {
                     if let Some(ref inverse) = prop_def.inverse_of {
                         result = Some(inverse.clone());
@@ -5343,7 +5376,7 @@ impl QueryExecutor {
     fn is_transitive_property(&self, engine: &LsmEngine, property: &str) -> bool {
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         for (_key, val_bytes) in entries {
-            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
                 if let Some(prop_def) = ontology.properties.get(property) {
                     return prop_def.is_transitive;
                 }
@@ -5356,7 +5389,7 @@ impl QueryExecutor {
     fn is_symmetric_property(&self, engine: &LsmEngine, property: &str) -> bool {
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         for (_key, val_bytes) in entries {
-            if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(&val_bytes) {
+            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
                 if let Some(prop_def) = ontology.properties.get(property) {
                     return prop_def.is_symmetric;
                 }

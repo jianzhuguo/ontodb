@@ -85,21 +85,24 @@ impl Reasoner {
         let mut all_inferred: Vec<Triple> = Vec::new();
         let mut rule_counts: HashMap<RuleId, usize> = HashMap::new();
         let mut iterations = 0;
+        let mut new_facts: Vec<Triple> = Vec::new(); // tracks facts added in previous iteration
 
         for _iter in 0..self.max_iterations {
             iterations += 1;
             let mut new_this_round: Vec<Triple> = Vec::new();
 
             for rule in &self.rules {
-                let inferred = rule.apply(&self.ontology, &all_facts);
+                let inferred = rule.apply(&self.ontology, &all_facts, &new_facts);
                 *rule_counts.entry(rule.id()).or_insert(0) += inferred.len();
                 new_this_round.extend(inferred);
             }
 
             // Deduplicate: only add triples not already known
+            new_facts.clear();
             let before = all_facts.len();
             for t in new_this_round {
                 if all_facts.insert(t.clone()) {
+                    new_facts.push(t.clone());
                     all_inferred.push(t);
                 }
             }
@@ -211,23 +214,28 @@ impl Reasoner {
         // Simple explanation: re-run rules one at a time and track which rule produced the target
         let mut all_facts: HashSet<Triple> = facts.iter().cloned().collect();
         let mut steps = Vec::new();
+        let mut new_facts: Vec<Triple> = Vec::new();
 
         for _iter in 0..self.max_iterations {
             let mut found = false;
+            let mut new_this_round: Vec<Triple> = Vec::new();
             for rule in &self.rules {
-                let inferred = rule.apply(&self.ontology, &all_facts);
-                for t in &inferred {
-                    if t == target && !all_facts.contains(t) {
+                let inferred = rule.apply(&self.ontology, &all_facts, &new_facts);
+                for t in inferred {
+                    if &t == target && !all_facts.contains(&t) {
                         steps.push(DerivationStep {
                             rule: rule.id(),
                             conclusion: t.clone(),
-                            premises: find_premises(&self.ontology, rule.id(), t, &all_facts),
+                            premises: find_premises(&self.ontology, rule.id(), &t, &all_facts),
                         });
                         found = true;
                     }
-                    all_facts.insert(t.clone());
+                    if all_facts.insert(t.clone()) {
+                        new_this_round.push(t);
+                    }
                 }
             }
+            new_facts = new_this_round;
             if found || all_facts.contains(target) {
                 break;
             }
