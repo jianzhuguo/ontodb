@@ -5,6 +5,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use parking_lot::RwLock as PLRwLock;
 
+use onto_core::EntityId;
+
 use crate::error::GraphError;
 use crate::model::{Edge, PropertyMap, Vertex};
 use crate::traversal::Direction;
@@ -627,6 +629,156 @@ impl GraphStore {
         let json = std::fs::read_to_string(path).map_err(|e| GraphError::StorageError(e.to_string()))?;
         self.import_json(&json)
     }
+
+    // ── EntityId Integration ──────────────────────────────────────
+
+    /// Create or update a graph vertex from an EntityId.
+    ///
+    /// If the vertex already exists, does nothing (idempotent).
+    /// The vertex ID will be `{class}::{pk}` — shared with relational storage.
+    pub fn upsert_vertex_from_entity(
+        &self,
+        entity_id: &EntityId,
+        labels: &[String],
+    ) -> Result<(), GraphError> {
+        let vertex_id = entity_id.to_vertex_id();
+        if self.get_vertex(&vertex_id).is_some() {
+            return Ok(()); // already exists
+        }
+        let vertex = Vertex::new(&vertex_id, labels.to_vec());
+        self.add_vertex(vertex)
+    }
+
+    /// Create or update a graph vertex with properties from an EntityId.
+    pub fn upsert_vertex_from_entity_with_props(
+        &self,
+        entity_id: &EntityId,
+        labels: &[String],
+        properties: PropertyMap,
+    ) -> Result<(), GraphError> {
+        let vertex_id = entity_id.to_vertex_id();
+        if let Some(mut existing) = self.get_vertex(&vertex_id) {
+            // Update properties
+            for (k, v) in properties {
+                existing.properties.insert(k, v);
+            }
+            self.update_vertex(&vertex_id, existing.properties)?;
+            return Ok(());
+        }
+        let mut vertex = Vertex::new(&vertex_id, labels.to_vec());
+        vertex.properties = properties;
+        self.add_vertex(vertex)
+    }
+
+    /// Delete a graph vertex by EntityId (cascades to edges).
+    pub fn delete_vertex_by_entity(&self, entity_id: &EntityId) -> Result<(), GraphError> {
+        let vertex_id = entity_id.to_vertex_id();
+        if self.get_vertex(&vertex_id).is_some() {
+            self.delete_vertex(&vertex_id)?;
+        }
+        Ok(())
+    }
+
+    /// Add a relationship (directed edge) between two entities.
+    ///
+    /// Creates vertices if they don't exist.
+    pub fn add_relationship(
+        &self,
+        from: &EntityId,
+        to: &EntityId,
+        label: &str,
+    ) -> Result<(), GraphError> {
+        self.add_relationship_with_props(from, to, label, PropertyMap::new())
+    }
+
+    /// Add a relationship with properties between two entities.
+    pub fn add_relationship_with_props(
+        &self,
+        from: &EntityId,
+        to: &EntityId,
+        label: &str,
+        properties: PropertyMap,
+    ) -> Result<(), GraphError> {
+        let from_id = from.to_vertex_id();
+        let to_id = to.to_vertex_id();
+
+        // Ensure both vertices exist
+        if self.get_vertex(&from_id).is_none() {
+            self.add_vertex(Vertex::new(&from_id, vec![from.class().to_string()]))?;
+        }
+        if self.get_vertex(&to_id).is_none() {
+            self.add_vertex(Vertex::new(&to_id, vec![to.class().to_string()]))?;
+        }
+
+        let edge_id = format!("{}->{}::{}", from_id, to_id, label);
+        let mut edge = Edge::new(&edge_id, &from_id, &to_id, label);
+        edge.properties = properties;
+        self.add_edge(edge)
+    }
+
+    /// Delete a relationship between two entities.
+    pub fn delete_relationship(
+        &self,
+        from: &EntityId,
+        to: &EntityId,
+        label: &str,
+    ) -> Result<(), GraphError> {
+        let from_id = from.to_vertex_id();
+        let to_id = to.to_vertex_id();
+        let edge_id = format!("{}->{}::{}", from_id, to_id, label);
+        if self.get_edge(&edge_id).is_some() {
+            self.delete_edge(&edge_id)?;
+        }
+        Ok(())
+    }
+
+    /// Get neighboring entities (outgoing, incoming, or both).
+    pub fn get_entity_neighbors(
+        &self,
+        entity_id: &EntityId,
+        direction: Direction,
+        edge_label: Option<&str>,
+    ) -> Vec<EntityId> {
+        let vertex_id = entity_id.to_vertex_id();
+        let edges = match direction {
+            Direction::Out => self.get_out_edges(&vertex_id),
+            Direction::In => self.get_in_edges(&vertex_id),
+            Direction::Both => {
+                let mut e = self.get_out_edges(&vertex_id);
+                e.extend(self.get_in_edges(&vertex_id));
+                e
+            }
+        };
+
+        edges.iter()
+            .filter(|e| edge_label.map_or(true, |l| e.label == l))
+            .filter_map(|e| {
+                let target_id = match direction {
+                    Direction::In => &e.from,
+                    _ => &e.to,
+                };
+                EntityId::from_str(target_id)
+            })
+            .collect()
+    }
+
+    /// Get vertex by EntityId.
+    pub fn get_entity_vertex(&self, entity_id: &EntityId) -> Option<Vertex> {
+        self.get_vertex(&entity_id.to_vertex_id())
+    }
+
+    /// Check if an entity exists in the graph.
+    pub fn has_entity(&self, entity_id: &EntityId) -> bool {
+        self.get_vertex(&entity_id.to_vertex_id()).is_some()
+    }
+
+    /// Get all entities of a given class (by label).
+    pub fn get_entities_by_class(&self, class: &str) -> Vec<EntityId> {
+        self.get_vertices_by_label(class)
+            .iter()
+            .filter_map(|v| EntityId::from_str(&v.id))
+            .collect()
+    }
 }
 
 impl Default for GraphStore {
@@ -728,5 +880,176 @@ mod tests {
         assert!(store.get_edge("e1").is_none());
         assert!(store.get_edge("e2").is_none());
         assert!(store.get_edge("e3").is_some());
+    }
+
+    // ── EntityId Integration Tests ──
+
+    #[test]
+    fn test_entity_upsert_vertex() {
+        let store = GraphStore::new();
+        let id = EntityId::new("Product", "001");
+
+        store.upsert_vertex_from_entity(&id, &["Product".to_string()]).unwrap();
+
+        assert!(store.has_entity(&id));
+        let vertex = store.get_entity_vertex(&id).unwrap();
+        assert_eq!(vertex.id, "Product::001");
+        assert_eq!(vertex.labels, vec!["Product"]);
+    }
+
+    #[test]
+    fn test_entity_upsert_idempotent() {
+        let store = GraphStore::new();
+        let id = EntityId::new("Product", "001");
+
+        // First insert
+        store.upsert_vertex_from_entity(&id, &["Product".to_string()]).unwrap();
+        // Second insert should not fail
+        store.upsert_vertex_from_entity(&id, &["Product".to_string()]).unwrap();
+
+        assert!(store.has_entity(&id));
+    }
+
+    #[test]
+    fn test_entity_delete_vertex() {
+        let store = GraphStore::new();
+        let id = EntityId::new("Product", "001");
+
+        store.upsert_vertex_from_entity(&id, &["Product".to_string()]).unwrap();
+        assert!(store.has_entity(&id));
+
+        store.delete_vertex_by_entity(&id).unwrap();
+        assert!(!store.has_entity(&id));
+    }
+
+    #[test]
+    fn test_entity_delete_nonexistent() {
+        let store = GraphStore::new();
+        let id = EntityId::new("Product", "999");
+
+        // Should not fail
+        store.delete_vertex_by_entity(&id).unwrap();
+    }
+
+    #[test]
+    fn test_entity_add_relationship() {
+        let store = GraphStore::new();
+        let product = EntityId::new("Product", "001");
+        let category = EntityId::new("Category", "electronics");
+
+        store.add_relationship(&product, &category, "belongs_to").unwrap();
+
+        let neighbors = store.get_entity_neighbors(&product, Direction::Out, Some("belongs_to"));
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0], category);
+    }
+
+    #[test]
+    fn test_entity_add_relationship_creates_vertices() {
+        let store = GraphStore::new();
+        let from = EntityId::new("Employee", "alice");
+        let to = EntityId::new("Employee", "bob");
+
+        store.add_relationship(&from, &to, "reports_to").unwrap();
+
+        // Both vertices should be auto-created
+        assert!(store.has_entity(&from));
+        assert!(store.has_entity(&to));
+    }
+
+    #[test]
+    fn test_entity_add_relationship_with_props() {
+        let store = GraphStore::new();
+        let from = EntityId::new("Person", "alice");
+        let to = EntityId::new("Person", "bob");
+
+        let mut props = PropertyMap::new();
+        props.insert("since".to_string(), PropValue::Int(2020));
+
+        store.add_relationship_with_props(&from, &to, "knows", props).unwrap();
+
+        let neighbors = store.get_entity_neighbors(&from, Direction::Out, Some("knows"));
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0], to);
+    }
+
+    #[test]
+    fn test_entity_delete_relationship() {
+        let store = GraphStore::new();
+        let from = EntityId::new("Product", "001");
+        let to = EntityId::new("Category", "electronics");
+
+        store.add_relationship(&from, &to, "belongs_to").unwrap();
+        assert_eq!(store.edge_count(), 1);
+
+        store.delete_relationship(&from, &to, "belongs_to").unwrap();
+        assert_eq!(store.edge_count(), 0);
+    }
+
+    #[test]
+    fn test_entity_get_neighbors_both_directions() {
+        let store = GraphStore::new();
+        let alice = EntityId::new("Person", "alice");
+        let bob = EntityId::new("Person", "bob");
+
+        store.add_relationship(&alice, &bob, "knows").unwrap();
+
+        // Outgoing
+        let out = store.get_entity_neighbors(&alice, Direction::Out, None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], bob);
+
+        // Incoming
+        let inp = store.get_entity_neighbors(&bob, Direction::In, None);
+        assert_eq!(inp.len(), 1);
+        assert_eq!(inp[0], alice);
+
+        // Both
+        let both = store.get_entity_neighbors(&alice, Direction::Both, None);
+        assert_eq!(both.len(), 1);
+    }
+
+    #[test]
+    fn test_entity_get_neighbors_filter_label() {
+        let store = GraphStore::new();
+        let alice = EntityId::new("Person", "alice");
+        let bob = EntityId::new("Person", "bob");
+        let company = EntityId::new("Company", "acme");
+
+        store.add_relationship(&alice, &bob, "knows").unwrap();
+        store.add_relationship(&alice, &company, "works_at").unwrap();
+
+        // Filter by label
+        let friends = store.get_entity_neighbors(&alice, Direction::Out, Some("knows"));
+        assert_eq!(friends.len(), 1);
+        assert_eq!(friends[0], bob);
+
+        let workplaces = store.get_entity_neighbors(&alice, Direction::Out, Some("works_at"));
+        assert_eq!(workplaces.len(), 1);
+        assert_eq!(workplaces[0], company);
+    }
+
+    #[test]
+    fn test_entity_get_entities_by_class() {
+        let store = GraphStore::new();
+
+        store.upsert_vertex_from_entity(
+            &EntityId::new("Product", "001"),
+            &["Product".to_string()],
+        ).unwrap();
+        store.upsert_vertex_from_entity(
+            &EntityId::new("Product", "002"),
+            &["Product".to_string()],
+        ).unwrap();
+        store.upsert_vertex_from_entity(
+            &EntityId::new("Category", "electronics"),
+            &["Category".to_string()],
+        ).unwrap();
+
+        let products = store.get_entities_by_class("Product");
+        assert_eq!(products.len(), 2);
+
+        let categories = store.get_entities_by_class("Category");
+        assert_eq!(categories.len(), 1);
     }
 }
