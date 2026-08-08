@@ -304,6 +304,45 @@ impl LsmEngine {
         Ok(())
     }
 
+    /// Batch put: inserts multiple key-value pairs in a single lock acquisition.
+    ///
+    /// This is significantly faster than calling `put()` in a loop because:
+    /// 1. Single write_state lock acquisition for all entries
+    /// 2. WAL entries are written in bulk with a single flush
+    /// 3. MemTable size check only once at the end
+    ///
+    /// Returns the number of entries inserted.
+    pub fn put_batch(&self, entries: Vec<(Key, Value)>) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let count = entries.len();
+        let needs_flush = {
+            let mut ws = self.write_state.write();
+            for (key, value) in entries {
+                let seq = self.next_seq();
+                let entry = Entry::put(key.clone(), value.clone(), seq);
+                ws.wal.append(&entry)?;
+                ws.wal_pending_count += 1;
+                ws.memtable.put_with_seq(key, value, seq);
+            }
+            // Flush WAL buffer once for the entire batch
+            ws.wal.flush_buf()?;
+            if self.options.sync_wal_on_commit {
+                ws.wal.sync()?;
+            }
+            ws.wal_pending_count = 0;
+            ws.memtable.size() >= self.options.memtable_size_limit
+        };
+
+        if needs_flush {
+            self.flush_memtable()?;
+        }
+
+        Ok(count)
+    }
+
     /// Gets a value by key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
         self.drain_compaction_notifications();
@@ -1032,6 +1071,24 @@ impl LsmEngine {
             ))?
             .put(key, value);
         Ok(())
+    }
+
+    /// Batch put within a transaction: buffers multiple entries in a single lock acquisition.
+    ///
+    /// This is much faster than calling `txn_put()` in a loop because the write_state
+    /// lock is acquired only once for all entries.
+    pub fn txn_put_batch(&self, txn_id: SeqNo, entries: Vec<(Key, Value)>) -> Result<usize> {
+        let count = entries.len();
+        let mut ws = self.write_state.write();
+        let txn = ws.txn_manager
+            .get_mut(txn_id)
+            .ok_or_else(|| onto_core::CoreError::InvalidArgument(
+                format!("transaction {} not found or not active", txn_id),
+            ))?;
+        for (key, value) in entries {
+            txn.put(key, value);
+        }
+        Ok(count)
     }
 
     /// Buffers a delete operation in a transaction.

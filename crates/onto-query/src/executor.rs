@@ -1033,6 +1033,10 @@ impl QueryExecutor {
                 engine.flush()?;
                 Ok(QueryResult::Success("MemTable flushed to SSTable".to_string()))
             }
+            QueryAst::Copy { class, file_path, format } => {
+                // COPY uses direct bulk load without transaction for maximum speed
+                self.execute_copy(engine, class, file_path, *format)
+            }
             _ => {
                 // For SELECT queries, check plan cache first
                 let cached_plan = if matches!(ast, QueryAst::Select { .. }) {
@@ -3827,6 +3831,9 @@ impl QueryExecutor {
             QueryAst::Import { class, file_path, format } => {
                 self.execute_import(engine, txn_id, class, file_path, *format)
             }
+            QueryAst::Copy { class, file_path, format } => {
+                self.execute_copy(engine, class, file_path, *format)
+            }
             QueryAst::Select {
                 distinct,
                 columns,
@@ -4579,8 +4586,134 @@ impl QueryExecutor {
         }
     }
 
+    /// Executes a COPY command: direct bulk load without transaction.
+    ///
+    /// This is the fastest import path — uses `engine.put_batch()` directly
+    /// with a single lock acquisition for all rows.
+    ///
+    /// Syntax: COPY <class> FROM '<file_path>' (FORMAT CSV|JSON)
+    fn execute_copy(
+        &self,
+        engine: &LsmEngine,
+        class: &str,
+        file_path: &str,
+        format: crate::parser::ImportFormat,
+    ) -> Result<QueryResult> {
+        use crate::parser::ImportFormat;
+
+        let start = std::time::Instant::now();
+        let content = std::fs::read_to_string(file_path).map_err(|e| {
+            CoreError::InvalidArgument(format!("failed to read file '{}': {}", file_path, e))
+        })?;
+
+        let entries = match format {
+            ImportFormat::Csv => self.parse_csv_to_entries(class, &content)?,
+            ImportFormat::Json => self.parse_json_to_entries(class, &content)?,
+        };
+
+        let count = entries.len();
+        let imported = engine.put_batch(entries)?;
+        let elapsed = start.elapsed();
+
+        let rate = imported as f64 / elapsed.as_secs_f64();
+        Ok(QueryResult::Success(format!(
+            "{} row(s) copied in {:.2}s ({:.0} rows/sec)",
+            imported, elapsed.as_secs_f64(), rate
+        )))
+    }
+
+    /// Parse CSV content into batch entries (key, value pairs).
+    fn parse_csv_to_entries(&self, class: &str, content: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(content.as_bytes());
+
+        let headers: Vec<String> = reader.headers()
+            .map_err(|e| CoreError::InvalidArgument(format!("CSV header error: {}", e)))?
+            .iter()
+            .map(|h| h.trim().to_string())
+            .collect();
+
+        if headers.is_empty() {
+            return Err(CoreError::InvalidArgument("CSV file has no headers".to_string()));
+        }
+
+        let mut entries = Vec::new();
+
+        for result in reader.records() {
+            let record = result.map_err(|e| {
+                CoreError::InvalidArgument(format!("CSV parse error: {}", e))
+            })?;
+
+            let mut doc = serde_json::Map::new();
+            doc.insert("__class__".to_string(), json!(class));
+
+            for (i, field) in record.iter().enumerate() {
+                if i < headers.len() && !headers[i].is_empty() {
+                    let json_val = self.literal_to_json(&Self::parse_csv_value(field));
+                    let json_val = Self::try_parse_vector(json_val);
+                    doc.insert(headers[i].clone(), json_val);
+                }
+            }
+
+            let key = self.generate_doc_key(class);
+            let value = doc_to_storage_bytes(&doc);
+            entries.push((key, value));
+        }
+
+        Ok(entries)
+    }
+
+    /// Parse JSON content into batch entries (key, value pairs).
+    fn parse_json_to_entries(&self, class: &str, content: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let trimmed = content.trim();
+        let mut entries = Vec::new();
+
+        if trimmed.starts_with('[') {
+            // JSON array
+            let arr: Vec<serde_json::Value> = serde_json::from_str(trimmed)
+                .map_err(|e| CoreError::InvalidArgument(format!("JSON parse error: {}", e)))?;
+
+            for item in arr {
+                if let serde_json::Value::Object(map) = item {
+                    let mut doc = serde_json::Map::new();
+                    doc.insert("__class__".to_string(), json!(class));
+                    for (key, val) in map {
+                        doc.insert(key.clone(), val);
+                    }
+                    let key = self.generate_doc_key(class);
+                    let value = doc_to_storage_bytes(&doc);
+                    entries.push((key, value));
+                }
+            }
+        } else {
+            // JSON Lines
+            for line in trimmed.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let serde_json::Value::Object(map) = serde_json::from_str::<serde_json::Value>(line)
+                    .map_err(|e| CoreError::InvalidArgument(format!("JSON parse error: {}", e)))?
+                {
+                    let mut doc = serde_json::Map::new();
+                    doc.insert("__class__".to_string(), json!(class));
+                    for (key, val) in map {
+                        doc.insert(key.clone(), val);
+                    }
+                    let key = self.generate_doc_key(class);
+                    let value = doc_to_storage_bytes(&doc);
+                    entries.push((key, value));
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
     /// Imports data from CSV content.
     /// First row is treated as header (column names).
+    /// Uses batch API for high-throughput insertion.
     fn execute_import_csv(
         &self,
         engine: &LsmEngine,
@@ -4602,8 +4735,9 @@ impl QueryExecutor {
             return Err(CoreError::InvalidArgument("CSV file has no headers".to_string()));
         }
 
-        let mut imported = 0u64;
-        let mut errors = Vec::new();
+        // Collect all valid rows first, then batch insert
+        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
 
         for (line_num, result) in reader.records().enumerate() {
             let record = match result {
@@ -4614,8 +4748,8 @@ impl QueryExecutor {
                 }
             };
 
-            let mut columns = Vec::new();
-            let mut values = Vec::new();
+            let mut doc = serde_json::Map::new();
+            doc.insert("__class__".to_string(), json!(class));
 
             for (i, field) in record.iter().enumerate() {
                 if i < headers.len() {
@@ -4623,18 +4757,20 @@ impl QueryExecutor {
                     if col.is_empty() {
                         continue;
                     }
-                    columns.push(col.clone());
-                    values.push(Self::parse_csv_value(field));
+                    let json_val = self.literal_to_json(&Self::parse_csv_value(field));
+                    let json_val = Self::try_parse_vector(json_val);
+                    doc.insert(col.clone(), json_val);
                 }
             }
 
-            match self.execute_insert_txn(engine, txn_id, class, &columns, &values) {
-                Ok(_) => imported += 1,
-                Err(e) => {
-                    errors.push(format!("line {}: insert error: {}", line_num + 2, e));
-                }
-            }
+            let key = self.generate_doc_key(class);
+            let value = doc_to_storage_bytes(&doc);
+            batch.push((key, value));
         }
+
+        // Batch insert into transaction buffer
+        let imported = engine.txn_put_batch(txn_id, batch)
+            .map_err(|e| CoreError::InvalidArgument(format!("batch insert error: {}", e)))? as u64;
 
         if errors.is_empty() {
             Ok(QueryResult::Success(format!("{} row(s) imported from CSV", imported)))
@@ -4698,6 +4834,7 @@ impl QueryExecutor {
     }
 
     /// Imports from a JSON array: `[{"col1": "val1"}, ...]`
+    /// Uses batch API for high-throughput insertion.
     fn execute_import_json_array(
         &self,
         engine: &LsmEngine,
@@ -4709,20 +4846,35 @@ impl QueryExecutor {
             CoreError::InvalidArgument(format!("JSON parse error: {}", e))
         })?;
 
-        let mut imported = 0u64;
+        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(arr.len());
         let mut errors = Vec::new();
 
         for (i, item) in arr.iter().enumerate() {
-            match self.import_json_object(engine, txn_id, class, item, i + 1) {
-                Ok(_) => imported += 1,
-                Err(e) => errors.push(format!("item {}: {}", i + 1, e)),
+            match item {
+                serde_json::Value::Object(map) => {
+                    let mut doc = serde_json::Map::new();
+                    doc.insert("__class__".to_string(), json!(class));
+                    for (key, val) in map {
+                        doc.insert(key.clone(), val.clone());
+                    }
+                    let key = self.generate_doc_key(class);
+                    let value = doc_to_storage_bytes(&doc);
+                    batch.push((key, value));
+                }
+                _ => {
+                    errors.push(format!("item {}: expected JSON object", i + 1));
+                }
             }
         }
+
+        let imported = engine.txn_put_batch(txn_id, batch)
+            .map_err(|e| CoreError::InvalidArgument(format!("batch insert error: {}", e)))? as u64;
 
         Self::build_import_result(imported, errors)
     }
 
     /// Imports from JSON Lines format (one JSON object per line).
+    /// Uses batch API for high-throughput insertion.
     fn execute_import_json_lines(
         &self,
         engine: &LsmEngine,
@@ -4730,7 +4882,7 @@ impl QueryExecutor {
         class: &str,
         content: &str,
     ) -> Result<QueryResult> {
-        let mut imported = 0u64;
+        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut errors = Vec::new();
 
         for (line_num, line) in content.lines().enumerate() {
@@ -4747,11 +4899,25 @@ impl QueryExecutor {
                 }
             };
 
-            match self.import_json_object(engine, txn_id, class, &obj, line_num + 1) {
-                Ok(_) => imported += 1,
-                Err(e) => errors.push(format!("line {}: {}", line_num + 1, e)),
+            match obj {
+                serde_json::Value::Object(map) => {
+                    let mut doc = serde_json::Map::new();
+                    doc.insert("__class__".to_string(), json!(class));
+                    for (key, val) in map {
+                        doc.insert(key.clone(), val.clone());
+                    }
+                    let key = self.generate_doc_key(class);
+                    let value = doc_to_storage_bytes(&doc);
+                    batch.push((key, value));
+                }
+                _ => {
+                    errors.push(format!("line {}: expected JSON object", line_num + 1));
+                }
             }
         }
+
+        let imported = engine.txn_put_batch(txn_id, batch)
+            .map_err(|e| CoreError::InvalidArgument(format!("batch insert error: {}", e)))? as u64;
 
         Self::build_import_result(imported, errors)
     }

@@ -147,6 +147,14 @@ pub enum QueryAst {
         format: ImportFormat,
     },
 
+    /// COPY <class> FROM '<file_path>' (FORMAT CSV|JSON)
+    /// Direct bulk load without transaction — fastest path for initial data loading.
+    Copy {
+        class: String,
+        file_path: String,
+        format: ImportFormat,
+    },
+
     /// BEGIN [TRANSACTION]
     Begin,
     /// COMMIT [TRANSACTION]
@@ -401,6 +409,7 @@ impl QueryAst {
             QueryAst::Update { .. } => false,
             QueryAst::Delete { .. } => false,
             QueryAst::Import { .. } => false,
+            QueryAst::Copy { .. } => false,
 
             // DDL
             QueryAst::CreateOntology { .. } => false,
@@ -735,6 +744,8 @@ impl QueryParser {
             Ok(QueryAst::Rollback)
         } else if starts_with("IMPORT") {
             Self::parse_import(input)
+        } else if starts_with("COPY") {
+            Self::parse_copy(input)
         } else if starts_with("INSERT") {
             Self::parse_insert(input)
         } else if starts_with("SELECT") {
@@ -994,6 +1005,49 @@ impl QueryParser {
         let file_path = after_from[path_start + 1..path_start + 1 + path_end].to_string();
 
         Ok(QueryAst::Import { class, file_path, format })
+    }
+
+    /// Parses COPY <class> FROM '<file_path>' (FORMAT CSV|JSON)
+    /// PostgreSQL-compatible bulk load syntax.
+    fn parse_copy(input: &str) -> Result<QueryAst> {
+        // COPY <class> FROM '<path>' (FORMAT CSV|JSON)
+        let after_copy = input[4..].trim();
+
+        let from_pos = find_ignore_ascii_case(after_copy, " FROM ")
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'FROM' in COPY".to_string()))?;
+
+        let class = after_copy[..from_pos].trim().to_string();
+        if class.is_empty() {
+            return Err(CoreError::InvalidArgument("missing class name in COPY".to_string()));
+        }
+
+        let after_from = after_copy[from_pos + 6..].trim();
+
+        // Extract file path (between quotes)
+        let path_start = after_from.find('\'')
+            .or_else(|| after_from.find('"'))
+            .ok_or_else(|| CoreError::InvalidArgument("expected quoted file path in COPY".to_string()))?;
+        let quote_char = after_from.as_bytes()[path_start] as char;
+        let path_end = after_from[path_start + 1..].find(quote_char)
+            .ok_or_else(|| CoreError::InvalidArgument("unterminated file path in COPY".to_string()))?;
+        let file_path = after_from[path_start + 1..path_start + 1 + path_end].to_string();
+
+        // Optional FORMAT clause
+        let after_path = after_from[path_start + 1 + path_end + 1..].trim();
+        let format = if after_path.to_uppercase().starts_with("FORMAT CSV") {
+            ImportFormat::Csv
+        } else if after_path.to_uppercase().starts_with("FORMAT JSON") {
+            ImportFormat::Json
+        } else {
+            // Default: detect by file extension
+            if file_path.ends_with(".csv") {
+                ImportFormat::Csv
+            } else {
+                ImportFormat::Json
+            }
+        };
+
+        Ok(QueryAst::Copy { class, file_path, format })
     }
 
     fn parse_insert(input: &str) -> Result<QueryAst> {
