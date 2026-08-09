@@ -10,6 +10,7 @@ pub mod binary_row;
 pub mod entity;
 pub mod error;
 pub mod geo;
+pub mod time_series;
 pub mod types;
 pub mod value;
 
