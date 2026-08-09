@@ -6554,6 +6554,134 @@ impl QueryExecutor {
                     Ok(Value::Null)
                 }
             }
+            // ── Time Series Functions ──
+            "TS_MEAN" => {
+                // TS_MEAN(array) → mean of numeric array
+                if let Some(Value::Array(arr)) = args.first() {
+                    let values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+                    if values.is_empty() {
+                        Ok(Value::Null)
+                    } else {
+                        let mean = values.iter().sum::<f64>() / values.len() as f64;
+                        Ok(json!(mean))
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "TS_STDDEV" => {
+                // TS_STDDEV(array) → standard deviation of numeric array
+                if let Some(Value::Array(arr)) = args.first() {
+                    let values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+                    if values.is_empty() {
+                        Ok(Value::Null)
+                    } else {
+                        let mean = values.iter().sum::<f64>() / values.len() as f64;
+                        let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+                        Ok(json!(var.sqrt()))
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "TS_MIN" => {
+                // TS_MIN(array) → minimum value
+                if let Some(Value::Array(arr)) = args.first() {
+                    let min = arr.iter().filter_map(|v| v.as_f64()).fold(f64::INFINITY, f64::min);
+                    if min == f64::INFINITY { Ok(Value::Null) } else { Ok(json!(min)) }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "TS_MAX" => {
+                // TS_MAX(array) → maximum value
+                if let Some(Value::Array(arr)) = args.first() {
+                    let max = arr.iter().filter_map(|v| v.as_f64()).fold(f64::NEG_INFINITY, f64::max);
+                    if max == f64::NEG_INFINITY { Ok(Value::Null) } else { Ok(json!(max)) }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "TS_COUNT" => {
+                // TS_COUNT(array) → count of non-null values
+                if let Some(Value::Array(arr)) = args.first() {
+                    let count = arr.iter().filter(|v| !v.is_null()).count();
+                    Ok(json!(count))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "TS_SUM" => {
+                // TS_SUM(array) → sum of numeric values
+                if let Some(Value::Array(arr)) = args.first() {
+                    let sum: f64 = arr.iter().filter_map(|v| v.as_f64()).sum();
+                    Ok(json!(sum))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "TS_ANOMALY_DETECT" => {
+                // TS_ANOMALY_DETECT(array, threshold) → array of anomalous indices
+                if let Some(Value::Array(arr)) = args.first() {
+                    let values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+                    let threshold = args.get(1).and_then(|v| v.as_f64()).unwrap_or(2.0);
+                    let anomalies = onto_core::time_series::detect_anomalies(&values, threshold);
+                    Ok(Value::Array(anomalies.into_iter().map(|i| json!(i)).collect()))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "TS_DTW" => {
+                // TS_DTW(array1, array2) → DTW distance between two sequences
+                if args.len() >= 2 {
+                    match (&args[0], &args[1]) {
+                        (Value::Array(a1), Value::Array(a2)) => {
+                            let v1: Vec<f64> = a1.iter().filter_map(|v| v.as_f64()).collect();
+                            let v2: Vec<f64> = a2.iter().filter_map(|v| v.as_f64()).collect();
+                            let distance = onto_core::time_series::dtw_distance(&v1, &v2, None);
+                            Ok(json!(distance))
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "TS_PERCENTILE" => {
+                // TS_PERCENTILE(array, percentile) → percentile value
+                if let Some(Value::Array(arr)) = args.first() {
+                    let mut values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+                    let percentile = args.get(1).and_then(|v| v.as_f64()).unwrap_or(50.0) / 100.0;
+                    if values.is_empty() {
+                        Ok(Value::Null)
+                    } else {
+                        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let idx = (percentile * (values.len() - 1) as f64).round() as usize;
+                        Ok(json!(values[idx.min(values.len() - 1)]))
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "TS_MEDIAN" => {
+                // TS_MEDIAN(array) → median value
+                if let Some(Value::Array(arr)) = args.first() {
+                    let mut values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+                    if values.is_empty() {
+                        Ok(Value::Null)
+                    } else {
+                        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let mid = values.len() / 2;
+                        if values.len() % 2 == 0 {
+                            Ok(json!((values[mid - 1] + values[mid]) / 2.0))
+                        } else {
+                            Ok(json!(values[mid]))
+                        }
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
             _ => Err(CoreError::InvalidArgument(format!("unknown function: {}", name))),
         }
     }
