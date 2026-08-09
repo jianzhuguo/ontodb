@@ -103,28 +103,191 @@ impl Geometry {
     }
 }
 
-// ── Spatial Predicates ──
+// ── Spatial Predicates (Nine-Intersection Model) ──
 
-/// Check if geometry A contains geometry B.
-pub fn contains(a: &Geometry, b: &Geometry) -> bool {
+/// Spatial relationship type based on DE-9IM (Dimensionally Extended
+/// 9-Intersection Model).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpatialRelation {
+    /// Geometries are identical.
+    Equals,
+    /// Geometries have no points in common.
+    Disjoint,
+    /// Geometries share at least one point.
+    Intersects,
+    /// Geometries touch at boundary but don't overlap.
+    Touches,
+    /// Geometries cross (different dimensions).
+    Crosses,
+    /// Geometry A is completely inside B.
+    Within,
+    /// Geometry A completely contains B.
+    Contains,
+    /// Geometries overlap with same dimension.
+    Overlaps,
+}
+
+/// Check all spatial relationships between two geometries.
+pub fn relate(a: &Geometry, b: &Geometry) -> SpatialRelation {
+    if equals(a, b) {
+        return SpatialRelation::Equals;
+    }
+    if !intersects(a, b) {
+        return SpatialRelation::Disjoint;
+    }
+    if contains(a, b) {
+        return SpatialRelation::Contains;
+    }
+    if within(a, b) {
+        return SpatialRelation::Within;
+    }
+    if touches(a, b) {
+        return SpatialRelation::Touches;
+    }
+    if crosses(a, b) {
+        return SpatialRelation::Crosses;
+    }
+    if overlaps(a, b) {
+        return SpatialRelation::Overlaps;
+    }
+    SpatialRelation::Intersects
+}
+
+/// Check if geometry A equals geometry B.
+pub fn equals(a: &Geometry, b: &Geometry) -> bool {
     match (a, b) {
-        (Geometry::Polygon(rings), Geometry::Point(p)) => {
+        (Geometry::Point(p1), Geometry::Point(p2)) => p1 == p2,
+        (Geometry::LineString(l1), Geometry::LineString(l2)) => l1 == l2,
+        (Geometry::Polygon(r1), Geometry::Polygon(r2)) => r1 == r2,
+        _ => false,
+    }
+}
+
+/// Check if geometry A is disjoint from geometry B.
+pub fn disjoint(a: &Geometry, b: &Geometry) -> bool {
+    !intersects(a, b)
+}
+
+/// Check if geometry A intersects geometry B.
+///
+/// Uses bounding box as fast pre-check, then precise geometry test.
+pub fn intersects(a: &Geometry, b: &Geometry) -> bool {
+    // Fast bounding box check
+    let bb_a = a.bounding_box();
+    let bb_b = b.bounding_box();
+    if !bbox_intersects(&bb_a, &bb_b) {
+        return false;
+    }
+
+    // Precise geometry check
+    match (a, b) {
+        (Geometry::Point(p), _) => point_in_geometry(p, b),
+        (_, Geometry::Point(p)) => point_in_geometry(p, a),
+        (Geometry::Polygon(rings_a), Geometry::Polygon(rings_b)) => {
+            polygon_intersects_polygon(rings_a, rings_b)
+        }
+        _ => true, // Conservative: assume intersects if bboxes overlap
+    }
+}
+
+/// Check if geometry A touches geometry B (share boundary, no interior overlap).
+pub fn touches(a: &Geometry, b: &Geometry) -> bool {
+    match (a, b) {
+        (Geometry::Point(p), Geometry::Polygon(rings)) => {
             if let Some(outer) = rings.first() {
-                point_in_polygon(p, outer)
+                point_on_boundary(p, outer)
             } else {
                 false
             }
         }
-        _ => false, // Other combinations not yet implemented
+        (Geometry::Polygon(rings), Geometry::Point(p)) => {
+            if let Some(outer) = rings.first() {
+                point_on_boundary(p, outer)
+            } else {
+                false
+            }
+        }
+        (Geometry::Polygon(rings_a), Geometry::Polygon(rings_b)) => {
+            // Two polygons touch if they share a boundary point but no interior
+            if let (Some(outer_a), Some(outer_b)) = (rings_a.first(), rings_b.first()) {
+                let has_boundary_contact = outer_a.iter().any(|p| point_on_boundary(p, outer_b))
+                    || outer_b.iter().any(|p| point_on_boundary(p, outer_a));
+                let has_interior_overlap = polygon_intersects_polygon(rings_a, rings_b)
+                    && !has_boundary_contact;
+                has_boundary_contact && !has_interior_overlap
+            } else {
+                false
+            }
+        }
+        _ => false,
     }
 }
 
-/// Check if geometry A intersects geometry B (bounding box overlap).
-pub fn intersects(a: &Geometry, b: &Geometry) -> bool {
-    let (min_x1, min_y1, max_x1, max_y1) = a.bounding_box();
-    let (min_x2, min_y2, max_x2, max_y2) = b.bounding_box();
+/// Check if geometry A crosses geometry B (different dimensions intersect).
+pub fn crosses(a: &Geometry, b: &Geometry) -> bool {
+    match (a, b) {
+        (Geometry::LineString(_), Geometry::Polygon(_)) => {
+            // Line crosses polygon if it intersects but is not fully contained
+            intersects(a, b) && !within(a, b)
+        }
+        (Geometry::Polygon(_), Geometry::LineString(_)) => {
+            intersects(a, b) && !within(b, a)
+        }
+        (Geometry::LineString(l1), Geometry::LineString(l2)) => {
+            // Two lines cross if they intersect at a point (not overlapping)
+            line_intersects_line(l1, l2)
+        }
+        _ => false,
+    }
+}
 
-    min_x1 <= max_x2 && max_x1 >= min_x2 && min_y1 <= max_y2 && max_y1 >= min_y2
+/// Check if geometry A is completely within geometry B.
+pub fn within(a: &Geometry, b: &Geometry) -> bool {
+    contains(b, a)
+}
+
+/// Check if geometry A completely contains geometry B.
+pub fn contains(a: &Geometry, b: &Geometry) -> bool {
+    match (a, b) {
+        (Geometry::Polygon(rings), Geometry::Point(p)) => {
+            if let Some(outer) = rings.first() {
+                point_in_polygon(p, outer) && !point_on_boundary(p, outer)
+            } else {
+                false
+            }
+        }
+        (Geometry::Polygon(rings_a), Geometry::Polygon(rings_b)) => {
+            if let (Some(outer_a), Some(outer_b)) = (rings_a.first(), rings_b.first()) {
+                // All points of B must be inside A
+                outer_b.iter().all(|p| point_in_polygon(p, outer_a))
+            } else {
+                false
+            }
+        }
+        (Geometry::Polygon(rings), Geometry::LineString(coords)) => {
+            if let Some(outer) = rings.first() {
+                coords.iter().all(|p| point_in_polygon(p, outer))
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Check if geometry A overlaps geometry B (same dimension, partial overlap).
+pub fn overlaps(a: &Geometry, b: &Geometry) -> bool {
+    match (a, b) {
+        (Geometry::Polygon(rings_a), Geometry::Polygon(rings_b)) => {
+            // Two polygons overlap if they intersect but neither contains the other
+            intersects(a, b) && !contains(a, b) && !contains(b, a)
+        }
+        (Geometry::LineString(l1), Geometry::LineString(l2)) => {
+            // Two lines overlap if they share a segment
+            intersects(a, b) && !within(a, b) && !within(b, a)
+        }
+        _ => false,
+    }
 }
 
 /// Calculate distance between two geometries (meters).
@@ -486,6 +649,114 @@ fn haversine_distance(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
     R * c
 }
 
+/// Check if two bounding boxes intersect.
+fn bbox_intersects(a: &(f64, f64, f64, f64), b: &(f64, f64, f64, f64)) -> bool {
+    a.0 <= b.2 && a.2 >= b.0 && a.1 <= b.3 && a.3 >= b.1
+}
+
+/// Check if a point is inside any part of a geometry.
+fn point_in_geometry(point: &Coord, geo: &Geometry) -> bool {
+    match geo {
+        Geometry::Point(p) => point == p,
+        Geometry::LineString(coords) => point_on_linestring(point, coords),
+        Geometry::Polygon(rings) => {
+            if let Some(outer) = rings.first() {
+                point_in_polygon(point, outer)
+            } else {
+                false
+            }
+        }
+        Geometry::MultiPolygon(polys) => polys.iter().any(|poly| {
+            if let Some(outer) = poly.first() {
+                point_in_polygon(point, outer)
+            } else {
+                false
+            }
+        }),
+    }
+}
+
+/// Check if a point is on a linestring.
+fn point_on_linestring(point: &Coord, coords: &[Coord]) -> bool {
+    for window in coords.windows(2) {
+        if point_on_line_segment(point, &window[0], &window[1]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a point is on a line segment.
+fn point_on_line_segment(point: &Coord, a: &Coord, b: &Coord) -> bool {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-10 {
+        return (point.x - a.x).abs() < 1e-10 && (point.y - a.y).abs() < 1e-10;
+    }
+    let t = ((point.x - a.x) * dx + (point.y - a.y) * dy) / len_sq;
+    if t < 0.0 || t > 1.0 {
+        return false;
+    }
+    let proj_x = a.x + t * dx;
+    let proj_y = a.y + t * dy;
+    ((point.x - proj_x).powi(2) + (point.y - proj_y).powi(2)).sqrt() < 1e-10
+}
+
+/// Check if a point is on the boundary of a polygon.
+fn point_on_boundary(point: &Coord, polygon: &[Coord]) -> bool {
+    for window in polygon.windows(2) {
+        if point_on_line_segment(point, &window[0], &window[1]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if two polygons intersect.
+fn polygon_intersects_polygon(rings_a: &[Vec<Coord>], rings_b: &[Vec<Coord>]) -> bool {
+    if let (Some(outer_a), Some(outer_b)) = (rings_a.first(), rings_b.first()) {
+        // Check if any point of A is inside B or vice versa
+        outer_a.iter().any(|p| point_in_polygon(p, outer_b))
+            || outer_b.iter().any(|p| point_in_polygon(p, outer_a))
+    } else {
+        false
+    }
+}
+
+/// Check if two linestrings intersect.
+fn line_intersects_line(l1: &[Coord], l2: &[Coord]) -> bool {
+    for w1 in l1.windows(2) {
+        for w2 in l2.windows(2) {
+            if segments_intersect(&w1[0], &w1[1], &w2[0], &w2[1]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if two line segments intersect.
+fn segments_intersect(a: &Coord, b: &Coord, c: &Coord, d: &Coord) -> bool {
+    let d1 = direction(c, d, a);
+    let d2 = direction(c, d, b);
+    let d3 = direction(a, b, c);
+    let d4 = direction(a, b, d);
+
+    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Cross product direction.
+fn direction(a: &Coord, b: &Coord, c: &Coord) -> f64 {
+    (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)
+}
+
 // ── Tests ──
 
 #[cfg(test)]
@@ -621,5 +892,95 @@ mod tests {
         assert_eq!(min_y, 2.0);
         assert_eq!(max_x, 5.0);
         assert_eq!(max_y, 8.0);
+    }
+
+    // ── Nine-Intersection Model Tests ──
+
+    fn make_square(x: f64, y: f64, size: f64) -> Geometry {
+        Geometry::Polygon(vec![vec![
+            Coord::new(x, y),
+            Coord::new(x + size, y),
+            Coord::new(x + size, y + size),
+            Coord::new(x, y + size),
+            Coord::new(x, y),
+        ]])
+    }
+
+    #[test]
+    fn test_contains_point() {
+        let poly = make_square(0.0, 0.0, 10.0);
+        let inside = Geometry::Point(Coord::new(5.0, 5.0));
+        let outside = Geometry::Point(Coord::new(15.0, 15.0));
+        let on_boundary = Geometry::Point(Coord::new(0.0, 5.0));
+
+        assert!(contains(&poly, &inside));
+        assert!(!contains(&poly, &outside));
+        assert!(!contains(&poly, &on_boundary)); // Boundary is not interior
+    }
+
+    #[test]
+    fn test_within() {
+        let poly = make_square(0.0, 0.0, 10.0);
+        let inside = Geometry::Point(Coord::new(5.0, 5.0));
+
+        assert!(within(&inside, &poly));
+        assert!(!within(&poly, &inside));
+    }
+
+    #[test]
+    fn test_disjoint() {
+        let a = make_square(0.0, 0.0, 10.0);
+        let b = make_square(20.0, 20.0, 10.0);
+
+        assert!(disjoint(&a, &b));
+        assert!(!intersects(&a, &b));
+    }
+
+    #[test]
+    fn test_intersects_polygons() {
+        let a = make_square(0.0, 0.0, 10.0);
+        let b = make_square(5.0, 5.0, 10.0);
+        let c = make_square(20.0, 20.0, 10.0);
+
+        assert!(intersects(&a, &b));
+        assert!(!intersects(&a, &c));
+    }
+
+    #[test]
+    fn test_overlaps() {
+        let a = make_square(0.0, 0.0, 10.0);
+        let b = make_square(5.0, 5.0, 10.0);
+
+        assert!(overlaps(&a, &b));
+    }
+
+    #[test]
+    fn test_contains_polygon() {
+        let outer = make_square(0.0, 0.0, 20.0);
+        let inner = make_square(5.0, 5.0, 5.0);
+
+        assert!(contains(&outer, &inner));
+        assert!(!contains(&inner, &outer));
+    }
+
+    #[test]
+    fn test_equals() {
+        let a = make_square(0.0, 0.0, 10.0);
+        let b = make_square(0.0, 0.0, 10.0);
+        let c = make_square(5.0, 5.0, 10.0);
+
+        assert!(equals(&a, &b));
+        assert!(!equals(&a, &c));
+    }
+
+    #[test]
+    fn test_relate() {
+        let a = make_square(0.0, 0.0, 10.0);
+        let b = make_square(5.0, 5.0, 10.0);
+        let c = make_square(20.0, 20.0, 10.0);
+
+        assert_eq!(relate(&a, &a), SpatialRelation::Equals);
+        assert_eq!(relate(&a, &c), SpatialRelation::Disjoint);
+        assert_eq!(relate(&a, &b), SpatialRelation::Overlaps);
     }
 }
