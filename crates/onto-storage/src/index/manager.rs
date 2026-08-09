@@ -665,10 +665,16 @@ mod tests {
         // Corrupted file should be deleted
         assert!(!idx_path.exists(), "corrupted .idx file should be deleted");
 
-        // Now rebuild from LSM entries
+        // Now rebuild from LSM entries (use current encode_value format)
+        let encoded_100 = IndexManager::encode_value(&json!(100));
+        let encoded_200 = IndexManager::encode_value(&json!(200));
+        let key1 = format!("__idx__Product__price::{}::pk1",
+            String::from_utf8_lossy(&encoded_100));
+        let key2 = format!("__idx__Product__price::{}::pk2",
+            String::from_utf8_lossy(&encoded_200));
         let entries = vec![
-            (b"__idx__Product__price::00000000000000000100::pk1".to_vec(), Vec::new()),
-            (b"__idx__Product__price::00000000000000000200::pk2".to_vec(), Vec::new()),
+            (key1.into_bytes(), Vec::new()),
+            (key2.into_bytes(), Vec::new()),
         ];
         mgr.rebuild_from_entries(&entries);
 

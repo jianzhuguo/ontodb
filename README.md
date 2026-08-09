@@ -119,6 +119,50 @@ curl http://localhost:7912/api/health
 curl http://localhost:7912/metrics
 ```
 
+## Performance
+
+Benchmarked on Windows x86_64, 100K rows, release build with optimizations.
+
+### Storage Engine
+
+| Operation | QPS | Latency (P50) | Notes |
+|-----------|-----|---------------|-------|
+| **Write (put)** | **1,010,863/s** | ~1µs | WAL batch sync |
+| **Read (get)** | **1,298,431/s** | ~0.77µs | MemTable hit |
+| **Batch write (put_batch)** | **1,328,256/s** | ~0.75µs | Single lock acquisition |
+| Sequential scan | 4,553/s | 109.8ms | 100K rows, 200 iterations |
+
+### Concurrent Scan (100K rows, 200 iterations)
+
+| Threads | Time | Speedup |
+|---------|------|---------|
+| 1 | 21.96s | 1.00x |
+| 2 | 13.92s | 1.58x |
+| 4 | 11.06s | 1.99x |
+| 8 | 10.13s | **2.17x** |
+
+### Vector Search (HNSW)
+
+| Dataset | ef_search | Recall@10 | Latency | QPS |
+|---------|-----------|-----------|---------|-----|
+| 1K × 64D | 200 | **100.0%** | 294µs | 3,401 |
+| 1K × 64D | 400 | **100.0%** | 501µs | 1,996 |
+| 5K × 128D | 200 | **100.0%** | 838µs | 1,193 |
+| 5K × 128D | 400 | **100.0%** | 1.28ms | 781 |
+| 10K × 256D | 200 | 99.7% | 3.75ms | 267 |
+| 10K × 256D | 400 | **100.0%** | 4.91ms | 204 |
+
+### Key Metrics Summary
+
+| Metric | Value |
+|--------|-------|
+| Write QPS | **1,010,863** |
+| Read QPS | **1,298,431** |
+| Batch Write QPS | **1,328,256** |
+| Concurrent Scan (8T) | **2.17x** speedup |
+| Vector Recall | **99.7% ~ 100%** |
+| Full Test Suite | **472/472** passing |
+
 ## Architecture
 
 ```
