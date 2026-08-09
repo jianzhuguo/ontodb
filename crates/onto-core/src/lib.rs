@@ -13,6 +13,7 @@ pub mod geo;
 pub mod geohash_index;
 pub mod rtree;
 pub mod spatiotemporal;
+pub mod sttrl;
 pub mod time_series;
 pub mod types;
 pub mod value;
