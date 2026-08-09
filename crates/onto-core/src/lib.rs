@@ -9,6 +9,7 @@
 pub mod binary_row;
 pub mod entity;
 pub mod error;
+pub mod geo;
 pub mod types;
 pub mod value;
 
