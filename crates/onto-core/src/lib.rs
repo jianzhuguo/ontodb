@@ -10,6 +10,7 @@ pub mod binary_row;
 pub mod entity;
 pub mod error;
 pub mod geo;
+pub mod geohash_index;
 pub mod rtree;
 pub mod time_series;
 pub mod types;
