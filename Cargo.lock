@@ -1460,6 +1460,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "csv",
+ "hex",
  "onto-core",
  "onto-graph",
  "onto-ontology",

@@ -6341,6 +6341,219 @@ impl QueryExecutor {
                     Ok(Value::Null)
                 }
             }
+            // ── GIS Functions ──
+            "ST_POINT" => {
+                // ST_POINT(lon, lat) → WKB hex string
+                if args.len() >= 2 {
+                    let lon = args[0].as_f64().unwrap_or(0.0);
+                    let lat = args[1].as_f64().unwrap_or(0.0);
+                    let point = onto_core::geo::Geometry::Point(onto_core::geo::Coord::new(lon, lat));
+                    let wkb = point.to_wkb();
+                    Ok(Value::String(hex::encode(&wkb)))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_DISTANCE" => {
+                // ST_DISTANCE(geom1, geom2) → distance in meters
+                if args.len() >= 2 {
+                    let g1 = parse_geometry_from_value(&args[0]);
+                    let g2 = parse_geometry_from_value(&args[1]);
+                    match (g1, g2) {
+                        (Some(a), Some(b)) => {
+                            let d = onto_core::geo::distance(&a, &b);
+                            Ok(json!(d))
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_CONTAINS" => {
+                // ST_CONTAINS(geom1, geom2) → boolean
+                if args.len() >= 2 {
+                    let g1 = parse_geometry_from_value(&args[0]);
+                    let g2 = parse_geometry_from_value(&args[1]);
+                    match (g1, g2) {
+                        (Some(a), Some(b)) => Ok(Value::Bool(onto_core::geo::contains(&a, &b))),
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_INTERSECTS" => {
+                // ST_INTERSECTS(geom1, geom2) → boolean
+                if args.len() >= 2 {
+                    let g1 = parse_geometry_from_value(&args[0]);
+                    let g2 = parse_geometry_from_value(&args[1]);
+                    match (g1, g2) {
+                        (Some(a), Some(b)) => Ok(Value::Bool(onto_core::geo::intersects(&a, &b))),
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_WITHIN" => {
+                // ST_WITHIN(geom1, geom2) → boolean
+                if args.len() >= 2 {
+                    let g1 = parse_geometry_from_value(&args[0]);
+                    let g2 = parse_geometry_from_value(&args[1]);
+                    match (g1, g2) {
+                        (Some(a), Some(b)) => Ok(Value::Bool(onto_core::geo::within(&a, &b))),
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_OVERLAPS" => {
+                // ST_OVERLAPS(geom1, geom2) → boolean
+                if args.len() >= 2 {
+                    let g1 = parse_geometry_from_value(&args[0]);
+                    let g2 = parse_geometry_from_value(&args[1]);
+                    match (g1, g2) {
+                        (Some(a), Some(b)) => Ok(Value::Bool(onto_core::geo::overlaps(&a, &b))),
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_TOUCHES" => {
+                // ST_TOUCHES(geom1, geom2) → boolean
+                if args.len() >= 2 {
+                    let g1 = parse_geometry_from_value(&args[0]);
+                    let g2 = parse_geometry_from_value(&args[1]);
+                    match (g1, g2) {
+                        (Some(a), Some(b)) => Ok(Value::Bool(onto_core::geo::touches(&a, &b))),
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_CROSSES" => {
+                // ST_CROSSES(geom1, geom2) → boolean
+                if args.len() >= 2 {
+                    let g1 = parse_geometry_from_value(&args[0]);
+                    let g2 = parse_geometry_from_value(&args[1]);
+                    match (g1, g2) {
+                        (Some(a), Some(b)) => Ok(Value::Bool(onto_core::geo::crosses(&a, &b))),
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_DISJOINT" => {
+                // ST_DISJOINT(geom1, geom2) → boolean
+                if args.len() >= 2 {
+                    let g1 = parse_geometry_from_value(&args[0]);
+                    let g2 = parse_geometry_from_value(&args[1]);
+                    match (g1, g2) {
+                        (Some(a), Some(b)) => Ok(Value::Bool(onto_core::geo::disjoint(&a, &b))),
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_EQUALS" => {
+                // ST_EQUALS(geom1, geom2) → boolean
+                if args.len() >= 2 {
+                    let g1 = parse_geometry_from_value(&args[0]);
+                    let g2 = parse_geometry_from_value(&args[1]);
+                    match (g1, g2) {
+                        (Some(a), Some(b)) => Ok(Value::Bool(onto_core::geo::equals(&a, &b))),
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_RELATE" => {
+                // ST_RELATE(geom1, geom2) → relationship string
+                if args.len() >= 2 {
+                    let g1 = parse_geometry_from_value(&args[0]);
+                    let g2 = parse_geometry_from_value(&args[1]);
+                    match (g1, g2) {
+                        (Some(a), Some(b)) => {
+                            let rel = onto_core::geo::relate(&a, &b);
+                            Ok(Value::String(format!("{:?}", rel)))
+                        }
+                        _ => Ok(Value::Null),
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_AS_TEXT" => {
+                // ST_AS_TEXT(geom) → WKT string
+                if let Some(geom) = parse_geometry_from_value(&args[0]) {
+                    Ok(Value::String(geom.to_wkt()))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_FROM_TEXT" => {
+                // ST_FROM_TEXT(wkt) → WKB hex string
+                if let Some(Value::String(wkt)) = args.first() {
+                    if let Some(geom) = onto_core::geo::Geometry::from_wkt(wkt) {
+                        let wkb = geom.to_wkb();
+                        Ok(Value::String(hex::encode(&wkb)))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "GEOHASH" => {
+                // GEOHASH(lat, lon, precision) → geohash string
+                if args.len() >= 2 {
+                    let lat = args[0].as_f64().unwrap_or(0.0);
+                    let lon = args[1].as_f64().unwrap_or(0.0);
+                    let precision = args.get(2).and_then(|v| v.as_i64()).unwrap_or(8) as usize;
+                    Ok(Value::String(onto_core::geo::geohash_encode(lat, lon, precision)))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_X" => {
+                // ST_X(point) → x coordinate (longitude)
+                if let Some(geom) = parse_geometry_from_value(&args[0]) {
+                    if let onto_core::geo::Geometry::Point(c) = geom {
+                        Ok(json!(c.x))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_Y" => {
+                // ST_Y(point) → y coordinate (latitude)
+                if let Some(geom) = parse_geometry_from_value(&args[0]) {
+                    if let onto_core::geo::Geometry::Point(c) = geom {
+                        Ok(json!(c.y))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "ST_GEOMETRY_TYPE" => {
+                // ST_GEOMETRY_TYPE(geom) → geometry type name
+                if let Some(geom) = parse_geometry_from_value(&args[0]) {
+                    Ok(Value::String(geom.geometry_type().to_string()))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
             _ => Err(CoreError::InvalidArgument(format!("unknown function: {}", name))),
         }
     }
@@ -6954,6 +7167,79 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
+    }
+}
+
+/// Parse a geometry from a JSON value.
+///
+/// Supports:
+/// - WKB hex string (from ST_POINT, ST_FROM_TEXT)
+/// - WKT string (e.g., "POINT(116.4 39.9)")
+/// - GeoJSON object
+fn parse_geometry_from_value(val: &Value) -> Option<onto_core::geo::Geometry> {
+    match val {
+        Value::String(s) => {
+            // Try WKB hex first
+            if let Ok(wkb) = hex::decode(s) {
+                if let Some(geom) = onto_core::geo::Geometry::from_wkb(&wkb) {
+                    return Some(geom);
+                }
+            }
+            // Try WKT
+            onto_core::geo::Geometry::from_wkt(s)
+        }
+        Value::Object(map) => {
+            // Try GeoJSON
+            parse_geojson(map)
+        }
+        _ => None,
+    }
+}
+
+/// Parse a GeoJSON object into a Geometry.
+fn parse_geojson(map: &serde_json::Map<String, Value>) -> Option<onto_core::geo::Geometry> {
+    let geom_type = map.get("type")?.as_str()?;
+    let coords = map.get("coordinates")?;
+
+    match geom_type {
+        "Point" => {
+            let arr = coords.as_array()?;
+            if arr.len() >= 2 {
+                let lon = arr[0].as_f64()?;
+                let lat = arr[1].as_f64()?;
+                Some(onto_core::geo::Geometry::Point(onto_core::geo::Coord::new(lon, lat)))
+            } else {
+                None
+            }
+        }
+        "LineString" => {
+            let arr = coords.as_array()?;
+            let mut points = Vec::new();
+            for coord in arr {
+                let c = coord.as_array()?;
+                if c.len() >= 2 {
+                    points.push(onto_core::geo::Coord::new(c[0].as_f64()?, c[1].as_f64()?));
+                }
+            }
+            Some(onto_core::geo::Geometry::LineString(points))
+        }
+        "Polygon" => {
+            let arr = coords.as_array()?;
+            let mut rings = Vec::new();
+            for ring in arr {
+                let ring_arr = ring.as_array()?;
+                let mut points = Vec::new();
+                for coord in ring_arr {
+                    let c = coord.as_array()?;
+                    if c.len() >= 2 {
+                        points.push(onto_core::geo::Coord::new(c[0].as_f64()?, c[1].as_f64()?));
+                    }
+                }
+                rings.push(points);
+            }
+            Some(onto_core::geo::Geometry::Polygon(rings))
+        }
+        _ => None,
     }
 }
 
