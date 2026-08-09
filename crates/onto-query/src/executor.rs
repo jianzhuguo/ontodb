@@ -9060,6 +9060,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_window_rank() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine().flush().unwrap();
+
+        let ast = QueryParser::parse(
+            "SELECT name, RANK() OVER (ORDER BY price DESC) FROM Product"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3);
+                for row in rows {
+                    assert!(row.contains_key("rank()"));
+                }
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[test]
+    fn test_window_running_aggregates() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine().flush().unwrap();
+
+        let ast = QueryParser::parse(
+            "SELECT name, SUM(price) OVER (ORDER BY price), AVG(price) OVER (ORDER BY price) FROM Product"
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3);
+                for row in rows {
+                    // Check that at least some aggregate keys exist
+                    let keys: Vec<&str> = row.keys().map(|s| s.as_str()).collect();
+                    assert!(keys.len() >= 2, "expected at least 2 columns, got: {:?}", keys);
+                }
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
     // 鈹€鈹€ Phase 21: EXPLAIN ANALYZE tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
