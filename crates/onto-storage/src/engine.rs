@@ -777,7 +777,7 @@ impl LsmEngine {
     }
 
     fn next_seq(&self) -> SeqNo {
-        self.seq_counter.fetch_add(1, Ordering::AcqRel)
+        self.seq_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Rebuilds secondary indexes by scanning persisted index entries from SSTables.
@@ -1059,6 +1059,10 @@ impl LsmEngine {
             if self.options.sync_wal_on_commit {
                 ws.wal.sync()?;
             }
+
+            // Relaxed ordering is sufficient: the write_state lock provides
+            // mutual exclusion, and the WAL flush provides persistence.
+            // No additional memory fence needed.
 
             ws.memtable.size() >= self.options.memtable_size_limit
         };
