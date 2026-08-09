@@ -2,7 +2,7 @@
 name = "onto-enterprise"
 version = "0.1.0"
 edition = "2021"
-license = "BUSL-1.1"
+license = "LicenseRef-Proprietary"
 authors = ["OntoDB Team"]
 description = "OntoDB Enterprise features — clustering, security, backup, observability"
 

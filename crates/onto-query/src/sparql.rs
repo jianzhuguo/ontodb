@@ -1063,11 +1063,15 @@ impl SparqlParser {
             sql.push_str("DISTINCT ");
         }
 
+        // Sanitize column names to prevent SQL injection
         let col_exprs: Vec<String> = select_cols.iter().map(|var| {
-            format!("\"{}\"", var)
+            let sanitized: String = var.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+            format!("\"{}\"", sanitized)
         }).collect();
         sql.push_str(&col_exprs.join(", "));
-        sql.push_str(&format!(" FROM {}", class_name));
+        // Sanitize class name to prevent SQL injection
+        let safe_class: String = class_name.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+        sql.push_str(&format!(" FROM {}", safe_class));
 
         // Build WHERE clause — main patterns only (not OPTIONAL)
         let mut conditions = Vec::new();

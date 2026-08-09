@@ -903,7 +903,7 @@ impl QueryExecutor {
                         self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner()).plan_cache_hits += 1;
                         cached
                     } else {
-                        let plan = self.planner.read().unwrap().plan(ast);
+                        let plan = self.planner.read().unwrap_or_else(|e| e.into_inner()).plan(ast);
                         if let Ok(ref p) = plan {
                             self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(ast_hash, p.clone());
                         }
@@ -1272,23 +1272,23 @@ impl QueryExecutor {
                 }
             }
             QueryAst::Backup { path } => {
+                Self::validate_file_path(path)?;
                 let backup_dir = std::path::Path::new(path);
                 let manifest = engine.backup(backup_dir)?;
                 Ok(QueryResult::Success(format!(
-                    "Backup completed: {} files, {} bytes total → {}",
+                    "Backup completed: {} files, {} bytes total",
                     manifest.files.len(),
                     manifest.files.iter().map(|f| f.size).sum::<u64>(),
-                    path
                 )))
             }
             QueryAst::Restore { path } => {
+                Self::validate_file_path(path)?;
                 let backup_dir = std::path::Path::new(path);
                 let data_dir = engine.data_dir();
                 let manifest = onto_storage::LsmEngine::restore(backup_dir, &data_dir)?;
                 Ok(QueryResult::Success(format!(
-                    "Restore completed: {} files restored from {}",
+                    "Restore completed: {} files restored",
                     manifest.files.len(),
-                    path
                 )))
             }
             QueryAst::Flush => {
@@ -1309,7 +1309,7 @@ impl QueryExecutor {
                         cached
                     } else {
                         // Plan cache miss - generate and cache plan
-                        let plan = self.planner.read().unwrap().plan(ast);
+                        let plan = self.planner.read().unwrap_or_else(|e| e.into_inner()).plan(ast);
                         if let Ok(ref p) = plan {
                             self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(ast_hash, p.clone());
                         }
@@ -2300,7 +2300,7 @@ impl QueryExecutor {
     /// Only executes the query for read-only queries (SELECT, etc.).
     /// DML queries (INSERT/UPDATE/DELETE) return the plan without execution.
     fn execute_explain(&self, query: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
-        let plan = self.planner.read().unwrap().plan(query)?;
+        let plan = self.planner.read().unwrap_or_else(|e| e.into_inner()).plan(query)?;
         let description = plan.describe();
 
         // Only execute for read-only queries; DML should not be executed in EXPLAIN
@@ -2433,7 +2433,7 @@ impl QueryExecutor {
 
     /// Read-only EXPLAIN: generates execution plan, runs inner query via read path.
     fn execute_explain_read(&self, query: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
-        let plan = self.planner.read().unwrap().plan(query)?;
+        let plan = self.planner.read().unwrap_or_else(|e| e.into_inner()).plan(query)?;
         let description = plan.describe();
 
         let start = std::time::Instant::now();
@@ -4112,7 +4112,7 @@ impl QueryExecutor {
             } => {
                 // Phase 24: Use plan-driven execution
                 // Generate execution plan, then execute it
-                let plan = self.planner.read().unwrap().plan(ast)?;
+                let plan = self.planner.read().unwrap_or_else(|e| e.into_inner()).plan(ast)?;
 
                 // Execute the plan to get core result rows
                 let plan_result = self.execute_plan(&plan, engine)?;
@@ -4853,6 +4853,24 @@ impl QueryExecutor {
         Ok(QueryResult::Success("1 row inserted".to_string()))
     }
 
+    /// Validates a file path to prevent path traversal attacks.
+    /// Rejects paths containing ".." components or null bytes.
+    fn validate_file_path(path: &str) -> Result<()> {
+        if path.contains('\0') {
+            return Err(CoreError::InvalidArgument("path contains null byte".into()));
+        }
+        let p = std::path::Path::new(path);
+        // Reject paths with ".." components
+        for component in p.components() {
+            if let std::path::Component::ParentDir = component {
+                return Err(CoreError::InvalidArgument(
+                    "path traversal detected: '..' is not allowed".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Executes an IMPORT command: reads a CSV or JSON file and inserts rows into the target class.
     ///
     /// CSV format: first row is header (column names), subsequent rows are data.
@@ -4868,9 +4886,10 @@ impl QueryExecutor {
         format: crate::parser::ImportFormat,
     ) -> Result<QueryResult> {
         use crate::parser::ImportFormat;
+        Self::validate_file_path(file_path)?;
 
         let content = std::fs::read_to_string(file_path).map_err(|e| {
-            CoreError::InvalidArgument(format!("failed to read file '{}': {}", file_path, e))
+            CoreError::InvalidArgument(format!("failed to read file: {}", e))
         })?;
 
         match format {
@@ -4893,10 +4912,11 @@ impl QueryExecutor {
         format: crate::parser::ImportFormat,
     ) -> Result<QueryResult> {
         use crate::parser::ImportFormat;
+        Self::validate_file_path(file_path)?;
 
         let start = std::time::Instant::now();
         let content = std::fs::read_to_string(file_path).map_err(|e| {
-            CoreError::InvalidArgument(format!("failed to read file '{}': {}", file_path, e))
+            CoreError::InvalidArgument(format!("failed to read file: {}", e))
         })?;
 
         let entries = match format {

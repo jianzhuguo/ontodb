@@ -349,7 +349,7 @@ impl LsmEngine {
 
         // 1. Collect candidate SST paths from levels (brief lock).
         let candidates = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let mut cands = Vec::new();
             for level in levels.iter() {
                 for sst_info in level.iter().rev() {
@@ -377,7 +377,7 @@ impl LsmEngine {
 
         // 3. Snapshot SST handles from cache (may lazily open files).
         let sst_handles: Vec<Arc<SsTable>> = {
-            let mut cache = self.sst_cache.lock().unwrap();
+            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
             candidates.iter().filter_map(|path| {
                 if !cache.contains_key(path) {
                     let sst = SsTable::open(path).ok()?;
@@ -431,7 +431,7 @@ impl LsmEngine {
 
         // Collect SSTable paths under lock, then release
         let sst_paths: Vec<PathBuf> = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let mut paths = Vec::new();
             for level in levels.iter().rev() {
                 for sst_info in level.iter() {
@@ -453,7 +453,7 @@ impl LsmEngine {
 
         // Step 1: Snapshot SST handles from cache (brief lock — open missing files outside)
         let sst_handles: Vec<Arc<SsTable>> = {
-            let mut cache = self.sst_cache.lock().unwrap();
+            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
             let mut handles = Vec::with_capacity(sst_paths.len());
             for path in &sst_paths {
                 if let Some(sst) = cache.get(path) {
@@ -649,7 +649,7 @@ impl LsmEngine {
         // Step 3: Add to shared levels (brief lock)
         let metadata = fs::metadata(&sst_path)?;
         {
-            let mut levels = self.levels.lock().unwrap();
+            let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             levels[0].push(SsTableInfo {
                 path: sst_path.clone(),
                 size: metadata.len(),
@@ -664,7 +664,7 @@ impl LsmEngine {
         // immutable MT cleared and the next lazy SST open.
         let new_sst = SsTable::open(&sst_path)?;
         {
-            self.sst_cache.lock().unwrap().insert(sst_path, Arc::new(new_sst));
+            self.sst_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(sst_path, Arc::new(new_sst));
         }
         {
             let mut ws = self.write_state.write();
@@ -693,7 +693,7 @@ impl LsmEngine {
         // Drain notifications under the receiver lock only (NOT holding write_state).
         let mut evicted_paths: Vec<PathBuf> = Vec::new();
         {
-            let receiver = self.compaction_notif_receiver.lock().unwrap();
+            let receiver = self.compaction_notif_receiver.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok(notif) = receiver.try_recv() {
                 match notif {
                     CompactionNotification::Compacted { evicted_paths: paths } => {
@@ -706,7 +706,7 @@ impl LsmEngine {
 
         // Selectively remove only the evicted SST paths from the cache.
         if !evicted_paths.is_empty() {
-            let mut cache = self.sst_cache.lock().unwrap();
+            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
             for path in &evicted_paths {
                 cache.remove(path);
             }
@@ -723,7 +723,7 @@ impl LsmEngine {
         self.drain_compaction_notifications();
 
         let _ = self.compaction_sender.send(CompactionMsg::FlushAndNotify);
-        let receiver = self.compaction_notif_receiver.lock().unwrap();
+        let receiver = self.compaction_notif_receiver.lock().unwrap_or_else(|e| e.into_inner());
         let mut evicted_paths: Vec<PathBuf> = Vec::new();
         loop {
             match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
@@ -740,7 +740,7 @@ impl LsmEngine {
         }
         drop(receiver);
         if !evicted_paths.is_empty() {
-            let mut cache = self.sst_cache.lock().unwrap();
+            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
             for path in &evicted_paths {
                 cache.remove(path);
             }
@@ -777,14 +777,14 @@ impl LsmEngine {
     }
 
     fn next_seq(&self) -> SeqNo {
-        self.seq_counter.fetch_add(1, Ordering::Relaxed)
+        self.seq_counter.fetch_add(1, Ordering::AcqRel)
     }
 
     /// Rebuilds secondary indexes by scanning persisted index entries from SSTables.
     fn rebuild_indexes(&self) -> Result<()> {
         let index_entries = self.scan_prefix(b"__idx__")?;
         if !index_entries.is_empty() {
-            let mut mgr = self.index_manager.write().unwrap();
+            let mut mgr = self.index_manager.write().unwrap_or_else(|e| e.into_inner());
             mgr.rebuild_from_entries(&index_entries);
             tracing::info!(
                 "Rebuilt {} index entries across {} indexes",
@@ -845,12 +845,12 @@ impl LsmEngine {
 
             if let Some(graph_data) = loaded_graphs.get(&graph_key) {
                 // Fast path: load HNSW graph structure directly
-                match self.vector_index_manager.write().unwrap().load_graph(class, column, graph_data) {
+                match self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner()).load_graph(class, column, graph_data) {
                     Ok(()) => {
                         tracing::info!(
                             "Loaded vector index graph for {}.{} ({} vectors, fast restore)",
                             class, column,
-                            self.vector_index_manager.read().unwrap()
+                            self.vector_index_manager.read().unwrap_or_else(|e| e.into_inner())
                                 .index_meta(class, column)
                                 .map(|m| m.dimension)
                                 .unwrap_or(0)
@@ -864,7 +864,7 @@ impl LsmEngine {
             }
 
             // Slow path: create empty index and backfill from documents
-            let _ = self.vector_index_manager.write().unwrap().create_index(
+            let _ = self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner()).create_index(
                 class, column, *dimension, *metric, *m, *ef_construction, *ef_search,
             );
 
@@ -892,11 +892,11 @@ impl LsmEngine {
                     .iter()
                     .map(|(pk, c, col, v)| (pk.clone(), c.as_str(), col.as_str(), v.clone()))
                     .collect();
-                self.vector_index_manager.write().unwrap().index_vector_batch(&batch_refs);
+                self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner()).index_vector_batch(&batch_refs);
             }
 
             // Persist the rebuilt HNSW graph structure for next restart
-            if let Some(graph_bytes) = self.vector_index_manager.read().unwrap().save_graph(class, column) {
+            if let Some(graph_bytes) = self.vector_index_manager.read().unwrap_or_else(|e| e.into_inner()).save_graph(class, column) {
                 let graph_key = format!("__vec_graph__{}_{}", class, column);
                 let seq = self.next_seq();
                 let entry = Entry::put(graph_key.clone().into_bytes(), graph_bytes, seq);
@@ -945,7 +945,7 @@ impl LsmEngine {
         // ── Phase 1: Take writes, assign sequence numbers, read old values ──
         // Snapshot SST cache BEFORE acquiring write_state lock to avoid nested lock deadlock.
         let sst_cache_snapshot: HashMap<PathBuf, Arc<SsTable>> = {
-            let cache = self.sst_cache.lock().unwrap();
+            let cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
             cache.clone()
         };
 
@@ -963,10 +963,10 @@ impl LsmEngine {
                 // Check index existence (brief read locks, dropped immediately)
                 let class = Self::extract_class_from_key(&key);
                 let has_indexes = class.as_ref().map_or(false, |c| {
-                    !self.index_manager.read().unwrap().indexes_for_class(c).is_empty()
+                    !self.index_manager.read().unwrap_or_else(|e| e.into_inner()).indexes_for_class(c).is_empty()
                 });
                 let has_vector_indexes = class.as_ref().map_or(false, |c| {
-                    self.vector_index_manager.read().unwrap().has_any_index(c)
+                    self.vector_index_manager.read().unwrap_or_else(|e| e.into_inner()).has_any_index(c)
                 });
 
                 // Read old value for de-indexing (from locked memtable + SST cache snapshot)
@@ -981,7 +981,7 @@ impl LsmEngine {
                     if let WriteOp::Put(ref value) = op {
                         if let Some(ref c) = class {
                             if let Some(ref doc) = parse_doc_bytes(value) {
-                                let entries = self.index_manager.read().unwrap().index_document_read_only(c, &key, doc);
+                                let entries = self.index_manager.read().unwrap_or_else(|e| e.into_inner()).index_document_read_only(c, &key, doc);
                                 for (idx_key, idx_val) in entries {
                                     let idx_seq = self.next_seq();
                                     index_entries_batch.push((idx_key, idx_val, idx_seq));
@@ -999,8 +999,8 @@ impl LsmEngine {
 
         // ── Phase 2: Index mutations (no write_state held) ──
         {
-            let mut idx_mgr = self.index_manager.write().unwrap();
-            let mut vec_mgr = self.vector_index_manager.write().unwrap();
+            let mut idx_mgr = self.index_manager.write().unwrap_or_else(|e| e.into_inner());
+            let mut vec_mgr = self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner());
 
             for (key, op, _) in &writes_with_seq {
                 let class = Self::extract_class_from_key(key);
@@ -1252,7 +1252,7 @@ impl LsmEngine {
 
         // Check SSTables (newest to oldest)
         let candidates: Vec<PathBuf> = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let mut cands = Vec::new();
             for level in levels.iter() {
                 for sst_info in level.iter().rev() {
@@ -1267,7 +1267,7 @@ impl LsmEngine {
 
         // Snapshot SST handles from cache (brief lock)
         let sst_handles: Vec<Arc<SsTable>> = {
-            let mut cache = self.sst_cache.lock().unwrap();
+            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
             let mut handles = Vec::with_capacity(candidates.len());
             for path in &candidates {
                 if let Some(sst) = cache.get(path) {
@@ -1317,7 +1317,7 @@ impl LsmEngine {
     /// Creates a secondary index on a class.column.
     /// Automatically backfills existing data for the class.
     pub fn create_index(&self, class: &str, column: &str) -> Result<()> {
-        self.index_manager.write().unwrap().create_index(class, column);
+        self.index_manager.write().unwrap_or_else(|e| e.into_inner()).create_index(class, column);
 
         // Backfill: scan all existing entries for this class and index them
         let prefix = format!("{}::", class);
@@ -1325,7 +1325,7 @@ impl LsmEngine {
 
         // Phase 1: Insert into index under a single write lock (not per-document)
         let all_index_entries: Vec<(Vec<u8>, Vec<u8>)> = {
-            let mut mgr = self.index_manager.write().unwrap();
+            let mut mgr = self.index_manager.write().unwrap_or_else(|e| e.into_inner());
             let mut all = Vec::new();
             for (pk, val_bytes) in &entries {
                 if let Some(doc) = parse_doc_bytes(val_bytes) {
@@ -1354,12 +1354,12 @@ impl LsmEngine {
 
     /// Drops a secondary index.
     pub fn drop_index(&self, class: &str, column: &str) -> bool {
-        self.index_manager.write().unwrap().drop_index(class, column)
+        self.index_manager.write().unwrap_or_else(|e| e.into_inner()).drop_index(class, column)
     }
 
     /// Returns true if an index exists on the given class.column.
     pub fn has_index(&self, class: &str, column: &str) -> bool {
-        self.index_manager.read().unwrap().has_index(class, column)
+        self.index_manager.read().unwrap_or_else(|e| e.into_inner()).has_index(class, column)
     }
 
     /// Returns a reference to the index manager RwLock.
@@ -1382,7 +1382,7 @@ impl LsmEngine {
         ef_construction: usize,
         ef_search: usize,
     ) -> Result<()> {
-        self.vector_index_manager.write().unwrap()
+        self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner())
             .create_index(class, column, dimension, metric, m, ef_construction, ef_search)?;
 
         // Persist vector index metadata to LSM
@@ -1434,11 +1434,11 @@ impl LsmEngine {
                 .iter()
                 .map(|(pk, v)| (pk.clone(), class, column, v.clone()))
                 .collect();
-            self.vector_index_manager.write().unwrap().index_vector_batch(&batch_refs);
+            self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner()).index_vector_batch(&batch_refs);
         }
 
         // Persist the HNSW graph structure for fast restart
-        if let Some(graph_bytes) = self.vector_index_manager.read().unwrap().save_graph(class, column) {
+        if let Some(graph_bytes) = self.vector_index_manager.read().unwrap_or_else(|e| e.into_inner()).save_graph(class, column) {
             let graph_key = format!("__vec_graph__{}_{}", class, column);
             let seq = self.next_seq();
             let entry = Entry::put(graph_key.clone().into_bytes(), graph_bytes, seq);
@@ -1453,7 +1453,7 @@ impl LsmEngine {
 
     /// Drops a vector index.
     pub fn drop_vector_index(&self, class: &str, column: &str) -> bool {
-        let removed = self.vector_index_manager.write().unwrap().drop_index(class, column);
+        let removed = self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner()).drop_index(class, column);
         if removed {
             // Remove persisted metadata
             let meta_key = Self::make_vec_meta_key(class, column);
@@ -1485,7 +1485,7 @@ impl LsmEngine {
 
     /// Returns true if a vector index exists on the given class.column.
     pub fn has_vector_index(&self, class: &str, column: &str) -> bool {
-        self.vector_index_manager.read().unwrap().has_index(class, column)
+        self.vector_index_manager.read().unwrap_or_else(|e| e.into_inner()).has_index(class, column)
     }
 
     /// Returns a reference to the vector index manager RwLock.
@@ -1496,7 +1496,7 @@ impl LsmEngine {
     /// Returns engine statistics.
     pub fn stats(&self) -> EngineStats {
         let ws = self.write_state.read();
-        let levels = self.levels.lock().unwrap();
+        let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
         let total_sstables: usize = levels.iter().map(|l| l.len()).sum();
         let total_sst_size: u64 = levels
             .iter()
@@ -1548,7 +1548,7 @@ impl LsmEngine {
         };
 
         // Step 4: Copy SSTable files
-        let levels = self.levels.lock().unwrap();
+        let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
         let mut sst_paths: Vec<PathBuf> = Vec::new();
         for level in levels.iter() {
             for info in level.iter() {
@@ -1690,7 +1690,7 @@ impl LsmEngine {
         };
 
         // Copy only SSTables modified since the last backup
-        let levels = self.levels.lock().unwrap();
+        let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
         let mut sst_paths: Vec<PathBuf> = Vec::new();
         for level in levels.iter() {
             for info in level.iter() {
@@ -1833,7 +1833,7 @@ impl LsmEngine {
 
     /// Flushes all disk-based indexes to disk (with fsync).
     fn flush_disk_indexes(&self) -> Result<()> {
-        self.index_manager.write().unwrap().flush_disk_indexes();
+        self.index_manager.write().unwrap_or_else(|e| e.into_inner()).flush_disk_indexes();
         Ok(())
     }
 }

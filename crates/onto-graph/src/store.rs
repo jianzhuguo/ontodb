@@ -151,7 +151,7 @@ impl GraphStore {
                 let to_idx = self.get_or_create_idx(&to_id);
                 let edge_idx = {
                     let mut ei = self.edge_index.write();
-                    let idx = ei.len() as u32;
+                    let idx = ei.len().min(u32::MAX as usize) as u32;
                     ei.push((from_idx, to_idx, edge_id));
                     idx
                 };
@@ -174,7 +174,9 @@ impl GraphStore {
     }
 
     /// Get or create integer index for a vertex ID.
+    /// All data structures updated atomically under a single lock.
     fn get_or_create_idx(&self, id: &str) -> u32 {
+        // Hold id_to_idx lock for the entire operation
         let mut map = self.id_to_idx.write();
         if let Some(&idx) = map.get(id) {
             return idx;
@@ -185,19 +187,10 @@ impl GraphStore {
             u32::MAX
         });
         map.insert(id.to_string(), idx);
-        drop(map);
-
-        let mut ids = self.idx_to_id.write();
-        ids.push(id.to_string());
-        drop(ids);
-
-        let mut adj_out = self.adj_out.write();
-        adj_out.push(Vec::new());
-        drop(adj_out);
-
-        let mut adj_in = self.adj_in.write();
-        adj_in.push(Vec::new());
-
+        // Update all related structures while holding the lock
+        self.idx_to_id.write().push(id.to_string());
+        self.adj_out.write().push(Vec::new());
+        self.adj_in.write().push(Vec::new());
         idx
     }
 
@@ -432,16 +425,15 @@ impl GraphStore {
 
     /// Add an edge to the graph.
     pub fn add_edge(&self, edge: Edge) -> Result<(), GraphError> {
-        // Verify source and target exist
-        {
-            let verts = self.vertices.read();
-            if !verts.contains_key(&edge.from) {
-                return Err(GraphError::VertexNotFound(edge.from.clone()));
-            }
-            if !verts.contains_key(&edge.to) {
-                return Err(GraphError::VertexNotFound(edge.to.clone()));
-            }
+        // Verify source and target exist (hold read lock during check)
+        let verts = self.vertices.read();
+        if !verts.contains_key(&edge.from) {
+            return Err(GraphError::VertexNotFound(edge.from.clone()));
         }
+        if !verts.contains_key(&edge.to) {
+            return Err(GraphError::VertexNotFound(edge.to.clone()));
+        }
+        drop(verts);
 
         // Persist to LSM engine before updating in-memory state
         self.persist_edge(&edge)?;
@@ -551,7 +543,7 @@ impl GraphStore {
     /// Get outgoing edges from a vertex.
     pub fn get_out_edges(&self, vertex_id: &str) -> Vec<Edge> {
         self.out_edges
-            .write()
+            .read()
             .get(vertex_id)
             .cloned()
             .unwrap_or_default()
@@ -560,7 +552,7 @@ impl GraphStore {
     /// Get incoming edges to a vertex.
     pub fn get_in_edges(&self, vertex_id: &str) -> Vec<Edge> {
         self.in_edges
-            .write()
+            .read()
             .get(vertex_id)
             .cloned()
             .unwrap_or_default()
@@ -568,9 +560,9 @@ impl GraphStore {
 
     /// Get neighbors of a vertex (outgoing direction).
     pub fn get_neighbors(&self, vertex_id: &str) -> Vec<Vertex> {
-        let verts = self.vertices.write();
+        let verts = self.vertices.read();
         self.out_edges
-            .write()
+            .read()
             .get(vertex_id)
             .map(|edges| {
                 edges

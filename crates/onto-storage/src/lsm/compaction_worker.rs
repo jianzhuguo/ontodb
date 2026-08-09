@@ -129,7 +129,8 @@ impl CompactionWorker {
                     // Keep compacting until no more is needed
                     loop {
                         let score = {
-                            let levels = self.levels.lock().unwrap();
+                            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+                            if levels.len() < 2 { break; }
                             let mut best = 0.0f64;
                             for level in 0..levels.len() - 1 {
                                 let s = self.compaction_score(&levels, level);
@@ -178,7 +179,7 @@ impl CompactionWorker {
 
         // Find the level with the highest compaction score
         let (best_level, best_score) = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let mut best_level = None;
             let mut best_score = 0.0f64;
 
@@ -236,7 +237,7 @@ impl CompactionWorker {
     fn compact_level(&mut self, level: usize) -> Result<()> {
         // Step 1: Snapshot SSTables to compact (don't remove from levels yet)
         let (ssts_to_compact, compact_min, compact_max) = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             if level >= levels.len() - 1 {
                 return Ok(());
             }
@@ -274,7 +275,7 @@ impl CompactionWorker {
         // Step 2: Find overlapping SSTables in level N+1 (snapshot, don't remove)
         let next_level = level + 1;
         let next_level_ssts: Vec<SsTableInfo> = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             levels[next_level]
                 .iter()
                 .filter(|sst_info| {
@@ -326,7 +327,7 @@ impl CompactionWorker {
         // Step 5: Deduplicate + tombstone cleanup
         // Snapshot levels once to avoid per-entry lock acquisition in the loop
         let (deepest_level, levels_snapshot) = {
-            let levels = self.levels.lock().unwrap();
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             (levels.len() - 1, levels.clone())
         };
 
@@ -410,7 +411,7 @@ impl CompactionWorker {
 
         // Step 7+8: Atomically update levels, evict cache, and schedule deletions under lock
         let evicted_paths = {
-            let mut levels = self.levels.lock().unwrap();
+            let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
 
             // Remove compacted SSTables from current level
             let compact_paths: std::collections::HashSet<PathBuf> =

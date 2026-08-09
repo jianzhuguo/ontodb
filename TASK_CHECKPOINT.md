@@ -633,3 +633,177 @@
 - **时序扩展**: 16天
 - **时空融合**: 8天
 - **总计**: ~36天 (约 5-6 周)
+
+---
+
+## 阶段六：企业版数字孪生监控大屏
+
+> 目标：构建企业级 3D 数字孪生监控大屏，作为 onto-enterprise 商业许可功能
+> 技术栈：Vite + React 18 + TypeScript + Three.js + TailwindCSS
+> 许可：仅企业版可用（LicenseRef-Proprietary）
+> 预计工时：3-4 周
+
+### 一、MVP 阶段（P0 — 3-4 周）
+
+#### DT6.1 集群 3D 拓扑可视化
+- **目标**: 3D 球体/网络拓扑展示集群节点，节点颜色编码健康状态
+- **数据源**: `GET /api/cluster` + `GET /api/health`
+- **交互**: 点击节点弹出详情面板（CPU/内存/存储/连接数）
+- **预计**: 1周
+
+#### DT6.2 实时指标大屏
+- **目标**: 大屏投放级实时监控面板
+- **数据源**: `GET /api/metrics` + WebSocket 实时推送
+- **展示**: QPS 曲线、存储用量、连接数、查询延迟分布
+- **预计**: 1周
+
+#### DT6.3 节点间数据流动画
+- **目标**: 节点间连线 + 数据包流动动画，展示复制/分片流量
+- **数据源**: `GET /api/cluster` (Raft 复制状态)
+- **效果**: 粒子沿连线流动，流量大小映射粒子密度
+- **预计**: 3天
+
+#### DT6.4 告警事件面板
+- **目标**: 实时告警滚动条 + 历史告警查询
+- **数据源**: `GET /api/digital-twin/alerts` (新增)
+- **预计**: 2天
+
+### 二、V1 阶段（P1 — 2-3 周）
+
+#### DT6.5 本体图谱 3D 浏览
+- **目标**: Class/Property 关系的力导向 3D 图
+- **数据源**: `GET /api/schema`
+- **预计**: 1周
+
+#### DT6.6 查询执行实时监控
+- **目标**: 慢查询 TOP10、查询类型分布、执行时间热力图
+- **预计**: 3天
+
+#### DT6.7 存储层可视化
+- **目标**: LSM 层级结构 3D 展示（MemTable → L0 → L1 → ...）
+- **预计**: 3天
+
+### 三、V2 阶段（P2 — 3-4 周）
+
+#### DT6.8 查询计划 3D 渲染
+- **目标**: SQL AST → 3D 树形结构，执行路径高亮
+- **数据源**: `POST /api/query/explain` (新增)
+- **预计**: 1周
+
+#### DT6.9 向量空间可视化
+- **目标**: 高维向量 t-SNE/UMAP 降维 → 3D 散点图
+- **预计**: 1周
+
+#### DT6.10 GLSL 着色器 + 后处理
+- **目标**: 脉冲效果、Bloom、SSAO 增强视觉
+- **预计**: 3天
+
+### 四、需新增后端 API
+
+```
+GET  /api/digital-twin/topology     → 集群拓扑完整数据（节点+连接+地理位置+指标）
+GET  /api/digital-twin/metrics/ws   → WebSocket 实时指标推送
+GET  /api/digital-twin/alerts       → 告警事件流
+POST /api/query/explain             → 查询执行计划（AST 树）
+```
+
+### 五、预计总工时
+
+| 阶段 | 内容 | 周期 |
+|------|------|------|
+| MVP | 3D 拓扑 + 指标大屏 + 数据流 + 告警 | 3-4 周 |
+| V1 | 本体图谱 + 查询监控 + 存储可视化 | 2-3 周 |
+| V2 | 查询计划 3D + 向量空间 + 着色器 | 3-4 周 |
+| **总计** | | **8-11 周** |
+
+---
+
+## 阶段七：全面代码审计（2026-08-10）
+
+> 总计: 42 个问题 (2 Critical / 14 High / 18 Medium / 8 Low)
+
+### 七、修复进度总览
+
+| 类别 | 状态 | 数量 |
+|------|------|------|
+| Critical (路径穿越) | 🔴 待修复 | 2 |
+| High (并发/溢出/注入) | 🔴 待修复 | 14 |
+| Medium (DoS/泄露) | 🟡 计划修复 | 18 |
+| Low (代码规范) | 🟢 可选 | 8 |
+
+### Critical — 路径穿越 (2)
+
+- [ ] B7.1 [onto-query] SQL BACKUP/RESTORE 路径穿越 → 添加路径校验 (`executor.rs:1274-1292`)
+- [ ] B7.2 [onto-query] SQL COPY/IMPORT 任意文件读取 → 添加路径白名单 (`executor.rs:4872-4899`)
+
+### High — 并发安全 (8)
+
+- [ ] B7.3 [onto-graph] get_neighbors() 用 write 锁做只读操作 → 改为 read() (`store.rs:569-582`)
+- [ ] B7.4 [onto-graph] get_or_create_idx() 4 个锁非原子获取 → 合并为单锁 (`store.rs:177-201`)
+- [ ] B7.5 [onto-graph] delete_vertex() 12+ 个锁顺序未定义 → 统一锁序 (`store.rs:314-409`)
+- [ ] B7.6 [onto-graph] add_edge() TOCTOU → 合并检查和插入到同一锁内 (`store.rs:436-468`)
+- [ ] B7.7 [onto-query] planner.read().unwrap() 锁中毒级联 panic → unwrap_or_else (`executor.rs:906`)
+- [ ] B7.8 [onto-storage] index_manager.write().unwrap() → unwrap_or_else (`engine.rs:787,848`)
+- [ ] B7.17 [onto-server] PG Wire 明文密码认证 → 改用 SCRAM-SHA-256 (`pgwire.rs:135`)
+- [ ] B7.35 [onto-storage] Ordering::Relaxed 序列号 → 改用 Acquire/Release (`engine.rs:780`)
+
+### High — 整数溢出 (2)
+
+- [ ] B7.9 [onto-storage] TSM 格式 as u16/u32 静默截断 → try_into() (`tsm.rs:361,386`)
+- [ ] B7.10 [onto-graph] ei.len() as u32 边索引溢出 → 溢出检查 (`store.rs:154,475`)
+
+### High — SQL 注入 (2)
+
+- [ ] B7.13 [onto-query] SPARQL 变量名嵌入 SQL 未转义 → 转义双引号 (`sparql.rs:1066`)
+- [ ] B7.14 [onto-query] IRI 类名嵌入 SQL 未校验 → 标识符校验 (`sparql.rs:1070`)
+
+### High — 其他 (2)
+
+- [ ] B7.11 [onto-storage] compaction_worker levels.len()-1 下溢 → 添加守卫 (`compaction_worker.rs:134`)
+- [ ] B7.12 [onto-query] 查询超时执行后才检查 → 改用 tokio timeout (`executor.rs:838`)
+
+### Medium (18)
+
+- [ ] B7.18 [onto-graph] get_out_edges/in_edges 用 write 锁 → 改 read (`store.rs:552`)
+- [ ] B7.19 [onto-storage] 三阶段提交 Phase1→Phase3 间隙 → 可能读旧值 (`engine.rs:960`)
+- [ ] B7.20 [onto-query] sum as i64 大值未定义 → saturating_cast (`executor.rs:4429`)
+- [ ] B7.21 [onto-core] as_nanos() as i64 2262 溢出 → 使用 u64 (`time_series.rs:43`)
+- [ ] B7.22 [onto-storage] bloom_filter from_bytes 大分配 → 限制 num_bits (`bloom_filter.rs:73`)
+- [ ] B7.23 [onto-storage] tsm Vec::with_capacity(block_count) → 限制上限 (`tsm.rs:427`)
+- [ ] B7.24 [onto-server] CDC 重试缓冲区无上限 → 添加 max_size (`cdc.rs:262`)
+- [ ] B7.25 [onto-server] 图遍历 max_depth 无上限 → 限制 100 (`http.rs:1223`)
+- [ ] B7.26 [onto-server] 向量搜索 top_k 无上限 → 限制 10000 (`http.rs:165`)
+- [ ] B7.27 [onto-server] query_vector 大小无限制 → 限制 4096 维 (`http.rs:163`)
+- [ ] B7.28 [onto-query] 内存预算定义但未执行 → 添加检查 (`executor.rs:240`)
+- [ ] B7.29 [onto-query] COPY/IMPORT 错误泄露文件路径 → 脱敏 (`executor.rs:4873`)
+- [ ] B7.30 [onto-server] 执行错误暴露内部详情 → 通用错误消息 (`http.rs:637`)
+- [ ] B7.31 [onto-server] 数字孪生端点泄露路径 → 移除路径信息 (`http.rs:1069`)
+- [ ] B7.32 [onto-server] validate_filter Unicode 绕过 → 严格校验 (`http.rs:42`)
+- [ ] B7.33 [onto-server] WHERE 提取字符串切片误切 → AST 提取 (`http.rs:969`)
+- [ ] B7.34 [onto-server] PG Wire secret 可预测 → 使用 OsRng (`pgwire.rs:196`)
+- [ ] B7.15 [onto-graph] 内存无大小限制 → 添加 max_vertices 配置 (`store.rs:52`)
+
+### Low (8)
+
+- [ ] B7.36 常量 header unwrap() → expect() (`http.rs:407`)
+- [ ] B7.37 path.file_name().unwrap() → 处理 None (`tiered_storage.rs:211`)
+- [ ] B7.38 DTW n+1 溢出 → 添加守卫 (`time_series.rs:295`)
+- [ ] B7.39 邻接表未扩展时静默丢弃边 → 返回错误 (`store.rs:160`)
+- [ ] B7.40 tokio::spawn 非 Tokio 线程 → 检查 runtime (`cdc.rs:501`)
+- [ ] B7.41 SUBSTRING 大值空字符串 → 限制范围 (`executor.rs:6266`)
+- [ ] B7.42 CSP unsafe-inline → 移除 (`http.rs:413`)
+
+### 存储引擎性能影响评估
+
+| Bug | 性能影响 | 说明 |
+|-----|---------|------|
+| B7.3 get_neighbors write 锁 | 🔴 高 | 并发图遍历时阻塞所有读操作 |
+| B7.4 多锁非原子 | 🟡 中 | 间隙期读到不一致状态，不影响吞吐 |
+| B7.7 planner unwrap | 🔴 高 | 锁中毒后所有查询 panic |
+| B7.8 engine unwrap | 🔴 高 | 锁中毒后存储引擎崩溃 |
+| B7.9 TSM 截断 | 🟡 中 | 大 key 时数据损坏，正常负载无影响 |
+| B7.11 compaction 下溢 | 🟡 中 | levels 为空时 panic，正常启动不会 |
+| B7.12 查询超时 | 🟡 中 | 慢查询占用资源，不影响正常查询 |
+| B7.35 Relaxed 序列号 | 🟡 中 | ARM 上可能快照不一致，x86 无影响 |
+
+**结论：当前 bug 主要影响并发安全性，对单线程存储引擎基准测试无显著性能影响。**

@@ -357,8 +357,9 @@ impl TsmWriter {
         buf.extend_from_slice(TSM_MAGIC);
         buf.push(TSM_VERSION);
 
-        // Write block count
-        buf.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+        // Write block count (saturating cast)
+        let block_count = blocks.len().min(u32::MAX as usize) as u32;
+        buf.extend_from_slice(&block_count.to_le_bytes());
 
         // Write each block
         for block in blocks {
@@ -382,21 +383,25 @@ impl TsmWriter {
                 _ => Vec::new(),
             };
 
-            // Write block header
-            buf.extend_from_slice(&(block.series_key.len() as u16).to_le_bytes());
+            // Write block header (saturating casts)
+            let key_len = block.series_key.len().min(u16::MAX as usize) as u16;
+            let count = block.timestamps.len().min(u32::MAX as usize) as u32;
+            buf.extend_from_slice(&key_len.to_le_bytes());
             buf.extend_from_slice(block.series_key.as_bytes());
             buf.extend_from_slice(&block.min_timestamp.to_le_bytes());
             buf.extend_from_slice(&block.max_timestamp.to_le_bytes());
-            buf.extend_from_slice(&(block.timestamps.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&count.to_le_bytes());
 
             // Write compressed timestamp data
             let ts_compressed = compress_block(&ts_encoded);
-            buf.extend_from_slice(&(ts_compressed.len() as u32).to_le_bytes());
+            let ts_len = ts_compressed.len().min(u32::MAX as usize) as u32;
+            buf.extend_from_slice(&ts_len.to_le_bytes());
             buf.extend_from_slice(&ts_compressed);
 
             // Write compressed value data
             let val_compressed = compress_block(&val_encoded);
-            buf.extend_from_slice(&(val_compressed.len() as u32).to_le_bytes());
+            let val_len = val_compressed.len().min(u32::MAX as usize) as u32;
+            buf.extend_from_slice(&val_len.to_le_bytes());
             buf.extend_from_slice(&val_compressed);
         }
 

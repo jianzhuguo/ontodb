@@ -1,0 +1,1089 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OntoDB Digital Twin</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#1a1b26;--surface:#24283b;--hover:#292e42;--border:#3b4261;--text:#c0caf5;--dim:#565f89;--accent:#7aa2f7;--green:#9ece6a;--red:#f7768e;--yellow:#e0af68;--purple:#bb9af7}
+body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var(--text);height:100vh;overflow:hidden}
+.header{display:flex;align-items:center;justify-content:space-between;padding:8px 16px;background:var(--surface);border-bottom:1px solid var(--border)}
+.header h1{font-size:16px;font-weight:600}.header h1 span{color:var(--accent)}
+.header .status{display:flex;align-items:center;gap:12px;font-size:13px}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block}.dot.ok{background:var(--green)}.dot.err{background:var(--red)}
+.main{display:flex;height:calc(100vh - 40px)}
+.canvas-area{flex:1;position:relative;overflow:hidden;background:var(--bg)}
+canvas{display:block}
+.overlay{position:absolute;top:12px;left:12px;display:flex;gap:8px;pointer-events:none;z-index:1}
+.badge{padding:4px 10px;background:rgba(26,27,38,0.85);border:1px solid var(--border);border-radius:6px;font-size:11px;color:var(--dim)}
+.badge .v{color:var(--text);font-weight:600}
+#tooltip{position:absolute;display:none;background:rgba(26,27,38,0.95);border:1px solid var(--accent);border-radius:8px;padding:12px;font-size:11px;pointer-events:none;z-index:10;max-width:280px;box-shadow:0 4px 20px rgba(0,0,0,0.5)}
+#tooltip .tt{font-size:13px;font-weight:600;color:var(--accent);margin-bottom:6px;border-bottom:1px solid var(--border);padding-bottom:4px}
+#tooltip .tr{display:flex;justify-content:space-between;padding:2px 0;color:#9aa5ce}
+#tooltip .tr span:last-child{color:var(--text);font-weight:500;margin-left:12px}
+.right-panel{width:380px;background:var(--surface);border-left:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
+.panel-tabs{display:flex;background:var(--bg);border-bottom:1px solid var(--border)}
+.panel-tab{flex:1;padding:8px;text-align:center;font-size:11px;font-weight:600;cursor:pointer;color:var(--dim);border-bottom:2px solid transparent;transition:all .15s}
+.panel-tab:hover{color:var(--text)}.panel-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.panel-content{flex:1;overflow-y:auto;display:none}.panel-content.active{display:block}
+.sec{padding:12px;border-bottom:1px solid var(--border)}
+.st{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--dim);margin-bottom:8px}
+.legend{display:flex;flex-wrap:wrap;gap:6px}
+.li{display:flex;align-items:center;gap:4px;font-size:10px;color:#9aa5ce}
+.ld{width:7px;height:7px;border-radius:50%}
+.mg{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.mc{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px}
+.mc .l{font-size:9px;text-transform:uppercase;color:var(--dim);margin-bottom:2px}.mc .v{font-size:15px;font-weight:700}
+.bar{display:flex;align-items:center;gap:6px;padding:3px 0;font-size:11px}
+.bar .bg{flex:1;height:4px;background:var(--border);border-radius:2px;overflow:hidden}.bar .fl{height:100%;border-radius:2px}
+.bar .pct{min-width:30px;text-align:right;font-size:10px}
+.row{display:flex;align-items:center;gap:6px;padding:3px 0;font-size:11px}
+.row .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.row .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.row .tag{font-size:9px;padding:1px 4px;border-radius:3px;font-weight:600}
+.alt{padding:4px 8px;border-left:3px solid;border-radius:3px;margin-bottom:3px;font-size:10px;background:var(--bg)}
+.alt.c{border-color:var(--red)}.alt.w{border-color:var(--yellow)}.alt.i{border-color:var(--accent)}
+/* Detail panel */
+.detail{padding:12px}
+.detail .back{font-size:11px;color:var(--dim);cursor:pointer;margin-bottom:8px;display:inline-block}
+.detail .back:hover{color:var(--accent)}
+.detail .title{font-size:14px;font-weight:600;color:var(--accent);margin-bottom:8px}
+.detail .info-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:12px}
+.detail .info-item{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:6px}
+.detail .info-item .label{font-size:9px;text-transform:uppercase;color:var(--dim)}.detail .info-item .value{font-size:13px;font-weight:600}
+.detail .rel-section{margin-top:10px}
+.detail .rel-title{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--dim);margin-bottom:6px}
+.detail .rel-item{display:flex;align-items:center;gap:6px;padding:4px 6px;background:var(--bg);border:1px solid var(--border);border-radius:4px;margin-bottom:4px;cursor:pointer;font-size:11px}
+.detail .rel-item:hover{border-color:var(--accent)}
+.detail .rel-item .dot{width:6px;height:6px;border-radius:50%}
+/* Vector visualization */
+.vector-area{padding:12px}
+.vector-canvas{width:100%;height:300px;background:var(--bg);border:1px solid var(--border);border-radius:8px;margin-bottom:8px}
+.vector-controls{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+.vector-controls select,.vector-controls button{padding:4px 8px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;font-size:11px;cursor:pointer}
+.vector-controls button:hover{border-color:var(--accent)}
+.vector-legend{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+.vector-legend .item{display:flex;align-items:center;gap:4px;font-size:10px;color:#9aa5ce}
+.vector-legend .dot{width:8px;height:8px;border-radius:50%}
+#vectorTooltip{position:absolute;display:none;background:rgba(26,27,38,0.95);border:1px solid var(--accent);border-radius:6px;padding:8px;font-size:10px;pointer-events:none;z-index:10}
+.conn{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(26,27,38,0.9);z-index:5;text-align:center}
+.conn .d{width:12px;height:12px;border-radius:50%;background:var(--red);margin:0 auto 10px;animation:p 1.5s infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.4}}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1><span>OntoDB</span> Digital Twin</h1>
+  <div class="status">
+    <span style="color:var(--dim)">Entities: <span id="h-ent" style="color:var(--text)">0</span></span>
+    <span style="color:var(--dim)">Relations: <span id="h-rel" style="color:var(--text)">0</span></span>
+    <span class="dot" id="dot"></span><span id="stxt">Connecting...</span>
+  </div>
+</div>
+<div class="main">
+  <div class="canvas-area">
+    <canvas id="c"></canvas>
+    <div class="overlay">
+      <div class="badge">Nodes: <span class="v" id="o-n">0</span></div>
+      <div class="badge">Edges: <span class="v" id="o-e">0</span></div>
+    </div>
+    <div id="tooltip"></div>
+    <div class="conn" id="conn"><div><div class="d"></div><div style="color:var(--dim);font-size:14px">连接 OntoDB...</div></div></div>
+  </div>
+  <div class="right-panel">
+    <div class="panel-tabs">
+      <div class="panel-tab active" data-tab="overview">概览</div>
+      <div class="panel-tab" data-tab="explore">图谱探索</div>
+      <div class="panel-tab" data-tab="vector">向量空间</div>
+      <div class="panel-tab" data-tab="multimodal">多模对比</div>
+      <div class="panel-tab" data-tab="ontology">本体推理</div>
+    </div>
+    <!-- Overview tab -->
+    <div class="panel-content active" id="tab-overview">
+      <div class="sec"><div class="st">图例</div>
+        <div class="legend">
+          <div class="li"><div class="ld" style="background:var(--accent)"></div>语义锚点</div>
+          <div class="li"><div class="ld" style="background:var(--purple)"></div>部门</div>
+          <div class="li"><div class="ld" style="background:var(--green)"></div>员工</div>
+          <div class="li"><div class="ld" style="background:var(--yellow)"></div>项目</div>
+          <div class="li"><div class="ld" style="background:var(--red)"></div>服务器</div>
+          <div class="li"><div class="ld" style="background:#f97316"></div>客户</div>
+          <div class="li"><div class="ld" style="background:#ec4899"></div>线索</div>
+        </div>
+      </div>
+      <div class="sec"><div class="st">企业概览</div><div class="mg" id="ov"></div></div>
+      <div class="sec"><div class="st">部门预算</div><div id="bg"></div></div>
+      <div class="sec"><div class="st">项目进度</div><div id="pj"></div></div>
+      <div class="sec"><div class="st">服务器集群</div><div id="sv"></div></div>
+      <div class="sec"><div class="st">客户</div><div id="cu"></div></div>
+      <div class="sec"><div class="st">告警</div><div id="al"></div></div>
+    </div>
+    <!-- Explore tab -->
+    <div class="panel-content" id="tab-explore">
+      <div class="sec">
+        <div class="st">点击图中任意节点查看关联数据</div>
+        <div style="color:var(--dim);font-size:11px;line-height:1.6">
+          点击一个实体节点，自动查询数据库中的关联记录并展开到图上。<br>
+          支持：部门→员工/项目、客户→合同/对接人、服务器→告警 等关系链。
+        </div>
+      </div>
+      <div id="detailPanel"></div>
+    </div>
+    <!-- Vector tab -->
+    <div class="panel-content" id="tab-vector">
+      <div class="vector-area">
+        <div class="st">向量空间可视化</div>
+        <div class="vector-controls">
+          <select id="vectorClass"><option>选择数据表...</option></select>
+          <button onclick="generateVectors()">生成向量</button>
+          <button onclick="runPCA()">降维可视化</button>
+        </div>
+        <canvas id="vectorCanvas" class="vector-canvas" width="356" height="300"></canvas>
+        <div id="vectorTooltip"></div>
+        <div class="vector-legend" id="vectorLegend"></div>
+        <div style="margin-top:8px;font-size:10px;color:var(--dim)">
+          基于实体属性生成特征向量 → PCA 降维到 2D → 按类别着色聚类
+        </div>
+      </div>
+    </div>
+    <!-- Multi-modal comparison tab -->
+    <div class="panel-content" id="tab-multimodal">
+      <div class="sec">
+        <div class="st">多模数据对比 — 同一实体的三种数据形态</div>
+        <div style="font-size:11px;color:var(--dim);margin-bottom:8px">选择一个实体，查看其关系型、向量型、时序型数据的统一视图</div>
+        <div class="vector-controls">
+          <select id="mmEntity" onchange="loadMultimodal()">
+            <option value="">选择实体...</option>
+            <option value="Department">部门</option>
+            <option value="Employee">员工</option>
+            <option value="Project">项目</option>
+            <option value="Server">服务器</option>
+            <option value="Customer">客户</option>
+          </select>
+        </div>
+      </div>
+      <div id="mmContent"></div>
+    </div>
+    <!-- Ontology reasoning tab -->
+    <div class="panel-content" id="tab-ontology">
+      <div class="sec">
+        <div class="st">本体推理链可视化</div>
+        <div style="font-size:11px;color:var(--dim);margin-bottom:8px">展示 OWL 本体类层次、属性关系和推理推导链</div>
+        <div class="vector-controls">
+          <button onclick="loadOntologyGraph()">加载本体图谱</button>
+          <button onclick="runReasoning()">运行推理</button>
+        </div>
+      </div>
+      <div class="sec">
+        <div class="st">类层次 (subClassOf)</div>
+        <div id="classHierarchy"></div>
+      </div>
+      <div class="sec">
+        <div class="st">属性关系</div>
+        <div id="propRelations"></div>
+      </div>
+      <div class="sec">
+        <div class="st">推理结果</div>
+        <div id="reasoningResults"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+var cv=document.getElementById('c'),cx=cv.getContext('2d');
+var W=0,H=0,nodes=[],edges=[],hoverN=null,dragN=null,dragOff={x:0,y:0};
+var COL={anchor:'#7aa2f7',dept:'#bb9af7',emp:'#9ece6a',proj:'#e0af68',server:'#f7768e',customer:'#f97316',lead:'#ec4899',alert:'#7dcfff'};
+var selectedNode=null, expandedNodes={};
+var allData={depts:[],emps:[],projs:[],srvs:[],alerts:[],custs:[],leads:[],metrics:[]};
+
+function fit(){W=cv.width=cv.parentElement.clientWidth;H=cv.height=cv.parentElement.clientHeight;}
+window.addEventListener('resize',fit);
+
+// ── Tabs ──
+document.querySelectorAll('.panel-tab').forEach(function(tab){
+  tab.addEventListener('click',function(){
+    document.querySelectorAll('.panel-tab').forEach(function(t){t.classList.remove('active');});
+    document.querySelectorAll('.panel-content').forEach(function(c){c.classList.remove('active');});
+    tab.classList.add('active');
+    document.getElementById('tab-'+tab.dataset.tab).classList.add('active');
+    if(tab.dataset.tab==='vector')initVectorTab();
+    if(tab.dataset.tab==='ontology')loadOntologyGraph();
+  });
+});
+
+// ── Force simulation ──
+function simulate(){
+  var cx0=W/2,cy0=H/2;
+  for(var i=0;i<nodes.length;i++){
+    var n=nodes[i];if(n.fixed||n===dragN)continue;
+    n.vx+=(cx0-n.x)*0.0003;n.vy+=(cy0-n.y)*0.0003;
+    for(var j=0;j<nodes.length;j++){if(i===j)continue;
+      var m=nodes[j],dx=n.x-m.x,dy=n.y-m.y,dist=Math.sqrt(dx*dx+dy*dy)||1;
+      if(dist<180){var force=300/(dist*dist);n.vx+=dx/dist*force;n.vy+=dy/dist*force;}}
+  }
+  for(var i=0;i<edges.length;i++){
+    var e=edges[i],fn=findN(e.from),tn=findN(e.to);if(!fn||!tn)continue;
+    var dx=tn.x-fn.x,dy=tn.y-fn.y,dist=Math.sqrt(dx*dx+dy*dy)||1;
+    var ideal=e.type==='semantic'?200:e.type==='belongs'?80:e.type==='contains'?100:e.type==='hosts'?250:e.type==='related'?120:60;
+    var force=(dist-ideal)*0.001;
+    if(!fn.fixed&&fn!==dragN){fn.vx+=dx/dist*force;fn.vy+=dy/dist*force;}
+    if(!tn.fixed&&tn!==dragN){tn.vx-=dx/dist*force;tn.vy-=dy/dist*force;}
+  }
+  for(var i=0;i<nodes.length;i++){
+    var n=nodes[i];if(n.fixed||n===dragN)continue;
+    n.vx*=0.88;n.vy*=0.88;n.x+=n.vx;n.y+=n.vy;
+    n.x=Math.max(n.r+10,Math.min(W-n.r-10,n.x));n.y=Math.max(n.r+10,Math.min(H-n.r-10,n.y));
+  }
+}
+function findN(id){for(var i=0;i<nodes.length;i++)if(nodes[i].id===id)return nodes[i];return null;}
+
+// ── Draw ──
+function draw(){
+  fit();cx.clearRect(0,0,W,H);if(W===0||H===0){requestAnimationFrame(draw);return;}
+  simulate();
+  var bg=cx.createRadialGradient(W/2,H/2,0,W/2,H/2,Math.max(W,H)*0.7);
+  bg.addColorStop(0,'#1e2030');bg.addColorStop(1,'#1a1b26');cx.fillStyle=bg;cx.fillRect(0,0,W,H);
+  // Subtle dot grid
+  cx.fillStyle='#ffffff04';
+  for(var gx=0;gx<W;gx+=30){for(var gy=0;gy<H;gy+=30){cx.fillRect(gx,gy,1,1);}}
+  // Edges
+  for(var i=0;i<edges.length;i++){
+    var e=edges[i],fn=findN(e.from),tn=findN(e.to);if(!fn||!tn)continue;
+    cx.beginPath();cx.moveTo(fn.x,fn.y);cx.lineTo(tn.x,tn.y);
+    var ec={semantic:'#7aa2f750',belongs:'#9ece6a25',contains:'#e0af6825',hosts:'#f7768e30',serves:'#f9731625',pipeline:'#ec489925',alerted:'#7dcfff30',related:'#7aa2f740'};
+    cx.strokeStyle=ec[e.type]||'#ffffff10';cx.lineWidth=e.type==='semantic'?2:e.type==='related'?1.5:1;
+    if(e.type==='alerted')cx.setLineDash([3,3]);cx.stroke();cx.setLineDash([]);
+    if(e.type==='semantic'||e.type==='related'){
+      var t=(Date.now()%3000)/3000;for(var k=0;k<3;k++){var pt=(t+k/3)%1;
+        var ppx=fn.x+(tn.x-fn.x)*pt,ppy=fn.y+(tn.y-fn.y)*pt;
+        cx.beginPath();cx.arc(ppx,ppy,2,0,Math.PI*2);cx.fillStyle='#7aa2f770';cx.fill();
+        // Particle glow
+        var pgl=cx.createRadialGradient(ppx,ppy,0,ppx,ppy,8);
+        pgl.addColorStop(0,'#7aa2f720');pgl.addColorStop(1,'#7aa2f700');
+        cx.fillStyle=pgl;cx.beginPath();cx.arc(ppx,ppy,8,0,Math.PI*2);cx.fill();}}
+    // Data flow particles on all edges
+    if(e.type==='belongs'||e.type==='contains'||e.type==='serves'){
+      var t=(Date.now()%4000)/4000;
+      var ppx=fn.x+(tn.x-fn.x)*t,ppy=fn.y+(tn.y-fn.y)*t;
+      cx.beginPath();cx.arc(ppx,ppy,1.5,0,Math.PI*2);cx.fillStyle='#ffffff30';cx.fill();}
+  }
+  // Nodes
+  for(var i=0;i<nodes.length;i++){
+    var n=nodes[i],col=COL[n.type]||'#565f89';
+    var r=n.r*(hoverN===n?1.3:1)*(selectedNode===n?1.2:1);
+    // Outer glow
+    var gl=cx.createRadialGradient(n.x,n.y,0,n.x,n.y,r*3);
+    gl.addColorStop(0,col+'30');gl.addColorStop(0.5,col+'10');gl.addColorStop(1,col+'00');
+    cx.fillStyle=gl;cx.beginPath();cx.arc(n.x,n.y,r*3,0,Math.PI*2);cx.fill();
+    cx.beginPath();cx.arc(n.x,n.y,r,0,Math.PI*2);
+    var sg=cx.createRadialGradient(n.x-r*.3,n.y-r*.3,r*.1,n.x,n.y,r);
+    sg.addColorStop(0,'#ffffff25');sg.addColorStop(.5,col);sg.addColorStop(1,col+'80');
+    cx.fillStyle=sg;cx.fill();
+    if(selectedNode===n){cx.beginPath();cx.arc(n.x,n.y,r+3,0,Math.PI*2);cx.strokeStyle=col+'80';cx.lineWidth=2;cx.stroke();}
+    // Pulse ring for anchor
+    if(n.type==='anchor'){
+      var pulseR=r+5+Math.sin(Date.now()*0.003)*8;
+      cx.beginPath();cx.arc(n.x,n.y,pulseR,0,Math.PI*2);cx.strokeStyle=col+'20';cx.lineWidth=1.5;cx.stroke();
+      var pulseR2=r+10+Math.sin(Date.now()*0.002)*12;
+      cx.beginPath();cx.arc(n.x,n.y,pulseR2,0,Math.PI*2);cx.strokeStyle=col+'10';cx.lineWidth=1;cx.stroke();
+    }
+    cx.beginPath();cx.arc(n.x,n.y,r+1,0,Math.PI*2);cx.strokeStyle=col+'40';cx.lineWidth=0.8;cx.stroke();
+    if(r>=5){cx.fillStyle='#e2e8f0';cx.font=(n.type==='anchor'?'bold ':'')+Math.max(10,r*.8)+'px Inter,sans-serif';cx.textAlign='center';cx.fillText(n.label,n.x,n.y-r-6);}
+    if(n.type==='server'&&n.info){cx.beginPath();cx.arc(n.x+r*.6,n.y-r*.6,2.5,0,Math.PI*2);cx.fillStyle=n.info.status==='online'?'#9ece6a':'#e0af68';cx.fill();}
+  }
+  // Tooltip
+  if(hoverN&&hoverN.info){
+    var tt=document.getElementById('tooltip'),n=hoverN,html='<div class="tt">'+n.label+'</div>';
+    var km={desc:'说明',code:'编码',head:'负责人',budget:'预算',level:'层级',region:'区域',city:'城市',emp_id:'工号',dept:'部门',title:'职位',salary:'薪资',email:'邮箱',node_id:'节点',role:'角色',cpu:'CPU',mem:'内存',storage:'存储',status:'状态',ip:'IP',progress:'进度',industry:'行业',contract:'合同额',contact:'联系人',source:'来源',stage:'阶段',value:'金额',owner:'负责人',created:'创建',message:'消息',resolved:'处理',entries:'条目数'};
+    for(var k in n.info){if(!n.info.hasOwnProperty(k))continue;html+='<div class="tr"><span>'+(km[k]||k)+'</span><span>'+n.info[k]+'</span></div>';}
+    html+='<div style="margin-top:6px;font-size:10px;color:var(--accent)">点击查看关联数据 →</div>';
+    tt.innerHTML=html;var tx=n.x+18,ty=n.y-18;if(tx+280>W)tx=n.x-298;if(ty<0)ty=10;
+    tt.style.left=tx+'px';tt.style.top=ty+'px';tt.style.display='block';
+  }else{document.getElementById('tooltip').style.display='none';}
+  cx.fillStyle='#3b4261';cx.font='10px monospace';cx.textAlign='left';cx.fillText('nodes:'+nodes.length+' edges:'+edges.length,8,H-6);
+  requestAnimationFrame(draw);
+}
+
+// ── Mouse ──
+cv.addEventListener('mousemove',function(e){
+  var rect=cv.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;
+  if(dragN){dragN.x=mx+dragOff.x;dragN.y=my+dragOff.y;return;}
+  hoverN=null;for(var i=nodes.length-1;i>=0;i--){var n=nodes[i],dx=mx-n.x,dy=my-n.y;if(dx*dx+dy*dy<(n.r+4)*(n.r+4)){hoverN=n;break;}}
+  cv.style.cursor=hoverN?'pointer':'default';
+});
+cv.addEventListener('mousedown',function(e){if(hoverN){dragN=hoverN;var rect=cv.getBoundingClientRect();dragOff={x:hoverN.x-(e.clientX-rect.left),y:hoverN.y-(e.clientY-rect.top)};}});
+cv.addEventListener('mouseup',function(){dragN=null;});
+cv.addEventListener('click',function(e){
+  if(dragN)return; // Was a drag, not a click
+  var rect=cv.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;
+  var clicked=null;
+  for(var i=nodes.length-1;i>=0;i--){var n=nodes[i],dx=mx-n.x,dy=my-n.y;if(dx*dx+dy*dy<(n.r+4)*(n.r+4)){clicked=n;break;}}
+  if(clicked){
+    selectedNode=clicked;
+    // Switch to explore tab
+    document.querySelectorAll('.panel-tab').forEach(function(t){t.classList.remove('active');});
+    document.querySelectorAll('.panel-content').forEach(function(c){c.classList.remove('active');});
+    document.querySelector('[data-tab="explore"]').classList.add('active');
+    document.getElementById('tab-explore').classList.add('active');
+    showNodeDetail(clicked);
+    expandRelations(clicked);
+  }
+});
+
+// ── Node detail & relation expansion ──
+function showNodeDetail(n){
+  var panel=document.getElementById('detailPanel');
+  var html='<div class="detail"><span class="back" onclick="clearDetail()">← 返回提示</span>';
+  html+='<div class="title">'+n.label+'</div>';
+  html+='<div class="info-grid">';
+  if(n.info){for(var k in n.info){if(!n.info.hasOwnProperty(k))continue;
+    var km={code:'编码',head:'负责人',budget:'预算',level:'层级',region:'区域',emp_id:'工号',title:'职位',salary:'薪资',email:'邮箱',node_id:'节点',role:'角色',cpu:'CPU',mem:'内存',storage:'存储',status:'状态',progress:'进度',industry:'行业',contract:'合同额',contact:'联系人',stage:'阶段',value:'金额',entries:'条目数'}[k]||k;
+    html+='<div class="info-item"><div class="label">'+km+'</div><div class="value">'+n.info[k]+'</div></div>';}}
+  html+='</div>';
+  // Related entities
+  html+='<div class="rel-section"><div class="rel-title">关联实体</div><div id="relatedList">查询中...</div></div>';
+  html+='</div>';
+  panel.innerHTML=html;
+}
+
+function clearDetail(){
+  selectedNode=null;
+  document.getElementById('detailPanel').innerHTML='<div class="sec"><div class="st">点击图中任意节点查看关联数据</div><div style="color:var(--dim);font-size:11px;line-height:1.6">点击一个实体节点，自动查询数据库中的关联记录并展开到图上。</div></div>';
+}
+
+async function expandRelations(n){
+  var relList=document.getElementById('relatedList');
+  var queries=[];
+  if(n.type==='dept'){
+    queries=[
+      {sql:'SELECT * FROM Employee WHERE department = \''+n.info.code+'\'',label:'员工',type:'emp'},
+      {sql:'SELECT * FROM Project WHERE department = \''+n.info.code+'\'',label:'项目',type:'proj'},
+    ];
+  }else if(n.type==='customer'){
+    queries=[
+      {sql:'SELECT * FROM Project WHERE department = (SELECT code FROM Department WHERE name LIKE \'%销售%\' LIMIT 1)',label:'相关项目',type:'proj'},
+    ];
+  }else if(n.type==='server'){
+    queries=[
+      {sql:'SELECT * FROM Alert WHERE source = \''+n.info.node_id+'\'',label:'告警',type:'alert'},
+    ];
+  }else if(n.type==='emp'){
+    queries=[
+      {sql:'SELECT * FROM Department WHERE code = \''+n.info.dept+'\'',label:'所属部门',type:'dept'},
+    ];
+  }else if(n.type==='proj'){
+    queries=[
+      {sql:'SELECT * FROM Department WHERE code = \''+n.info.dept+'\'',label:'所属部门',type:'dept'},
+    ];
+  }
+  var html='';
+  for(var qi=0;qi<queries.length;qi++){
+    var q=queries[qi];
+    try{
+      var resp=await fetch('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q.sql})});
+      var data=await resp.json();
+      var rows=data.data||[];
+      if(rows.length>0){
+        html+='<div class="rel-title">'+q.label+' ('+rows.length+')</div>';
+        for(var ri=0;ri<rows.length;ri++){
+          var r=rows[ri];
+          var rid=q.type+'_'+(r.emp_id||r.code||r.node_id||r.name||ri);
+          var rname=r.name||r.emp_id||r.code||r.node_id||'unknown';
+          var alreadyExpanded=expandedNodes[rid];
+          html+='<div class="rel-item'+(alreadyExpanded?'':'')+'" onclick="addToGraph(\''+q.type+'\',\''+rid.replace(/'/g,"\\'")+'\',\''+rname.replace(/'/g,"\\'")+'\')">';
+          html+='<div class="dot" style="background:'+(COL[q.type]||'#565f89')+'"></div>';
+          html+='<span>'+rname+'</span>';
+          html+='<span style="margin-left:auto;color:var(--dim);font-size:9px">'+(alreadyExpanded?'已展开':'点击展开')+'</span>';
+          html+='</div>';
+        }
+      }else{
+        html+='<div style="color:var(--dim);font-size:11px;padding:4px 0">无关联'+q.label+'</div>';
+      }
+    }catch(e){
+      html+='<div style="color:var(--red);font-size:11px">查询失败</div>';
+    }
+  }
+  relList.innerHTML=html||'<div style="color:var(--dim);font-size:11px">暂无关联数据</div>';
+}
+
+function addToGraph(type,id,label){
+  if(expandedNodes[id])return;
+  if(findN(id))return;
+  var n=selectedNode;if(!n)return;
+  var angle=Math.random()*Math.PI*2;
+  var r=80+Math.random()*40;
+  var info={};
+  // Copy info from query result
+  if(type==='emp')info={emp_id:id.replace('emp_',''),title:'员工'};
+  else if(type==='proj')info={code:id.replace('p_',''),status:'进行中'};
+  else if(type==='dept')info={code:id.replace('d_','')};
+  else if(type==='alert')info={level:'WARNING'};
+  nodes.push({id:id,label:label,type:type,x:n.x+Math.cos(angle)*r,y:n.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:6,info:info});
+  edges.push({from:n.id,to:id,type:'related'});
+  expandedNodes[id]=true;
+  // Refresh detail
+  showNodeDetail(n);expandRelations(n);
+  document.getElementById('h-rel').textContent=edges.length;
+  document.getElementById('o-n').textContent=nodes.length;document.getElementById('o-e').textContent=edges.length;
+}
+
+// ── Query ──
+function q(sql){return fetch('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:sql})}).then(function(r){return r.json();});}
+
+// ── Build graph ──
+function build(d){
+  nodes=[];edges=[];expandedNodes={};
+  var cx0=W/2,cy0=H/2;
+  nodes.push({id:'anchor',label:'OntoDB',type:'anchor',x:cx0,y:cy0,vx:0,vy:0,fixed:true,r:24,info:{entries:d.total}});
+  var l2=d.depts.filter(function(x){return x.level===2;});
+  for(var i=0;i<l2.length;i++){var dd=l2[i],angle=2*Math.PI*i/l2.length-Math.PI/2,radius=Math.min(W,H)*0.22;
+    nodes.push({id:'d_'+dd.code,label:dd.name,type:'dept',x:cx0+Math.cos(angle)*radius,y:cy0+Math.sin(angle)*radius,vx:0,vy:0,fixed:false,r:14,info:{code:dd.code,head:dd.head,budget:(dd.budget/10000).toFixed(0)+'万',level:2}});
+    edges.push({from:'anchor',to:'d_'+dd.code,type:'semantic'});}
+  var l3=d.depts.filter(function(x){return x.level===3;});
+  for(var i=0;i<l3.length;i++){var dd=l3[i],pn=findN('d_'+dd.parent);if(!pn)continue;var angle=2*Math.PI*i/l3.length,r=60+Math.random()*20;
+    nodes.push({id:'d_'+dd.code,label:dd.name,type:'dept',x:pn.x+Math.cos(angle)*r,y:pn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:9,info:{code:dd.code,head:dd.head,budget:(dd.budget/10000).toFixed(0)+'万',level:3}});
+    edges.push({from:'d_'+dd.parent,to:'d_'+dd.code,type:'contains'});}
+  var de={};d.emps.forEach(function(e){if(!de[e.department])de[e.department]=[];de[e.department].push(e);});
+  for(var dept in de){var dn=findN('d_'+dept);if(!dn)continue;var es=de[dept];
+    for(var j=0;j<Math.min(es.length,5);j++){var e=es[j],angle=2*Math.PI*j/es.length+Math.random()*.3,r=40+Math.random()*15;
+      nodes.push({id:'e_'+e.emp_id,label:e.name,type:'emp',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:7,info:{emp_id:e.emp_id,dept:e.department,title:e.title,salary:(e.salary/1000).toFixed(0)+'K',email:e.email}});
+      edges.push({from:'d_'+dept,to:'e_'+e.emp_id,type:'belongs'});}}
+  for(var i=0;i<d.projs.length;i++){var p=d.projs[i],dn=findN('d_'+p.department);if(!dn)continue;var angle=2*Math.PI*i/d.projs.length+1,r=70+Math.random()*30;
+    nodes.push({id:'p_'+p.code,label:p.name,type:'proj',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:8,info:{code:p.code,dept:p.department,status:p.status,budget:(p.budget/10000).toFixed(0)+'万',progress:p.progress+'%'}});
+    edges.push({from:'d_'+p.department,to:'p_'+p.code,type:'contains'});}
+  for(var i=0;i<d.srvs.length;i++){var s=d.srvs[i],angle=2*Math.PI*i/d.srvs.length+0.5,radius=Math.min(W,H)*0.38;
+    nodes.push({id:'s_'+s.node_id,label:s.name,type:'server',x:cx0+Math.cos(angle)*radius,y:cy0+Math.sin(angle)*radius,vx:0,vy:0,fixed:false,r:10,info:{node_id:s.node_id,role:s.role,region:s.region,cpu:s.cpu_cores+'核',mem:s.memory_gb+'G',storage:s.storage_tb+'TB',status:s.status}});
+    edges.push({from:'anchor',to:'s_'+s.node_id,type:'hosts'});}
+  for(var i=0;i<d.custs.length;i++){var c=d.custs[i],dn=findN('d_SALES')||findN('d_SALES_EAST')||nodes[1];var angle=2*Math.PI*i/d.custs.length-0.5,r=80+Math.random()*30;
+    nodes.push({id:'cu_'+i,label:c.name,type:'customer',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:7,info:{industry:c.industry,level:c.level,contract:(c.contract_value/10000).toFixed(0)+'万',status:c.status,contact:c.contact,region:c.region}});
+    var dd={华东:'SALES_EAST',华北:'SALES_NORTH',华南:'SALES_SOUTH',东南亚:'OVERSEA_SEA',中东:'OVERSEA_ME',欧洲:'OVERSEA_EU'}[c.region]||'SALES';
+    edges.push({from:'d_'+dd,to:'cu_'+i,type:'serves'});}
+  for(var i=0;i<d.leads.length;i++){var l=d.leads[i],dn=findN('d_SALES')||nodes[1];var angle=2*Math.PI*i/d.leads.length+1.5,r=100+Math.random()*30;
+    nodes.push({id:'l_'+i,label:l.company,type:'lead',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:6,info:{industry:l.industry,stage:l.stage,value:(l.value/10000).toFixed(0)+'万'}});
+    edges.push({from:'d_SALES',to:'l_'+i,type:'pipeline'});}
+  for(var i=0;i<d.alerts.length;i++){var a=d.alerts[i],sn=findN('s_'+a.source);if(!sn)continue;
+    nodes.push({id:'a_'+i,label:a.level,type:'alert',x:sn.x+Math.cos(Math.random()*6.28)*25,y:sn.y+Math.sin(Math.random()*6.28)*25,vx:0,vy:0,fixed:false,r:3,info:{time:a.time,level:a.level,message:a.message,resolved:a.resolved?'已解决':'未解决'}});
+    edges.push({from:'s_'+a.source,to:'a_'+i,type:'alerted'});}
+}
+
+// ── Panel ──
+function mc(l,v,c){return '<div class="mc"><div class="l">'+l+'</div><div class="v"'+(c?' style="color:'+c+'"':'')+'>'+v+'</div></div>';}
+function bar(l,p,col){return '<div class="bar"><span style="min-width:80px;color:#9aa5ce;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+l+'</span><div class="bg"><div class="fl" style="width:'+p+'%;background:'+col+'"></div></div><span class="pct">'+p+'%</span></div>';}
+function rp(d){
+  document.getElementById('ov').innerHTML=[mc('部门',d.depts.filter(function(x){return x.level===2;}).length,'#bb9af7'),mc('员工',d.emps.length,'#9ece6a'),mc('项目',d.projs.length,'#e0af68'),mc('服务器',d.srvs.length,'#f7768e'),mc('客户',d.custs.length,'#f97316'),mc('线索',d.leads.length,'#ec4899'),mc('条目',d.total.toLocaleString(),'#7aa2f7'),mc('告警',d.alerts.length,'#7dcfff')].join('');
+  var l2=d.depts.filter(function(x){return x.level===2;});var seen={};l2=l2.filter(function(x){if(seen[x.code])return false;seen[x.code]=1;return true;});l2.sort(function(a,b){return b.budget-a.budget;});
+  var mx=l2.length?l2[0].budget:1;var h='';l2.forEach(function(x){h+=bar(x.name,Math.round(x.budget/mx*100),'#bb9af7');});document.getElementById('bg').innerHTML=h;
+  var sp=d.projs;var seenP={};sp=sp.filter(function(x){if(seenP[x.code])return false;seenP[x.code]=1;return true;});sp.sort(function(a,b){return b.progress-a.progress;});
+  h='';sp.forEach(function(p){var c=p.status==='已完成'?'#9ece6a':p.status==='规划中'?'#565f89':'#e0af68';h+=bar(p.name,p.progress,c);});document.getElementById('pj').innerHTML=h;
+  h='';var seenS={};d.srvs.forEach(function(s){if(seenS[s.node_id])return;seenS[s.node_id]=1;var c=s.status==='online'?'#9ece6a':'#e0af68';h+='<div class="row"><div class="dot" style="background:'+c+'"></div><div class="nm">'+s.name+'</div><span style="color:#565f89;font-size:9px">'+s.region+'</span></div>';});document.getElementById('sv').innerHTML=h;
+  h='';var seenC={};d.custs.forEach(function(c){if(seenC[c.name])return;seenC[c.name]=1;var lc=c.level==='S'?'#f7768e':c.level==='A'?'#e0af68':'#9ece6a';h+='<div class="row"><span class="tag" style="background:'+lc+';color:#1a1b26">'+c.level+'</span><div class="nm">'+c.name+'</div><span style="color:#f97316">'+(c.contract_value/10000).toFixed(0)+'万</span></div>';});document.getElementById('cu').innerHTML=h;
+  h='';var seenA={};d.alerts.forEach(function(a){var key=a.time+a.source;if(seenA[key])return;seenA[key]=1;var cls=a.level==='CRITICAL'?'c':a.level==='WARNING'?'w':'i';h+='<div class="alt '+cls+'"><b>'+a.level+'</b> ['+a.source+'] '+a.message+(a.resolved?' ✓':'')+'</div>';});document.getElementById('al').innerHTML=h||'<div style="color:#565f89;font-size:10px">无</div>';
+}
+
+// ── Vector Visualization ──
+var vectorData=[], vectorLabels=[], vectorColors=[];
+var CLUSTER_COLORS=['#7aa2f7','#9ece6a','#e0af68','#f7768e','#bb9af7','#f97316','#ec4899','#7dcfff','#565f89','#a9b1d6'];
+
+function initVectorTab(){
+  var sel=document.getElementById('vectorClass');
+  if(sel.options.length<=1){
+    var tables=['Department','Employee','Project','Server','Customer'];
+    tables.forEach(function(t){var opt=document.createElement('option');opt.value=t;opt.textContent=t;sel.appendChild(opt);});
+  }
+}
+
+function generateVectors(){
+  var cls=document.getElementById('vectorClass').value;
+  if(cls==='选择数据表...')return;
+  q('SELECT * FROM '+cls).then(function(resp){
+    var rows=resp.data||[];
+    if(rows.length===0)return;
+    // Generate feature vectors from numeric/string attributes
+    var keys=Object.keys(rows[0]);
+    var numKeys=keys.filter(function(k){return typeof rows[0][k]==='number';});
+    if(numKeys.length<2)numKeys=keys.slice(0,3); // fallback
+    vectorData=[];vectorLabels=[];vectorColors=[];
+    // Find a categorical field for coloring
+    var catKey=null;
+    var cats=['industry','region','department','status','level','role'];
+    for(var ci=0;ci<cats.length;ci++){if(keys.indexOf(cats[ci])!==-1){catKey=cats[ci];break;}}
+    var catMap={};var catIdx=0;
+    rows.forEach(function(r,i){
+      var vec=[];
+      numKeys.forEach(function(k){vec.push(typeof r[k]==='number'?r[k]:r[k].length);});
+      // Pad to at least 5 dimensions
+      while(vec.length<5)vec.push(Math.random()*100);
+      vectorData.push(vec);
+      vectorLabels.push(r.name||r.emp_id||r.code||r.node_id||('row_'+i));
+      if(catKey){
+        var cat=r[catKey]||'unknown';
+        if(!(cat in catMap))catMap[cat]=catIdx++;
+        vectorColors.push(CLUSTER_COLORS[catMap[cat]%CLUSTER_COLORS.length]);
+      }else{
+        vectorColors.push(CLUSTER_COLORS[i%CLUSTER_COLORS.length]);
+      }
+    });
+    // Store catMap for legend
+    window._catMap=catMap;
+    runPCA();
+  });
+}
+
+function runPCA(){
+  if(vectorData.length===0)return;
+  var n=vectorData.length,dim=vectorData[0].length;
+  // Center data
+  var mean=[];for(var j=0;j<dim;j++){var s=0;for(var i=0;i<n;i++)s+=vectorData[i][j];mean.push(s/n);}
+  var centered=[];for(var i=0;i<n;i++){var row=[];for(var j=0;j<dim;j++)row.push(vectorData[i][j]-mean[j]);centered.push(row);}
+  // Compute covariance and find top 2 eigenvectors (power iteration)
+  var cov=[];for(var i=0;i<dim;i++){cov[i]=[];for(var j=0;j<dim;j++){var s=0;for(var k=0;k<n;k++)s+=centered[k][i]*centered[k][j];cov[i][j]=s/n;}}
+  // Power iteration for first eigenvector
+  var eig1=new Array(dim).fill(0).map(function(){return Math.random();});
+  for(var iter=0;iter<50;iter++){var nv=[];for(var i=0;i<dim;i++){var s=0;for(var j=0;j<dim;j++)s+=cov[i][j]*eig1[j];nv.push(s);}var norm=Math.sqrt(nv.reduce(function(a,b){return a+b*b;},0))||1;eig1=nv.map(function(x){return x/norm;});}
+  // Deflate and get second eigenvector
+  var cov2=[];for(var i=0;i<dim;i++){cov2[i]=[];for(var j=0;j<dim;j++){cov2[i][j]=cov[i][j]-eig1[i]*eig1[j]*cov.reduce(function(s,row,ii){return s+row[ii]*eig1[ii]*eig1[ii];},0);}}
+  var eig2=new Array(dim).fill(0).map(function(){return Math.random();});
+  for(var iter=0;iter<50;iter++){var nv=[];for(var i=0;i<dim;i++){var s=0;for(var j=0;j<dim;j++)s+=cov2[i][j]*eig2[j];nv.push(s);}var norm=Math.sqrt(nv.reduce(function(a,b){return a+b*b;},0))||1;eig2=nv.map(function(x){return x/norm;});}
+  // Project
+  var projected=[];for(var i=0;i<n;i++){var x=0,y=0;for(var j=0;j<dim;j++){x+=centered[i][j]*eig1[j];y+=centered[i][j]*eig2[j];}projected.push([x,y]);}
+  // Normalize to canvas
+  var minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
+  projected.forEach(function(p){if(p[0]<minX)minX=p[0];if(p[0]>maxX)maxX=p[0];if(p[1]<minY)minY=p[1];if(p[1]>maxY)maxY=p[1];});
+  var rangeX=maxX-minX||1,rangeY=maxY-minY||1;
+  var vcv=document.getElementById('vectorCanvas'),vcx=vcv.getContext('2d');
+  var vw=vcv.width,vh=vcv.height;
+  vcx.clearRect(0,0,vw,vh);
+  vcx.fillStyle='#0f1018';vcx.fillRect(0,0,vw,vh);
+  // Grid
+  vcx.strokeStyle='#1e293b';vcx.lineWidth=0.5;
+  for(var i=0;i<5;i++){var x=vw*i/4;vcx.beginPath();vcx.moveTo(x,0);vcx.lineTo(x,vh);vcx.stroke();}
+  for(var i=0;i<5;i++){var y=vh*i/4;vcx.beginPath();vcx.moveTo(0,y);vcx.lineTo(vw,y);vcx.stroke();}
+  // Points
+  for(var i=0;i<n;i++){
+    var px=20+(projected[i][0]-minX)/rangeX*(vw-40);
+    var py=20+(projected[i][1]-minY)/rangeY*(vh-40);
+    var col=vectorColors[i];
+    // Glow
+    var gl=vcx.createRadialGradient(px,py,0,px,py,10);
+    gl.addColorStop(0,col+'40');gl.addColorStop(1,col+'00');
+    vcx.fillStyle=gl;vcx.beginPath();vcx.arc(px,py,10,0,Math.PI*2);vcx.fill();
+    // Dot
+    vcx.beginPath();vcx.arc(px,py,4,0,Math.PI*2);vcx.fillStyle=col;vcx.fill();
+    vcx.beginPath();vcx.arc(px,py,5,0,Math.PI*2);vcx.strokeStyle=col+'60';vcx.lineWidth=1;vcx.stroke();
+    // Label
+    vcx.fillStyle='#c0caf5aa';vcx.font='9px Inter,sans-serif';vcx.textAlign='center';
+    vcx.fillText(vectorLabels[i].substring(0,8),px,py-8);
+  }
+  // Legend
+  var catMap=window._catMap||{};
+  var legendHtml='';
+  for(var cat in catMap){
+    legendHtml+='<div class="item"><div class="dot" style="background:'+CLUSTER_COLORS[catMap[cat]%CLUSTER_COLORS.length]+'"></div>'+cat+'</div>';
+  }
+  document.getElementById('vectorLegend').innerHTML=legendHtml;
+  // Hover
+  vcv.onmousemove=function(e){
+    var rect=vcv.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    var found=null;
+    for(var i=0;i<n;i++){
+      var px=20+(projected[i][0]-minX)/rangeX*(vw-40),py=20+(projected[i][1]-minY)/rangeY*(vh-40);
+      if((mx-px)*(mx-px)+(my-py)*(my-py)<100){found=i;break;}
+    }
+    var vtt=document.getElementById('vectorTooltip');
+    if(found!==null){
+      vtt.innerHTML='<b>'+vectorLabels[found]+'</b><br><span style="color:#9aa5ce">Cluster: '+vectorColors[found]+'</span>';
+      vtt.style.left=(mx+10)+'px';vtt.style.top=(my-10)+'px';vtt.style.display='block';
+    }else{vtt.style.display='none';}
+  };
+}
+
+// ── Fetch ──
+function go(){
+  Promise.all([q('SELECT * FROM Department'),q('SELECT * FROM Employee'),q('SELECT * FROM Project'),q('SELECT * FROM Server'),q('SELECT * FROM Alert'),q('SELECT * FROM BizMetrics'),q('SELECT * FROM Customer'),q('SELECT * FROM Lead')
+  ]).then(function(a){
+    allData={depts:a[0].data||[],emps:a[1].data||[],projs:a[2].data||[],srvs:a[3].data||[],alerts:a[4].data||[],custs:a[6].data||[],leads:a[7].data||[]};
+    var total=allData.depts.length+allData.emps.length+allData.projs.length+allData.srvs.length+allData.alerts.length+(a[5].data||[]).length+allData.custs.length+allData.leads.length;
+    document.getElementById('conn').style.display='none';
+    document.getElementById('dot').className='dot ok';document.getElementById('stxt').textContent='Connected';document.getElementById('stxt').style.color='#9ece6a';
+    document.getElementById('h-ent').textContent=total;
+    build({depts:allData.depts,emps:allData.emps,projs:allData.projs,srvs:allData.srvs,alerts:allData.alerts,custs:allData.custs,leads:allData.leads,total:total});
+    document.getElementById('h-rel').textContent=edges.length;
+    document.getElementById('o-n').textContent=nodes.length;document.getElementById('o-e').textContent=edges.length;
+    rp({depts:allData.depts,emps:allData.emps,projs:allData.projs,srvs:allData.srvs,alerts:allData.alerts,custs:allData.custs,leads:allData.leads,total:total});
+    // Auto-expand relationships after initial load
+    setTimeout(function(){autoExpand();},500);
+  }).catch(function(e){
+    console.error('[OntoDB]',e);document.getElementById('conn').style.display='flex';
+    document.getElementById('dot').className='dot err';document.getElementById('stxt').textContent='Disconnected';document.getElementById('stxt').style.color='#f7768e';
+  });
+}
+
+// ── Auto-expand 2 levels of relationships ──
+async function autoExpand(){
+  // Level 1: Expand each L2 department to show employees and projects
+  var l2=nodes.filter(function(n){return n.type==='dept'&&n.info&&n.info.level===2;});
+  for(var i=0;i<Math.min(l2.length,6);i++){
+    var dept=l2[i];
+    expandedNodes[dept.id]=true;
+    // Add employees for this dept
+    var emps=allData.emps.filter(function(e){return e.department===dept.info.code;});
+    for(var j=0;j<Math.min(emps.length,3);j++){
+      var e=emps[j];var eid='e_'+e.emp_id;
+      if(findN(eid))continue;
+      var angle=Math.random()*Math.PI*2,r=50+Math.random()*30;
+      nodes.push({id:eid,label:e.name,type:'emp',x:dept.x+Math.cos(angle)*r,y:dept.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:7,info:{emp_id:e.emp_id,dept:e.department,title:e.title,salary:(e.salary/1000).toFixed(0)+'K',email:e.email}});
+      edges.push({from:dept.id,to:eid,type:'related'});
+      expandedNodes[eid]=true;
+    }
+    // Add projects for this dept
+    var projs=allData.projs.filter(function(p){return p.department===dept.info.code;});
+    for(var j=0;j<Math.min(projs.length,2);j++){
+      var p=projs[j];var pid='p_'+p.code;
+      if(findN(pid))continue;
+      var angle=Math.random()*Math.PI*2,r=70+Math.random()*30;
+      nodes.push({id:pid,label:p.name,type:'proj',x:dept.x+Math.cos(angle)*r,y:dept.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:8,info:{code:p.code,dept:p.department,status:p.status,budget:(p.budget/10000).toFixed(0)+'万',progress:p.progress+'%'}});
+      edges.push({from:dept.id,to:pid,type:'related'});
+      expandedNodes[pid]=true;
+    }
+  }
+  // Level 2: Expand servers to show alerts
+  var srvs=nodes.filter(function(n){return n.type==='server';});
+  for(var i=0;i<srvs.length;i++){
+    var srv=srvs[i];
+    var alerts=allData.alerts.filter(function(a){return a.source===srv.info.node_id;});
+    for(var j=0;j<Math.min(alerts.length,2);j++){
+      var a=alerts[j];var aid='a_'+allData.alerts.indexOf(a);
+      if(findN(aid))continue;
+      var angle=Math.random()*Math.PI*2;
+      nodes.push({id:aid,label:a.level,type:'alert',x:srv.x+Math.cos(angle)*30,y:srv.y+Math.sin(angle)*30,vx:0,vy:0,fixed:false,r:4,info:{time:a.time,level:a.level,message:a.message,resolved:a.resolved?'已解决':'未解决'}});
+      edges.push({from:srv.id,to:aid,type:'related'});
+      expandedNodes[aid]=true;
+    }
+  }
+  // Level 2: Expand sales dept to show some customers
+  var salesDept=findN('d_SALES')||findN('d_SALES_EAST');
+  if(salesDept){
+    for(var i=0;i<Math.min(allData.custs.length,4);i++){
+      var c=allData.custs[i];var cid='cu_'+i;
+      if(findN(cid))continue;
+      var angle=Math.random()*Math.PI*2,r=60+Math.random()*30;
+      nodes.push({id:cid,label:c.name,type:'customer',x:salesDept.x+Math.cos(angle)*r,y:salesDept.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:6,info:{industry:c.industry,level:c.level,contract:(c.contract_value/10000).toFixed(0)+'万',status:c.status}});
+      edges.push({from:salesDept.id,to:cid,type:'related'});
+      expandedNodes[cid]=true;
+    }
+  }
+  document.getElementById('h-rel').textContent=edges.length;
+  document.getElementById('o-n').textContent=nodes.length;document.getElementById('o-e').textContent=edges.length;
+}
+
+// ── Multi-modal data comparison ──
+async function loadMultimodal(){
+  var cls=document.getElementById('mmEntity').value;
+  if(!cls)return;
+  var container=document.getElementById('mmContent');
+  container.innerHTML='<div style="padding:12px;color:var(--dim)">加载中...</div>';
+
+  try{
+    // Fetch all three data modalities in parallel
+    var results=await Promise.all([
+      q('SELECT * FROM '+cls),
+      q("SELECT * FROM EntityVector WHERE entity_type = '"+cls+"'"),
+      q("SELECT * FROM BizMetrics ORDER BY date DESC LIMIT 20")
+    ]);
+    var relData=results[0].data||[];
+    var vecData=results[1].data||[];
+    var tsData=results[2].data||[];
+
+    var html='';
+
+    // === Relational view ===
+    html+='<div class="sec"><div class="st">① 关系型 (Relational) — <span style="color:var(--green)">'+relData.length+' 行</span></div>';
+    if(relData.length>0){
+      var cols=Object.keys(relData[0]).slice(0,5);
+      html+='<table style="width:100%;font-size:10px;border-collapse:collapse;margin-top:4px">';
+      html+='<tr>'+cols.map(function(c){return '<th style="padding:4px 6px;text-align:left;border-bottom:2px solid var(--accent);color:var(--accent);font-size:10px">'+c+'</th>';}).join('')+'</tr>';
+      relData.slice(0,6).forEach(function(row){
+        html+='<tr>'+cols.map(function(c){
+          var v=row[c];
+          if(v===null||v===undefined)v='-';
+          else if(typeof v==='number')v=v.toLocaleString();
+          return '<td style="padding:3px 6px;border-bottom:1px solid var(--border);color:var(--text)">'+v+'</td>';
+        }).join('')+'</tr>';
+      });
+      html+='</table>';
+      if(relData.length>6)html+='<div style="color:var(--dim);font-size:9px;margin-top:4px">... 共 '+relData.length+' 条</div>';
+    }else{html+='<div style="color:var(--dim);font-size:11px">无数据</div>';}
+    html+='</div>';
+
+    // === Vector view ===
+    html+='<div class="sec"><div class="st">② 向量型 (Vector Embeddings) — <span style="color:var(--accent)">'+vecData.length+' 个向量</span></div>';
+    if(vecData.length>0){
+      vecData.forEach(function(v){
+        var vec=(v.vector||'').split(',').map(Number);
+        var maxD=Math.max.apply(null,vec)||1;
+        html+='<div style="margin-bottom:6px">';
+        html+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">';
+        html+='<span style="color:var(--accent);font-size:11px;font-weight:600;min-width:50px">'+v.entity_id+'</span>';
+        html+='<span style="color:var(--dim);font-size:9px">['+vec.length+'D]</span>';
+        html+='<span style="background:var(--purple)20;color:var(--purple);font-size:9px;padding:1px 5px;border-radius:3px">cluster '+v.cluster_id+'</span>';
+        html+='</div>';
+        // Vector bar visualization
+        html+='<div style="display:flex;gap:2px;height:20px;align-items:flex-end">';
+        vec.slice(0,12).forEach(function(d,i){
+          var h=Math.max(2,d/maxD*20);
+          var hue=i*30;
+          html+='<div style="flex:1;height:'+h+'px;background:hsl('+hue+',60%,55%);border-radius:2px;min-width:3px" title="d'+i+': '+d.toFixed(2)+'"></div>';
+        });
+        html+='</div>';
+        html+='<div style="font-size:9px;color:var(--dim);margin-top:1px">'+(v.description||'')+'</div>';
+        html+='</div>';
+      });
+    }else{html+='<div style="color:var(--dim);font-size:11px">无向量数据（请先运行向量生成）</div>';}
+    html+='</div>';
+
+    // === Time-series view ===
+    html+='<div class="sec"><div class="st">③ 时序型 (Time Series) — <span style="color:var(--yellow)">'+tsData.length+' 个数据点</span></div>';
+    if(tsData.length>0){
+      var metrics={};
+      tsData.forEach(function(m){
+        if(!metrics[m.metric])metrics[m.metric]=[];
+        metrics[m.metric].push({date:m.date,value:m.value,unit:m.unit});
+      });
+      for(var metric in metrics){
+        var points=metrics[metric];
+        if(points.length<2)continue;
+        var maxV=0;points.forEach(function(p){if(p.value>maxV)maxV=p.value;});
+        var latest=points[points.length-1];
+        var col=metric.indexOf('延迟')!==-1?'var(--yellow)':metric.indexOf('错误')!==-1?'var(--red)':'var(--green)';
+        html+='<div style="margin-bottom:10px">';
+        html+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">';
+        html+='<span style="font-size:10px;color:'+col+'">'+metric+'</span>';
+        html+='<span style="font-size:11px;color:var(--text);font-weight:600">'+(typeof latest.value==='number'?latest.value.toLocaleString():latest.value)+latest.unit+'</span>';
+        html+='</div>';
+        // Sparkline
+        html+='<div style="display:flex;align-items:flex-end;gap:1px;height:28px">';
+        points.forEach(function(p){
+          var h=Math.max(2,p.value/maxV*28);
+          html+='<div style="flex:1;height:'+h+'px;background:'+col+';border-radius:1px 1px 0 0;opacity:0.7" title="'+p.date+': '+p.value+p.unit+'"></div>';
+        });
+        html+='</div>';
+        html+='<div style="display:flex;justify-content:space-between;font-size:8px;color:var(--dim);margin-top:1px">';
+        html+='<span>'+points[0].date+'</span><span>'+latest.date+'</span></div>';
+        html+='</div>';
+      }
+    }else{html+='<div style="color:var(--dim);font-size:11px">无时序数据</div>';}
+    html+='</div>';
+
+    // === Summary: how the three modalities connect ===
+    html+='<div class="sec"><div class="st">多模融合</div>';
+    html+='<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:11px;line-height:1.6">';
+    html+='<div style="color:var(--accent);margin-bottom:4px">同一实体在三种模态中的统一表示：</div>';
+    html+='<div style="color:var(--dim)">';
+    html+='• <b style="color:var(--text)">'+cls+'</b> 在关系表中有 <b style="color:var(--green)">'+relData.length+'</b> 条结构化记录<br>';
+    html+='• 同时拥有 <b style="color:var(--accent)">'+vecData.length+'</b> 个语义向量（可用于相似度搜索）<br>';
+    html+='• 关联 <b style="color:var(--yellow)">'+tsData.length+'</b> 个时序数据点（可用于趋势分析）<br>';
+    html+='</div>';
+    html+='<div style="color:var(--accent);margin-top:6px;font-size:10px">→ OntoDB 支持在一次查询中同时使用三种模态数据</div>';
+    html+='</div></div>';
+
+    container.innerHTML=html;
+  }catch(e){
+    container.innerHTML='<div style="padding:12px;color:var(--red);font-size:12px">加载失败: '+e.message+'</div>';
+    console.error('[Multimodal]',e);
+  }
+}
+
+// ── Ontology reasoning chain visualization ──
+async function loadOntologyGraph(){
+  // Load class hierarchy
+  var classes=[];
+  try{var r=await q('SELECT * FROM __ontology_classes__');classes=r.data||[];}catch(e){}
+
+  // Load properties
+  var props=[];
+  try{var r=await q('SELECT * FROM __ontology_properties__');props=r.data||[];}catch(e){}
+
+  // Load rdf:type assertions
+  var types=[];
+  try{var r=await q('SELECT * FROM __rdf_type__');types=r.data||[];}catch(e){}
+
+  // Render class hierarchy as a tree
+  var ch=document.getElementById('classHierarchy');
+  if(classes.length>0){
+    // Build tree structure
+    var tree={};
+    var roots=[];
+    classes.forEach(function(c){
+      var name=c.uri.split('#').pop()||c.uri;
+      tree[name]={label:c.label||name,parent:c.parent_uri?c.parent_uri.split('#').pop():null,children:[]};
+    });
+    for(var name in tree){
+      if(tree[name].parent&&tree[tree[name].parent]){
+        tree[tree[name].parent].children.push(name);
+      }else if(!tree[name].parent){
+        roots.push(name);
+      }
+    }
+    // Render tree
+    function renderTree(name,depth){
+      var node=tree[name];if(!node)return '';
+      var indent='　'.repeat(depth);
+      var arrow=depth>0?'└─ ':'';
+      var icon=depth===0?'●':'○';
+      var color=depth===0?'var(--accent)':depth===1?'var(--purple)':depth===2?'var(--green)':'var(--dim)';
+      // Count instances
+      var instanceCount=types.filter(function(t){return t.class_uri&&t.class_uri.indexOf(name)!==-1;}).length;
+      var instStr=instanceCount>0?' <span style="color:var(--yellow)">('+instanceCount+' 实例)</span>':'';
+      var html='<div style="padding:2px 0;font-size:11px;color:'+color+'">'+indent+arrow+icon+' '+node.label+instStr+'</div>';
+      node.children.forEach(function(child){html+=renderTree(child,depth+1);});
+      return html;
+    }
+    var treeHtml='';
+    roots.forEach(function(r){treeHtml+=renderTree(r,0);});
+    ch.innerHTML=treeHtml;
+  }else{ch.innerHTML='<div style="color:var(--dim);font-size:11px">未加载到本体数据</div>';}
+
+  // Render property relations
+  var pr=document.getElementById('propRelations');
+  if(props.length>0){
+    var propHtml='';
+    props.forEach(function(p){
+      var name=p.uri.split('#').pop()||p.uri;
+      var domain=p.domain_uri?p.domain_uri.split('#').pop():'?';
+      var range=p.range_uri?p.range_uri.split('#').pop():'?';
+      var type=p.property_type||'object';
+      propHtml+='<div style="display:flex;align-items:center;gap:6px;padding:3px 0;font-size:10px">';
+      propHtml+='<span style="color:var(--accent);min-width:50px">'+name+'</span>';
+      propHtml+='<span style="color:var(--dim)">'+domain+'</span>';
+      propHtml+='<span style="color:var(--accent)">→</span>';
+      propHtml+='<span style="color:var(--dim)">'+range+'</span>';
+      propHtml+='<span style="color:var(--dim);font-size:9px">('+type+')</span>';
+      propHtml+='</div>';
+    });
+    pr.innerHTML=propHtml;
+  }else{pr.innerHTML='<div style="color:var(--dim);font-size:11px">无属性定义</div>';}
+}
+
+async function runReasoning(){
+  var rr=document.getElementById('reasoningResults');
+  rr.innerHTML='<div style="color:var(--dim);font-size:11px">推理中...</div>';
+
+  // Load data
+  var classes=[],types=[],subProps=[];
+  try{var r=await q('SELECT * FROM __ontology_classes__');classes=r.data||[];}catch(e){console.error(e);}
+  try{var r=await q('SELECT * FROM __rdf_type__');types=r.data||[];}catch(e){console.error(e);}
+  try{var r=await q('SELECT * FROM __rdfs_subproperty__');subProps=r.data||[];}catch(e){console.error(e);}
+
+  if(classes.length===0){
+    rr.innerHTML='<div style="color:var(--red);font-size:11px">未找到本体数据，请先运行本体初始化</div>';
+    return;
+  }
+
+  // Build class hierarchy
+  var classMap={};
+  classes.forEach(function(c){
+    var name=c.uri?c.uri.split('#').pop():c.uri;
+    classMap[name]={label:c.label||name,parent:c.parent_uri?c.parent_uri.split('#').pop():null,uri:c.uri};
+  });
+
+  // === Cax-sco reasoning: x type A, A subClassOf B => x type B ===
+  var inferred=[];
+  var derivations=[];
+
+  types.forEach(function(t){
+    var className=t.class_uri?t.class_uri.split('#').pop():null;
+    if(!className||!classMap[className])return;
+    var current=className;
+    var chain=[className];
+    while(classMap[current]&&classMap[current].parent){
+      var parent=classMap[current].parent;
+      if(!classMap[parent])break;
+      var exists=types.some(function(x){return x.subject===t.subject&&x.class_uri&&x.class_uri.indexOf(parent)!==-1;});
+      if(!exists){
+        inferred.push({subject:t.subject,predicate:'rdf:type',object:parent});
+        derivations.push({rule:'Cax-sco',subject:t.subject,from:className,to:parent,chain:chain.concat(parent)});
+      }
+      chain.push(parent);
+      current=parent;
+    }
+  });
+
+  // === Prp-spo reasoning ===
+  subProps.forEach(function(sp){
+    var sub=sp.sub_property_uri?sp.sub_property_uri.split('#').pop():null;
+    var sup=sp.super_property_uri?sp.super_property_uri.split('#').pop():null;
+    if(sub&&sup){
+      derivations.push({rule:'Prp-spo',subject:sub,from:sub,to:sup,chain:[sub,sup]});
+    }
+  });
+
+  // === Render results ===
+  var html='';
+
+  // Stats summary
+  html+='<div style="display:flex;gap:12px;margin-bottom:10px">';
+  html+='<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;flex:1;text-align:center">';
+  html+='<div style="font-size:18px;font-weight:700;color:var(--green)">'+inferred.length+'</div>';
+  html+='<div style="font-size:9px;color:var(--dim)">推理事实</div></div>';
+  html+='<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;flex:1;text-align:center">';
+  html+='<div style="font-size:18px;font-weight:700;color:var(--accent)">'+derivations.length+'</div>';
+  html+='<div style="font-size:9px;color:var(--dim)">推理链</div></div>';
+  html+='<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;flex:1;text-align:center">';
+  html+='<div style="font-size:18px;font-weight:700;color:var(--purple)">2</div>';
+  html+='<div style="font-size:9px;color:var(--dim)">推理规则</div></div>';
+  html+='</div>';
+
+  // Inference chain visualization canvas
+  html+='<div style="margin-bottom:10px"><div style="font-size:10px;font-weight:700;color:var(--dim);margin-bottom:6px">推理链图谱</div>';
+  html+='<canvas id="reasonCanvas" width="356" height="200" style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px"></canvas></div>';
+
+  // Derivation details
+  html+='<div style="font-size:10px;font-weight:700;color:var(--dim);margin-bottom:6px">推理推导详情</div>';
+  derivations.forEach(function(d,i){
+    var ruleColor=d.rule==='Cax-sco'?'var(--accent)':'var(--purple)';
+    var arrow='→';
+    html+='<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:6px">';
+    html+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">';
+    html+='<span style="background:'+ruleColor+'20;color:'+ruleColor+';font-size:9px;padding:2px 8px;border-radius:3px;font-weight:700">'+d.rule+'</span>';
+    html+='<span style="color:var(--text);font-size:11px;font-weight:600">'+d.subject+'</span>';
+    html+='<span style="color:var(--dim)">'+arrow+'</span>';
+    html+='<span style="color:var(--green)">'+d.to+'</span>';
+    html+='</div>';
+    // Chain visualization
+    html+='<div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">';
+    d.chain.forEach(function(c,ci){
+      var isFirst=ci===0,isLast=ci===d.chain.length-1;
+      var bg=isFirst?'var(--accent)20':isLast?'var(--green)20':'var(--dim)10';
+      var col=isFirst?'var(--accent)':isLast?'var(--green)':'var(--dim)';
+      var border=isFirst?'var(--accent)':isLast?'var(--green)':'var(--border)';
+      html+='<span style="background:'+bg+';border:1px solid '+border+';color:'+col+';font-size:10px;padding:2px 8px;border-radius:4px">'+(classMap[c]?classMap[c].label:c)+'</span>';
+      if(ci<d.chain.length-1)html+='<span style="color:var(--dim);font-size:12px">→</span>';
+    });
+    html+='</div>';
+    // Premises
+    if(d.rule==='Cax-sco'){
+      html+='<div style="font-size:9px;color:var(--dim);margin-top:4px">前提: <span style="color:var(--text)">'+d.subject+' ∈ '+d.from+'</span> ∧ <span style="color:var(--text)">'+d.from+' ⊑ '+d.to+'</span></div>';
+      html+='<div style="font-size:9px;color:var(--green);margin-top:2px">结论: <span style="font-weight:600">'+d.subject+' ∈ '+d.to+'</span></div>';
+    }else{
+      html+='<div style="font-size:9px;color:var(--dim);margin-top:4px">前提: <span style="color:var(--text)">? '+d.subject+' ?</span> ∧ <span style="color:var(--text)">'+d.from+' ⊑ '+d.to+'</span></div>';
+      html+='<div style="font-size:9px;color:var(--green);margin-top:2px">结论: <span style="font-weight:600">? '+d.to+' ?</span> (若 ? '+d.subject+' ?)</div>';
+    }
+    html+='</div>';
+  });
+
+  rr.innerHTML=html;
+
+  // Draw reasoning chain canvas with animation
+  window._reasonDerivations=derivations;
+  window._reasonClassMap=classMap;
+  drawReasoningCanvas(derivations,classMap);
+  if(window._reasonAnim)clearInterval(window._reasonAnim);
+  window._reasonAnim=setInterval(function(){drawReasoningCanvas(window._reasonDerivations,window._reasonClassMap);},50);
+}
+
+function drawReasoningCanvas(derivations,classMap){
+  var cv=document.getElementById('reasonCanvas');
+  if(!cv)return;
+  var cx=cv.getContext('2d');
+  var W=cv.width,cvH=cv.height;
+  cx.clearRect(0,0,W,cvH);
+  cx.fillStyle='#0f1018';cx.fillRect(0,0,W,cvH);
+
+  // Draw class hierarchy tree
+  var nodes=[],edges=[];
+  var drawn={};
+  // Collect unique classes from derivations
+  derivations.forEach(function(d){
+    d.chain.forEach(function(c){
+      if(!drawn[c]){
+        drawn[c]=true;
+        nodes.push({id:c,label:classMap[c]?classMap[c].label:c});
+      }
+    });
+  });
+  // Build edges from chain
+  derivations.forEach(function(d){
+    for(var i=0;i<d.chain.length-1;i++){
+      var key=d.chain[i]+'->'+d.chain[i+1];
+      if(!edges.some(function(e){return e.key===key;})){
+        edges.push({key:key,from:d.chain[i],to:d.chain[i+1],rule:d.rule});
+      }
+    }
+  });
+
+  // Layout: tree from left to right
+  var levels={};
+  function assignLevel(id,depth){
+    if(levels[id]!==undefined&&levels[id]>=depth)return;
+    levels[id]=depth;
+    edges.forEach(function(e){if(e.from===id)assignLevel(e.to,depth+1);});
+  }
+  // Find roots
+  var hasParent={};
+  edges.forEach(function(e){hasParent[e.to]=true;});
+  nodes.forEach(function(n){if(!hasParent[n.id])assignLevel(n.id,0);});
+  // Fallback
+  nodes.forEach(function(n){if(levels[n.id]===undefined)levels[n.id]=0;});
+
+  var maxLevel=0;for(var k in levels)if(levels[k]>maxLevel)maxLevel=levels[k];
+  var levelNodes={};
+  nodes.forEach(function(n){
+    var l=levels[n.id]||0;
+    if(!levelNodes[l])levelNodes[l]=[];
+    levelNodes[l].push(n);
+  });
+
+  // Position nodes
+  var pos={};
+  for(var l=0;l<=maxLevel;l++){
+    var ln=levelNodes[l]||[];
+    var x=40+l*(W-80)/Math.max(maxLevel,1);
+    ln.forEach(function(n,i){
+      var y=30+i*(cvH-60)/Math.max(ln.length-1,1);
+      if(ln.length===1)y=cvH/2;
+      pos[n.id]={x:x,y:y};
+    });
+  }
+
+  // Draw edges
+  edges.forEach(function(e){
+    var from=pos[e.from],to=pos[e.to];
+    if(!from||!to)return;
+    var col=e.rule==='Cax-sco'?'#7aa2f7':'#bb9af7';
+    cx.beginPath();cx.moveTo(from.x,from.y);cx.lineTo(to.x,to.y);
+    cx.strokeStyle=col+'60';cx.lineWidth=2;cx.stroke();
+    // Arrow
+    var angle=Math.atan2(to.y-from.y,to.x-from.x);
+    var arrowX=to.x-12*Math.cos(angle),arrowY=to.y-12*Math.sin(angle);
+    cx.beginPath();cx.moveTo(to.x-8,to.y);cx.lineTo(arrowX-6*Math.cos(angle-0.4),arrowY-6*Math.sin(angle-0.4));cx.lineTo(arrowX-6*Math.cos(angle+0.4),arrowY-6*Math.sin(angle+0.4));cx.closePath();cx.fillStyle=col+'80';cx.fill();
+    // Particle
+    var t=(Date.now()%2000)/2000;
+    var px=from.x+(to.x-from.x)*t,py=from.y+(to.y-from.y)*t;
+    cx.beginPath();cx.arc(px,py,3,0,Math.PI*2);cx.fillStyle=col;cx.fill();
+  });
+
+  // Draw nodes
+  nodes.forEach(function(n){
+    var p=pos[n.id];if(!p)return;
+    var r=16;
+    var gl=cx.createRadialGradient(p.x,p.y,0,p.x,p.y,r*2);
+    gl.addColorStop(0,'#7aa2f720');gl.addColorStop(1,'#7aa2f700');
+    cx.fillStyle=gl;cx.beginPath();cx.arc(p.x,p.y,r*2,0,Math.PI*2);cx.fill();
+    cx.beginPath();cx.arc(p.x,p.y,r,0,Math.PI*2);
+    cx.fillStyle='#7aa2f740';cx.fill();
+    cx.strokeStyle='#7aa2f7';cx.lineWidth=1.5;cx.stroke();
+    cx.fillStyle='#e2e8f0';cx.font='bold 10px Inter,sans-serif';cx.textAlign='center';
+    cx.fillText(n.label,p.x,p.y+4);
+  });
+
+  // Legend
+  cx.fillStyle='#565f89';cx.font='9px Inter,sans-serif';cx.textAlign='left';
+  cx.fillText('Cax-sco: 类型继承',8,cvH-16);
+  cx.fillStyle='#bb9af7';cx.fillText('Prp-spo: 属性继承',8,cvH-6);
+}
+
+draw();go();setInterval(go,5000);
+</script>
+</body>
+</html>

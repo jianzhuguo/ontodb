@@ -319,6 +319,8 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         // Web console
         .route("/console", get(web_console))
         .route("/", get(web_console))
+        // Digital Twin
+        .route("/digital-twin", get(digital_twin))
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .layer(build_cors_layer(cors_origins))
         .layer(TraceLayer::new_for_http())
@@ -375,6 +377,8 @@ pub fn build_router_with_auth(
         .route("/api/openapi.json", get(openapi_spec))
         .route("/console", get(web_console))
         .route("/", get(web_console))
+        // Digital Twin (no auth required)
+        .route("/digital-twin", get(digital_twin))
         // Merge admin routes (after main routes to avoid conflicts)
         .merge(admin_routes)
         // Apply rate limiting middleware
@@ -626,11 +630,18 @@ async fn execute_query(
             let elapsed = start.elapsed().as_secs_f64();
             state.metrics.record_query(query_type, elapsed, false);
             // Audit log — failed query
-            let audit_entry = state.audit.create_query_entry(&client_ip, None, query_type, query, elapsed * 1000.0, false, Some(e.to_string()));
+            let err_msg = e.to_string();
+            let audit_entry = state.audit.create_query_entry(&client_ip, None, query_type, query, elapsed * 1000.0, false, Some(err_msg.clone()));
             state.audit.log(audit_entry);
+            // Sanitize error message for client: remove file paths and internal details
+            let safe_msg = if err_msg.contains("failed to read file") || err_msg.contains("Permission denied") {
+                "Internal server error".to_string()
+            } else {
+                format!("Execution error: {}", err_msg)
+            };
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                PrettyJson(ApiResponse::<Value>::error(format!("Execution error: {}", e)), false),
+                PrettyJson(ApiResponse::<Value>::error(safe_msg), false),
             );
         }
     };
@@ -791,6 +802,12 @@ async fn vector_search(
             Json(ApiResponse::<Value>::error(format!("Invalid column name: {}", e))),
         );
     }
+    if req.query_vector.len() > 4096 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error("query_vector too large (max 4096 dimensions)".to_string())),
+        );
+    }
 
     // Build VECTOR SEARCH query
     let filter_clause = if let Some(f) = &req.filter {
@@ -812,9 +829,10 @@ async fn vector_search(
         .collect::<Vec<_>>()
         .join(", ");
 
+    let top_k = req.top_k.min(10000);
     let query = format!(
         "VECTOR SEARCH ON {} ({}) QUERY [{}] TOP {}{}",
-        req.class, req.column, vector_str, req.top_k, filter_clause
+        req.class, req.column, vector_str, top_k, filter_clause
     );
 
     let ast = match QueryParser::parse(&query) {
@@ -1056,6 +1074,16 @@ async fn web_console() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("static/console.html"))
 }
 
+/// GET /digital-twin - Enterprise digital twin monitoring dashboard.
+/// Reads from disk at runtime so changes take effect without recompilation.
+async fn digital_twin() -> axum::response::Html<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/static/digital_twin.html");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => axum::response::Html(content),
+        Err(_) => axum::response::Html("<h1>Digital Twin dashboard unavailable</h1><p>Please check server configuration.</p>".to_string()),
+    }
+}
+
 // ── Cluster API ──────────────────────────────────────────────────
 
 /// GET /api/cluster - Get cluster information.
@@ -1206,7 +1234,7 @@ async fn graph_traverse(
 
     let start_id = req.get("start").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let direction_str = req.get("direction").and_then(|v| v.as_str()).unwrap_or("out");
-    let max_depth = req.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+    let max_depth = req.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3).min(100) as usize;
     let edge_label = req.get("edge_label").and_then(|v| v.as_str());
     let algo = req.get("algorithm").and_then(|v| v.as_str()).unwrap_or("bfs");
 
