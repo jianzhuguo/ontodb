@@ -13,6 +13,7 @@ pub mod iterator;
 pub mod lsm;
 pub mod mvcc;
 pub mod options;
+pub mod tsm;
 pub mod vector;
 
 pub use engine::{LsmEngine, BackupManifest, BackupFile, BackupFileType};
