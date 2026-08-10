@@ -1,0 +1,472 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "OntoDB v0.3.0 Monitoring Dashboard",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Query Throughput (QPS)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "queries/sec",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "none",
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "mode": "none" }
+          },
+          "unit": "ops"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(ontodb_queries_total[1m])",
+          "legendFormat": "Total QPS",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(ontodb_queries_select[1m])",
+          "legendFormat": "SELECT",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(ontodb_queries_insert[1m])",
+          "legendFormat": "INSERT",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(ontodb_queries_update[1m])",
+          "legendFormat": "UPDATE",
+          "refId": "D"
+        },
+        {
+          "expr": "rate(ontodb_queries_delete[1m])",
+          "legendFormat": "DELETE",
+          "refId": "E"
+        },
+        {
+          "expr": "rate(ontodb_queries_vector_search[1m])",
+          "legendFormat": "Vector Search",
+          "refId": "F"
+        }
+      ]
+    },
+    {
+      "title": "Query Latency Distribution",
+      "type": "heatmap",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "scheme", "schemeName": "Oranges" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "latency",
+            "lineWidth": 2,
+            "fillOpacity": 80,
+            "gradientMode": "scheme"
+          },
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(ontodb_query_latency_bucket[5m])",
+          "legendFormat": "{{le}}",
+          "refId": "A",
+          "format": "heatmap",
+          "interval": "1m"
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "yAxis": { "unit": "s" },
+        "color": { "scheme": "Oranges" },
+        "cellGap": 1
+      }
+    },
+    {
+      "title": "Connections",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 100 },
+              { "color": "red", "value": 500 }
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "expr": "ontodb_http_connections_active",
+          "legendFormat": "HTTP Active",
+          "refId": "A"
+        },
+        {
+          "expr": "ontodb_tcp_connections_active",
+          "legendFormat": "TCP Active",
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area"
+      }
+    },
+    {
+      "title": "Storage Size",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1073741824 },
+              { "color": "red", "value": 10737418240 }
+            ]
+          },
+          "unit": "bytes"
+        }
+      },
+      "targets": [
+        {
+          "expr": "ontodb_disk_usage_bytes",
+          "legendFormat": "Disk Usage",
+          "refId": "A"
+        },
+        {
+          "expr": "ontodb_memtable_size_bytes",
+          "legendFormat": "MemTable",
+          "refId": "B"
+        },
+        {
+          "expr": "ontodb_wal_size_bytes",
+          "legendFormat": "WAL",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none"
+      }
+    },
+    {
+      "title": "Cache Hit Rate",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "green", "value": 80 }
+            ]
+          },
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        }
+      },
+      "targets": [
+        {
+          "expr": "ontodb_cache_hits / (ontodb_cache_hits + ontodb_cache_misses) * 100",
+          "legendFormat": "Block Cache Hit Rate",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      }
+    },
+    {
+      "title": "Errors",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 10 }
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(ontodb_query_errors[5m])",
+          "legendFormat": "Query Errors/s",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(ontodb_parse_errors[5m])",
+          "legendFormat": "Parse Errors/s",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(ontodb_slow_queries_total[5m])",
+          "legendFormat": "Slow Queries/s",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area"
+      }
+    },
+    {
+      "title": "Compaction Activity",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "count",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "mode": "none" }
+          },
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(ontodb_compactions_total[5m])",
+          "legendFormat": "Compactions/sec",
+          "refId": "A"
+        },
+        {
+          "expr": "ontodb_sstable_count",
+          "legendFormat": "SSTable Count",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Memory Usage",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "bytes",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "none",
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "mode": "none" }
+          },
+          "unit": "bytes"
+        }
+      },
+      "targets": [
+        {
+          "expr": "ontodb_memory_usage_bytes",
+          "legendFormat": "RSS Memory",
+          "refId": "A"
+        },
+        {
+          "expr": "ontodb_memtable_size_bytes",
+          "legendFormat": "MemTable",
+          "refId": "B"
+        },
+        {
+          "expr": "ontodb_wal_size_bytes",
+          "legendFormat": "WAL",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "title": "Authentication",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "attempts/sec",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "mode": "none" }
+          },
+          "unit": "ops"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(ontodb_auth_attempts[5m])",
+          "legendFormat": "Auth Attempts",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(ontodb_auth_successes[5m])",
+          "legendFormat": "Success",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(ontodb_auth_failures[5m])",
+          "legendFormat": "Failures",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "title": "Rate Limiting",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "requests/sec",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "mode": "none" }
+          },
+          "unit": "ops"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(ontodb_rate_limited_total[5m])",
+          "legendFormat": "Rate Limited",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Vector Search Performance",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "latency",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "mode": "none" }
+          },
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(ontodb_vector_search_latency_sum[5m]) / rate(ontodb_vector_search_latency_count[5m])",
+          "legendFormat": "Avg Latency",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(ontodb_vector_search_results[5m])",
+          "legendFormat": "Results/sec",
+          "refId": "B"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["ontodb", "database", "monitoring"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" },
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "queryValue": "",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "OntoDB v0.3.0 Monitoring",
+  "uid": "ontodb-v030",
+  "version": 1
+}

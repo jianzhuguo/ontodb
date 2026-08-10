@@ -1,0 +1,39 @@
+# Prometheus configuration for OntoDB monitoring
+#
+# Usage:
+#   prometheus --config.file=prometheus.yml
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'ontodb'
+    # OntoDB exposes metrics at /metrics in Prometheus format
+    metrics_path: '/metrics'
+    
+    # Static targets (single node)
+    static_configs:
+      - targets: ['localhost:7912']
+        labels:
+          instance: 'ontodb-01'
+          environment: 'production'
+    
+    # For multiple nodes, add more targets:
+    # - targets: ['ontodb-01:7912', 'ontodb-02:7912', 'ontodb-03:7912']
+    
+    # Scrape timeout
+    scrape_timeout: 10s
+    
+    # Optional: basic auth if API key is enabled
+    # basic_auth:
+    #   username: 'ontodb'
+    #   password_file: '/etc/prometheus/ontodb-password'
+
+  # Optional: scrape OntoDB health endpoint
+  - job_name: 'ontodb-health'
+    metrics_path: '/api/health'
+    static_configs:
+      - targets: ['localhost:7912']
+    scrape_interval: 30s
+    scrape_timeout: 5s
