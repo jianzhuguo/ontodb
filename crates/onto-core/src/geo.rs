@@ -496,6 +496,7 @@ fn decode_wkb(data: &[u8]) -> Option<Geometry> {
                 if offset + 16 > data.len() {
                     return None;
                 }
+                // Safe: bounds checked above
                 let x = f64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
                 let y = f64::from_le_bytes(data[offset + 8..offset + 16].try_into().ok()?);
                 coords.push(Coord::new(x, y));

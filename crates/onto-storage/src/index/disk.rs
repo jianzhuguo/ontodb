@@ -296,6 +296,9 @@ impl DiskPage {
     /// Writes the i-th slot.
     fn write_slot(&mut self, i: u16, entry_offset: u16, key_len: u16) {
         let off = Self::slot_offset(i);
+        if off + SLOT_SIZE > self.data.len() {
+            return; // Bounds check: slot would exceed page
+        }
         self.data[off..off + 2].copy_from_slice(&entry_offset.to_le_bytes());
         self.data[off + 2..off + 4].copy_from_slice(&key_len.to_le_bytes());
     }

@@ -88,6 +88,16 @@ fn find_unquoted_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize
     None
 }
 
+/// Safely slice a string from `start` to end. Returns empty string if out of bounds.
+fn safe_slice_from(s: &str, start: usize) -> &str {
+    if start >= s.len() { "" } else { &s[start..] }
+}
+
+/// Safely slice a string from `start` to `end`. Returns empty string if out of bounds.
+fn safe_slice(s: &str, start: usize, end: usize) -> &str {
+    if start >= end || start >= s.len() || end > s.len() { "" } else { &s[start..end] }
+}
+
 /// File format for IMPORT command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImportFormat {
@@ -818,7 +828,7 @@ impl QueryParser {
         let mut recursive = false;
 
         // Check for RECURSIVE keyword
-        if remaining.len() >= 9 && remaining[..9].eq_ignore_ascii_case("RECURSIVE") {
+        if remaining.len() >= 9 && safe_slice(remaining, 0, 9).eq_ignore_ascii_case("RECURSIVE") {
             recursive = true;
             remaining = remaining[9..].trim();
         }
@@ -830,8 +840,8 @@ impl QueryParser {
             let as_pos = find_ignore_ascii_case(remaining, " AS ")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'AS' after CTE name".to_string()))?;
 
-            let name_part = remaining[..as_pos].trim();
-            remaining = remaining[as_pos + 4..].trim();
+            let name_part = safe_slice(remaining, 0, as_pos).trim();
+            remaining = safe_slice_from(remaining, as_pos + 4).trim();
 
             // Parse optional column aliases: "cte_name(col1, col2)" or just "cte_name"
             let (name, columns) = if let Some(paren_start) = name_part.find('(') {
@@ -840,8 +850,8 @@ impl QueryParser {
                 if paren_start + 1 >= close {
                     return Err(CoreError::InvalidArgument("empty or malformed CTE column list".to_string()));
                 }
-                let cte_name = name_part[..paren_start].trim().to_string();
-                let cols_str = &name_part[paren_start + 1..close];
+                let cte_name = safe_slice(name_part, 0, paren_start).trim().to_string();
+                let cols_str = safe_slice(name_part, paren_start + 1, close);
                 let cols: Vec<String> = cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
                 (cte_name, cols)
             } else {
@@ -883,7 +893,7 @@ impl QueryParser {
                 query: Box::new(cte_query),
             });
 
-            remaining = remaining[close + 1..].trim();
+            remaining = safe_slice_from(remaining, close + 1).trim();
 
             // Check for more CTEs (comma-separated)
             if remaining.starts_with(',') {
@@ -924,7 +934,7 @@ impl QueryParser {
             } else if c == ')' {
                 depth -= 1;
             } else if depth == 0 && find_ignore_ascii_case(&input[i..], "UNION") == Some(0) {
-                let after = &input[i + 5..].trim_start();
+                let after = &safe_slice_from(input, i + 5).trim_start();
                 let (all, rest) = if find_ignore_ascii_case(after, "ALL") == Some(0) {
                     (true, after[3..].trim())
                 } else {
@@ -982,12 +992,15 @@ impl QueryParser {
         let from_pos = find_ignore_ascii_case(input, " FROM ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'FROM' in IMPORT".to_string()))?;
 
-        let class = input[into_pos + 4..from_pos].trim().to_string();
+        if into_pos + 4 >= from_pos {
+            return Err(CoreError::InvalidArgument("missing class name in IMPORT".to_string()));
+        }
+        let class = safe_slice(input, into_pos + 4, from_pos).trim().to_string();
         if class.is_empty() {
             return Err(CoreError::InvalidArgument("missing class name in IMPORT".to_string()));
         }
 
-        let after_from = input[from_pos + 6..].trim();
+        let after_from = safe_slice_from(input, from_pos + 6).trim();
         let starts_with = |kw: &str| find_ignore_ascii_case(after_from, kw) == Some(0);
 
         let format = if starts_with("CSV") {
@@ -1003,9 +1016,9 @@ impl QueryParser {
             .or_else(|| after_from.find('"'))
             .ok_or_else(|| CoreError::InvalidArgument("expected quoted file path in IMPORT".to_string()))?;
         let quote_char = after_from.as_bytes()[path_start] as char;
-        let path_end = after_from[path_start + 1..].find(quote_char)
+        let path_end = safe_slice_from(after_from, path_start + 1).find(quote_char)
             .ok_or_else(|| CoreError::InvalidArgument("unterminated file path in IMPORT".to_string()))?;
-        let file_path = after_from[path_start + 1..path_start + 1 + path_end].to_string();
+        let file_path = safe_slice(after_from, path_start + 1, path_start + 1 + path_end).to_string();
 
         Ok(QueryAst::Import { class, file_path, format })
     }
@@ -1019,24 +1032,24 @@ impl QueryParser {
         let from_pos = find_ignore_ascii_case(after_copy, " FROM ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'FROM' in COPY".to_string()))?;
 
-        let class = after_copy[..from_pos].trim().to_string();
+        let class = safe_slice(after_copy, 0, from_pos).trim().to_string();
         if class.is_empty() {
             return Err(CoreError::InvalidArgument("missing class name in COPY".to_string()));
         }
 
-        let after_from = after_copy[from_pos + 6..].trim();
+        let after_from = safe_slice_from(after_copy, from_pos + 6).trim();
 
         // Extract file path (between quotes)
         let path_start = after_from.find('\'')
             .or_else(|| after_from.find('"'))
             .ok_or_else(|| CoreError::InvalidArgument("expected quoted file path in COPY".to_string()))?;
         let quote_char = after_from.as_bytes()[path_start] as char;
-        let path_end = after_from[path_start + 1..].find(quote_char)
+        let path_end = safe_slice_from(after_from, path_start + 1).find(quote_char)
             .ok_or_else(|| CoreError::InvalidArgument("unterminated file path in COPY".to_string()))?;
-        let file_path = after_from[path_start + 1..path_start + 1 + path_end].to_string();
+        let file_path = safe_slice(after_from, path_start + 1, path_start + 1 + path_end).to_string();
 
         // Optional FORMAT clause
-        let after_path = after_from[path_start + 1 + path_end + 1..].trim();
+        let after_path = safe_slice_from(after_from, path_start + 1 + path_end + 1).trim();
         let format = if after_path.to_uppercase().starts_with("FORMAT CSV") {
             ImportFormat::Csv
         } else if after_path.to_uppercase().starts_with("FORMAT JSON") {
@@ -1060,9 +1073,9 @@ impl QueryParser {
         // Check if this is INSERT INTO ... SELECT
         let select_pos = Self::find_unquoted(input, " SELECT ");
         if let Some(sp) = select_pos {
-            let header = input[into_pos + 4..sp].trim();
+            let header = safe_slice(input, into_pos + 4, sp).trim();
             let (class, columns) = Self::parse_insert_header(header)?;
-            let query_str = input[sp + 1..].trim();
+            let query_str = safe_slice_from(input, sp + 1).trim();
             let query = Self::parse(query_str)?;
             return Ok(QueryAst::InsertSelect { class, columns, query: Box::new(query) });
         }
@@ -1074,21 +1087,21 @@ impl QueryParser {
             return Err(CoreError::InvalidArgument("malformed INSERT: 'VALUES' appears before 'INTO'".to_string()));
         }
 
-        let header = input[into_pos + 4..values_pos].trim();
-        let values_str = input[values_pos + 6..].trim();
+        let header = safe_slice(input, into_pos + 4, values_pos).trim();
+        let values_str = safe_slice_from(input, values_pos + 6).trim();
 
         let (class, columns) = Self::parse_insert_header(header)?;
 
         // Check for ON CONFLICT (UPSERT)
         let (values_str, upsert_info) = if let Some(oc_pos) = find_unquoted_ignore_ascii_case(values_str, " ON CONFLICT ") {
-            let vals_part = &values_str[..oc_pos];
-            let conflict_part = &values_str[oc_pos + 13..].trim();
+            let vals_part = safe_slice(&values_str, 0, oc_pos);
+            let conflict_part = &safe_slice_from(values_str, oc_pos + 13).trim();
             // Parse: (col) DO UPDATE SET col1 = val1, col2 = val2
             let do_update_pos = find_ignore_ascii_case(conflict_part, " DO UPDATE SET ")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'DO UPDATE SET' after ON CONFLICT".to_string()))?;
-            let conflict_col = conflict_part[..do_update_pos].trim();
+            let conflict_col = safe_slice(conflict_part, 0, do_update_pos).trim();
             let conflict_col = conflict_col.trim_start_matches('(').trim_end_matches(')').trim().to_string();
-            let set_part = conflict_part[do_update_pos + 15..].trim();
+            let set_part = safe_slice_from(conflict_part, do_update_pos + 15).trim();
             let assignments = Self::parse_set_assignments(set_part)?;
             (vals_part, Some((conflict_col, assignments)))
         } else {
@@ -1112,7 +1125,7 @@ impl QueryParser {
                     .map(|s| Self::parse_literal(s.trim()))
                     .collect::<Result<Vec<_>>>()?;
                 rows.push(values);
-                remaining = remaining[close + 1..].trim();
+                remaining = safe_slice_from(remaining, close + 1).trim();
                 if remaining.starts_with(',') {
                     remaining = remaining[1..].trim();
                 }
@@ -1171,8 +1184,8 @@ impl QueryParser {
         let paren_start = header
             .find('(')
             .ok_or_else(|| CoreError::InvalidArgument("expected '(' in INSERT".to_string()))?;
-        let class = header[..paren_start].trim().to_string();
-        let cols_str = &header[paren_start + 1..header.len() - 1];
+        let class = safe_slice(header, 0, paren_start).trim().to_string();
+        let cols_str = safe_slice(header, paren_start + 1, header.len() - 1);
         let columns: Vec<String> = cols_str
             .split(',')
             .map(|s| s.trim().to_string())
@@ -1189,8 +1202,8 @@ impl QueryParser {
                 let s = s.trim();
                 let eq_pos = Self::find_unquoted(s, "=")
                     .ok_or_else(|| CoreError::InvalidArgument("expected '=' in SET".to_string()))?;
-                let col = s[..eq_pos].trim().to_string();
-                let val = Self::parse_literal(s[eq_pos + 1..].trim())?;
+                let col = safe_slice(s, 0, eq_pos).trim().to_string();
+                let val = Self::parse_literal(safe_slice_from(s, eq_pos + 1).trim())?;
                 Ok((col, val))
             })
             .collect::<Result<Vec<_>>>()
@@ -1226,7 +1239,7 @@ impl QueryParser {
             (false, after_select)
         };
 
-        let rest = input[from_pos + 6..].trim();
+        let rest = safe_slice_from(input, from_pos + 6).trim();
 
         let columns = if cols_str == "*" {
             SelectColumns::All
@@ -1253,7 +1266,7 @@ impl QueryParser {
         let (group_by, rest) = if starts_with_ignore_ascii_case(rest_trimmed, "GROUP BY") {
             let pos = find_unquoted_ignore_ascii_case(&rest, "GROUP BY")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'GROUP BY'".to_string()))?;
-            let rest = rest[pos + 8..].trim();
+            let rest = safe_slice_from(&rest, pos + 8).trim();
             let (cols_str, rest) = Self::consume_until_keywords(rest, &["HAVING", "ORDER BY", "LIMIT"]);
             let columns: Vec<String> = cols_str
                 .split(',')
@@ -1270,7 +1283,7 @@ impl QueryParser {
         let (having, rest) = if starts_with_ignore_ascii_case(rest_trimmed, "HAVING") {
             let pos = find_unquoted_ignore_ascii_case(&rest, "HAVING")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'HAVING'".to_string()))?;
-            let rest = rest[pos + 6..].trim();
+            let rest = safe_slice_from(&rest, pos + 6).trim();
             Self::parse_where(rest)?
         } else {
             (None, rest)
@@ -1281,7 +1294,7 @@ impl QueryParser {
         let (order_by, rest) = if starts_with_ignore_ascii_case(rest_trimmed, "ORDER BY") {
             let start = find_unquoted_ignore_ascii_case(&rest, "ORDER BY")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'ORDER BY'".to_string()))?;
-            let (ob_str, rest) = Self::consume_until_keywords(rest[start + 8..].trim(), &["LIMIT", "OFFSET"]);
+            let (ob_str, rest) = Self::consume_until_keywords(safe_slice_from(&rest, start + 8).trim(), &["LIMIT", "OFFSET"]);
             let mut order_cols = Vec::new();
             for part in Self::split_quoted(ob_str.trim(), ',') {
                 let part = part.trim();
@@ -1306,7 +1319,7 @@ impl QueryParser {
         let (limit, offset, _rest) = if starts_with_ignore_ascii_case(rest_trimmed, "LIMIT") {
             let start = find_unquoted_ignore_ascii_case(&rest, "LIMIT")
                 .ok_or_else(|| CoreError::InvalidArgument("expected 'LIMIT'".to_string()))?;
-            let after_limit = rest[start + 5..].trim();
+            let after_limit = safe_slice_from(&rest, start + 5).trim();
             // Parse limit number (may be followed by OFFSET or end)
             let (num_str, after_num) = Self::parse_word(after_limit)?;
             let limit_val = num_str
@@ -1417,8 +1430,8 @@ impl QueryParser {
             // Parse <left> = <right>
             let eq_pos = Self::find_unquoted(on_input, "=")
                 .ok_or_else(|| CoreError::InvalidArgument("expected '=' in ON clause".to_string()))?;
-            let left = on_input[..eq_pos].trim().to_string();
-            let right_on = on_input[eq_pos + 1..].trim();
+            let left = safe_slice(on_input, 0, eq_pos).trim().to_string();
+            let right_on = safe_slice_from(on_input, eq_pos + 1).trim();
 
             // Right side ends at WHERE/JOIN/ORDER/LIMIT or end of string
             let (right, rest_after_on) = Self::consume_until_keywords(
@@ -1452,7 +1465,7 @@ impl QueryParser {
                 let case_expr = Self::parse_case_when(part)?;
                 // Check for alias after END
                 let expr = if let Some(end_pos) = find_ignore_ascii_case(part, " END") {
-                    let after_end = part[end_pos + 4..].trim();
+                    let after_end = safe_slice_from(part, end_pos + 4).trim();
                     if starts_with_ignore_ascii_case(after_end, "AS ") {
                         let _alias = after_end[3..].trim().to_string();
                         SelectItem::Expression(case_expr)
@@ -1513,10 +1526,10 @@ impl QueryParser {
                 if open + 1 >= close {
                     return Err(CoreError::InvalidArgument("empty or malformed aggregate function".to_string()));
                 }
-                let arg = part[open + 1..close].trim().to_string();
+                let arg = safe_slice(part, open + 1, close).trim().to_string();
 
                 // Check for alias: ... AS alias
-                let after = part[close + 1..].trim();
+                let after = safe_slice_from(part, close + 1).trim();
                 let alias = if starts_with_ignore_ascii_case(after, "AS") {
                     Some(after[2..].trim().to_string())
                 } else if !after.is_empty() {
@@ -1532,7 +1545,7 @@ impl QueryParser {
                 let (col, alias_part) = if let Some(as_pos) =
                     find_unquoted_ignore_ascii_case(part, " AS ")
                 {
-                    (part[..as_pos].trim(), Some(part[as_pos + 4..].trim()))
+                    (safe_slice(part, 0, as_pos).trim(), Some(safe_slice_from(part, as_pos + 4).trim()))
                 } else {
                     (part, None)
                 };
@@ -1573,8 +1586,8 @@ impl QueryParser {
         let over_pos = find_unquoted_ignore_ascii_case(input, " OVER ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'OVER' in window function".to_string()))?;
         
-        let func_part = input[..over_pos].trim();
-        let over_part = input[over_pos + 6..].trim();
+        let func_part = safe_slice(input, 0, over_pos).trim();
+        let over_part = safe_slice_from(input, over_pos + 6).trim();
 
         // Parse function name and argument
         let (func, arg) = Self::parse_window_func_name(func_part)?;
@@ -1583,9 +1596,9 @@ impl QueryParser {
         let over = Self::parse_window_spec(over_part)?;
 
         // Check for alias after OVER clause
-        let after_over = &input[over_pos + 6..];
+        let after_over = &safe_slice_from(input, over_pos + 6);
         let close_paren = Self::find_matching_paren(after_over)?;
-        let after = after_over[close_paren + 1..].trim();
+        let after = safe_slice_from(after_over, close_paren + 1).trim();
         let alias = if starts_with_ignore_ascii_case(after, "AS") {
             Some(after[2..].trim().to_string())
         } else if !after.is_empty() {
@@ -1608,8 +1621,8 @@ impl QueryParser {
         if open >= close {
             return Err(CoreError::InvalidArgument("malformed window function: '(' after ')'".to_string()));
         }
-        let func_name = &input[..open];
-        let arg_str = input[open + 1..close].trim();
+        let func_name = safe_slice(input, 0, open);
+        let arg_str = safe_slice(input, open + 1, close).trim();
         let arg = if arg_str.is_empty() || arg_str == "*" {
             None
         } else {
@@ -1666,7 +1679,7 @@ impl QueryParser {
 
         // Parse PARTITION BY
         if let Some(pb_pos) = find_unquoted_ignore_ascii_case(input, "PARTITION BY") {
-            let pb_str = &input[pb_pos + 12..].trim();
+            let pb_str = &safe_slice_from(input, pb_pos + 12).trim();
             let (pb_cols, remaining) = Self::consume_until_keywords(pb_str, &["ORDER BY", "ROWS", "RANGE"]);
             partition_by = pb_cols.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             
@@ -1718,14 +1731,14 @@ impl QueryParser {
         // Parse: ROWS BETWEEN <start> AND <end>
         let between_pos = find_unquoted_ignore_ascii_case(input, "BETWEEN")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'BETWEEN' in window frame".to_string()))?;
-        let frame_str = &input[between_pos + 7..].trim();
+        let frame_str = safe_slice_from(input, between_pos + 7).trim();
 
         // Find AND separator
         let and_pos = find_ignore_ascii_case(&frame_str, " AND ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'AND' in window frame".to_string()))?;
 
-        let start_str = frame_str[..and_pos].trim();
-        let end_str = frame_str[and_pos + 5..].trim();
+        let start_str = safe_slice(frame_str, 0, and_pos).trim();
+        let end_str = safe_slice_from(frame_str, and_pos + 5).trim();
 
         let start = Self::parse_frame_bound(start_str)?;
         let end = Some(Self::parse_frame_bound(end_str)?);
@@ -1742,13 +1755,13 @@ impl QueryParser {
             Ok(WindowFrameBound::UnboundedFollowing)
         } else if input.eq_ignore_ascii_case("CURRENT ROW") {
             Ok(WindowFrameBound::CurrentRow)
-        } else if input.len() >= 9 && input[input.len() - 9..].eq_ignore_ascii_case("PRECEDING") {
-            let n_str = input[..input.len() - 9].trim();
+        } else if input.len() >= 9 && safe_slice_from(input, input.len() - 9).eq_ignore_ascii_case("PRECEDING") {
+            let n_str = safe_slice(input, 0, input.len() - 9).trim();
             let n = n_str.parse::<u64>()
                 .map_err(|_| CoreError::InvalidArgument("invalid frame bound".to_string()))?;
             Ok(WindowFrameBound::Preceding(n))
-        } else if input.len() >= 9 && input[input.len() - 9..].eq_ignore_ascii_case("FOLLOWING") {
-            let n_str = input[..input.len() - 9].trim();
+        } else if input.len() >= 9 && safe_slice_from(input, input.len() - 9).eq_ignore_ascii_case("FOLLOWING") {
+            let n_str = safe_slice(input, 0, input.len() - 9).trim();
             let n = n_str.parse::<u64>()
                 .map_err(|_| CoreError::InvalidArgument("invalid frame bound".to_string()))?;
             Ok(WindowFrameBound::Following(n))
@@ -1784,7 +1797,7 @@ impl QueryParser {
             }
         }
 
-        let consumed = input[..earliest].trim().to_string();
+        let consumed = safe_slice(input, 0, earliest).trim().to_string();
         let remaining = &input[earliest..];
         (consumed, remaining)
     }
@@ -1793,17 +1806,17 @@ impl QueryParser {
     fn parse_create_index(input: &str) -> Result<QueryAst> {
         let on_pos = find_ignore_ascii_case(input, " ON ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after CREATE INDEX".to_string()))?;
-        let rest = input[on_pos + 4..].trim();
+        let rest = safe_slice_from(input, on_pos + 4).trim();
 
         // Find the parenthesized column(s)
         let paren_open = rest
             .find('(')
             .ok_or_else(|| CoreError::InvalidArgument("expected '(column)' in CREATE INDEX".to_string()))?;
-        let class = rest[..paren_open].trim().to_string();
+        let class = safe_slice(rest, 0, paren_open).trim().to_string();
         let paren_close = rest
             .find(')')
             .ok_or_else(|| CoreError::InvalidArgument("expected ')' in CREATE INDEX".to_string()))?;
-        let columns_str = rest[paren_open + 1..paren_close].trim().to_string();
+        let columns_str = safe_slice(rest, paren_open + 1, paren_close).trim().to_string();
 
         if class.is_empty() || columns_str.is_empty() {
             return Err(CoreError::InvalidArgument(
@@ -1821,7 +1834,9 @@ impl QueryParser {
         if columns.len() > 1 {
             Ok(QueryAst::CreateCompositeIndex { class, columns })
         } else {
-            Ok(QueryAst::CreateIndex { class, column: columns.into_iter().next().unwrap() })
+            let column = columns.into_iter().next()
+                .ok_or_else(|| CoreError::InvalidArgument("expected column name in CREATE INDEX".to_string()))?;
+            Ok(QueryAst::CreateIndex { class, column })
         }
     }
 
@@ -1829,16 +1844,16 @@ impl QueryParser {
     fn parse_drop_index(input: &str) -> Result<QueryAst> {
         let on_pos = find_ignore_ascii_case(input, " ON ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after DROP INDEX".to_string()))?;
-        let rest = input[on_pos + 4..].trim();
+        let rest = safe_slice_from(input, on_pos + 4).trim();
 
         let paren_open = rest
             .find('(')
             .ok_or_else(|| CoreError::InvalidArgument("expected '(column)' in DROP INDEX".to_string()))?;
-        let class = rest[..paren_open].trim().to_string();
+        let class = safe_slice(rest, 0, paren_open).trim().to_string();
         let paren_close = rest
             .find(')')
             .ok_or_else(|| CoreError::InvalidArgument("expected ')' in DROP INDEX".to_string()))?;
-        let column = rest[paren_open + 1..paren_close].trim().to_string();
+        let column = safe_slice(rest, paren_open + 1, paren_close).trim().to_string();
 
         if class.is_empty() || column.is_empty() {
             return Err(CoreError::InvalidArgument(
@@ -1853,17 +1868,17 @@ impl QueryParser {
     fn parse_create_vector_index(input: &str) -> Result<QueryAst> {
         let on_pos = find_ignore_ascii_case(input, " ON ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after CREATE VECTOR INDEX".to_string()))?;
-        let rest = input[on_pos + 4..].trim();
+        let rest = safe_slice_from(input, on_pos + 4).trim();
 
         // Find the parenthesized column
         let paren_open = rest
             .find('(')
             .ok_or_else(|| CoreError::InvalidArgument("expected '(column)' in CREATE VECTOR INDEX".to_string()))?;
-        let class = rest[..paren_open].trim().to_string();
+        let class = safe_slice(rest, 0, paren_open).trim().to_string();
         let paren_close = rest
             .find(')')
             .ok_or_else(|| CoreError::InvalidArgument("expected ')' in CREATE VECTOR INDEX".to_string()))?;
-        let column = rest[paren_open + 1..paren_close].trim().to_string();
+        let column = safe_slice(rest, paren_open + 1, paren_close).trim().to_string();
 
         if class.is_empty() || column.is_empty() {
             return Err(CoreError::InvalidArgument(
@@ -1871,22 +1886,22 @@ impl QueryParser {
             ));
         }
 
-        let after_paren = rest[paren_close + 1..].trim();
+        let after_paren = safe_slice_from(&rest, paren_close + 1).trim();
 
         // Parse METRIC
         let metric = if let Some(pos) = find_ignore_ascii_case(after_paren, "METRIC") {
-            let metric_str = after_paren[pos + 6..].trim();
+            let metric_str = safe_slice_from(after_paren, pos + 6).trim();
             let end = metric_str.find(|c: char| c.is_whitespace()).unwrap_or(metric_str.len());
-            metric_str[..end].to_lowercase()
+            safe_slice(metric_str, 0, end).to_lowercase()
         } else {
             "cosine".to_string()
         };
 
         // Parse DIMENSION
         let dimension = if let Some(pos) = find_ignore_ascii_case(after_paren, "DIMENSION") {
-            let dim_str = after_paren[pos + 9..].trim();
+            let dim_str = safe_slice_from(after_paren, pos + 9).trim();
             let end = dim_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(dim_str.len());
-            dim_str[..end].parse::<usize>()
+            safe_slice(dim_str, 0, end).parse::<usize>()
                 .map_err(|_| CoreError::InvalidArgument("invalid DIMENSION value".to_string()))?
         } else {
             return Err(CoreError::InvalidArgument("DIMENSION is required in CREATE VECTOR INDEX".to_string()));
@@ -1894,27 +1909,27 @@ impl QueryParser {
 
         // Parse optional M
         let m = if let Some(pos) = find_ignore_ascii_case(after_paren, " M ") {
-            let m_str = after_paren[pos + 3..].trim();
+            let m_str = safe_slice_from(after_paren, pos + 3).trim();
             let end = m_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(m_str.len());
-            m_str[..end].parse::<usize>().unwrap_or(16)
+            safe_slice(m_str, 0, end).parse::<usize>().unwrap_or(16)
         } else {
             16
         };
 
         // Parse optional EF_CONSTRUCTION
         let ef_construction = if let Some(pos) = find_ignore_ascii_case(after_paren, "EF_CONSTRUCTION") {
-            let ef_str = after_paren[pos + 15..].trim();
+            let ef_str = safe_slice_from(after_paren, pos + 15).trim();
             let end = ef_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(ef_str.len());
-            ef_str[..end].parse::<usize>().unwrap_or(200)
+            safe_slice(ef_str, 0, end).parse::<usize>().unwrap_or(200)
         } else {
             200
         };
 
         // Parse optional EF_SEARCH
         let ef_search = if let Some(pos) = find_ignore_ascii_case(after_paren, "EF_SEARCH") {
-            let ef_str = after_paren[pos + 9..].trim();
+            let ef_str = safe_slice_from(after_paren, pos + 9).trim();
             let end = ef_str.find(|c: char| !c.is_ascii_digit()).unwrap_or(ef_str.len());
-            ef_str[..end].parse::<usize>().unwrap_or(100)
+            safe_slice(ef_str, 0, end).parse::<usize>().unwrap_or(100)
         } else {
             100
         };
@@ -1934,16 +1949,16 @@ impl QueryParser {
     fn parse_drop_vector_index(input: &str) -> Result<QueryAst> {
         let on_pos = find_ignore_ascii_case(input, " ON ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after DROP VECTOR INDEX".to_string()))?;
-        let rest = input[on_pos + 4..].trim();
+        let rest = safe_slice_from(input, on_pos + 4).trim();
 
         let paren_open = rest
             .find('(')
             .ok_or_else(|| CoreError::InvalidArgument("expected '(column)' in DROP VECTOR INDEX".to_string()))?;
-        let class = rest[..paren_open].trim().to_string();
+        let class = safe_slice(rest, 0, paren_open).trim().to_string();
         let paren_close = rest
             .find(')')
             .ok_or_else(|| CoreError::InvalidArgument("expected ')' in DROP VECTOR INDEX".to_string()))?;
-        let column = rest[paren_open + 1..paren_close].trim().to_string();
+        let column = safe_slice(rest, paren_open + 1, paren_close).trim().to_string();
 
         if class.is_empty() || column.is_empty() {
             return Err(CoreError::InvalidArgument(
@@ -1958,17 +1973,17 @@ impl QueryParser {
     fn parse_vector_search(input: &str) -> Result<QueryAst> {
         let on_pos = find_ignore_ascii_case(input, " ON ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'ON' after VECTOR SEARCH".to_string()))?;
-        let rest = input[on_pos + 4..].trim();
+        let rest = safe_slice_from(input, on_pos + 4).trim();
 
         // Find the parenthesized column
         let paren_open = rest
             .find('(')
             .ok_or_else(|| CoreError::InvalidArgument("expected '(column)' in VECTOR SEARCH".to_string()))?;
-        let class = rest[..paren_open].trim().to_string();
+        let class = safe_slice(rest, 0, paren_open).trim().to_string();
         let paren_close = rest
             .find(')')
             .ok_or_else(|| CoreError::InvalidArgument("expected ')' in VECTOR SEARCH".to_string()))?;
-        let column = rest[paren_open + 1..paren_close].trim().to_string();
+        let column = safe_slice(rest, paren_open + 1, paren_close).trim().to_string();
 
         if class.is_empty() || column.is_empty() {
             return Err(CoreError::InvalidArgument(
@@ -1976,12 +1991,12 @@ impl QueryParser {
             ));
         }
 
-        let after_paren = rest[paren_close + 1..].trim();
+        let after_paren = safe_slice_from(&rest, paren_close + 1).trim();
 
         // Parse QUERY keyword
         let query_pos = find_ignore_ascii_case(after_paren, "QUERY")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'QUERY' in VECTOR SEARCH".to_string()))?;
-        let after_query = after_paren[query_pos + 5..].trim();
+        let after_query = safe_slice_from(after_paren, query_pos + 5).trim();
 
         // Parse the vector: [v1, v2, ...]
         let bracket_open = after_query
@@ -1990,19 +2005,19 @@ impl QueryParser {
         let bracket_close = after_query
             .find(']')
             .ok_or_else(|| CoreError::InvalidArgument("expected ']' for query vector".to_string()))?;
-        let vec_str = &after_query[bracket_open + 1..bracket_close];
+        let vec_str = safe_slice(after_query, bracket_open + 1, bracket_close);
         let query_vector: Vec<f32> = vec_str
             .split(',')
             .map(|s| s.trim().parse::<f32>())
             .collect::<std::result::Result<Vec<f32>, _>>()
             .map_err(|_| CoreError::InvalidArgument("invalid vector element".to_string()))?;
 
-        let after_vec = after_query[bracket_close + 1..].trim();
+        let after_vec = safe_slice_from(after_query, bracket_close + 1).trim();
 
         // Parse TOP <k>
         let top_pos = find_ignore_ascii_case(after_vec, "TOP")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'TOP' in VECTOR SEARCH".to_string()))?;
-        let after_top = after_vec[top_pos + 3..].trim();
+        let after_top = safe_slice_from(after_vec, top_pos + 3).trim();
         let (top_str, remaining) = Self::parse_word(after_top)?;
         let top_k = top_str
             .parse::<usize>()
@@ -2029,13 +2044,13 @@ impl QueryParser {
             .ok_or_else(|| CoreError::InvalidArgument("expected 'SET'".to_string()))?;
 
         let class = input[6..set_pos].trim().to_string();
-        let rest = &input[set_pos + 5..];
+        let rest = &safe_slice_from(input, set_pos + 5);
 
         // Find WHERE position, respecting quotes
         let (set_part, filter_str) = if let Some(wp) = Self::find_unquoted(rest, " WHERE ") {
-            (&rest[..wp], Some(rest[wp + 7..].trim()))
+            (safe_slice(rest, 0, wp), Some(safe_slice_from(rest, wp + 7).trim()))
         } else {
-            (rest, None)
+            (*rest, None)
         };
 
         // Split assignments by comma, respecting quotes
@@ -2045,8 +2060,8 @@ impl QueryParser {
                 let s = s.trim();
                 let eq_pos = Self::find_unquoted(s, "=")
                     .ok_or_else(|| CoreError::InvalidArgument("expected '=' in SET".to_string()))?;
-                let col = s[..eq_pos].trim().to_string();
-                let val = Self::parse_literal(s[eq_pos + 1..].trim())?;
+                let col = safe_slice(s, 0, eq_pos).trim().to_string();
+                let val = Self::parse_literal(safe_slice_from(s, eq_pos + 1).trim())?;
                 Ok((col, val))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2105,7 +2120,7 @@ impl QueryParser {
         let from_pos = find_ignore_ascii_case(input, "FROM")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'FROM'".to_string()))?;
 
-        let rest = input[from_pos + 4..].trim();
+        let rest = safe_slice_from(input, from_pos + 4).trim();
         let (class, rest) = Self::parse_word(rest)?;
 
         let filter = if starts_with_ignore_ascii_case(&rest, "WHERE") {
@@ -2132,17 +2147,17 @@ impl QueryParser {
         if open + 1 >= close {
             return Err(CoreError::InvalidArgument("empty or malformed MATCH pattern".to_string()));
         }
-        let pattern = rest[open + 1..close].trim();
+        let pattern = safe_slice(rest, open + 1, close).trim();
 
         // Parse pattern: <var>: <Class>
         let colon_pos = pattern
             .find(':')
             .ok_or_else(|| CoreError::InvalidArgument("expected ':' in MATCH pattern".to_string()))?;
 
-        let variable = pattern[..colon_pos].trim().to_string();
-        let class = pattern[colon_pos + 1..].trim().to_string();
+        let variable = safe_slice(pattern, 0, colon_pos).trim().to_string();
+        let class = safe_slice_from(pattern, colon_pos + 1).trim().to_string();
 
-        let after = rest[close + 1..].trim();
+        let after = safe_slice_from(&rest, close + 1).trim();
 
         // Parse optional WHERE
         let (filter, after) = if starts_with_ignore_ascii_case(after, "WHERE") {
@@ -2205,7 +2220,7 @@ impl QueryParser {
         // Check for NOT (expr)
         if starts_with_ignore_ascii_case(input, "NOT ") || starts_with_ignore_ascii_case(input, "NOT(") {
             let not_len = if starts_with_ignore_ascii_case(input, "NOT(") { 4 } else { 4 };
-            let rest = input[not_len..].trim();
+            let rest = safe_slice_from(input, not_len).trim();
             if rest.starts_with('(') {
                 // Find matching closing paren
                 let mut depth = 0i32;
@@ -2221,8 +2236,8 @@ impl QueryParser {
                     }
                 }
                 if let Some(close) = close_pos {
-                    let inner = rest[1..close].trim();
-                    let remaining = rest[close + 1..].trim();
+                    let inner = safe_slice(rest, 1, close).trim();
+                    let remaining = safe_slice_from(&rest, close + 1).trim();
                     let (inner_expr, _) = Self::parse_where(inner)?;
                     if let Some(expr) = inner_expr {
                         let expr = FilterExpr::Not(Box::new(expr));
@@ -2239,7 +2254,7 @@ impl QueryParser {
             } else {
                 (6, false)
             };
-            let rest = input[exists_start..].trim();
+            let rest = safe_slice_from(input, exists_start).trim();
             if rest.starts_with('(') {
                 // Find matching closing paren
                 let mut depth = 0i32;
@@ -2255,8 +2270,8 @@ impl QueryParser {
                     }
                 }
                 if let Some(close) = close_pos {
-                    let inner = rest[1..close].trim();
-                    let remaining = rest[close + 1..].trim();
+                    let inner = safe_slice(rest, 1, close).trim();
+                    let remaining = safe_slice_from(&rest, close + 1).trim();
                     let subquery = Self::parse(inner)?;
                     let expr = if is_not {
                         FilterExpr::NotExists(Box::new(subquery))
@@ -2270,8 +2285,8 @@ impl QueryParser {
 
         // Check for IS NULL / IS NOT NULL: column IS [NOT] NULL
         if let Some(is_pos) = find_unquoted_ignore_ascii_case(input, " IS ") {
-            let col = input[..is_pos].trim().to_string();
-            let rest = input[is_pos + 4..].trim();
+            let col = safe_slice(input, 0, is_pos).trim().to_string();
+            let rest = safe_slice_from(input, is_pos + 4).trim();
             if starts_with_ignore_ascii_case(rest, "NOT NULL") {
                 let remaining = rest[8..].trim();
                 let expr = FilterExpr::IsNotNull(col);
@@ -2285,8 +2300,8 @@ impl QueryParser {
 
         // Check for LIKE: column LIKE 'pattern'
         if let Some(like_pos) = find_unquoted_ignore_ascii_case(input, " LIKE ") {
-            let col = input[..like_pos].trim().to_string();
-            let rest = input[like_pos + 6..].trim();
+            let col = safe_slice(input, 0, like_pos).trim().to_string();
+            let rest = safe_slice_from(input, like_pos + 6).trim();
             let (pattern, remaining) = Self::extract_quoted_or_word(rest);
             let expr = FilterExpr::Like(col, pattern);
             return Self::wrap_chain(expr, &remaining);
@@ -2294,12 +2309,12 @@ impl QueryParser {
 
         // Check for BETWEEN: column BETWEEN low AND high
         if let Some(between_pos) = find_unquoted_ignore_ascii_case(input, " BETWEEN ") {
-            let col = input[..between_pos].trim().to_string();
-            let rest = input[between_pos + 9..].trim();
+            let col = safe_slice(input, 0, between_pos).trim().to_string();
+            let rest = safe_slice_from(input, between_pos + 9).trim();
 
             if let Some(and_pos) = find_unquoted_ignore_ascii_case(rest, " AND ") {
-                let low_str = rest[..and_pos].trim();
-                let high_rest = rest[and_pos + 5..].trim();
+                let low_str = safe_slice(rest, 0, and_pos).trim();
+                let high_rest = safe_slice_from(&rest, and_pos + 5).trim();
                 let (high_str, remaining) = Self::extract_quoted_or_word(high_rest);
                 let low = Self::parse_literal(low_str)?;
                 let high = Self::parse_literal(&high_str)?;
@@ -2310,8 +2325,8 @@ impl QueryParser {
 
         // Check for IN: column IN (val1, val2, ...) or column IN (SELECT ...)
         if let Some(in_pos) = find_unquoted_ignore_ascii_case(input, " IN ") {
-            let col = input[..in_pos].trim().to_string();
-            let rest = input[in_pos + 4..].trim();
+            let col = safe_slice(input, 0, in_pos).trim().to_string();
+            let rest = safe_slice_from(input, in_pos + 4).trim();
             if rest.starts_with('(') {
                 // Find matching closing paren
                 let mut depth = 0i32;
@@ -2327,8 +2342,8 @@ impl QueryParser {
                     }
                 }
                 if let Some(close) = close_pos {
-                    let inner = rest[1..close].trim();
-                    let remaining = rest[close + 1..].trim();
+                    let inner = safe_slice(rest, 1, close).trim();
+                    let remaining = safe_slice_from(&rest, close + 1).trim();
 
                     // Check if it's a subquery
                     if starts_with_ignore_ascii_case(inner, "SELECT") {
@@ -2359,8 +2374,8 @@ impl QueryParser {
             ("=", FilterExpr::Eq),
         ] {
             if let Some(pos) = Self::find_unquoted(input, op_str) {
-                let col = input[..pos].trim().to_string();
-                let rest = input[pos + op_str.len()..].trim();
+                let col = safe_slice(input, 0, pos).trim().to_string();
+                let rest = safe_slice_from(input, pos + op_str.len()).trim();
 
                 let (val_str, remaining) = Self::extract_quoted_or_word(rest);
                 let val = Self::parse_literal(&val_str)?;
@@ -2402,17 +2417,17 @@ impl QueryParser {
         let input = input.trim();
         if input.starts_with('\'') || input.starts_with('"') {
             let quote = input.as_bytes()[0] as char;
-            if let Some(end) = input[1..].find(quote) {
+            if let Some(end) = safe_slice_from(input, 1).find(quote) {
                 return (
-                    input[1..1 + end].to_string(),
-                    input[1 + end + 1..].trim().to_string(),
+                    safe_slice(input, 1, 1 + end).to_string(),
+                    safe_slice_from(input, end + 2).trim().to_string(),
                 );
             }
         }
         let end = input
             .find(|c: char| c.is_whitespace() || c == ';' || c == ',')
             .unwrap_or(input.len());
-        (input[..end].to_string(), input[end..].trim().to_string())
+        (safe_slice(input, 0, end).to_string(), safe_slice_from(input, end).trim().to_string())
     }
 
     /// Parse CREATE MATERIALIZED VIEW <name> AS <query>
@@ -2425,8 +2440,8 @@ impl QueryParser {
         let as_pos = find_ignore_ascii_case(rest, " AS ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'AS' in CREATE MATERIALIZED VIEW".to_string()))?;
 
-        let name = rest[..as_pos].trim().to_string();
-        let query_str = rest[as_pos + 4..].trim();
+        let name = safe_slice(rest, 0, as_pos).trim().to_string();
+        let query_str = safe_slice_from(&rest, as_pos + 4).trim();
         let query = Self::parse(query_str)?;
 
         Ok(QueryAst::CreateMaterializedView {
@@ -2472,8 +2487,8 @@ impl QueryParser {
                 // Find THEN keyword
                 let then_pos = find_unquoted_ignore_ascii_case(remaining_trimmed, " THEN ")
                     .ok_or_else(|| CoreError::InvalidArgument("expected THEN after WHEN".to_string()))?;
-                let cond_str = remaining_trimmed[5..then_pos].trim();
-                remaining = remaining_trimmed[then_pos + 6..].trim();
+                let cond_str = safe_slice(remaining_trimmed, 5, then_pos).trim();
+                remaining = safe_slice_from(remaining_trimmed, then_pos + 6).trim();
 
                 // Parse condition as filter expression
                 let (cond, _) = Self::parse_where(cond_str)?;
@@ -2531,8 +2546,8 @@ impl QueryParser {
             if starts_with_ignore_ascii_case(input, func_name) && input.len() > func_name.len() && input.as_bytes()[func_name.len()] == b'(' {
                 // Find matching closing paren
                 let open = func_name.len();
-                let close = Self::find_matching_paren_simple(&input[open..])? + open;
-                let args_str = &input[open + 1..close];
+                let close = Self::find_matching_paren_simple(safe_slice_from(input, open))? + open;
+                let args_str = safe_slice(input, open + 1, close);
                 let args: Vec<ValueExpr> = if args_str.trim().is_empty() {
                     Vec::new()
                 } else {
@@ -2550,8 +2565,8 @@ impl QueryParser {
 
         // Try arithmetic: look for + or - outside parentheses
         if let Some((op, pos)) = Self::find_top_level_arithmetic(input) {
-            let left = Self::parse_value_expr(&input[..pos])?;
-            let right = Self::parse_value_expr(&input[pos + 1..])?;
+            let left = Self::parse_value_expr(safe_slice(input, 0, pos))?;
+            let right = Self::parse_value_expr(safe_slice_from(input, pos + 1))?;
             return Ok(ValueExpr::Arithmetic {
                 op,
                 left: Box::new(left),
@@ -2634,7 +2649,7 @@ impl QueryParser {
         if (s.starts_with('\'') && s.ends_with('\''))
             || (s.starts_with('"') && s.ends_with('"'))
         {
-            return Ok(LiteralValue::String(s[1..s.len() - 1].to_string()));
+            return Ok(LiteralValue::String(safe_slice(s, 1, s.len() - 1).to_string()));
         }
 
         // Number
@@ -2653,7 +2668,7 @@ impl QueryParser {
         let end = input
             .find(|c: char| c.is_whitespace() || c == ';' || c == ',')
             .unwrap_or(input.len());
-        Ok((input[..end].to_string(), input[end..].trim_start().to_string()))
+        Ok((safe_slice(input, 0, end).to_string(), safe_slice_from(input, end).trim_start().to_string()))
     }
 
     // ── Graph Query Parsers ──────────────────────────────────────────
@@ -2669,7 +2684,7 @@ impl QueryParser {
             return Err(CoreError::InvalidArgument("expected '(' after table name".to_string()));
         }
         let end = rest.find(')').ok_or_else(|| CoreError::InvalidArgument("missing ')'".to_string()))?;
-        let cols_str = rest[1..end].trim();
+        let cols_str = safe_slice(rest, 1, end).trim();
 
         let columns = Self::parse_column_defs(cols_str)?;
 
@@ -2686,14 +2701,14 @@ impl QueryParser {
             return Err(CoreError::InvalidArgument("expected '(' after table name".to_string()));
         }
         let end = rest.find(')').ok_or_else(|| CoreError::InvalidArgument("missing ')'".to_string()))?;
-        let inner = rest[1..end].trim();
+        let inner = safe_slice(rest, 1, end).trim();
 
         // Parse FROM and TO clauses
         let from_pos = find_ignore_ascii_case(inner, "FROM ").ok_or_else(|| CoreError::InvalidArgument("expected FROM".to_string()))?;
         let to_pos = find_ignore_ascii_case(inner, " TO ").ok_or_else(|| CoreError::InvalidArgument("expected TO".to_string()))?;
 
-        let from_table = inner[from_pos + 5..to_pos].trim().to_string();
-        let after_to = inner[to_pos + 4..].trim();
+        let from_table = safe_slice(inner, from_pos + 5, to_pos).trim().to_string();
+        let after_to = safe_slice_from(inner, to_pos + 4).trim();
         let (to_table, cols_str) = Self::parse_word(after_to)?;
 
         let columns = if cols_str.starts_with(',') {
@@ -2835,7 +2850,7 @@ impl QueryParser {
         // For now, return a simple pattern
         // Full implementation would parse the graph pattern syntax
         let returns = if let Some(ret_pos) = find_ignore_ascii_case(rest, "RETURN") {
-            rest[ret_pos + 6..].trim()
+            safe_slice_from(&rest, ret_pos + 6).trim()
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect()
@@ -2905,9 +2920,9 @@ impl QueryParser {
         let quote_pos = trimmed.find('\'').or_else(|| trimmed.find('"'))
             .ok_or_else(|| CoreError::InvalidArgument("expected quoted path".to_string()))?;
         let quote_char = trimmed.as_bytes()[quote_pos] as char;
-        let end = trimmed[quote_pos + 1..].find(quote_char)
+        let end = safe_slice_from(trimmed, quote_pos + 1).find(quote_char)
             .ok_or_else(|| CoreError::InvalidArgument("unterminated path string".to_string()))?;
-        Ok(trimmed[quote_pos + 1..quote_pos + 1 + end].to_string())
+        Ok(safe_slice(trimmed, quote_pos + 1, quote_pos + 1 + end).to_string())
     }
 
     /// Parse column definitions: "name STRING, age INT, ..."
