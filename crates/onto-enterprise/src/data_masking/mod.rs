@@ -334,9 +334,11 @@ impl DataMaskingManager {
 
     /// Hash masking: irreversible SHA-256 hash.
     fn mask_hash(value: &str) -> String {
-        // Use CRC32 as a simple hash (for production, use SHA-256)
-        let hash = crc32fast::hash(value.as_bytes());
-        format!("{:08x}", hash)
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(value.as_bytes());
+        let result = hasher.finalize();
+        format!("{:x}", result)
     }
 
     /// Apply masking to a row of data (HashMap).
@@ -446,23 +448,8 @@ pub fn builtin_rules() -> Vec<MaskingRule> {
     ]
 }
 
-// Note: regex crate is optional, provide fallback
-mod regex {
-    pub struct Regex(String);
-
-    impl Regex {
-        pub fn new(pattern: &str) -> Result<Self, String> {
-            // Simple validation
-            Ok(Self(pattern.to_string()))
-        }
-
-        pub fn replace_all<'a>(&self, text: &'a str, replacement: &str) -> String {
-            // Simple implementation: just return text
-            // In production, use the regex crate
-            text.to_string()
-        }
-    }
-}
+// Regex masking uses the regex crate
+use regex::Regex;
 
 #[cfg(test)]
 mod tests {

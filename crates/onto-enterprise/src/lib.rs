@@ -273,18 +273,13 @@ mod tests {
     #[test]
     fn test_enabled_features() {
         let features = enabled_features();
-        // Number of features depends on compile-time configuration
-        #[cfg(feature = "enterprise-gov")]
+        // Features depend on compile-time configuration
+        // When running with any feature flag, features should not be empty
+        #[cfg(any(feature = "enterprise-gov", feature = "enterprise-standard", feature = "security", feature = "encryption"))]
         assert!(!features.is_empty());
 
-        #[cfg(not(feature = "enterprise-gov"))]
-        {
-            #[cfg(feature = "enterprise-standard")]
-            assert!(!features.is_empty());
-
-            #[cfg(not(feature = "enterprise-standard"))]
-            assert!(features.is_empty());
-        }
+        #[cfg(not(any(feature = "enterprise-gov", feature = "enterprise-standard", feature = "security", feature = "encryption")))]
+        assert!(features.is_empty());
     }
 
     #[test]
