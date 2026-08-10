@@ -282,6 +282,9 @@ impl SparqlParser {
         // Parse CONSTRUCT template (simplified: just parse triple patterns in { })
         let construct_start = construct_part.find('{').ok_or("Missing { in CONSTRUCT")?;
         let construct_end = construct_part.rfind('}').ok_or("Missing } in CONSTRUCT")?;
+        if construct_start + 1 >= construct_end {
+            return Err("Invalid CONSTRUCT: empty or malformed template".to_string());
+        }
         let construct_body = &construct_part[construct_start+1..construct_end];
         let construct_patterns = self.parse_triple_patterns(construct_body)?;
 
@@ -373,6 +376,9 @@ impl SparqlParser {
         // Find the opening {
         let start = input.find('{').ok_or("Missing { in WHERE clause")?;
         let end = self.find_matching_brace(&input[start..]).ok_or("Missing } in WHERE clause")?;
+        if start + 1 >= start + end {
+            return Err("Invalid WHERE clause: empty or malformed braces".to_string());
+        }
         let body = &input[start+1..start+end];
 
         let (main_patterns, filters, optional_blocks, union_blocks) = self.parse_where_body(body)?;
