@@ -1,4 +1,4 @@
-//! Runtime metrics collection and Prometheus export for OntoDB.
+﻿//! Runtime metrics collection and Prometheus export for OntoDB.
 //!
 //! Collects and exposes metrics in Prometheus exposition format.
 
@@ -88,7 +88,7 @@ impl Histogram {
             }
         }
         // +Inf bucket
-        self.counts.last().unwrap().fetch_add(1, Ordering::Relaxed);
+        self.counts.last().expect("should be valid").fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the total sum in seconds.
@@ -113,7 +113,7 @@ impl Histogram {
             output.push_str(&format!("{}{{le=\"{}\"}} {}\n", name, boundary, cumulative));
         }
         // +Inf
-        cumulative += self.counts.last().unwrap().load(Ordering::Relaxed);
+        cumulative += self.counts.last().expect("should be valid").load(Ordering::Relaxed);
         output.push_str(&format!("{}{{le=\"+Inf\"}} {}\n", name, cumulative));
         output.push_str(&format!("{}_sum {}\n", name, self.sum()));
         output.push_str(&format!("{}_count {}\n", name, self.count()));

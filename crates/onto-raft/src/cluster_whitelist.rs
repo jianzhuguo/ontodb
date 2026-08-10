@@ -288,8 +288,11 @@ impl ClusterWhitelistManager {
             }
 
             // TCP reachability check (sync version)
+            // Safe: "127.0.0.1:0" is a valid address literal
+            let fallback: std::net::SocketAddr = "127.0.0.1:0".parse().expect("valid address");
+            let parsed_addr = addr.parse().unwrap_or(fallback);
             let reachable = std::net::TcpStream::connect_timeout(
-                &addr.parse().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()),
+                &parsed_addr,
                 std::time::Duration::from_secs(2),
             ).is_ok();
 

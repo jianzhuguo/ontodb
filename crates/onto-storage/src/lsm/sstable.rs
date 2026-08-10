@@ -1,4 +1,4 @@
-//! SSTable (Sorted String Table): On-disk sorted key-value storage.
+﻿//! SSTable (Sorted String Table): On-disk sorted key-value storage.
 //!
 //! Format:
 //! [data blocks][index block][bloom filter][footer]
@@ -306,9 +306,9 @@ impl SsTable {
         let mut footer = [0u8; 25];
         file.read_exact(&mut footer)?;
 
-        let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
-        let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
-        let magic = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+        let index_offset = u64::from_le_bytes(footer[0..8].try_into().expect("should be valid"));
+        let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().expect("should be valid"));
+        let magic = u64::from_le_bytes(footer[16..24].try_into().expect("should be valid"));
         let flags = footer[24];
         let compressed = flags & FLAG_COMPRESSED != 0;
 
@@ -353,7 +353,7 @@ impl SsTable {
             if block.len() < 4 {
                 Vec::new()
             } else {
-                let key_len = u32::from_le_bytes(block[0..4].try_into().unwrap()) as usize;
+                let key_len = u32::from_le_bytes(block[0..4].try_into().expect("should be valid")) as usize;
                 if block.len() < 4 + key_len {
                     Vec::new()
                 } else {
@@ -523,7 +523,7 @@ impl SsTable {
         }
 
         let num_restarts =
-            u32::from_le_bytes(block[block.len() - 4..block.len()].try_into().unwrap()) as usize;
+            u32::from_le_bytes(block[block.len() - 4..block.len()].try_into().expect("should be valid")) as usize;
 
         if num_restarts == 0 {
             return Ok(None);
@@ -533,7 +533,7 @@ impl SsTable {
         let mut restarts = Vec::with_capacity(num_restarts);
         for i in 0..num_restarts {
             let off = restart_start + i * 4;
-            restarts.push(u32::from_le_bytes(block[off..off + 4].try_into().unwrap()) as usize);
+            restarts.push(u32::from_le_bytes(block[off..off + 4].try_into().expect("should be valid")) as usize);
         }
 
         // Binary search restart points
@@ -576,7 +576,7 @@ impl SsTable {
         if pos + 4 > data.len() {
             return None;
         }
-        let key_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let key_len = u32::from_le_bytes(data[pos..pos + 4].try_into().expect("should be valid")) as usize;
         pos += 4;
 
         // key
@@ -590,7 +590,7 @@ impl SsTable {
         if pos + 4 > data.len() {
             return None;
         }
-        let val_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let val_len = u32::from_le_bytes(data[pos..pos + 4].try_into().expect("should be valid")) as usize;
         pos += 4;
 
         // value
@@ -604,7 +604,7 @@ impl SsTable {
         if pos + 8 > data.len() {
             return None;
         }
-        let seq_no = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        let seq_no = u64::from_le_bytes(data[pos..pos + 8].try_into().expect("should be valid"));
         pos += 8;
 
         // kind
@@ -624,7 +624,7 @@ impl SsTable {
             return Vec::new();
         }
 
-        let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let count = u32::from_le_bytes(data[0..4].try_into().expect("should be valid")) as usize;
         let mut entries = Vec::with_capacity(count);
         let mut pos = 4;
 
@@ -632,7 +632,7 @@ impl SsTable {
             if pos + 4 > data.len() {
                 break;
             }
-            let key_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            let key_len = u32::from_le_bytes(data[pos..pos + 4].try_into().expect("should be valid")) as usize;
             pos += 4;
 
             if pos + key_len > data.len() {
@@ -644,8 +644,8 @@ impl SsTable {
             if pos + 16 > data.len() {
                 break;
             }
-            let offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-            let size = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap());
+            let offset = u64::from_le_bytes(data[pos..pos + 8].try_into().expect("should be valid"));
+            let size = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().expect("should be valid"));
             pos += 16;
 
             entries.push(BlockIndexEntry {
@@ -723,7 +723,7 @@ impl<'a> SsTableIterator<'a> {
         }
 
         let num_restarts =
-            u32::from_le_bytes(data[data.len() - 4..data.len()].try_into().unwrap()) as usize;
+            u32::from_le_bytes(data[data.len() - 4..data.len()].try_into().expect("should be valid")) as usize;
         let restart_data_size = num_restarts * 4;
         if restart_data_size + 4 > data.len() {
             return Err(CoreError::corruption("invalid restart count in block"));
@@ -734,7 +734,7 @@ impl<'a> SsTableIterator<'a> {
         for i in 0..num_restarts {
             let off = self.restart_start + i * 4;
             self.restarts
-                .push(u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize);
+                .push(u32::from_le_bytes(data[off..off + 4].try_into().expect("should be valid")) as usize);
         }
 
         self.pos = 0;
@@ -786,7 +786,7 @@ impl<'a> SsTableIterator<'a> {
         if pos + 4 > data.len() {
             return None;
         }
-        let key_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let key_len = u32::from_le_bytes(data[pos..pos + 4].try_into().expect("should be valid")) as usize;
         pos += 4;
 
         // key
@@ -801,7 +801,7 @@ impl<'a> SsTableIterator<'a> {
         if pos + 4 > data.len() {
             return None;
         }
-        let val_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let val_len = u32::from_le_bytes(data[pos..pos + 4].try_into().expect("should be valid")) as usize;
         pos += 4;
 
         // value
@@ -816,7 +816,7 @@ impl<'a> SsTableIterator<'a> {
         if pos + 8 > data.len() {
             return None;
         }
-        let seq_no = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        let seq_no = u64::from_le_bytes(data[pos..pos + 8].try_into().expect("should be valid"));
         pos += 8;
 
         // kind (1 byte)
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn test_sstable_write_and_read() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let path = dir.path().join("test.sst");
 
         let mut builder = SsTableBuilder::new();
@@ -878,25 +878,25 @@ mod tests {
                 i as u64,
             ));
         }
-        builder.build(&path).unwrap();
+        builder.build(&path).expect("should be valid");
 
         // Open and read
-        let mut sst = SsTable::open(&path).unwrap();
+        let mut sst = SsTable::open(&path).expect("should be valid");
 
         // Point lookups
-        let (val, _) = sst.get(b"key_0050").unwrap().unwrap();
+        let (val, _) = sst.get(b"key_0050").expect("should be valid").expect("should be valid");
         assert_eq!(val, b"value_50");
 
-        let (val, _) = sst.get(b"key_0001").unwrap().unwrap();
+        let (val, _) = sst.get(b"key_0001").expect("should be valid").expect("should be valid");
         assert_eq!(val, b"value_1");
 
         // Missing key
-        assert!(sst.get(b"missing_key").unwrap().is_none());
+        assert!(sst.get(b"missing_key").expect("should be valid").is_none());
     }
 
     #[test]
     fn test_sstable_iteration() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let path = dir.path().join("iter_test.sst");
 
         let mut builder = SsTableBuilder::new();
@@ -904,10 +904,10 @@ mod tests {
             let key = format!("k{:03}", i);
             builder.add(&Entry::put(key.into_bytes(), vec![i as u8], i as u64));
         }
-        builder.build(&path).unwrap();
+        builder.build(&path).expect("should be valid");
 
-        let mut sst = SsTable::open(&path).unwrap();
-        let mut iter = sst.iter().unwrap();
+        let mut sst = SsTable::open(&path).expect("should be valid");
+        let mut iter = sst.iter().expect("should be valid");
 
         let mut count = 0;
         while iter.is_valid() {
@@ -919,7 +919,7 @@ mod tests {
 
     #[test]
     fn test_sstable_compressed_write_and_read() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let path = dir.path().join("compressed.sst");
 
         let mut builder = SsTableBuilder::new();
@@ -933,26 +933,26 @@ mod tests {
                 i as u64,
             ));
         }
-        builder.build(&path).unwrap();
+        builder.build(&path).expect("should be valid");
 
         // Open and read
-        let mut sst = SsTable::open(&path).unwrap();
+        let mut sst = SsTable::open(&path).expect("should be valid");
         assert!(sst.compressed, "SSTable should be marked as compressed");
 
         // Point lookups
-        let (val, _) = sst.get(b"key_000050").unwrap().unwrap();
+        let (val, _) = sst.get(b"key_000050").expect("should be valid").expect("should be valid");
         assert_eq!(val, b"value_000050_padding_data_to_make_compression_worthwhile");
 
-        let (val, _) = sst.get(b"key_000001").unwrap().unwrap();
+        let (val, _) = sst.get(b"key_000001").expect("should be valid").expect("should be valid");
         assert_eq!(val, b"value_000001_padding_data_to_make_compression_worthwhile");
 
         // Missing key
-        assert!(sst.get(b"missing_key").unwrap().is_none());
+        assert!(sst.get(b"missing_key").expect("should be valid").is_none());
     }
 
     #[test]
     fn test_sstable_compressed_iteration() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let path = dir.path().join("compressed_iter.sst");
 
         let mut builder = SsTableBuilder::new();
@@ -962,10 +962,10 @@ mod tests {
             let value = format!("v{:04}_some_repetitive_value_for_compression", i);
             builder.add(&Entry::put(key.into_bytes(), value.into_bytes(), i as u64));
         }
-        builder.build(&path).unwrap();
+        builder.build(&path).expect("should be valid");
 
-        let mut sst = SsTable::open(&path).unwrap();
-        let mut iter = sst.iter().unwrap();
+        let mut sst = SsTable::open(&path).expect("should be valid");
+        let mut iter = sst.iter().expect("should be valid");
 
         let mut count = 0;
         while iter.is_valid() {
@@ -980,7 +980,7 @@ mod tests {
 
     #[test]
     fn test_sstable_compressed_smaller_size() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let path_uncompressed = dir.path().join("uncompressed.sst");
         let path_compressed = dir.path().join("compressed.sst");
 
@@ -991,7 +991,7 @@ mod tests {
             let value = format!("value_with_repetitive_padding_data_for_compression_test_{:06}", i);
             builder.add(&Entry::put(key.into_bytes(), value.into_bytes(), i as u64));
         }
-        builder.build(&path_uncompressed).unwrap();
+        builder.build(&path_uncompressed).expect("should be valid");
 
         // Build compressed
         let mut builder = SsTableBuilder::new();
@@ -1001,10 +1001,10 @@ mod tests {
             let value = format!("value_with_repetitive_padding_data_for_compression_test_{:06}", i);
             builder.add(&Entry::put(key.into_bytes(), value.into_bytes(), i as u64));
         }
-        builder.build(&path_compressed).unwrap();
+        builder.build(&path_compressed).expect("should be valid");
 
-        let size_uncompressed = std::fs::metadata(&path_uncompressed).unwrap().len();
-        let size_compressed = std::fs::metadata(&path_compressed).unwrap().len();
+        let size_uncompressed = std::fs::metadata(&path_uncompressed).expect("should be valid").len();
+        let size_compressed = std::fs::metadata(&path_compressed).expect("should be valid").len();
 
         println!("Uncompressed: {} bytes, Compressed: {} bytes, Ratio: {:.1}%",
             size_uncompressed, size_compressed,
@@ -1019,7 +1019,7 @@ mod tests {
 
     #[test]
     fn test_sstable_compressed_with_tombstones() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let path = dir.path().join("compressed_tomb.sst");
 
         let mut builder = SsTableBuilder::new();
@@ -1034,20 +1034,20 @@ mod tests {
                 builder.add(&Entry::put(key.into_bytes(), value.into_bytes(), i as u64));
             }
         }
-        builder.build(&path).unwrap();
+        builder.build(&path).expect("should be valid");
 
-        let mut sst = SsTable::open(&path).unwrap();
+        let mut sst = SsTable::open(&path).expect("should be valid");
 
         // Check put entries
-        let result = sst.get_full(b"key_0001").unwrap().unwrap();
+        let result = sst.get_full(b"key_0001").expect("should be valid").expect("should be valid");
         assert_eq!(result.2, EntryKind::Put);
         assert_eq!(result.0, b"value_0001");
 
         // Check tombstone entries
-        let result = sst.get_full(b"key_0000").unwrap().unwrap();
+        let result = sst.get_full(b"key_0000").expect("should be valid").expect("should be valid");
         assert_eq!(result.2, EntryKind::Delete);
 
         // get() should return None for tombstones
-        assert!(sst.get(b"key_0000").unwrap().is_none());
+        assert!(sst.get(b"key_0000").expect("should be valid").is_none());
     }
 }

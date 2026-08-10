@@ -1,4 +1,4 @@
-//! Disk-based page structures and buffer pool for B+Tree indexes.
+﻿//! Disk-based page structures and buffer pool for B+Tree indexes.
 //!
 //! Each B+Tree index is stored in a dedicated `.idx` file with 4KB pages.
 //! A shared buffer pool caches hot pages in memory with LRU eviction.
@@ -352,7 +352,7 @@ impl DiskPage {
         // Shift slots from slot_pos..num_entries right by 1
         let num = header.num_entries;
         for i in (slot_pos..num).rev() {
-            let (off, kl) = self.read_slot(i).unwrap();
+            let (off, kl) = self.read_slot(i).expect("should be valid");
             self.write_slot(i + 1, off, kl);
         }
 
@@ -435,7 +435,7 @@ impl DiskPage {
         }
 
         // Read the entry from the slot and compute its size before shifting
-        let (_entry_offset, _key_len) = self.read_slot(slot_pos).unwrap();
+        let (_entry_offset, _key_len) = self.read_slot(slot_pos).expect("should be valid");
         let entry_size = self.entry_data(slot_pos)
             .map(|d| d.len())
             .unwrap_or(0);
@@ -443,7 +443,7 @@ impl DiskPage {
         // Shift slots left
         let num = header.num_entries;
         for i in slot_pos..num - 1 {
-            let (off, kl) = self.read_slot(i + 1).unwrap();
+            let (off, kl) = self.read_slot(i + 1).expect("should be valid");
             self.write_slot(i, off, kl);
         }
 
@@ -840,7 +840,7 @@ impl BufferPool {
         }
 
         self.touch(page_id);
-        Ok(self.cache.get(&page_id).unwrap())
+        Ok(self.cache.get(&page_id).expect("should be valid"))
     }
 
     /// Fetches a page for writing (marks it as dirty).
@@ -861,7 +861,7 @@ impl BufferPool {
         }
 
         self.touch(page_id);
-        let page = self.cache.get_mut(&page_id).unwrap();
+        let page = self.cache.get_mut(&page_id).expect("should be valid");
         page.dirty = true;
         Ok(page)
     }
@@ -1356,8 +1356,8 @@ impl BTreeIndex {
         }
 
         // Rebuild left page from scratch to avoid fragmentation issues
-        let left_header = left_orig.header().unwrap();
-        let right_header = right.header().unwrap();
+        let left_header = left_orig.header().expect("should be valid");
+        let right_header = right.header().expect("should be valid");
         let mut left = DiskPage::new(left_id, PageType::Leaf);
         left.set_parent(left_header.parent);
         left.set_right_leaf(right_header.right_leaf);
@@ -1415,14 +1415,14 @@ impl BTreeIndex {
             onto_core::CoreError::Corruption("failed to read parent entry".into())
         })?;
         // The separator key is at slot child_idx-1
-        let separator_key = parent.slot_key(child_idx - 1).unwrap().to_vec();
+        let separator_key = parent.slot_key(child_idx - 1).expect("should be valid").to_vec();
 
         let mut left = self.get_page(left_id)?;
         let mut node = self.get_page(node_id)?;
 
         // Move last entry from left, push separator down
         let last_idx = left.num_entries() - 1;
-        let (left_key, left_child) = left.get_internal(last_idx).unwrap();
+        let (left_key, left_child) = left.get_internal(last_idx).expect("should be valid");
         left.remove_entry(last_idx)?;
 
         // The moved child becomes the first_child of node, old first_child becomes entry
@@ -1453,7 +1453,7 @@ impl BTreeIndex {
         let node_id = self.get_child(&parent, child_idx)?;
         let right_id = self.get_child(&parent, child_idx + 1)?;
 
-        let separator_key = parent.slot_key(child_idx).unwrap().to_vec();
+        let separator_key = parent.slot_key(child_idx).expect("should be valid").to_vec();
 
         let mut node = self.get_page(node_id)?;
         let mut right = self.get_page(right_id)?;
@@ -1464,7 +1464,7 @@ impl BTreeIndex {
         node.insert_internal(pos, &separator_key, right_first)?;
 
         // Move right's first entry up to parent
-        let (right_key, right_child) = right.get_internal(0).unwrap();
+        let (right_key, right_child) = right.get_internal(0).expect("should be valid");
         right.remove_entry(0)?;
         right.set_first_child(right_child);
 
@@ -1491,7 +1491,7 @@ impl BTreeIndex {
         let left_id = self.get_child(&parent, left_idx)?;
         let right_id = self.get_child(&parent, right_idx)?;
 
-        let separator_key = parent.slot_key(left_idx).unwrap().to_vec();
+        let separator_key = parent.slot_key(left_idx).expect("should be valid").to_vec();
 
         let left_orig = self.get_page(left_id)?;
         let right = self.get_page(right_id)?;
@@ -1507,19 +1507,19 @@ impl BTreeIndex {
         // Left's existing entries
         let num_left = left_orig.num_entries();
         for i in 0..num_left {
-            let (key, child) = left_orig.get_internal(i).unwrap();
+            let (key, child) = left_orig.get_internal(i).expect("should be valid");
             all_entries.push((key, child));
         }
 
         // Right's entries
         let num_right = right.num_entries();
         for i in 0..num_right {
-            let (key, child) = right.get_internal(i).unwrap();
+            let (key, child) = right.get_internal(i).expect("should be valid");
             all_entries.push((key, child));
         }
 
         // Rebuild left page from scratch
-        let left_header = left_orig.header().unwrap();
+        let left_header = left_orig.header().expect("should be valid");
         let mut left = DiskPage::new(left_id, PageType::Internal);
         left.set_parent(left_header.parent);
         left.set_first_child(left_first);
@@ -1537,7 +1537,7 @@ impl BTreeIndex {
             self.put_page(&rf)?;
         }
         for i in 0..num_right {
-            let (_, child) = right.get_internal(i).unwrap();
+            let (_, child) = right.get_internal(i).expect("should be valid");
             let mut c = self.get_page(child)?;
             c.set_parent(left_id);
             self.put_page(&c)?;
@@ -1561,7 +1561,7 @@ impl BTreeIndex {
     /// Updates the parent separator key for a leaf whose first key may have changed.
     fn update_parent_separator(&mut self, leaf_id: u32) -> Result<()> {
         let leaf = self.get_page(leaf_id)?;
-        let header = leaf.header().unwrap();
+        let header = leaf.header().expect("should be valid");
         let parent_id = header.parent;
         if parent_id == NULL_PAGE {
             return Ok(());
@@ -1828,7 +1828,7 @@ impl BTreeIndex {
         let mut inserted = false;
 
         for i in 0..num {
-            let (k, child) = parent.get_internal(i).unwrap();
+            let (k, child) = parent.get_internal(i).expect("should be valid");
             if !inserted && i == insert_pos {
                 all_entries.push((key.to_vec(), right_child_id));
                 inserted = true;
@@ -1867,7 +1867,7 @@ impl BTreeIndex {
             self.put_page(&fc)?;
         }
         for i in 0..new_internal.num_entries() {
-            let (_, child_id) = new_internal.get_internal(i).unwrap();
+            let (_, child_id) = new_internal.get_internal(i).expect("should be valid");
             let mut child = self.get_page(child_id)?;
             child.set_parent(new_page_id);
             self.put_page(&child)?;
@@ -1900,14 +1900,14 @@ impl BTreeIndex {
                     } else {
                         match page.binary_search(key) {
                             Ok(i) => {
-                                let (_, child) = page.get_internal(i).unwrap();
+                                let (_, child) = page.get_internal(i).expect("should be valid");
                                 child
                             }
                             Err(i) => {
                                 if i == 0 {
                                     page.first_child()
                                 } else {
-                                    let (_, child) = page.get_internal(i - 1).unwrap();
+                                    let (_, child) = page.get_internal(i - 1).expect("should be valid");
                                     child
                                 }
                             }
@@ -1968,7 +1968,7 @@ impl BTreeIndex {
                 eprintln!("{}Internal[{}] parent={} first_child={} entries={}", indent, page_id, parent, fc, num);
                 self.debug_print_page(fc, depth + 1);
                 for i in 0..num {
-                    let (key, child) = page.get_internal(i).unwrap();
+                    let (key, child) = page.get_internal(i).expect("should be valid");
                     eprintln!("{}  key={} -> child={}", indent, String::from_utf8_lossy(&key), child);
                     self.debug_print_page(child, depth + 1);
                 }
@@ -2021,7 +2021,7 @@ mod tests {
         let mut buf = [0u8; PAGE_SIZE];
         header.encode(&mut buf);
 
-        let decoded = PageHeader::decode(&buf).unwrap();
+        let decoded = PageHeader::decode(&buf).expect("should be valid");
         assert_eq!(decoded.page_type, PageType::Leaf);
         assert_eq!(decoded.num_entries, 42);
         assert_eq!(decoded.data_start, 3000);
@@ -2036,7 +2036,7 @@ mod tests {
         let key = b"hello";
         let child = 42u32;
         let encoded = encode_internal_entry(key, child);
-        let (k, c) = decode_internal_entry(&encoded).unwrap();
+        let (k, c) = decode_internal_entry(&encoded).expect("should be valid");
         assert_eq!(k, key);
         assert_eq!(c, child);
     }
@@ -2046,7 +2046,7 @@ mod tests {
         let key = b"price_00000000000000999";
         let pks: Vec<Vec<u8>> = vec![b"pk1".to_vec(), b"pk2".to_vec(), b"pk3".to_vec()];
         let encoded = encode_leaf_entry(key, &pks);
-        let (k, decoded_pks) = decode_leaf_entry(&encoded).unwrap();
+        let (k, decoded_pks) = decode_leaf_entry(&encoded).expect("should be valid");
         assert_eq!(k, key);
         assert_eq!(decoded_pks.len(), 3);
         assert_eq!(decoded_pks[0], b"pk1");
@@ -2059,7 +2059,7 @@ mod tests {
         let key = b"test_key";
         let pks: Vec<Vec<u8>> = vec![b"only_pk".to_vec()];
         let encoded = encode_leaf_entry(key, &pks);
-        let (k, decoded_pks) = decode_leaf_entry(&encoded).unwrap();
+        let (k, decoded_pks) = decode_leaf_entry(&encoded).expect("should be valid");
         assert_eq!(k, key);
         assert_eq!(decoded_pks, vec![b"only_pk".to_vec()]);
     }
@@ -2069,9 +2069,9 @@ mod tests {
         let mut page = DiskPage::new(1, PageType::Leaf);
 
         // Insert entries in sorted order
-        page.append_leaf(b"aaa", &[b"pk1".to_vec()]).unwrap();
-        page.append_leaf(b"bbb", &[b"pk2".to_vec()]).unwrap();
-        page.append_leaf(b"ccc", &[b"pk3".to_vec()]).unwrap();
+        page.append_leaf(b"aaa", &[b"pk1".to_vec()]).expect("should be valid");
+        page.append_leaf(b"bbb", &[b"pk2".to_vec()]).expect("should be valid");
+        page.append_leaf(b"ccc", &[b"pk3".to_vec()]).expect("should be valid");
 
         assert_eq!(page.num_entries(), 3);
 
@@ -2092,15 +2092,15 @@ mod tests {
     fn test_disk_page_insert_ordered() {
         let mut page = DiskPage::new(1, PageType::Internal);
 
-        page.append_internal(b"100", 2).unwrap();
-        page.append_internal(b"200", 3).unwrap();
-        page.append_internal(b"300", 4).unwrap();
+        page.append_internal(b"100", 2).expect("should be valid");
+        page.append_internal(b"200", 3).expect("should be valid");
+        page.append_internal(b"300", 4).expect("should be valid");
 
-        let (k, c) = page.get_internal(0).unwrap();
+        let (k, c) = page.get_internal(0).expect("should be valid");
         assert_eq!(k, b"100");
         assert_eq!(c, 2);
 
-        let (k, c) = page.get_internal(2).unwrap();
+        let (k, c) = page.get_internal(2).expect("should be valid");
         assert_eq!(k, b"300");
         assert_eq!(c, 4);
     }
@@ -2109,20 +2109,20 @@ mod tests {
     fn test_disk_page_insert_at_position() {
         let mut page = DiskPage::new(1, PageType::Leaf);
 
-        page.append_leaf(b"aaa", &[b"pk1".to_vec()]).unwrap();
-        page.append_leaf(b"ccc", &[b"pk3".to_vec()]).unwrap();
+        page.append_leaf(b"aaa", &[b"pk1".to_vec()]).expect("should be valid");
+        page.append_leaf(b"ccc", &[b"pk3".to_vec()]).expect("should be valid");
 
         // Insert "bbb" at position 1
-        page.insert_leaf(1, b"bbb", &[b"pk2".to_vec()]).unwrap();
+        page.insert_leaf(1, b"bbb", &[b"pk2".to_vec()]).expect("should be valid");
 
         assert_eq!(page.num_entries(), 3);
         assert_eq!(page.binary_search(b"bbb"), Ok(1));
 
-        let (k, _) = page.get_leaf(0).unwrap();
+        let (k, _) = page.get_leaf(0).expect("should be valid");
         assert_eq!(k, b"aaa");
-        let (k, _) = page.get_leaf(1).unwrap();
+        let (k, _) = page.get_leaf(1).expect("should be valid");
         assert_eq!(k, b"bbb");
-        let (k, _) = page.get_leaf(2).unwrap();
+        let (k, _) = page.get_leaf(2).expect("should be valid");
         assert_eq!(k, b"ccc");
     }
 
@@ -2130,16 +2130,16 @@ mod tests {
     fn test_disk_page_remove() {
         let mut page = DiskPage::new(1, PageType::Leaf);
 
-        page.append_leaf(b"aaa", &[b"pk1".to_vec()]).unwrap();
-        page.append_leaf(b"bbb", &[b"pk2".to_vec()]).unwrap();
-        page.append_leaf(b"ccc", &[b"pk3".to_vec()]).unwrap();
+        page.append_leaf(b"aaa", &[b"pk1".to_vec()]).expect("should be valid");
+        page.append_leaf(b"bbb", &[b"pk2".to_vec()]).expect("should be valid");
+        page.append_leaf(b"ccc", &[b"pk3".to_vec()]).expect("should be valid");
 
-        page.remove_entry(1).unwrap();
+        page.remove_entry(1).expect("should be valid");
         assert_eq!(page.num_entries(), 2);
 
-        let (k, _) = page.get_leaf(0).unwrap();
+        let (k, _) = page.get_leaf(0).expect("should be valid");
         assert_eq!(k, b"aaa");
-        let (k, _) = page.get_leaf(1).unwrap();
+        let (k, _) = page.get_leaf(1).expect("should be valid");
         assert_eq!(k, b"ccc");
     }
 
@@ -2151,7 +2151,7 @@ mod tests {
         for i in 0..100u32 {
             let key = format!("{:010}", i);
             let pk = format!("pk_{:04}", i);
-            page.append_leaf(key.as_bytes(), &[pk.into_bytes()]).unwrap();
+            page.append_leaf(key.as_bytes(), &[pk.into_bytes()]).expect("should be valid");
         }
 
         assert_eq!(page.num_entries(), 100);
@@ -2164,8 +2164,8 @@ mod tests {
 
         // Verify sorted order
         for i in 0..99u16 {
-            let k1 = page.slot_key(i).unwrap();
-            let k2 = page.slot_key(i + 1).unwrap();
+            let k1 = page.slot_key(i).expect("should be valid");
+            let k2 = page.slot_key(i + 1).expect("should be valid");
             assert!(k1 < k2, "keys not sorted at positions {} and {}", i, i + 1);
         }
     }
@@ -2179,10 +2179,10 @@ mod tests {
         for i in 0..50u32 {
             let key = format!("{:010}", i);
             let pk = format!("pk_{}", i);
-            page.append_leaf(key.as_bytes(), &[pk.into_bytes()]).unwrap();
+            page.append_leaf(key.as_bytes(), &[pk.into_bytes()]).expect("should be valid");
         }
 
-        let split_key = page.split_leaf(&mut new_page).unwrap();
+        let split_key = page.split_leaf(&mut new_page).expect("should be valid");
 
         // Split key should be the first key of the new page
         assert!(!split_key.is_empty());
@@ -2193,8 +2193,8 @@ mod tests {
         assert_eq!(page.num_entries() + new_page.num_entries(), 50);
 
         // Sibling pointers should be set
-        let h1 = page.header().unwrap();
-        let h2 = new_page.header().unwrap();
+        let h1 = page.header().expect("should be valid");
+        let h2 = new_page.header().expect("should be valid");
         assert_eq!(h1.right_leaf, 2);
         assert_eq!(h2.left_leaf, 1);
     }
@@ -2212,7 +2212,7 @@ mod tests {
         let mut buf = [0u8; PAGE_SIZE];
         meta.encode(&mut buf);
 
-        let decoded = IndexMeta::decode(&buf).unwrap();
+        let decoded = IndexMeta::decode(&buf).expect("should be valid");
         assert_eq!(decoded.root_page, 1);
         assert_eq!(decoded.num_pages, 10);
         assert_eq!(decoded.class, "Product");
@@ -2221,7 +2221,7 @@ mod tests {
 
     #[test]
     fn test_buffer_pool_basic() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("test.idx");
         let mut file = OpenOptions::new()
             .read(true)
@@ -2229,32 +2229,32 @@ mod tests {
             .create(true)
             .truncate(true)
             .open(&path)
-            .unwrap();
+            .expect("should be valid");
 
         // Write 3 pages
         for i in 0..3u32 {
             let mut data = [0u8; PAGE_SIZE];
             data[0] = i as u8;
-            file.write_all(&data).unwrap();
+            file.write_all(&data).expect("should be valid");
         }
 
         let mut pool = BufferPool::new(2);
 
         // Fetch page 0
         {
-            let page = pool.fetch(0, &mut file).unwrap();
+            let page = pool.fetch(0, &mut file).expect("should be valid");
             assert_eq!(page.data[0], 0);
         }
 
         // Fetch page 1
         {
-            let page = pool.fetch(1, &mut file).unwrap();
+            let page = pool.fetch(1, &mut file).expect("should be valid");
             assert_eq!(page.data[0], 1);
         }
 
         // Fetch page 2 — should evict page 0 (LRU)
         {
-            let page = pool.fetch(2, &mut file).unwrap();
+            let page = pool.fetch(2, &mut file).expect("should be valid");
             assert_eq!(page.data[0], 2);
         }
 
@@ -2262,14 +2262,14 @@ mod tests {
 
         // Re-fetch page 0 — should read from disk again
         {
-            let page = pool.fetch(0, &mut file).unwrap();
+            let page = pool.fetch(0, &mut file).expect("should be valid");
             assert_eq!(page.data[0], 0);
         }
     }
 
     #[test]
     fn test_buffer_pool_flush() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("test_flush.idx");
         let mut file = OpenOptions::new()
             .read(true)
@@ -2277,27 +2277,27 @@ mod tests {
             .create(true)
             .truncate(true)
             .open(&path)
-            .unwrap();
+            .expect("should be valid");
 
         // Write a blank page
         let blank = [0u8; PAGE_SIZE];
-        file.write_all(&blank).unwrap();
+        file.write_all(&blank).expect("should be valid");
 
         let mut pool = BufferPool::new(10);
 
         // Modify page 0
         {
-            let page = pool.fetch_mut(0, &mut file).unwrap();
+            let page = pool.fetch_mut(0, &mut file).expect("should be valid");
             page.data[0] = 0xFF;
         }
 
         // Flush
-        pool.flush(&mut file).unwrap();
+        pool.flush(&mut file).expect("should be valid");
 
         // Read back from disk
         let mut buf = [0u8; PAGE_SIZE];
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.read_exact(&mut buf).unwrap();
+        file.seek(SeekFrom::Start(0)).expect("should be valid");
+        file.read_exact(&mut buf).expect("should be valid");
         assert_eq!(buf[0], 0xFF);
     }
 
@@ -2309,7 +2309,7 @@ mod tests {
         assert!(page.binary_search(b"any").is_err());
 
         // Single entry
-        page.append_leaf(b"only", &[b"pk".to_vec()]).unwrap();
+        page.append_leaf(b"only", &[b"pk".to_vec()]).expect("should be valid");
         assert_eq!(page.binary_search(b"only"), Ok(0));
         assert!(page.binary_search(b"a").is_err());
         assert!(page.binary_search(b"z").is_err());
@@ -2319,43 +2319,43 @@ mod tests {
 
     #[test]
     fn test_btree_index_create_and_lookup() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("test.idx");
 
-        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+        let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
 
         // Insert entries
-        idx.insert(b"100", b"pk1".to_vec()).unwrap();
-        idx.insert(b"200", b"pk2".to_vec()).unwrap();
-        idx.insert(b"300", b"pk3".to_vec()).unwrap();
+        idx.insert(b"100", b"pk1".to_vec()).expect("should be valid");
+        idx.insert(b"200", b"pk2".to_vec()).expect("should be valid");
+        idx.insert(b"300", b"pk3".to_vec()).expect("should be valid");
 
         // Lookup
-        let pks = idx.lookup(b"200").unwrap();
+        let pks = idx.lookup(b"200").expect("should be valid");
         assert_eq!(pks.len(), 1);
         assert_eq!(pks[0], b"pk2");
 
-        let pks = idx.lookup(b"100").unwrap();
+        let pks = idx.lookup(b"100").expect("should be valid");
         assert_eq!(pks.len(), 1);
         assert_eq!(pks[0], b"pk1");
 
         // Not found
-        let pks = idx.lookup(b"999").unwrap();
+        let pks = idx.lookup(b"999").expect("should be valid");
         assert!(pks.is_empty());
     }
 
     #[test]
     fn test_btree_index_duplicate_key() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("dup.idx");
 
-        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+        let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
 
         // Same key, different PKs
-        idx.insert(b"100", b"pk1".to_vec()).unwrap();
-        idx.insert(b"100", b"pk2".to_vec()).unwrap();
-        idx.insert(b"100", b"pk3".to_vec()).unwrap();
+        idx.insert(b"100", b"pk1".to_vec()).expect("should be valid");
+        idx.insert(b"100", b"pk2".to_vec()).expect("should be valid");
+        idx.insert(b"100", b"pk3".to_vec()).expect("should be valid");
 
-        let pks = idx.lookup(b"100").unwrap();
+        let pks = idx.lookup(b"100").expect("should be valid");
         assert_eq!(pks.len(), 3);
         assert!(pks.contains(&b"pk1".to_vec()));
         assert!(pks.contains(&b"pk2".to_vec()));
@@ -2364,109 +2364,109 @@ mod tests {
 
     #[test]
     fn test_btree_index_range_scan() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("range.idx");
 
-        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+        let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
 
         for i in 0..20u32 {
             let key = format!("{:04}", i);
             let pk = format!("pk_{}", i);
-            idx.insert(key.as_bytes(), pk.into_bytes()).unwrap();
+            idx.insert(key.as_bytes(), pk.into_bytes()).expect("should be valid");
         }
 
         // Range scan [0005, 0015]
-        let pks = idx.range_scan(Some(b"0005"), Some(b"0015")).unwrap();
+        let pks = idx.range_scan(Some(b"0005"), Some(b"0015")).expect("should be valid");
         assert_eq!(pks.len(), 11); // 5..=15
 
         // Unbounded low
-        let pks = idx.range_scan(None, Some(b"0002")).unwrap();
+        let pks = idx.range_scan(None, Some(b"0002")).expect("should be valid");
         assert_eq!(pks.len(), 3); // 0, 1, 2
 
         // Unbounded high
-        let pks = idx.range_scan(Some(b"0018"), None).unwrap();
+        let pks = idx.range_scan(Some(b"0018"), None).expect("should be valid");
         assert_eq!(pks.len(), 2); // 18, 19
     }
 
     #[test]
     fn test_btree_index_split_leaf() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("split.idx");
 
-        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+        let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
 
         // Insert enough entries to trigger a leaf split
         for i in 0..200u32 {
             let key = format!("{:06}", i);
             let pk = format!("pk_{:04}", i);
-            idx.insert(key.as_bytes(), pk.into_bytes()).unwrap();
+            idx.insert(key.as_bytes(), pk.into_bytes()).expect("should be valid");
         }
 
         // Verify all entries are still accessible
         for i in 0..200u32 {
             let key = format!("{:06}", i);
             let pk = format!("pk_{:04}", i);
-            let pks = idx.lookup(key.as_bytes()).unwrap();
+            let pks = idx.lookup(key.as_bytes()).expect("should be valid");
             assert_eq!(pks.len(), 1, "key {} should have 1 pk", key);
             assert_eq!(pks[0], pk.as_bytes());
         }
 
         // Range scan across split boundaries
-        let pks = idx.range_scan(Some(b"000050"), Some(b"000150")).unwrap();
+        let pks = idx.range_scan(Some(b"000050"), Some(b"000150")).expect("should be valid");
         assert_eq!(pks.len(), 101); // 50..=150
     }
 
     #[test]
     fn test_btree_index_split_internal() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("split_int.idx");
 
-        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+        let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
 
         // Insert enough entries to trigger multiple splits
         for i in 0..500u32 {
             let key = format!("{:08}", i);
             let pk = format!("pk_{:04}", i);
-            idx.insert(key.as_bytes(), pk.into_bytes()).unwrap();
+            idx.insert(key.as_bytes(), pk.into_bytes()).expect("should be valid");
         }
 
         // Verify all
         for i in 0..500u32 {
             let key = format!("{:08}", i);
-            let pks = idx.lookup(key.as_bytes()).unwrap();
+            let pks = idx.lookup(key.as_bytes()).expect("should be valid");
             assert_eq!(pks.len(), 1, "key {} lost after splits", key);
         }
 
         // Range scan
-        let pks = idx.range_scan(Some(b"00000100"), Some(b"00000200")).unwrap();
+        let pks = idx.range_scan(Some(b"00000100"), Some(b"00000200")).expect("should be valid");
         assert_eq!(pks.len(), 101);
     }
 
     #[test]
     fn test_btree_index_persistence() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("persist.idx");
 
         // Write
         {
-            let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+            let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
             for i in 0..100u32 {
                 let key = format!("{:06}", i);
                 let pk = format!("pk_{}", i);
-                idx.insert(key.as_bytes(), pk.into_bytes()).unwrap();
+                idx.insert(key.as_bytes(), pk.into_bytes()).expect("should be valid");
             }
-            idx.flush().unwrap();
+            idx.flush().expect("should be valid");
         }
 
         // Reopen and verify
         {
-            let mut idx = BTreeIndex::open(&path).unwrap();
+            let mut idx = BTreeIndex::open(&path).expect("should be valid");
             assert_eq!(idx.meta().class, "Product");
             assert_eq!(idx.meta().column, "price");
 
             for i in 0..100u32 {
                 let key = format!("{:06}", i);
-                let pks = idx.lookup(key.as_bytes()).unwrap();
+                let pks = idx.lookup(key.as_bytes()).expect("should be valid");
                 assert_eq!(pks.len(), 1, "key {} not found after reopen", key);
             }
         }
@@ -2474,174 +2474,174 @@ mod tests {
 
     #[test]
     fn test_btree_index_large_dataset() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("large.idx");
 
-        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+        let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
 
         let n = 2000u32;
         for i in 0..n {
             let key = format!("{:010}", i);
             let pk = format!("pk_{:08}", i);
-            idx.insert(key.as_bytes(), pk.into_bytes()).unwrap();
+            idx.insert(key.as_bytes(), pk.into_bytes()).expect("should be valid");
         }
 
         // Point lookup
-        let pks = idx.lookup(b"0000001000").unwrap();
+        let pks = idx.lookup(b"0000001000").expect("should be valid");
         assert_eq!(pks.len(), 1);
 
         // Range scan
-        let pks = idx.range_scan(Some(b"0000000500"), Some(b"0000000599")).unwrap();
+        let pks = idx.range_scan(Some(b"0000000500"), Some(b"0000000599")).expect("should be valid");
         assert_eq!(pks.len(), 100);
     }
 
     #[test]
     fn test_btree_index_remove_basic() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("remove_basic.idx");
 
-        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+        let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
 
-        idx.insert(b"100", b"pk1".to_vec()).unwrap();
-        idx.insert(b"200", b"pk2".to_vec()).unwrap();
-        idx.insert(b"300", b"pk3".to_vec()).unwrap();
+        idx.insert(b"100", b"pk1".to_vec()).expect("should be valid");
+        idx.insert(b"200", b"pk2".to_vec()).expect("should be valid");
+        idx.insert(b"300", b"pk3".to_vec()).expect("should be valid");
 
         // Remove one
-        let removed = idx.remove(b"200", b"pk2").unwrap();
+        let removed = idx.remove(b"200", b"pk2").expect("should be valid");
         assert!(removed);
-        assert!(idx.lookup(b"200").unwrap().is_empty());
+        assert!(idx.lookup(b"200").expect("should be valid").is_empty());
 
         // Others still present
-        assert_eq!(idx.lookup(b"100").unwrap().len(), 1);
-        assert_eq!(idx.lookup(b"300").unwrap().len(), 1);
+        assert_eq!(idx.lookup(b"100").expect("should be valid").len(), 1);
+        assert_eq!(idx.lookup(b"300").expect("should be valid").len(), 1);
     }
 
     #[test]
     fn test_btree_index_remove_one_of_many_pks() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("remove_partial.idx");
 
-        let mut idx = BTreeIndex::create(&path, "Order", "status").unwrap();
+        let mut idx = BTreeIndex::create(&path, "Order", "status").expect("should be valid");
 
-        idx.insert(b"active", b"o1".to_vec()).unwrap();
-        idx.insert(b"active", b"o2".to_vec()).unwrap();
-        idx.insert(b"active", b"o3".to_vec()).unwrap();
+        idx.insert(b"active", b"o1".to_vec()).expect("should be valid");
+        idx.insert(b"active", b"o2".to_vec()).expect("should be valid");
+        idx.insert(b"active", b"o3".to_vec()).expect("should be valid");
 
-        idx.remove(b"active", b"o2").unwrap();
-        let pks = idx.lookup(b"active").unwrap();
+        idx.remove(b"active", b"o2").expect("should be valid");
+        let pks = idx.lookup(b"active").expect("should be valid");
         assert_eq!(pks.len(), 2);
         assert!(!pks.contains(&b"o2".to_vec()));
 
         // Remove remaining
-        idx.remove(b"active", b"o1").unwrap();
-        idx.remove(b"active", b"o3").unwrap();
-        assert!(idx.lookup(b"active").unwrap().is_empty());
+        idx.remove(b"active", b"o1").expect("should be valid");
+        idx.remove(b"active", b"o3").expect("should be valid");
+        assert!(idx.lookup(b"active").expect("should be valid").is_empty());
     }
 
     #[test]
     fn test_btree_index_remove_nonexistent() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("remove_none.idx");
 
-        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
-        idx.insert(b"100", b"pk1".to_vec()).unwrap();
+        let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
+        idx.insert(b"100", b"pk1".to_vec()).expect("should be valid");
 
         // Remove non-existent key
-        let removed = idx.remove(b"999", b"pk999").unwrap();
+        let removed = idx.remove(b"999", b"pk999").expect("should be valid");
         assert!(!removed);
-        assert_eq!(idx.lookup(b"100").unwrap().len(), 1);
+        assert_eq!(idx.lookup(b"100").expect("should be valid").len(), 1);
 
         // Remove non-existent pk on existing key
-        let removed = idx.remove(b"100", b"wrong_pk").unwrap();
+        let removed = idx.remove(b"100", b"wrong_pk").expect("should be valid");
         assert!(!removed);
-        assert_eq!(idx.lookup(b"100").unwrap().len(), 1);
+        assert_eq!(idx.lookup(b"100").expect("should be valid").len(), 1);
     }
 
     #[test]
     fn test_btree_index_remove_with_merge() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("remove_merge.idx");
 
-        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+        let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
 
         let n = 300u32;
         for i in 0..n {
             let key = format!("{:010}", i);
             let pk = format!("pk_{}", i);
-            idx.insert(key.as_bytes(), pk.into_bytes()).unwrap();
+            idx.insert(key.as_bytes(), pk.into_bytes()).expect("should be valid");
         }
 
         // Remove most entries to trigger underflow and merges
         for i in 0..(n - 5) {
             let key = format!("{:010}", i);
-            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes()).unwrap();
+            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes()).expect("should be valid");
         }
 
         // Verify remaining entries
         for i in (n - 5)..n {
             let key = format!("{:010}", i);
-            let pks = idx.lookup(key.as_bytes()).unwrap();
+            let pks = idx.lookup(key.as_bytes()).expect("should be valid");
             assert_eq!(pks.len(), 1, "key {} should still exist", key);
         }
 
         // Range scan should still work
-        let all = idx.range_scan(None, None).unwrap();
+        let all = idx.range_scan(None, None).expect("should be valid");
         assert_eq!(all.len(), 5);
     }
 
     #[test]
     fn test_btree_index_remove_interleaved() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("remove_interleave.idx");
 
-        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+        let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
 
         for i in 0..200u32 {
             let key = format!("{:010}", i);
-            idx.insert(key.as_bytes(), format!("pk_{}", i).into_bytes()).unwrap();
+            idx.insert(key.as_bytes(), format!("pk_{}", i).into_bytes()).expect("should be valid");
         }
 
         // Remove even keys
         for i in (0..200u32).step_by(2) {
             let key = format!("{:010}", i);
-            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes()).unwrap();
+            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes()).expect("should be valid");
         }
         // Verify odd keys remain
         for i in (1..200u32).step_by(2) {
             let key = format!("{:010}", i);
-            assert_eq!(idx.lookup(key.as_bytes()).unwrap().len(), 1);
+            assert_eq!(idx.lookup(key.as_bytes()).expect("should be valid").len(), 1);
         }
         // Verify even keys are gone
         for i in (0..200u32).step_by(2) {
             let key = format!("{:010}", i);
-            assert!(idx.lookup(key.as_bytes()).unwrap().is_empty());
+            assert!(idx.lookup(key.as_bytes()).expect("should be valid").is_empty());
         }
 
         // Re-insert even keys
         for i in (0..200u32).step_by(2) {
             let key = format!("{:010}", i);
-            idx.insert(key.as_bytes(), format!("new_{}", i).into_bytes()).unwrap();
+            idx.insert(key.as_bytes(), format!("new_{}", i).into_bytes()).expect("should be valid");
         }
-        assert_eq!(idx.range_scan(None, None).unwrap().len(), 200);
+        assert_eq!(idx.range_scan(None, None).expect("should be valid").len(), 200);
     }
 
     #[test]
     fn test_btree_index_remove_all() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let path = dir.path().join("remove_all.idx");
 
-        let mut idx = BTreeIndex::create(&path, "Product", "price").unwrap();
+        let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
 
         for i in 0..100u32 {
             let key = format!("{:010}", i);
-            idx.insert(key.as_bytes(), format!("pk_{}", i).into_bytes()).unwrap();
+            idx.insert(key.as_bytes(), format!("pk_{}", i).into_bytes()).expect("should be valid");
         }
 
         for i in 0..100u32 {
             let key = format!("{:010}", i);
-            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes()).unwrap();
+            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes()).expect("should be valid");
         }
 
-        assert!(idx.range_scan(None, None).unwrap().is_empty());
+        assert!(idx.range_scan(None, None).expect("should be valid").is_empty());
     }
 }

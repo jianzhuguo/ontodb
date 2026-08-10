@@ -1,4 +1,4 @@
-//! Write-Ahead Log (WAL) for crash recovery.
+﻿//! Write-Ahead Log (WAL) for crash recovery.
 //!
 //! Format: [length: u32][crc32: u32][payload: bytes]
 //!
@@ -141,14 +141,14 @@ impl Wal {
             return Err(CoreError::corruption("WAL entry too short"));
         }
 
-        let seq_no = u64::from_le_bytes(data[0..8].try_into().unwrap());
+        let seq_no = u64::from_le_bytes(data[0..8].try_into().expect("should be valid"));
         let kind = match data[8] {
             0 => EntryKind::Put,
             1 => EntryKind::Delete,
             _ => return Err(CoreError::corruption("invalid entry kind")),
         };
 
-        let key_len = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
+        let key_len = u32::from_le_bytes(data[9..13].try_into().expect("should be valid")) as usize;
         if data.len() < 17 + key_len {
             return Err(CoreError::corruption("WAL entry key truncated"));
         }
@@ -159,7 +159,7 @@ impl Wal {
             return Err(CoreError::corruption("WAL entry value length truncated"));
         }
         let val_len =
-            u32::from_le_bytes(data[val_offset..val_offset + 4].try_into().unwrap()) as usize;
+            u32::from_le_bytes(data[val_offset..val_offset + 4].try_into().expect("should be valid")) as usize;
         if data.len() < val_offset + 4 + val_len {
             return Err(CoreError::corruption("WAL entry value truncated"));
         }
@@ -191,7 +191,7 @@ pub fn replay_wal(path: impl AsRef<Path>) -> Result<Vec<Entry>> {
     let mut pos = 0;
     while pos + 8 <= buf.len() {
         // Read length
-        let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().expect("should be valid")) as usize;
         pos += 4;
 
         // Sanity check: length shouldn't be unreasonably large (max 100MB per entry)
@@ -204,7 +204,7 @@ pub fn replay_wal(path: impl AsRef<Path>) -> Result<Vec<Entry>> {
         if pos + 4 > buf.len() {
             break; // Truncated CRC at end of file
         }
-        let expected_crc = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        let expected_crc = u32::from_le_bytes(buf[pos..pos + 4].try_into().expect("should be valid"));
         pos += 4;
 
         // Read payload
@@ -241,22 +241,22 @@ mod tests {
 
     #[test]
     fn test_wal_append_and_replay() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let wal_path = dir.path().join("test.wal");
 
-        let mut wal = Wal::open(&wal_path).unwrap();
+        let mut wal = Wal::open(&wal_path).expect("should be valid");
 
         let e1 = Entry::put(b"key1".to_vec(), b"value1".to_vec(), 1);
         let e2 = Entry::put(b"key2".to_vec(), b"value2".to_vec(), 2);
         let e3 = Entry::delete(b"key1".to_vec(), 3);
 
-        wal.append(&e1).unwrap();
-        wal.append(&e2).unwrap();
-        wal.append(&e3).unwrap();
-        wal.sync().unwrap();
+        wal.append(&e1).expect("should be valid");
+        wal.append(&e2).expect("should be valid");
+        wal.append(&e3).expect("should be valid");
+        wal.sync().expect("should be valid");
 
         // Replay
-        let entries = replay_wal(&wal_path).unwrap();
+        let entries = replay_wal(&wal_path).expect("should be valid");
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0], e1);
         assert_eq!(entries[1], e2);
@@ -267,40 +267,40 @@ mod tests {
     fn test_wal_serde_roundtrip() {
         let entry = Entry::put(b"hello".to_vec(), b"world".to_vec(), 42);
         let payload = Wal::serialize_entry(&entry);
-        let recovered = Wal::deserialize_entry(&payload).unwrap();
+        let recovered = Wal::deserialize_entry(&payload).expect("should be valid");
         assert_eq!(entry, recovered);
     }
 
     #[test]
     fn test_wal_corruption_stops_replay() {
         // Write 3 valid entries, then corrupt the 4th
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let wal_path = dir.path().join("corrupt.wal");
 
-        let mut wal = Wal::open(&wal_path).unwrap();
+        let mut wal = Wal::open(&wal_path).expect("should be valid");
 
         let e1 = Entry::put(b"key1".to_vec(), b"v1".to_vec(), 1);
         let e2 = Entry::put(b"key2".to_vec(), b"v2".to_vec(), 2);
         let e3 = Entry::put(b"key3".to_vec(), b"v3".to_vec(), 3);
 
-        wal.append(&e1).unwrap();
-        wal.append(&e2).unwrap();
-        wal.append(&e3).unwrap();
-        wal.sync().unwrap();
+        wal.append(&e1).expect("should be valid");
+        wal.append(&e2).expect("should be valid");
+        wal.append(&e3).expect("should be valid");
+        wal.sync().expect("should be valid");
 
         // Append a corrupted entry (bad CRC)
         use std::io::Write;
         let bad_payload = b"garbage_data";
         let bad_len = bad_payload.len() as u32;
         let bad_crc = 0xDEADBEEFu32; // Wrong CRC
-        let mut file = std::fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
-        file.write_all(&bad_len.to_le_bytes()).unwrap();
-        file.write_all(&bad_crc.to_le_bytes()).unwrap();
-        file.write_all(bad_payload).unwrap();
-        file.sync_all().unwrap();
+        let mut file = std::fs::OpenOptions::new().append(true).open(&wal_path).expect("should be valid");
+        file.write_all(&bad_len.to_le_bytes()).expect("should be valid");
+        file.write_all(&bad_crc.to_le_bytes()).expect("should be valid");
+        file.write_all(bad_payload).expect("should be valid");
+        file.sync_all().expect("should be valid");
 
         // Replay should return only the 3 valid entries, stopping at corruption
-        let entries = replay_wal(&wal_path).unwrap();
+        let entries = replay_wal(&wal_path).expect("should be valid");
         assert_eq!(entries.len(), 3, "should stop at corrupted entry");
         assert_eq!(entries[0], e1);
         assert_eq!(entries[1], e2);
@@ -309,34 +309,34 @@ mod tests {
 
     #[test]
     fn test_wal_truncated_payload_stops_replay() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let wal_path = dir.path().join("truncated.wal");
 
-        let mut wal = Wal::open(&wal_path).unwrap();
+        let mut wal = Wal::open(&wal_path).expect("should be valid");
 
         let e1 = Entry::put(b"key1".to_vec(), b"v1".to_vec(), 1);
         let e2 = Entry::put(b"key2".to_vec(), b"v2".to_vec(), 2);
-        wal.append(&e1).unwrap();
-        wal.append(&e2).unwrap();
-        wal.sync().unwrap();
+        wal.append(&e1).expect("should be valid");
+        wal.append(&e2).expect("should be valid");
+        wal.sync().expect("should be valid");
 
         // Truncate the file mid-way through the second entry's payload
         // Entry format: [len:4][crc:4][payload:N]. We want to keep all of
         // entry 1, plus the len+crc of entry 2, but cut into entry 2's payload.
         let payload2 = Wal::serialize_entry(&e2);
         let entry2_total = 4 + 4 + payload2.len(); // len + crc + payload
-        let metadata = std::fs::metadata(&wal_path).unwrap();
+        let metadata = std::fs::metadata(&wal_path).expect("should be valid");
         // Keep entry 1 fully + 10 bytes of entry 2 (enough for len+crc but not full payload)
         let truncate_to = metadata.len() - (entry2_total as u64) + 10;
         std::fs::OpenOptions::new()
             .write(true)
             .open(&wal_path)
-            .unwrap()
+            .expect("should be valid")
             .set_len(truncate_to)
-            .unwrap();
+            .expect("should be valid");
 
         // Should recover entry 1, stop at truncated entry 2
-        let entries = replay_wal(&wal_path).unwrap();
+        let entries = replay_wal(&wal_path).expect("should be valid");
         assert_eq!(entries.len(), 1, "should stop at truncated entry");
         assert_eq!(entries[0], e1);
     }

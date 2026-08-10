@@ -1,4 +1,4 @@
-//! HTTP API for OntoDB.
+﻿//! HTTP API for OntoDB.
 //!
 //! Provides RESTful endpoints for SQL queries, vector search, hybrid queries,
 //! health checks, and Prometheus metrics.
@@ -406,13 +406,13 @@ async fn security_headers_middleware(
 ) -> axum::response::Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
-    headers.insert("x-frame-options", "DENY".parse().unwrap());
-    headers.insert("x-xss-protection", "1; mode=block".parse().unwrap());
-    headers.insert("referrer-policy", "strict-origin-when-cross-origin".parse().unwrap());
+    headers.insert("x-content-type-options", "nosniff".parse().expect("should be valid"));
+    headers.insert("x-frame-options", "DENY".parse().expect("should be valid"));
+    headers.insert("x-xss-protection", "1; mode=block".parse().expect("should be valid"));
+    headers.insert("referrer-policy", "strict-origin-when-cross-origin".parse().expect("should be valid"));
     headers.insert(
         "content-security-policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'".parse().unwrap(),
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'".parse().expect("should be valid"),
     );
     response
 }

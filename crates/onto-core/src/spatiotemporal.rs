@@ -1,4 +1,4 @@
-//! Spatio-temporal index for OntoDB.
+﻿//! Spatio-temporal index for OntoDB.
 //!
 //! Combines spatial indexing (quadtree) with temporal indexing (timeline)
 //! for efficient queries like:
@@ -230,7 +230,7 @@ impl STIndex {
             for entry in entries {
                 let q = node.quadrant(entry.lon, entry.lat);
                 // Safety: we just created children above
-                let children = node.children.as_mut().unwrap();
+                let children = node.children.as_mut().expect("should be valid");
                 Self::insert_into(&mut children[q], entry, depth + 1);
             }
         }
@@ -238,7 +238,7 @@ impl STIndex {
         // Insert into children if they exist
         if node.children.is_some() {
             let q = node.quadrant(point.lon, point.lat);
-            let children = node.children.as_mut().unwrap();
+            let children = node.children.as_mut().expect("should be valid");
             Self::insert_into(&mut children[q], point, depth + 1);
         } else {
             // Insert into this node's timeline

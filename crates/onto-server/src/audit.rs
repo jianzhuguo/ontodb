@@ -1,4 +1,4 @@
-//! Audit logging for OntoDB — 等保2.0三级合规.
+﻿//! Audit logging for OntoDB — 等保2.0三级合规.
 //!
 //! Features:
 //! - Query audit with metadata (user, timestamp, duration, status)
@@ -189,7 +189,7 @@ impl AuditLogger {
         let expected_name = format!("audit_{}.jsonl", today);
         let path = self.config.log_dir.join(&expected_name);
 
-        let mut file_guard = self.file.lock().unwrap();
+        let mut file_guard = self.file.lock().expect("should be valid");
 
         // Check if we already have this file open by trying to open it
         // In append mode, reopening is safe and idempotent
@@ -217,7 +217,7 @@ impl AuditLogger {
 
         // Set integrity chain — hold lock atomically for prev_hash read + update
         {
-            let mut last = self.last_hash.lock().unwrap();
+            let mut last = self.last_hash.lock().expect("should be valid");
             entry.prev_hash = last.clone();
             entry.entry_hash = compute_entry_hash(&entry);
             *last = entry.entry_hash.clone();
@@ -228,7 +228,7 @@ impl AuditLogger {
 
         // Write entry
         if let Ok(json) = serde_json::to_string(&entry) {
-            let mut file_guard = self.file.lock().unwrap();
+            let mut file_guard = self.file.lock().expect("should be valid");
             if let Some(f) = file_guard.as_mut() {
                 let _ = writeln!(f, "{}", json);
                 let _ = f.flush();
@@ -324,7 +324,7 @@ impl AuditLogger {
 
     /// Get the current integrity chain hash.
     pub fn current_hash(&self) -> String {
-        self.last_hash.lock().unwrap().clone()
+        self.last_hash.lock().expect("should be valid").clone()
     }
 
     /// Verify the integrity of a log file. Returns (total_entries, valid_entries, first_invalid_line).
@@ -617,7 +617,7 @@ fn fallback_file() -> std::fs::File {
                 .create(true)
                 .append(true)
                 .open(tmp)
-                .unwrap()
+                .expect("should be valid")
         })
 }
 
@@ -718,9 +718,9 @@ mod tests {
 
         // Tamper with the log file
         let log_file = dir.join(format!("audit_{}.jsonl", today_str()));
-        let content = fs::read_to_string(&log_file).unwrap();
+        let content = fs::read_to_string(&log_file).expect("should be valid");
         let tampered = content.replace("SELECT", "DROP");
-        fs::write(&log_file, tampered).unwrap();
+        fs::write(&log_file, tampered).expect("should be valid");
 
         // Verification should fail
         let (total, valid, first_invalid) = AuditLogger::verify_log_file(&log_file);
@@ -739,11 +739,11 @@ mod tests {
         // Create an old log file
         let old_date = "20200101";
         let old_file = dir.join(format!("audit_{}.jsonl", old_date));
-        fs::write(&old_file, "{}\n").unwrap();
+        fs::write(&old_file, "{}\n").expect("should be valid");
 
         // Create a recent log file
         let recent_file = dir.join(format!("audit_{}.jsonl", today_str()));
-        fs::write(&recent_file, "{}\n").unwrap();
+        fs::write(&recent_file, "{}\n").expect("should be valid");
 
         let removed = logger.cleanup_expired_logs();
         assert!(removed > 0, "should have removed old files");

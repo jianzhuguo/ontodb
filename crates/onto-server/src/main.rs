@@ -1,4 +1,4 @@
-//! OntoDB Server - Main entry point.
+﻿//! OntoDB Server - Main entry point.
 //!
 //! Supports three modes:
 //! - Standalone REPL (interactive or stdin)
@@ -273,7 +273,7 @@ fn main() -> Result<()> {
         let has_raft = args.raft_node_id.is_some() && args.raft_listen.is_some();
 
         if has_raft {
-            println!("Raft node {} enabled, listening on {}", args.raft_node_id.unwrap(), args.raft_listen.as_deref().unwrap());
+            println!("Raft node {} enabled, listening on {}", args.raft_node_id.expect("should be valid"), args.raft_listen.as_deref().expect("should be valid"));
             if let Some(ref peers) = args.raft_peers {
                 println!("  Peers: {}", peers);
             }
@@ -328,8 +328,8 @@ fn main() -> Result<()> {
                 }
 
                 if has_raft {
-                    let raft_addr = args.raft_listen.clone().unwrap();
-                    let node_id = args.raft_node_id.unwrap();
+                    let raft_addr = args.raft_listen.clone().expect("should be valid");
+                    let node_id = args.raft_node_id.expect("should be valid");
                     let peers = args.raft_peers.clone().unwrap_or_default();
                     futs.push(Box::pin(async move {
                         run_raft_node(node_id, &raft_addr, &peers).await

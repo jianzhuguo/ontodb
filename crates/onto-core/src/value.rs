@@ -1,4 +1,4 @@
-//! Ontology-aware value types for OntoDB.
+﻿//! Ontology-aware value types for OntoDB.
 //!
 //! These types represent the semantic data model that sits above raw bytes.
 
@@ -147,7 +147,7 @@ mod tests {
 
         for val in values {
             let bytes = val.to_bytes();
-            let restored = OntoValue::from_bytes(&bytes).unwrap();
+            let restored = OntoValue::from_bytes(&bytes).expect("should be valid");
             assert_eq!(val, restored);
         }
     }
@@ -174,9 +174,9 @@ mod tests {
         match val {
             OntoValue::Object(obj) => {
                 assert_eq!(obj.len(), 2);
-                let name = obj.iter().find(|(k, _)| k == "name").unwrap();
+                let name = obj.iter().find(|(k, _)| k == "name").expect("should be valid");
                 assert_eq!(name.1, OntoValue::String("Alice".into()));
-                let age = obj.iter().find(|(k, _)| k == "age").unwrap();
+                let age = obj.iter().find(|(k, _)| k == "age").expect("should be valid");
                 assert_eq!(age.1, OntoValue::Int64(30));
             }
             _ => panic!("expected Object"),

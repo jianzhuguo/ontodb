@@ -1,4 +1,4 @@
-//! Tiered storage for time series data.
+﻿//! Tiered storage for time series data.
 //!
 //! Implements hot/warm/cold data tiering:
 //! - **Hot**: MemTable (in memory) — recent data, fast reads/writes
@@ -208,7 +208,7 @@ impl TieredStorage {
 
                         if age >= self.config.warm_to_cold_secs {
                             // Move to cold tier
-                            let filename = path.file_name().unwrap();
+                            let filename = path.file_name().expect("should be valid");
                             let cold_path = cold_dir.join(filename);
                             std::fs::rename(&path, &cold_path).map_err(|e| e.to_string())?;
                             self.stats.migrations_to_cold += 1;
@@ -365,13 +365,13 @@ mod tests {
 
     #[test]
     fn test_tiered_storage_write() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let config = TieredConfig {
             data_dir: dir.path().to_path_buf(),
             hot_max_bytes: 1024, // Small for testing
             ..Default::default()
         };
-        let mut storage = TieredStorage::new(config).unwrap();
+        let mut storage = TieredStorage::new(config).expect("should be valid");
 
         // Write some points
         for i in 0..10 {
@@ -381,7 +381,7 @@ mod tests {
                     timestamp: 1000 + i,
                     value: TsValue::Float(0.5),
                 },
-            ).unwrap();
+            ).expect("should be valid");
         }
 
         assert_eq!(storage.stats().hot_entries, 10);
@@ -389,13 +389,13 @@ mod tests {
 
     #[test]
     fn test_tiered_storage_flush() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let config = TieredConfig {
             data_dir: dir.path().to_path_buf(),
             hot_max_bytes: 100, // Very small to trigger flush
             ..Default::default()
         };
-        let mut storage = TieredStorage::new(config).unwrap();
+        let mut storage = TieredStorage::new(config).expect("should be valid");
 
         // Write enough to trigger flush
         for i in 0..100 {
@@ -405,7 +405,7 @@ mod tests {
                     timestamp: 1000 + i,
                     value: TsValue::Float(0.5),
                 },
-            ).unwrap();
+            ).expect("should be valid");
         }
 
         // Should have flushed to warm tier
@@ -414,18 +414,18 @@ mod tests {
 
     #[test]
     fn test_tier_for_timestamp() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("should be valid");
         let config = TieredConfig {
             data_dir: dir.path().to_path_buf(),
             hot_to_warm_secs: 3600,
             warm_to_cold_secs: 86400,
             ..Default::default()
         };
-        let storage = TieredStorage::new(config).unwrap();
+        let storage = TieredStorage::new(config).expect("should be valid");
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("should be valid")
             .as_secs() as i64;
 
         assert_eq!(storage.tier_for_timestamp(now), Tier::Hot);

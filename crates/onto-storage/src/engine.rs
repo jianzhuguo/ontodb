@@ -1,4 +1,4 @@
-//! LSM Engine: The main storage engine that orchestrates WAL, MemTable, and SSTables.
+﻿//! LSM Engine: The main storage engine that orchestrates WAL, MemTable, and SSTables.
 //!
 //! Write path:  WAL -> MemTable -> (when full) flush to SSTable
 //! Read path:   MemTable -> SSTables (newest to oldest)
@@ -1615,7 +1615,7 @@ impl LsmEngine {
         drop(levels);
 
         for sst_path in &sst_paths {
-            let fname = sst_path.file_name().unwrap().to_str().unwrap();
+            let fname = sst_path.file_name().expect("should be valid").to_str().expect("should be valid");
             let dest = backup_dir.join(fname);
             fs::copy(sst_path, &dest)?;
             let data = fs::read(&dest)?;
@@ -1650,7 +1650,7 @@ impl LsmEngine {
                 let entry = entry?;
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("idx") {
-                    let fname = path.file_name().unwrap().to_str().unwrap();
+                    let fname = path.file_name().expect("should be valid").to_str().expect("should be valid");
                     let dest = idx_backup_dir.join(fname);
                     fs::copy(&path, &dest)?;
                     let data = fs::read(&dest)?;
@@ -1760,7 +1760,7 @@ impl LsmEngine {
             let meta = fs::metadata(sst_path)?;
             if let Ok(modified) = meta.modified() {
                 if modified > since_modified {
-                    let fname = sst_path.file_name().unwrap().to_str().unwrap();
+                    let fname = sst_path.file_name().expect("should be valid").to_str().expect("should be valid");
                     let dest = backup_dir.join(fname);
                     fs::copy(sst_path, &dest)?;
                     let data = fs::read(&dest)?;
@@ -1800,7 +1800,7 @@ impl LsmEngine {
                     if let Ok(meta) = fs::metadata(&path) {
                         if let Ok(modified) = meta.modified() {
                             if modified > since_modified {
-                                let fname = path.file_name().unwrap().to_str().unwrap();
+                                let fname = path.file_name().expect("should be valid").to_str().expect("should be valid");
                                 let dest = idx_backup_dir.join(fname);
                                 fs::copy(&path, &dest)?;
                                 let data = fs::read(&dest)?;
@@ -2010,84 +2010,84 @@ mod tests {
 
     #[test]
     fn test_engine_basic_put_get() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             memtable_size_limit: 1024 * 1024, // 1MB
             ..Default::default()
         };
 
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
         engine
             .put(b"name".to_vec(), b"alice".to_vec())
-            .unwrap();
-        engine.put(b"age".to_vec(), b"30".to_vec()).unwrap();
+            .expect("should be valid");
+        engine.put(b"age".to_vec(), b"30".to_vec()).expect("should be valid");
 
-        let val = engine.get(b"name").unwrap();
+        let val = engine.get(b"name").expect("should be valid");
         assert_eq!(val, Some(b"alice".to_vec()));
 
-        let val = engine.get(b"age").unwrap();
+        let val = engine.get(b"age").expect("should be valid");
         assert_eq!(val, Some(b"30".to_vec()));
 
-        let val = engine.get(b"missing").unwrap();
+        let val = engine.get(b"missing").expect("should be valid");
         assert_eq!(val, None);
     }
 
     #[test]
     fn test_engine_overwrite() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
 
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
-        engine.put(b"key".to_vec(), b"v1".to_vec()).unwrap();
-        engine.put(b"key".to_vec(), b"v2".to_vec()).unwrap();
+        engine.put(b"key".to_vec(), b"v1".to_vec()).expect("should be valid");
+        engine.put(b"key".to_vec(), b"v2".to_vec()).expect("should be valid");
 
-        let val = engine.get(b"key").unwrap();
+        let val = engine.get(b"key").expect("should be valid");
         assert_eq!(val, Some(b"v2".to_vec()));
     }
 
     #[test]
     fn test_engine_delete() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
 
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
-        engine.put(b"key".to_vec(), b"value".to_vec()).unwrap();
-        assert!(engine.get(b"key").unwrap().is_some());
+        engine.put(b"key".to_vec(), b"value".to_vec()).expect("should be valid");
+        assert!(engine.get(b"key").expect("should be valid").is_some());
 
-        engine.delete(b"key".to_vec()).unwrap();
-        assert!(engine.get(b"key").unwrap().is_none());
+        engine.delete(b"key".to_vec()).expect("should be valid");
+        assert!(engine.get(b"key").expect("should be valid").is_none());
     }
 
     #[test]
     fn test_engine_flush_to_sstable() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             memtable_size_limit: 128, // Very small to trigger flush
             ..Default::default()
         };
 
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
         // Write enough data to trigger a flush
         for i in 0..20u32 {
             let key = format!("key_{:04}", i);
             let value = format!("value_{}", i);
-            engine.put(key.into_bytes(), value.into_bytes()).unwrap();
+            engine.put(key.into_bytes(), value.into_bytes()).expect("should be valid");
         }
 
         // All data should still be readable
-        let val = engine.get(b"key_0005").unwrap();
+        let val = engine.get(b"key_0005").expect("should be valid");
         assert_eq!(val, Some(b"value_5".to_vec()));
 
         let stats = engine.stats();
@@ -2096,7 +2096,7 @@ mod tests {
 
     #[test]
     fn test_engine_recovery() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let data_dir = dir.path().to_path_buf();
 
         // Write data
@@ -2105,13 +2105,13 @@ mod tests {
                 data_dir: data_dir.clone(),
                 ..Default::default()
             };
-            let engine = LsmEngine::open(options).unwrap();
+            let engine = LsmEngine::open(options).expect("should be valid");
             engine
                 .put(b"key1".to_vec(), b"value1".to_vec())
-                .unwrap();
+                .expect("should be valid");
             engine
                 .put(b"key2".to_vec(), b"value2".to_vec())
-                .unwrap();
+                .expect("should be valid");
             // Don't drop cleanly - simulate crash (WAL should persist)
         }
 
@@ -2121,19 +2121,19 @@ mod tests {
                 data_dir,
                 ..Default::default()
             };
-            let engine = LsmEngine::open(options).unwrap();
+            let engine = LsmEngine::open(options).expect("should be valid");
 
-            let val = engine.get(b"key1").unwrap();
+            let val = engine.get(b"key1").expect("should be valid");
             assert_eq!(val, Some(b"value1".to_vec()));
 
-            let val = engine.get(b"key2").unwrap();
+            let val = engine.get(b"key2").expect("should be valid");
             assert_eq!(val, Some(b"value2".to_vec()));
         }
     }
 
     #[test]
     fn test_engine_compaction() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             memtable_size_limit: 128, // Very small to trigger frequent flushes
@@ -2141,14 +2141,14 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
         // Write enough data to trigger multiple flushes and compaction
         let num_keys = 100u32;
         for i in 0..num_keys {
             let key = format!("key_{:04}", i);
             let value = format!("value_{:06}", i); // Larger values to fill memtable faster
-            engine.put(key.into_bytes(), value.into_bytes()).unwrap();
+            engine.put(key.into_bytes(), value.into_bytes()).expect("should be valid");
         }
 
         let stats = engine.stats();
@@ -2161,7 +2161,7 @@ mod tests {
         for i in 0..num_keys {
             let key = format!("key_{:04}", i);
             let expected = format!("value_{:06}", i);
-            let val = engine.get(key.as_bytes()).unwrap();
+            let val = engine.get(key.as_bytes()).expect("should be valid");
             assert_eq!(
                 val,
                 Some(expected.into_bytes()),
@@ -2180,7 +2180,7 @@ mod tests {
 
     #[test]
     fn test_engine_compaction_with_overwrites() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             memtable_size_limit: 128,
@@ -2188,27 +2188,27 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
         // Write initial data
         for i in 0..50u32 {
             let key = format!("key_{:04}", i);
             let value = format!("v1_{:06}", i);
-            engine.put(key.into_bytes(), value.into_bytes()).unwrap();
+            engine.put(key.into_bytes(), value.into_bytes()).expect("should be valid");
         }
 
         // Overwrite all keys with new values
         for i in 0..50u32 {
             let key = format!("key_{:04}", i);
             let value = format!("v2_{:06}", i);
-            engine.put(key.into_bytes(), value.into_bytes()).unwrap();
+            engine.put(key.into_bytes(), value.into_bytes()).expect("should be valid");
         }
 
         // Verify the latest values are returned
         for i in 0..50u32 {
             let key = format!("key_{:04}", i);
             let expected = format!("v2_{:06}", i);
-            let val = engine.get(key.as_bytes()).unwrap();
+            let val = engine.get(key.as_bytes()).expect("should be valid");
             assert_eq!(
                 val,
                 Some(expected.into_bytes()),
@@ -2220,7 +2220,7 @@ mod tests {
 
     #[test]
     fn test_engine_compaction_with_deletes() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             memtable_size_limit: 128,
@@ -2228,28 +2228,28 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
         // Write data
         for i in 0..50u32 {
             let key = format!("key_{:04}", i);
             let value = format!("value_{:06}", i);
-            engine.put(key.into_bytes(), value.into_bytes()).unwrap();
+            engine.put(key.into_bytes(), value.into_bytes()).expect("should be valid");
         }
 
         // Delete even-numbered keys
         for i in (0..50u32).step_by(2) {
             let key = format!("key_{:04}", i);
-            engine.delete(key.into_bytes()).unwrap();
+            engine.delete(key.into_bytes()).expect("should be valid");
         }
 
         // Flush remaining entries in memtable
-        engine.flush().unwrap();
+        engine.flush().expect("should be valid");
 
         // Verify: odd keys exist, even keys are deleted
         for i in 0..50u32 {
             let key = format!("key_{:04}", i);
-            let val = engine.get(key.as_bytes()).unwrap();
+            let val = engine.get(key.as_bytes()).expect("should be valid");
             if i % 2 == 0 {
                 assert!(val.is_none(), "deleted key {} should not exist, got {:?}", key, val);
             } else {
@@ -2264,7 +2264,7 @@ mod tests {
 
     #[test]
     fn test_compaction_scoring_and_tombstone_cleanup() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             memtable_size_limit: 128,
@@ -2272,36 +2272,36 @@ mod tests {
             ..Default::default()
         };
 
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
         // Write data, then delete most of it
         for i in 0..80u32 {
             let key = format!("key_{:04}", i);
             let value = format!("value_{:06}", i);
-            engine.put(key.into_bytes(), value.into_bytes()).unwrap();
+            engine.put(key.into_bytes(), value.into_bytes()).expect("should be valid");
         }
 
         // Delete all but the last 10 keys
         for i in 0..70u32 {
             let key = format!("key_{:04}", i);
-            engine.delete(key.into_bytes()).unwrap();
+            engine.delete(key.into_bytes()).expect("should be valid");
         }
 
         // Force flush and compaction
-        engine.flush().unwrap();
+        engine.flush().expect("should be valid");
 
         // Verify remaining keys
         for i in 70..80u32 {
             let key = format!("key_{:04}", i);
             let expected = format!("value_{:06}", i);
-            let val = engine.get(key.as_bytes()).unwrap();
+            let val = engine.get(key.as_bytes()).expect("should be valid");
             assert_eq!(val, Some(expected.into_bytes()), "key {} should exist", key);
         }
 
         // Verify deleted keys are gone
         for i in 0..70u32 {
             let key = format!("key_{:04}", i);
-            let val = engine.get(key.as_bytes()).unwrap();
+            let val = engine.get(key.as_bytes()).expect("should be valid");
             assert!(val.is_none(), "deleted key {} should not exist", key);
         }
 
@@ -2314,172 +2314,172 @@ mod tests {
     // ══════════════════════════════════════════════════════════════�?
     #[test]
     fn test_txn_basic_commit() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
         let txn = engine.begin_txn();
-        engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).unwrap();
-        engine.txn_put(txn, b"age".to_vec(), b"30".to_vec()).unwrap();
-        engine.commit_txn(txn).unwrap();
+        engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).expect("should be valid");
+        engine.txn_put(txn, b"age".to_vec(), b"30".to_vec()).expect("should be valid");
+        engine.commit_txn(txn).expect("should be valid");
 
-        assert_eq!(engine.get(b"name").unwrap(), Some(b"alice".to_vec()));
-        assert_eq!(engine.get(b"age").unwrap(), Some(b"30".to_vec()));
+        assert_eq!(engine.get(b"name").expect("should be valid"), Some(b"alice".to_vec()));
+        assert_eq!(engine.get(b"age").expect("should be valid"), Some(b"30".to_vec()));
     }
 
     #[test]
     fn test_txn_abort() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
         let txn = engine.begin_txn();
-        engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).unwrap();
-        engine.abort_txn(txn).unwrap();
+        engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).expect("should be valid");
+        engine.abort_txn(txn).expect("should be valid");
 
-        assert_eq!(engine.get(b"name").unwrap(), None);
+        assert_eq!(engine.get(b"name").expect("should be valid"), None);
     }
 
     #[test]
     fn test_txn_read_own_writes() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
         let txn = engine.begin_txn();
-        engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).unwrap();
-        engine.txn_put(txn, b"age".to_vec(), b"30".to_vec()).unwrap();
+        engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).expect("should be valid");
+        engine.txn_put(txn, b"age".to_vec(), b"30".to_vec()).expect("should be valid");
 
-        assert_eq!(engine.txn_get(txn, b"name").unwrap(), Some(b"alice".to_vec()));
-        assert_eq!(engine.txn_get(txn, b"age").unwrap(), Some(b"30".to_vec()));
+        assert_eq!(engine.txn_get(txn, b"name").expect("should be valid"), Some(b"alice".to_vec()));
+        assert_eq!(engine.txn_get(txn, b"age").expect("should be valid"), Some(b"30".to_vec()));
 
-        engine.commit_txn(txn).unwrap();
+        engine.commit_txn(txn).expect("should be valid");
     }
 
     #[test]
     fn test_txn_snapshot_isolation() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
-        engine.put(b"key".to_vec(), b"v1".to_vec()).unwrap();
+        engine.put(b"key".to_vec(), b"v1".to_vec()).expect("should be valid");
 
         let txn1 = engine.begin_txn();
 
-        engine.put(b"key".to_vec(), b"v2".to_vec()).unwrap();
+        engine.put(b"key".to_vec(), b"v2".to_vec()).expect("should be valid");
 
         // txn1 still sees v1 (snapshot isolation)
-        assert_eq!(engine.txn_get(txn1, b"key").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(engine.txn_get(txn1, b"key").expect("should be valid"), Some(b"v1".to_vec()));
 
         let txn2 = engine.begin_txn();
-        assert_eq!(engine.txn_get(txn2, b"key").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(engine.txn_get(txn2, b"key").expect("should be valid"), Some(b"v2".to_vec()));
 
-        engine.commit_txn(txn1).unwrap();
-        engine.commit_txn(txn2).unwrap();
+        engine.commit_txn(txn1).expect("should be valid");
+        engine.commit_txn(txn2).expect("should be valid");
     }
 
     #[test]
     fn test_txn_write_conflict_independence() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
         let txn1 = engine.begin_txn();
         let txn2 = engine.begin_txn();
 
-        engine.txn_put(txn1, b"a".to_vec(), b"1".to_vec()).unwrap();
-        engine.txn_put(txn2, b"b".to_vec(), b"2".to_vec()).unwrap();
+        engine.txn_put(txn1, b"a".to_vec(), b"1".to_vec()).expect("should be valid");
+        engine.txn_put(txn2, b"b".to_vec(), b"2".to_vec()).expect("should be valid");
 
-        engine.commit_txn(txn1).unwrap();
-        engine.commit_txn(txn2).unwrap();
+        engine.commit_txn(txn1).expect("should be valid");
+        engine.commit_txn(txn2).expect("should be valid");
 
-        assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
-        assert_eq!(engine.get(b"b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(engine.get(b"a").expect("should be valid"), Some(b"1".to_vec()));
+        assert_eq!(engine.get(b"b").expect("should be valid"), Some(b"2".to_vec()));
     }
 
     #[test]
     fn test_txn_delete_in_transaction() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
-        engine.put(b"key".to_vec(), b"value".to_vec()).unwrap();
+        engine.put(b"key".to_vec(), b"value".to_vec()).expect("should be valid");
 
         let txn = engine.begin_txn();
-        engine.txn_delete(txn, b"key".to_vec()).unwrap();
-        assert_eq!(engine.txn_get(txn, b"key").unwrap(), None);
+        engine.txn_delete(txn, b"key".to_vec()).expect("should be valid");
+        assert_eq!(engine.txn_get(txn, b"key").expect("should be valid"), None);
 
-        engine.commit_txn(txn).unwrap();
-        assert_eq!(engine.get(b"key").unwrap(), None);
+        engine.commit_txn(txn).expect("should be valid");
+        assert_eq!(engine.get(b"key").expect("should be valid"), None);
     }
 
     #[test]
     fn test_txn_scan_prefix() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
-        engine.put(b"user:1".to_vec(), b"alice".to_vec()).unwrap();
-        engine.put(b"user:2".to_vec(), b"bob".to_vec()).unwrap();
-        engine.put(b"item:1".to_vec(), b"widget".to_vec()).unwrap();
+        engine.put(b"user:1".to_vec(), b"alice".to_vec()).expect("should be valid");
+        engine.put(b"user:2".to_vec(), b"bob".to_vec()).expect("should be valid");
+        engine.put(b"item:1".to_vec(), b"widget".to_vec()).expect("should be valid");
 
         let txn = engine.begin_txn();
-        engine.txn_put(txn, b"user:3".to_vec(), b"charlie".to_vec()).unwrap();
+        engine.txn_put(txn, b"user:3".to_vec(), b"charlie".to_vec()).expect("should be valid");
 
-        let results = engine.txn_scan_prefix(txn, b"user:").unwrap();
+        let results = engine.txn_scan_prefix(txn, b"user:").expect("should be valid");
         assert_eq!(results.len(), 3);
 
-        engine.commit_txn(txn).unwrap();
+        engine.commit_txn(txn).expect("should be valid");
     }
 
     #[test]
     fn test_txn_overwrite_in_buffer() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
         let txn = engine.begin_txn();
-        engine.txn_put(txn, b"key".to_vec(), b"v1".to_vec()).unwrap();
-        engine.txn_put(txn, b"key".to_vec(), b"v2".to_vec()).unwrap();
+        engine.txn_put(txn, b"key".to_vec(), b"v1".to_vec()).expect("should be valid");
+        engine.txn_put(txn, b"key".to_vec(), b"v2".to_vec()).expect("should be valid");
 
-        assert_eq!(engine.txn_get(txn, b"key").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(engine.txn_get(txn, b"key").expect("should be valid"), Some(b"v2".to_vec()));
 
-        engine.commit_txn(txn).unwrap();
-        assert_eq!(engine.get(b"key").unwrap(), Some(b"v2".to_vec()));
+        engine.commit_txn(txn).expect("should be valid");
+        assert_eq!(engine.get(b"key").expect("should be valid"), Some(b"v2".to_vec()));
     }
 
     #[test]
     fn test_txn_active_count() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
-        let engine = LsmEngine::open(options).unwrap();
+        let engine = LsmEngine::open(options).expect("should be valid");
 
         assert_eq!(engine.active_txn_count(), 0);
 
@@ -2489,16 +2489,16 @@ mod tests {
         let t2 = engine.begin_txn();
         assert_eq!(engine.active_txn_count(), 2);
 
-        engine.commit_txn(t1).unwrap();
+        engine.commit_txn(t1).expect("should be valid");
         assert_eq!(engine.active_txn_count(), 1);
 
-        engine.abort_txn(t2).unwrap();
+        engine.abort_txn(t2).expect("should be valid");
         assert_eq!(engine.active_txn_count(), 0);
     }
 
     #[test]
     fn test_index_persistence_across_restart() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let data_dir = dir.path().to_path_buf();
 
         // Phase 1: Create index, insert data, flush to SSTable
@@ -2508,19 +2508,19 @@ mod tests {
                 memtable_size_limit: 1024 * 1024,
                 ..Default::default()
             };
-            let engine = LsmEngine::open(options).unwrap();
+            let engine = LsmEngine::open(options).expect("should be valid");
 
-            engine.create_index("Product", "price").unwrap();
+            engine.create_index("Product", "price").expect("should be valid");
 
             // Insert via transaction so indexes are maintained
             let txn = engine.begin_txn();
             let doc1 = serde_json::json!({"__class__": "Product", "name": "iPhone", "price": 999});
             let doc2 = serde_json::json!({"__class__": "Product", "name": "iPad", "price": 799});
-            engine.txn_put(txn, b"Product::001".to_vec(), serde_json::to_vec(&doc1).unwrap()).unwrap();
-            engine.txn_put(txn, b"Product::002".to_vec(), serde_json::to_vec(&doc2).unwrap()).unwrap();
-            engine.commit_txn(txn).unwrap();
+            engine.txn_put(txn, b"Product::001".to_vec(), serde_json::to_vec(&doc1).expect("should be valid")).expect("should be valid");
+            engine.txn_put(txn, b"Product::002".to_vec(), serde_json::to_vec(&doc2).expect("should be valid")).expect("should be valid");
+            engine.commit_txn(txn).expect("should be valid");
 
-            engine.flush().unwrap();
+            engine.flush().expect("should be valid");
         }
 
         // Phase 2: Reopen engine �?indexes should be rebuilt automatically
@@ -2530,35 +2530,35 @@ mod tests {
                 memtable_size_limit: 1024 * 1024,
                 ..Default::default()
             };
-            let engine = LsmEngine::open(options).unwrap();
+            let engine = LsmEngine::open(options).expect("should be valid");
 
             // Index should exist after restart
             assert!(engine.has_index("Product", "price"), "index should persist across restart");
 
             // Index should be functional: lookup by value
-            let pkeys = engine.index_manager().write().unwrap().lookup_eq(
+            let pkeys = engine.index_manager().write().expect("should be valid").lookup_eq(
                 "Product",
                 "price",
                 &serde_json::json!(999),
             );
             assert!(pkeys.is_some(), "index lookup should work after restart");
-            assert_eq!(pkeys.unwrap().len(), 1);
+            assert_eq!(pkeys.expect("should be valid").len(), 1);
 
             // Range scan should also work
-            let pkeys = engine.index_manager().write().unwrap().lookup_range(
+            let pkeys = engine.index_manager().write().expect("should be valid").lookup_range(
                 "Product",
                 "price",
                 Some(&serde_json::json!(500)),
                 Some(&serde_json::json!(1000)),
             );
             assert!(pkeys.is_some());
-            assert_eq!(pkeys.unwrap().len(), 2); // both products
+            assert_eq!(pkeys.expect("should be valid").len(), 2); // both products
         }
     }
 
     #[test]
     fn test_backup_and_restore() {
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("should be valid");
         let data_dir = dir.path().join("data");
         let backup_dir = dir.path().join("backup");
 
@@ -2569,15 +2569,15 @@ mod tests {
                 memtable_size_limit: 1024 * 1024,
                 ..Default::default()
             };
-            let engine = LsmEngine::open(options).unwrap();
+            let engine = LsmEngine::open(options).expect("should be valid");
 
-            engine.put(b"key1".to_vec(), b"value1".to_vec()).unwrap();
-            engine.put(b"key2".to_vec(), b"value2".to_vec()).unwrap();
-            engine.put(b"key3".to_vec(), b"value3".to_vec()).unwrap();
-            engine.flush().unwrap();
+            engine.put(b"key1".to_vec(), b"value1".to_vec()).expect("should be valid");
+            engine.put(b"key2".to_vec(), b"value2".to_vec()).expect("should be valid");
+            engine.put(b"key3".to_vec(), b"value3".to_vec()).expect("should be valid");
+            engine.flush().expect("should be valid");
 
             // Create backup
-            let manifest = engine.backup(&backup_dir).unwrap();
+            let manifest = engine.backup(&backup_dir).expect("should be valid");
             assert!(!manifest.files.is_empty(), "backup should have files");
             assert!(backup_dir.join("manifest.json").exists());
             assert!(backup_dir.join("wal.log").exists());
@@ -2592,7 +2592,7 @@ mod tests {
         // Phase 2: Restore to a new directory
         let restore_dir = dir.path().join("restored");
         {
-            let manifest = LsmEngine::restore(&backup_dir, &restore_dir).unwrap();
+            let manifest = LsmEngine::restore(&backup_dir, &restore_dir).expect("should be valid");
             assert!(!manifest.files.is_empty());
 
             // Verify files were copied
@@ -2606,12 +2606,12 @@ mod tests {
                 memtable_size_limit: 1024 * 1024,
                 ..Default::default()
             };
-            let engine = LsmEngine::open(options).unwrap();
+            let engine = LsmEngine::open(options).expect("should be valid");
 
-            assert_eq!(engine.get(b"key1").unwrap(), Some(b"value1".to_vec()));
-            assert_eq!(engine.get(b"key2").unwrap(), Some(b"value2".to_vec()));
-            assert_eq!(engine.get(b"key3").unwrap(), Some(b"value3".to_vec()));
-            assert_eq!(engine.get(b"missing").unwrap(), None);
+            assert_eq!(engine.get(b"key1").expect("should be valid"), Some(b"value1".to_vec()));
+            assert_eq!(engine.get(b"key2").expect("should be valid"), Some(b"value2".to_vec()));
+            assert_eq!(engine.get(b"key3").expect("should be valid"), Some(b"value3".to_vec()));
+            assert_eq!(engine.get(b"missing").expect("should be valid"), None);
         }
     }
 }
