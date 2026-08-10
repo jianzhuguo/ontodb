@@ -332,6 +332,7 @@ impl LsmEngine {
     /// 1. Single write_state lock acquisition for all entries
     /// 2. WAL entries are written in bulk with a single flush
     /// 3. MemTable size check only once at the end
+    /// 4. Group commit: single sync for the entire batch
     ///
     /// Returns the number of entries inserted.
     pub fn put_batch(&self, entries: Vec<(Key, Value)>) -> Result<usize> {
@@ -340,7 +341,7 @@ impl LsmEngine {
         }
 
         let count = entries.len();
-        let needs_flush = {
+        let (needs_flush, should_sync) = {
             let mut ws = self.write_state.write();
             for (key, value) in entries {
                 let seq = self.next_seq();
@@ -351,12 +352,26 @@ impl LsmEngine {
             }
             // Flush WAL buffer once for the entire batch
             ws.wal.flush_buf()?;
-            if self.options.sync_wal_on_commit {
-                ws.wal.sync()?;
-            }
             ws.wal_pending_count = 0;
-            ws.memtable.size() >= self.options.memtable_size_limit
+            (ws.memtable.size() >= self.options.memtable_size_limit, self.options.sync_wal_on_commit)
         };
+        // write_state lock released here
+
+        // Group commit: batch sync across concurrent writers
+        if should_sync {
+            let current_seq = self.seq_counter.load(Ordering::Relaxed);
+            let is_leader = self.group_commit.register(current_seq);
+            if is_leader {
+                let _batch_size = self.group_commit.wait_for_batch();
+                {
+                    let mut ws = self.write_state.write();
+                    ws.wal.sync()?;
+                }
+                self.group_commit.complete_sync(current_seq);
+            } else {
+                self.group_commit.wait_for_sync(current_seq);
+            }
+        }
 
         if needs_flush {
             self.flush_memtable()?;
