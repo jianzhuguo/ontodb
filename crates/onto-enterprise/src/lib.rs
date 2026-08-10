@@ -28,6 +28,9 @@ pub mod cluster;
 #[cfg(feature = "sharding")]
 pub mod sharding;
 
+#[cfg(feature = "sharding")]
+pub mod cross_shard;
+
 // === Security features (LDAP/SAML) ===
 #[cfg(feature = "security")]
 pub mod security;
@@ -278,10 +281,10 @@ mod tests {
         let features = enabled_features();
         // Features depend on compile-time configuration
         // When running with any feature flag, features should not be empty
-        #[cfg(any(feature = "enterprise-gov", feature = "enterprise-standard", feature = "security", feature = "encryption"))]
+        #[cfg(any(feature = "enterprise-gov", feature = "enterprise-standard", feature = "security", feature = "encryption", feature = "sharding", feature = "cluster", feature = "backup"))]
         assert!(!features.is_empty());
 
-        #[cfg(not(any(feature = "enterprise-gov", feature = "enterprise-standard", feature = "security", feature = "encryption")))]
+        #[cfg(not(any(feature = "enterprise-gov", feature = "enterprise-standard", feature = "security", feature = "encryption", feature = "sharding", feature = "cluster", feature = "backup")))]
         assert!(features.is_empty());
     }
 
