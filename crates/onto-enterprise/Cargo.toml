@@ -21,6 +21,10 @@ tokio-rustls = { version = "0.26", optional = true }
 hex = { version = "0.4", optional = true }
 gm-sm4 = { version = "0.10", optional = true }  # SM4 block cipher (国密标准)
 
+# KMS dependencies
+ureq = { version = "2", optional = true, features = ["json"] }
+base64 = { version = "0.21", optional = true }
+
 # CRC validation
 crc32fast = { workspace = true, optional = true }
 
@@ -45,7 +49,7 @@ sharding = []
 
 # === Security features (Gov/Finance edition) ===
 security = ["dep:ring", "dep:chrono", "dep:crc32fast"]  # RBAC + data masking
-encryption = ["dep:ring", "dep:rustls", "dep:tokio-rustls", "dep:hex", "dep:gm-sm4"]
+encryption = ["dep:ring", "dep:rustls", "dep:tokio-rustls", "dep:hex", "dep:gm-sm4", "dep:ureq", "dep:base64", "dep:chrono"]
 
 # === Backup features ===
 backup = ["dep:chrono", "dep:crc32fast", "dep:rand", "dep:csv"]

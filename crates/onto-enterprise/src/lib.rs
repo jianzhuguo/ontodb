@@ -36,6 +36,10 @@ pub mod security;
 #[cfg(feature = "encryption")]
 pub mod encryption;
 
+// === KMS (Key Management Service) ===
+#[cfg(feature = "encryption")]
+pub mod kms;
+
 // === Backup features ===
 #[cfg(feature = "backup")]
 pub mod backup;

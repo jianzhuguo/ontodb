@@ -171,8 +171,33 @@ impl EncryptionManager {
                 }
                 bytes
             }
-            KeySource::Kms(_endpoint) => {
-                anyhow::bail!("KMS key source not yet implemented");
+            KeySource::Kms(endpoint) => {
+                // Parse KMS config from endpoint (format: "endpoint|key_name|token")
+                let parts: Vec<&str> = endpoint.split('|').collect();
+                let (kms_endpoint, key_name, token) = if parts.len() >= 3 {
+                    (parts[0], parts[1], parts[2])
+                } else if parts.len() == 2 {
+                    (parts[0], parts[1], "")
+                } else {
+                    (endpoint.as_str(), "ontodb-master", "")
+                };
+
+                let kms_config = crate::kms::KmsConfig {
+                    endpoint: kms_endpoint.to_string(),
+                    key_name: key_name.to_string(),
+                    token: token.to_string(),
+                    timeout_secs: 30,
+                    cache_ttl_secs: 300,
+                };
+
+                let kms_client = crate::kms::KmsClient::new(kms_config)
+                    .context("Failed to create KMS client")?;
+
+                let (bytes, _version) = kms_client.fetch_master_key()
+                    .context("Failed to fetch master key from KMS")?;
+
+                tracing::info!("Master key loaded from KMS: {} (version: {})", kms_endpoint, _version);
+                bytes
             }
         };
 
