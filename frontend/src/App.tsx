@@ -7,8 +7,11 @@ import { NodeDetail } from './components/NodeDetail'
 import { QueryConsole } from './components/QueryConsole'
 import { DataBrowser } from './components/DataBrowser'
 import { VectorSearch } from './components/VectorSearch'
+import { GraphExplorer } from './components/GraphExplorer'
+import { SchemaBrowser } from './components/SchemaBrowser'
+import { MetricsDashboard } from './components/MetricsDashboard'
 
-type Tab = 'topology' | 'query' | 'data' | 'vector'
+type Tab = 'topology' | 'query' | 'data' | 'vector' | 'graph' | 'schema' | 'metrics'
 
 export default function App() {
   const fetchAll = useDashboardStore((s) => s.fetchAll)
@@ -25,7 +28,10 @@ export default function App() {
     { id: 'topology', label: '拓扑监控', icon: '🌐' },
     { id: 'query', label: 'SQL 控制台', icon: '💻' },
     { id: 'data', label: '数据浏览', icon: '📊' },
+    { id: 'schema', label: 'Schema', icon: '📋' },
     { id: 'vector', label: '向量搜索', icon: '🔍' },
+    { id: 'graph', label: '图谱浏览器', icon: '🕸️' },
+    { id: 'metrics', label: '实时指标', icon: '📈' },
   ]
 
   return (
@@ -33,12 +39,12 @@ export default function App() {
       <Header />
 
       {/* Tab Navigation */}
-      <div className="flex items-center border-b border-gray-800 bg-gray-900">
+      <div className="flex items-center border-b border-gray-800 bg-gray-900 overflow-x-auto">
         {tabs.map((tab) => (
           <button
             key={tab.id}
             onClick={() => setActiveTab(tab.id)}
-            className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium transition-colors border-b-2 ${
+            className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium transition-colors border-b-2 whitespace-nowrap ${
               activeTab === tab.id
                 ? 'text-blue-400 border-blue-500 bg-gray-800/50'
                 : 'text-gray-400 border-transparent hover:text-gray-300 hover:bg-gray-800/30'
@@ -85,9 +91,27 @@ export default function App() {
           </div>
         )}
 
+        {activeTab === 'schema' && (
+          <div className="h-full bg-gray-950">
+            <SchemaBrowser />
+          </div>
+        )}
+
         {activeTab === 'vector' && (
           <div className="h-full bg-gray-950">
             <VectorSearch />
+          </div>
+        )}
+
+        {activeTab === 'graph' && (
+          <div className="h-full bg-gray-950">
+            <GraphExplorer />
+          </div>
+        )}
+
+        {activeTab === 'metrics' && (
+          <div className="h-full bg-gray-950 overflow-y-auto">
+            <MetricsDashboard />
           </div>
         )}
       </div>
