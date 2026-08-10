@@ -2,6 +2,33 @@
 
 All notable changes to OntoDB will be documented in this file.
 
+## [v0.5.9] - 2026-08-10
+
+### Features
+
+#### Adaptive Memory Management
+- **MemoryManager** integrated into LsmEngine storage engine
+- Dynamic MemTable sizing based on write rate (4MB - 256MB)
+- Adaptive Block Cache sizing based on hit rate (16MB - 1GB)
+- Memory pressure detection and automatic shrinking
+- Write rate tracking with 10-interval sliding window
+- Cache hit/miss tracking for adaptive sizing
+- `with_initial_sizes()` constructor for backward compatibility
+
+#### Performance
+- Write: 863,618 ops/s
+- Read: 1,256,518 ops/s
+- Batch: 1,082,230 ops/s
+- Vector recall: 100% at ef_search=200 (341µs latency)
+- 8-thread speedup: 1.82x
+
+#### Industry Analysis
+- 9 industry scenarios analyzed (Algorithm/Storage/Computing/AI/Embodied/Automotive/Aerospace/Computing-Integrated/Industrial AI)
+- Comprehensive competitive analysis vs AIDBS
+
+### Tests
+- 584/584 passing, zero regressions
+
 ## [v0.5.7] - 2026-08-10
 
 ### Security Audit & Hardening
