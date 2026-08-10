@@ -778,8 +778,9 @@ impl LsmEngine {
 
     fn next_seq(&self) -> SeqNo {
         // AcqRel is required for snapshot isolation correctness.
-        // Relaxed causes stale reads on weakly-ordered architectures (ARM)
-        // and even on x86 under high concurrency (test_txn_snapshot_isolation fails).
+        // Batch allocation with thread_local breaks snapshot isolation
+        // because sequence numbers within a batch are assigned locally
+        // without memory ordering guarantees across threads.
         self.seq_counter.fetch_add(1, Ordering::AcqRel)
     }
 
