@@ -1069,11 +1069,13 @@ impl LsmEngine {
         // write_state lock released here
 
         // Group commit: batch sync across concurrent transactions
+        // Strategy: wait up to 10µs OR until 4 transactions are ready
         if self.options.sync_wal_on_commit {
             let current_seq = self.seq_counter.load(Ordering::Relaxed);
-            let is_leader = self.group_commit.register_and_maybe_leader(current_seq);
+            let is_leader = self.group_commit.register(current_seq);
             if is_leader {
-                // Leader performs the sync for all waiting transactions
+                // Leader waits for batch or timeout, then syncs
+                let _batch_size = self.group_commit.wait_for_batch();
                 {
                     let mut ws = self.write_state.write();
                     ws.wal.sync()?;
