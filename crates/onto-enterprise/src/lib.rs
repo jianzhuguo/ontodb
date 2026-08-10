@@ -32,6 +32,9 @@ pub mod sharding;
 #[cfg(feature = "security")]
 pub mod security;
 
+#[cfg(feature = "security")]
+pub mod ldap;
+
 // === Encryption (TLS + AES) ===
 #[cfg(feature = "encryption")]
 pub mod encryption;
