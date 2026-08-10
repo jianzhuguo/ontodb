@@ -27,6 +27,9 @@ pub mod cluster;
 #[cfg(feature = "cluster")]
 pub mod cluster_config;
 
+#[cfg(feature = "cluster")]
+pub mod cluster_router;
+
 // === Sharding features ===
 #[cfg(feature = "sharding")]
 pub mod sharding;

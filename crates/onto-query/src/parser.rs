@@ -837,6 +837,9 @@ impl QueryParser {
             let (name, columns) = if let Some(paren_start) = name_part.find('(') {
                 let close = name_part.rfind(')')
                     .ok_or_else(|| CoreError::InvalidArgument("expected ')' in CTE column list".to_string()))?;
+                if paren_start + 1 >= close {
+                    return Err(CoreError::InvalidArgument("empty or malformed CTE column list".to_string()));
+                }
                 let cte_name = name_part[..paren_start].trim().to_string();
                 let cols_str = &name_part[paren_start + 1..close];
                 let cols: Vec<String> = cols_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
@@ -1507,6 +1510,9 @@ impl QueryParser {
                     .ok_or_else(|| CoreError::InvalidArgument("expected '(' in aggregate".to_string()))?;
                 let close = part.rfind(')')
                     .ok_or_else(|| CoreError::InvalidArgument("expected ')' in aggregate".to_string()))?;
+                if open + 1 >= close {
+                    return Err(CoreError::InvalidArgument("empty or malformed aggregate function".to_string()));
+                }
                 let arg = part[open + 1..close].trim().to_string();
 
                 // Check for alias: ... AS alias
@@ -1599,6 +1605,9 @@ impl QueryParser {
         let close = input.rfind(')')
             .ok_or_else(|| CoreError::InvalidArgument("expected ')' in window function".to_string()))?;
 
+        if open >= close {
+            return Err(CoreError::InvalidArgument("malformed window function: '(' after ')'".to_string()));
+        }
         let func_name = &input[..open];
         let arg_str = input[open + 1..close].trim();
         let arg = if arg_str.is_empty() || arg_str == "*" {
@@ -2120,6 +2129,9 @@ impl QueryParser {
             .find(')')
             .ok_or_else(|| CoreError::InvalidArgument("expected ')' in MATCH pattern".to_string()))?;
 
+        if open + 1 >= close {
+            return Err(CoreError::InvalidArgument("empty or malformed MATCH pattern".to_string()));
+        }
         let pattern = rest[open + 1..close].trim();
 
         // Parse pattern: <var>: <Class>
