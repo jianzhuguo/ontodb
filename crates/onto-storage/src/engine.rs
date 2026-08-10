@@ -1060,13 +1060,10 @@ impl LsmEngine {
 
             ws.wal.flush_buf()?;
 
+            // Use sync_if_dirty to avoid redundant fsync when no new data
             if self.options.sync_wal_on_commit {
-                ws.wal.sync()?;
+                ws.wal.sync_if_dirty()?;
             }
-
-            // Relaxed ordering is sufficient: the write_state lock provides
-            // mutual exclusion, and the WAL flush provides persistence.
-            // No additional memory fence needed.
 
             ws.memtable.size() >= self.options.memtable_size_limit
         };

@@ -19,6 +19,8 @@ struct CacheEntry {
 /// Caches decompressed blocks keyed by their offset in the SSTable file.
 /// Uses a monotonic counter for O(1) LRU touch and O(n) eviction
 /// (n = cache capacity, typically small ~64-256 blocks).
+///
+/// Supports prefetching adjacent blocks for sequential access patterns.
 pub struct BlockCache {
     /// Cached blocks keyed by block offset.
     entries: HashMap<u64, CacheEntry>,
@@ -26,6 +28,8 @@ pub struct BlockCache {
     capacity: usize,
     /// Monotonic counter for LRU tracking.
     counter: u64,
+    /// Prefetch window size (number of adjacent blocks to prefetch).
+    prefetch_window: usize,
 }
 
 impl BlockCache {
@@ -35,7 +39,13 @@ impl BlockCache {
             entries: HashMap::with_capacity(capacity),
             capacity,
             counter: 0,
+            prefetch_window: 2, // Prefetch 2 adjacent blocks
         }
+    }
+
+    /// Sets the prefetch window size.
+    pub fn set_prefetch_window(&mut self, window: usize) {
+        self.prefetch_window = window;
     }
 
     /// Gets a cached block by offset. Returns None on cache miss.
@@ -81,6 +91,25 @@ impl BlockCache {
     /// Returns the current number of cached entries.
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Returns offsets that should be prefetched based on a cache miss.
+    /// When a block at `offset` is accessed and not in cache, this returns
+    /// the offsets of adjacent blocks that are likely to be accessed next.
+    pub fn prefetch_offsets(&self, offset: u64, block_size: u64, file_size: u64) -> Vec<u64> {
+        let mut offsets = Vec::new();
+        for i in 1..=self.prefetch_window as u64 {
+            let next_offset = offset + i * block_size;
+            if next_offset < file_size && !self.entries.contains_key(&next_offset) {
+                offsets.push(next_offset);
+            }
+        }
+        offsets
+    }
+
+    /// Returns true if the given offset is in cache.
+    pub fn contains(&self, offset: u64) -> bool {
+        self.entries.contains_key(&offset)
     }
 
     /// Returns true if the cache is empty.

@@ -17,6 +17,8 @@ pub struct Wal {
     offset: u64,
     /// Reusable buffer for entry serialization to avoid per-write allocation.
     serialize_buf: Vec<u8>,
+    /// Track if there are unsynced writes.
+    dirty: bool,
 }
 
 impl Wal {
@@ -34,6 +36,7 @@ impl Wal {
             writer: BufWriter::new(file),
             offset,
             serialize_buf: Vec::with_capacity(256),
+            dirty: false,
         })
     }
 
@@ -57,6 +60,7 @@ impl Wal {
         self.writer.write_all(&self.serialize_buf)?;
 
         self.offset += 4 + 4 + self.serialize_buf.len() as u64;
+        self.dirty = true;
 
         Ok(offset)
     }
@@ -91,6 +95,15 @@ impl Wal {
     pub fn sync(&mut self) -> Result<()> {
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Sync only if there are dirty writes. Avoids redundant fsync calls.
+    pub fn sync_if_dirty(&mut self) -> Result<()> {
+        if self.dirty {
+            self.sync()?;
+        }
         Ok(())
     }
 

@@ -724,7 +724,11 @@ impl<'a> SsTableIterator<'a> {
 
         let num_restarts =
             u32::from_le_bytes(data[data.len() - 4..data.len()].try_into().unwrap()) as usize;
-        self.restart_start = data.len() - 4 - num_restarts * 4;
+        let restart_data_size = num_restarts * 4;
+        if restart_data_size + 4 > data.len() {
+            return Err(CoreError::corruption("invalid restart count in block"));
+        }
+        self.restart_start = data.len() - 4 - restart_data_size;
         self.restarts = Vec::with_capacity(num_restarts);
 
         for i in 0..num_restarts {
