@@ -11,6 +11,7 @@ import { VectorSearch } from './components/VectorSearch'
 import { GraphExplorer } from './components/GraphExplorer'
 import { SchemaBrowser } from './components/SchemaBrowser'
 import { MetricsDashboard } from './components/MetricsDashboard'
+import { ConnectionManager } from './components/ConnectionManager'
 
 type Tab = 'topology' | 'query' | 'data' | 'vector' | 'graph' | 'schema' | 'metrics'
 
@@ -81,9 +82,8 @@ export default function App() {
           </button>
         ))}
         <div className="flex-1" />
-        <div className="flex items-center gap-2 pr-3">
-          <div className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500 animate-pulse'}`} />
-          <span className="text-xs text-gray-500">{connected ? '已连接' : '断开'}</span>
+        <div className="pr-3">
+          <ConnectionManager serverUrl={settings.serverUrl} />
         </div>
       </div>
 
