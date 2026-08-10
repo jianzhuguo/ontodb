@@ -560,7 +560,7 @@ impl BackupManager {
             io::Error::new(io::ErrorKind::NotFound, "No backup chain available for PITR")
         })?;
 
-        // Restore from the chain
+        // Safe: chain is guaranteed non-empty by ok_or_else above
         let full_id = chain.first().unwrap().backup_id.clone();
         let inc_ids: Vec<&str> = chain[1..].iter().map(|m| m.backup_id.as_str()).collect();
 

@@ -421,8 +421,9 @@ impl AuditRetentionManager {
         // Use a simple but effective hash: CRC32 of (previous_hash + content)
         // For production, consider using SHA-256 via ring or another crate
         let mut hasher_input = Vec::new();
-        hasher_input.write_all(previous_hash.as_bytes()).unwrap();
-        hasher_input.write_all(content.as_bytes()).unwrap();
+        // Vec::write_all never fails (only returns Err on IOError)
+        let _ = hasher_input.write_all(previous_hash.as_bytes());
+        let _ = hasher_input.write_all(content.as_bytes());
 
         // Use two rounds of CRC32 for better collision resistance
         let hash1 = crc32fast::hash(&hasher_input);

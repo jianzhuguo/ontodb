@@ -300,7 +300,8 @@ impl TurtleParser {
                         }
                         let raw_value = &obj[1..end_quote];
                         let value = unescape_turtle_string(raw_value);
-                        let rest = obj[end_quote+1..].trim();
+                        // Safe: end_quote found by loop searching for closing quote
+                        let rest = if end_quote + 1 < obj.len() { &obj[end_quote+1..] } else { "" }.trim();
                         let (language, datatype) = if rest.starts_with('@') {
                             (Some(rest[1..].to_string()), None)
                         } else if rest.starts_with("^^") {
@@ -344,6 +345,7 @@ impl TurtleParser {
     fn expand_prefixed_name(&self, name: &str) -> String {
         if let Some(colon_pos) = name.find(':') {
             let prefix = &name[..colon_pos];
+            // Safe: colon_pos found by find(':'), so colon_pos + 1 <= name.len()
             let local = &name[colon_pos + 1..];
             if let Some(iri) = self.prefixes.get(prefix) {
                 return format!("{}{}", iri, local);
@@ -364,10 +366,13 @@ impl TurtleParser {
     /// Extracts the local name from an IRI.
     fn extract_local_name(iri: &str) -> String {
         if let Some(pos) = iri.rfind('#') {
+            // Safe: pos found by rfind('#'), so pos + 1 <= iri.len()
             iri[pos + 1..].to_string()
         } else if let Some(pos) = iri.rfind('/') {
+            // Safe: pos found by rfind('/'), so pos + 1 <= iri.len()
             iri[pos + 1..].to_string()
         } else if let Some(pos) = iri.rfind(':') {
+            // Safe: pos found by rfind(':'), so pos + 1 <= iri.len()
             iri[pos + 1..].to_string()
         } else {
             iri.to_string()

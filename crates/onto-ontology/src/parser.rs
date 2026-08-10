@@ -43,7 +43,8 @@ impl OntologyParser {
             ));
         }
 
-        let body = rest[paren_pos + 1..].trim();
+        // Safe: paren_pos found by find('('), so paren_pos + 1 <= rest.len()
+        let body = if paren_pos + 1 < rest.len() { &rest[paren_pos + 1..] } else { "" }.trim();
         let body = body
             .strip_suffix(';')
             .unwrap_or(body)
@@ -114,7 +115,8 @@ impl OntologyParser {
         let upper_rest = rest.to_uppercase();
         if let Some(sub_pos) = upper_rest.find("SUBCLASS OF") {
             let class_name = rest[..sub_pos].trim();
-            let parent = rest[sub_pos + 11..].trim();
+            // Safe: sub_pos found by find(), "SUBCLASS OF" is 11 chars
+            let parent = if sub_pos + 11 < rest.len() { &rest[sub_pos + 11..] } else { "" }.trim();
 
             if class_name.is_empty() {
                 return Err(CoreError::InvalidArgument(
@@ -159,8 +161,9 @@ impl OntologyParser {
         }
 
         let prop_name = rest[..domain_pos].trim();
-        let domain = rest[domain_pos + 6..range_pos].trim();
-        let after_range = rest[range_pos + 5..].trim();
+        let domain = if domain_pos + 6 < rest.len() { &rest[domain_pos + 6..range_pos] } else { "" }.trim();
+        // Safe: range_pos found by find(), "RANGE" is 5 chars
+        let after_range = if range_pos + 5 < rest.len() { &rest[range_pos + 5..] } else { "" }.trim();
 
         if prop_name.is_empty() {
             return Err(CoreError::InvalidArgument(

@@ -445,6 +445,7 @@ impl EncryptionManager {
         if padded.is_empty() {
             anyhow::bail!("Decrypted data is empty");
         }
+        // Safe: checked padded.is_empty() above
         let padding_len = *padded.last().unwrap() as usize;
         if padding_len == 0 || padding_len > 16 || padding_len > padded.len() {
             anyhow::bail!("Invalid PKCS7 padding");

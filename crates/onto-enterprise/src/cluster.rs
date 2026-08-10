@@ -225,10 +225,12 @@ impl ClusterManager {
         *gen += 1;
 
         // Record event
-        self.events.write().push(ClusterEvent::NodeJoined {
-            node_id: id,
-            address: nodes.get(&id).unwrap().address.clone(),
-        });
+        if let Some(node) = nodes.get(&id) {
+            self.events.write().push(ClusterEvent::NodeJoined {
+                node_id: id,
+                address: node.address.clone(),
+            });
+        }
 
         tracing::info!("Node {} joined cluster", id);
         Ok(())
