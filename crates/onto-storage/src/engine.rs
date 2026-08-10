@@ -110,6 +110,9 @@ pub struct LsmEngine {
 
     /// Handle to the background compaction worker thread for graceful shutdown.
     worker_handle: Mutex<Option<JoinHandle<()>>>,
+
+    /// Group commit coordinator for batching WAL syncs.
+    group_commit: Arc<crate::lsm::group_commit::GroupCommitCoordinator>,
 }
 
 /// Temporary helper for loading WAL + SSTables before spawning the compaction worker.
@@ -260,6 +263,7 @@ impl LsmEngine {
             compaction_notif_receiver: Mutex::new(compaction_notif_receiver),
             compaction_pending: AtomicBool::new(false),
             worker_handle: Mutex::new(Some(_worker_handle)),
+            group_commit: Arc::new(crate::lsm::group_commit::GroupCommitCoordinator::new()),
         };
 
         // Rebuild secondary indexes from persisted index entries
@@ -1060,13 +1064,26 @@ impl LsmEngine {
 
             ws.wal.flush_buf()?;
 
-            // Use sync_if_dirty to avoid redundant fsync when no new data
-            if self.options.sync_wal_on_commit {
-                ws.wal.sync_if_dirty()?;
-            }
-
             ws.memtable.size() >= self.options.memtable_size_limit
         };
+        // write_state lock released here
+
+        // Group commit: batch sync across concurrent transactions
+        if self.options.sync_wal_on_commit {
+            let current_seq = self.seq_counter.load(Ordering::Relaxed);
+            let is_leader = self.group_commit.register_and_maybe_leader(current_seq);
+            if is_leader {
+                // Leader performs the sync for all waiting transactions
+                {
+                    let mut ws = self.write_state.write();
+                    ws.wal.sync()?;
+                }
+                self.group_commit.complete_sync(current_seq);
+            } else {
+                // Follower waits for the leader to complete sync
+                self.group_commit.wait_for_sync(current_seq);
+            }
+        }
 
         if needs_flush {
             self.flush_memtable()?;
