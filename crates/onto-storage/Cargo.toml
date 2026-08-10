@@ -35,3 +35,7 @@ harness = false
 [[bench]]
 name = "batch_import"
 harness = false
+
+[[bench]]
+name = "group_commit_bench"
+harness = false
