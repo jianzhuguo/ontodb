@@ -1,241 +1,27 @@
-# OntoDB Production Deployment
-#
-# Usage:
-#   1. Copy and edit the environment file:
-#      cp .env.example .env
-#   2. Generate API keys:
-#      cp config/api_keys.example.json config/api_keys.json
-#      # Edit config/api_keys.json with real keys
-#   3. Start all services:
-#      docker compose up -d
-#   4. Verify:
-#      curl http://localhost:7912/api/health
-#
-# Services included:
-#   - ontodb:      Database server
-#   - nginx:       TLS reverse proxy
-#   - prometheus:  Metrics collection
-#   - grafana:     Monitoring dashboards
-#   - backup:      Scheduled backup (daily)
+version: '3.8'
 
 services:
-  # ── OntoDB Server ──────────────────────────────────────────
   ontodb:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        RUN_TESTS: "false"
+    build: .
+    image: ontodb/ontodb:latest
     container_name: ontodb
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${ONTODB_HTTP_PORT:-7912}:7912"   # HTTP API
-      - "127.0.0.1:${ONTODB_TCP_PORT:-7913}:7913"    # TCP CLI
-      - "127.0.0.1:${ONTODB_PG_PORT:-5432}:5432"     # PG wire protocol
+      - "7912:7912"   # HTTP API
+      - "7913:7913"   # PostgreSQL Wire Protocol
+      - "7914:7914"   # MySQL Wire Protocol
     volumes:
-      - ontodb-data:/data/ontodb
-      - ontodb-backup:/data/backup
-      - ./config/api_keys.json:/etc/ontodb/api_keys.json:ro
-    command:
-      - "--data-dir=/data/ontodb"
-      - "--http=0.0.0.0:7912"
-      - "--listen=0.0.0.0:7913"
-      - "--auth"
-      - "--api-keys-file=/etc/ontodb/api_keys.json"
-      - "--rate-limit=${ONTODB_RATE_LIMIT:-300}"
-      - "--burst-size=${ONTODB_BURST_SIZE:-50}"
-      - "--pgwire=0.0.0.0:5432"
-      - "--cors-origins=${CORS_ORIGINS:-}"
-    deploy:
-      resources:
-        limits:
-          memory: ${ONTODB_MEMORY_LIMIT:-2g}
-          cpus: "${ONTODB_CPU_LIMIT:-2.0}"
-        reservations:
-          memory: 256m
-          cpus: "0.25"
+      - ontodb-data:/data
+    environment:
+      - ONTODB_HTTP=0.0.0.0:7912
+      - ONTODB_DATA_DIR=/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7912/api/health/live"]
+      test: ["CMD", "curl", "-f", "http://localhost:7912/api/health"]
       interval: 30s
-      timeout: 5s
-      start_period: 10s
+      timeout: 3s
       retries: 3
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "5"
-    networks:
-      - ontodb-net
-
-  # ── Nginx TLS Reverse Proxy ────────────────────────────────
-  nginx:
-    image: nginx:1.27-alpine
-    container_name: ontodb-nginx
-    restart: unless-stopped
-    ports:
-      - "${HTTPS_PORT:-443}:443"
-      - "${HTTP_PORT:-80}:80"
-    volumes:
-      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./deploy/nginx/certs:/etc/nginx/certs:ro
-    depends_on:
-      ontodb:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "20m"
-        max-file: "3"
-    networks:
-      - ontodb-net
-
-  # ── Prometheus Metrics ─────────────────────────────────────
-  prometheus:
-    image: prom/prometheus:v2.53.0
-    container_name: ontodb-prometheus
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
-    volumes:
-      - ./deploy/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./deploy/monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
-      - prometheus-data:/prometheus
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.retention.time=30d"
-      - "--storage.tsdb.retention.size=5GB"
-    networks:
-      - ontodb-net
-
-  # ── Alertmanager ────────────────────────────────────────────
-  alertmanager:
-    image: prom/alertmanager:v0.27.0
-    container_name: ontodb-alertmanager
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:9093:9093"
-    volumes:
-      - ./deploy/monitoring/alertmanager.yml.template:/etc/alertmanager/alertmanager.yml.template:ro
-    environment:
-      - ALERT_EMAIL=${ALERT_EMAIL:?Set ALERT_EMAIL in .env}
-      - SMTP_AUTH_PASSWORD=${SMTP_AUTH_PASSWORD:?Set SMTP_AUTH_PASSWORD in .env}
-    entrypoint: ["/bin/sh", "-c", "envsubst < /etc/alertmanager/alertmanager.yml.template > /tmp/alertmanager.yml && exec /bin/alertmanager --config.file=/tmp/alertmanager.yml"]
-    networks:
-      - ontodb-net
-
-  # ── Node Exporter (OS metrics: CPU, disk, network) ─────────
-  node-exporter:
-    image: prom/node-exporter:v1.8.1
-    container_name: ontodb-node-exporter
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:9100:9100"
-    volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /:/rootfs:ro
-    command:
-      - "--path.procfs=/host/proc"
-      - "--path.sysfs=/host/sys"
-      - "--path.rootfs=/rootfs"
-    networks:
-      - ontodb-net
-
-  # ── 钉钉告警适配器 ────────────────────────────────────────
-  dingtalk:
-    image: timonwong/prometheus-webhook-dingtalk:v2.1.0
-    container_name: ontodb-dingtalk
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8060:8060"
-    environment:
-      - GIN_MODE=release
-    volumes:
-      - ./deploy/monitoring/dingtalk-config.yml:/etc/prometheus-webhook-dingtalk/config.yml:ro
-    command:
-      - "--config.file=/etc/prometheus-webhook-dingtalk/config.yml"
-    depends_on:
-      - alertmanager
-    networks:
-      - ontodb-net
-
-  # ── 企业微信告警适配器 ────────────────────────────────────
-  wechat-webhook:
-    image: k8simage/wechat-webhook:v1.0
-    container_name: ontodb-wechat
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8061:80"
-    environment:
-      - CORP_ID=${WECHAT_CORP_ID:-}
-      - CORP_SECRET=${WECHAT_CORP_SECRET:-}
-      - AGENT_ID=${WECHAT_AGENT_ID:-}
-      - TO_USER=${WECHAT_TO_USER:-@all}
-    depends_on:
-      - alertmanager
-    networks:
-      - ontodb-net
-
-  # ── Grafana Dashboards ─────────────────────────────────────
-  grafana:
-    image: grafana/grafana:11.1.0
-    container_name: ontodb-grafana
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ./deploy/monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/ontodb.json:ro
-      - ./deploy/monitoring/grafana-sql-dashboard.json:/var/lib/grafana/dashboards/ontodb-sql.json:ro
-      - ./deploy/monitoring/grafana-node-dashboard.json:/var/lib/grafana/dashboards/ontodb-node.json:ro
-      - ./deploy/monitoring/grafana-datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:ro
-      - ./deploy/monitoring/grafana-dashboard-provider.yml:/etc/grafana/provisioning/dashboards/provider.yml:ro
-    environment:
-      # SECURITY: Change this password in .env before deploying!
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
-      GF_USERS_ALLOW_SIGN_UP: "false"
-    depends_on:
-      - prometheus
-    networks:
-      - ontodb-net
-
-  # ── Scheduled Backup ───────────────────────────────────────
-  # Runs backup daily at 03:00, keeps last 7 days
-  backup:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: ontodb-backup
-    restart: "no"
-    volumes:
-      - ontodb-data:/data/ontodb:ro
-      - ontodb-backup:/data/backup
-      - ./deploy/backup/backup.sh:/usr/local/bin/backup.sh:ro
-    entrypoint: ["/bin/sh", "/usr/local/bin/backup.sh"]
-    environment:
-      BACKUP_RETENTION_DAYS: "${BACKUP_RETENTION_DAYS:-7}"
-    depends_on:
-      ontodb:
-        condition: service_healthy
-    networks:
-      - ontodb-net
+      start_period: 5s
 
 volumes:
   ontodb-data:
     driver: local
-  ontodb-backup:
-    driver: local
-  prometheus-data:
-    driver: local
-  grafana-data:
-    driver: local
-
-networks:
-  ontodb-net:
-    driver: bridge

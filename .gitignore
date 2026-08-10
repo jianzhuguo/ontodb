@@ -1,36 +1,34 @@
-/target
-ontodb_data/
-*.swp
-*.swo
-*~
-.DS_Store
+# Rust build artifacts
+/target/
+**/*.rs.bk
 
 # IDE
 .idea/
 .vscode/
-*.code-workspace
+*.swp
+*.swo
 
 # OS
+.DS_Store
 Thumbs.db
-desktop.ini
 
-# Build artifacts
-*.dll
-*.exe
-*.pdb
+# Data directory
+/data/
+/test_data/*.log
+/test_data/*.dat
+/test_data/wal.log
 
-# Test data
-*.sst
-*.wal
+# Python
+__pycache__/
+*.pyc
+.venv/
 
-# Secrets — NEVER commit these
-.env
-config/api_keys.json
+# Node.js (frontend)
+node_modules/
+dist/
+
+# Secrets
 *.pem
 *.key
-*.crt
-
-# Alertmanager config (contains SMTP credentials)
-deploy/monitoring/alertmanager.yml
-deploy/monitoring/.env.alerting
-deploy/monitoring/alertmanager.yml.template
+*.env
+.env.local

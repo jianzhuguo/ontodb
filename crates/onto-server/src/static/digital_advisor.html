@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>数字军师 — 企业决策智能系统</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0f172a;--surface:#1e293b;--card:#1e293b;--border:#334155;--accent:#3b82f6;--accent2:#8b5cf6;--green:#22c55e;--yellow:#eab308;--red:#ef4444;--cyan:#06b6d4;--text:#f1f5f9;--dim:#94a3b8;--dim2:#64748b}
+body{font-family:'PingFang SC','Microsoft YaHei','Inter',sans-serif;background:var(--bg);color:var(--text);height:100vh;overflow:hidden}
+.header{height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 24px;background:linear-gradient(135deg,#1e293b 0%,#0f172a 100%);border-bottom:1px solid var(--border)}
+.header h1{font-size:18px;font-weight:700;letter-spacing:1px}
+.header h1 .icon{font-size:20px;margin-right:8px}
+.header h1 span{background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.header .stats{display:flex;gap:20px;font-size:12px;color:var(--dim)}
+.header .stats .num{font-size:20px;font-weight:700;color:var(--accent)}
+.main{display:flex;height:calc(100vh - 52px)}
+.left{flex:1;overflow-y:auto;padding:20px}
+.right{width:400px;background:var(--surface);border-left:1px solid var(--border);overflow-y:auto;flex-shrink:0}
+/* Hero insight */
+.hero{background:linear-gradient(135deg,rgba(59,130,246,.12) 0%,rgba(139,92,246,.08) 100%);border:1px solid rgba(59,130,246,.2);border-radius:12px;padding:20px;margin-bottom:16px}
+.hero .label{font-size:11px;color:var(--accent);text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px}
+.hero .insight{font-size:16px;font-weight:600;line-height:1.6}
+.hero .sub{font-size:12px;color:var(--dim);margin-top:8px}
+/* Decision cards */
+.dcard{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:10px;cursor:pointer;transition:all .2s;position:relative;overflow:hidden}
+.dcard:hover{border-color:var(--accent);transform:translateY(-1px);box-shadow:0 4px 20px rgba(59,130,246,.1)}
+.dcard.active{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.dcard .top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px}
+.dcard .title{font-size:15px;font-weight:600}
+.dcard .desc{font-size:12px;color:var(--dim);line-height:1.5;margin-bottom:8px}
+.dcard .meta{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.dcard .emotion-badge{position:absolute;top:12px;right:12px;font-size:20px}
+.tag{font-size:10px;padding:3px 8px;border-radius:4px;font-weight:600}
+.tag-p0{background:rgba(239,68,68,.15);color:#ef4444;border:1px solid rgba(239,68,68,.2)}
+.tag-p1{background:rgba(234,179,8,.15);color:#eab308;border:1px solid rgba(234,179,8,.2)}
+.tag-p2{background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.2)}
+.tag-cat{background:rgba(59,130,246,.12);color:#60a5fa;border:1px solid rgba(59,130,246,.2)}
+.tag-st{background:rgba(34,197,94,.12);color:#4ade80;border:1px solid rgba(34,197,94,.2)}
+.tag-st2{background:rgba(234,179,8,.12);color:#facc15;border:1px solid rgba(234,179,8,.2)}
+/* Detail panel */
+.detail-header{padding:20px;border-bottom:1px solid var(--border);background:linear-gradient(180deg,rgba(59,130,246,.06) 0%,transparent 100%)}
+.detail-header .dtitle{font-size:20px;font-weight:700;margin-bottom:6px}
+.detail-header .ddesc{font-size:12px;color:var(--dim);line-height:1.5}
+.sec{padding:16px 20px;border-bottom:1px solid var(--border)}
+.st{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--dim2);margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.st .icon{font-size:14px}
+.val{font-size:13px;line-height:1.7}
+.val.highlight{color:var(--accent);font-weight:500}
+/* Stats row */
+.stats-row{display:flex;gap:0;margin-bottom:0;border-radius:8px;overflow:hidden;border:1px solid var(--border)}
+.stat-item{flex:1;padding:12px;text-align:center;background:var(--card);border-right:1px solid var(--border)}
+.stat-item:last-child{border-right:none}
+.stat-item .num{font-size:20px;font-weight:700;margin-bottom:2px}
+.stat-item .lb{font-size:10px;color:var(--dim)}
+/* Chain */
+.chain{margin-top:4px}
+.cstep{display:flex;gap:10px;margin-bottom:8px;position:relative;padding-left:24px}
+.cstep::before{content:'';position:absolute;left:8px;top:0;bottom:0;width:2px;background:linear-gradient(180deg,var(--accent),var(--border))}
+.cstep:last-child::before{display:none}
+.cdot{position:absolute;left:3px;top:5px;width:12px;height:12px;border-radius:50%;background:var(--accent);border:2px solid var(--surface)}
+.cstep .th{font-size:12px;line-height:1.5;font-weight:500}
+.cstep .rs{font-size:11px;color:var(--dim);margin-top:2px}
+.cstep .em{font-size:10px;color:var(--yellow);margin-top:2px}
+/* Outcome */
+.outcome{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px}
+.outcome .res{font-size:14px;font-weight:600;margin-bottom:6px}
+.outcome .det{font-size:12px;color:var(--dim);line-height:1.6}
+.outcome .metric{display:inline-flex;align-items:center;gap:4px;margin-top:6px;padding:4px 10px;background:rgba(34,197,94,.1);border-radius:4px;font-size:12px;color:var(--green);font-weight:600}
+/* Trait bars */
+.tbar{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.tbar .nm{min-width:80px;font-size:11px;color:var(--dim)}
+.tbar .bg{flex:1;height:8px;background:var(--border);border-radius:4px;overflow:hidden}
+.tbar .fl{height:100%;border-radius:4px;transition:width .5s}
+.tbar .vl{min-width:36px;font-size:11px;text-align:right;font-weight:600}
+/* Sandbox */
+.sandbox{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px}
+.sandbox textarea{width:100%;height:70px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;padding:10px;resize:none;outline:none;font-family:inherit}
+.sandbox textarea:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(59,130,246,.15)}
+.sandbox .btn{margin-top:8px;padding:8px 20px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;transition:opacity .15s}
+.sandbox .btn:hover{opacity:.9}
+.simres{margin-top:10px;font-size:12px;line-height:1.7}
+/* Tabs */
+.tabs{display:flex;gap:0;margin-bottom:16px;background:var(--card);border-radius:8px;overflow:hidden;border:1px solid var(--border)}
+.tabs .tab{flex:1;padding:10px;font-size:12px;text-align:center;cursor:pointer;color:var(--dim);transition:all .15s;font-weight:500}
+.tabs .tab.active{background:var(--accent);color:#fff}
+.tabs .tab:hover:not(.active){background:rgba(59,130,246,.08)}
+/* Search */
+.search-box{margin-bottom:12px}
+.search-box input{width:100%;padding:10px 14px;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:12px;outline:none;transition:border-color .15s}
+.search-box input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(59,130,246,.1)}
+.search-box input::placeholder{color:var(--dim2)}
+/* Buttons */
+.btn-row{display:flex;gap:8px;margin-bottom:12px}
+.btn-primary{padding:8px 16px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer}
+.btn-secondary{padding:8px 16px;background:var(--card);color:var(--dim);border:1px solid var(--border);border-radius:6px;font-size:12px;cursor:pointer}
+.btn-export{padding:8px 16px;background:rgba(139,92,246,.15);color:var(--accent2);border:1px solid rgba(139,92,246,.2);border-radius:6px;font-size:12px;cursor:pointer;font-weight:600}
+/* Graph */
+#graphCanvas{width:100%;height:280px;background:var(--card);border:1px solid var(--border);border-radius:10px;cursor:pointer}
+/* Similar cards */
+.sim-card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:8px;cursor:pointer;transition:all .15s}
+.sim-card:hover{border-color:var(--accent);transform:translateY(-1px)}
+.sim-card .sim-title{font-size:13px;font-weight:600;margin-bottom:3px}
+.sim-card .sim-meta{font-size:11px;color:var(--dim)}
+.sim-score{display:inline-block;padding:2px 6px;background:rgba(59,130,246,.12);color:var(--accent);border-radius:3px;font-size:10px;font-weight:600;margin-left:6px}
+/* Form */
+.form-row{margin-bottom:10px}
+.form-row label{display:block;font-size:11px;color:var(--dim);margin-bottom:4px;font-weight:500}
+.form-row input,.form-row select,.form-row textarea{width:100%;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;outline:none;font-family:inherit}
+.form-row input:focus,.form-row select:focus,.form-row textarea:focus{border-color:var(--accent)}
+.form-row textarea{height:70px;resize:vertical}
+.form-btns{display:flex;gap:8px;margin-top:12px}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1><span class="icon">🧠</span><span>数字军师</span> — 企业决策智能系统</h1>
+  <div class="stats">
+    <div>决策记录 <span class="num" id="totalCount">0</span></div>
+    <div>成功率 <span class="num" id="successRate">-</span></div>
+    <div>决策者 <span class="num" id="makerCount">0</span></div>
+  </div>
+</div>
+<div class="main">
+  <div class="left">
+    <div class="hero" id="heroInsight">
+      <div class="label">决策洞察</div>
+      <div class="insight">正在分析决策模式...</div>
+      <div class="sub">基于您的历史决策数据生成</div>
+    </div>
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('list')">决策列表</div>
+      <div class="tab" onclick="switchTab('search')">相似度搜索</div>
+      <div class="tab" onclick="switchTab('graph')">影响链图谱</div>
+    </div>
+    <div id="tabList">
+      <div class="search-box"><input id="searchInput" placeholder="搜索决策标题、描述、类别..." oninput="filterDecisions()"></div>
+      <div class="btn-row">
+        <button class="btn-primary" onclick="showNewForm()">+ 新建决策</button>
+        <button class="btn-secondary" onclick="loadAll()">刷新</button>
+        <button class="btn-export" onclick="exportReport()">导出审计报告</button>
+      </div>
+      <div id="newForm" style="display:none"></div>
+      <div id="decisionList"></div>
+    </div>
+    <div id="tabSearch" style="display:none">
+      <div class="sandbox">
+        <div class="st"><span class="icon">🔍</span>场景相似度搜索</div>
+        <textarea id="simSearchInput" placeholder="描述一个新场景，系统会自动匹配历史上最相似的决策...&#10;&#10;例如：竞对突然降价50%，市场部建议跟进，我该怎么办？"></textarea>
+        <button class="btn" onclick="searchSimilar()">搜索相似决策</button>
+        <div class="simres" id="simSearchResult"></div>
+      </div>
+    </div>
+    <div id="tabGraph" style="display:none">
+      <div class="st"><span class="icon">🕸️</span>决策影响关系图谱</div>
+      <canvas id="graphCanvas"></canvas>
+      <div style="font-size:11px;color:var(--dim);margin-top:8px">节点=决策，连线=语义相似度。颜色: <span style="color:#3b82f6">战略</span> <span style="color:#22c55e">产品</span> <span style="color:#eab308">人事</span></div>
+    </div>
+  </div>
+  <div class="right">
+    <div id="detailPanel">
+      <div class="sec" style="text-align:center;padding:40px">
+        <div style="font-size:40px;margin-bottom:12px">🧠</div>
+        <div style="font-size:14px;font-weight:600;margin-bottom:6px">选择一条决策查看详情</div>
+        <div style="font-size:12px;color:var(--dim)">点击左侧决策卡片，查看决策过程、思维路径和结果</div>
+      </div>
+    </div>
+    <div class="sec">
+      <div class="st"><span class="icon">👤</span>决策者画像</div>
+      <div id="traitsPanel"></div>
+    </div>
+    <div class="sec">
+      <div class="st"><span class="icon">🧪</span>人格沙盒 — 模拟决策</div>
+      <div class="sandbox">
+        <textarea id="simInput" placeholder="输入一个新场景，模拟CEO的决策反应...&#10;例如：竞对降价30%，我们是否跟进？"></textarea>
+        <button class="btn" onclick="runSimulation()">模拟决策</button>
+        <div class="simres" id="simResult"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+var decisions=[],contexts={},outcomes={},steps={},traits=[];
+var selectedIdx=-1;
+
+async function q(sql){
+  var r=await fetch('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:sql})});
+  var j=await r.json();return j.data||[];
+}
+
+async function loadAll(){
+  try{
+    var[d,ctx,out,stp,trt]=await Promise.all([
+      q("SELECT * FROM Decision"),q("SELECT * FROM DecisionContext"),
+      q("SELECT * FROM DecisionOutcome"),q("SELECT * FROM DecisionStep"),
+      q("SELECT * FROM PersonalityTrait")
+    ]);
+    decisions=d;contexts={};outcomes={};steps={};traits=trt;
+    ctx.forEach(function(c){contexts[c.decision_id]=c;});
+    out.forEach(function(o){outcomes[o.decision_id]=o;});
+    stp.forEach(function(s){if(!steps[s.decision_id])steps[s.decision_id]=[];steps[s.decision_id].push(s);});
+    for(var k in steps)steps[k].sort(function(a,b){return a.step_order-b.step_order;});
+    renderList();renderTraits();renderHero();renderGraph();updateStats();
+  }catch(e){console.error('loadAll:',e);}
+}
+
+function updateStats(){
+  document.getElementById('totalCount').textContent=decisions.length;
+  document.getElementById('makerCount').textContent=[...new Set(traits.map(function(t){return t.maker_id;}))].length;
+  var successCount=decisions.filter(function(d){var o=outcomes[d.decision_id];return o&&o.result_type==='成功';}).length;
+  var total=decisions.filter(function(d){return outcomes[d.decision_id];}).length;
+  document.getElementById('successRate').textContent=total?Math.round(successCount/total*100)+'%':'-';
+}
+
+function renderHero(){
+  var total=decisions.length;
+  var p0=decisions.filter(function(d){return d.priority==='P0';}).length;
+  var highPressure=decisions.filter(function(d){return d.pressure_level>=7;}).length;
+  var successRate=0;
+  var outcomesArr=Object.values(outcomes);
+  if(outcomesArr.length){
+    var ok=outcomesArr.filter(function(o){return o.result_type==='成功';}).length;
+    successRate=Math.round(ok/outcomesArr.length*100);
+  }
+  var riskTrait=traits.find(function(t){return t.trait_name==='风险偏好';});
+  var riskPct=riskTrait?Math.round(riskTrait.trait_value*100):50;
+  var html='<div class="label">决策洞察</div>';
+  html+='<div class="insight">您共做出 '+total+' 个重大决策，其中 '+p0+' 个为P0级。';
+  html+='在 '+highPressure+' 次高压决策中，成功率 '+successRate+'%。</div>';
+  html+='<div class="sub">风险偏好 '+riskPct+'% · 决策风格：' + (riskPct>65?'积极进取型':'稳健保守型') + ' · 建议：高压决策前增加冷静期</div>';
+  document.getElementById('heroInsight').innerHTML=html;
+}
+
+function switchTab(t){
+  document.querySelectorAll('.tabs .tab').forEach(function(el,i){
+    el.classList.toggle('active',['list','search','graph'][i]===t);
+  });
+  document.getElementById('tabList').style.display=t==='list'?'':'none';
+  document.getElementById('tabSearch').style.display=t==='search'?'':'none';
+  document.getElementById('tabGraph').style.display=t==='graph'?'':'none';
+  if(t==='graph')setTimeout(renderGraph,50);
+}
+
+function filterDecisions(){
+  var q=document.getElementById('searchInput').value.toLowerCase();
+  document.querySelectorAll('.dcard').forEach(function(c){
+    var t=c.getAttribute('data-search')||'';
+    c.style.display=t.toLowerCase().indexOf(q)!==-1?'':'none';
+  });
+}
+
+var emotionEmoji={冷静:'🧊',焦虑:'😰',兴奋:'🔥',犹豫:'🤔',坚定:'💪'};
+
+function renderList(){
+  var html='';
+  decisions.forEach(function(d,i){
+    var tag=d.priority==='P0'?'tag-p0':d.priority==='P1'?'tag-p1':'tag-p2';
+    var stag=d.status==='已执行'?'tag-st':d.status==='已决策'?'tag-st2':'tag-p1';
+    var search=d.title+' '+d.description+' '+d.category+' '+d.status;
+    var emoji=emotionEmoji[d.emotion_state]||'📋';
+    html+='<div class="dcard'+(selectedIdx===i?' active':'')+'" data-search="'+search+'" onclick="selectDecision('+i+')">';
+    html+='<div class="emotion-badge">'+emoji+'</div>';
+    html+='<div class="top"><div class="title">'+d.title+'</div></div>';
+    html+='<div class="desc">'+d.description+'</div>';
+    html+='<div class="meta"><span class="tag '+tag+'">'+d.priority+'</span><span class="tag '+stag+'">'+d.status+'</span>';
+    html+='<span class="tag tag-cat">'+d.category+'</span>';
+    html+='<span style="font-size:11px;color:var(--dim)">'+d.decision_date+'</span></div></div>';
+  });
+  document.getElementById('decisionList').innerHTML=html||'<div style="color:var(--dim);font-size:13px;padding:30px;text-align:center">暂无决策记录，点击"+ 新建决策"开始</div>';
+}
+
+function selectDecision(i){
+  selectedIdx=i;renderList();
+  var d=decisions[i],c=contexts[d.decision_id]||{},o=outcomes[d.decision_id]||{};
+  var s=steps[d.decision_id]||[];
+  var emoji=emotionEmoji[d.emotion_state]||'📋';
+  var html='<div class="detail-header"><div class="dtitle">'+emoji+' '+d.title+'</div>';
+  html+='<div class="ddesc">'+d.description+'</div></div>';
+  // Stats
+  html+='<div class="sec"><div class="stats-row">';
+  html+='<div class="stat-item"><div class="num" style="color:var(--yellow)">'+d.emotion_state+'</div><div class="lb">情绪状态</div></div>';
+  html+='<div class="stat-item"><div class="num" style="color:var(--accent)">'+Math.round(d.confidence_score*100)+'%</div><div class="lb">信心指数</div></div>';
+  html+='<div class="stat-item"><div class="num" style="color:'+(d.pressure_level>7?'var(--red)':d.pressure_level>4?'var(--yellow)':'var(--green)')+'">'+d.pressure_level+'/10</div><div class="lb">压力等级</div></div>';
+  html+='<div class="stat-item"><div class="num" style="font-size:14px">'+d.category+'</div><div class="lb">决策类别</div></div>';
+  html+='</div></div>';
+  // Decision text
+  html+='<div class="sec"><div class="st"><span class="icon">📌</span>决策结论</div><div class="val highlight">'+d.decision_text+'</div></div>';
+  // Context
+  html+='<div class="sec"><div class="st"><span class="icon">🌐</span>背景</div><div class="val">'+d.context_summary+'</div></div>';
+  if(c.event_type){
+    html+='<div class="sec"><div class="st"><span class="icon">📊</span>决策环境</div><div class="val">';
+    html+='事件: '+c.event_type+' — '+c.event_detail+'<br>';
+    html+='市场: '+c.market_condition+' | 竞对: '+c.competition+'<br>';
+    html+='团队士气: '+c.team_morale+'/10 | 财务压力: '+c.financial_pressure+'/10 | 时间压力: '+c.time_pressure+'/10';
+    html+='</div></div>';
+  }
+  // Steps
+  if(s.length){
+    html+='<div class="sec"><div class="st"><span class="icon">🧠</span>思维路径</div><div class="chain">';
+    s.forEach(function(st){
+      var emo=emotionEmoji[st.emotion]||'💭';
+      html+='<div class="cstep"><div class="cdot"></div><div>';
+      html+='<div class="th">'+st.thought+'</div>';
+      html+='<div class="rs">选项: '+st.option+' → '+st.reason+'</div>';
+      html+='<div class="em">'+emo+' '+st.emotion+' · '+st.timestamp+'</div>';
+      html+='</div></div>';
+    });
+    html+='</div></div>';
+  }
+  // Outcome
+  if(o.result_type){
+    html+='<div class="sec"><div class="st"><span class="icon">📈</span>决策结果</div><div class="outcome">';
+    html+='<div class="res" style="color:'+(o.result_type==='成功'?'var(--green)':o.result_type==='失败'?'var(--red)':'var(--yellow)')+'">'+(o.result_type==='成功'?'✅':'❌')+' '+o.result_type+'</div>';
+    html+='<div class="det">'+o.result_detail+'</div>';
+    if(o.revenue_impact) html+='<div class="metric">💰 收入影响: '+o.revenue_impact+'万</div>';
+    if(o.lesson_learned) html+='<div style="margin-top:6px;font-size:11px;color:var(--yellow)">💡 '+o.lesson_learned+'</div>';
+    html+='</div></div>';
+  }
+  // Similar
+  html+='<div class="sec"><div class="st"><span class="icon">🔗</span>相似决策</div>';
+  var sims=findSimilar(d,3);
+  if(sims.length){
+    sims.forEach(function(s){
+      html+='<div class="sim-card" onclick="selectDecision('+s.idx+')">';
+      html+='<div class="sim-title">'+s.title+'<span class="sim-score">'+s.score+'%相似</span></div>';
+      html+='<div class="sim-meta">'+s.category+' · '+s.date+'</div></div>';
+    });
+  } else {
+    html+='<div style="font-size:11px;color:var(--dim)">暂无相似决策</div>';
+  }
+  html+='</div>';
+  document.getElementById('detailPanel').innerHTML=html;
+}
+
+function findSimilar(d,topN){
+  var emb=(d.embedding||'').split(',').map(Number);
+  var scores=[];
+  decisions.forEach(function(other,i){
+    if(other.decision_id===d.decision_id)return;
+    var oemb=(other.embedding||'').split(',').map(Number);
+    if(emb.length!==oemb.length)return;
+    var dot=0,na=0,nb=0;
+    for(var j=0;j<emb.length;j++){dot+=emb[j]*oemb[j];na+=emb[j]*emb[j];nb+=oemb[j]*oemb[j];}
+    var sim=na&&nb?dot/(Math.sqrt(na)*Math.sqrt(nb)):0;
+    scores.push({idx:i,title:other.title,category:other.category,date:other.decision_date,score:Math.round((sim+1)*50)});
+  });
+  scores.sort(function(a,b){return b.score-a.score;});
+  return scores.slice(0,topN);
+}
+
+function searchSimilar(){
+  var input=document.getElementById('simSearchInput').value.trim();
+  if(!input)return;
+  var hash=0;
+  for(var i=0;i<input.length;i++){hash=((hash<<5)-hash)+input.charCodeAt(i);hash|=0;}
+  var emb=[];
+  for(var i=0;i<8;i++){hash=((hash*1103515245+12345)&0x7fffffff);emb.push(((hash%2000)-1000)/1000);}
+  var scores=[];
+  decisions.forEach(function(d,i){
+    var oemb=(d.embedding||'').split(',').map(Number);
+    if(emb.length!==oemb.length)return;
+    var dot=0,na=0,nb=0;
+    for(var j=0;j<emb.length;j++){dot+=emb[j]*oemb[j];na+=emb[j]*emb[j];nb+=oemb[j]*oemb[j];}
+    var sim=na&&nb?dot/(Math.sqrt(na)*Math.sqrt(nb)):0;
+    scores.push({idx:i,title:d.title,desc:d.description,category:d.category,date:d.decision_date,score:Math.round((sim+1)*50)});
+  });
+  scores.sort(function(a,b){return b.score-a.score;});
+  var html='';
+  scores.slice(0,5).forEach(function(s){
+    html+='<div class="sim-card" onclick="selectDecision('+s.idx+');switchTab(\'list\')">';
+    html+='<div class="sim-title">'+s.title+'<span class="sim-score">'+s.score+'%相似</span></div>';
+    html+='<div class="sim-meta">'+s.category+' · '+s.date+'</div>';
+    html+='<div style="font-size:11px;color:var(--dim);margin-top:4px">'+s.desc+'</div></div>';
+  });
+  document.getElementById('simSearchResult').innerHTML=html||'<div style="color:var(--dim);font-size:11px;padding:8px">未找到相似决策</div>';
+}
+
+var graphNodes=[];
+function renderGraph(){
+  var canvas=document.getElementById('graphCanvas');
+  if(!canvas||canvas.offsetParent===null)return;
+  var ctx=canvas.getContext('2d');
+  canvas.width=canvas.offsetWidth*2;canvas.height=canvas.offsetHeight*2;
+  ctx.scale(2,2);
+  var W=canvas.offsetWidth,H=canvas.offsetHeight;
+  ctx.clearRect(0,0,W,H);
+  graphNodes=[];
+  var catColors={战略:'#3b82f6',产品:'#22c55e',人事:'#eab308',财务:'#a855f7',危机:'#ef4444'};
+  decisions.forEach(function(d,i){
+    var angle=2*Math.PI*i/decisions.length-Math.PI/2;
+    var r=Math.min(W,H)*0.36;
+    graphNodes.push({x:W/2+r*Math.cos(angle),y:H/2+r*Math.sin(angle),r:20,label:d.title.slice(0,4),color:catColors[d.category]||'#64748b',idx:i});
+  });
+  var edges=[];
+  for(var i=0;i<decisions.length;i++){
+    for(var j=i+1;j<decisions.length;j++){
+      var emb1=(decisions[i].embedding||'').split(',').map(Number);
+      var emb2=(decisions[j].embedding||'').split(',').map(Number);
+      if(emb1.length!==emb2.length)continue;
+      var dot=0,na=0,nb=0;
+      for(var k=0;k<emb1.length;k++){dot+=emb1[k]*emb2[k];na+=emb1[k]*emb1[k];nb+=emb2[k]*emb2[k];}
+      var sim=na&&nb?dot/(Math.sqrt(na)*Math.sqrt(nb)):0;
+      if(sim>0.2)edges.push({from:i,to:j,weight:sim});
+    }
+  }
+  ctx.strokeStyle='#334155';ctx.lineWidth=1;
+  edges.forEach(function(e){
+    var a=graphNodes[e.from],b=graphNodes[e.to];
+    ctx.globalAlpha=0.2+e.weight*0.6;
+    ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
+  });
+  ctx.globalAlpha=1;
+  graphNodes.forEach(function(n){
+    ctx.beginPath();ctx.arc(n.x,n.y,n.r,0,2*Math.PI);
+    ctx.fillStyle=n.color+'25';ctx.fill();
+    ctx.strokeStyle=n.color;ctx.lineWidth=2;ctx.stroke();
+    ctx.fillStyle='#fff';ctx.font='bold 10px PingFang SC';ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText(n.label,n.x,n.y);
+  });
+  canvas.onclick=function(e){
+    var rect=canvas.getBoundingClientRect();
+    var mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    graphNodes.forEach(function(n){
+      if(Math.hypot(mx-n.x,my-n.y)<n.r+4){selectDecision(n.idx);switchTab('list');}
+    });
+  };
+}
+
+function renderTraits(){
+  var html='';
+  var colors={风险偏好:'var(--accent)',决策速度:'var(--green)',数据依赖:'var(--cyan)',直觉权重:'var(--yellow)'};
+  traits.forEach(function(t){
+    var col=colors[t.trait_name]||'var(--dim)';
+    html+='<div class="tbar"><span class="nm">'+t.trait_name+'</span>';
+    html+='<div class="bg"><div class="fl" style="width:'+(t.trait_value*100)+'%;background:'+col+'"></div></div>';
+    html+='<span class="vl" style="color:'+col+'">'+(t.trait_value*100).toFixed(0)+'%</span></div>';
+  });
+  document.getElementById('traitsPanel').innerHTML=html||'<div style="color:var(--dim);font-size:11px">暂无人格数据</div>';
+}
+
+function showNewForm(){
+  var f=document.getElementById('newForm');
+  if(f.style.display==='block'){f.style.display='none';return;}
+  f.style.display='block';
+  f.innerHTML='<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px">'+
+    '<div class="form-row"><label>决策标题</label><input id="nTitle" placeholder="例如：是否进入政务市场"></div>'+
+    '<div class="form-row"><label>描述</label><textarea id="nDesc" placeholder="决策背景和关键问题"></textarea></div>'+
+    '<div class="form-row"><label>类别</label><select id="nCat"><option>战略</option><option>产品</option><option>人事</option><option>财务</option><option>危机</option></select></div>'+
+    '<div class="form-row"><label>优先级</label><select id="nPri"><option>P0</option><option>P1</option><option>P2</option></select></div>'+
+    '<div class="form-row"><label>决策结论</label><textarea id="nText" placeholder="最终决策内容"></textarea></div>'+
+    '<div class="form-row"><label>情绪状态</label><select id="nEmo"><option>冷静</option><option>焦虑</option><option>兴奋</option><option>犹豫</option><option>坚定</option></select></div>'+
+    '<div class="form-row"><label>压力等级 (1-10)</label><input id="nPres" type="number" min="1" max="10" value="5"></div>'+
+    '<div class="form-row"><label>信心指数 (0-100)</label><input id="nConf" type="number" min="0" max="100" value="70"></div>'+
+    '<div class="form-btns"><button class="btn-primary" onclick="submitDecision()">提交决策</button><button class="btn-secondary" onclick="document.getElementById(\'newForm\').style.display=\'none\'">取消</button></div>'+
+    '</div>';
+}
+
+async function submitDecision(){
+  var title=document.getElementById('nTitle').value.trim();
+  var desc=document.getElementById('nDesc').value.trim();
+  var cat=document.getElementById('nCat').value;
+  var pri=document.getElementById('nPri').value;
+  var text=document.getElementById('nText').value.trim();
+  var emo=document.getElementById('nEmo').value;
+  var pres=parseInt(document.getElementById('nPres').value)||5;
+  var conf=parseInt(document.getElementById('nConf').value)/100;
+  if(!title||!text){alert('请填写标题和决策结论');return;}
+  var date=new Date().toISOString().slice(0,10);
+  var emb=[];
+  for(var i=0;i<8;i++)emb.push((Math.random()*2-1).toFixed(2));
+  var sql="INSERT INTO Decision (title, description, category, priority, status, decision_text, decision_date, context_summary, emotion_state, confidence_score, pressure_level, embedding) VALUES ('"+
+    title.replace(/'/g,"''")+"','"+desc.replace(/'/g,"''")+"','"+cat+"','"+pri+"','已决策','"+
+    text.replace(/'/g,"''")+"','"+date+"','"+desc.replace(/'/g,"''")+"','"+emo+"',"+conf+","+pres+",'"+emb.join(',')+"')";
+  try{
+    await q(sql);
+    document.getElementById('newForm').style.display='none';
+    await loadAll();
+  }catch(e){alert('提交失败: '+e.message);}
+}
+
+function runSimulation(){
+  var input=document.getElementById('simInput').value.trim();
+  if(!input)return;
+  var risk=traits.find(function(t){return t.trait_name==='风险偏好';});
+  var data=traits.find(function(t){return t.trait_name==='数据依赖';});
+  var speed=traits.find(function(t){return t.trait_name==='决策速度';});
+  var r=risk?risk.trait_value:0.5;
+  var d=data?data.trait_value:0.5;
+  var s=speed?speed.trait_value:0.5;
+  var html='<div style="margin-bottom:8px;color:var(--dim)">基于人格特征模拟的决策倾向：</div>';
+  html+='<div style="line-height:1.8">';
+  if(r>0.6) html+='🎯 风险偏好较高，倾向于积极应对<br>';
+  else html+='🛡️ 风险偏好较低，倾向于稳健保守<br>';
+  if(d>0.6) html+='📊 重视数据分析，会先看竞对数据和市场报告<br>';
+  else html+='💡 偏重直觉判断，会参考行业经验快速决策<br>';
+  if(s>0.7) html+='⚡ 决策速度快，预计2-3天内给出方案<br>';
+  else html+='🔍 决策较谨慎，预计需要1-2周充分论证<br>';
+  html+='<br><b style="color:var(--accent)">模拟决策建议:</b> ';
+  if(r>0.6&&s>0.7) html+='会主动出击，制定竞争性策略';
+  else if(r<0.4) html+='会先观望，收集更多信息后再决策';
+  else html+='会平衡分析后做出稳健决策';
+  html+='</div>';
+  document.getElementById('simResult').innerHTML=html;
+}
+
+function exportReport(){
+  var lines=['═══════════════════════════════════════════════════════════════',
+    '          数字军师 — 企业决策审计报告','          导出时间: '+new Date().toLocaleString(),
+    '═══════════════════════════════════════════════════════════════',''];
+  lines.push('■ 决策概览: 共 '+decisions.length+' 条决策记录');
+  var cats={};decisions.forEach(function(d){cats[d.category]=(cats[d.category]||0)+1;});
+  for(var k in cats)lines.push('  - '+k+': '+cats[k]+' 条');
+  lines.push('');
+  decisions.forEach(function(d,i){
+    var o=outcomes[d.decision_id]||{};
+    lines.push('───────────────────────────────────────────────────────────────');
+    lines.push('【'+(i+1)+'】'+d.title);
+    lines.push('  优先级: '+d.priority+' | 类别: '+d.category+' | 状态: '+d.status);
+    lines.push('  日期: '+d.decision_date+' | 情绪: '+d.emotion_state+' | 信心: '+Math.round(d.confidence_score*100)+'% | 压力: '+d.pressure_level+'/10');
+    lines.push('  决策结论: '+d.decision_text);
+    if(o.result_type){
+      lines.push('  结果: '+o.result_type+' — '+o.result_detail);
+      if(o.revenue_impact)lines.push('  收入影响: '+o.revenue_impact+'万');
+      if(o.lesson_learned)lines.push('  经验教训: '+o.lesson_learned);
+    }
+    var s=steps[d.decision_id]||[];
+    if(s.length){
+      lines.push('  思维路径:');
+      s.forEach(function(st){lines.push('    '+st.step_order+'. '+st.thought+' → '+st.reason+' ['+st.emotion+']');});
+    }
+    lines.push('');
+  });
+  lines.push('═══════════════════════════════════════════════════════════════');
+  lines.push('          报告结束 · 由数字军师系统自动生成');
+  var blob=new Blob([lines.join('\n')],{type:'text/plain;charset=utf-8'});
+  var a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download='决策审计报告_'+new Date().toISOString().slice(0,10)+'.txt';
+  a.click();
+}
+
+document.addEventListener('keydown',function(e){
+  if(e.ctrlKey&&e.key==='Enter'){
+    var f=document.getElementById('newForm');
+    if(f.style.display==='block')submitDecision();
+  }
+});
+
+loadAll();
+setInterval(loadAll,15000);
+</script>
+</body>
+</html>
