@@ -285,21 +285,39 @@ impl LsmEngine {
         let seq = self.next_seq();
         let entry = Entry::put(key.clone(), value.clone(), seq);
 
-        let needs_flush = {
+        let (needs_flush, should_sync) = {
             let mut ws = self.write_state.write();
             ws.wal.append(&entry)?;
             ws.wal_pending_count += 1;
             // Batch flush: only flush WAL buffer every 64 writes
+            let mut do_sync = false;
             if ws.wal_pending_count >= 64 {
                 ws.wal.flush_buf()?;
-                if self.options.sync_wal_on_commit {
-                    ws.wal.sync()?;
-                }
                 ws.wal_pending_count = 0;
+                if self.options.sync_wal_on_commit {
+                    do_sync = true;
+                }
             }
             ws.memtable.put_with_seq(key, value, seq);
-            ws.memtable.size() >= self.options.memtable_size_limit
+            (ws.memtable.size() >= self.options.memtable_size_limit, do_sync)
         };
+        // write_state lock released here
+
+        // Group commit: batch sync across concurrent writers
+        if should_sync {
+            let current_seq = self.seq_counter.load(Ordering::Relaxed);
+            let is_leader = self.group_commit.register(current_seq);
+            if is_leader {
+                let _batch_size = self.group_commit.wait_for_batch();
+                {
+                    let mut ws = self.write_state.write();
+                    ws.wal.sync()?;
+                }
+                self.group_commit.complete_sync(current_seq);
+            } else {
+                self.group_commit.wait_for_sync(current_seq);
+            }
+        }
 
         if needs_flush {
             self.flush_memtable()?;
