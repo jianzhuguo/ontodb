@@ -1,21 +1,31 @@
-"""OntoDB Python SDK - Exception classes."""
+"""OntoDB SDK exceptions."""
 
 
 class OntoDBError(Exception):
-    """Base exception for OntoDB SDK errors."""
+    """Base exception for all OntoDB SDK errors."""
     pass
 
 
 class ConnectionError(OntoDBError):
-    """Raised when connection to server fails."""
+    """Failed to connect to OntoDB server."""
     pass
 
 
 class QueryError(OntoDBError):
-    """Raised when query execution fails."""
+    """SQL/SPARQL query execution failed."""
     pass
 
 
 class AuthenticationError(OntoDBError):
-    """Raised when authentication fails."""
+    """Authentication failed (invalid API key)."""
+    pass
+
+
+class TimeoutError(OntoDBError):
+    """Request timed out."""
+    pass
+
+
+class SchemaError(OntoDBError):
+    """Schema validation error."""
     pass

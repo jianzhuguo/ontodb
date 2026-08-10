@@ -1,479 +1,474 @@
-"""OntoDB Python SDK - Client library for OntoDB HTTP API."""
+"""OntoDB Python SDK — main client."""
+
+import time
+from typing import Any, Dict, List, Optional, Union
 
 import requests
-from typing import Any, Dict, List, Optional, Union
-from .exceptions import OntoDBError, ConnectionError, QueryError, AuthenticationError
+
+from .exceptions import (
+    AuthenticationError,
+    ConnectionError,
+    OntoDBError,
+    QueryError,
+    TimeoutError,
+)
+from .models import QueryResult, VectorSearchResult, GraphResult, SchemaInfo
 
 
-class OntoDBClient:
-    """Client for interacting with OntoDB HTTP API.
-    
-    Example:
-        ```python
-        from ontodb import OntoDBClient
-        
-        client = OntoDBClient("http://localhost:7912")
-        
-        # Execute SQL query
-        result = client.query("SELECT * FROM Product WHERE price > 100")
-        
-        # Execute SPARQL query
-        result = client.sparql("SELECT ?name WHERE { ?p <name> ?name }")
-        
-        # Vector search
-        results = client.vector_search("Product", "embedding", [0.1, 0.2, 0.3], top_k=10)
-        ```
+class OntoDB:
+    """OntoDB client.
+
+    Args:
+        base_url: Server URL (e.g., "http://localhost:7912")
+        api_key: API key for authentication
+        timeout: Default request timeout in seconds
+        max_retries: Maximum number of retries on failure
+
+    Example::
+
+        db = OntoDB("http://localhost:7912", api_key="your-key")
+        result = db.query("SELECT * FROM users")
     """
-    
+
     def __init__(
         self,
         base_url: str = "http://localhost:7912",
         api_key: Optional[str] = None,
-        timeout: int = 30,
+        timeout: float = 30.0,
+        max_retries: int = 3,
     ):
-        """Initialize the OntoDB client.
-        
-        Args:
-            base_url: Base URL of the OntoDB server
-            api_key: Optional API key for authentication
-            timeout: Request timeout in seconds
-        """
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self.session = requests.Session()
-        
+        self.max_retries = max_retries
+        self._session = requests.Session()
         if api_key:
-            self.session.headers["Authorization"] = f"Bearer {api_key}"
-    
+            self._session.headers["Authorization"] = f"Bearer {api_key}"
+        self._session.headers["Content-Type"] = "application/json"
+
     def _request(
         self,
         method: str,
         path: str,
         json: Optional[Dict] = None,
-        **kwargs,
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Make an HTTP request to the OntoDB server.
-        
-        Args:
-            method: HTTP method (GET, POST, etc.)
-            path: API path
-            json: JSON request body
-            **kwargs: Additional request arguments
-            
-        Returns:
-            Response JSON data
-            
-        Raises:
-            ConnectionError: If connection fails
-            QueryError: If query execution fails
-            AuthenticationError: If authentication fails
-        """
+        """Send HTTP request with retry logic."""
         url = f"{self.base_url}{path}"
-        
-        try:
-            response = self.session.request(
-                method,
-                url,
-                json=json,
-                timeout=self.timeout,
-                **kwargs,
-            )
-        except requests.exceptions.ConnectionError:
-            raise ConnectionError(f"Failed to connect to {self.base_url}")
-        except requests.exceptions.Timeout:
-            raise ConnectionError(f"Request timed out after {self.timeout}s")
-        
-        if response.status_code == 401:
-            raise AuthenticationError("Invalid or missing API key")
-        
-        if response.status_code == 429:
-            raise OntoDBError("Rate limit exceeded")
-        
-        data = response.json()
-        
-        if not data.get("success", True):
-            raise QueryError(data.get("error", "Unknown error"))
-        
-        return data
-    
-    def health(self) -> Dict[str, Any]:
-        """Check server health.
-        
-        Returns:
-            Health status dictionary
-        """
-        return self._request("GET", "/api/health")
-    
-    def ready(self) -> bool:
-        """Check if server is ready to accept traffic.
-        
-        Returns:
-            True if ready
-        """
-        try:
-            result = self._request("GET", "/api/health/ready")
-            return result.get("status") == "ready"
-        except OntoDBError:
-            return False
-    
-    def live(self) -> bool:
-        """Check if server is alive.
-        
-        Returns:
-            True if alive
-        """
-        try:
-            result = self._request("GET", "/api/health/live")
-            return result.get("status") == "alive"
-        except OntoDBError:
-            return False
-    
-    def metrics(self) -> Dict[str, Any]:
-        """Get server metrics in JSON format.
-        
-        Returns:
-            Metrics dictionary
-        """
-        return self._request("GET", "/api/metrics")
-    
-    def schema(self) -> Dict[str, Any]:
-        """Get database schema information.
-        
-        Returns:
-            Schema dictionary with classes, indexes, etc.
-        """
-        return self._request("GET", "/api/schema")
-    
-    def query(
-        self,
-        sql: str,
-        pretty: bool = False,
-    ) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
-        """Execute a SQL query.
-        
+        last_error = None
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = self._session.request(
+                    method,
+                    url,
+                    json=json,
+                    timeout=timeout or self.timeout,
+                )
+
+                if resp.status_code == 401:
+                    raise AuthenticationError("Invalid API key")
+                if resp.status_code == 429:
+                    raise OntoDBError("Rate limit exceeded")
+                if resp.status_code >= 400:
+                    try:
+                        body = resp.json()
+                        msg = body.get("error", resp.text)
+                    except Exception:
+                        msg = resp.text
+                    raise QueryError(f"HTTP {resp.status_code}: {msg}")
+
+                return resp.json()
+
+            except requests.exceptions.ConnectionError as e:
+                last_error = ConnectionError(f"Cannot connect to {self.base_url}: {e}")
+                if attempt < self.max_retries:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise last_error
+
+            except requests.exceptions.Timeout:
+                last_error = TimeoutError(f"Request timed out after {timeout or self.timeout}s")
+                if attempt < self.max_retries:
+                    continue
+                raise last_error
+
+            except (QueryError, AuthenticationError):
+                raise
+
+            except OntoDBError:
+                raise
+
+            except Exception as e:
+                raise OntoDBError(f"Unexpected error: {e}")
+
+        raise last_error or OntoDBError("Max retries exceeded")
+
+    # ──────────────────────────────────────────────
+    # SQL Queries
+    # ──────────────────────────────────────────────
+
+    def query(self, sql: str, timeout: Optional[float] = None) -> List[Dict[str, Any]]:
+        """Execute a SQL query and return results.
+
         Args:
             sql: SQL query string
-            pretty: Pretty-print JSON results
-            
+            timeout: Request timeout in seconds
+
         Returns:
-            Query results as list of dictionaries, or status message
-            
-        Example:
-            ```python
-            # SELECT query
-            rows = client.query("SELECT * FROM Product WHERE price > 100")
-            
-            # INSERT query
-            result = client.query("INSERT INTO Product (name, price) VALUES ('iPhone', 999)")
-            ```
+            List of row dictionaries
+
+        Example::
+
+            rows = db.query("SELECT * FROM users WHERE age > 25")
+            for row in rows:
+                print(row["name"], row["age"])
         """
-        data = self._request("POST", "/api/query", json={
-            "query": sql,
-            "pretty": pretty,
-        })
-        
-        if "data" in data:
-            return data["data"]
-        return data
-    
-    def sparql(self, query: str) -> Dict[str, Any]:
-        """Execute a SPARQL query.
-        
+        result = self._request("POST", "/api/query", json={"query": sql}, timeout=timeout)
+        if result.get("error"):
+            raise QueryError(result["error"])
+        return result.get("data", [])
+
+    def execute(self, sql: str, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Execute a SQL statement (INSERT/UPDATE/DELETE/DDL).
+
         Args:
-            query: SPARQL query string
-            
+            sql: SQL statement
+            timeout: Request timeout in seconds
+
         Returns:
-            SPARQL results in W3C JSON format
-            
-        Example:
-            ```python
-            result = client.sparql("""
-                PREFIX ex: <http://example.org/>
-                SELECT ?name WHERE {
-                    ?p a ex:Product .
-                    ?p ex:name ?name
-                }
-            """)
-            ```
+            Response dict with status info
+
+        Example::
+
+            db.execute("INSERT INTO users (name, age) VALUES ('Alice', 30)")
         """
-        return self._request("POST", "/sparql", json={
-            "query": query,
-        })
-    
+        result = self._request("POST", "/api/query", json={"query": sql}, timeout=timeout)
+        if result.get("error"):
+            raise QueryError(result["error"])
+        return result
+
+    def query_many(self, sqls: List[str], timeout: Optional[float] = None) -> List[List[Dict]]:
+        """Execute multiple SQL queries.
+
+        Args:
+            sqls: List of SQL query strings
+            timeout: Per-query timeout
+
+        Returns:
+            List of result sets
+        """
+        results = []
+        for sql in sqls:
+            results.append(self.query(sql, timeout=timeout))
+        return results
+
+    # ──────────────────────────────────────────────
+    # Vector Search
+    # ──────────────────────────────────────────────
+
     def vector_search(
         self,
-        class_name: str,
+        table: str,
         column: str,
-        query_vector: List[float],
+        vector: List[float],
         top_k: int = 10,
         filter_expr: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """Perform vector similarity search.
-        
+        """Search for similar vectors.
+
         Args:
-            class_name: Target class name
+            table: Table/class name
             column: Vector column name
-            query_vector: Query vector for similarity search
-            top_k: Number of top results to return
-            filter_expr: Optional SQL WHERE clause for hybrid filtering
-            
+            query_vector: Query vector
+            top_k: Number of results to return
+            filter_expr: Optional SQL WHERE filter
+
         Returns:
-            List of search results with similarity scores
-            
-        Example:
-            ```python
-            results = client.vector_search(
-                "Product",
-                "embedding",
-                [0.1, 0.2, 0.3, 0.4],
-                top_k=5,
-                filter_expr="price > 100"
+            List of matching rows with similarity scores
+
+        Example::
+
+            results = db.vector_search(
+                "documents", "embedding",
+                [0.1, 0.2, 0.3, ...],
+                top_k=5
             )
-            ```
+            for r in results:
+                print(r["title"], r.get("_score"))
         """
-        payload = {
-            "class": class_name,
+        body = {
+            "class": table,
             "column": column,
-            "query_vector": query_vector,
+            "query_vector": vector,
             "top_k": top_k,
         }
         if filter_expr:
-            payload["filter"] = filter_expr
-        
-        data = self._request("POST", "/api/vector/search", json=payload)
-        return data.get("data", [])
-    
-    def hybrid_query(
+            body["filter"] = filter_expr
+
+        result = self._request("POST", "/api/vector/search", json=body, timeout=timeout)
+        if result.get("error"):
+            raise QueryError(result["error"])
+        return result.get("data", [])
+
+    def hybrid_search(
         self,
-        sql_filter: str,
+        table: str,
         vector_column: str,
-        query_vector: List[float],
+        vector: List[float],
+        sql_filter: str = "",
         top_k: int = 10,
-        class_name: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """Execute a hybrid SQL + vector search query.
-        
+        """Hybrid SQL + vector search.
+
         Args:
-            sql_filter: SQL query for filtering
-            vector_column: Vector column for similarity ranking
-            query_vector: Query vector for similarity search
-            top_k: Number of top results to return
-            class_name: Optional target class name
-            
+            table: Table name
+            vector_column: Vector column name
+            vector: Query vector
+            sql_filter: SQL WHERE clause
+            top_k: Number of results
+
         Returns:
-            List of search results
+            List of matching rows
         """
-        payload = {
-            "sql_filter": sql_filter,
+        body = {
+            "class": table,
             "vector_column": vector_column,
-            "query_vector": query_vector,
+            "query_vector": vector,
             "top_k": top_k,
+            "filter": sql_filter,
         }
-        if class_name:
-            payload["class"] = class_name
-        
-        data = self._request("POST", "/api/hybrid/query", json=payload)
-        return data.get("data", [])
-    
-    # ── Graph Operations ──────────────────────────────────────────
-    
-    def add_vertex(
-        self,
-        vertex_id: str,
-        labels: List[str],
-        properties: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Add a vertex to the graph.
-        
+        result = self._request("POST", "/api/hybrid/query", json=body, timeout=timeout)
+        if result.get("error"):
+            raise QueryError(result["error"])
+        return result.get("data", [])
+
+    # ──────────────────────────────────────────────
+    # SPARQL
+    # ──────────────────────────────────────────────
+
+    def sparql(self, query: str, timeout: Optional[float] = None) -> List[Dict[str, Any]]:
+        """Execute a SPARQL query.
+
         Args:
-            vertex_id: Unique vertex ID
-            labels: List of labels (e.g., ["Person", "Employee"])
-            properties: Optional vertex properties
-            
+            query: SPARQL query string
+            timeout: Request timeout
+
         Returns:
-            Response with vertex info
-            
-        Example:
-            ```python
-            client.add_vertex("alice", ["Person"], {"name": "Alice", "age": 30})
-            ```
+            List of result bindings
+
+        Example::
+
+            results = db.sparql('''
+                PREFIX ex: <http://example.org/>
+                SELECT ?name WHERE { ?p ex:name ?name }
+            ''')
         """
-        payload = {
-            "id": vertex_id,
-            "labels": labels,
-            "properties": properties or {},
-        }
-        return self._request("POST", "/api/graph/vertex", json=payload)
-    
-    def add_edge(
-        self,
-        edge_id: str,
-        from_id: str,
-        to_id: str,
-        label: str,
-        properties: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Add an edge to the graph.
-        
-        Args:
-            edge_id: Unique edge ID
-            from_id: Source vertex ID
-            to_id: Target vertex ID
-            label: Edge label (e.g., "KNOWS", "WORKS_AT")
-            properties: Optional edge properties
-            
-        Returns:
-            Response with edge info
-            
-        Example:
-            ```python
-            client.add_edge("e1", "alice", "bob", "KNOWS", {"since": 2020})
-            ```
-        """
-        payload = {
-            "id": edge_id,
-            "from": from_id,
-            "to": to_id,
-            "label": label,
-            "properties": properties or {},
-        }
-        return self._request("POST", "/api/graph/edge", json=payload)
-    
-    def get_vertex(self, vertex_id: str) -> Dict[str, Any]:
-        """Get a vertex by ID.
-        
-        Args:
-            vertex_id: Vertex ID to retrieve
-            
-        Returns:
-            Vertex data
-        """
-        return self._request("GET", f"/api/graph/vertex/{vertex_id}")
-    
-    def delete_vertex(self, vertex_id: str) -> Dict[str, Any]:
-        """Delete a vertex and all connected edges.
-        
-        Args:
-            vertex_id: Vertex ID to delete
-            
-        Returns:
-            Deletion confirmation
-        """
-        return self._request("DELETE", f"/api/graph/vertex/{vertex_id}")
-    
-    def get_neighbors(
-        self,
-        vertex_id: str,
-        direction: str = "out",
-        edge_label: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """Get neighbors of a vertex.
-        
-        Args:
-            vertex_id: Vertex ID
-            direction: "in", "out", or "both"
-            edge_label: Optional filter by edge label
-            
-        Returns:
-            List of neighbor vertices
-        """
-        params = {"direction": direction}
-        if edge_label:
-            params["edge_label"] = edge_label
-        data = self._request("GET", f"/api/graph/neighbors/{vertex_id}", params=params)
-        return data.get("neighbors", [])
-    
+        result = self._request("POST", "/api/sparql", json={"query": query}, timeout=timeout)
+        if result.get("error"):
+            raise QueryError(result["error"])
+        return result.get("data", [])
+
+    # ──────────────────────────────────────────────
+    # Graph Operations
+    # ──────────────────────────────────────────────
+
     def graph_traverse(
         self,
         start_id: str,
         direction: str = "out",
-        max_depth: int = 3,
         edge_label: Optional[str] = None,
+        depth: int = 3,
+        algorithm: str = "bfs",
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Traverse the graph from a starting vertex (fast, no path info).
-        
+        """Traverse the graph from a starting vertex.
+
         Args:
             start_id: Starting vertex ID
             direction: "in", "out", or "both"
-            max_depth: Maximum traversal depth
-            edge_label: Optional filter by edge label
-            
+            edge_label: Filter by edge label
+            depth: Maximum traversal depth
+            algorithm: "bfs" or "dfs"
+
         Returns:
-            Traversal results with vertices
-            
-        Example:
-            ```python
-            result = client.graph_traverse("alice", direction="out", max_depth=2, edge_label="KNOWS")
-            for vertex in result["vertices"]:
-                print(vertex["id"])
-            ```
+            Traversal result with vertices and edges
+
+        Example::
+
+            result = db.graph_traverse("Person::1", direction="out", depth=2)
+            for vertex in result.get("vertices", []):
+                print(vertex)
         """
-        payload = {
+        body = {
             "start": start_id,
             "direction": direction,
-            "max_depth": max_depth,
+            "max_depth": depth,
+            "algorithm": algorithm,
         }
         if edge_label:
-            payload["edge_label"] = edge_label
-        return self._request("POST", "/api/graph/traverse", json=payload)
-    
-    def graph_traverse_with_paths(
-        self,
-        start_id: str,
-        direction: str = "out",
-        max_depth: int = 3,
-    ) -> Dict[str, Any]:
-        """Traverse the graph with path reconstruction (slower, includes paths).
-        
-        Args:
-            start_id: Starting vertex ID
-            direction: "in", "out", or "both"
-            max_depth: Maximum traversal depth
-            
-        Returns:
-            Traversal results with vertices and paths from start to each vertex
-            
-        Example:
-            ```python
-            result = client.graph_traverse_with_paths("alice", direction="out", max_depth=2)
-            for path in result["paths"]:
-                print(f"{' -> '.join(path['vertex_ids'])} (length: {path['length']})")
-            ```
-        """
-        payload = {
-            "start": start_id,
-            "direction": direction,
-            "max_depth": max_depth,
-            "with_paths": True,
-        }
-        return self._request("POST", "/api/graph/traverse", json=payload)
-    
-    def shortest_path(
+            body["edge_label"] = edge_label
+
+        result = self._request("POST", "/api/graph/traverse", json=body, timeout=timeout)
+        if result.get("error"):
+            raise QueryError(result["error"])
+        return result.get("data", {})
+
+    def graph_shortest_path(
         self,
         from_id: str,
         to_id: str,
-        max_depth: int = 10,
-    ) -> Dict[str, Any]:
+        timeout: Optional[float] = None,
+    ) -> List[str]:
         """Find shortest path between two vertices.
-        
+
         Args:
             from_id: Source vertex ID
             to_id: Target vertex ID
-            max_depth: Maximum path length
-            
+
         Returns:
-            Path information
-            
-        Example:
-            ```python
-            path = client.shortest_path("alice", "dave")
-            if path["path"]:
-                print(f"Path length: {path['path']['length']}")
-            ```
+            List of vertex IDs on the path
         """
-        payload = {
-            "from": from_id,
-            "to": to_id,
-            "max_depth": max_depth,
-        }
-        return self._request("POST", "/api/graph/shortest-path", json=payload)
+        body = {"from": from_id, "to": to_id}
+        result = self._request("POST", "/api/graph/shortest-path", json=body, timeout=timeout)
+        if result.get("error"):
+            raise QueryError(result["error"])
+        return result.get("data", {}).get("path", [])
+
+    # ──────────────────────────────────────────────
+    # Schema
+    # ──────────────────────────────────────────────
+
+    def schema(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Get database schema information.
+
+        Returns:
+            Schema dict with tables, columns, indexes
+        """
+        result = self._request("GET", "/api/schema", timeout=timeout)
+        return result.get("data", {})
+
+    # ──────────────────────────────────────────────
+    # Health & Metrics
+    # ──────────────────────────────────────────────
+
+    def health(self, timeout: Optional[float] = 5.0) -> Dict[str, Any]:
+        """Check server health.
+
+        Returns:
+            Health status dict
+        """
+        return self._request("GET", "/api/health", timeout=timeout)
+
+    def metrics(self, timeout: Optional[float] = 5.0) -> Dict[str, Any]:
+        """Get server metrics.
+
+        Returns:
+            Metrics dict with QPS, latency, storage stats
+        """
+        return self._request("GET", "/api/metrics", timeout=timeout)
+
+    def is_ready(self) -> bool:
+        """Check if server is ready to accept requests."""
+        try:
+            resp = self.health(timeout=2.0)
+            return resp.get("status") == "ok"
+        except Exception:
+            return False
+
+    # ──────────────────────────────────────────────
+    # Backup
+    # ──────────────────────────────────────────────
+
+    def backup(self, path: str, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Create a full backup.
+
+        Args:
+            path: Backup file path on server
+
+        Returns:
+            Backup result with file path and size
+        """
+        result = self._request("POST", "/api/backup", json={"path": path}, timeout=timeout)
+        if result.get("error"):
+            raise QueryError(result["error"])
+        return result
+
+    def restore(self, path: str, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Restore from backup.
+
+        Args:
+            path: Backup file path on server
+        """
+        result = self._request("POST", "/api/restore", json={"path": path}, timeout=timeout)
+        if result.get("error"):
+            raise QueryError(result["error"])
+        return result
+
+    # ──────────────────────────────────────────────
+    # Batch Operations
+    # ──────────────────────────────────────────────
+
+    def insert_many(
+        self,
+        table: str,
+        rows: List[Dict[str, Any]],
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Insert multiple rows using BATCH INSERT.
+
+        Args:
+            table: Table name
+            rows: List of row dicts
+
+        Returns:
+            Insert result
+
+        Example::
+
+            db.insert_many("users", [
+                {"name": "Alice", "age": 30},
+                {"name": "Bob", "age": 25},
+            ])
+        """
+        if not rows:
+            return {}
+
+        columns = list(rows[0].keys())
+        cols_str = ", ".join(columns)
+
+        values = []
+        for row in rows:
+            vals = []
+            for col in columns:
+                v = row.get(col)
+                if v is None:
+                    vals.append("NULL")
+                elif isinstance(v, str):
+                    vals.append(f"'{v.replace(chr(39), chr(39)*2)}'")
+                elif isinstance(v, bool):
+                    vals.append("TRUE" if v else "FALSE")
+                else:
+                    vals.append(str(v))
+            values.append(f"({', '.join(vals)})")
+
+        sql = f"BATCH INSERT INTO {table} ({cols_str}) VALUES {', '.join(values)}"
+        return self.execute(sql, timeout=timeout)
+
+    # ──────────────────────────────────────────────
+    # Context Manager
+    # ──────────────────────────────────────────────
+
+    def close(self):
+        """Close the HTTP session."""
+        self._session.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def __repr__(self):
+        return f"OntoDB('{self.base_url}')"
