@@ -319,8 +319,9 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         // Web console
         .route("/console", get(web_console))
         .route("/", get(web_console))
-        // Digital Twin
+        // Digital Twin & Advisor
         .route("/digital-twin", get(digital_twin))
+        .route("/digital-advisor", get(digital_advisor))
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .layer(build_cors_layer(cors_origins))
         .layer(TraceLayer::new_for_http())
@@ -377,8 +378,9 @@ pub fn build_router_with_auth(
         .route("/api/openapi.json", get(openapi_spec))
         .route("/console", get(web_console))
         .route("/", get(web_console))
-        // Digital Twin (no auth required)
+        // Digital Twin & Advisor (no auth required)
         .route("/digital-twin", get(digital_twin))
+        .route("/digital-advisor", get(digital_advisor))
         // Merge admin routes (after main routes to avoid conflicts)
         .merge(admin_routes)
         // Apply rate limiting middleware
@@ -1081,6 +1083,15 @@ async fn digital_twin() -> axum::response::Html<String> {
     match std::fs::read_to_string(&path) {
         Ok(content) => axum::response::Html(content),
         Err(_) => axum::response::Html("<h1>Digital Twin dashboard unavailable</h1><p>Please check server configuration.</p>".to_string()),
+    }
+}
+
+/// GET /digital-advisor - Enterprise decision intelligence dashboard.
+async fn digital_advisor() -> axum::response::Html<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/static/digital_advisor.html");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => axum::response::Html(content),
+        Err(_) => axum::response::Html("<h1>Digital Advisor unavailable</h1>".to_string()),
     }
 }
 
