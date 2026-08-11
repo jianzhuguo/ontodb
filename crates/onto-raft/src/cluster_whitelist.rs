@@ -130,7 +130,7 @@ impl ClusterWhitelistManager {
                 None => {
                     key_config["allowed_ips"] = serde_json::json!([]);
                     // Safe: just set to empty array above
-                    key_config.get_mut("allowed_ips").unwrap().as_array_mut().unwrap()
+                    key_config.get_mut("allowed_ips").expect("just set allowed_ips").as_array_mut().expect("just set to array")
                 }
             };
 
