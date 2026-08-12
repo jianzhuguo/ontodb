@@ -648,7 +648,23 @@ impl LsmEngine {
         }
         Ok(())
     }
+}
 
+impl Drop for LsmEngine {
+    fn drop(&mut self) {
+        // Flush any remaining WAL buffer to OS cache
+        if let Some(mut ws) = self.write_state.try_write_for(std::time::Duration::from_millis(100)) {
+            if ws.wal_pending_count > 0 {
+                let _ = ws.wal.flush_buf();
+                ws.wal_pending_count = 0;
+            }
+            // fsync to ensure data survives crash
+            let _ = ws.wal.sync();
+        }
+    }
+}
+
+impl LsmEngine {
     /// Flushes the current MemTable to an SSTable on disk.
     fn flush_memtable(&self) -> Result<()> {
         // Step 1: Swap current MemTable to immutable (brief lock)
