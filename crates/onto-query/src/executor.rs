@@ -4934,8 +4934,8 @@ impl QueryExecutor {
         use crate::parser::ImportFormat;
         Self::validate_file_path(file_path)?;
 
-        let content = std::fs::read_to_string(file_path).map_err(|e| {
-            CoreError::InvalidArgument(format!("failed to read file: {}", e))
+        let content = std::fs::read_to_string(file_path).map_err(|_| {
+            CoreError::InvalidArgument("file not found or unreadable".to_string())
         })?;
 
         match format {
@@ -4961,8 +4961,8 @@ impl QueryExecutor {
         Self::validate_file_path(file_path)?;
 
         let start = std::time::Instant::now();
-        let content = std::fs::read_to_string(file_path).map_err(|e| {
-            CoreError::InvalidArgument(format!("failed to read file: {}", e))
+        let content = std::fs::read_to_string(file_path).map_err(|_| {
+            CoreError::InvalidArgument("file not found or unreadable".to_string())
         })?;
 
         let entries = match format {
@@ -6330,7 +6330,7 @@ impl QueryExecutor {
             "SUBSTRING" => {
                 if let Some(Value::String(s)) = args.first() {
                     let start = args.get(1).and_then(|v| v.as_i64()).unwrap_or(1).max(1) as usize - 1;
-                    let len = args.get(2).and_then(|v| v.as_i64()).map(|l| l as usize);
+                    let len = args.get(2).and_then(|v| v.as_i64()).map(|l| l.max(0) as usize);
                     let substr: String = s.chars().skip(start).take(len.unwrap_or(s.len())).collect();
                     Ok(Value::String(substr))
                 } else {

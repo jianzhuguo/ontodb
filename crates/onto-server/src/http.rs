@@ -1,4 +1,4 @@
-﻿//! HTTP API for OntoDB.
+//! HTTP API for OntoDB.
 //!
 //! Provides RESTful endpoints for SQL queries, vector search, hybrid queries,
 //! health checks, and Prometheus metrics.
@@ -54,8 +54,9 @@ fn validate_filter(filter: &str) -> Result<(), String> {
     if filter.contains("--") {
         return Err("filter must not contain line comments".into());
     }
-    // Reject dangerous SQL keywords (case-insensitive, word-boundary aware)
-    let upper = filter.to_uppercase();
+    // Reject dangerous SQL keywords (case-insensitive, Unicode-aware word boundaries)
+    let upper: String = filter.chars().map(|c| c.to_uppercase()).flatten().collect();
+    let upper_chars: Vec<char> = upper.chars().collect();
     let forbidden = [
         "DROP", "DELETE", "INSERT", "UPDATE", "UNION",
         "ALTER", "CREATE", "TRUNCATE", "EXEC", "EXECUTE",
@@ -63,19 +64,20 @@ fn validate_filter(filter: &str) -> Result<(), String> {
         "PG_SLEEP", "INFORMATION_SCHEMA",
     ];
     for kw in &forbidden {
-        // Check for keyword preceded by start/non-alnum and followed by non-alnum
+        let kw_chars: Vec<char> = kw.chars().collect();
         let mut search_start = 0;
-        while let Some(pos) = upper[search_start..].find(kw) {
-            let abs_pos = search_start + pos;
-            let before_ok = abs_pos == 0
-                || !upper.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
-            let end_pos = abs_pos + kw.len();
-            let after_ok = end_pos >= upper.len()
-                || !upper.as_bytes()[end_pos].is_ascii_alphanumeric();
-            if before_ok && after_ok {
-                return Err(format!("filter must not contain '{}'", kw));
+        while search_start + kw_chars.len() <= upper_chars.len() {
+            if upper_chars[search_start..search_start + kw_chars.len()] == kw_chars[..] {
+                let before_ok = search_start == 0
+                    || !upper_chars[search_start - 1].is_alphanumeric();
+                let after_pos = search_start + kw_chars.len();
+                let after_ok = after_pos >= upper_chars.len()
+                    || !upper_chars[after_pos].is_alphanumeric();
+                if before_ok && after_ok {
+                    return Err(format!("filter must not contain '{}'", kw));
+                }
             }
-            search_start = abs_pos + 1;
+            search_start += 1;
         }
     }
     Ok(())
@@ -97,6 +99,31 @@ fn validate_identifier(name: &str) -> Result<(), String> {
         return Err(format!("invalid identifier '{}': malformed dot usage", name));
     }
     Ok(())
+}
+
+/// Strips internal details (file paths, OS errors, line numbers) from error
+/// messages before returning them to the client.
+fn sanitize_error(err: &str) -> String {
+    let lower = err.to_lowercase();
+    if lower.contains("failed to read file")
+        || lower.contains("permission denied")
+        || lower.contains("no such file")
+        || lower.contains("the system cannot find")
+        || lower.contains("access is denied")
+    {
+        return "file not found or inaccessible".to_string();
+    }
+    // Keep user-facing parse/validation errors, strip internal paths
+    if lower.contains("parse error") || lower.contains("syntax error") || lower.contains("invalid") {
+        // Sanitize: remove any Windows/Unix path patterns
+        let sanitized: String = err
+            .split(|c: char| c == '\\' || c == '/')
+            .last()
+            .unwrap_or(err)
+            .to_string();
+        return sanitized;
+    }
+    "query execution failed".to_string()
 }
 
 /// Validates a backup path to prevent path traversal attacks.
@@ -412,7 +439,7 @@ async fn security_headers_middleware(
     headers.insert("referrer-policy", "strict-origin-when-cross-origin".parse().expect("should be valid"));
     headers.insert(
         "content-security-policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'".parse().expect("should be valid"),
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'".parse().expect("should be valid"),
     );
     response
 }
@@ -636,11 +663,7 @@ async fn execute_query(
             let audit_entry = state.audit.create_query_entry(&client_ip, None, query_type, query, elapsed * 1000.0, false, Some(err_msg.clone()));
             state.audit.log(audit_entry);
             // Sanitize error message for client: remove file paths and internal details
-            let safe_msg = if err_msg.contains("failed to read file") || err_msg.contains("Permission denied") {
-                "Internal server error".to_string()
-            } else {
-                format!("Execution error: {}", err_msg)
-            };
+            let safe_msg = sanitize_error(&err_msg);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 PrettyJson(ApiResponse::<Value>::error(safe_msg), false),
@@ -708,7 +731,7 @@ async fn sparql_query(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<Value>::error(format!("SPARQL translation error: {}", e))),
+                Json(ApiResponse::<Value>::error(sanitize_error(&e.to_string()))),
             );
         }
     };
@@ -737,7 +760,7 @@ async fn sparql_query(
             state.metrics.record_query("SPARQL", elapsed, false);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<Value>::error(format!("SPARQL execution error: {}", e))),
+                Json(ApiResponse::<Value>::error(sanitize_error(&e.to_string()))),
             );
         }
     };
@@ -860,7 +883,7 @@ async fn vector_search(
             state.metrics.record_query("VECTOR_SEARCH", elapsed, false);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<Value>::error(format!("Execution error: {}", e))),
+                Json(ApiResponse::<Value>::error(sanitize_error(&e.to_string()))),
             );
         }
     };
@@ -950,10 +973,10 @@ async fn hybrid_query(
     };
     let sql_result = match sql_result {
         Ok(r) => r,
-        Err(e) => {
+        Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<Value>::error(format!("SQL execution error: {}", e))),
+                Json(ApiResponse::<Value>::error("query execution failed".to_string())),
             );
         }
     };
@@ -969,7 +992,16 @@ async fn hybrid_query(
         }
     });
 
+    // Validate vector dimensions (DoS protection)
+    if req.query_vector.len() > 4096 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error("query_vector too large (max 4096 dimensions)".to_string())),
+        );
+    }
+
     // Step 2: Build vector search with filter from SQL results
+    let top_k = req.top_k.min(10000);
     let vector_str = req
         .query_vector
         .iter()
@@ -981,10 +1013,13 @@ async fn hybrid_query(
     // The SQL filter is applied as a WHERE clause in the vector search
     let filter_clause = match &sql_ast {
         QueryAst::Select { filter: Some(_), .. } => {
-            // Extract the WHERE clause from the original SQL
-            let sql_upper = sql_query.to_uppercase();
-            if let Some(where_pos) = sql_upper.find(" WHERE ") {
-                let extracted = &sql_query[where_pos + 7..].trim();
+            // Extract the WHERE clause using case-insensitive char-aware search
+            let sql_upper: String = sql_query.chars().map(|c| c.to_uppercase()).flatten().collect();
+            if let Some(byte_pos) = sql_upper.find(" WHERE ") {
+                // Count chars up to byte_pos to get a safe char boundary in the original
+                let char_count = sql_upper[..byte_pos].chars().count();
+                let after_where: String = sql_query.chars().skip(char_count + 7).collect();
+                let extracted = after_where.trim();
                 if let Err(e) = validate_filter(extracted) {
                     return (
                         StatusCode::BAD_REQUEST,
@@ -1001,7 +1036,7 @@ async fn hybrid_query(
 
     let vector_query = format!(
         "VECTOR SEARCH ON {} ({}) QUERY [{}] TOP {}{}",
-        class, req.vector_column, vector_str, req.top_k, filter_clause
+        class, req.vector_column, vector_str, top_k, filter_clause
     );
 
     let vector_ast = match QueryParser::parse(&vector_query) {
@@ -1024,7 +1059,7 @@ async fn hybrid_query(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<Value>::error(format!("Vector search error: {}", e))),
+                Json(ApiResponse::<Value>::error(sanitize_error(&e.to_string()))),
             );
         }
     };
@@ -1310,7 +1345,7 @@ async fn graph_shortest_path(
 
     let from_id = req.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let to_id = req.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let max_depth = req.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let max_depth = req.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(10).min(100) as usize;
 
     if from_id.is_empty() || to_id.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(ApiResponse::<serde_json::Value>::error("missing from/to vertex ids")));

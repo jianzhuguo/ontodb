@@ -1,4 +1,4 @@
-﻿//! Tiered storage for time series data.
+//! Tiered storage for time series data.
 //!
 //! Implements hot/warm/cold data tiering:
 //! - **Hot**: MemTable (in memory) — recent data, fast reads/writes
@@ -208,7 +208,10 @@ impl TieredStorage {
 
                         if age >= self.config.warm_to_cold_secs {
                             // Move to cold tier
-                            let filename = path.file_name().expect("should be valid");
+                            let filename = match path.file_name() {
+                                Some(f) => f,
+                                None => continue,
+                            };
                             let cold_path = cold_dir.join(filename);
                             std::fs::rename(&path, &cold_path).map_err(|e| e.to_string())?;
                             self.stats.migrations_to_cold += 1;

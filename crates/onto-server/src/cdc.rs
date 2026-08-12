@@ -494,10 +494,14 @@ impl CdcPublisher for KafkaCdcPublisher {
 
         let key = event.key.clone();
 
-        // Use async runtime to send
+        // Use async runtime to send (only if Tokio runtime is available)
         let topic = self.topic.clone();
         let producer = self.producer.clone();
 
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::warn!("CDC Kafka publish called outside Tokio runtime, skipping");
+            return;
+        }
         tokio::spawn(async move {
             let record = FutureRecord::to(&topic)
                 .key(&key)

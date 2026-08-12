@@ -40,7 +40,8 @@ impl Timestamp {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos() as i64;
+            .as_nanos()
+            .min(i64::MAX as u128) as i64;
         Timestamp(nanos)
     }
 
@@ -287,6 +288,10 @@ pub fn dtw_distance(a: &[f64], b: &[f64], window: Option<usize>) -> f64 {
     let n = a.len();
     let m = b.len();
     if n == 0 || m == 0 {
+        return f64::INFINITY;
+    }
+    // Guard against overflow (n+1)*(m+1) and excessive memory use
+    if n > 100_000 || m > 100_000 {
         return f64::INFINITY;
     }
 

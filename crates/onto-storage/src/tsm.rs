@@ -428,6 +428,10 @@ impl TsmReader {
 
         let _version = data[4];
         let block_count = u32::from_le_bytes(data[5..9].try_into().ok()?) as usize;
+        // Cap allocation to prevent OOM from malformed data
+        if block_count > 1_000_000 {
+            return None;
+        }
 
         let mut blocks = Vec::with_capacity(block_count);
         let mut pos = 9;

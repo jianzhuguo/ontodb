@@ -20,6 +20,9 @@ use crate::traversal::Direction;
 const GRAPH_VERTEX_PREFIX: &str = "__graph_v__";
 const GRAPH_EDGE_PREFIX: &str = "__graph_e__";
 
+/// Maximum number of vertices allowed in the in-memory graph store (DoS protection).
+const MAX_VERTICES: usize = 1_000_000;
+
 /// In-memory graph store with optional LSM persistence.
 ///
 /// # Lock Ordering (deadlock prevention)
@@ -172,14 +175,20 @@ impl GraphStore {
                 };
                 {
                     let mut adj_out = self.adj_out.write();
-                    if (from_idx as usize) < adj_out.len() {
-                        adj_out[from_idx as usize].push((to_idx, edge_idx));
+                    let idx = from_idx as usize;
+                    if idx < adj_out.len() {
+                        adj_out[idx].push((to_idx, edge_idx));
+                    } else {
+                        tracing::warn!("adj_out index {} out of bounds (len={}), skipping", idx, adj_out.len());
                     }
                 }
                 {
                     let mut adj_in = self.adj_in.write();
-                    if (to_idx as usize) < adj_in.len() {
-                        adj_in[to_idx as usize].push((from_idx, edge_idx));
+                    let idx = to_idx as usize;
+                    if idx < adj_in.len() {
+                        adj_in[idx].push((from_idx, edge_idx));
+                    } else {
+                        tracing::warn!("adj_in index {} out of bounds (len={}), skipping", idx, adj_in.len());
                     }
                 }
             }
@@ -286,6 +295,13 @@ impl GraphStore {
     pub fn add_vertex(&self, vertex: Vertex) -> Result<(), GraphError> {
         let id = vertex.id.clone();
         let labels = vertex.labels.clone();
+
+        // DoS protection: enforce max vertex count
+        if self.vertices.read().len() >= MAX_VERTICES {
+            return Err(GraphError::StorageError(format!(
+                "vertex limit reached ({})", MAX_VERTICES
+            )));
+        }
 
         // Persist to LSM engine before updating in-memory state
         self.persist_vertex(&vertex)?;

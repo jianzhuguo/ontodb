@@ -216,15 +216,9 @@ async fn handle_pgwire_client(
     key_msg.put_u8(BACKEND_KEY);
     key_msg.put_u32(12); // length
     key_msg.put_i32(std::process::id() as i32);
-    // Generate a per-connection secret using time + port + counter for cancel request validation
-    static SECRET_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let counter = SECRET_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let time_seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let port = stream.peer_addr().map(|a| a.port() as u32).unwrap_or(0);
-    let secret: i32 = (time_seed ^ port ^ counter ^ (std::process::id() << 16)) as i32;
+    // Generate a cryptographically random per-connection secret for cancel request validation
+    use rand::Rng;
+    let secret: i32 = rand::thread_rng().gen();
     key_msg.put_i32(secret);
     stream.write_all(&key_msg).await?;
 

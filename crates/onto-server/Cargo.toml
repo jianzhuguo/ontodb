@@ -45,6 +45,8 @@ sha2 = "0.10"
 md5 = "0.7"
 # Date/time for security audit timestamps
 chrono = "0.4"
+# Random number generation (PG Wire secret)
+rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

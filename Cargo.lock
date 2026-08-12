@@ -1639,6 +1639,7 @@ dependencies = [
  "onto-raft",
  "onto-storage",
  "parking_lot",
+ "rand",
  "rcgen",
  "rustls",
  "rustls-pemfile",
