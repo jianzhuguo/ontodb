@@ -4472,7 +4472,7 @@ impl QueryExecutor {
                     .filter_map(|v| v.parse::<f64>().ok())
                     .sum();
                 if sum.fract() == 0.0 {
-                    Value::Number(serde_json::Number::from(sum as i64))
+                    Value::Number(serde_json::Number::from(sum.clamp(i64::MIN as f64, i64::MAX as f64) as i64))
                 } else {
                     Value::Number(
                         serde_json::Number::from_f64(sum).unwrap_or(serde_json::Number::from(0)),
@@ -4681,7 +4681,7 @@ impl QueryExecutor {
             .filter_map(|v| v.parse::<f64>().ok())
             .sum();
         if sum.fract() == 0.0 {
-            Value::Number(serde_json::Number::from(sum as i64))
+            Value::Number(serde_json::Number::from(sum.clamp(i64::MIN as f64, i64::MAX as f64) as i64))
         } else {
             Value::Number(serde_json::Number::from_f64(sum).unwrap_or(serde_json::Number::from(0)))
         }
