@@ -400,7 +400,7 @@ fn extract_cert_validity(der: &[u8]) -> Option<(String, String, bool, Option<u64
                 Some(0)
             } else {
                 // Approximate days remaining
-                let remaining = cert.validity().not_after.to_string();
+                let _remaining = cert.validity().not_after.to_string();
                 // Parse the date and calculate difference
                 // For simplicity, we'll return None if we can't calculate
                 None
@@ -527,7 +527,7 @@ mod tests {
     #[test]
     fn test_auto_load() {
         let dir = std::env::temp_dir().join(format!("ontodb_tls_test5_{}", std::process::id()));
-        let generated = generate_self_signed_cert(&dir).unwrap();
+        let _generated = generate_self_signed_cert(&dir).unwrap();
 
         let mut config = TlsConfig::new(
             PathBuf::from("/tmp/cert.pem"),

@@ -422,6 +422,12 @@ pub struct InMemoryCdcPublisher {
     events: parking_lot::Mutex<Vec<CdcEvent>>,
 }
 
+impl Default for InMemoryCdcPublisher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InMemoryCdcPublisher {
     pub fn new() -> Self {
         Self {
@@ -789,13 +795,13 @@ mod tests {
 
         // Flush multiple times to exhaust retries
         std::thread::sleep(std::time::Duration::from_millis(20));
-        resilient.flush();
+        let _ = resilient.flush();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        resilient.flush();
+        let _ = resilient.flush();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        resilient.flush();
+        let _ = resilient.flush();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        resilient.flush();
+        let _ = resilient.flush();
 
         // After max retries, event should move to DLQ
         // (buffer may still have it if retry delay hasn't elapsed)
@@ -859,7 +865,7 @@ mod tests {
         // Publish and flush to exhaust retries
         resilient.publish(&event).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        resilient.flush();
+        let _ = resilient.flush();
 
         // Get dead letters
         let dl = resilient.get_dead_letters();

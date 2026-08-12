@@ -9,7 +9,7 @@ interface QueryResult {
 }
 
 export function QueryConsole() {
-  const [sql, setSql] = useState('SELECT * FROM users LIMIT 10')
+  const [sql, setSql] = useState('SELECT * FROM Person LIMIT 10')
   const [results, setResults] = useState<QueryResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -143,12 +143,44 @@ export function QueryConsole() {
 
         {/* Editor + Results */}
         <div className="flex-1 flex flex-col min-h-0">
+          {/* Quick actions */}
+          <div className="flex items-center gap-1 px-3 py-1.5 border-b border-gray-800 bg-gray-900/50 overflow-x-auto">
+            <span className="text-gray-500 text-xs mr-1 shrink-0">OntoQL:</span>
+            {[
+              { label: 'CREATE CLASS', sql: 'CREATE CLASS ' },
+              { label: 'EXTENDS', sql: 'CREATE CLASS  EXTENDS ' },
+              { label: 'INSERT SET', sql: 'INSERT INTO  SET  = ' },
+              { label: 'SELECT', sql: 'SELECT * FROM ' },
+              { label: 'EXPLAIN', sql: 'EXPLAIN SELECT * FROM ' },
+              { label: 'BEGIN', sql: 'BEGIN' },
+              { label: 'COMMIT', sql: 'COMMIT' },
+            ].map(({ label, sql: insertSql }) => (
+              <button
+                key={label}
+                onClick={() => setSql(prev => prev + insertSql)}
+                className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-green-400 text-xs rounded font-mono transition-colors shrink-0"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <textarea
             value={sql}
             onChange={(e) => setSql(e.target.value)}
             onKeyDown={handleKeyDown}
             className="h-40 bg-gray-950 text-green-400 font-mono text-sm p-4 resize-none outline-none border-b border-gray-800"
-            placeholder="输入 SQL 查询..."
+            placeholder={`输入 SQL 或 OntoQL 查询...
+
+OntoQL 示例:
+  CREATE CLASS Person
+  CREATE CLASS Employee EXTENDS Person
+  INSERT INTO Person SET name = "Alice", age = 30
+  SELECT * FROM Person WHERE age > 18
+  EXPLAIN SELECT * FROM Person
+
+SQL 示例:
+  SELECT * FROM Person LIMIT 10
+  INSERT INTO Person (name, age) VALUES ('Bob', 25)`}
             spellCheck={false}
           />
 
@@ -199,10 +231,26 @@ export function QueryConsole() {
             )}
 
             {!error && !results && !loading && (
-              <div className="flex flex-col items-center justify-center h-full text-gray-500 gap-2">
+              <div className="flex flex-col items-center justify-center h-full text-gray-500 gap-4">
                 <div className="text-4xl">💻</div>
                 <div className="text-sm">按 Ctrl+Enter 执行查询</div>
-                <div className="text-xs text-gray-600">支持 SQL、SPARQL、GRAPH TRAVERSE</div>
+                <div className="text-xs text-gray-600">支持 OntoQL · SQL · SPARQL · GRAPH TRAVERSE</div>
+                <div className="flex flex-wrap gap-2 justify-center max-w-lg">
+                  {[
+                    'CREATE CLASS Person',
+                    'SELECT * FROM Person',
+                    'INSERT INTO Person SET name = "Alice"',
+                    'EXPLAIN SELECT * FROM Person',
+                  ].map((example) => (
+                    <button
+                      key={example}
+                      onClick={() => setSql(example)}
+                      className="px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-green-400 text-xs rounded font-mono transition-colors"
+                    >
+                      {example}
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
           </div>

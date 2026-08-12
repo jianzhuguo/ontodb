@@ -127,15 +127,28 @@ a { color: var(--accent); text-decoration: none; }
         <div class="editor-toolbar">
           <button onclick="executeQuery()">Run Query</button>
           <button class="secondary" onclick="editor.setValue('')">Clear</button>
+          <span style="color:var(--text-dim);font-size:11px;margin-left:4px">OntoQL:</span>
+          <button class="secondary" onclick="editor.setValue('CREATE CLASS ')">CLASS</button>
+          <button class="secondary" onclick="editor.setValue('CREATE CLASS  EXTENDS ')">EXTENDS</button>
+          <button class="secondary" onclick="editor.setValue('INSERT INTO  SET  = ')">INSERT SET</button>
           <button class="secondary" onclick="editor.setValue('SELECT * FROM ')">SELECT</button>
-          <button class="secondary" onclick="editor.setValue('INSERT INTO ')">INSERT</button>
-          <button class="secondary" onclick="editor.setValue('CREATE CLASS ')">CREATE</button>
+          <button class="secondary" onclick="editor.setValue('EXPLAIN SELECT * FROM ')">EXPLAIN</button>
+          <span style="color:var(--text-dim);font-size:11px;margin-left:8px">Triple:</span>
+          <button class="secondary" onclick="editor.setValue('INSERT TRIPLE SET subject = &quot;&quot;, predicate = &quot;&quot;, object = &quot;&quot;')">INS</button>
+          <button class="secondary" onclick="editor.setValue('SELECT TRIPLE')">QUERY</button>
+          <button class="secondary" onclick="editor.setValue('SELECT TRIPLE WHERE subject = &quot;&quot;')">BY S</button>
+          <button class="secondary" onclick="editor.setValue('SELECT TRIPLE WHERE predicate = &quot;&quot;')">BY P</button>
           <span class="info" id="queryInfo">Ctrl+Enter to run</span>
         </div>
         <textarea id="editor"></textarea>
       </div>
       <div class="results-area" id="results">
-        <div class="message">Enter a query and press Run or Ctrl+Enter</div>
+        <div class="message">
+          Enter a query and press Run or Ctrl+Enter<br>
+          <span style="font-size:12px;color:var(--text-dim);margin-top:8px;display:inline-block">
+            Supports <b>OntoQL</b> (CREATE CLASS, INSERT SET, SELECT, EXPLAIN) and SQL
+          </span>
+        </div>
       </div>
     </div>
 

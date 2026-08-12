@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["OntoDB Team"]
@@ -28,6 +28,7 @@ onto-storage  = { path = "crates/onto-storage" }
 onto-ontology = { path = "crates/onto-ontology" }
 onto-query    = { path = "crates/onto-query" }
 onto-raft     = { path = "crates/onto-raft" }
+onto-sharding = { path = "crates/onto-sharding" }
 onto-graph     = { path = "crates/onto-graph" }
 onto-enterprise = { path = "crates/onto-enterprise" }
 

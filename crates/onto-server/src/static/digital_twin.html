@@ -796,127 +796,234 @@ async function loadMultimodal(){
 
 // ── Ontology reasoning chain visualization ──
 async function loadOntologyGraph(){
-  // Load class hierarchy
-  var classes=[];
-  try{var r=await q('SELECT * FROM __ontology_classes__');classes=r.data||[];}catch(e){}
+  // Load ontology from /api/schema
+  var schemaData=null;
+  try{
+    var resp=await fetch('/api/schema');
+    var r=await resp.json();
+    schemaData=r.data||r;
+  }catch(e){console.error('Schema load error:',e);}
 
-  // Load properties
-  var props=[];
-  try{var r=await q('SELECT * FROM __ontology_properties__');props=r.data||[];}catch(e){}
-
-  // Load rdf:type assertions
-  var types=[];
-  try{var r=await q('SELECT * FROM __rdf_type__');types=r.data||[];}catch(e){}
-
-  // Render class hierarchy as a tree
+  var ontologies=schemaData?schemaData.ontologies||[]:[];
   var ch=document.getElementById('classHierarchy');
-  if(classes.length>0){
-    // Build tree structure
-    var tree={};
-    var roots=[];
-    classes.forEach(function(c){
-      var name=c.uri.split('#').pop()||c.uri;
-      tree[name]={label:c.label||name,parent:c.parent_uri?c.parent_uri.split('#').pop():null,children:[]};
+
+  if(ontologies.length>0){
+    // Build tree from ontology classes
+    var allClasses={};
+    ontologies.forEach(function(ont){
+      var classes=ont.classes||{};
+      for(var name in classes){
+        var cls=classes[name];
+        allClasses[name]={
+          name:name,
+          superclasses:cls.superclasses||[],
+          properties:cls.properties||[],
+          type:cls.type||'Normal'
+        };
+      }
     });
-    for(var name in tree){
-      if(tree[name].parent&&tree[tree[name].parent]){
-        tree[tree[name].parent].children.push(name);
-      }else if(!tree[name].parent){
+
+    // Find roots (no superclasses)
+    var roots=[];
+    for(var name in allClasses){
+      if(!allClasses[name].superclasses||allClasses[name].superclasses.length===0){
         roots.push(name);
       }
     }
+
+    // Build children map
+    for(var name in allClasses){
+      allClasses[name].children=[];
+    }
+    for(var name in allClasses){
+      var sc=allClasses[name].superclasses;
+      if(sc){
+        sc.forEach(function(parent){
+          if(allClasses[parent])allClasses[parent].children.push(name);
+        });
+      }
+    }
+
+    // Count instances per class
+    var instanceCounts={};
+    for(var name in allClasses){
+      try{
+        var r=await q('SELECT * FROM '+name);
+        instanceCounts[name]=(r.data||[]).length;
+      }catch(e){instanceCounts[name]=0;}
+    }
+
     // Render tree
     function renderTree(name,depth){
-      var node=tree[name];if(!node)return '';
+      var node=allClasses[name];if(!node)return '';
       var indent='　'.repeat(depth);
       var arrow=depth>0?'└─ ':'';
       var icon=depth===0?'●':'○';
       var color=depth===0?'var(--accent)':depth===1?'var(--purple)':depth===2?'var(--green)':'var(--dim)';
-      // Count instances
-      var instanceCount=types.filter(function(t){return t.class_uri&&t.class_uri.indexOf(name)!==-1;}).length;
-      var instStr=instanceCount>0?' <span style="color:var(--yellow)">('+instanceCount+' 实例)</span>':'';
-      var html='<div style="padding:2px 0;font-size:11px;color:'+color+'">'+indent+arrow+icon+' '+node.label+instStr+'</div>';
+      var count=instanceCounts[name]||0;
+      var instStr=count>0?' <span style="color:var(--yellow)">('+count+' 实例)</span>':'';
+      var superStr=node.superclasses&&node.superclasses.length>0?' <span style="color:var(--dim);font-size:9px">← '+node.superclasses.join(', ')+'</span>':'';
+      var html='<div style="padding:2px 0;font-size:11px;color:'+color+'">'+indent+arrow+icon+' '+name+instStr+superStr+'</div>';
       node.children.forEach(function(child){html+=renderTree(child,depth+1);});
       return html;
     }
     var treeHtml='';
     roots.forEach(function(r){treeHtml+=renderTree(r,0);});
     ch.innerHTML=treeHtml;
-  }else{ch.innerHTML='<div style="color:var(--dim);font-size:11px">未加载到本体数据</div>';}
 
-  // Render property relations
-  var pr=document.getElementById('propRelations');
-  if(props.length>0){
+    // Render property relations
+    var pr=document.getElementById('propRelations');
     var propHtml='';
-    props.forEach(function(p){
-      var name=p.uri.split('#').pop()||p.uri;
-      var domain=p.domain_uri?p.domain_uri.split('#').pop():'?';
-      var range=p.range_uri?p.range_uri.split('#').pop():'?';
-      var type=p.property_type||'object';
-      propHtml+='<div style="display:flex;align-items:center;gap:6px;padding:3px 0;font-size:10px">';
-      propHtml+='<span style="color:var(--accent);min-width:50px">'+name+'</span>';
-      propHtml+='<span style="color:var(--dim)">'+domain+'</span>';
-      propHtml+='<span style="color:var(--accent)">→</span>';
-      propHtml+='<span style="color:var(--dim)">'+range+'</span>';
-      propHtml+='<span style="color:var(--dim);font-size:9px">('+type+')</span>';
-      propHtml+='</div>';
+    ontologies.forEach(function(ont){
+      var props=ont.properties||{};
+      for(var pname in props){
+        var p=props[pname];
+        propHtml+='<div style="display:flex;align-items:center;gap:6px;padding:3px 0;font-size:10px">';
+        propHtml+='<span style="color:var(--accent);min-width:80px">'+pname+'</span>';
+        propHtml+='<span style="color:var(--dim)">'+(p.domain||'?')+'</span>';
+        propHtml+='<span style="color:var(--accent)">→</span>';
+        propHtml+='<span style="color:var(--dim)">'+(p.range||'?')+'</span>';
+        var tags=[];
+        if(p.is_transitive)tags.push('T');
+        if(p.is_symmetric)tags.push('S');
+        if(p.is_functional)tags.push('F');
+        if(tags.length>0)propHtml+='<span style="color:var(--yellow);font-size:9px">['+tags.join('')+']</span>';
+        propHtml+='</div>';
+      }
     });
-    pr.innerHTML=propHtml;
-  }else{pr.innerHTML='<div style="color:var(--dim);font-size:11px">无属性定义</div>';}
+    pr.innerHTML=propHtml||'<div style="color:var(--dim);font-size:11px">无属性定义</div>';
+
+  }else{
+    ch.innerHTML='<div style="color:var(--dim);font-size:11px">未加载到本体数据</div>';
+  }
 }
 
 async function runReasoning(){
   var rr=document.getElementById('reasoningResults');
   rr.innerHTML='<div style="color:var(--dim);font-size:11px">推理中...</div>';
 
-  // Load data
-  var classes=[],types=[],subProps=[];
-  try{var r=await q('SELECT * FROM __ontology_classes__');classes=r.data||[];}catch(e){console.error(e);}
-  try{var r=await q('SELECT * FROM __rdf_type__');types=r.data||[];}catch(e){console.error(e);}
-  try{var r=await q('SELECT * FROM __rdfs_subproperty__');subProps=r.data||[];}catch(e){console.error(e);}
+  // Load ontology from /api/schema
+  var schemaData=null;
+  try{
+    var resp=await fetch('/api/schema');
+    var r=await resp.json();
+    schemaData=r.data||r;
+  }catch(e){console.error('Schema load error:',e);}
 
-  if(classes.length===0){
-    rr.innerHTML='<div style="color:var(--red);font-size:11px">未找到本体数据，请先运行本体初始化</div>';
+  var ontologies=schemaData?schemaData.ontologies||[]:[];
+  if(ontologies.length===0){
+    rr.innerHTML='<div style="color:var(--red);font-size:11px">未找到本体数据</div>';
     return;
   }
 
-  // Build class hierarchy
+  // Build unified class hierarchy from all ontologies
   var classMap={};
-  classes.forEach(function(c){
-    var name=c.uri?c.uri.split('#').pop():c.uri;
-    classMap[name]={label:c.label||name,parent:c.parent_uri?c.parent_uri.split('#').pop():null,uri:c.uri};
+  ontologies.forEach(function(ont){
+    var classes=ont.classes||{};
+    for(var name in classes){
+      if(!classMap[name]){
+        var cls=classes[name];
+        classMap[name]={
+          name:name,
+          superclasses:cls.superclasses||[],
+          properties:cls.properties||[]
+        };
+      }
+    }
   });
+
+  // Find inheritance relationships (child -> parent)
+  var inheritancePairs=[];
+  for(var childName in classMap){
+    var supers=classMap[childName].superclasses||[];
+    supers.forEach(function(parentName){
+      if(classMap[parentName]){
+        inheritancePairs.push({child:childName,parent:parentName});
+      }
+    });
+  }
 
   // === Cax-sco reasoning: x type A, A subClassOf B => x type B ===
   var inferred=[];
   var derivations=[];
 
-  types.forEach(function(t){
-    var className=t.class_uri?t.class_uri.split('#').pop():null;
-    if(!className||!classMap[className])return;
-    var current=className;
-    var chain=[className];
-    while(classMap[current]&&classMap[current].parent){
-      var parent=classMap[current].parent;
-      if(!classMap[parent])break;
-      var exists=types.some(function(x){return x.subject===t.subject&&x.class_uri&&x.class_uri.indexOf(parent)!==-1;});
-      if(!exists){
-        inferred.push({subject:t.subject,predicate:'rdf:type',object:parent});
-        derivations.push({rule:'Cax-sco',subject:t.subject,from:className,to:parent,chain:chain.concat(parent)});
-      }
-      chain.push(parent);
-      current=parent;
-    }
-  });
+  // For each inheritance pair, propagate instances
+  for(var i=0;i<inheritancePairs.length;i++){
+    var pair=inheritancePairs[i];
+    var childClass=pair.child;
+    var parentClass=pair.parent;
 
-  // === Prp-spo reasoning ===
-  subProps.forEach(function(sp){
-    var sub=sp.sub_property_uri?sp.sub_property_uri.split('#').pop():null;
-    var sup=sp.super_property_uri?sp.super_property_uri.split('#').pop():null;
-    if(sub&&sup){
-      derivations.push({rule:'Prp-spo',subject:sub,from:sub,to:sup,chain:[sub,sup]});
+    // Get instances of child class
+    var instances=[];
+    try{var r=await q('SELECT * FROM '+childClass);instances=r.data||[];}catch(e){continue;}
+
+    // Get instances of parent class to check for duplicates
+    var parentInstances=[];
+    try{var r=await q('SELECT * FROM '+parentClass);parentInstances=r.data||[];}catch(e){}
+    var parentPks=new Set(parentInstances.map(function(p){return p.__pk__;}));
+
+    instances.forEach(function(inst){
+      var pk=inst.__pk__||'';
+      if(!pk)return;
+
+      // Check if already in parent class
+      if(!parentPks.has(pk)){
+        inferred.push({subject:pk,predicate:'rdf:type',object:parentClass});
+        derivations.push({
+          rule:'Cax-sco',
+          subject:pk,
+          subjectName:inst.name||inst.emp_id||inst.code||pk.split('::')[1],
+          from:childClass,
+          to:parentClass,
+          chain:[childClass,parentClass]
+        });
+      }
+    });
+  }
+
+  // Walk up full hierarchy chain (e.g., Dog -> Animal, and if Animal -> Living, then Dog -> Living)
+  // Repeat until no new inferences
+  var maxDepth=5;
+  for(var depth=0;depth<maxDepth;depth++){
+    var newInferred=[];
+    for(var i=0;i<inferred.length;i++){
+      var inf=inferred[i];
+      var superClass=inf.object;
+      var supers=classMap[superClass]?classMap[superClass].superclasses||[]:[];
+      supers.forEach(function(parentClass){
+        if(!classMap[parentClass])return;
+        var alreadyExists=inferred.some(function(x){return x.subject===inf.subject&&x.object===parentClass;});
+        if(!alreadyExists){
+          newInferred.push({subject:inf.subject,predicate:'rdf:type',object:parentClass});
+          derivations.push({
+            rule:'Cax-sco (transitive)',
+            subject:inf.subject,
+            subjectName:inf.subjectName,
+            from:superClass,
+            to:parentClass,
+            chain:[inf.from,superClass,parentClass]
+          });
+        }
+      });
+    }
+    if(newInferred.length===0)break;
+    inferred=inferred.concat(newInferred);
+  }
+
+  // === Prp-spo reasoning (subproperty propagation) ===
+  var propDerivations=[];
+  ontologies.forEach(function(ont){
+    var props=ont.properties||{};
+    for(var pname in props){
+      var p=props[pname];
+      if(p.subproperty_of&&p.subproperty_of.length>0){
+        p.subproperty_of.forEach(function(superProp){
+          propDerivations.push({rule:'Prp-spo',subject:pname,from:pname,to:superProp,chain:[pname,superProp]});
+        });
+      }
     }
   });
+  derivations=derivations.concat(propDerivations);
 
   // === Render results ===
   var html='';
@@ -930,8 +1037,8 @@ async function runReasoning(){
   html+='<div style="font-size:18px;font-weight:700;color:var(--accent)">'+derivations.length+'</div>';
   html+='<div style="font-size:9px;color:var(--dim)">推理链</div></div>';
   html+='<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;flex:1;text-align:center">';
-  html+='<div style="font-size:18px;font-weight:700;color:var(--purple)">2</div>';
-  html+='<div style="font-size:9px;color:var(--dim)">推理规则</div></div>';
+  html+='<div style="font-size:18px;font-weight:700;color:var(--purple)">'+inheritancePairs.length+'</div>';
+  html+='<div style="font-size:9px;color:var(--dim)">继承关系</div></div>';
   html+='</div>';
 
   // Inference chain visualization canvas
@@ -941,12 +1048,13 @@ async function runReasoning(){
   // Derivation details
   html+='<div style="font-size:10px;font-weight:700;color:var(--dim);margin-bottom:6px">推理推导详情</div>';
   derivations.forEach(function(d,i){
-    var ruleColor=d.rule==='Cax-sco'?'var(--accent)':'var(--purple)';
+    var ruleColor=d.rule.indexOf('Cax-sco')>=0?'var(--accent)':'var(--purple)';
     var arrow='→';
+    var displayName=d.subjectName||d.subject;
     html+='<div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:6px">';
     html+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">';
     html+='<span style="background:'+ruleColor+'20;color:'+ruleColor+';font-size:9px;padding:2px 8px;border-radius:3px;font-weight:700">'+d.rule+'</span>';
-    html+='<span style="color:var(--text);font-size:11px;font-weight:600">'+d.subject+'</span>';
+    html+='<span style="color:var(--text);font-size:11px;font-weight:600">'+displayName+'</span>';
     html+='<span style="color:var(--dim)">'+arrow+'</span>';
     html+='<span style="color:var(--green)">'+d.to+'</span>';
     html+='</div>';
@@ -957,17 +1065,17 @@ async function runReasoning(){
       var bg=isFirst?'var(--accent)20':isLast?'var(--green)20':'var(--dim)10';
       var col=isFirst?'var(--accent)':isLast?'var(--green)':'var(--dim)';
       var border=isFirst?'var(--accent)':isLast?'var(--green)':'var(--border)';
-      html+='<span style="background:'+bg+';border:1px solid '+border+';color:'+col+';font-size:10px;padding:2px 8px;border-radius:4px">'+(classMap[c]?classMap[c].label:c)+'</span>';
+      html+='<span style="background:'+bg+';border:1px solid '+border+';color:'+col+';font-size:10px;padding:2px 8px;border-radius:4px">'+(classMap[c]?classMap[c].name:c)+'</span>';
       if(ci<d.chain.length-1)html+='<span style="color:var(--dim);font-size:12px">→</span>';
     });
     html+='</div>';
     // Premises
-    if(d.rule==='Cax-sco'){
-      html+='<div style="font-size:9px;color:var(--dim);margin-top:4px">前提: <span style="color:var(--text)">'+d.subject+' ∈ '+d.from+'</span> ∧ <span style="color:var(--text)">'+d.from+' ⊑ '+d.to+'</span></div>';
-      html+='<div style="font-size:9px;color:var(--green);margin-top:2px">结论: <span style="font-weight:600">'+d.subject+' ∈ '+d.to+'</span></div>';
+    if(d.rule.indexOf('Cax-sco')>=0){
+      html+='<div style="font-size:9px;color:var(--dim);margin-top:4px">前提: <span style="color:var(--text)">'+displayName+' ∈ '+d.from+'</span> ∧ <span style="color:var(--text)">'+d.from+' ⊑ '+d.to+'</span></div>';
+      html+='<div style="font-size:9px;color:var(--green);margin-top:2px">结论: <span style="font-weight:600">'+displayName+' ∈ '+d.to+'</span></div>';
     }else{
-      html+='<div style="font-size:9px;color:var(--dim);margin-top:4px">前提: <span style="color:var(--text)">? '+d.subject+' ?</span> ∧ <span style="color:var(--text)">'+d.from+' ⊑ '+d.to+'</span></div>';
-      html+='<div style="font-size:9px;color:var(--green);margin-top:2px">结论: <span style="font-weight:600">? '+d.to+' ?</span> (若 ? '+d.subject+' ?)</div>';
+      html+='<div style="font-size:9px;color:var(--dim);margin-top:4px">前提: <span style="color:var(--text)">? '+displayName+' ?</span> ∧ <span style="color:var(--text)">'+d.from+' ⊑ '+d.to+'</span></div>';
+      html+='<div style="font-size:9px;color:var(--green);margin-top:2px">结论: <span style="font-weight:600">? '+d.to+' ?</span> (若 ? '+displayName+' ?)</div>';
     }
     html+='</div>';
   });

@@ -1,4 +1,4 @@
-﻿//! SSTable (Sorted String Table): On-disk sorted key-value storage.
+//! SSTable (Sorted String Table): On-disk sorted key-value storage.
 //!
 //! Format:
 //! [data blocks][index block][bloom filter][footer]
@@ -81,6 +81,12 @@ pub struct SsTableBuilder {
     compression_level: i32,
 }
 
+impl Default for SsTableBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SsTableBuilder {
     pub fn new() -> Self {
         Self {
@@ -108,7 +114,7 @@ impl SsTableBuilder {
         self.keys_for_bloom.push(entry.key.clone());
 
         // Record restart point
-        if self.entry_count_in_block % RESTART_INTERVAL == 0 {
+        if self.entry_count_in_block.is_multiple_of(RESTART_INTERVAL) {
             self.restart_points
                 .push(self.current_block.len() as u32);
         }
@@ -133,7 +139,7 @@ impl SsTableBuilder {
     /// no longer need the Entry after this call.
     pub fn add_owned(&mut self, entry: Entry) {
         // Record restart point
-        if self.entry_count_in_block % RESTART_INTERVAL == 0 {
+        if self.entry_count_in_block.is_multiple_of(RESTART_INTERVAL) {
             self.restart_points
                 .push(self.current_block.len() as u32);
         }
@@ -497,7 +503,7 @@ impl SsTable {
         // Decompress if the SSTable uses compression
         let block_data = if self.compressed {
             zstd::decode_all(buf.as_slice())
-                .map_err(|e| CoreError::corruption(&format!("zstd decompression failed: {}", e)))?
+                .map_err(|e| CoreError::corruption(format!("zstd decompression failed: {}", e)))?
         } else {
             buf
         };
@@ -881,7 +887,7 @@ mod tests {
         builder.build(&path).expect("should be valid");
 
         // Open and read
-        let mut sst = SsTable::open(&path).expect("should be valid");
+        let sst = SsTable::open(&path).expect("should be valid");
 
         // Point lookups
         let (val, _) = sst.get(b"key_0050").expect("should be valid").expect("should be valid");
@@ -906,7 +912,7 @@ mod tests {
         }
         builder.build(&path).expect("should be valid");
 
-        let mut sst = SsTable::open(&path).expect("should be valid");
+        let sst = SsTable::open(&path).expect("should be valid");
         let mut iter = sst.iter().expect("should be valid");
 
         let mut count = 0;
@@ -936,7 +942,7 @@ mod tests {
         builder.build(&path).expect("should be valid");
 
         // Open and read
-        let mut sst = SsTable::open(&path).expect("should be valid");
+        let sst = SsTable::open(&path).expect("should be valid");
         assert!(sst.compressed, "SSTable should be marked as compressed");
 
         // Point lookups
@@ -964,7 +970,7 @@ mod tests {
         }
         builder.build(&path).expect("should be valid");
 
-        let mut sst = SsTable::open(&path).expect("should be valid");
+        let sst = SsTable::open(&path).expect("should be valid");
         let mut iter = sst.iter().expect("should be valid");
 
         let mut count = 0;
@@ -1036,7 +1042,7 @@ mod tests {
         }
         builder.build(&path).expect("should be valid");
 
-        let mut sst = SsTable::open(&path).expect("should be valid");
+        let sst = SsTable::open(&path).expect("should be valid");
 
         // Check put entries
         let result = sst.get_full(b"key_0001").expect("should be valid").expect("should be valid");

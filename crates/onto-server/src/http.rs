@@ -10,7 +10,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use onto_query::{QueryAst, QueryExecutor, QueryParser};
+use onto_query::{OntoQLParser, QueryAst, QueryExecutor, QueryParser};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -55,7 +55,7 @@ fn validate_filter(filter: &str) -> Result<(), String> {
         return Err("filter must not contain line comments".into());
     }
     // Reject dangerous SQL keywords (case-insensitive, Unicode-aware word boundaries)
-    let upper: String = filter.chars().map(|c| c.to_uppercase()).flatten().collect();
+    let upper: String = filter.chars().flat_map(|c| c.to_uppercase()).collect();
     let upper_chars: Vec<char> = upper.chars().collect();
     let forbidden = [
         "DROP", "DELETE", "INSERT", "UPDATE", "UNION",
@@ -117,8 +117,8 @@ fn sanitize_error(err: &str) -> String {
     if lower.contains("parse error") || lower.contains("syntax error") || lower.contains("invalid") {
         // Sanitize: remove any Windows/Unix path patterns
         let sanitized: String = err
-            .split(|c: char| c == '\\' || c == '/')
-            .last()
+            .split(['\\', '/'])
+            .next_back()
             .unwrap_or(err)
             .to_string();
         return sanitized;
@@ -280,7 +280,7 @@ impl<T: Serialize> ApiResponse<T> {
 /// "*" = allow all origins (NOT recommended for production).
 fn build_cors_layer(origins: &str) -> CorsLayer {
     if origins.trim() == "*" {
-        tracing::warn!("CORS: allowing ALL origins — do NOT use in production");
+        tracing::warn!("CORS: allowing ALL origins �?do NOT use in production");
         // Use Any origin without credentials (not permissive() which allows credentials)
         CorsLayer::new()
             .allow_origin(tower_http::cors::Any)
@@ -288,7 +288,7 @@ fn build_cors_layer(origins: &str) -> CorsLayer {
             .allow_headers(tower_http::cors::Any)
             .allow_credentials(false)
     } else if origins.trim().is_empty() {
-        // Same-origin only — no cross-origin requests allowed
+        // Same-origin only �?no cross-origin requests allowed
         CorsLayer::new()
             .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PUT, axum::http::Method::DELETE])
             .allow_headers(tower_http::cors::Any)
@@ -340,6 +340,24 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/backup/incremental", post(backup_incremental))
         .route("/api/backup/verify", post(verify_backup_endpoint))
         .route("/api/flush", post(flush))
+        // Sharding configuration
+        .route("/api/sharding/config", get(get_sharding_config).put(update_sharding_config))
+        .route("/api/sharding/shard", post(add_shard))
+        .route("/api/sharding/class", post(assign_class_shard))
+        .route("/api/sharding/status", get(get_sharding_status))
+        // Migration endpoints
+        .route("/api/sharding/migrate", post(start_migration))
+        .route("/api/sharding/migrate/progress", put(update_migration_progress))
+        .route("/api/sharding/migrate/complete", post(complete_migration))
+        .route("/api/sharding/migrate/cancel", post(cancel_migration))
+        .route("/api/sharding/migrations", get(list_migrations))
+        // Rebalance endpoints
+        .route("/api/sharding/rebalance", post(rebalance_shards))
+        // Scale endpoints
+        .route("/api/sharding/scale/add", post(add_shard_and_rebalance))
+        .route("/api/sharding/scale/remove", post(remove_shard))
+        // Split endpoints
+        .route("/api/sharding/split", post(split_shard))
         // API documentation
         .route("/api/docs", get(swagger_ui))
         .route("/api/openapi.json", get(openapi_spec))
@@ -400,6 +418,24 @@ pub fn build_router_with_auth(
         .route("/api/backup/incremental", post(backup_incremental))
         .route("/api/backup/verify", post(verify_backup_endpoint))
         .route("/api/flush", post(flush))
+        // Sharding configuration (Admin only)
+        .route("/api/sharding/config", get(get_sharding_config).put(update_sharding_config))
+        .route("/api/sharding/shard", post(add_shard))
+        .route("/api/sharding/class", post(assign_class_shard))
+        .route("/api/sharding/status", get(get_sharding_status))
+        // Migration endpoints (Admin only)
+        .route("/api/sharding/migrate", post(start_migration))
+        .route("/api/sharding/migrate/progress", put(update_migration_progress))
+        .route("/api/sharding/migrate/complete", post(complete_migration))
+        .route("/api/sharding/migrate/cancel", post(cancel_migration))
+        .route("/api/sharding/migrations", get(list_migrations))
+        // Rebalance endpoints (Admin only)
+        .route("/api/sharding/rebalance", post(rebalance_shards))
+        // Scale endpoints (Admin only)
+        .route("/api/sharding/scale/add", post(add_shard_and_rebalance))
+        .route("/api/sharding/scale/remove", post(remove_shard))
+        // Split endpoints (Admin only)
+        .route("/api/sharding/split", post(split_shard))
         // API documentation and console (no auth required)
         .route("/api/docs", get(swagger_ui))
         .route("/api/openapi.json", get(openapi_spec))
@@ -439,7 +475,7 @@ async fn security_headers_middleware(
     headers.insert("referrer-policy", "strict-origin-when-cross-origin".parse().expect("should be valid"));
     headers.insert(
         "content-security-policy",
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'".parse().expect("should be valid"),
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'".parse().expect("should be valid"),
     );
     response
 }
@@ -496,7 +532,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 async fn health_ready(State(state): State<AppState>) -> impl IntoResponse {
     // Check: engine stats available (storage alive)
     let engine_ok = state.executor.engine_stats().is_some();
-    // Check: parser works (query engine alive) — use a query syntax that always parses
+    // Check: parser works (query engine alive) �?use a query syntax that always parses
     let parser_ok = QueryParser::parse("SELECT * FROM health_check").is_ok()
         || QueryParser::parse("CREATE CLASS health_check").is_ok();
 
@@ -627,14 +663,119 @@ async fn execute_query(
     let client_ip = addr.ip().to_string();
 
     let query = req.query.trim_end_matches(';').trim();
-    let ast = match QueryParser::parse(query) {
-        Ok(ast) => ast,
-        Err(e) => {
-            state.metrics.record_parse_error();
-            return (
-                StatusCode::BAD_REQUEST,
-                PrettyJson(ApiResponse::<Value>::error(format!("Parse error: {}", e)), false),
-            );
+    // Try OntoQL parser first, fall back to SQL parser
+    let ast = match OntoQLParser::parse(query) {
+        Ok(ontoql_ast) => {
+            // Handle triple operations directly via TripleStore
+            match &ontoql_ast {
+                onto_query::OntoQLAst::InsertTriple { subject, predicate, object } => {
+                    if let Some(ts) = state.executor.triple_store() {
+                        match ts.add_triple(subject, predicate, object) {
+                            Ok(()) => {
+                                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                                state.metrics.record_query("INSERT_TRIPLE", elapsed_ms / 1000.0, true);
+                                return (
+                                    StatusCode::OK,
+                                    PrettyJson(ApiResponse::success(json!({"message": "Triple inserted"}), elapsed_ms), req.pretty),
+                                );
+                            }
+                            Err(e) => {
+                                return (StatusCode::INTERNAL_SERVER_ERROR, PrettyJson(ApiResponse::<Value>::error(e), false));
+                            }
+                        }
+                    } else {
+                        return (StatusCode::BAD_REQUEST, PrettyJson(ApiResponse::<Value>::error("TripleStore not configured".to_string()), false));
+                    }
+                }
+                onto_query::OntoQLAst::InsertTriples { triples } => {
+                    if let Some(ts) = state.executor.triple_store() {
+                        let count = triples.len();
+                        match ts.add_triples(&triples.iter().map(|(s,p,o)| (s.clone(), p.clone(), o.clone())).collect::<Vec<_>>()) {
+                            Ok(_) => {
+                                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                                state.metrics.record_query("INSERT_TRIPLES", elapsed_ms / 1000.0, true);
+                                return (
+                                    StatusCode::OK,
+                                    PrettyJson(ApiResponse::success(json!({"message": format!("{} triples inserted", count)}), elapsed_ms), req.pretty),
+                                );
+                            }
+                            Err(e) => {
+                                return (StatusCode::INTERNAL_SERVER_ERROR, PrettyJson(ApiResponse::<Value>::error(e), false));
+                            }
+                        }
+                    } else {
+                        return (StatusCode::BAD_REQUEST, PrettyJson(ApiResponse::<Value>::error("TripleStore not configured".to_string()), false));
+                    }
+                }
+                onto_query::OntoQLAst::DeleteTriple { subject, predicate, object } => {
+                    if let Some(ts) = state.executor.triple_store() {
+                        match ts.remove_triple(subject, predicate, object) {
+                            Ok(()) => {
+                                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                                state.metrics.record_query("DELETE_TRIPLE", elapsed_ms / 1000.0, true);
+                                return (
+                                    StatusCode::OK,
+                                    PrettyJson(ApiResponse::success(json!({"message": "Triple deleted"}), elapsed_ms), req.pretty),
+                                );
+                            }
+                            Err(e) => {
+                                return (StatusCode::INTERNAL_SERVER_ERROR, PrettyJson(ApiResponse::<Value>::error(e), false));
+                            }
+                        }
+                    } else {
+                        return (StatusCode::BAD_REQUEST, PrettyJson(ApiResponse::<Value>::error("TripleStore not configured".to_string()), false));
+                    }
+                }
+                onto_query::OntoQLAst::SelectTriples { subject, predicate, object, limit } => {
+                    let results = state.executor.query_triples(
+                        subject.as_deref(),
+                        predicate.as_deref(),
+                        object.as_deref(),
+                    );
+                    match results {
+                        Ok(mut rows) => {
+                            if let Some(l) = limit {
+                                rows.truncate(*l);
+                            }
+                            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                            state.metrics.record_query("SELECT_TRIPLE", elapsed_ms / 1000.0, true);
+                            return (
+                                StatusCode::OK,
+                                PrettyJson(ApiResponse::success(json!(rows), elapsed_ms), req.pretty),
+                            );
+                        }
+                        Err(e) => {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, PrettyJson(ApiResponse::<Value>::error(e.to_string()), false));
+                        }
+                    }
+                }
+                _ => {
+                    // Non-triple OntoQL operation - translate to QueryAst
+                    match ontoql_ast.to_query_ast() {
+                        Ok(ast) => ast,
+                        Err(e) => {
+                            state.metrics.record_parse_error();
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                PrettyJson(ApiResponse::<Value>::error(format!("OntoQL translation error: {}", e)), false),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            // OntoQL parser didn't recognize it �?try SQL parser
+            match QueryParser::parse(query) {
+                Ok(ast) => ast,
+                Err(e) => {
+                    state.metrics.record_parse_error();
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        PrettyJson(ApiResponse::<Value>::error(format!("Parse error: {}", e)), false),
+                    );
+                }
+            }
         }
     };
 
@@ -658,7 +799,7 @@ async fn execute_query(
         Err(e) => {
             let elapsed = start.elapsed().as_secs_f64();
             state.metrics.record_query(query_type, elapsed, false);
-            // Audit log — failed query
+            // Audit log �?failed query
             let err_msg = e.to_string();
             let audit_entry = state.audit.create_query_entry(&client_ip, None, query_type, query, elapsed * 1000.0, false, Some(err_msg.clone()));
             state.audit.log(audit_entry);
@@ -674,7 +815,7 @@ async fn execute_query(
     let elapsed = start.elapsed().as_secs_f64();
     state.metrics.record_query(query_type, elapsed, true);
 
-    // Audit log — successful query
+    // Audit log �?successful query
     let audit_entry = state.audit.create_query_entry(&client_ip, None, query_type, query, elapsed * 1000.0, true, None);
     state.audit.log(audit_entry);
 
@@ -1014,7 +1155,7 @@ async fn hybrid_query(
     let filter_clause = match &sql_ast {
         QueryAst::Select { filter: Some(_), .. } => {
             // Extract the WHERE clause using case-insensitive char-aware search
-            let sql_upper: String = sql_query.chars().map(|c| c.to_uppercase()).flatten().collect();
+            let sql_upper: String = sql_query.chars().flat_map(|c| c.to_uppercase()).collect();
             if let Some(byte_pos) = sql_upper.find(" WHERE ") {
                 // Count chars up to byte_pos to get a safe char boundary in the original
                 let char_count = sql_upper[..byte_pos].chars().count();
@@ -1621,7 +1762,7 @@ fn days_since_epoch(year: u16, month: u8, day: u8) -> u64 {
 }
 
 fn is_leap_year(year: u16) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 fn days_in_month(year: u16, month: u8) -> u32 {
@@ -1650,6 +1791,772 @@ async fn flush(
             let _elapsed = start.elapsed().as_secs_f64() * 1000.0;
             (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
                 format!("Flush failed: {}", e)
+            )))
+        }
+    }
+}
+
+// ── Sharding API ──────────────────────────────────────────────────
+
+/// Sharding configuration request.
+#[derive(Debug, Deserialize)]
+pub struct ShardConfigRequest {
+    /// Shard ID.
+    pub id: u32,
+    /// Human-readable name.
+    pub name: String,
+    /// Optional Raft group ID.
+    #[serde(default)]
+    pub raft_group: Option<u64>,
+    /// Node IDs that hold replicas.
+    #[serde(default)]
+    pub replicas: Vec<u64>,
+    /// Whether this shard is the primary.
+    #[serde(default = "default_true")]
+    pub is_primary: bool,
+}
+
+fn default_true() -> bool { true }
+
+/// Class sharding assignment request.
+#[derive(Debug, Deserialize)]
+pub struct ClassShardRequest {
+    /// Class (table) name.
+    pub class: String,
+    /// Sharding strategy type: "class", "range", "hash".
+    #[serde(default = "default_class_strategy")]
+    pub strategy: String,
+    /// For class-based: target shard ID.
+    #[serde(default)]
+    pub shard: Option<u32>,
+    /// For range-based: range boundaries.
+    #[serde(default)]
+    pub ranges: Option<Vec<RangeShardConfig>>,
+    /// For hash-based: number of virtual shards.
+    #[serde(default)]
+    pub num_shards: Option<u32>,
+    /// For hash-based: slot to shard mapping.
+    #[serde(default)]
+    pub slot_map: Option<Vec<u32>>,
+}
+
+fn default_class_strategy() -> String { "class".to_string() }
+
+/// Range shard configuration.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RangeShardConfig {
+    /// Upper bound (exclusive).
+    pub end_key: String,
+    /// Shard ID for this range.
+    pub shard: u32,
+}
+
+/// GET /api/sharding/config - Get current sharding configuration.
+async fn get_sharding_config(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    let mgr = state.executor.shard_manager();
+    match mgr.as_ref() {
+        Some(shard_mgr) => {
+            let config = shard_mgr.shard_map();
+            let shards_json: Vec<serde_json::Value> = config.shards.iter().map(|(id, s)| json!({
+                "id": id,
+                "name": s.name,
+                "raft_group": s.raft_group,
+                "replicas": s.replicas,
+                "is_primary": s.is_primary,
+            })).collect();
+
+            let strategies_json: Vec<serde_json::Value> = config.class_strategies.iter().map(|(class, strategy)| {
+                let strategy_json = match strategy {
+                    onto_sharding::ShardStrategy::ClassBased { shard } => json!({
+                        "type": "class",
+                        "shard": shard,
+                    }),
+                    onto_sharding::ShardStrategy::RangeBased { ranges } => json!({
+                        "type": "range",
+                        "ranges": ranges.iter().map(|r| json!({
+                            "end_key": String::from_utf8_lossy(&r.end_key),
+                            "shard": r.shard,
+                        })).collect::<Vec<_>>(),
+                    }),
+                    onto_sharding::ShardStrategy::HashBased { num_shards, slot_map } => json!({
+                        "type": "hash",
+                        "num_shards": num_shards,
+                        "slot_map": slot_map,
+                    }),
+                };
+                json!({
+                    "class": class,
+                    "strategy": strategy_json,
+                })
+            }).collect();
+
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "default_shard": config.default_shard,
+                "shards": shards_json,
+                "class_strategies": strategies_json,
+            }), elapsed)))
+        }
+        None => {
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "enabled": false,
+                "message": "Sharding is not configured"
+            }), elapsed)))
+        }
+    }
+}
+
+/// PUT /api/sharding/config - Update sharding configuration.
+async fn update_sharding_config(
+    State(state): State<AppState>,
+    Json(config): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    // Parse the shard map from the request
+    let shard_map: onto_sharding::ShardMap = match serde_json::from_value(config) {
+        Ok(m) => m,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                format!("Invalid sharding config: {}", e)
+            )));
+        }
+    };
+
+    // Get local shards (for now, assume all shards are local)
+    let local_shards: Vec<u32> = shard_map.shards.keys().cloned().collect();
+
+    // Update the executor's shard configuration
+    state.executor.update_shard_config(shard_map.clone(), local_shards);
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    (StatusCode::OK, Json(ApiResponse::success(json!({
+        "message": "Sharding configuration updated",
+        "shards": shard_map.shards.len(),
+        "class_strategies": shard_map.class_strategies.len(),
+    }), elapsed)))
+}
+
+/// POST /api/sharding/shard - Add a new shard.
+async fn add_shard(
+    State(state): State<AppState>,
+    Json(req): Json<ShardConfigRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let mut mgr = state.executor.shard_manager();
+    let shard_mgr = mgr.get_or_insert_with(|| onto_sharding::ShardManager::new(0));
+
+    let config = onto_sharding::ShardConfig {
+        id: req.id,
+        name: req.name,
+        raft_group: req.raft_group,
+        replicas: req.replicas,
+        is_primary: req.is_primary,
+    };
+
+    shard_mgr.create_shard(config);
+
+    // Update the shard router with the new configuration
+    let shard_map = shard_mgr.shard_map().clone();
+    let local_shards: Vec<u32> = shard_map.shards.keys().cloned().collect();
+    drop(mgr); // Release the lock before updating
+    state.executor.update_shard_config(shard_map, local_shards);
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    (StatusCode::OK, Json(ApiResponse::success(json!({
+        "message": format!("Shard {} added", req.id),
+        "shard_id": req.id,
+    }), elapsed)))
+}
+
+/// POST /api/sharding/class - Assign a class to a sharding strategy.
+async fn assign_class_shard(
+    State(state): State<AppState>,
+    Json(req): Json<ClassShardRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let mut mgr = state.executor.shard_manager();
+    let shard_mgr = mgr.get_or_insert_with(|| onto_sharding::ShardManager::new(0));
+
+    match req.strategy.as_str() {
+        "class" => {
+            let shard = req.shard.unwrap_or(0);
+            if let Err(e) = shard_mgr.assign_class(&req.class, shard) {
+                return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                    format!("Failed to assign class: {}", e)
+                )));
+            }
+        }
+        "range" => {
+            let ranges = req.ranges.unwrap_or_default();
+            let shard_ranges: Vec<onto_sharding::RangeShard> = ranges.iter().map(|r| {
+                onto_sharding::RangeShard {
+                    end_key: r.end_key.as_bytes().to_vec(),
+                    shard: r.shard,
+                }
+            }).collect();
+            shard_mgr.shard_map_mut().shard_class_range(&req.class, shard_ranges);
+        }
+        "hash" => {
+            let num_shards = req.num_shards.unwrap_or(4);
+            let slot_map = req.slot_map.unwrap_or_else(|| (0..num_shards).collect());
+            shard_mgr.shard_map_mut().shard_class_hash(&req.class, num_shards, slot_map);
+        }
+        _ => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                format!("Unknown strategy '{}': must be 'class', 'range', or 'hash'", req.strategy)
+            )));
+        }
+    }
+
+    // Update the shard router with the new configuration
+    let shard_map = shard_mgr.shard_map().clone();
+    let local_shards: Vec<u32> = shard_map.shards.keys().cloned().collect();
+    drop(mgr); // Release the lock before updating
+    state.executor.update_shard_config(shard_map, local_shards);
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    (StatusCode::OK, Json(ApiResponse::success(json!({
+        "message": format!("Class '{}' assigned to {} sharding", req.class, req.strategy),
+        "class": req.class,
+        "strategy": req.strategy,
+    }), elapsed)))
+}
+
+/// GET /api/sharding/status - Get sharding status and statistics.
+async fn get_sharding_status(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    let mgr = state.executor.shard_manager();
+    match mgr.as_ref() {
+        Some(shard_mgr) => {
+            let active = shard_mgr.active_shards();
+            let config = shard_mgr.shard_map();
+            let stats = shard_mgr.shard_statistics();
+
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "enabled": true,
+                "active_shards": active,
+                "total_shards": config.shards.len(),
+                "sharded_classes": config.class_strategies.len(),
+                "shards": config.shards.iter().map(|(id, s)| {
+                    let status = shard_mgr.shard_status(*id);
+                    let shard_stats = stats.get(id);
+                    json!({
+                        "id": id,
+                        "name": s.name,
+                        "status": format!("{:?}", status),
+                        "is_primary": s.is_primary,
+                        "classes_count": shard_stats.map(|s| s.classes_count).unwrap_or(0),
+                    })
+                }).collect::<Vec<_>>(),
+                "active_migrations": shard_mgr.active_migrations().len(),
+                "migration_history": shard_mgr.migration_history().len(),
+            }), elapsed)))
+        }
+        None => {
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "enabled": false,
+                "message": "Sharding is not configured"
+            }), elapsed)))
+        }
+    }
+}
+
+// ── Migration API ──────────────────────────────────────────────────
+
+/// Migration request.
+#[derive(Debug, Deserialize)]
+pub struct MigrationRequest {
+    /// Source shard ID.
+    pub source_shard: u32,
+    /// Target shard ID.
+    pub target_shard: u32,
+    /// Class (table) to migrate. Use "*" for all classes.
+    #[serde(default = "default_all_classes")]
+    pub class: String,
+    /// Optional key range for range-based migration.
+    #[serde(default)]
+    pub key_range: Option<KeyRange>,
+}
+
+fn default_all_classes() -> String { "*".to_string() }
+
+/// Key range for migration.
+#[derive(Debug, Deserialize)]
+pub struct KeyRange {
+    /// Start key (inclusive).
+    pub start: String,
+    /// End key (exclusive).
+    pub end: String,
+}
+
+/// POST /api/sharding/migrate - Start a migration task.
+async fn start_migration(
+    State(state): State<AppState>,
+    Json(req): Json<MigrationRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let mut mgr = state.executor.shard_manager();
+    let shard_mgr = match mgr.as_mut() {
+        Some(m) => m,
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                "Sharding is not configured"
+            )));
+        }
+    };
+
+    let key_range = req.key_range.map(|kr| (kr.start.into_bytes(), kr.end.into_bytes()));
+
+    match shard_mgr.create_migration(req.source_shard, req.target_shard, &req.class, key_range) {
+        Ok(migration_id) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": "Migration started",
+                "migration_id": migration_id,
+                "source_shard": req.source_shard,
+                "target_shard": req.target_shard,
+                "class": req.class,
+            }), elapsed)))
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                format!("Failed to start migration: {}", e)
+            )))
+        }
+    }
+}
+
+/// Migration progress update request.
+#[derive(Debug, Deserialize)]
+pub struct MigrationProgressRequest {
+    /// Migration ID.
+    pub migration_id: String,
+    /// Total records to migrate.
+    pub total_records: u64,
+    /// Records migrated so far.
+    pub migrated_records: u64,
+}
+
+/// PUT /api/sharding/migrate/progress - Update migration progress.
+async fn update_migration_progress(
+    State(state): State<AppState>,
+    Json(req): Json<MigrationProgressRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let mut mgr = state.executor.shard_manager();
+    let shard_mgr = match mgr.as_mut() {
+        Some(m) => m,
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                "Sharding is not configured"
+            )));
+        }
+    };
+
+    match shard_mgr.update_migration_progress(&req.migration_id, req.total_records, req.migrated_records) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": "Migration progress updated",
+                "migration_id": req.migration_id,
+                "total_records": req.total_records,
+                "migrated_records": req.migrated_records,
+                "progress_percent": if req.total_records > 0 { (req.migrated_records as f64 / req.total_records as f64 * 100.0) as u64 } else { 0 },
+            }), elapsed)))
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                format!("Failed to update migration progress: {}", e)
+            )))
+        }
+    }
+}
+
+/// Migration completion request.
+#[derive(Debug, Deserialize)]
+pub struct MigrationCompleteRequest {
+    /// Migration ID.
+    pub migration_id: String,
+}
+
+/// POST /api/sharding/migrate/complete - Complete a migration.
+async fn complete_migration(
+    State(state): State<AppState>,
+    Json(req): Json<MigrationCompleteRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let mut mgr = state.executor.shard_manager();
+    let shard_mgr = match mgr.as_mut() {
+        Some(m) => m,
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                "Sharding is not configured"
+            )));
+        }
+    };
+
+    match shard_mgr.complete_migration_task(&req.migration_id) {
+        Ok(result) => {
+            // Update the shard router with the new configuration
+            let shard_map = shard_mgr.shard_map().clone();
+            let local_shards: Vec<u32> = shard_map.shards.keys().cloned().collect();
+            drop(mgr);
+            state.executor.update_shard_config(shard_map, local_shards);
+
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": "Migration completed",
+                "migration_id": result.migration_id,
+                "source_shard": result.source_shard,
+                "target_shard": result.target_shard,
+                "records_migrated": result.records_migrated,
+                "status": format!("{:?}", result.status),
+            }), elapsed)))
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                format!("Failed to complete migration: {}", e)
+            )))
+        }
+    }
+}
+
+/// POST /api/sharding/migrate/cancel - Cancel a migration.
+async fn cancel_migration(
+    State(state): State<AppState>,
+    Json(req): Json<MigrationCompleteRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let mut mgr = state.executor.shard_manager();
+    let shard_mgr = match mgr.as_mut() {
+        Some(m) => m,
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                "Sharding is not configured"
+            )));
+        }
+    };
+
+    match shard_mgr.cancel_migration(&req.migration_id) {
+        Ok(()) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": "Migration cancelled",
+                "migration_id": req.migration_id,
+            }), elapsed)))
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                format!("Failed to cancel migration: {}", e)
+            )))
+        }
+    }
+}
+
+/// GET /api/sharding/migrations - List all migrations.
+async fn list_migrations(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    let mgr = state.executor.shard_manager();
+    match mgr.as_ref() {
+        Some(shard_mgr) => {
+            let migrations: Vec<Value> = shard_mgr.list_migrations().iter().map(|m| {
+                json!({
+                    "id": m.id,
+                    "source_shard": m.source_shard,
+                    "target_shard": m.target_shard,
+                    "class": m.class,
+                    "status": format!("{:?}", m.status),
+                    "created_at": m.created_at,
+                    "completed_at": m.completed_at,
+                })
+            }).collect();
+
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "migrations": migrations,
+                "total": migrations.len(),
+                "active": shard_mgr.active_migrations().len(),
+            }), elapsed)))
+        }
+        None => {
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "enabled": false,
+                "message": "Sharding is not configured"
+            }), elapsed)))
+        }
+    }
+}
+
+// ── Rebalance API ──────────────────────────────────────────────────
+
+/// Rebalance request.
+#[derive(Debug, Deserialize)]
+pub struct RebalanceRequest {
+    /// Classes to rebalance. If empty, rebalances all classes.
+    #[serde(default)]
+    pub classes: Vec<String>,
+}
+
+/// POST /api/sharding/rebalance - Rebalance classes across shards.
+async fn rebalance_shards(
+    State(state): State<AppState>,
+    Json(req): Json<RebalanceRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let mut mgr = state.executor.shard_manager();
+    let shard_mgr = match mgr.as_mut() {
+        Some(m) => m,
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                "Sharding is not configured"
+            )));
+        }
+    };
+
+    // If no classes specified, rebalance all
+    let classes = if req.classes.is_empty() {
+        shard_mgr.shard_map().class_strategies.keys().cloned().collect()
+    } else {
+        req.classes
+    };
+
+    match shard_mgr.rebalance_classes(classes) {
+        Ok(result) => {
+            // Update the shard router with the new configuration
+            let shard_map = shard_mgr.shard_map().clone();
+            let local_shards: Vec<u32> = shard_map.shards.keys().cloned().collect();
+            drop(mgr);
+            state.executor.update_shard_config(shard_map, local_shards);
+
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": "Rebalance completed",
+                "rebalance_id": result.rebalance_id,
+                "classes_rebalanced": result.classes_rebalanced,
+                "new_assignments": result.new_assignments,
+                "status": result.status,
+            }), elapsed)))
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                format!("Failed to rebalance: {}", e)
+            )))
+        }
+    }
+}
+
+// ── Scale API ──────────────────────────────────────────────────────
+
+/// Scale request - add shard and optionally rebalance.
+#[derive(Debug, Deserialize)]
+pub struct ScaleRequest {
+    /// Shard configuration.
+    pub shard: ShardConfigRequest,
+    /// Whether to rebalance after adding.
+    #[serde(default = "default_true")]
+    pub rebalance: bool,
+}
+
+/// POST /api/sharding/scale/add - Add a new shard and optionally rebalance.
+async fn add_shard_and_rebalance(
+    State(state): State<AppState>,
+    Json(req): Json<ScaleRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let mut mgr = state.executor.shard_manager();
+    let shard_mgr = match mgr.as_mut() {
+        Some(m) => m,
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                "Sharding is not configured"
+            )));
+        }
+    };
+
+    let config = onto_sharding::ShardConfig {
+        id: req.shard.id,
+        name: req.shard.name,
+        raft_group: req.shard.raft_group,
+        replicas: req.shard.replicas,
+        is_primary: req.shard.is_primary,
+    };
+
+    match shard_mgr.add_shard_and_rebalance(config, req.rebalance) {
+        Ok(result) => {
+            // Update the shard router with the new configuration
+            let shard_map = shard_mgr.shard_map().clone();
+            let local_shards: Vec<u32> = shard_map.shards.keys().cloned().collect();
+            drop(mgr);
+            state.executor.update_shard_config(shard_map, local_shards);
+
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": result.status,
+                "shard_id": req.shard.id,
+                "rebalance_id": result.rebalance_id,
+                "classes_rebalanced": result.classes_rebalanced,
+                "new_assignments": result.new_assignments,
+            }), elapsed)))
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                format!("Failed to add shard: {}", e)
+            )))
+        }
+    }
+}
+
+/// Remove shard request.
+#[derive(Debug, Deserialize)]
+pub struct RemoveShardRequest {
+    /// Shard ID to remove.
+    pub shard_id: u32,
+    /// Target shard to migrate data to.
+    pub target_shard: u32,
+}
+
+/// POST /api/sharding/scale/remove - Remove a shard and migrate its data.
+async fn remove_shard(
+    State(state): State<AppState>,
+    Json(req): Json<RemoveShardRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let mut mgr = state.executor.shard_manager();
+    let shard_mgr = match mgr.as_mut() {
+        Some(m) => m,
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                "Sharding is not configured"
+            )));
+        }
+    };
+
+    match shard_mgr.remove_shard_with_migration(req.shard_id, req.target_shard) {
+        Ok(message) => {
+            // Update the shard router with the new configuration
+            let shard_map = shard_mgr.shard_map().clone();
+            let local_shards: Vec<u32> = shard_map.shards.keys().cloned().collect();
+            drop(mgr);
+            state.executor.update_shard_config(shard_map, local_shards);
+
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": message,
+                "removed_shard": req.shard_id,
+                "target_shard": req.target_shard,
+            }), elapsed)))
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                format!("Failed to remove shard: {}", e)
+            )))
+        }
+    }
+}
+
+// ── Split API ──────────────────────────────────────────────────────
+
+/// Split shard request.
+#[derive(Debug, Deserialize)]
+pub struct SplitRequest {
+    /// Source shard ID to split.
+    pub source_shard: u32,
+    /// New shards to create.
+    pub new_shards: Vec<ShardConfigRequest>,
+    /// Split strategy: "even", "range", "hash".
+    #[serde(default = "default_split_strategy")]
+    pub strategy: String,
+    /// Optional ranges for range-based split.
+    #[serde(default)]
+    pub ranges: Option<Vec<KeyRange>>,
+}
+
+fn default_split_strategy() -> String { "even".to_string() }
+
+/// POST /api/sharding/split - Split a shard into multiple new shards.
+async fn split_shard(
+    State(state): State<AppState>,
+    Json(req): Json<SplitRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let mut mgr = state.executor.shard_manager();
+    let shard_mgr = match mgr.as_mut() {
+        Some(m) => m,
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                "Sharding is not configured"
+            )));
+        }
+    };
+
+    let new_shard_configs: Vec<onto_sharding::ShardConfig> = req.new_shards.iter().map(|s| {
+        onto_sharding::ShardConfig {
+            id: s.id,
+            name: s.name.clone(),
+            raft_group: s.raft_group,
+            replicas: s.replicas.clone(),
+            is_primary: s.is_primary,
+        }
+    }).collect();
+
+    let strategy = match req.strategy.as_str() {
+        "range" => {
+            let ranges = req.ranges.unwrap_or_default();
+            onto_sharding::SplitStrategy::RangeBased {
+                ranges: ranges.iter().map(|r| (r.start.clone().into_bytes(), r.end.clone().into_bytes())).collect(),
+            }
+        }
+        "hash" => onto_sharding::SplitStrategy::HashBased,
+        _ => onto_sharding::SplitStrategy::Even,
+    };
+
+    match shard_mgr.split_shard(req.source_shard, new_shard_configs, strategy) {
+        Ok(migrations) => {
+            // Update the shard router with the new configuration
+            let shard_map = shard_mgr.shard_map().clone();
+            let local_shards: Vec<u32> = shard_map.shards.keys().cloned().collect();
+            drop(mgr);
+            state.executor.update_shard_config(shard_map, local_shards);
+
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": format!("Shard {} split initiated", req.source_shard),
+                "source_shard": req.source_shard,
+                "new_shards": req.new_shards.iter().map(|s| s.id).collect::<Vec<_>>(),
+                "migrations_created": migrations.len(),
+                "migrations": migrations.iter().map(|m| json!({
+                    "id": m.id,
+                    "source": m.source_shard,
+                    "target": m.target_shard,
+                    "status": format!("{:?}", m.status),
+                })).collect::<Vec<_>>(),
+            }), elapsed)))
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
+                format!("Failed to split shard: {}", e)
             )))
         }
     }

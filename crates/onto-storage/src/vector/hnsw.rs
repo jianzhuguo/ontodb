@@ -160,8 +160,10 @@ pub struct HnswIndex {
     entry_point: Option<usize>,
     max_layer: usize,
     /// Reusable visited bitmap (thread-safe interior mutability).
+    #[allow(dead_code)]
     visited: parking_lot::RwLock<Vec<u64>>,
     /// Current generation for visited bitmap (avoids clearing).
+    #[allow(dead_code)]
     visited_gen: std::sync::atomic::AtomicU64,
 }
 
@@ -354,7 +356,7 @@ impl HnswIndex {
         // Phase 1: Greedy search from top layer to layer 1
         let mut curr = ep;
         for layer in (1..=self.max_layer).rev() {
-            curr = self.search_layer_greedy(&query, curr, layer);
+            curr = self.search_layer_greedy(query, curr, layer);
         }
 
         // Phase 2: Beam search at layer 0
@@ -394,7 +396,7 @@ impl HnswIndex {
 
         let mut curr = ep;
         for layer in (1..=self.max_layer).rev() {
-            curr = self.search_layer_greedy(&query, curr, layer);
+            curr = self.search_layer_greedy(query, curr, layer);
         }
 
         let candidates = self.search_layer_beam(query, curr, ef, 0);
@@ -531,6 +533,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    #[allow(dead_code)]
     fn random_vector(dim: usize) -> Vec<f32> {
         let mut rng = rand::thread_rng();
         (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect()
