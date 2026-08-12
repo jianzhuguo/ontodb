@@ -130,16 +130,40 @@ async fn handle_pgwire_client(
         let params = parse_startup_params(params_data);
         buf.advance(len);
 
-        // Step 2: Authenticate
+        // Step 2: Authenticate (MD5 password)
         if auth.enabled {
-            // Request cleartext password
+            // Extract username from startup params
+            let username = params.iter()
+                .find(|(k, _)| k == "user")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("ontodb");
+
+            // Generate random 4-byte salt for MD5 challenge
+            let mut salt = [0u8; 4];
+            {
+                use std::io::Write;
+                // Use time + PID + counter for non-crypto salt (just needs to be unique)
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let pid = std::process::id();
+                static SALT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let ctr = SALT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let seed = format!("{}{}{}", t, pid, ctr);
+                let hash = md5::compute(seed.as_bytes());
+                salt.copy_from_slice(&hash[..4]);
+            }
+
+            // Send AuthenticationMD5Password (type 5) with salt
             let mut auth_req = BytesMut::new();
             auth_req.put_u8(AUTH_OK);
-            auth_req.put_u32(8); // length
-            auth_req.put_i32(3); // AuthenticationCleartextPassword
+            auth_req.put_u32(12); // length = 4 + 4 + 4
+            auth_req.put_i32(5); // AuthenticationMD5Password
+            auth_req.extend_from_slice(&salt);
             stream.write_all(&auth_req).await?;
 
-            // Read password message
+            // Read password message (client sends "md5" + 32 hex chars)
             let password = loop {
                 let n = stream.read_buf(&mut buf).await?;
                 if n == 0 {
@@ -166,8 +190,8 @@ async fn handle_pgwire_client(
                 }
             };
 
-            // Validate password as API key
-            if auth.validate(&password).is_none() {
+            // Validate MD5 hash against stored API keys
+            if auth.validate_md5(&password, username, &salt).is_none() {
                 let mut err_msg = BytesMut::new();
                 err_msg.put_u8(ERROR_RESPONSE);
                 // Build error fields

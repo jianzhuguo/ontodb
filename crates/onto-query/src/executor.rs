@@ -249,6 +249,15 @@ impl Default for QueryConfig {
     }
 }
 
+/// Process-wide monotonic clock for timeout tracking (nanoseconds since creation).
+/// Avoids SystemTime overhead and clock-adjustment issues.
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn now_nanos() -> u64 {
+    let start = PROCESS_START.get_or_init(std::time::Instant::now);
+    start.elapsed().as_nanos() as u64
+}
+
 /// Executes parsed queries with caching support.
 pub struct QueryExecutor {
     engine: Arc<LsmEngine>,
@@ -276,6 +285,9 @@ pub struct QueryExecutor {
     /// Inference cache: class name → hierarchy (all super/sub classes).
     /// Cleared on ontology changes (CREATE ONTOLOGY).
     inference_cache: Mutex<InferenceCache>,
+    /// Query deadline in nanoseconds (monotonic). Set before each query execution.
+    /// Checked in hot loops to allow early cancellation of slow queries.
+    query_deadline: AtomicU64,
 }
 
 /// Column-level statistics collected by ANALYZE.
@@ -366,7 +378,27 @@ impl QueryExecutor {
             active_txn: Mutex::new(None),
             config,
             inference_cache: Mutex::new(InferenceCache::default()),
+            query_deadline: AtomicU64::new(0),
         }
+    }
+
+    /// Sets the query deadline based on the configured timeout.
+    fn arm_timeout(&self) {
+        let deadline = now_nanos() + self.config.query_timeout.as_nanos() as u64;
+        self.query_deadline.store(deadline, Ordering::Relaxed);
+    }
+
+    /// Returns an error if the current query has exceeded its timeout.
+    /// Cheap: one atomic load + one subtraction. Safe to call in hot loops.
+    fn check_timeout(&self) -> Result<()> {
+        let deadline = self.query_deadline.load(Ordering::Relaxed);
+        if deadline > 0 && now_nanos() > deadline {
+            return Err(CoreError::Custom(format!(
+                "query timeout: exceeded {} seconds",
+                self.config.query_timeout.as_secs()
+            )));
+        }
+        Ok(())
     }
 
     /// Set the graph store for unified entity anchor (relational ↔ graph sync).
@@ -792,6 +824,7 @@ impl QueryExecutor {
     /// Supports all query types including subqueries, CTEs, materialized views,
     /// expressions, and transactions.
     pub fn execute(&self, ast: &QueryAst) -> Result<QueryResult> {
+        self.arm_timeout();
         // For simple DML (INSERT/UPDATE/DELETE) without an active multi-statement txn,
         // use a short write lock that's only held during the commit phase.
         // This allows concurrent reads to proceed during query planning and execution.
@@ -857,6 +890,7 @@ impl QueryExecutor {
     /// materialized views, CTEs, or expression evaluation.
     /// Multiple `execute_read` calls can run concurrently.
     pub fn execute_read(&self, ast: &QueryAst) -> Result<QueryResult> {
+        self.arm_timeout();
         let engine = &self.engine;
         self.execute_select_read(ast, &engine)
     }
@@ -1644,10 +1678,16 @@ impl QueryExecutor {
         };
 
         let mut rows = Vec::new();
+        let mut scan_count: u64 = 0;
         for scan_class in &scan_classes {
             let prefix = format!("{}::", scan_class);
             let entries = engine.scan_prefix(prefix.as_bytes())?;
             for (key, val_bytes) in &entries {
+                // Check query timeout every 1024 rows (cheap: one atomic load)
+                scan_count += 1;
+                if scan_count & 0x3FF == 0 {
+                    self.check_timeout()?;
+                }
                 // Tier 1: fast byte-level rejection (definitely doesn't match → skip)
                 if !fast_filter_cols.is_empty() {
                     if Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
@@ -2785,10 +2825,16 @@ impl QueryExecutor {
         };
 
         let mut rows = Vec::new();
+        let mut scan_count: u64 = 0;
         for scan_class in &class_hierarchy {
             let prefix = format!("{}::", scan_class);
             let entries = engine.scan_prefix(prefix.as_bytes())?;
             for (key, val_bytes) in &entries {
+                // Check query timeout every 1024 rows (cheap: one atomic load)
+                scan_count += 1;
+                if scan_count & 0x3FF == 0 {
+                    self.check_timeout()?;
+                }
                 // Tier 1: fast byte-level rejection
                 if !fast_filter_cols.is_empty() {
                     if Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {

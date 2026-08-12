@@ -41,6 +41,8 @@ rcgen = "0.13"
 x509-parser = "0.16"
 # Cryptographic hashing (audit integrity chain)
 sha2 = "0.10"
+# MD5 for PostgreSQL wire protocol authentication
+md5 = "0.7"
 # Date/time for security audit timestamps
 chrono = "0.4"
 

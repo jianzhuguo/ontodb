@@ -21,28 +21,43 @@ const GRAPH_VERTEX_PREFIX: &str = "__graph_v__";
 const GRAPH_EDGE_PREFIX: &str = "__graph_e__";
 
 /// In-memory graph store with optional LSM persistence.
+///
+/// # Lock Ordering (deadlock prevention)
+///
+/// When acquiring multiple locks, always follow this sequence:
+///
+/// 1. `vertices`        — vertex data
+/// 2. `edges`           — edge data by ID
+/// 3. `out_edges` / `in_edges`  — edge lists by vertex (same level, can interleave)
+/// 4. `label_index`     — label → vertex set
+/// 5. `id_to_idx`       — string → integer mapping
+/// 6. `idx_to_id` / `adj_out` / `adj_in` / `edge_index` — integer-indexed structures (same level)
+///
+/// Never acquire a higher-numbered lock while holding a lower-numbered one.
+/// Same-level locks can be acquired in any order relative to each other.
 pub struct GraphStore {
-    /// Vertices indexed by ID.
+    /// [LOCK 1] Vertices indexed by ID.
     vertices: RwLock<HashMap<String, Vertex>>,
-    /// Outgoing edges indexed by source vertex ID.
+    /// [LOCK 3a] Outgoing edges indexed by source vertex ID.
     out_edges: RwLock<HashMap<String, Vec<Edge>>>,
-    /// Incoming edges indexed by target vertex ID.
+    /// [LOCK 3b] Incoming edges indexed by target vertex ID.
     in_edges: RwLock<HashMap<String, Vec<Edge>>>,
-    /// All edges indexed by ID.
+    /// [LOCK 2] All edges indexed by ID.
     edges: RwLock<HashMap<String, Edge>>,
-    /// Labels index: label -> set of vertex IDs.
+    /// [LOCK 4] Labels index: label -> set of vertex IDs.
     label_index: RwLock<HashMap<String, HashSet<String>>>,
     /// Optional LSM engine for persistence.
     engine: Option<Arc<onto_storage::LsmEngine>>,
-    /// Internal integer ID mapping for fast traversal.
+    /// [LOCK 5] Internal integer ID mapping for fast traversal.
     /// Maps string ID -> integer index.
     id_to_idx: RwLock<HashMap<String, u32>>,
-    /// Maps integer index -> string ID.
+    /// [LOCK 6a] Maps integer index -> string ID.
     idx_to_id: RwLock<Vec<String>>,
-    /// Adjacency list using integer indices: idx -> list of (neighbor_idx, edge_idx).
+    /// [LOCK 6b] Adjacency list using integer indices: idx -> list of (neighbor_idx, edge_idx).
     adj_out: RwLock<Vec<Vec<(u32, u32)>>>,
+    /// [LOCK 6c]
     adj_in: RwLock<Vec<Vec<(u32, u32)>>>,
-    /// Edge index -> (from_idx, to_idx, edge_id).
+    /// [LOCK 6d] Edge index -> (from_idx, to_idx, edge_id).
     edge_index: RwLock<Vec<(u32, u32, String)>>,
 }
 
@@ -174,9 +189,13 @@ impl GraphStore {
     }
 
     /// Get or create integer index for a vertex ID.
-    /// All data structures updated atomically under a single lock.
+    ///
+    /// Acquires all four index locks (id_to_idx → idx_to_id → adj_out → adj_in)
+    /// in lock order, then releases them together.  Another thread reading any of
+    /// these structures will either see none of the update or all of it — never
+    /// a partial state.
     fn get_or_create_idx(&self, id: &str) -> u32 {
-        // Hold id_to_idx lock for the entire operation
+        // LOCK 5: id_to_idx (write)
         let mut map = self.id_to_idx.write();
         if let Some(&idx) = map.get(id) {
             return idx;
@@ -187,10 +206,16 @@ impl GraphStore {
             u32::MAX
         });
         map.insert(id.to_string(), idx);
-        // Update all related structures while holding the lock
-        self.idx_to_id.write().push(id.to_string());
-        self.adj_out.write().push(Vec::new());
-        self.adj_in.write().push(Vec::new());
+        // LOCK 6a: idx_to_id (write) — hold all four together for atomicity
+        let mut ids = self.idx_to_id.write();
+        // LOCK 6b: adj_out (write)
+        let mut ao = self.adj_out.write();
+        // LOCK 6c: adj_in (write)
+        let mut ai = self.adj_in.write();
+        ids.push(id.to_string());
+        ao.push(Vec::new());
+        ai.push(Vec::new());
+        // All four locks released together here — atomic update
         idx
     }
 
@@ -226,6 +251,21 @@ impl GraphStore {
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
             engine.put(key.into_bytes(), value)
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Persist an edge to LSM by its ID (reads from the in-memory edges map).
+    fn persist_edge_by_id(&self, id: &str) -> Result<(), GraphError> {
+        if let Some(ref engine) = self.engine {
+            let edges = self.edges.read();
+            if let Some(edge) = edges.get(id) {
+                let key = format!("{}{}", GRAPH_EDGE_PREFIX, id);
+                let value = serde_json::to_vec(edge)
+                    .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                engine.put(key.into_bytes(), value)
+                    .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            }
         }
         Ok(())
     }
@@ -304,16 +344,47 @@ impl GraphStore {
     }
 
     /// Delete a vertex and all its connected edges.
+    ///
+    /// Lock order: vertices → edges → out_edges → in_edges → label_index →
+    ///             id_to_idx → idx_to_id / adj_out / adj_in / edge_index
     pub fn delete_vertex(&self, id: &str) -> Result<(), GraphError> {
+        // LOCK 1: vertices (write)
         let vertex = {
             let mut verts = self.vertices.write();
             verts.remove(id).ok_or_else(|| GraphError::VertexNotFound(id.to_string()))?
         };
 
-        // Unpersist vertex from LSM engine
+        // Unpersist vertex from LSM engine (no lock held)
         self.unpersist_vertex(id)?;
 
-        // Remove from label index
+        // Collect edges and build neighbor cleanup lists.
+        // Acquire locks in order: edges(2) → out_edges(3a) → in_edges(3b)
+        let (outgoing_neighbors, incoming_neighbors) = {
+            // LOCK 2: edges (write) — hold while collecting from out/in_edges
+            let mut edges = self.edges.write();
+            // LOCK 3a: out_edges (write)
+            let out = self.out_edges.write().remove(id).unwrap_or_default();
+            // LOCK 3b: in_edges (write)
+            let inp = self.in_edges.write().remove(id).unwrap_or_default();
+
+            let mut out_neighbors: Vec<(String, String)> = Vec::new();
+            let mut in_neighbors: Vec<(String, String)> = Vec::new();
+
+            for edge in out {
+                out_neighbors.push((edge.to.clone(), edge.id.clone()));
+                edges.remove(&edge.id);
+                let _ = self.unpersist_edge(&edge.id);
+            }
+            for edge in inp {
+                in_neighbors.push((edge.from.clone(), edge.id.clone()));
+                edges.remove(&edge.id);
+                let _ = self.unpersist_edge(&edge.id);
+            }
+            (out_neighbors, in_neighbors)
+            // edges, out_edges, in_edges locks dropped here
+        };
+
+        // LOCK 4: label_index (write)
         {
             let mut idx = self.label_index.write();
             for label in &vertex.labels {
@@ -323,35 +394,8 @@ impl GraphStore {
             }
         }
 
-        // Collect outgoing and incoming edges, remove them from the edges map,
-        // and build neighbor cleanup lists — all under a single lock scope.
-        let (outgoing_neighbors, incoming_neighbors, outgoing_edge_ids, incoming_edge_ids) = {
-            let out = self.out_edges.write().remove(id).unwrap_or_default();
-            let inp = self.in_edges.write().remove(id).unwrap_or_default();
-
-            let mut out_neighbors: Vec<(String, String)> = Vec::new(); // (neighbor_id, edge_id)
-            let mut in_neighbors: Vec<(String, String)> = Vec::new();
-            let mut out_eids: Vec<String> = Vec::new();
-            let mut in_eids: Vec<String> = Vec::new();
-
-            let mut edges = self.edges.write();
-            for edge in out {
-                out_eids.push(edge.id.clone());
-                out_neighbors.push((edge.to.clone(), edge.id.clone()));
-                edges.remove(&edge.id);
-                let _ = self.unpersist_edge(&edge.id);
-            }
-            for edge in inp {
-                in_eids.push(edge.id.clone());
-                in_neighbors.push((edge.from.clone(), edge.id.clone()));
-                edges.remove(&edge.id);
-                let _ = self.unpersist_edge(&edge.id);
-            }
-            (out_neighbors, in_neighbors, out_eids, in_eids)
-        };
-
-        // Clean up neighbor adjacency lists — single lock acquisition per neighbor
-        // For outgoing edges: remove from neighbor's in_edges
+        // Clean up neighbor adjacency lists
+        // LOCK 3b: in_edges (write) — remove deleted edges from neighbors' in_edges
         {
             let mut in_map = self.in_edges.write();
             for (neighbor_id, edge_id) in &outgoing_neighbors {
@@ -360,7 +404,7 @@ impl GraphStore {
                 }
             }
         }
-        // For incoming edges: remove from neighbor's out_edges
+        // LOCK 3a: out_edges (write) — remove deleted edges from neighbors' out_edges
         {
             let mut out_map = self.out_edges.write();
             for (neighbor_id, edge_id) in &incoming_neighbors {
@@ -371,7 +415,7 @@ impl GraphStore {
         }
 
         // Clean up integer adjacency lists
-        // First, get the idx under a short lock scope
+        // LOCK 5: id_to_idx (write) — get the integer index
         let maybe_idx = self.id_to_idx.write().get(id).copied();
 
         if let Some(idx) = maybe_idx {
@@ -424,57 +468,73 @@ impl GraphStore {
     // ── Edge CRUD ────────────────────────────────────────────────
 
     /// Add an edge to the graph.
+    ///
+    /// Holds the vertices read lock throughout the in-memory update to prevent
+    /// TOCTOU: another thread deleting a vertex between the existence check and
+    /// the edge insertion.  Lock ordering: vertices → edges → out_edges → in_edges
+    /// (consistent with delete_vertex).
     pub fn add_edge(&self, edge: Edge) -> Result<(), GraphError> {
-        // Verify source and target exist (hold read lock during check)
-        let verts = self.vertices.read();
-        if !verts.contains_key(&edge.from) {
-            return Err(GraphError::VertexNotFound(edge.from.clone()));
-        }
-        if !verts.contains_key(&edge.to) {
-            return Err(GraphError::VertexNotFound(edge.to.clone()));
-        }
-        drop(verts);
-
-        // Persist to LSM engine before updating in-memory state
-        self.persist_edge(&edge)?;
-
         let id = edge.id.clone();
         let from = edge.from.clone();
         let to = edge.to.clone();
 
+        // Hold vertices read lock for the entire in-memory update phase.
+        // This prevents a concurrent delete_vertex from removing the vertex
+        // between our existence check and edge insertion (TOCTOU fix).
+        // Lock order: vertices(read) → edges(write) → out/in_edges(write)
+        // — same order as delete_vertex uses, so no deadlock.
         {
-            let mut edges = self.edges.write();
-            if edges.contains_key(&id) {
-                return Err(GraphError::DuplicateVertex(format!("Edge {}", id)));
+            let verts = self.vertices.read();
+            if !verts.contains_key(&edge.from) {
+                return Err(GraphError::VertexNotFound(edge.from.clone()));
             }
-            edges.insert(id.clone(), edge.clone());
+            if !verts.contains_key(&edge.to) {
+                return Err(GraphError::VertexNotFound(edge.to.clone()));
+            }
+
+            {
+                let mut edges = self.edges.write();
+                if edges.contains_key(&id) {
+                    return Err(GraphError::DuplicateVertex(format!("Edge {}", id)));
+                }
+                edges.insert(id.clone(), edge.clone());
+            }
+
+            {
+                let mut out = self.out_edges.write();
+                out.entry(from.clone()).or_insert_with(Vec::new).push(edge.clone());
+            }
+            {
+                let mut inp = self.in_edges.write();
+                inp.entry(to.clone()).or_insert_with(Vec::new).push(edge);
+            }
+            // verts dropped here — vertex can no longer be concurrently deleted
+            // while we were inserting the edge.
         }
 
-        {
-            let mut out = self.out_edges.write();
-            out.entry(from.clone()).or_insert_with(Vec::new).push(edge.clone());
-        }
-        {
-            let mut inp = self.in_edges.write();
-            inp.entry(to.clone()).or_insert_with(Vec::new).push(edge);
-        }
+        // Persist to LSM engine (I/O outside the vertices lock scope)
+        self.persist_edge_by_id(&id)?;
 
         // Update integer adjacency lists
         let from_idx = self.get_or_create_idx(&from);
         let to_idx = self.get_or_create_idx(&to);
         let edge_idx = {
             let mut ei = self.edge_index.write();
-            let idx = ei.len() as u32;
+            let idx = ei.len().min(u32::MAX as usize) as u32;
             ei.push((from_idx, to_idx, id));
             idx
         };
         {
             let mut adj_out = self.adj_out.write();
-            adj_out[from_idx as usize].push((to_idx, edge_idx));
+            if (from_idx as usize) < adj_out.len() {
+                adj_out[from_idx as usize].push((to_idx, edge_idx));
+            }
         }
         {
             let mut adj_in = self.adj_in.write();
-            adj_in[to_idx as usize].push((from_idx, edge_idx));
+            if (to_idx as usize) < adj_in.len() {
+                adj_in[to_idx as usize].push((from_idx, edge_idx));
+            }
         }
 
         Ok(())

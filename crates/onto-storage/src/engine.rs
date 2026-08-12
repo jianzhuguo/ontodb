@@ -1,4 +1,4 @@
-﻿//! LSM Engine: The main storage engine that orchestrates WAL, MemTable, and SSTables.
+//! LSM Engine: The main storage engine that orchestrates WAL, MemTable, and SSTables.
 //!
 //! Write path:  WAL -> MemTable -> (when full) flush to SSTable
 //! Read path:   MemTable -> SSTables (newest to oldest)
@@ -971,8 +971,10 @@ impl LsmEngine {
     /// Begins a new transaction. Returns the transaction ID.
     /// Snapshot is taken at the last committed data point.
     pub fn begin_txn(&self) -> SeqNo {
-        // seq_counter is the NEXT value to assign, so last committed = seq_counter - 1
-        let last_seq = self.seq_counter.load(Ordering::Relaxed).saturating_sub(1);
+        // seq_counter is the NEXT value to assign, so last committed = seq_counter - 1.
+        // Acquire pairs with the AcqRel in fetch_add (line ~821) to ensure we see
+        // all data written before the sequence number was incremented.
+        let last_seq = self.seq_counter.load(Ordering::Acquire).saturating_sub(1);
         self.write_state.write().txn_manager.begin(last_seq)
     }
 

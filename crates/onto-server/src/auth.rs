@@ -310,6 +310,33 @@ impl AuthState {
         None
     }
 
+    /// Validate a PostgreSQL MD5 password hash.
+    ///
+    /// The client sends: "md5" + hex(md5(md5(password + username) + salt))
+    /// where inner md5 produces a 32-char hex string, and the outer md5
+    /// takes those 32 ASCII bytes + 4 raw salt bytes.
+    pub fn validate_md5(&self, client_hash: &str, username: &str, salt: &[u8; 4]) -> Option<(String, Permission, Option<u32>, Option<Vec<String>>)> {
+        let hash_hex = client_hash.strip_prefix("md5").unwrap_or(client_hash);
+        if hash_hex.len() != 32 {
+            return None;
+        }
+        let keys = self.keys.read();
+        for (stored_key, value) in keys.iter() {
+            // inner = md5(api_key + username) → 32-char hex string
+            let inner_input = format!("{}{}", stored_key, username);
+            let inner_hash = format!("{:x}", md5::compute(inner_input.as_bytes()));
+            // outer = md5(inner_hash[32 ASCII bytes] + salt[4 raw bytes])
+            let mut outer_input = Vec::with_capacity(36);
+            outer_input.extend_from_slice(inner_hash.as_bytes());
+            outer_input.extend_from_slice(salt);
+            let expected = format!("{:x}", md5::compute(&outer_input));
+            if constant_time_eq(hash_hex.as_bytes(), expected.as_bytes()) {
+                return Some(value.clone());
+            }
+        }
+        None
+    }
+
     /// Check if a client IP is allowed by the global IP whitelist.
     pub fn is_ip_allowed(&self, client_ip: &str) -> bool {
         let wl = self.ip_whitelist.read();
