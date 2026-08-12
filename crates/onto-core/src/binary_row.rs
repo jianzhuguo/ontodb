@@ -178,7 +178,7 @@ impl<'a> BinaryRow<'a> {
 
     /// Check if the `__class__` field matches any class in the hierarchy set.
     pub fn class_in_hierarchy(&self, hierarchy: &std::collections::HashSet<String>) -> bool {
-        self.class_value().map_or(false, |c| hierarchy.contains(c))
+        self.class_value().is_some_and(|c| hierarchy.contains(c))
     }
 
     /// Convert the binary row to a `Map<String, Value>`.
@@ -268,7 +268,7 @@ impl<'a> BinaryRow<'a> {
         let idx = self.find_field(name)?;
         let (tag, raw) = self.field_value_raw(idx);
         if tag == TAG_BOOL {
-            Some(raw.first().map_or(false, |b| *b != 0))
+            Some(raw.first().is_some_and(|b| *b != 0))
         } else {
             None
         }
@@ -350,9 +350,9 @@ pub fn binary_bytes_to_map(data: &[u8]) -> Option<Map<String, Value>> {
                 if value_offset + 8 > data.len() { return None; }
                 let arr: [u8; 8] = data[value_offset..value_offset + 8].try_into().ok()?;
                 let f = f64::from_be_bytes(arr);
-                match serde_json::Number::from_f64(f) {
-                    Some(n) => Value::Number(n),
-                    None => return None,
+                {
+                    let n = serde_json::Number::from_f64(f)?;
+                    Value::Number(n)
                 }
             }
             TAG_STRING => {
@@ -371,9 +371,9 @@ pub fn binary_bytes_to_map(data: &[u8]) -> Option<Map<String, Value>> {
                 ) as usize;
                 if value_offset + 4 + olen > data.len() { return None; }
                 let inner = &data[value_offset + 4..value_offset + 4 + olen];
-                match binary_bytes_to_map(inner) {
-                    Some(m) => Value::Object(m),
-                    None => return None,
+                {
+                    let m = binary_bytes_to_map(inner)?;
+                    Value::Object(m)
                 }
             }
             TAG_ARRAY => {
@@ -499,7 +499,7 @@ fn serde_value_to_binary(val: &Value) -> (u8, Vec<u8>) {
 pub fn binary_to_serde_value(tag: u8, raw: &[u8]) -> Option<Value> {
     match tag {
         TAG_NULL => Some(Value::Null),
-        TAG_BOOL => Some(Value::Bool(raw.first().map_or(false, |b| *b != 0))),
+        TAG_BOOL => Some(Value::Bool(raw.first().is_some_and(|b| *b != 0))),
         TAG_INT => {
             let arr: [u8; 8] = raw.get(..8)?.try_into().ok()?;
             Some(Value::Number(serde_json::Number::from(i64::from_be_bytes(arr))))
@@ -579,12 +579,12 @@ pub fn binary_value_eq_serde(tag: u8, raw: &[u8], lit: &Value) -> bool {
         (TAG_NULL, Value::Null) => true,
         (TAG_NULL, _) => false,
         (_, Value::Null) => false,
-        (TAG_BOOL, Value::Bool(b)) => raw.first().map_or(false, |v| (*v != 0) == *b),
+        (TAG_BOOL, Value::Bool(b)) => raw.first().is_some_and(|v| (*v != 0) == *b),
         (TAG_INT, Value::Number(n)) => {
             if let Ok(arr) = raw.try_into() as Result<[u8; 8], _> {
                 let v = i64::from_be_bytes(arr);
-                n.as_i64().map_or(false, |ni| v == ni)
-                    || n.as_f64().map_or(false, |nf| v as f64 == nf)
+                (n.as_i64() == Some(v))
+                    || (n.as_f64() == Some(v as f64))
             } else {
                 false
             }
@@ -592,13 +592,13 @@ pub fn binary_value_eq_serde(tag: u8, raw: &[u8], lit: &Value) -> bool {
         (TAG_FLOAT, Value::Number(n)) => {
             if let Ok(arr) = raw.try_into() as Result<[u8; 8], _> {
                 let v = f64::from_be_bytes(arr);
-                n.as_f64().map_or(false, |nf| v == nf)
-                    || n.as_i64().map_or(false, |ni| v == ni as f64)
+                (n.as_f64() == Some(v))
+                    || n.as_i64().is_some_and(|ni| v == ni as f64)
             } else {
                 false
             }
         }
-        (TAG_STRING, Value::String(s)) => parse_string_value(raw).map_or(false, |v| v == s.as_str()),
+        (TAG_STRING, Value::String(s)) => parse_string_value(raw) == Some(s.as_str()),
         _ => false,
     }
 }

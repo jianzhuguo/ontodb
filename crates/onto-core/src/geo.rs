@@ -278,11 +278,11 @@ pub fn contains(a: &Geometry, b: &Geometry) -> bool {
 /// Check if geometry A overlaps geometry B (same dimension, partial overlap).
 pub fn overlaps(a: &Geometry, b: &Geometry) -> bool {
     match (a, b) {
-        (Geometry::Polygon(rings_a), Geometry::Polygon(rings_b)) => {
+        (Geometry::Polygon(_rings_a), Geometry::Polygon(_rings_b)) => {
             // Two polygons overlap if they intersect but neither contains the other
             intersects(a, b) && !contains(a, b) && !contains(b, a)
         }
-        (Geometry::LineString(l1), Geometry::LineString(l2)) => {
+        (Geometry::LineString(_l1), Geometry::LineString(_l2)) => {
             // Two lines overlap if they share a segment
             intersects(a, b) && !within(a, b) && !within(b, a)
         }
@@ -588,7 +588,7 @@ fn decode_wkt(s: &str) -> Option<Geometry> {
 }
 
 fn parse_coord(s: &str) -> Option<Coord> {
-    let parts: Vec<&str> = s.trim().split_whitespace().collect();
+    let parts: Vec<&str> = s.split_whitespace().collect();
     if parts.len() >= 2 {
         let x = parts[0].parse::<f64>().ok()?;
         let y = parts[1].parse::<f64>().ok()?;
@@ -696,7 +696,7 @@ fn point_on_line_segment(point: &Coord, a: &Coord, b: &Coord) -> bool {
         return (point.x - a.x).abs() < 1e-10 && (point.y - a.y).abs() < 1e-10;
     }
     let t = ((point.x - a.x) * dx + (point.y - a.y) * dy) / len_sq;
-    if t < 0.0 || t > 1.0 {
+    if !(0.0..=1.0).contains(&t) {
         return false;
     }
     let proj_x = a.x + t * dx;

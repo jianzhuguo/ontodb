@@ -7,6 +7,7 @@ use crate::optimizer::{ExecutionPlan, PlanNode};
 use onto_core::{CoreError, Result};
 use onto_core::binary_row::BinaryRow;
 use onto_ontology::{DataType, OntologyStore, Reasoner};
+use onto_sharding::{ShardRouter, ShardManager, ShardMap};
 use onto_storage::LsmEngine;
 use serde_json::{json, Map, Value};
 
@@ -33,7 +34,7 @@ fn owned_value_to_serde(val: simd_json::OwnedValue) -> Option<Map<String, Value>
         SVal::Object(map) => {
             let mut out = Map::with_capacity(map.len());
             for (k, v) in map.into_iter() {
-                out.insert(k.into(), simd_val_to_serde(v));
+                out.insert(k, simd_val_to_serde(v));
             }
             Some(out)
         }
@@ -51,12 +52,12 @@ fn simd_val_to_serde(val: simd_json::OwnedValue) -> Value {
             simd_json::StaticNode::U64(n) => serde_json::json!(n),
             simd_json::StaticNode::F64(n) => serde_json::json!(n),
         },
-        SVal::String(s) => Value::String(s.into()),
+        SVal::String(s) => Value::String(s),
         SVal::Array(arr) => Value::Array(arr.into_iter().map(simd_val_to_serde).collect()),
         SVal::Object(map) => {
             let mut out = Map::with_capacity(map.len());
             for (k, v) in map.into_iter() {
-                out.insert(k.into(), simd_val_to_serde(v));
+                out.insert(k, simd_val_to_serde(v));
             }
             Value::Object(out)
         }
@@ -153,7 +154,7 @@ fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
         (TAG_NULL, LiteralValue::Null) => true,
         (TAG_NULL, _) => false,
         (_, LiteralValue::Null) => false,
-        (TAG_BOOL, LiteralValue::Bool(b)) => raw.first().map_or(false, |v| (*v != 0) == *b),
+        (TAG_BOOL, LiteralValue::Bool(b)) => raw.first().is_some_and(|v| (*v != 0) == *b),
         (TAG_INT, LiteralValue::Int(n)) => {
             if let Ok(arr) = <[u8; 8]>::try_from(raw) {
                 i64::from_be_bytes(arr) == *n
@@ -175,7 +176,7 @@ fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
             } else { false }
         }
         (TAG_STRING, LiteralValue::String(s)) => {
-            parse_string_value(raw).map_or(false, |v| v == s.as_str())
+            parse_string_value(raw) == Some(s.as_str())
         }
         _ => false,
     }
@@ -288,6 +289,11 @@ pub struct QueryExecutor {
     /// Query deadline in nanoseconds (monotonic). Set before each query execution.
     /// Checked in hot loops to allow early cancellation of slow queries.
     query_deadline: AtomicU64,
+    /// Shard router for data sharding. Optional for backward compatibility.
+    /// Wrapped in RwLock for runtime updates.
+    shard_router: std::sync::RwLock<Option<ShardRouter>>,
+    /// Shard manager for shard lifecycle management. Optional for backward compatibility.
+    shard_manager: Mutex<Option<ShardManager>>,
 }
 
 /// Column-level statistics collected by ANALYZE.
@@ -379,6 +385,8 @@ impl QueryExecutor {
             config,
             inference_cache: Mutex::new(InferenceCache::default()),
             query_deadline: AtomicU64::new(0),
+            shard_router: std::sync::RwLock::new(None),
+            shard_manager: Mutex::new(None),
         }
     }
 
@@ -411,6 +419,49 @@ impl QueryExecutor {
     pub fn with_triple_store(mut self, triple_store: Arc<onto_ontology::TripleStore>) -> Self {
         self.triple_store = Some(triple_store);
         self
+    }
+
+    /// Set the shard router for data sharding support.
+    pub fn with_shard_router(self, shard_map: ShardMap, local_shards: Vec<onto_sharding::ShardId>) -> Self {
+        {
+            let mut router = self.shard_router.write().unwrap_or_else(|e| e.into_inner());
+            *router = Some(ShardRouter::new(shard_map.clone(), local_shards));
+        }
+        {
+            let mut mgr = self.shard_manager.lock().unwrap_or_else(|e| e.into_inner());
+            *mgr = Some(ShardManager::from_json(
+                &serde_json::to_string(&shard_map).unwrap_or_default()
+            ).unwrap_or_else(|_| ShardManager::new(0)));
+        }
+        self
+    }
+
+    /// Get a snapshot of the shard router (cloned).
+    pub fn shard_router_snapshot(&self) -> Option<ShardRouter> {
+        let router = self.shard_router.read().unwrap_or_else(|e| e.into_inner());
+        router.as_ref().map(|r| ShardRouter::new(
+            r.shard_map().clone(),
+            r.local_shards().to_vec(),
+        ))
+    }
+
+    /// Get the shard manager reference (if configured).
+    pub fn shard_manager(&self) -> std::sync::MutexGuard<'_, Option<ShardManager>> {
+        self.shard_manager.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Update the shard configuration at runtime.
+    pub fn update_shard_config(&self, shard_map: ShardMap, local_shards: Vec<onto_sharding::ShardId>) {
+        {
+            let mut router = self.shard_router.write().unwrap_or_else(|e| e.into_inner());
+            *router = Some(ShardRouter::new(shard_map.clone(), local_shards));
+        }
+        {
+            let mut mgr = self.shard_manager.lock().unwrap_or_else(|e| e.into_inner());
+            *mgr = Some(ShardManager::from_json(
+                &serde_json::to_string(&shard_map).unwrap_or_default()
+            ).unwrap_or_else(|_| ShardManager::new(0)));
+        }
     }
 
     /// Get the graph store reference (if configured).
@@ -846,7 +897,7 @@ impl QueryExecutor {
         // For DDL, transactions, and complex queries, use a read lock
         // (all LsmEngine methods take &self via interior mutability)
         let engine = &self.engine;
-        self.execute_write_with_engine(ast, &engine)
+        self.execute_write_with_engine(ast, engine)
     }
 
     /// Executes a simple DML statement (INSERT/UPDATE/DELETE) with minimal write lock scope.
@@ -892,7 +943,7 @@ impl QueryExecutor {
     pub fn execute_read(&self, ast: &QueryAst) -> Result<QueryResult> {
         self.arm_timeout();
         let engine = &self.engine;
-        self.execute_select_read(ast, &engine)
+        self.execute_select_read(ast, engine)
     }
 
     /// Write-path execution: acquires write lock, handles timeout+stats+transactions.
@@ -1152,7 +1203,7 @@ impl QueryExecutor {
                     let row_count = rows.len();
                     for (i, row) in rows.iter().enumerate() {
                         let key = format!("{}{:010}", prefix, i);
-                        let value = doc_to_storage_bytes(&row);
+                        let value = doc_to_storage_bytes(row);
                         engine.put(key.as_bytes().to_vec(), value)?;
                     }
                     // Store metadata with original query for incremental refresh
@@ -1235,7 +1286,7 @@ impl QueryExecutor {
 
                     for (i, row) in new_rows.iter().enumerate() {
                         let key = format!("{}{:010}", prefix, i);
-                        let value = doc_to_storage_bytes(&row);
+                        let value = doc_to_storage_bytes(row);
                         // Strip internal fields for comparison (same as old rows)
                         let mut stripped_row = row.clone();
                         Self::strip_internal_fields(&mut stripped_row);
@@ -1519,7 +1570,7 @@ impl QueryExecutor {
                                         };
                                         if let Some(val) = raw_row.get(real_col) {
                                             let name = alias_part.unwrap_or(real_col);
-                                            let name = name.split('.').last().unwrap_or(name);
+                                            let name = name.split('.').next_back().unwrap_or(name);
                                             projected.insert(name.to_string(), val.clone());
                                         }
                                     }
@@ -1565,7 +1616,7 @@ impl QueryExecutor {
                 }
                 Ok(rows)
             }
-            PlanNode::Aggregation { input, group_by: _, .. } => {
+            PlanNode::Aggregation { input, .. } => {
                 let rows = self.execute_plan_node(input, engine)?;
                 // Basic aggregation: just return grouped rows
                 // Full aggregation is handled by execute_aggregation
@@ -1612,6 +1663,34 @@ impl QueryExecutor {
         filter: &Option<FilterExpr>,
         projected_columns: Option<&SelectColumns>,
     ) -> Result<Vec<Map<String, Value>>> {
+        // Sharding: check if this table is sharded and route accordingly
+        {
+            let shard_router = self.shard_router.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(router) = shard_router.as_ref() {
+                use onto_sharding::strategy::ShardTarget;
+                let target = router.route_scan(table);
+                match target {
+                    ShardTarget::Single(shard) => {
+                        if !router.is_local(shard) {
+                            tracing::debug!(table = table, shard = shard, "shard not local, skipping scan");
+                            return Ok(Vec::new());
+                        }
+                    }
+                    ShardTarget::Multi(shards) => {
+                        let local_shards: Vec<_> = shards.into_iter().filter(|s| router.is_local(*s)).collect();
+                        if local_shards.is_empty() {
+                            tracing::debug!(table = table, "no local shards for multi-shard scan");
+                            return Ok(Vec::new());
+                        }
+                        tracing::debug!(table = table, shards = ?local_shards, "scanning local shards");
+                    }
+                    ShardTarget::All => {
+                        // Scan all local shards
+                    }
+                }
+            }
+        }
+
         // Check CTE tables first
         let cte_prefix = format!("__cte_{}::", table.to_lowercase());
         let cte_entries = engine.scan_prefix(cte_prefix.as_bytes()).unwrap_or_default();
@@ -1661,7 +1740,7 @@ impl QueryExecutor {
                     match item {
                         SelectItem::Column(col) => {
                             let real = if let Some(pos) = col.find(" as ") { &col[..pos] } else { col.as_str() };
-                            let name = real.split('.').last().unwrap_or(real).to_string();
+                            let name = real.split('.').next_back().unwrap_or(real).to_string();
                             if !cols.contains(&name) { cols.push(name); }
                         }
                         SelectItem::Aggregate(a) => {
@@ -1689,11 +1768,10 @@ impl QueryExecutor {
                     self.check_timeout()?;
                 }
                 // Tier 1: fast byte-level rejection (definitely doesn't match → skip)
-                if !fast_filter_cols.is_empty() {
-                    if Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
+                if !fast_filter_cols.is_empty()
+                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
                         continue;
                     }
-                }
                 // Tier 2: BinaryRow path (for binary-stored data) — no JSON parsing
                 if let Some(brow) = BinaryRow::parse(val_bytes) {
                     if !brow.class_in_hierarchy(&scan_classes) {
@@ -1707,6 +1785,12 @@ impl QueryExecutor {
                                 if let Some(mut doc) = brow.to_map() {
                                     if !self.eval_filter(engine, &doc, f) { continue; }
                                     doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                                    // Add shard routing info for debugging
+                                    if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                                        let pk = String::from_utf8_lossy(key);
+                                        let target = router.route_key(table, pk.as_bytes());
+                                        doc.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                                    }
                                     rows.push(doc);
                                 }
                                 continue;
@@ -1715,6 +1799,12 @@ impl QueryExecutor {
                     }
                     if let Some(mut doc) = brow.to_map_projected(&proj_cols) {
                         doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                        // Add shard routing info for debugging
+                        if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                            let pk = String::from_utf8_lossy(key);
+                            let target = router.route_key(table, pk.as_bytes());
+                            doc.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                        }
                         rows.push(doc);
                     }
                     continue;
@@ -1728,6 +1818,12 @@ impl QueryExecutor {
                         if !self.eval_filter(engine, &doc, f) { continue; }
                     }
                     doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                    // Add shard routing info for debugging
+                    if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                        let pk = String::from_utf8_lossy(key);
+                        let target = router.route_key(table, pk.as_bytes());
+                        doc.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                    }
                     rows.push(doc);
                 }
             }
@@ -1861,11 +1957,10 @@ impl QueryExecutor {
                 let entries = engine.scan_prefix(prefix.as_bytes())?;
                 for (key, val_bytes) in &entries {
                     if let Some(ref doc) = storage_bytes_to_doc(val_bytes) {
-                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
-                            if self.eval_filter(engine, doc, f) {
+                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                            && self.eval_filter(engine, doc, f) {
                                 allowed_ids.insert(key.clone());
                             }
-                        }
                     }
                 }
             }
@@ -2711,7 +2806,7 @@ impl QueryExecutor {
                                     };
                                     if let Some(val) = raw_row.get(real_col) {
                                         let name = alias_part.unwrap_or(real_col);
-                                        let name = name.split('.').last().unwrap_or(name);
+                                        let name = name.split('.').next_back().unwrap_or(name);
                                         projected.insert(name.to_string(), val.clone());
                                     }
                                 }
@@ -2792,6 +2887,34 @@ impl QueryExecutor {
         filter: &Option<FilterExpr>,
         projected_columns: Option<&SelectColumns>,
     ) -> Result<Vec<Map<String, Value>>> {
+        // Sharding: check if this table is sharded and route accordingly
+        {
+            let shard_router = self.shard_router.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(router) = shard_router.as_ref() {
+                use onto_sharding::strategy::ShardTarget;
+                let target = router.route_scan(table);
+                match target {
+                    ShardTarget::Single(shard) => {
+                        if !router.is_local(shard) {
+                            tracing::debug!(table = table, shard = shard, "shard not local, skipping scan");
+                            return Ok(Vec::new());
+                        }
+                    }
+                    ShardTarget::Multi(shards) => {
+                        let local_shards: Vec<_> = shards.into_iter().filter(|s| router.is_local(*s)).collect();
+                        if local_shards.is_empty() {
+                            tracing::debug!(table = table, "no local shards for multi-shard scan");
+                            return Ok(Vec::new());
+                        }
+                        tracing::debug!(table = table, shards = ?local_shards, "scanning local shards");
+                    }
+                    ShardTarget::All => {
+                        // Scan all local shards
+                    }
+                }
+            }
+        }
+
         let class_hierarchy = self.get_class_hierarchy_read(engine, table);
 
         // Pre-extract simple filter column names for fast byte-level rejection.
@@ -2808,7 +2931,7 @@ impl QueryExecutor {
                             // Strip " as alias" suffix
                             let real = if let Some(pos) = col.find(" as ") { &col[..pos] } else { col.as_str() };
                             // Strip "table." prefix
-                            let name = real.split('.').last().unwrap_or(real).to_string();
+                            let name = real.split('.').next_back().unwrap_or(real).to_string();
                             if !cols.contains(&name) { cols.push(name); }
                         }
                         SelectItem::Aggregate(a) => {
@@ -2836,11 +2959,10 @@ impl QueryExecutor {
                     self.check_timeout()?;
                 }
                 // Tier 1: fast byte-level rejection
-                if !fast_filter_cols.is_empty() {
-                    if Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
+                if !fast_filter_cols.is_empty()
+                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
                         continue;
                     }
-                }
                 // Tier 2: BinaryRow path (for binary-stored data) — no JSON parsing
                 if let Some(brow) = BinaryRow::parse(val_bytes) {
                     if !brow.class_in_hierarchy(&class_hierarchy) {
@@ -2855,6 +2977,12 @@ impl QueryExecutor {
                                 if let Some(mut doc) = brow.to_map() {
                                     if !self.eval_filter_read(engine, &doc, f) { continue; }
                                     doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                                    // Add shard routing info
+                                    if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                                        let pk = String::from_utf8_lossy(key);
+                                        let target = router.route_key(table, pk.as_bytes());
+                                        doc.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                                    }
                                     rows.push(doc);
                                 }
                                 continue;
@@ -2864,6 +2992,12 @@ impl QueryExecutor {
                     // Use projected conversion when column list is available
                     if let Some(mut doc) = brow.to_map_projected(&proj_cols) {
                         doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                        // Add shard routing info
+                        if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                            let pk = String::from_utf8_lossy(key);
+                            let target = router.route_key(table, pk.as_bytes());
+                            doc.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                        }
                         rows.push(doc);
                     }
                     continue;
@@ -2877,6 +3011,12 @@ impl QueryExecutor {
                         if !self.eval_filter_read(engine, &doc, f) { continue; }
                     }
                     doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                    // Add shard routing info
+                    if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                        let pk = String::from_utf8_lossy(key);
+                        let target = router.route_key(table, pk.as_bytes());
+                        doc.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                    }
                     rows.push(doc);
                 }
             }
@@ -2933,11 +3073,10 @@ impl QueryExecutor {
             let entries = engine.scan_prefix(prefix.as_bytes())?;
             for (_key, val_bytes) in &entries {
                 // Tier 1: fast byte-level rejection
-                if !fast_filter_cols.is_empty() {
-                    if Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
+                if !fast_filter_cols.is_empty()
+                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
                         continue;
                     }
-                }
                 // Tier 2: BinaryRow path — filter without full deserialization
                 if let Some(brow) = BinaryRow::parse(val_bytes) {
                     if !brow.class_in_hierarchy(&class_hierarchy) {
@@ -3218,7 +3357,7 @@ impl QueryExecutor {
             end
         } else {
             // Number, bool, null: read until comma or closing brace
-            rest.find(|c: char| c == ',' || c == '}' || c == ']').unwrap_or(rest.len())
+            rest.find([',', '}', ']']).unwrap_or(rest.len())
         };
         Some(&json_bytes[value_start..value_start + value_end])
     }
@@ -3303,6 +3442,15 @@ impl QueryExecutor {
                         .map(|c| class_hierarchy.contains(c))
                         .unwrap_or(false)
                 });
+                // Add shard routing info
+                if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    for row in &mut rows {
+                        if let Some(pk) = row.get("__pk__").and_then(|v| v.as_str()) {
+                            let target = router.route_key(table, pk.as_bytes());
+                            row.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                        }
+                    }
+                }
                 if let Some(a) = alias {
                     Self::apply_alias(&mut rows, a);
                 }
@@ -3445,11 +3593,10 @@ impl QueryExecutor {
                 let entries = engine.scan_prefix(prefix.as_bytes())?;
                 for (key, val_bytes) in &entries {
                     if let Some(ref doc) = storage_bytes_to_doc(val_bytes) {
-                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
-                            if self.eval_filter_read(engine, doc, f) {
+                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                            && self.eval_filter_read(engine, doc, f) {
                                 allowed_ids.insert(key.clone());
                             }
-                        }
                     }
                 }
             }
@@ -3554,11 +3701,10 @@ impl QueryExecutor {
                 let entries = engine.scan_prefix(prefix.as_bytes())?;
                 for (key, val_bytes) in &entries {
                     if let Some(ref doc) = storage_bytes_to_doc(val_bytes) {
-                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
-                            if Self::eval_filter_static_with_hierarchy(doc, filter_expr, &class_hierarchy) {
+                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                            && Self::eval_filter_static_with_hierarchy(doc, filter_expr, &class_hierarchy) {
                                 allowed_ids.insert(key.clone());
                             }
-                        }
                     }
                 }
             }
@@ -3628,7 +3774,7 @@ impl QueryExecutor {
                         }
                         SelectItem::Column(col) => {
                             let col_name = col.split(" as ").last().unwrap_or(col);
-                            let col_name = col_name.split('.').last().unwrap_or(col_name);
+                            let col_name = col_name.split('.').next_back().unwrap_or(col_name);
                             if !result_row.contains_key(col_name) {
                                 if let Some(val) = Self::resolve_column_value(group_rows[0], col) {
                                     result_row.insert(col_name.to_string(), Value::String(val));
@@ -3641,7 +3787,7 @@ impl QueryExecutor {
             }
 
             // Use read-path filter for HAVING with ontology reasoning
-            if having.as_ref().map_or(true, |h| self.eval_filter_read(engine, &result_row, h)) {
+            if having.as_ref().is_none_or(|h| self.eval_filter_read(engine, &result_row, h)) {
                 result_rows.push(result_row);
             }
         }
@@ -3703,7 +3849,7 @@ impl QueryExecutor {
     fn eval_filter_read(&self, engine: &LsmEngine, doc: &Map<String, Value>, expr: &FilterExpr) -> bool {
         match expr {
             FilterExpr::Eq(col, val) => {
-                doc.get(col).map_or(false, |v| {
+                doc.get(col).is_some_and(|v| {
                     if col == "__class__" {
                         self.class_value_matches_read(engine, v, val)
                     } else {
@@ -3712,7 +3858,7 @@ impl QueryExecutor {
                 })
             }
             FilterExpr::Ne(col, val) => {
-                !doc.get(col).map_or(false, |v| {
+                !doc.get(col).is_some_and(|v| {
                     if col == "__class__" {
                         self.class_value_matches_read(engine, v, val)
                     } else {
@@ -3721,19 +3867,19 @@ impl QueryExecutor {
                 })
             }
             FilterExpr::Gt(col, val) => {
-                doc.get(col).map_or(false, |v| self.value_gt(v, val))
+                doc.get(col).is_some_and(|v| self.value_gt(v, val))
             }
             FilterExpr::Lt(col, val) => {
-                doc.get(col).map_or(false, |v| self.value_lt(v, val))
+                doc.get(col).is_some_and(|v| self.value_lt(v, val))
             }
             FilterExpr::Gte(col, val) => {
-                doc.get(col).map_or(false, |v| self.value_gt(v, val) || self.value_matches(v, val))
+                doc.get(col).is_some_and(|v| self.value_gt(v, val) || self.value_matches(v, val))
             }
             FilterExpr::Lte(col, val) => {
-                doc.get(col).map_or(false, |v| self.value_lt(v, val) || self.value_matches(v, val))
+                doc.get(col).is_some_and(|v| self.value_lt(v, val) || self.value_matches(v, val))
             }
             FilterExpr::Like(col, pattern) => {
-                doc.get(col).map_or(false, |v| {
+                doc.get(col).is_some_and(|v| {
                     let s = match v {
                         Value::String(s) => s.clone(),
                         _ => v.to_string(),
@@ -3742,12 +3888,12 @@ impl QueryExecutor {
                 })
             }
             FilterExpr::Between(col, low, high) => {
-                doc.get(col).map_or(false, |v| {
+                doc.get(col).is_some_and(|v| {
                     self.value_gte(v, low) && self.value_lte(v, high)
                 })
             }
             FilterExpr::In(col, values) => {
-                doc.get(col).map_or(false, |v| {
+                doc.get(col).is_some_and(|v| {
                     if col == "__class__" {
                         values.iter().any(|val| self.class_value_matches_read(engine, v, val))
                     } else {
@@ -3756,10 +3902,10 @@ impl QueryExecutor {
                 })
             }
             FilterExpr::IsNull(col) => {
-                doc.get(col).map_or(true, |v| matches!(v, Value::Null))
+                doc.get(col).is_none_or(|v| matches!(v, Value::Null))
             }
             FilterExpr::IsNotNull(col) => {
-                doc.get(col).map_or(false, |v| !matches!(v, Value::Null))
+                doc.get(col).is_some_and(|v| !matches!(v, Value::Null))
             }
             FilterExpr::Not(expr) => {
                 !self.eval_filter_read(engine, doc, expr)
@@ -3887,7 +4033,7 @@ impl QueryExecutor {
                 // Insert each row as a CTE entry
                 for (i, row) in rows.iter().enumerate() {
                     let key = format!("{}{:010}", prefix, i);
-                    let value = doc_to_storage_bytes(&row);
+                    let value = doc_to_storage_bytes(row);
                     engine.put(key.as_bytes().to_vec(), value)?;
                 }
             }
@@ -4414,7 +4560,7 @@ impl QueryExecutor {
                             // the value comes from the first row (already added above)
                             // Only add if not already added by GROUP BY
                             let col_name = col.split(" as ").last().unwrap_or(col);
-                            let col_name = col_name.split('.').last().unwrap_or(col_name);
+                            let col_name = col_name.split('.').next_back().unwrap_or(col_name);
                             if !result_row.contains_key(col_name) {
                                 if let Some(val) = Self::resolve_column_value(group_rows[0], col) {
                                     result_row.insert(col_name.to_string(), Value::String(val));
@@ -4617,7 +4763,7 @@ impl QueryExecutor {
                     } else {
                         let col = arg.unwrap_or("");
                         Self::resolve_column_value(&partition[idx - 1].1, col)
-                            .map(|v| Value::String(v))
+                            .map(Value::String)
                             .unwrap_or(Value::Null)
                     }
                 }
@@ -4628,20 +4774,20 @@ impl QueryExecutor {
                     } else {
                         let col = arg.unwrap_or("");
                         Self::resolve_column_value(&partition[idx + 1].1, col)
-                            .map(|v| Value::String(v))
+                            .map(Value::String)
                             .unwrap_or(Value::Null)
                     }
                 }
                 WindowFunc::FirstValue => {
                     let col = arg.unwrap_or("");
                     Self::resolve_column_value(&partition[0].1, col)
-                        .map(|v| Value::String(v))
+                        .map(Value::String)
                         .unwrap_or(Value::Null)
                 }
                 WindowFunc::LastValue => {
                     let col = arg.unwrap_or("");
                     Self::resolve_column_value(&partition[n - 1].1, col)
-                        .map(|v| Value::String(v))
+                        .map(Value::String)
                         .unwrap_or(Value::Null)
                 }
                 WindowFunc::NthValue => {
@@ -4649,7 +4795,7 @@ impl QueryExecutor {
                     let col = arg.unwrap_or("");
                     // For simplicity, return the value at the current row position
                     Self::resolve_column_value(&partition[idx].1, col)
-                        .map(|v| Value::String(v))
+                        .map(Value::String)
                         .unwrap_or(Value::Null)
                 }
                 WindowFunc::Sum => {
@@ -4729,7 +4875,7 @@ impl QueryExecutor {
     /// Returns a default column name for a ValueExpr.
     fn value_expr_default_name(expr: &ValueExpr) -> String {
         match expr {
-            ValueExpr::Column(col) => col.split('.').last().unwrap_or(col).to_string(),
+            ValueExpr::Column(col) => col.split('.').next_back().unwrap_or(col).to_string(),
             ValueExpr::Literal(lit) => format!("{:?}", lit),
             ValueExpr::CaseWhen { .. } => "case".to_string(),
             ValueExpr::ScalarSubquery(_) => "subquery".to_string(),
@@ -4752,8 +4898,8 @@ impl QueryExecutor {
     /// Resolves join column references from the ON condition.
     /// Returns (left_column_name, right_column_name) without alias prefixes.
     fn resolve_join_columns(on: &crate::parser::JoinOn) -> Result<(String, String)> {
-        let left = on.left.split('.').last().unwrap_or(&on.left).to_string();
-        let right = on.right.split('.').last().unwrap_or(&on.right).to_string();
+        let left = on.left.split('.').next_back().unwrap_or(&on.left).to_string();
+        let right = on.right.split('.').next_back().unwrap_or(&on.right).to_string();
         Ok((left, right))
     }
 
@@ -5290,6 +5436,7 @@ impl QueryExecutor {
     }
 
     /// Imports a single JSON object as a row.
+    #[allow(dead_code)]
     fn import_json_object(
         &self,
         engine: &LsmEngine,
@@ -5431,11 +5578,10 @@ impl QueryExecutor {
                     if let Ok(serde_json::Value::Object(ref doc)) =
                         serde_json::from_slice::<serde_json::Value>(val_bytes)
                     {
-                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
-                            if self.matches_filter(engine, doc, &Some(filter_expr.clone())) {
+                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                            && self.matches_filter(engine, doc, &Some(filter_expr.clone())) {
                                 allowed_ids.insert(key.clone());
                             }
-                        }
                     }
                 }
             }
@@ -5502,7 +5648,7 @@ impl QueryExecutor {
             .unwrap_or_default()
             .as_nanos();
         // Combine timestamp + counter for collision-free uniqueness
-        let unique = (ts as u128) << 64 | seq as u128;
+        let unique = ts << 64 | seq as u128;
         format!("{}::{:040}", class, unique).into_bytes()
     }
 
@@ -5617,7 +5763,7 @@ impl QueryExecutor {
         };
         match filter {
             FilterExpr::Eq(col, val) => {
-                resolve_val(col).map_or(false, |v| {
+                resolve_val(col).is_some_and(|v| {
                     if col == "__class__" && !class_hierarchy.is_empty() {
                         Self::class_value_matches_hierarchy(v, val, class_hierarchy)
                     } else {
@@ -5626,7 +5772,7 @@ impl QueryExecutor {
                 })
             }
             FilterExpr::Ne(col, val) => {
-                !resolve_val(col).map_or(false, |v| {
+                !resolve_val(col).is_some_and(|v| {
                     if col == "__class__" && !class_hierarchy.is_empty() {
                         Self::class_value_matches_hierarchy(v, val, class_hierarchy)
                     } else {
@@ -5635,19 +5781,19 @@ impl QueryExecutor {
                 })
             }
             FilterExpr::Gt(col, val) => {
-                resolve_val(col).map_or(false, |v| Self::value_gt_static(v, val))
+                resolve_val(col).is_some_and(|v| Self::value_gt_static(v, val))
             }
             FilterExpr::Lt(col, val) => {
-                resolve_val(col).map_or(false, |v| Self::value_lt_static(v, val))
+                resolve_val(col).is_some_and(|v| Self::value_lt_static(v, val))
             }
             FilterExpr::Gte(col, val) => {
-                resolve_val(col).map_or(false, |v| Self::value_gte_static(v, val))
+                resolve_val(col).is_some_and(|v| Self::value_gte_static(v, val))
             }
             FilterExpr::Lte(col, val) => {
-                resolve_val(col).map_or(false, |v| Self::value_lte_static(v, val))
+                resolve_val(col).is_some_and(|v| Self::value_lte_static(v, val))
             }
             FilterExpr::Like(col, pattern) => {
-                resolve_val(col).map_or(false, |v| {
+                resolve_val(col).is_some_and(|v| {
                     let s = match v {
                         Value::String(s) => s.clone(),
                         _ => v.to_string(),
@@ -5656,12 +5802,12 @@ impl QueryExecutor {
                 })
             }
             FilterExpr::Between(col, low, high) => {
-                resolve_val(col).map_or(false, |v| {
+                resolve_val(col).is_some_and(|v| {
                     Self::value_gte_static(v, low) && Self::value_lte_static(v, high)
                 })
             }
             FilterExpr::In(col, values) => {
-                resolve_val(col).map_or(false, |v| {
+                resolve_val(col).is_some_and(|v| {
                     if col == "__class__" && !class_hierarchy.is_empty() {
                         values.iter().any(|lv| Self::class_value_matches_hierarchy(v, lv, class_hierarchy))
                     } else {
@@ -5719,8 +5865,8 @@ impl QueryExecutor {
     #[allow(dead_code)]
     fn value_gt_static(v: &Value, lit: &LiteralValue) -> bool {
         match (v, lit) {
-            (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().map_or(false, |n| n > *l),
-            (Value::Number(n), LiteralValue::Float(l)) => n.as_f64().map_or(false, |n| n > *l),
+            (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().is_some_and(|n| n > *l),
+            (Value::Number(n), LiteralValue::Float(l)) => n.as_f64().is_some_and(|n| n > *l),
             (Value::String(s), LiteralValue::String(l)) => s.as_str() > l.as_str(),
             _ => false,
         }
@@ -5729,8 +5875,8 @@ impl QueryExecutor {
     #[allow(dead_code)]
     fn value_lt_static(v: &Value, lit: &LiteralValue) -> bool {
         match (v, lit) {
-            (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().map_or(false, |n| n < *l),
-            (Value::Number(n), LiteralValue::Float(l)) => n.as_f64().map_or(false, |n| n < *l),
+            (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().is_some_and(|n| n < *l),
+            (Value::Number(n), LiteralValue::Float(l)) => n.as_f64().is_some_and(|n| n < *l),
             (Value::String(s), LiteralValue::String(l)) => s.as_str() < l.as_str(),
             _ => false,
         }
@@ -5773,7 +5919,7 @@ impl QueryExecutor {
     fn eval_filter(&self, engine: &LsmEngine, doc: &Map<String, Value>, expr: &FilterExpr) -> bool {
         match expr {
             FilterExpr::Eq(col, val) => {
-                doc.get(col).map_or(false, |v| {
+                doc.get(col).is_some_and(|v| {
                     if col == "__class__" {
                         self.class_value_matches(engine, v, val)
                     } else {
@@ -5782,7 +5928,7 @@ impl QueryExecutor {
                 })
             }
             FilterExpr::Ne(col, val) => {
-                !doc.get(col).map_or(false, |v| {
+                !doc.get(col).is_some_and(|v| {
                     if col == "__class__" {
                         self.class_value_matches(engine, v, val)
                     } else {
@@ -5792,22 +5938,22 @@ impl QueryExecutor {
             }
             FilterExpr::Gt(col, val) => {
                 doc.get(col)
-                    .map_or(false, |v| self.value_gt(v, val))
+                    .is_some_and(|v| self.value_gt(v, val))
             }
             FilterExpr::Lt(col, val) => {
                 doc.get(col)
-                    .map_or(false, |v| self.value_lt(v, val))
+                    .is_some_and(|v| self.value_lt(v, val))
             }
             FilterExpr::Gte(col, val) => {
                 doc.get(col)
-                    .map_or(false, |v| self.value_gt(v, val) || self.value_matches(v, val))
+                    .is_some_and(|v| self.value_gt(v, val) || self.value_matches(v, val))
             }
             FilterExpr::Lte(col, val) => {
                 doc.get(col)
-                    .map_or(false, |v| self.value_lt(v, val) || self.value_matches(v, val))
+                    .is_some_and(|v| self.value_lt(v, val) || self.value_matches(v, val))
             }
             FilterExpr::Like(col, pattern) => {
-                doc.get(col).map_or(false, |v| {
+                doc.get(col).is_some_and(|v| {
                     let s = match v {
                         Value::String(s) => s.clone(),
                         _ => v.to_string(),
@@ -5816,12 +5962,12 @@ impl QueryExecutor {
                 })
             }
             FilterExpr::Between(col, low, high) => {
-                doc.get(col).map_or(false, |v| {
+                doc.get(col).is_some_and(|v| {
                     self.value_gte(v, low) && self.value_lte(v, high)
                 })
             }
             FilterExpr::In(col, values) => {
-                doc.get(col).map_or(false, |v| {
+                doc.get(col).is_some_and(|v| {
                     if col == "__class__" {
                         values.iter().any(|val| self.class_value_matches(engine, v, val))
                     } else {
@@ -5833,13 +5979,13 @@ impl QueryExecutor {
                 let sub_result = self.execute_with_engine_inner(subquery, engine);
                 match sub_result {
                     Ok(QueryResult::Rows(rows)) => {
-                        doc.get(col).map_or(false, |v| {
+                        doc.get(col).is_some_and(|v| {
                             rows.iter().any(|row| {
                                 row.values().any(|sv| {
                                     match (v, sv) {
                                         (Value::String(a), Value::String(b)) => a == b,
                                         (Value::Number(a), Value::Number(b)) => a == b,
-                                        _ => v.to_string() == sv.to_string(),
+                                        _ => *v == *sv,
                                     }
                                 })
                             })
@@ -5863,10 +6009,10 @@ impl QueryExecutor {
                 }
             }
             FilterExpr::IsNull(col) => {
-                doc.get(col).map_or(true, |v| matches!(v, Value::Null))
+                doc.get(col).is_none_or(|v| matches!(v, Value::Null))
             }
             FilterExpr::IsNotNull(col) => {
-                doc.get(col).map_or(false, |v| !matches!(v, Value::Null))
+                doc.get(col).is_some_and(|v| !matches!(v, Value::Null))
             }
             FilterExpr::Not(expr) => {
                 !self.eval_filter(engine, doc, expr)
@@ -6168,8 +6314,8 @@ impl QueryExecutor {
 
     fn value_gt(&self, v: &Value, lit: &LiteralValue) -> bool {
         match (v, lit) {
-            (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().map_or(false, |n| n > *l),
-            (Value::Number(n), LiteralValue::Float(l)) => n.as_f64().map_or(false, |n| n > *l),
+            (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().is_some_and(|n| n > *l),
+            (Value::Number(n), LiteralValue::Float(l)) => n.as_f64().is_some_and(|n| n > *l),
             (Value::String(s), LiteralValue::String(l)) => s.as_str() > l.as_str(),
             _ => false,
         }
@@ -6177,8 +6323,8 @@ impl QueryExecutor {
 
     fn value_lt(&self, v: &Value, lit: &LiteralValue) -> bool {
         match (v, lit) {
-            (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().map_or(false, |n| n < *l),
-            (Value::Number(n), LiteralValue::Float(l)) => n.as_f64().map_or(false, |n| n < *l),
+            (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().is_some_and(|n| n < *l),
+            (Value::Number(n), LiteralValue::Float(l)) => n.as_f64().is_some_and(|n| n < *l),
             (Value::String(s), LiteralValue::String(l)) => s.as_str() < l.as_str(),
             _ => false,
         }
@@ -6738,7 +6884,7 @@ impl QueryExecutor {
                     } else {
                         values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                         let mid = values.len() / 2;
-                        if values.len() % 2 == 0 {
+                        if values.len().is_multiple_of(2) {
                             Ok(json!((values[mid - 1] + values[mid]) / 2.0))
                         } else {
                             Ok(json!(values[mid]))
@@ -6796,14 +6942,14 @@ impl QueryExecutor {
                             // Try direct lookup first (preserves Value type)
                             if let Some(val) = doc.get(real_col) {
                                 let name = alias.unwrap_or(real_col);
-                                let name = name.split('.').last().unwrap_or(name);
+                                let name = name.split('.').next_back().unwrap_or(name);
                                 result.insert(name.to_string(), val.clone());
                             } else {
                                 // Try alias-aware lookup
                                 for (k, v) in doc {
                                     if k.ends_with(&format!(".{}", real_col)) || k == real_col {
                                         let name = alias.unwrap_or(real_col);
-                                        let name = name.split('.').last().unwrap_or(name);
+                                        let name = name.split('.').next_back().unwrap_or(name);
                                         result.insert(name.to_string(), v.clone());
                                         break;
                                     }
@@ -7151,6 +7297,7 @@ impl QueryExecutor {
 }
 
 /// Converts a JSON value to a LiteralValue for import.
+#[allow(dead_code)]
 fn json_to_literal(val: &serde_json::Value) -> LiteralValue {
     match val {
         serde_json::Value::Null => LiteralValue::Null,
@@ -7169,6 +7316,7 @@ fn json_to_literal(val: &serde_json::Value) -> LiteralValue {
 }
 
 /// Returns a human-readable type name for a JSON value.
+#[allow(dead_code)]
 fn obj_type_name(val: &serde_json::Value) -> &'static str {
     match val {
         serde_json::Value::Null => "null",

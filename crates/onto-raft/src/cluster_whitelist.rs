@@ -398,10 +398,7 @@ fn config_hash(data: &[u8]) -> u64 {
 
 /// Simple TCP connectivity check.
 async fn check_tcp_reachable(addr: &str) -> bool {
-    match tokio::net::TcpStream::connect(addr).await {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    tokio::net::TcpStream::connect(addr).await.is_ok()
 }
 
 #[cfg(test)]

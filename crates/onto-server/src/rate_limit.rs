@@ -144,6 +144,7 @@ impl RateLimiter {
     }
 
     /// Get the current rate limit info for a key.
+    #[allow(dead_code)]
     pub async fn get_info(&self, key: &str) -> RateLimitInfo {
         let buckets = self.buckets.lock().await;
         if let Some(bucket) = buckets.get(key) {

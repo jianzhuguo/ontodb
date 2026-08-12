@@ -424,10 +424,10 @@ fn is_valid_ip_or_cidr(s: &str) -> bool {
     if let Some((ip, prefix)) = s.split_once('/') {
         // CIDR notation: validate IP and prefix length
         if ip.parse::<std::net::Ipv4Addr>().is_ok() {
-            return prefix.parse::<u32>().map_or(false, |p| p <= 32);
+            return prefix.parse::<u32>().is_ok_and(|p| p <= 32);
         }
         if ip.parse::<std::net::Ipv6Addr>().is_ok() {
-            return prefix.parse::<u32>().map_or(false, |p| p <= 128);
+            return prefix.parse::<u32>().is_ok_and(|p| p <= 128);
         }
         return false;
     }

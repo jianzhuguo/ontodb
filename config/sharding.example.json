@@ -1,0 +1,48 @@
+{
+  "default_shard": 0,
+  "shards": {
+    "0": {
+      "id": 0,
+      "name": "default",
+      "raft_group": null,
+      "replicas": [0],
+      "is_primary": true
+    },
+    "1": {
+      "id": 1,
+      "name": "shard-beijing",
+      "raft_group": 1,
+      "replicas": [0, 1],
+      "is_primary": true
+    },
+    "2": {
+      "id": 2,
+      "name": "shard-shanghai",
+      "raft_group": 2,
+      "replicas": [0, 2],
+      "is_primary": true
+    }
+  },
+  "class_strategies": {
+    "User": {
+      "HashBased": {
+        "num_shards": 4,
+        "slot_map": [0, 0, 1, 1]
+      }
+    },
+    "Order": {
+      "ClassBased": {
+        "shard": 1
+      }
+    },
+    "Product": {
+      "RangeBased": {
+        "ranges": [
+          {"end_key": "m", "shard": 0},
+          {"end_key": "t", "shard": 1},
+          {"end_key": "z", "shard": 2}
+        ]
+      }
+    }
+  }
+}

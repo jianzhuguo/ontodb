@@ -22,7 +22,7 @@ impl BloomFilter {
         // Optimal number of hash functions: (m/n) * ln(2)
         let num_hashes = Self::optimal_hashes(num_bits, expected_items).max(1);
 
-        let num_u64 = (num_bits + 63) / 64;
+        let num_u64 = num_bits.div_ceil(64);
         Self {
             bits: vec![0u64; num_u64],
             num_hashes,
@@ -80,7 +80,7 @@ impl BloomFilter {
         if num_bits > 128 * 1024 * 1024 * 8 {
             return None;
         }
-        let num_u64 = (num_bits + 63) / 64;
+        let num_u64 = num_bits.div_ceil(64);
 
         if data.len() < 8 + num_u64 * 8 {
             return None;

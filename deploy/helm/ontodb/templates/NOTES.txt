@@ -1,0 +1,27 @@
+OntoDB has been deployed successfully!
+
+Release: {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+1. Get the application URL:
+{{- if .Values.ingress.enabled }}
+{{- range $host := .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host.host }}{{ (first $host.paths).path }}
+{{- end }}
+{{- else if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[1].nodePort}" services {{ include "ontodb.fullname" . }})
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo http://$NODE_IP:$NODE_PORT
+{{- else if contains "LoadBalancer" .Values.service.type }}
+  NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+  kubectl get --namespace {{ .Release.Namespace }} svc {{ include "ontodb.fullname" . }} -w
+{{- else if contains "ClusterIP" .Values.service.type }}
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "ontodb.fullname" . }} {{ .Values.service.http.port }}:{{ .Values.service.http.port }}
+  echo "Visit http://127.0.0.1:{{ .Values.service.http.port }}"
+{{- end }}
+
+2. Check application health:
+  curl http://localhost:{{ .Values.service.http.port }}/api/health
+
+3. Access the TCP protocol:
+  Port {{ .Values.service.tcp.port }} (native OntoDB protocol)

@@ -403,7 +403,7 @@ impl DiskPage {
 
         // Rewrite entries contiguously from the end of the page
         let mut write_pos = PAGE_SIZE;
-        for (entry_data, key_len) in entries.iter().rev() {
+        for (entry_data, _key_len) in entries.iter().rev() {
             write_pos -= entry_data.len();
             self.data[write_pos..write_pos + entry_data.len()].copy_from_slice(entry_data);
         }

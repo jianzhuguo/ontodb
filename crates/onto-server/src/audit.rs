@@ -466,7 +466,7 @@ fn days_to_ymd(mut days: u64) -> (u16, u8, u8) {
 }
 
 fn is_leap(year: u16) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 /// Parse YYYYMMDD from a filename like "audit_20260808.jsonl".
@@ -479,7 +479,7 @@ fn parse_date_from_filename(name: &str) -> Option<u64> {
     let year: u16 = date_str[0..4].parse().ok()?;
     let month: u8 = date_str[4..6].parse().ok()?;
     let day: u8 = date_str[6..8].parse().ok()?;
-    if month < 1 || month > 12 || day < 1 || day > 31 {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
     // Convert to days since epoch
@@ -547,11 +547,10 @@ fn cleanup_old_logs(log_dir: &Path, retention_days: u32) -> usize {
         }
 
         if let Some(file_days) = parse_date_from_filename(&name_str) {
-            if file_days < cutoff {
-                if fs::remove_file(entry.path()).is_ok() {
+            if file_days < cutoff
+                && fs::remove_file(entry.path()).is_ok() {
                     removed += 1;
                 }
-            }
         }
     }
     removed

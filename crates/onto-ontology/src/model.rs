@@ -24,8 +24,10 @@ pub struct Ontology {
 
 /// OWL-lite class type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum ClassType {
     /// Normal class.
+    #[default]
     Normal,
     /// Enumerated class with fixed instances.
     Enum(Vec<String>),
@@ -95,11 +97,6 @@ mod ordered_f64 {
 
 impl Eq for Literal {}
 
-impl Default for ClassType {
-    fn default() -> Self {
-        ClassType::Normal
-    }
-}
 
 /// A class in the ontology (like a type or category).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,11 +295,10 @@ impl Ontology {
                 if superclass == parent {
                     return true;
                 }
-                if visited.insert(superclass.clone()) {
-                    if self.is_subclass_of_inner(superclass, parent, visited) {
+                if visited.insert(superclass.clone())
+                    && self.is_subclass_of_inner(superclass, parent, visited) {
                         return true;
                     }
-                }
             }
         }
         false

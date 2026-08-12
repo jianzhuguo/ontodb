@@ -1,0 +1,190 @@
+# -- Number of replicas (WARNING: keep at 1 until Raft consensus is functional)
+replicaCount: 1
+
+image:
+  # -- Container image repository
+  repository: ontodb
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag (default is the chart appVersion)
+  tag: ""
+
+# -- Image pull secrets for private registries
+imagePullSecrets: []
+# -- Override the release name
+nameOverride: ""
+# -- Override the full release name
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Whether to create a service account
+  create: true
+  # -- Annotations for the service account
+  annotations: {}
+  # -- Name of the service account (generated if empty)
+  name: ""
+
+# -- Pod-level annotations
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "7912"
+  prometheus.io/path: "/metrics"
+
+# -- Pod-level security context
+podSecurityContext: {}
+  # fsGroup: 1000
+
+# -- Container-level security context
+securityContext: {}
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+service:
+  # -- Service type
+  type: ClusterIP
+  # -- Service annotations
+  annotations: {}
+  tcp:
+    # -- TCP protocol port (native protocol)
+    port: 7913
+  http:
+    # -- HTTP API port
+    port: 7912
+
+ingress:
+  # -- Whether to create an Ingress resource
+  enabled: false
+  # -- Ingress class name (e.g., nginx, traefik)
+  className: ""
+  # -- Ingress annotations
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: ontodb.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: ontodb-tls
+  #    hosts:
+  #      - ontodb.local
+
+persistence:
+  # -- Whether to create a PersistentVolumeClaim
+  enabled: true
+  # -- PVC access modes
+  accessModes:
+    - ReadWriteOnce
+  # -- Requested storage size
+  size: 10Gi
+  # -- Storage class name (leave empty for default)
+  storageClassName: ""
+  # -- Existing PVC name (if set, no PVC will be created)
+  existingClaim: ""
+
+config:
+  # -- Storage engine: memtable size in bytes (default 4MB)
+  storageMemtableSize: "4194304"
+  # -- Storage engine: block size in bytes (default 4KB)
+  storageBlockSize: "4096"
+  # -- Storage engine: number of LSM levels
+  storageNumLevels: "7"
+  # -- Storage engine: zstd compression level
+  storageCompressionLevel: "3"
+  # -- Rate limiting: requests per minute
+  rateLimitRpm: "60"
+  # -- Rate limiting: burst size
+  rateLimitBurst: "10"
+
+# -- Environment variables injected directly (key-value pairs)
+extraEnv: []
+  # - name: FOO
+  #   value: bar
+
+# -- Additional volumes to mount
+extraVolumes: []
+# -- Additional volume mounts
+extraVolumeMounts: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+# -- Liveness probe configuration
+livenessProbe:
+  httpGet:
+    path: /api/health/live
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+# -- Readiness probe configuration
+readinessProbe:
+  httpGet:
+    path: /api/health/ready
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+# -- Startup probe configuration
+startupProbe:
+  httpGet:
+    path: /api/health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 5
+  failureThreshold: 30
+
+autoscaling:
+  # -- Whether to enable HPA
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 1
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  # -- HPA behavior configuration
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+
+monitoring:
+  serviceMonitor:
+    # -- Whether to create a ServiceMonitor for Prometheus Operator
+    enabled: false
+    # -- Scrape interval
+    interval: 15s
+    # -- Scrape timeout
+    scrapeTimeout: 10s
+    # -- Additional labels for ServiceMonitor
+    labels: {}
+    # -- Metric endpoint path
+    path: /metrics
+
+# -- Node selector for pod scheduling
+nodeSelector: {}
+
+# -- Tolerations for pod scheduling
+tolerations: []
+
+# -- Affinity rules for pod scheduling
+affinity: {}

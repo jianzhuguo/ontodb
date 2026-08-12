@@ -1,4 +1,24 @@
-﻿//! OntoDB Server - Main entry point.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::manual_strip)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::collapsible_match)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::ptr_arg)]
+#![allow(clippy::non_canonical_partial_ord_impl)]
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::sliced_string_as_bytes)]
+#![allow(clippy::len_without_is_empty)]
+#![allow(clippy::lines_filter_map_ok)]
+#![allow(clippy::vec_init_then_push)]
+#![allow(clippy::unnecessary_find_map)]
+#![allow(clippy::unnecessary_unwrap)]
+#![allow(clippy::result_large_err)]
+#![allow(clippy::doc_lazy_continuation)]
+
+//! OntoDB Server - Main entry point.
 //!
 //! Supports three modes:
 //! - Standalone REPL (interactive or stdin)
@@ -131,7 +151,7 @@ struct Args {
     #[arg(long, env = "ENCRYPTION_MASTER_KEY_ENV")]
     master_key_env: Option<String>,
 
-    /// Audit retention days (Gov/Finance edition only, default 180 per 等保2.0)
+    /// Audit retention days (Gov/Finance edition only, default 180 per 绛変繚2.0)
     #[arg(long, default_value = "180", env = "AUDIT_RETENTION_DAYS")]
     audit_retention_days: u64,
 
@@ -158,6 +178,31 @@ struct Args {
     /// Minimum TLS version: "1.2" or "1.3" (default: "1.2")
     #[arg(long, default_value = "1.2", env = "TLS_MIN_VERSION")]
     tls_min_version: String,
+
+    // === Sharding options ===
+    /// Enable data sharding
+    #[arg(long, env = "SHARDING_ENABLED")]
+    sharding_enabled: bool,
+
+    /// Shard configuration file path (JSON format)
+    #[arg(long, env = "SHARDING_CONFIG_FILE")]
+    sharding_config: Option<PathBuf>,
+
+    /// Default shard ID for unsharded data
+    #[arg(long, default_value = "0", env = "SHARDING_DEFAULT_SHARD")]
+    default_shard: u32,
+
+    /// Auto-rebalance when adding new shards
+    #[arg(long, default_value = "true", env = "SHARDING_AUTO_REBALANCE")]
+    sharding_auto_rebalance: bool,
+
+    /// Migration batch size (records per batch)
+    #[arg(long, default_value = "1000", env = "SHARDING_MIGRATION_BATCH_SIZE")]
+    migration_batch_size: u64,
+
+    /// Maximum concurrent migrations
+    #[arg(long, default_value = "2", env = "SHARDING_MAX_CONCURRENT_MIGRATIONS")]
+    max_concurrent_migrations: u32,
 }
 
 fn main() -> Result<()> {
@@ -190,7 +235,7 @@ fn main() -> Result<()> {
 
     // Initialize enterprise features first (before args are moved)
     let enterprise_config = build_enterprise_config(&args, tier);
-    let enterprise_features = onto_enterprise::EnterpriseFeatures::init(&enterprise_config)
+    let _enterprise_features = onto_enterprise::EnterpriseFeatures::init(&enterprise_config)
         .map_err(|e| onto_core::CoreError::Custom(format!("Enterprise features init failed: {}", e)))?;
 
     let options = StorageOptions {
@@ -222,11 +267,28 @@ fn main() -> Result<()> {
     let ontology_store = OntologyStore::new(Arc::clone(&engine));
     let graph_store = Arc::new(onto_graph::GraphStore::new());
     let triple_store = Arc::new(onto_ontology::TripleStore::new(Arc::clone(&engine)));
-    let executor = Arc::new(
-        QueryExecutor::new(Arc::clone(&engine), ontology_store)
-            .with_graph(graph_store.clone())
-            .with_triple_store(triple_store)
-    );
+
+    // Initialize sharding if enabled
+    let executor = if args.sharding_enabled {
+        let shard_config = load_sharding_config(args.sharding_config.as_deref(), args.default_shard)?;
+        println!("Sharding: ENABLED (default shard: {})", args.default_shard);
+        println!("  Shards: {}", shard_config.shards.len());
+        println!("  Sharded classes: {}", shard_config.class_strategies.len());
+
+        let local_shards: Vec<u32> = shard_config.shards.keys().cloned().collect();
+        Arc::new(
+            QueryExecutor::new(Arc::clone(&engine), ontology_store)
+                .with_graph(graph_store.clone())
+                .with_triple_store(triple_store)
+                .with_shard_router(shard_config, local_shards)
+        )
+    } else {
+        Arc::new(
+            QueryExecutor::new(Arc::clone(&engine), ontology_store)
+                .with_graph(graph_store.clone())
+                .with_triple_store(triple_store)
+        )
+    };
 
     if args.interactive {
         run_repl(&executor)?;
@@ -346,7 +408,7 @@ fn main() -> Result<()> {
                 let failed_name = server_names.get(idx).unwrap_or(&"Unknown");
                 match &res {
                     Ok(()) => tracing::info!("Server {} exited gracefully", failed_name),
-                    Err(e) => tracing::error!("Server {} failed: {} — initiating shutdown", failed_name, e),
+                    Err(e) => tracing::error!("Server {} failed: {} 鈥?initiating shutdown", failed_name, e),
                 }
                 // Give remaining servers a brief window to finish in-flight requests
                 let shutdown_timeout = std::time::Duration::from_secs(5);
@@ -437,7 +499,7 @@ fn build_enterprise_config(args: &Args, tier: ProductTier) -> onto_enterprise::E
 fn load_auth_config(file_path: Option<&std::path::Path>) -> Result<AuthConfig> {
     if let Some(path) = file_path {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| onto_core::CoreError::Io(e))?;
+            .map_err(onto_core::CoreError::Io)?;
         let config: AuthConfig = serde_json::from_str(&content)
             .map_err(|e| onto_core::CoreError::Custom(format!("Invalid auth config: {}", e)))?;
         Ok(config)
@@ -568,7 +630,7 @@ async fn run_http_server(
     } else {
         // Plain HTTP server (no TLS)
         let listener = tokio::net::TcpListener::bind(addr).await
-            .map_err(|e| onto_core::CoreError::Io(e))?;
+            .map_err(onto_core::CoreError::Io)?;
         axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await
             .map_err(|e| onto_core::CoreError::Custom(format!("HTTP server error: {}", e)))?;
     }
@@ -621,7 +683,7 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// Runs the async TCP server, accepting client connections.
 async fn run_tcp_server(addr: &str, executor: Arc<QueryExecutor>, metrics: Arc<metrics::Metrics>) -> Result<()> {
     let listener = TcpListener::bind(addr).await
-        .map_err(|e| onto_core::CoreError::Io(e))?;
+        .map_err(onto_core::CoreError::Io)?;
     let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_CONNECTIONS));
 
     println!("Listening on {}", addr);
@@ -629,7 +691,7 @@ async fn run_tcp_server(addr: &str, executor: Arc<QueryExecutor>, metrics: Arc<m
 
     loop {
         let (stream, _peer_addr) = listener.accept().await
-            .map_err(|e| onto_core::CoreError::Io(e))?;
+            .map_err(onto_core::CoreError::Io)?;
 
         let permit = match conn_semaphore.clone().acquire_owned().await {
             Ok(p) => p,
@@ -675,7 +737,7 @@ async fn handle_client(
     loop {
         line.clear();
         let n = reader.read_line(&mut line).await
-            .map_err(|e| onto_core::CoreError::Io(e))?;
+            .map_err(onto_core::CoreError::Io)?;
         if n == 0 {
             break;
         }
@@ -801,5 +863,24 @@ fn execute_and_print(executor: &QueryExecutor, input: &str) {
         Err(e) => {
             eprintln!("Parse error: {}", e);
         }
+    }
+}
+
+/// Loads sharding configuration from file or creates default.
+fn load_sharding_config(
+    file_path: Option<&std::path::Path>,
+    default_shard: u32,
+) -> Result<onto_sharding::ShardMap> {
+    if let Some(path) = file_path {
+        let content = std::fs::read_to_string(path)
+            .map_err(onto_core::CoreError::Io)?;
+        let config: onto_sharding::ShardMap = serde_json::from_str(&content)
+            .map_err(|e| onto_core::CoreError::Custom(format!("Invalid sharding config: {}", e)))?;
+        tracing::info!("Loaded sharding config from {:?}", path);
+        Ok(config)
+    } else {
+        // Create default config with a single shard
+        tracing::info!("No sharding config file specified, using default single-shard config");
+        Ok(onto_sharding::ShardMap::new(default_shard))
     }
 }

@@ -603,7 +603,7 @@ impl QueryPlanner {
         if let Some(dot_pos) = col.find('.') {
             let table_prefix = &col[..dot_pos];
             // Match against main table or alias - can push down
-            if table_prefix == main_table || Some(table_prefix) == main_alias.as_deref() {
+            if table_prefix == main_table || Some(table_prefix) == main_alias {
                 return Some(main_table.to_string());
             }
             // Match against join tables - DON'T push down
@@ -668,7 +668,7 @@ impl QueryPlanner {
             });
 
             // Check if join column has an index for potential index scan
-            let right_col = join.on.right.split('.').last().unwrap_or(&join.on.right);
+            let right_col = join.on.right.split('.').next_back().unwrap_or(&join.on.right);
             let has_index = right_stats.secondary_indexes.iter().any(|i| i.column == right_col);
 
             let right_plan = if has_index {
@@ -810,7 +810,7 @@ impl QueryPlanner {
             });
 
             // Check if join column has an index for potential index scan
-            let right_col = join.on.right.split('.').last().unwrap_or(&join.on.right);
+            let right_col = join.on.right.split('.').next_back().unwrap_or(&join.on.right);
             let has_index = right_stats.secondary_indexes.iter().any(|i| i.column == right_col);
 
             let right_plan = if has_index {

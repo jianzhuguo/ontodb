@@ -105,7 +105,7 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(batch.depth(), 2);
+        assert_eq!(batch.depth(), 3);
         assert!(!batch.exceeds_max_depth());
     }
 

@@ -39,7 +39,7 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len() && s.as_bytes()[..prefix.len()]
         .iter()
         .zip(prefix.as_bytes())
-        .all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
 /// Check if `s` ends with `suffix` case-insensitively (ASCII only).
@@ -47,7 +47,7 @@ fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
     s.len() >= suffix.len() && s.as_bytes()[s.len() - suffix.len()..]
         .iter()
         .zip(suffix.as_bytes())
-        .all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
+        .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
 /// Case-insensitive (ASCII) version of `find_unquoted`.
@@ -1094,7 +1094,7 @@ impl QueryParser {
 
         // Check for ON CONFLICT (UPSERT)
         let (values_str, upsert_info) = if let Some(oc_pos) = find_unquoted_ignore_ascii_case(values_str, " ON CONFLICT ") {
-            let vals_part = safe_slice(&values_str, 0, oc_pos);
+            let vals_part = safe_slice(values_str, 0, oc_pos);
             let conflict_part = &safe_slice_from(values_str, oc_pos + 13).trim();
             // Parse: (col) DO UPDATE SET col1 = val1, col2 = val2
             let do_update_pos = find_ignore_ascii_case(conflict_part, " DO UPDATE SET ")
@@ -1668,7 +1668,7 @@ impl QueryParser {
         
         // Remove outer parentheses
         let input = if input.starts_with('(') && input.ends_with(')') {
-            &input[1..input.len() - 1].trim()
+            input[1..input.len() - 1].trim()
         } else {
             input
         };
@@ -1734,7 +1734,7 @@ impl QueryParser {
         let frame_str = safe_slice_from(input, between_pos + 7).trim();
 
         // Find AND separator
-        let and_pos = find_ignore_ascii_case(&frame_str, " AND ")
+        let and_pos = find_ignore_ascii_case(frame_str, " AND ")
             .ok_or_else(|| CoreError::InvalidArgument("expected 'AND' in window frame".to_string()))?;
 
         let start_str = safe_slice(frame_str, 0, and_pos).trim();
@@ -1886,7 +1886,7 @@ impl QueryParser {
             ));
         }
 
-        let after_paren = safe_slice_from(&rest, paren_close + 1).trim();
+        let after_paren = safe_slice_from(rest, paren_close + 1).trim();
 
         // Parse METRIC
         let metric = if let Some(pos) = find_ignore_ascii_case(after_paren, "METRIC") {
@@ -1991,7 +1991,7 @@ impl QueryParser {
             ));
         }
 
-        let after_paren = safe_slice_from(&rest, paren_close + 1).trim();
+        let after_paren = safe_slice_from(rest, paren_close + 1).trim();
 
         // Parse QUERY keyword
         let query_pos = find_ignore_ascii_case(after_paren, "QUERY")
@@ -2157,7 +2157,7 @@ impl QueryParser {
         let variable = safe_slice(pattern, 0, colon_pos).trim().to_string();
         let class = safe_slice_from(pattern, colon_pos + 1).trim().to_string();
 
-        let after = safe_slice_from(&rest, close + 1).trim();
+        let after = safe_slice_from(rest, close + 1).trim();
 
         // Parse optional WHERE
         let (filter, after) = if starts_with_ignore_ascii_case(after, "WHERE") {
@@ -2237,7 +2237,7 @@ impl QueryParser {
                 }
                 if let Some(close) = close_pos {
                     let inner = safe_slice(rest, 1, close).trim();
-                    let remaining = safe_slice_from(&rest, close + 1).trim();
+                    let remaining = safe_slice_from(rest, close + 1).trim();
                     let (inner_expr, _) = Self::parse_where(inner)?;
                     if let Some(expr) = inner_expr {
                         let expr = FilterExpr::Not(Box::new(expr));
@@ -2271,7 +2271,7 @@ impl QueryParser {
                 }
                 if let Some(close) = close_pos {
                     let inner = safe_slice(rest, 1, close).trim();
-                    let remaining = safe_slice_from(&rest, close + 1).trim();
+                    let remaining = safe_slice_from(rest, close + 1).trim();
                     let subquery = Self::parse(inner)?;
                     let expr = if is_not {
                         FilterExpr::NotExists(Box::new(subquery))
@@ -2314,7 +2314,7 @@ impl QueryParser {
 
             if let Some(and_pos) = find_unquoted_ignore_ascii_case(rest, " AND ") {
                 let low_str = safe_slice(rest, 0, and_pos).trim();
-                let high_rest = safe_slice_from(&rest, and_pos + 5).trim();
+                let high_rest = safe_slice_from(rest, and_pos + 5).trim();
                 let (high_str, remaining) = Self::extract_quoted_or_word(high_rest);
                 let low = Self::parse_literal(low_str)?;
                 let high = Self::parse_literal(&high_str)?;
@@ -2343,7 +2343,7 @@ impl QueryParser {
                 }
                 if let Some(close) = close_pos {
                     let inner = safe_slice(rest, 1, close).trim();
-                    let remaining = safe_slice_from(&rest, close + 1).trim();
+                    let remaining = safe_slice_from(rest, close + 1).trim();
 
                     // Check if it's a subquery
                     if starts_with_ignore_ascii_case(inner, "SELECT") {
@@ -2441,7 +2441,7 @@ impl QueryParser {
             .ok_or_else(|| CoreError::InvalidArgument("expected 'AS' in CREATE MATERIALIZED VIEW".to_string()))?;
 
         let name = safe_slice(rest, 0, as_pos).trim().to_string();
-        let query_str = safe_slice_from(&rest, as_pos + 4).trim();
+        let query_str = safe_slice_from(rest, as_pos + 4).trim();
         let query = Self::parse(query_str)?;
 
         Ok(QueryAst::CreateMaterializedView {
@@ -2611,9 +2611,8 @@ impl QueryParser {
                 '*' if depth == 0 => {
                     if last_op.is_none() { last_op = Some((ArithmeticOp::Mul, i)); }
                 }
-                '/' if depth == 0 => {
-                    if last_op.is_none() { last_op = Some((ArithmeticOp::Div, i)); }
-                }
+                '/' if depth == 0
+                    && last_op.is_none() => { last_op = Some((ArithmeticOp::Div, i)); }
                 _ => {}
             }
         }
@@ -2850,7 +2849,7 @@ impl QueryParser {
         // For now, return a simple pattern
         // Full implementation would parse the graph pattern syntax
         let returns = if let Some(ret_pos) = find_ignore_ascii_case(rest, "RETURN") {
-            safe_slice_from(&rest, ret_pos + 6).trim()
+            safe_slice_from(rest, ret_pos + 6).trim()
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect()

@@ -297,7 +297,7 @@ impl Rule {
                     RuleResult::NotTriggered
                 }
             }
-            RuleType::UnusualLocation { known_locations, tolerance_m } => {
+            RuleType::UnusualLocation { known_locations, tolerance_m: _ } => {
                 let is_known = known_locations.iter().any(|r| r.contains(event.lon, event.lat));
 
                 if !is_known {

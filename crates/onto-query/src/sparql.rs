@@ -817,15 +817,14 @@ impl SparqlParser {
                 '(' => depth += 1,
                 ')' => depth -= 1,
                 '"' => in_string = !in_string,
-                _ if depth == 0 && !in_string => {
-                    if bytes[i..].starts_with(op_bytes) {
+                _ if depth == 0 && !in_string
+                    && bytes[i..].starts_with(op_bytes) => {
                         // Make sure >= and <= don't match > and <
                         if (op == ">" || op == "<") && i + 1 < bytes.len() && bytes[i + 1] == b'=' {
                             continue;
                         }
                         return Some(i);
                     }
-                }
                 _ => {}
             }
         }

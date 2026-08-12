@@ -20,17 +20,18 @@ use openraft::{
     Entry, EntryPayload, LogId, LogState, Snapshot, SnapshotMeta,
     StorageError, StoredMembership, Vote,
 };
-use serde::{Deserialize, Serialize};
 
 use crate::types::{NodeId, OntoRaftConfig, OntoRequest, OntoResponse};
 
 // Key prefixes for isolating Raft data in the LSM store
+#[allow(dead_code)]
 const RAFT_META_PREFIX: &[u8] = b"__raft_meta__";
 const RAFT_LOG_PREFIX: &[u8] = b"__raft_log__";
 const RAFT_SM_PREFIX: &[u8] = b"__raft_sm__";
 
 // Specific metadata keys
 const KEY_VOTE: &[u8] = b"__raft_meta__vote";
+#[allow(dead_code)]
 const KEY_COMMITTED: &[u8] = b"__raft_meta__committed";
 const KEY_PURGED: &[u8] = b"__raft_meta__purged";
 const KEY_LAST_APPLIED: &[u8] = b"__raft_meta__last_applied";
@@ -167,7 +168,7 @@ impl PersistentRaftStore {
     /// Get the state machine data for snapshot building.
     fn get_all_sm_data(&self) -> Result<Vec<u8>, std::io::Error> {
         let entries = self.engine.scan_prefix(RAFT_SM_PREFIX)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Convert to a simple map for snapshot
         let mut sm_data = std::collections::BTreeMap::new();
@@ -178,7 +179,7 @@ impl PersistentRaftStore {
         }
 
         serde_json::to_vec(&sm_data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
 
@@ -225,7 +226,7 @@ impl RaftLogReader<OntoRaftConfig> for PersistentRaftStore {
                         source: openraft::StorageIOError::new(
                             openraft::ErrorSubject::LogIndex(index),
                             openraft::ErrorVerb::Read,
-                            &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                            &std::io::Error::other(e.to_string()),
                         ),
                     });
                 }
@@ -258,7 +259,7 @@ impl RaftSnapshotBuilder<OntoRaftConfig> for PersistentRaftStore {
             source: openraft::StorageIOError::new(
                 openraft::ErrorSubject::Snapshot(None),
                 openraft::ErrorVerb::Write,
-                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                &std::io::Error::other(e.to_string()),
             ),
         })?;
 
@@ -267,7 +268,7 @@ impl RaftSnapshotBuilder<OntoRaftConfig> for PersistentRaftStore {
                 source: openraft::StorageIOError::new(
                     openraft::ErrorSubject::Snapshot(None),
                     openraft::ErrorVerb::Write,
-                    &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                    &std::io::Error::other(e.to_string()),
                 ),
             });
         }
@@ -291,7 +292,7 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
             source: openraft::StorageIOError::new(
                 openraft::ErrorSubject::Vote,
                 openraft::ErrorVerb::Write,
-                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                &std::io::Error::other(e.to_string()),
             ),
         })?;
 
@@ -299,7 +300,7 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
             source: openraft::StorageIOError::new(
                 openraft::ErrorSubject::Vote,
                 openraft::ErrorVerb::Write,
-                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                &std::io::Error::other(e.to_string()),
             ),
         })?;
 
@@ -346,7 +347,7 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
                 source: openraft::StorageIOError::new(
                     openraft::ErrorSubject::LogIndex(entry.log_id.index),
                     openraft::ErrorVerb::Write,
-                    &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                    &std::io::Error::other(e.to_string()),
                 ),
             })?;
 
@@ -354,7 +355,7 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
                 source: openraft::StorageIOError::new(
                     openraft::ErrorSubject::LogIndex(entry.log_id.index),
                     openraft::ErrorVerb::Write,
-                    &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                    &std::io::Error::other(e.to_string()),
                 ),
             })?;
         }
@@ -363,7 +364,7 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
             source: openraft::StorageIOError::new(
                 openraft::ErrorSubject::Logs,
                 openraft::ErrorVerb::Write,
-                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                &std::io::Error::other(e.to_string()),
             ),
         })?;
         Ok(())
@@ -397,14 +398,14 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
             source: openraft::StorageIOError::new(
                 openraft::ErrorSubject::Logs,
                 openraft::ErrorVerb::Write,
-                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                &std::io::Error::other(e.to_string()),
             ),
         })?;
         self.engine.put(KEY_PURGED.to_vec(), data).map_err(|e| StorageError::IO {
             source: openraft::StorageIOError::new(
                 openraft::ErrorSubject::Logs,
                 openraft::ErrorVerb::Write,
-                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                &std::io::Error::other(e.to_string()),
             ),
         })?;
         self.purged = Some(log_id);
@@ -450,14 +451,14 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
             source: openraft::StorageIOError::new(
                 openraft::ErrorSubject::StateMachine,
                 openraft::ErrorVerb::Write,
-                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                &std::io::Error::other(e.to_string()),
             ),
         })?;
         self.engine.put(KEY_LAST_APPLIED.to_vec(), last_applied_data).map_err(|e| StorageError::IO {
             source: openraft::StorageIOError::new(
                 openraft::ErrorSubject::StateMachine,
                 openraft::ErrorVerb::Write,
-                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                &std::io::Error::other(e.to_string()),
             ),
         })?;
 
@@ -466,14 +467,14 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
                 source: openraft::StorageIOError::new(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Write,
-                    &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                    &std::io::Error::other(e.to_string()),
                 ),
             })?;
             self.engine.put(KEY_MEMBERSHIP.to_vec(), membership_data).map_err(|e| StorageError::IO {
                 source: openraft::StorageIOError::new(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Write,
-                    &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                    &std::io::Error::other(e.to_string()),
                 ),
             })?;
         }
@@ -525,7 +526,7 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
                 source: openraft::StorageIOError::new(
                     openraft::ErrorSubject::Snapshot(None),
                     openraft::ErrorVerb::Write,
-                    &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                    &std::io::Error::other(e.to_string()),
                 ),
             })?;
         }
@@ -536,7 +537,7 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
             source: openraft::StorageIOError::new(
                 openraft::ErrorSubject::Snapshot(None),
                 openraft::ErrorVerb::Write,
-                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                &std::io::Error::other(e.to_string()),
             ),
         })?;
 
@@ -558,14 +559,14 @@ impl RaftStorage<OntoRaftConfig> for PersistentRaftStore {
             source: openraft::StorageIOError::new(
                 openraft::ErrorSubject::Snapshot(None),
                 openraft::ErrorVerb::Write,
-                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                &std::io::Error::other(e.to_string()),
             ),
         })?;
         self.engine.put(KEY_SNAPSHOT_META.to_vec(), meta_json).map_err(|e| StorageError::IO {
             source: openraft::StorageIOError::new(
                 openraft::ErrorSubject::Snapshot(None),
                 openraft::ErrorVerb::Write,
-                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                &std::io::Error::other(e.to_string()),
             ),
         })?;
 
@@ -617,7 +618,7 @@ impl PersistentRaftStore {
             source: openraft::StorageIOError::new(
                 openraft::ErrorSubject::Logs,
                 openraft::ErrorVerb::Read,
-                &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                &std::io::Error::other(e.to_string()),
             ),
         })?;
 
@@ -627,7 +628,7 @@ impl PersistentRaftStore {
 
         // Parse the last entry to get its log id
         // The entries are sorted by key (index), so the last one is the highest
-        if let Some((key, data)) = entries.last() {
+        if let Some((_key, data)) = entries.last() {
             if let Ok(entry) = serde_json::from_slice::<Entry<OntoRaftConfig>>(data) {
                 return Ok(Some(entry.log_id));
             }

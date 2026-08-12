@@ -122,9 +122,8 @@ impl CompactionWorker {
                 }
                 Ok(CompactionMsg::FlushAndNotify) => {
                     // Perform all pending compaction
-                    while let Err(e) = self.try_compact() {
+                    if let Err(e) = self.try_compact() {
                         tracing::error!("Background compaction failed: {}", e);
-                        break;
                     }
                     // Keep compacting until no more is needed
                     loop {

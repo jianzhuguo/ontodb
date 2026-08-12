@@ -111,7 +111,7 @@ impl openraft::RaftNetwork<OntoRaftConfig> for OntoRaftNetwork {
         req: AppendEntriesRequest<OntoRaftConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        self.send_rpc(&req).await.map_err(|e| RPCError::Network(e))
+        self.send_rpc(&req).await.map_err(RPCError::Network)
     }
 
     async fn install_snapshot(
@@ -119,7 +119,7 @@ impl openraft::RaftNetwork<OntoRaftConfig> for OntoRaftNetwork {
         req: InstallSnapshotRequest<OntoRaftConfig>,
         _option: RPCOption,
     ) -> Result<InstallSnapshotResponse<NodeId>, RPCError<NodeId, BasicNode, openraft::error::RaftError<NodeId, InstallSnapshotError>>> {
-        self.send_rpc(&req).await.map_err(|e| RPCError::Network(e))
+        self.send_rpc(&req).await.map_err(RPCError::Network)
     }
 
     async fn vote(
@@ -127,7 +127,7 @@ impl openraft::RaftNetwork<OntoRaftConfig> for OntoRaftNetwork {
         req: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        self.send_rpc(&req).await.map_err(|e| RPCError::Network(e))
+        self.send_rpc(&req).await.map_err(RPCError::Network)
     }
 }
 

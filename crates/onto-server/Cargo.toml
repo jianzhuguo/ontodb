@@ -17,6 +17,7 @@ onto-query = { workspace = true }
 onto-graph = { workspace = true }
 onto-raft = { workspace = true }
 onto-enterprise = { workspace = true }
+onto-sharding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

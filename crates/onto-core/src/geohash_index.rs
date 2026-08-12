@@ -15,7 +15,6 @@
 //! Each geohash cell maps to a list of entity IDs that fall within that cell.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use serde::{Deserialize, Serialize};
 
 /// Geohash precision levels and their approximate cell sizes.
 /// Precision 1: ~5000km, Precision 5: ~5km, Precision 8: ~20m, etc.
@@ -69,7 +68,7 @@ impl GeohashIndex {
         // Insert new entry
         self.index
             .entry(hash.clone())
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(entity_id.to_string());
         self.reverse.insert(entity_id.to_string(), hash);
     }

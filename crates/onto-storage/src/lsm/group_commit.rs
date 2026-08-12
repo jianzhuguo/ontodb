@@ -7,7 +7,6 @@
 //! are ready, whichever comes first.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex};
 
@@ -80,7 +79,7 @@ impl GroupCommitCoordinator {
     ///
     /// Leader election: first transaction becomes leader and waits for
     /// batch_threshold or timeout before syncing.
-    pub fn register(&self, seq: u64) -> bool {
+    pub fn register(&self, _seq: u64) -> bool {
         let mut state = self.state.lock();
         state.waiters += 1;
 
@@ -171,6 +170,7 @@ impl Default for GroupCommitCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::thread;
 
     #[test]

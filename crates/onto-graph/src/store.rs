@@ -132,7 +132,7 @@ impl GraphStore {
                 {
                     let mut idx = self.label_index.write();
                     for label in &labels {
-                        idx.entry(label.clone()).or_insert_with(HashSet::new).insert(id.clone());
+                        idx.entry(label.clone()).or_default().insert(id.clone());
                     }
                 }
 
@@ -157,11 +157,11 @@ impl GraphStore {
                 // Update adjacency lists
                 {
                     let mut out = self.out_edges.write();
-                    out.entry(from_id.clone()).or_insert_with(Vec::new).push(edge.clone());
+                    out.entry(from_id.clone()).or_default().push(edge.clone());
                 }
                 {
                     let mut inp = self.in_edges.write();
-                    inp.entry(to_id.clone()).or_insert_with(Vec::new).push(edge);
+                    inp.entry(to_id.clone()).or_default().push(edge);
                 }
 
                 // Update integer adjacency lists
@@ -253,6 +253,7 @@ impl GraphStore {
     }
 
     /// Persist an edge to the LSM engine.
+    #[allow(dead_code)]
     fn persist_edge(&self, edge: &Edge) -> Result<(), GraphError> {
         if let Some(ref engine) = self.engine {
             let key = format!("{}{}", GRAPH_EDGE_PREFIX, edge.id);
@@ -318,18 +319,18 @@ impl GraphStore {
         {
             let mut idx = self.label_index.write();
             for label in labels {
-                idx.entry(label).or_insert_with(HashSet::new).insert(id.clone());
+                idx.entry(label).or_default().insert(id.clone());
             }
         }
 
         // Initialize adjacency lists
         {
             let mut out = self.out_edges.write();
-            out.entry(id.clone()).or_insert_with(Vec::new);
+            out.entry(id.clone()).or_default();
         }
         {
             let mut in_e = self.in_edges.write();
-            in_e.entry(id.clone()).or_insert_with(Vec::new);
+            in_e.entry(id.clone()).or_default();
         }
 
         // Create integer index for fast traversal
@@ -518,11 +519,11 @@ impl GraphStore {
 
             {
                 let mut out = self.out_edges.write();
-                out.entry(from.clone()).or_insert_with(Vec::new).push(edge.clone());
+                out.entry(from.clone()).or_default().push(edge.clone());
             }
             {
                 let mut inp = self.in_edges.write();
-                inp.entry(to.clone()).or_insert_with(Vec::new).push(edge);
+                inp.entry(to.clone()).or_default().push(edge);
             }
             // verts dropped here — vertex can no longer be concurrently deleted
             // while we were inserting the edge.
@@ -990,7 +991,7 @@ impl GraphStore {
         };
 
         edges.iter()
-            .filter(|e| edge_label.map_or(true, |l| e.label == l))
+            .filter(|e| edge_label.is_none_or(|l| e.label == l))
             .filter_map(|e| {
                 let target_id = match direction {
                     Direction::In => &e.from,

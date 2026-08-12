@@ -1,4 +1,4 @@
-﻿//! Spatio-temporal index for OntoDB.
+//! Spatio-temporal index for OntoDB.
 //!
 //! Combines spatial indexing (quadtree) with temporal indexing (timeline)
 //! for efficient queries like:
@@ -82,6 +82,7 @@ impl STNode {
     }
 
     /// Check if a point is within this node's bounds.
+    #[allow(dead_code)]
     fn contains(&self, lon: f64, lat: f64) -> bool {
         lon >= self.min_lon && lon <= self.max_lon
             && lat >= self.min_lat && lat <= self.max_lat

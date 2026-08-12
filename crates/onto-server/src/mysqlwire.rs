@@ -57,11 +57,17 @@ const COM_QUIT: u8 = 0x01;
 const COM_INIT_DB: u8 = 0x02;
 
 /// Column type constants (MySQL text protocol).
+#[allow(dead_code)]
 const MYSQL_TYPE_VAR_STRING: u8 = 0xFD;
+#[allow(dead_code)]
 const MYSQL_TYPE_LONGLONG: u8 = 0x08;
+#[allow(dead_code)]
 const MYSQL_TYPE_DOUBLE: u8 = 0x05;
+#[allow(dead_code)]
 const MYSQL_TYPE_LONG: u8 = 0x03;
+#[allow(dead_code)]
 const MYSQL_TYPE_TINY: u8 = 0x01;
+#[allow(dead_code)]
 const MYSQL_TYPE_NULL: u8 = 0x06;
 
 /// Maximum packet size (16 MB).
@@ -83,7 +89,7 @@ pub async fn run_mysql_server(
     let auth = AuthState::new(&auth_config);
     let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_MYSQL_CONNECTIONS));
     println!("MySQL protocol listening on {}", addr);
-    println!("Connect with: mysql -h 127.0.0.1 -P {} -u root", addr.split(':').last().unwrap_or("3306"));
+    println!("Connect with: mysql -h 127.0.0.1 -P {} -u root", addr.split(':').next_back().unwrap_or("3306"));
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -284,7 +290,7 @@ async fn send_result_set(
     // 2. Column definitions
     for (i, col_name) in columns.iter().enumerate() {
         let mut seq = (i as u8) + 2;
-        if seq > 250 { seq = seq % 250; }
+        if seq > 250 { seq %= 250; }
         let col_def = build_column_definition(col_name, MYSQL_TYPE_VAR_STRING);
         write_packet(stream, seq, &col_def).await?;
     }

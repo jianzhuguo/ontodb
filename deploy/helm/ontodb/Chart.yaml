@@ -1,0 +1,17 @@
+apiVersion: v2
+name: ontodb
+description: OntoDB - 本体语义多模数据库 Helm Chart
+type: application
+version: 0.1.0
+appVersion: "latest"
+keywords:
+  - database
+  - ontology
+  - multi-model
+  - semantic
+home: https://github.com/ontodb/ontodb
+sources:
+  - https://github.com/ontodb/ontodb
+maintainers:
+  - name: ontodb
+    email: dev@ontodb.io

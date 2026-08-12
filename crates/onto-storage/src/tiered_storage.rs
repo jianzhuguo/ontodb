@@ -9,11 +9,10 @@
 //! Queries transparently read from all tiers.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
-use crate::tsm::{TsBlock, TsPoint, TsValue, TsmWriter, TsmReader};
+use crate::tsm::{TsPoint, TsmWriter};
 
 // ── Configuration ──
 
@@ -112,7 +111,7 @@ impl TieredStorage {
 
         self.hot_buffer
             .entry(series_key)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(point);
 
         self.stats.hot_entries += 1;
@@ -297,6 +296,12 @@ pub struct ContinuousQueryEngine {
     last_run: HashMap<String, u64>,
 }
 
+impl Default for ContinuousQueryEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ContinuousQueryEngine {
     pub fn new() -> Self {
         Self {
@@ -365,6 +370,7 @@ impl ContinuousQueryEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tsm::TsValue;
 
     #[test]
     fn test_tiered_storage_write() {

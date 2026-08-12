@@ -96,6 +96,12 @@ irm https://get.ontodb.io/install.ps1 | iex
 
 # 启用 Raft 集群
 ./ontodb-server --data-dir ./data --http 127.0.0.1:7912 --raft --raft-id 1 --raft-peers "2@10.0.0.2:7913,3@10.0.0.3:7913"
+
+# 启用数据分片
+./ontodb-server --data-dir ./data --http 127.0.0.1:7912 --sharding-enabled --sharding-config config/sharding.json
+
+# 启用分片 + 自定义默认分片
+./ontodb-server --data-dir ./data --http 127.0.0.1:7912 --sharding-enabled --default-shard 1 --migration-batch-size 5000
 ```
 
 ### 命令行参数
@@ -114,6 +120,12 @@ irm https://get.ontodb.io/install.ps1 | iex
 | `--raft-peers` | 集群节点列表 | 无 |
 | `--encryption-enabled` | 启用加密存储 | `false` |
 | `--audit-retention-days` | 审计日志保留天数 | `180` |
+| `--sharding-enabled` | 启用数据分片 | `false` |
+| `--sharding-config` | 分片配置文件 | 无 |
+| `--default-shard` | 默认分片 ID | `0` |
+| `--sharding-auto-rebalance` | 添加分片时自动重新平衡 | `true` |
+| `--migration-batch-size` | 迁移批次大小 | `1000` |
+| `--max-concurrent-migrations` | 最大并发迁移数 | `2` |
 
 ## 访问方式
 
@@ -292,6 +304,90 @@ cargo build --release --features enterprise-gov
 | 数据脱敏 | ❌ | ❌ | ✅ |
 | 滚动升级 | ❌ | ❌ | ✅ |
 
+## 数据分片
+
+OntoDB 支持三种分片策略，可将数据水平分散到多个分片中，提升大规模数据场景下的查询性能和存储容量。
+
+### 分片策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|----------|
+| **Class-based** | 不同的类（表）分配到不同分片 | 多租户、按业务模块隔离 |
+| **Range-based** | 按主键范围分割 | 时间序列、有序数据 |
+| **Hash-based** | 按主键哈希值分配 | 均匀分布、无明显热点 |
+
+### 配置示例
+
+**分片配置文件** (`config/sharding.json`):
+
+```json
+{
+  "default_shard": 0,
+  "shards": {
+    "0": {"id": 0, "name": "default", "replicas": [0], "is_primary": true},
+    "1": {"id": 1, "name": "shard-beijing", "replicas": [0], "is_primary": true},
+    "2": {"id": 2, "name": "shard-shanghai", "replicas": [0], "is_primary": true}
+  },
+  "class_strategies": {
+    "User": {"HashBased": {"num_shards": 4, "slot_map": [0, 0, 1, 1]}},
+    "Order": {"ClassBased": {"shard": 1}},
+    "Product": {"RangeBased": {"ranges": [
+      {"end_key": "m", "shard": 0},
+      {"end_key": "t", "shard": 1},
+      {"end_key": "z", "shard": 2}
+    ]}}
+  }
+}
+```
+
+### 分片操作
+
+```bash
+# 添加分片
+curl -X POST http://127.0.0.1:7912/api/sharding/shard \
+  -H "Content-Type: application/json" \
+  -d '{"id": 3, "name": "shard-guangzhou"}'
+
+# 为类分配分片策略 (Hash-based)
+curl -X POST http://127.0.0.1:7912/api/sharding/class \
+  -H "Content-Type: application/json" \
+  -d '{"class": "User", "strategy": "hash", "num_shards": 4, "slot_map": [0, 0, 1, 1]}'
+
+# 添加分片并自动重新平衡
+curl -X POST http://127.0.0.1:7912/api/sharding/scale/add \
+  -H "Content-Type: application/json" \
+  -d '{"shard": {"id": 3, "name": "shard-new"}, "rebalance": true}'
+
+# 创建迁移任务
+curl -X POST http://127.0.0.1:7912/api/sharding/migrate \
+  -H "Content-Type: application/json" \
+  -d '{"source_shard": 0, "target_shard": 1, "class": "User"}'
+
+# 完成迁移
+curl -X POST http://127.0.0.1:7912/api/sharding/migrate/complete \
+  -H "Content-Type: application/json" \
+  -d '{"migration_id": "mig_0_1_0"}'
+
+# 分片分裂
+curl -X POST http://127.0.0.1:7912/api/sharding/split \
+  -H "Content-Type: application/json" \
+  -d '{"source_shard": 0, "new_shards": [{"id": 3, "name": "new-1"}, {"id": 4, "name": "new-2"}], "strategy": "even"}'
+```
+
+### 分片路由
+
+查询时，系统会自动将请求路由到正确的分片。查询结果中包含 `__shard__` 字段，显示数据所在的分片：
+
+```json
+{
+  "__class__": "User",
+  "__pk__": "User::001",
+  "__shard__": "Single(1)",
+  "name": "Alice",
+  "age": 30
+}
+```
+
 ## 项目结构
 
 ```
@@ -306,7 +402,7 @@ ontodb/
 │   ├── onto-enterprise/    # 企业版功能（加密/RBAC/审计/备份）
 │   ├── onto-raft/          # Raft 共识层
 │   ├── onto-cli/           # 命令行工具
-│   └── onto-sharding/      # 分片（开发中）
+│   └── onto-sharding/      # 数据分片（类/范围/哈希）
 ├── benches/                # 性能基准测试
 ├── tests/                  # 集成测试
 └── docs/                   # 文档和专利
@@ -330,6 +426,21 @@ ontodb/
 | POST | `/api/backup/incremental` | 增量备份 |
 | POST | `/api/restore` | 恢复备份 |
 | GET | `/api/cluster` | 集群状态 |
+| **分片管理** | | |
+| GET | `/api/sharding/config` | 获取分片配置 |
+| PUT | `/api/sharding/config` | 更新分片配置 |
+| POST | `/api/sharding/shard` | 添加分片 |
+| POST | `/api/sharding/class` | 为类分配分片策略 |
+| GET | `/api/sharding/status` | 分片状态 |
+| POST | `/api/sharding/migrate` | 创建迁移任务 |
+| PUT | `/api/sharding/migrate/progress` | 更新迁移进度 |
+| POST | `/api/sharding/migrate/complete` | 完成迁移 |
+| POST | `/api/sharding/migrate/cancel` | 取消迁移 |
+| GET | `/api/sharding/migrations` | 迁移历史 |
+| POST | `/api/sharding/rebalance` | 重新平衡 |
+| POST | `/api/sharding/scale/add` | 添加分片+重新平衡 |
+| POST | `/api/sharding/scale/remove` | 移除分片 |
+| POST | `/api/sharding/split` | 分片分裂 |
 | GET | `/api/docs` | Swagger UI |
 | GET | `/console` | Web 控制台 |
 | GET | `/digital-twin` | 数字孪生大屏 |

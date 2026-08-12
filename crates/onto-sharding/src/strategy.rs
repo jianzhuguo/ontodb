@@ -69,11 +69,10 @@ impl ShardStrategy {
                 let mut target_shards = Vec::new();
                 for range in ranges {
                     // Include shard if its range overlaps with [start, end)
-                    if start < range.end_key.as_slice() && end > ranges.first().map(|r| r.end_key.as_slice()).unwrap_or(&[]) {
-                        if !target_shards.contains(&range.shard) {
+                    if start < range.end_key.as_slice() && end > ranges.first().map(|r| r.end_key.as_slice()).unwrap_or(&[])
+                        && !target_shards.contains(&range.shard) {
                             target_shards.push(range.shard);
                         }
-                    }
                 }
                 if target_shards.is_empty() {
                     ShardTarget::All

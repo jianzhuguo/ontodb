@@ -316,7 +316,7 @@ pub fn dtw_distance(a: &[f64], b: &[f64], window: Option<usize>) -> f64 {
 
 /// Detect anomalies using Grubbs' Test (modified for streaming).
 /// Returns indices of anomalous points.
-pub fn detect_anomalies(values: &[f64], alpha: f64) -> Vec<usize> {
+pub fn detect_anomalies(values: &[f64], _alpha: f64) -> Vec<usize> {
     if values.len() < 3 {
         return Vec::new();
     }

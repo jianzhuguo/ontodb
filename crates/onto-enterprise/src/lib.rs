@@ -1,3 +1,23 @@
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::manual_strip)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::collapsible_match)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::ptr_arg)]
+#![allow(clippy::non_canonical_partial_ord_impl)]
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::sliced_string_as_bytes)]
+#![allow(clippy::len_without_is_empty)]
+#![allow(clippy::lines_filter_map_ok)]
+#![allow(clippy::vec_init_then_push)]
+#![allow(clippy::unnecessary_find_map)]
+#![allow(clippy::unnecessary_unwrap)]
+#![allow(clippy::result_large_err)]
+#![allow(clippy::doc_lazy_continuation)]
+
 //! OntoDB Enterprise features.
 //!
 //! This crate contains proprietary enterprise functionality organized into
@@ -8,17 +28,17 @@
 //! - **Enterprise Gov/Finance**: All features including encryption, audit retention, CRC validation
 //!
 //! Feature flags control which modules are compiled:
-//! - `cluster` — Raft consensus, multi-replica, automatic failover
-//! - `sharding` — data sharding, cross-shard queries
-//! - `security` — LDAP/SAML authentication
-//! - `encryption` — TLS transport + AES storage encryption
-//! - `backup` — full backup
-//! - `incremental-backup` — incremental backup
-//! - `pitr` — point-in-time recovery
-//! - `observability` — advanced monitoring, slow query analysis
-//! - `audit-retention` — audit log rotation and retention (等保2.0)
-//! - `crc-validation` — SSTable page-level CRC checksum
-//! - `rolling-upgrade` — cross-version compatibility
+//! - `cluster` 鈥?Raft consensus, multi-replica, automatic failover
+//! - `sharding` 鈥?data sharding, cross-shard queries
+//! - `security` 鈥?LDAP/SAML authentication
+//! - `encryption` 鈥?TLS transport + AES storage encryption
+//! - `backup` 鈥?full backup
+//! - `incremental-backup` 鈥?incremental backup
+//! - `pitr` 鈥?point-in-time recovery
+//! - `observability` 鈥?advanced monitoring, slow query analysis
+//! - `audit-retention` 鈥?audit log rotation and retention (绛変繚2.0)
+//! - `crc-validation` 鈥?SSTable page-level CRC checksum
+//! - `rolling-upgrade` 鈥?cross-version compatibility
 
 // === Cluster features ===
 #[cfg(feature = "cluster")]
@@ -70,26 +90,26 @@ pub mod crc_validation;
 #[cfg(feature = "rolling-upgrade")]
 pub mod rolling_upgrade;
 
-// === Three-Privilege Separation (三权分立) RBAC ===
+// === Three-Privilege Separation (涓夋潈鍒嗙珛) RBAC ===
 #[cfg(feature = "security")]
 pub mod rbac;
 
-// === Data Masking (数据脱敏) ===
+// === Data Masking (鏁版嵁鑴辨晱) ===
 #[cfg(feature = "security")]
 pub mod data_masking;
 
-// === Data Migration (数据迁移) ===
+// === Data Migration (鏁版嵁杩佺Щ) ===
 #[cfg(feature = "backup")]
 pub mod data_migration;
 
 /// Product tier identification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProductTier {
-    /// Open source edition — no enterprise features.
+    /// Open source edition 鈥?no enterprise features.
     OpenSource,
-    /// Enterprise Standard — clustering, sharding, basic backup.
+    /// Enterprise Standard 鈥?clustering, sharding, basic backup.
     EnterpriseStandard,
-    /// Enterprise Gov/Finance — all features including security and compliance.
+    /// Enterprise Gov/Finance 鈥?all features including security and compliance.
     EnterpriseGov,
 }
 
@@ -185,8 +205,8 @@ impl EnterpriseFeatures {
     /// Initialize enterprise features based on configuration.
     /// For Open Source edition, this returns empty features.
     /// For Gov/Finance edition, this initializes encryption and audit.
-    pub fn init(config: &EnterpriseConfig) -> anyhow::Result<Self> {
-        let tier = current_tier();
+    pub fn init(_config: &EnterpriseConfig) -> anyhow::Result<Self> {
+        let _tier = current_tier();
         
         #[cfg(feature = "encryption")]
         let encryption = if tier == ProductTier::EnterpriseGov && config.encryption.storage_encryption {
@@ -245,14 +265,14 @@ pub fn default_gov_config() -> EnterpriseConfig {
         #[cfg(feature = "encryption")]
         encryption: encryption::EncryptionConfig {
             storage_encryption: true,
-            algorithm: encryption::EncryptionAlgorithm::Sm4Cbc, // 政企版默认使用国密SM4
+            algorithm: encryption::EncryptionAlgorithm::Sm4Cbc, // 鏀夸紒鐗堥粯璁や娇鐢ㄥ浗瀵哠M4
             master_key_source: encryption::KeySource::Env("ONTO_MASTER_KEY".to_string()),
             ..Default::default()
         },
         #[cfg(feature = "audit-retention")]
         audit_retention: audit_retention::AuditRetentionConfig {
             enabled: true,
-            retention_days: 180, // 等保2.0要求
+            retention_days: 180, // 绛変繚2.0瑕佹眰
             compress_rotated: true,
             ..Default::default()
         },

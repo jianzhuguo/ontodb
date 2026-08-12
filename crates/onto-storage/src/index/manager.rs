@@ -20,8 +20,10 @@ const INDEX_PREFIX: &[u8] = b"__idx__";
 
 /// Configuration for index storage mode.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum IndexStorageMode {
     /// All indexes stored in memory (default, fast but limited by RAM).
+    #[default]
     InMemory,
     /// All indexes stored on disk (slower but handles large datasets).
     DiskBased,
@@ -29,11 +31,6 @@ pub enum IndexStorageMode {
     Hybrid { threshold_entries: usize },
 }
 
-impl Default for IndexStorageMode {
-    fn default() -> Self {
-        IndexStorageMode::InMemory
-    }
-}
 
 /// Manages all secondary indexes.
 pub struct IndexManager {
@@ -87,10 +84,10 @@ impl IndexManager {
 
         // Create disk-based index if configured
         if let Some(path) = self.index_path(class, column) {
-            if !self.disk_indexes.contains_key(&key) {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.disk_indexes.entry(key) {
                 match BTreeIndex::create(&path, class, column) {
                     Ok(idx) => {
-                        self.disk_indexes.insert(key, idx);
+                        e.insert(idx);
                     }
                     Err(e) => {
                         eprintln!("Warning: failed to create disk index for {}.{}: {}", class, column, e);
@@ -305,7 +302,7 @@ impl IndexManager {
 
     /// Flushes all disk-based indexes to disk (with fsync).
     pub fn flush_disk_indexes(&mut self) {
-        for (_, disk_idx) in &mut self.disk_indexes {
+        for disk_idx in self.disk_indexes.values_mut() {
             let _ = disk_idx.flush();
         }
     }
@@ -353,8 +350,8 @@ impl IndexManager {
         high: Option<&serde_json::Value>,
     ) -> Option<Vec<Vec<u8>>> {
         let key = (class.to_string(), column.to_string());
-        let low_bytes = low.map(|v| Self::encode_value(v));
-        let high_bytes = high.map(|v| Self::encode_value(v));
+        let low_bytes = low.map(Self::encode_value);
+        let high_bytes = high.map(Self::encode_value);
 
         // Try in-memory index first
         if let Some(tree) = self.indexes.get(&key) {
@@ -430,8 +427,8 @@ impl IndexManager {
         high: Option<&serde_json::Value>,
     ) -> Option<Vec<Vec<u8>>> {
         let key = (class.to_string(), column.to_string());
-        let low_bytes = low.map(|v| Self::encode_value(v));
-        let high_bytes = high.map(|v| Self::encode_value(v));
+        let low_bytes = low.map(Self::encode_value);
+        let high_bytes = high.map(Self::encode_value);
         self.indexes.get(&key).map(|tree| tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref()))
     }
 
@@ -531,7 +528,7 @@ impl IndexManager {
         }
 
         // Flush all disk indexes after rebuild (with fsync)
-        for (_, disk_idx) in &mut self.disk_indexes {
+        for disk_idx in self.disk_indexes.values_mut() {
             let _ = disk_idx.flush();
         }
     }

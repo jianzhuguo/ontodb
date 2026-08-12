@@ -370,8 +370,8 @@ impl<'a> TraversalEngine<'a> {
             &mut result_vertices,
             &mut result_edges,
             &mut result_paths,
-            &vec![start_id.to_string()],
-            &vec![],
+            &[start_id.to_string()],
+            &[],
         )?;
 
         Ok(TraversalResult {

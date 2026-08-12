@@ -317,6 +317,12 @@ pub struct TsmWriter {
     written_blocks: Vec<TsBlock>,
 }
 
+impl Default for TsmWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TsmWriter {
     pub fn new() -> Self {
         Self {

@@ -19,8 +19,10 @@ use serde::{Deserialize, Serialize};
 /// Maximum entries per node (typical: 25-50 for disk-based, 100+ for memory-based).
 const MAX_ENTRIES: usize = 25;
 /// Minimum entries per node (typically 40% of MAX).
+#[allow(dead_code)]
 const MIN_ENTRIES: usize = 10;
 /// Number of entries to reinsert on overflow (typically 30% of MAX).
+#[allow(dead_code)]
 const REINSERT_COUNT: usize = 8;
 
 // ── Bounding Box ──
@@ -164,6 +166,7 @@ impl Node {
         self.entries.len() >= MAX_ENTRIES
     }
 
+    #[allow(dead_code)]
     fn is_underfull(&self) -> bool {
         self.entries.len() < MIN_ENTRIES
     }
@@ -427,6 +430,7 @@ impl RTree {
     }
 }
 
+#[allow(dead_code)]
 fn center_distance(bbox: &BBox, cx: f64, cy: f64) -> f64 {
     let bx = (bbox.min_x + bbox.max_x) / 2.0;
     let by = (bbox.min_y + bbox.max_y) / 2.0;

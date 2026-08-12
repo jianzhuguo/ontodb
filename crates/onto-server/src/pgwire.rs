@@ -55,7 +55,7 @@ pub async fn run_pgwire_server(
     let auth = AuthState::new(&auth_config);
     let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_PGWIRE_CONNECTIONS));
     println!("PG wire protocol listening on {}", addr);
-    println!("Connect with: psql -h 127.0.0.1 -p {} -d ontodb", addr.split(':').last().unwrap_or("5432"));
+    println!("Connect with: psql -h 127.0.0.1 -p {} -d ontodb", addr.split(':').next_back().unwrap_or("5432"));
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -141,7 +141,7 @@ async fn handle_pgwire_client(
             // Generate random 4-byte salt for MD5 challenge
             let mut salt = [0u8; 4];
             {
-                use std::io::Write;
+                
                 // Use time + PID + counter for non-crypto salt (just needs to be unique)
                 let t = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

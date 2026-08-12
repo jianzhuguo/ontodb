@@ -1,4 +1,4 @@
-﻿//! Disk-oriented B+Tree for secondary index lookups.
+//! Disk-oriented B+Tree for secondary index lookups.
 //!
 //! Architecture:
 //! - Internal nodes: keys + child pointers (no values)
@@ -134,6 +134,7 @@ impl BPlusTree {
         self.nodes.get(&id)
     }
 
+    #[allow(dead_code)]
     fn get_node_mut(&mut self, id: u64) -> Option<&mut Node> {
         self.nodes.get_mut(&id)
     }
@@ -800,7 +801,7 @@ impl BPlusTree {
             }
 
             let k = leaf.keys[cursor.idx].as_slice();
-            if high.map_or(false, |h| k > h) {
+            if high.is_some_and(|h| k > h) {
                 break;
             }
 

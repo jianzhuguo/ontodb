@@ -37,6 +37,12 @@ pub struct OntoRaftStore {
     snapshot_meta: Option<SnapshotMeta<NodeId, openraft::BasicNode>>,
 }
 
+impl Default for OntoRaftStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OntoRaftStore {
     pub fn new() -> Self {
         Self {
@@ -98,7 +104,7 @@ impl RaftSnapshotBuilder<OntoRaftConfig> for OntoRaftStore {
                 source: openraft::StorageIOError::new(
                     openraft::ErrorSubject::Snapshot(None),
                     openraft::ErrorVerb::Write,
-                    &std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                    &std::io::Error::other(e.to_string()),
                 ),
             })?;
 

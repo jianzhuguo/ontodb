@@ -1,3 +1,23 @@
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::manual_strip)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::collapsible_match)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::manual_checked_ops)]
+#![allow(clippy::ptr_arg)]
+#![allow(clippy::non_canonical_partial_ord_impl)]
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::sliced_string_as_bytes)]
+#![allow(clippy::len_without_is_empty)]
+#![allow(clippy::lines_filter_map_ok)]
+#![allow(clippy::vec_init_then_push)]
+#![allow(clippy::unnecessary_find_map)]
+#![allow(clippy::unnecessary_unwrap)]
+#![allow(clippy::result_large_err)]
+#![allow(clippy::doc_lazy_continuation)]
+
 //! OntoDB CLI - Interactive command-line client for OntoDB server.
 //!
 //! Features:
@@ -61,9 +81,9 @@ fn main() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 //  Single query mode
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 
 fn run_single_query(stream: TcpStream, query: &str) {
     let query = query.trim().trim_end_matches(';').trim();
@@ -86,9 +106,9 @@ fn run_single_query(stream: TcpStream, query: &str) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 //  File execution mode
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 
 fn run_file(stream: TcpStream, file_path: &str) {
     let content = match std::fs::read_to_string(file_path) {
@@ -133,9 +153,9 @@ fn run_file(stream: TcpStream, file_path: &str) {
     eprintln!("{} succeeded, {} failed", ok, err);
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 //  Interactive REPL
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 
 fn run_repl(stream: TcpStream, addr: &str) {
     print_banner(addr);
@@ -250,7 +270,7 @@ fn execute_with_timing(stream: &TcpStream, query: &str) {
                 if response.contains("(0 rows)") {
                     println!("{}", response);
                 } else if response.contains("rows)") {
-                    // It's a SELECT result — format with borders
+                    // It's a SELECT result 鈥?format with borders
                     print_table(&response);
                 } else {
                     // It's a success message (INSERT, UPDATE, DELETE, CREATE)
@@ -437,9 +457,9 @@ fn print_help() {
     println!();
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 //  Protocol helpers
-// ═══════════════════════════════════════════════════════════════════
+// 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 
 fn send_query(stream: &TcpStream, query: &str) -> io::Result<String> {
     let mut stream = stream.try_clone()?;

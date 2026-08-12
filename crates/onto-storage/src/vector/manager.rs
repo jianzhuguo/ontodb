@@ -49,6 +49,12 @@ pub struct VectorIndexManager {
     deleted_keys: HashSet<Vec<u8>>,
 }
 
+impl Default for VectorIndexManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VectorIndexManager {
     pub fn new() -> Self {
         Self {
@@ -225,11 +231,11 @@ impl VectorIndexManager {
                 class: class.to_string(),
                 column: column.to_string(),
             };
-            by_index.entry(key).or_insert_with(Vec::new).push((doc_key.clone(), vector.clone()));
+            by_index.entry(key).or_default().push((doc_key.clone(), vector.clone()));
             // Track doc_vectors
             self.doc_vectors
                 .entry(doc_key.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((class.to_string(), column.to_string(), vector.clone()));
         }
 
@@ -267,7 +273,7 @@ impl VectorIndexManager {
         // Track the vector for this document
         self.doc_vectors
             .entry(doc_key.to_vec())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push((class.to_string(), column.to_string(), vector.clone()));
 
         if let Some(index) = self.indexes.get_mut(&key) {
