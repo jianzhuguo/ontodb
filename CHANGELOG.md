@@ -2,6 +2,41 @@
 
 All notable changes to OntoDB will be documented in this file.
 
+## [v0.6.1] - 2026-08-13
+
+### Bug Fixes
+
+- **B7.20**: Explicit saturating cast for SUM aggregation results to prevent overflow
+- Resolve 5 release blocking issues for v0.6.1
+
+### Release Readiness
+
+- Version alignment across Cargo.toml, README, SDK, and docs
+- Repository hygiene and config consistency
+- Tests, English docs, and SDK version alignment
+- Bump version to v0.6.1
+
+---
+
+## [v0.6.0] - 2026-08-12
+
+### Security Hardening
+
+- **Phase 7 Security Audit**: Resolve 23 security issues total
+  - 6 critical/high issues (B7.4-B7.6, B7.12, B7.17, B7.35)
+  - 17 medium/low issues (DoS guards, error sanitization, overflow protection)
+
+### Code Quality
+
+- Eliminate last 3 bare `unwrap()` from production code — now zero production unwrap
+- All 430 `unwrap()` calls replaced with `expect()` or proper error handling
+
+### Tests
+
+- 584/584 passing, zero regressions
+
+---
+
 ## [v0.5.9] - 2026-08-10
 
 ### Features

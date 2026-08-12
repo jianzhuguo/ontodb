@@ -36,9 +36,9 @@
 
 ```bash
 # Linux x86_64
-wget https://release.ontodb.io/ontodb-v0.6.0-linux-x86_64.tar.gz
-tar xzf ontodb-v0.6.0-linux-x86_64.tar.gz
-cd ontodb-v0.6.0
+wget https://release.ontodb.io/ontodb-v0.6.1-linux-x86_64.tar.gz
+tar xzf ontodb-v0.6.1-linux-x86_64.tar.gz
+cd ontodb-v0.6.1
 
 # Start server
 ./ontodb-server --data-dir ./data --http 0.0.0.0:7912
@@ -46,9 +46,9 @@ cd ontodb-v0.6.0
 
 ```powershell
 # Windows x86_64
-Invoke-WebRequest -Uri "https://release.ontodb.io/ontodb-v0.6.0-windows-x86_64.zip" -OutFile ontodb.zip
+Invoke-WebRequest -Uri "https://release.ontodb.io/ontodb-v0.6.1-windows-x86_64.zip" -OutFile ontodb.zip
 Expand-Archive ontodb.zip -DestinationPath .
-cd ontodb-v0.6.0
+cd ontodb-v0.6.1
 
 # Start server
 .\ontodb-server.exe --data-dir .\data --http 0.0.0.0:7912
