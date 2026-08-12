@@ -27,6 +27,11 @@ export type {
   HealthStatus,
   MetricsInfo,
   SchemaInfo,
+  ApiResponse,
+  Vertex,
+  Edge,
+  HealthResponse,
+  BackupResult,
 } from './types';
 export {
   OntoDBError,

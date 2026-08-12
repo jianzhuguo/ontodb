@@ -403,3 +403,157 @@ async fn check_tcp_reachable(addr: &str) -> bool {
         Err(_) => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_ipv4_valid() {
+        assert_eq!(parse_ipv4("192.168.1.1"), Some(192 << 24 | 168 << 16 | 1 << 8 | 1));
+        assert_eq!(parse_ipv4("0.0.0.0"), Some(0));
+        assert_eq!(parse_ipv4("255.255.255.255"), Some(0xFFFFFFFF));
+    }
+
+    #[test]
+    fn test_parse_ipv4_invalid() {
+        assert_eq!(parse_ipv4("not.an.ip.address"), None);
+        assert_eq!(parse_ipv4("256.1.1.1"), None);
+        assert_eq!(parse_ipv4("1.1.1"), None);
+        assert_eq!(parse_ipv4(""), None);
+    }
+
+    #[test]
+    fn test_ip_in_cidr_exact() {
+        assert!(ip_in_cidr("192.168.1.1", "192.168.1.1/32"));
+        assert!(!ip_in_cidr("192.168.1.2", "192.168.1.1/32"));
+    }
+
+    #[test]
+    fn test_ip_in_cidr_subnet() {
+        assert!(ip_in_cidr("192.168.1.100", "192.168.1.0/24"));
+        assert!(ip_in_cidr("192.168.1.1", "192.168.0.0/16"));
+        assert!(!ip_in_cidr("192.169.1.1", "192.168.0.0/16"));
+    }
+
+    #[test]
+    fn test_ip_in_cidr_prefix_zero() {
+        assert!(ip_in_cidr("8.8.8.8", "0.0.0.0/0"));
+    }
+
+    #[test]
+    fn test_ip_in_cidr_invalid() {
+        assert!(!ip_in_cidr("bad", "192.168.1.0/24"));
+        assert!(!ip_in_cidr("192.168.1.1", "bad"));
+        assert!(!ip_in_cidr("192.168.1.1", "192.168.1.0/abc"));
+    }
+
+    #[test]
+    fn test_extract_all_ips() {
+        let config = serde_json::json!({
+            "keys": [
+                {"allowed_ips": ["192.168.1.1/32", "10.0.0.0/8"]},
+                {"allowed_ips": ["192.168.1.1/32", "172.16.0.0/12"]}
+            ]
+        });
+        let ips = extract_all_ips(&config);
+        assert_eq!(ips.len(), 3); // 192.168.1.1/32 is deduplicated
+        assert!(ips.contains("192.168.1.1/32"));
+        assert!(ips.contains("10.0.0.0/8"));
+        assert!(ips.contains("172.16.0.0/12"));
+    }
+
+    #[test]
+    fn test_extract_all_ips_empty() {
+        let config = serde_json::json!({"keys": []});
+        assert!(extract_all_ips(&config).is_empty());
+    }
+
+    #[test]
+    fn test_extract_all_ips_no_keys() {
+        let config = serde_json::json!({});
+        assert!(extract_all_ips(&config).is_empty());
+    }
+
+    #[test]
+    fn test_config_hash_deterministic() {
+        let data = b"test data";
+        let h1 = config_hash(data);
+        let h2 = config_hash(data);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_config_hash_different_inputs() {
+        let h1 = config_hash(b"data1");
+        let h2 = config_hash(b"data2");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_cluster_whitelist_manager_new() {
+        let config_store = SharedConfigStore::new(None);
+        let manager = ClusterWhitelistManager::new(1, config_store);
+        assert_eq!(manager.self_id(), 1);
+        assert!(manager.get_nodes().is_empty());
+    }
+
+    #[test]
+    fn test_cluster_whitelist_update_cluster() {
+        let config_store = SharedConfigStore::new(None);
+        config_store.apply(b"{\"keys\":[]}").unwrap();
+        let manager = ClusterWhitelistManager::new(1, config_store);
+
+        let mut nodes = BTreeMap::new();
+        nodes.insert(1, "127.0.0.1:9000".to_string());
+        nodes.insert(2, "127.0.0.1:9001".to_string());
+
+        manager.update_cluster(nodes).unwrap();
+        assert_eq!(manager.get_nodes().len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_whitelist_validate_empty_cluster() {
+        let config_store = SharedConfigStore::new(None);
+        config_store.apply(b"{\"keys\":[]}").unwrap();
+        let manager = ClusterWhitelistManager::new(1, config_store);
+
+        let result = manager.validate_cluster_whitelist();
+        assert!(result.all_consistent);
+        assert!(result.node_results.is_empty());
+    }
+
+    #[test]
+    fn test_cluster_whitelist_validate_single_node() {
+        let config_store = SharedConfigStore::new(None);
+        config_store.apply(b"{\"keys\":[]}").unwrap();
+        let manager = ClusterWhitelistManager::new(1, config_store);
+
+        let mut nodes = BTreeMap::new();
+        nodes.insert(1, "127.0.0.1:9000".to_string());
+        manager.update_cluster(nodes).unwrap();
+
+        let result = manager.validate_cluster_whitelist();
+        assert_eq!(result.node_results.len(), 1);
+        assert!(result.node_results[0].reachable); // self is always reachable
+    }
+
+    #[test]
+    fn test_sync_peer_ips() {
+        let config_store = SharedConfigStore::new(None);
+        config_store.apply(b"{\"keys\":[{\"allowed_ips\":[]}]}").unwrap();
+        let manager = ClusterWhitelistManager::new(1, config_store.clone());
+
+        let mut nodes = BTreeMap::new();
+        nodes.insert(1, "127.0.0.1:9000".to_string());
+        nodes.insert(2, "10.0.0.1:9001".to_string());
+        manager.update_cluster(nodes).unwrap();
+
+        let result = manager.sync_peer_ips();
+        assert_eq!(result["status"], "synced");
+
+        // Verify the peer IP was added to config
+        let config_json = String::from_utf8(config_store.get_json()).unwrap();
+        assert!(config_json.contains("10.0.0.1/32"));
+    }
+}

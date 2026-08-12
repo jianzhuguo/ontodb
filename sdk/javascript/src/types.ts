@@ -72,7 +72,44 @@ export interface ColumnInfo {
 
 /** API response wrapper */
 export interface ApiResponse<T = unknown> {
+  success?: boolean;
   data?: T;
   error?: string;
   rows_affected?: number;
+  elapsed_ms?: number;
+}
+
+/** Graph vertex */
+export interface Vertex {
+  id: string;
+  labels?: string[];
+  properties?: Record<string, unknown>;
+}
+
+/** Graph edge */
+export interface Edge {
+  id: string;
+  from: string;
+  to: string;
+  label?: string;
+  properties?: Record<string, unknown>;
+}
+
+/** Detailed health response */
+export interface HealthResponse {
+  status: 'ok' | 'degraded';
+  version: string;
+  engine: string;
+  uptime_seconds: number;
+  checks: Record<string, unknown>;
+}
+
+/** Backup result */
+export interface BackupResult {
+  message: string;
+  path: string;
+  files: number;
+  total_bytes: number;
+  timestamp: string;
+  backup_type?: string;
 }

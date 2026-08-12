@@ -78,3 +78,80 @@ pub enum OntoResponse {
     Success(Option<String>),
     Error(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_request_depth_flat() {
+        let put = OntoRequest::Put { key: b"k".to_vec(), value: b"v".to_vec() };
+        assert_eq!(put.depth(), 1);
+        assert!(!put.exceeds_max_depth());
+
+        let del = OntoRequest::Delete { key: b"k".to_vec() };
+        assert_eq!(del.depth(), 1);
+    }
+
+    #[test]
+    fn test_request_depth_nested_batch() {
+        let batch = OntoRequest::Batch {
+            ops: vec![
+                OntoRequest::Put { key: b"a".to_vec(), value: b"1".to_vec() },
+                OntoRequest::Batch {
+                    ops: vec![
+                        OntoRequest::Put { key: b"b".to_vec(), value: b"2".to_vec() },
+                    ],
+                },
+            ],
+        };
+        assert_eq!(batch.depth(), 2);
+        assert!(!batch.exceeds_max_depth());
+    }
+
+    #[test]
+    fn test_request_depth_exceeds_max() {
+        // Build a deeply nested batch (depth = MAX_BATCH_DEPTH + 1)
+        let mut deep = OntoRequest::Put { key: b"k".to_vec(), value: b"v".to_vec() };
+        for _ in 0..MAX_BATCH_DEPTH {
+            deep = OntoRequest::Batch { ops: vec![deep] };
+        }
+        assert!(deep.exceeds_max_depth());
+    }
+
+    #[test]
+    fn test_request_flatten() {
+        let nested = OntoRequest::Batch {
+            ops: vec![
+                OntoRequest::Put { key: b"a".to_vec(), value: b"1".to_vec() },
+                OntoRequest::Batch {
+                    ops: vec![
+                        OntoRequest::Delete { key: b"b".to_vec() },
+                        OntoRequest::Put { key: b"c".to_vec(), value: b"3".to_vec() },
+                    ],
+                },
+            ],
+        };
+        let flat = nested.flatten();
+        assert_eq!(flat.len(), 3);
+        assert!(matches!(&flat[0], OntoRequest::Put { .. }));
+        assert!(matches!(&flat[1], OntoRequest::Delete { .. }));
+        assert!(matches!(&flat[2], OntoRequest::Put { .. }));
+    }
+
+    #[test]
+    fn test_request_flatten_single() {
+        let put = OntoRequest::Put { key: b"k".to_vec(), value: b"v".to_vec() };
+        let flat = put.flatten();
+        assert_eq!(flat.len(), 1);
+    }
+
+    #[test]
+    fn test_request_config_change() {
+        let config = OntoRequest::ConfigChange {
+            config_json: b"{\"keys\":[]}".to_vec(),
+        };
+        assert_eq!(config.depth(), 1);
+        assert!(!config.exceeds_max_depth());
+    }
+}

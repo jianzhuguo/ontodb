@@ -129,3 +129,145 @@ impl RaftLogStorage<OntoRaftConfig> for OntoLogStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::storage::RaftLogStorage;
+    use openraft::{CommittedLeaderId, Entry, EntryPayload};
+    use crate::types::OntoRequest;
+
+    fn make_entry(index: u64, term: u64, key: &[u8], value: &[u8]) -> Entry<OntoRaftConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(term, 1), index),
+            payload: EntryPayload::Normal(OntoRequest::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_log_store_empty_state() {
+        let mut store = OntoLogStore::new();
+        let state = store.get_log_state().await.unwrap();
+        assert!(state.last_log_id.is_none());
+        assert!(state.last_purged_log_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_log_store_append_and_read() {
+        let mut store = OntoLogStore::new();
+        let entries = vec![
+            make_entry(1, 1, b"k1", b"v1"),
+            make_entry(2, 1, b"k2", b"v2"),
+            make_entry(3, 1, b"k3", b"v3"),
+        ];
+        let cb = openraft::storage::LogFlushed::new(None);
+        store.append(entries, cb).await.unwrap();
+
+        let state = store.get_log_state().await.unwrap();
+        assert!(state.last_log_id.is_some());
+        assert_eq!(state.last_log_id.unwrap().index, 3);
+
+        let read_entries = store.try_get_log_entries(1..4).await.unwrap();
+        assert_eq!(read_entries.len(), 3);
+        assert_eq!(read_entries[0].log_id.index, 1);
+        assert_eq!(read_entries[2].log_id.index, 3);
+    }
+
+    #[tokio::test]
+    async fn test_log_store_append_range_query() {
+        let mut store = OntoLogStore::new();
+        let entries = vec![
+            make_entry(1, 1, b"a", b"1"),
+            make_entry(2, 1, b"b", b"2"),
+            make_entry(3, 1, b"c", b"3"),
+            make_entry(4, 1, b"d", b"4"),
+            make_entry(5, 1, b"e", b"5"),
+        ];
+        let cb = openraft::storage::LogFlushed::new(None);
+        store.append(entries, cb).await.unwrap();
+
+        // Range 2..4 should return entries 2, 3
+        let subset = store.try_get_log_entries(2..4).await.unwrap();
+        assert_eq!(subset.len(), 2);
+        assert_eq!(subset[0].log_id.index, 2);
+        assert_eq!(subset[1].log_id.index, 3);
+    }
+
+    #[tokio::test]
+    async fn test_log_store_truncate() {
+        let mut store = OntoLogStore::new();
+        let entries = vec![
+            make_entry(1, 1, b"a", b"1"),
+            make_entry(2, 1, b"b", b"2"),
+            make_entry(3, 1, b"c", b"3"),
+            make_entry(4, 1, b"d", b"4"),
+            make_entry(5, 1, b"e", b"5"),
+        ];
+        let cb = openraft::storage::LogFlushed::new(None);
+        store.append(entries, cb).await.unwrap();
+
+        // Truncate after index 2 (remove 3, 4, 5)
+        store.truncate(LogId::new(CommittedLeaderId::new(1, 1), 2)).await.unwrap();
+
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_log_id.unwrap().index, 2);
+
+        let remaining = store.try_get_log_entries(1..10).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_log_store_purge() {
+        let mut store = OntoLogStore::new();
+        let entries = vec![
+            make_entry(1, 1, b"a", b"1"),
+            make_entry(2, 1, b"b", b"2"),
+            make_entry(3, 1, b"c", b"3"),
+            make_entry(4, 1, b"d", b"4"),
+        ];
+        let cb = openraft::storage::LogFlushed::new(None);
+        store.append(entries, cb).await.unwrap();
+
+        // Purge entries <= index 2
+        store.purge(LogId::new(CommittedLeaderId::new(1, 1), 2)).await.unwrap();
+
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id.unwrap().index, 2);
+
+        let remaining = store.try_get_log_entries(1..10).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].log_id.index, 3);
+    }
+
+    #[tokio::test]
+    async fn test_log_store_vote_save_read() {
+        let mut store = OntoLogStore::new();
+
+        // Initially no vote
+        assert!(store.read_vote().await.unwrap().is_none());
+
+        // Save a vote
+        let vote = Vote::new(1, 1);
+        store.save_vote(&vote).await.unwrap();
+
+        // Read it back
+        let read_vote = store.read_vote().await.unwrap().unwrap();
+        assert_eq!(read_vote.leader_id.node_id, 1);
+        assert_eq!(read_vote.leader_id.term, 1);
+    }
+
+    #[tokio::test]
+    async fn test_log_store_get_reader() {
+        let mut store = OntoLogStore::new();
+        let entries = vec![make_entry(1, 1, b"k", b"v")];
+        let cb = openraft::storage::LogFlushed::new(None);
+        store.append(entries, cb).await.unwrap();
+
+        let mut reader = store.get_log_reader().await;
+        let state = reader.get_log_state().await.unwrap();
+        assert_eq!(state.last_log_id.unwrap().index, 1);
+    }
+}

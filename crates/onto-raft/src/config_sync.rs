@@ -99,3 +99,86 @@ pub struct ConfigChangeResult {
     pub replicated_via_raft: bool,
     pub node_count: usize,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn test_config_store_new_empty() {
+        let store = SharedConfigStore::new(None);
+        assert!(store.get_json().is_empty());
+        assert!(store.file_path().is_none());
+    }
+
+    #[test]
+    fn test_config_store_apply_valid_json() {
+        let store = SharedConfigStore::new(None);
+        let config = r#"{"enabled":true,"keys":[]}"#;
+        store.apply(config.as_bytes()).unwrap();
+        assert_eq!(store.get_json(), config.as_bytes());
+    }
+
+    #[test]
+    fn test_config_store_apply_invalid_json() {
+        let store = SharedConfigStore::new(None);
+        let result = store.apply(b"not valid json");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid config JSON"));
+    }
+
+    #[test]
+    fn test_config_store_apply_with_tempfile() {
+        let dir = std::env::temp_dir().join("ontodb_config_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_config.json");
+
+        let store = SharedConfigStore::new(Some(path.clone()));
+        let config = r#"{"enabled":false}"#;
+        store.apply(config.as_bytes()).unwrap();
+
+        // Verify file was written
+        let disk_content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(disk_content, config);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_config_store_on_change_callback() {
+        let store = SharedConfigStore::new(None);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+
+        store.on_change(Box::new(move |_| {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        store.apply(b"{}").unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        store.apply(b"{}").unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_config_store_load_from_disk_no_file() {
+        let store = SharedConfigStore::new(None);
+        assert!(!store.load_from_disk());
+    }
+
+    #[test]
+    fn test_config_store_clone_shares_state() {
+        let store = SharedConfigStore::new(None);
+        store.apply(b"{\"test\":1}").unwrap();
+
+        let cloned = store.clone();
+        assert_eq!(cloned.get_json(), b"{\"test\":1}");
+
+        // Update via clone
+        cloned.apply(b"{\"test\":2}").unwrap();
+        assert_eq!(store.get_json(), b"{\"test\":2}");
+    }
+}

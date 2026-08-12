@@ -25,7 +25,7 @@ Basic usage::
     results = db.graph_traverse("Person::1", direction="out", depth=3)
 """
 
-__version__ = "0.3.0"
+__version__ = "0.6.1"
 
 from .client import OntoDB
 from .exceptions import (

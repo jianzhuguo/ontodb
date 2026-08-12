@@ -6,6 +6,10 @@ import type {
   HealthStatus,
   SchemaInfo,
   ApiResponse,
+  Vertex,
+  Edge,
+  HealthResponse,
+  BackupResult,
 } from './types';
 import {
   OntoDBError,
@@ -370,6 +374,110 @@ export class OntoDB {
     const result = await this.request('POST', '/api/restore', { path }, timeout);
     if (result.error) throw new QueryError(result.error);
     return result;
+  }
+
+  /**
+   * Create an incremental backup (only files changed since the given time).
+   */
+  async backupIncremental(path: string, since: string, timeout?: number): Promise<BackupResult> {
+    const result = await this.request<BackupResult>('POST', '/api/backup/incremental', { path, since }, timeout);
+    if (result.error) throw new QueryError(result.error);
+    return result.data!;
+  }
+
+  /**
+   * Verify a backup's integrity.
+   */
+  async verifyBackup(path: string, timeout?: number): Promise<{ message: string }> {
+    const result = await this.request<{ message: string }>('POST', '/api/backup/verify', { path }, timeout);
+    if (result.error) throw new QueryError(result.error);
+    return result.data!;
+  }
+
+  // ──────────────────────────────────────────────
+  // Graph CRUD Operations
+  // ──────────────────────────────────────────────
+
+  /**
+   * Add a vertex to the graph.
+   */
+  async addVertex(vertex: Vertex, timeout?: number): Promise<ApiResponse> {
+    return this.request('POST', '/api/graph/vertex', vertex, timeout);
+  }
+
+  /**
+   * Get a vertex by ID.
+   */
+  async getVertex(id: string, timeout?: number): Promise<Vertex> {
+    const result = await this.request<Vertex>('GET', `/api/graph/vertex/${encodeURIComponent(id)}`, undefined, timeout);
+    return result.data!;
+  }
+
+  /**
+   * Delete a vertex and its connected edges.
+   */
+  async deleteVertex(id: string, timeout?: number): Promise<void> {
+    await this.request('DELETE', `/api/graph/vertex/${encodeURIComponent(id)}`, undefined, timeout);
+  }
+
+  /**
+   * Add an edge to the graph.
+   */
+  async addEdge(edge: Edge, timeout?: number): Promise<ApiResponse> {
+    return this.request('POST', '/api/graph/edge', edge, timeout);
+  }
+
+  /**
+   * Get neighbors of a vertex.
+   */
+  async getNeighbors(id: string, timeout?: number): Promise<{ vertex_id: string; count: number; neighbors: Vertex[] }> {
+    const result = await this.request<{ vertex_id: string; count: number; neighbors: Vertex[] }>(
+      'GET', `/api/graph/neighbors/${encodeURIComponent(id)}`, undefined, timeout,
+    );
+    return result.data!;
+  }
+
+  // ──────────────────────────────────────────────
+  // Health Probes (Kubernetes)
+  // ──────────────────────────────────────────────
+
+  /**
+   * Comprehensive health check (probes storage + query engine).
+   */
+  async healthDetailed(timeout?: number): Promise<HealthResponse> {
+    const result = await this.request<HealthResponse>('GET', '/api/health', undefined, timeout ?? 5000);
+    return result.data!;
+  }
+
+  /**
+   * Kubernetes readiness probe.
+   */
+  async ready(): Promise<boolean> {
+    try {
+      await this.request('GET', '/api/health/ready', undefined, 2000);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Kubernetes liveness probe.
+   */
+  async alive(): Promise<boolean> {
+    try {
+      await this.request('GET', '/api/health/live', undefined, 2000);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Flush MemTable to SSTable.
+   */
+  async flush(timeout?: number): Promise<void> {
+    await this.request('POST', '/api/flush', undefined, timeout);
   }
 
   toString(): string {

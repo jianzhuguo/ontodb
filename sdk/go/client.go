@@ -27,7 +27,7 @@ import (
 )
 
 // Version is the SDK version.
-const Version = "0.3.0"
+const Version = "0.6.1"
 
 // Client is the OntoDB client.
 type Client struct {

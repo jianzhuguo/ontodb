@@ -12,14 +12,14 @@ Requires Java 11+.
 <dependency>
     <groupId>io.ontodb</groupId>
     <artifactId>ontodb-java</artifactId>
-    <version>0.3.0</version>
+    <version>0.6.1</version>
 </dependency>
 ```
 
 ### Gradle
 
 ```groovy
-implementation 'io.ontodb:ontodb-java:0.3.0'
+implementation 'io.ontodb:ontodb-java:0.6.1'
 ```
 
 ## Quick Start

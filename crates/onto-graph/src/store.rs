@@ -727,7 +727,7 @@ impl GraphStore {
             };
 
             for (nbr, _) in neighbors {
-                if !visited[nbr as usize] {
+                if (nbr as usize) < visited.len() && !visited[nbr as usize] {
                     visited[nbr as usize] = true;
                     queue.push_back((nbr, depth + 1));
                 }
@@ -775,7 +775,7 @@ impl GraphStore {
             };
 
             for (nbr, _) in neighbors {
-                if !visited[nbr as usize] {
+                if (nbr as usize) < visited.len() && !visited[nbr as usize] {
                     visited[nbr as usize] = true;
                     parent[nbr as usize] = Some(curr);
                     queue.push_back((nbr, depth + 1));

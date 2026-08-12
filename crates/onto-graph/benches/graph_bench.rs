@@ -226,9 +226,9 @@ fn main() {
     bench_graph_vector_hybrid(&store, 50);
     println!();
 
-    // Test 3: Large graph (100K vertices) - deep traversal tests
-    println!("--- Large Graph (100K vertices) ---");
-    let store = build_social_graph(100000, 20);
+    // Test 3: Large graph (50K vertices) - deep traversal tests
+    println!("--- Large Graph (50K vertices) ---");
+    let store = build_social_graph(50000, 20);
     bench_vertex_crud(&store, 10000);
     bench_edge_crud(&store, 10000);
     bench_traversal(&store, 100, 3);
