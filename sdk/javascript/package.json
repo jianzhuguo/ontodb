@@ -1,6 +1,6 @@
 {
   "name": "ontodb",
-  "version": "0.3.0",
+  "version": "0.6.0",
   "description": "JavaScript/TypeScript SDK for OntoDB — the ontology-driven semantic multi-modal database",
   "main": "dist/index.js",
   "module": "dist/index.mjs",

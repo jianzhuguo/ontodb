@@ -1,5 +1,7 @@
 # OntoDB — 本体驱动的六模态语义数据库
 
+**[English](README.en.md)** | 中文
+
 <p align="center">
   <b>全球首个将 OWL 推理引擎嵌入数据库内核的六模态统一语义数据库</b>
 </p>
@@ -37,9 +39,9 @@
 
 ```bash
 # Linux x86_64
-wget https://release.ontodb.io/ontodb-v0.3.0-linux-x86_64.tar.gz
-tar xzf ontodb-v0.3.0-linux-x86_64.tar.gz
-cd ontodb-v0.3.0
+wget https://release.ontodb.io/ontodb-v0.6.0-linux-x86_64.tar.gz
+tar xzf ontodb-v0.6.0-linux-x86_64.tar.gz
+cd ontodb-v0.6.0
 
 # 启动服务器
 ./ontodb-server --data-dir ./data --http 0.0.0.0:7912
@@ -47,9 +49,9 @@ cd ontodb-v0.3.0
 
 ```powershell
 # Windows x86_64
-Invoke-WebRequest -Uri "https://release.ontodb.io/ontodb-v0.3.0-windows-x86_64.zip" -OutFile ontodb.zip
+Invoke-WebRequest -Uri "https://release.ontodb.io/ontodb-v0.6.0-windows-x86_64.zip" -OutFile ontodb.zip
 Expand-Archive ontodb.zip -DestinationPath .
-cd ontodb-v0.3.0
+cd ontodb-v0.6.0
 
 # 启动服务器
 .\ontodb-server.exe --data-dir .\data --http 0.0.0.0:7912

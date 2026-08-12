@@ -465,3 +465,35 @@ fn send_query(stream: &TcpStream, query: &str) -> io::Result<String> {
 
     String::from_utf8(response).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_statement_end_simple() {
+        assert_eq!(find_statement_end("SELECT 1;"), Some(8));
+        assert_eq!(find_statement_end("SELECT 1"), None);
+        assert_eq!(find_statement_end(""), None);
+    }
+
+    #[test]
+    fn test_find_statement_end_with_quotes() {
+        // Semicolon inside single quotes should be ignored
+        assert_eq!(find_statement_end("SELECT 'hello;world';"), Some(20));
+        // Semicolon inside double quotes should be ignored
+        assert_eq!(find_statement_end(r#"SELECT "hello;world";"#), Some(20));
+    }
+
+    #[test]
+    fn test_find_statement_end_multiple_semicolons() {
+        // Returns first unquoted semicolon
+        assert_eq!(find_statement_end("SELECT 1; SELECT 2;"), Some(8));
+    }
+
+    #[test]
+    fn test_find_statement_end_empty_quotes() {
+        assert_eq!(find_statement_end("'';"), Some(2));
+        assert_eq!(find_statement_end(r#""";"#), Some(2));
+    }
+}
