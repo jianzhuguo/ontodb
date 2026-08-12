@@ -72,7 +72,8 @@ pub struct LsmEngine {
     /// Read lock for get/scan, write lock for put/delete/flush.
     /// Uses parking_lot::RwLock for FIFO fairness — prevents writer starvation
     /// when multiple readers hold concurrent read locks.
-    write_state: FairRwLock<WriteState>,
+    /// Wrapped in Arc for sharing with background WAL sync thread.
+    write_state: Arc<FairRwLock<WriteState>>,
 
     /// SSTable handle cache (separate Mutex — read path may lazily open files).
     sst_cache: Mutex<HashMap<PathBuf, Arc<SsTable>>>,
@@ -109,6 +110,7 @@ pub struct LsmEngine {
     compaction_pending: AtomicBool,
 
     /// Handle to the background compaction worker thread for graceful shutdown.
+    #[allow(dead_code)]
     worker_handle: Mutex<Option<JoinHandle<()>>>,
 
     /// Group commit coordinator for batching WAL syncs.
@@ -150,7 +152,7 @@ impl PreLoadEngine {
         for entry in dir_entries {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "sst") {
+            if path.extension().is_some_and(|ext| ext == "sst") {
                 sst_files.push(path);
             }
         }
@@ -251,7 +253,7 @@ impl LsmEngine {
         };
 
         let engine = LsmEngine {
-            write_state: FairRwLock::new(pre_engine.write_state),
+            write_state: Arc::new(FairRwLock::new(pre_engine.write_state)),
             sst_cache: Mutex::new(pre_engine.sst_cache),
             levels,
             options,
@@ -265,6 +267,35 @@ impl LsmEngine {
             worker_handle: Mutex::new(Some(_worker_handle)),
             group_commit: Arc::new(crate::lsm::group_commit::GroupCommitCoordinator::new()),
         };
+
+        // Spawn background WAL sync thread
+        // Every 100ms, flush WAL buffer to OS cache and fsync if dirty
+        // This ensures single put() calls are persisted within 100ms
+        let sync_write_state = engine.write_state.clone();
+        let sync_wal_on_commit = engine.options.sync_wal_on_commit;
+        let sync_handle = std::thread::Builder::new()
+            .name("ontodb-wal-sync".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if let Some(mut ws) = sync_write_state.try_write_for(std::time::Duration::from_millis(5)) {
+                        if ws.wal_pending_count > 0 {
+                            let _ = ws.wal.flush_buf();
+                            ws.wal_pending_count = 0;
+                            if sync_wal_on_commit {
+                                let _ = ws.wal.sync();
+                            }
+                        } else if sync_wal_on_commit {
+                            let _ = ws.wal.sync_if_dirty();
+                        }
+                    }
+                }
+            })
+            .ok();
+        // Leak the handle so the thread runs for the lifetime of the engine
+        if let Some(h) = sync_handle {
+            std::mem::forget(h);
+        }
 
         // Rebuild secondary indexes from persisted index entries
         engine.rebuild_indexes()?;
@@ -285,39 +316,20 @@ impl LsmEngine {
         let seq = self.next_seq();
         let entry = Entry::put(key.clone(), value.clone(), seq);
 
-        let (needs_flush, should_sync) = {
+        let needs_flush = {
             let mut ws = self.write_state.write();
             ws.wal.append(&entry)?;
             ws.wal_pending_count += 1;
             // Batch flush: only flush WAL buffer every 64 writes
-            let mut do_sync = false;
             if ws.wal_pending_count >= 64 {
                 ws.wal.flush_buf()?;
                 ws.wal_pending_count = 0;
-                if self.options.sync_wal_on_commit {
-                    do_sync = true;
-                }
             }
             ws.memtable.put_with_seq(key, value, seq);
-            (ws.memtable.size() >= self.options.memtable_size_limit, do_sync)
+            ws.memtable.size() >= self.options.memtable_size_limit
         };
         // write_state lock released here
-
-        // Group commit: batch sync across concurrent writers
-        if should_sync {
-            let current_seq = self.seq_counter.load(Ordering::Relaxed);
-            let is_leader = self.group_commit.register(current_seq);
-            if is_leader {
-                let _batch_size = self.group_commit.wait_for_batch();
-                {
-                    let mut ws = self.write_state.write();
-                    ws.wal.sync()?;
-                }
-                self.group_commit.complete_sync(current_seq);
-            } else {
-                self.group_commit.wait_for_sync(current_seq);
-            }
-        }
+        // WAL sync is handled by background thread (100ms interval)
 
         if needs_flush {
             self.flush_memtable()?;
@@ -647,7 +659,7 @@ impl LsmEngine {
                 ws.wal.flush_buf()?;
                 ws.wal_pending_count = 0;
             }
-            let old_mem = std::mem::replace(&mut ws.memtable, MemTable::new());
+            let old_mem = std::mem::take(&mut ws.memtable);
             ws.immutable_memtable = Some(old_mem);
         }
 
@@ -1005,10 +1017,10 @@ impl LsmEngine {
 
                 // Check index existence (brief read locks, dropped immediately)
                 let class = Self::extract_class_from_key(&key);
-                let has_indexes = class.as_ref().map_or(false, |c| {
+                let has_indexes = class.as_ref().is_some_and(|c| {
                     !self.index_manager.read().unwrap_or_else(|e| e.into_inner()).indexes_for_class(c).is_empty()
                 });
-                let has_vector_indexes = class.as_ref().map_or(false, |c| {
+                let has_vector_indexes = class.as_ref().is_some_and(|c| {
                     self.vector_index_manager.read().unwrap_or_else(|e| e.into_inner()).has_any_index(c)
                 });
 
@@ -1982,7 +1994,7 @@ fn chrono_timestamp() -> String {
 }
 
 fn is_leap_year(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 #[cfg(test)]
