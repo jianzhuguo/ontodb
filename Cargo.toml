@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["OntoDB Team"]
@@ -68,4 +68,10 @@ rand = "0.8"
 opt-level = 3
 lto = true
 codegen-units = 1
+strip = true
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
 strip = true

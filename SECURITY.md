@@ -4,13 +4,13 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.1.x   | :white_check_mark: |
+| 0.6.x   | :white_check_mark: |
 
 ## Reporting a Vulnerability
 
 **Please do NOT open a public GitHub issue for security vulnerabilities.**
 
-Instead, report them privately via email to: **security@ontodb.dev** (placeholder — replace with real address).
+Instead, report them privately via email to: **security@ontodb.io**.
 
 ### What to include
 

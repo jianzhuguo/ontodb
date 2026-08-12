@@ -223,7 +223,7 @@ async fn handle_pgwire_client(
     stream.write_all(&key_msg).await?;
 
     // Step 4: Send ParameterStatus messages
-    send_parameter_status(&mut stream, "server_version", "0.1.0").await?;
+    send_parameter_status(&mut stream, "server_version", "0.6.0").await?;
     send_parameter_status(&mut stream, "server_encoding", "UTF8").await?;
     send_parameter_status(&mut stream, "client_encoding", "UTF8").await?;
     send_parameter_status(&mut stream, "DateStyle", "ISO, MDY").await?;

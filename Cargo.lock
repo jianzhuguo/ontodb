@@ -1505,14 +1505,14 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onto-cli"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "onto-core"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "onto-enterprise"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "onto-graph"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "onto-core",
  "onto-storage",
@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "onto-ontology"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -1582,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "onto-query"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "csv",
@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "onto-raft"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "onto-server"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "onto-sharding"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "onto-core",
  "serde",
@@ -1669,7 +1669,7 @@ dependencies = [
 
 [[package]]
 name = "onto-storage"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bincode",

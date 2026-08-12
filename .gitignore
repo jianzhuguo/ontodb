@@ -17,6 +17,7 @@ Thumbs.db
 /test_data/*.log
 /test_data/*.dat
 /test_data/wal.log
+/test_data/ontodb.pid
 
 # Python
 __pycache__/
@@ -27,8 +28,18 @@ __pycache__/
 node_modules/
 dist/
 
-# Secrets
+# Secrets and credentials
 *.pem
 *.key
 *.env
 .env.local
+config/api_keys.json
+test_cluster_keys.json
+
+# TLS certificates
+deploy/nginx/certs/
+
+# Microsoft Office temp files
+~$*.docx
+~$*.xlsx
+~$*.pptx
