@@ -1725,9 +1725,11 @@ impl QueryExecutor {
 
         // Regular table scan — expand class hierarchy via ontology reasoning
         let class_hierarchy = self.get_class_hierarchy(engine, table);
+        tracing::debug!("plan_seq_scan: table='{}', class_hierarchy={:?}", table, class_hierarchy);
 
         // Semantic optimization: narrow scan scope using __class__ filter and disjoint constraints
         let scan_classes = self.narrow_scan_scope(engine, table, filter, &class_hierarchy);
+        tracing::debug!("plan_seq_scan: scan_classes={:?}", scan_classes);
 
         // Pre-extract simple filter column names for fast byte-level rejection.
         let fast_filter_cols = Self::extract_fast_filter_columns(filter);
@@ -2295,6 +2297,7 @@ impl QueryExecutor {
         {
             let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.class_hierarchy.get(table) {
+                tracing::debug!("get_class_hierarchy: cache hit for '{}': {:?}", table, cached);
                 return cached.clone();
             }
         }
@@ -2302,8 +2305,31 @@ impl QueryExecutor {
         let mut classes = HashSet::new();
         classes.insert(table.to_string());
 
-        if let Ok(Some(ontology)) = self.ontology_store.find_ontology_for_class(engine, table) {
-            let reasoner = Reasoner::new(ontology.clone());
+        // Scan ALL ontologies to build complete class hierarchy
+        // This handles the case where each class is stored in its own ontology
+        let mut merged_ontology = onto_ontology::Ontology::new("__merged__");
+        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+        tracing::debug!("get_class_hierarchy: found {} ontology entries", entries.len());
+        for (_key, val_bytes) in entries {
+            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
+                // Merge all classes into a single ontology
+                for (name, class) in &ontology.classes {
+                    if !merged_ontology.classes.contains_key(name) {
+                        merged_ontology.classes.insert(name.clone(), class.clone());
+                    }
+                }
+            }
+        }
+
+        tracing::debug!("get_class_hierarchy: merged ontology has {} classes", merged_ontology.classes.len());
+
+        // Rebuild indexes on merged ontology
+        merged_ontology.rebuild_indexes();
+
+        // Now find subclasses using the merged ontology
+        if merged_ontology.classes.contains_key(table) {
+            tracing::debug!("get_class_hierarchy: found '{}' in merged ontology", table);
+            let reasoner = Reasoner::new(merged_ontology.clone());
             let probe_triple = onto_ontology::Triple::type_of("__probe__", table);
             let result = reasoner.reason(&[probe_triple]);
 
@@ -2313,9 +2339,14 @@ impl QueryExecutor {
                 }
             }
 
-            let subclasses = ontology.get_all_subclasses(table);
+            let subclasses = merged_ontology.get_all_subclasses(table);
+            tracing::debug!("get_class_hierarchy: subclasses of '{}': {:?}", table, subclasses);
             classes.extend(subclasses);
+        } else {
+            tracing::debug!("get_class_hierarchy: '{}' NOT found in merged ontology", table);
         }
+
+        tracing::debug!("get_class_hierarchy: final classes for '{}': {:?}", table, classes);
 
         // Store in cache
         {
@@ -2961,21 +2992,27 @@ impl QueryExecutor {
                 // Tier 1: fast byte-level rejection
                 if !fast_filter_cols.is_empty()
                     && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
+                        tracing::debug!("fast_filter_reject: rejected row");
                         continue;
                     }
                 // Tier 2: BinaryRow path (for binary-stored data) — no JSON parsing
                 if let Some(brow) = BinaryRow::parse(val_bytes) {
                     if !brow.class_in_hierarchy(&class_hierarchy) {
+                        tracing::debug!("class_in_hierarchy: rejected row, class={:?}", brow.class_value());
                         continue;
                     }
                     if let Some(f) = filter {
-                        match eval_binary_filter(&brow, f) {
+                        let filter_result = eval_binary_filter(&brow, f);
+                        tracing::debug!("eval_binary_filter: result={:?}, filter={:?}", filter_result, f);
+                        match filter_result {
                             Some(true) => {}
                             Some(false) => continue,
                             None => {
                                 // Filter can't be evaluated from BinaryRow alone — need full map
                                 if let Some(mut doc) = brow.to_map() {
-                                    if !self.eval_filter_read(engine, &doc, f) { continue; }
+                                    let filter_pass = self.eval_filter_read(engine, &doc, f);
+                                    tracing::debug!("eval_filter_read: result={}", filter_pass);
+                                    if !filter_pass { continue; }
                                     doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
                                     // Add shard routing info
                                     if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
@@ -3815,24 +3852,34 @@ impl QueryExecutor {
         let mut classes = HashSet::new();
         classes.insert(table.to_string());
 
-        // Scan ontologies directly (read-only)
+        // Scan ALL ontologies and merge into one (handles per-class ontology storage)
+        let mut merged_ontology = onto_ontology::Ontology::new("__merged__");
         let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
         for (_key, val_bytes) in entries {
             if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
-                if ontology.classes.contains_key(table) {
-                    let reasoner = Reasoner::new(ontology.clone());
-                    let probe_triple = onto_ontology::Triple::type_of("__probe__", table);
-                    let result = reasoner.reason(&[probe_triple]);
-                    for triple in &result.all_facts {
-                        if triple.subject == "__probe__" && triple.predicate == "rdf:type" {
-                            classes.insert(triple.object.clone());
-                        }
+                for (name, class) in &ontology.classes {
+                    if !merged_ontology.classes.contains_key(name) {
+                        merged_ontology.classes.insert(name.clone(), class.clone());
                     }
-                    let subclasses = ontology.get_all_subclasses(table);
-                    classes.extend(subclasses);
-                    break;
                 }
             }
+        }
+
+        // Rebuild indexes on merged ontology
+        merged_ontology.rebuild_indexes();
+
+        // Now find subclasses using the merged ontology
+        if merged_ontology.classes.contains_key(table) {
+            let reasoner = Reasoner::new(merged_ontology.clone());
+            let probe_triple = onto_ontology::Triple::type_of("__probe__", table);
+            let result = reasoner.reason(&[probe_triple]);
+            for triple in &result.all_facts {
+                if triple.subject == "__probe__" && triple.predicate == "rdf:type" {
+                    classes.insert(triple.object.clone());
+                }
+            }
+            let subclasses = merged_ontology.get_all_subclasses(table);
+            classes.extend(subclasses);
         }
 
         {

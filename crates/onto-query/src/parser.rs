@@ -924,7 +924,17 @@ impl QueryParser {
         let mut i = 0;
 
         while i + 5 <= bytes.len() {
-            let c = bytes[i] as char;
+            let b = bytes[i];
+            // Skip non-ASCII bytes (multi-byte UTF-8 chars like Chinese)
+            if b >= 0x80 {
+                i += 1;
+                // Skip continuation bytes (10xxxxxx)
+                while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+                    i += 1;
+                }
+                continue;
+            }
+            let c = b as char;
             if let Some(q) = in_quote {
                 if c == q { in_quote = None; }
             } else if c == '\'' || c == '"' {
@@ -2214,8 +2224,46 @@ impl QueryParser {
         None
     }
 
+    /// Strips surrounding quotes from an identifier if present.
+    /// Handles both single and double quoted identifiers.
+    fn strip_identifier_quotes(s: &str) -> String {
+        if (s.starts_with('"') && s.ends_with('"'))
+            || (s.starts_with('\'') && s.ends_with('\''))
+        {
+            s[1..s.len()-1].to_string()
+        } else {
+            s.to_string()
+        }
+    }
+
     fn parse_where(input: &str) -> Result<(Option<FilterExpr>, String)> {
         let input = input.trim();
+
+        // Handle parenthesized expressions: (expr)
+        if input.starts_with('(') {
+            // Find matching closing paren
+            let mut depth = 0i32;
+            let mut close_pos = None;
+            for (i, c) in input.char_indices() {
+                if c == '(' { depth += 1; }
+                if c == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_pos = Some(i);
+                        break;
+                    }
+                }
+            }
+            if let Some(close) = close_pos {
+                let inner = safe_slice(input, 1, close).trim();
+                let remaining = safe_slice_from(input, close + 1).trim();
+                // Parse the inner expression and chain with AND/OR if present
+                let (inner_expr, _) = Self::parse_where(inner)?;
+                if let Some(expr) = inner_expr {
+                    return Self::wrap_chain(expr, remaining);
+                }
+            }
+        }
 
         // Check for NOT (expr)
         if starts_with_ignore_ascii_case(input, "NOT ") || starts_with_ignore_ascii_case(input, "NOT(") {
@@ -2285,7 +2333,8 @@ impl QueryParser {
 
         // Check for IS NULL / IS NOT NULL: column IS [NOT] NULL
         if let Some(is_pos) = find_unquoted_ignore_ascii_case(input, " IS ") {
-            let col = safe_slice(input, 0, is_pos).trim().to_string();
+            let col_raw = safe_slice(input, 0, is_pos).trim();
+            let col = Self::strip_identifier_quotes(col_raw);
             let rest = safe_slice_from(input, is_pos + 4).trim();
             if starts_with_ignore_ascii_case(rest, "NOT NULL") {
                 let remaining = rest[8..].trim();
@@ -2300,7 +2349,8 @@ impl QueryParser {
 
         // Check for LIKE: column LIKE 'pattern'
         if let Some(like_pos) = find_unquoted_ignore_ascii_case(input, " LIKE ") {
-            let col = safe_slice(input, 0, like_pos).trim().to_string();
+            let col_raw = safe_slice(input, 0, like_pos).trim();
+            let col = Self::strip_identifier_quotes(col_raw);
             let rest = safe_slice_from(input, like_pos + 6).trim();
             let (pattern, remaining) = Self::extract_quoted_or_word(rest);
             let expr = FilterExpr::Like(col, pattern);
@@ -2309,7 +2359,8 @@ impl QueryParser {
 
         // Check for BETWEEN: column BETWEEN low AND high
         if let Some(between_pos) = find_unquoted_ignore_ascii_case(input, " BETWEEN ") {
-            let col = safe_slice(input, 0, between_pos).trim().to_string();
+            let col_raw = safe_slice(input, 0, between_pos).trim();
+            let col = Self::strip_identifier_quotes(col_raw);
             let rest = safe_slice_from(input, between_pos + 9).trim();
 
             if let Some(and_pos) = find_unquoted_ignore_ascii_case(rest, " AND ") {
@@ -2325,7 +2376,8 @@ impl QueryParser {
 
         // Check for IN: column IN (val1, val2, ...) or column IN (SELECT ...)
         if let Some(in_pos) = find_unquoted_ignore_ascii_case(input, " IN ") {
-            let col = safe_slice(input, 0, in_pos).trim().to_string();
+            let col_raw = safe_slice(input, 0, in_pos).trim();
+            let col = Self::strip_identifier_quotes(col_raw);
             let rest = safe_slice_from(input, in_pos + 4).trim();
             if rest.starts_with('(') {
                 // Find matching closing paren
@@ -2363,25 +2415,41 @@ impl QueryParser {
             }
         }
 
-        // Symbol operators: >=, <=, !=, <>, >, <, =
-        for (op_str, op_fn) in &[
-            (">=", FilterExpr::Gte as fn(String, LiteralValue) -> FilterExpr),
+        // Symbol operators: find the leftmost operator to handle AND/OR correctly.
+        // We check all operators and pick the one with the smallest position.
+        let operators: &[(&str, fn(String, LiteralValue) -> FilterExpr)] = &[
+            (">=", FilterExpr::Gte),
             ("<=", FilterExpr::Lte),
             ("!=", FilterExpr::Ne),
             ("<>", FilterExpr::Ne),
             (">", FilterExpr::Gt),
             ("<", FilterExpr::Lt),
             ("=", FilterExpr::Eq),
-        ] {
+        ];
+        let mut best_op: Option<(usize, &str, fn(String, LiteralValue) -> FilterExpr)> = None;
+        for &(op_str, op_fn) in operators {
             if let Some(pos) = Self::find_unquoted(input, op_str) {
-                let col = safe_slice(input, 0, pos).trim().to_string();
-                let rest = safe_slice_from(input, pos + op_str.len()).trim();
-
-                let (val_str, remaining) = Self::extract_quoted_or_word(rest);
-                let val = Self::parse_literal(&val_str)?;
-                let expr = op_fn(col, val);
-                return Self::wrap_chain(expr, &remaining);
+                if best_op.is_none() || pos < best_op.unwrap().0 {
+                    best_op = Some((pos, op_str, op_fn));
+                }
             }
+        }
+        if let Some((pos, op_str, op_fn)) = best_op {
+            let col_raw = safe_slice(input, 0, pos).trim();
+            // Strip surrounding quotes from column name if present
+            let col = if (col_raw.starts_with('"') && col_raw.ends_with('"'))
+                || (col_raw.starts_with('\'') && col_raw.ends_with('\''))
+            {
+                col_raw[1..col_raw.len()-1].to_string()
+            } else {
+                col_raw.to_string()
+            };
+            let rest = safe_slice_from(input, pos + op_str.len()).trim();
+
+            let (val_str, remaining) = Self::extract_quoted_or_word(rest);
+            let val = Self::parse_literal(&val_str)?;
+            let expr = op_fn(col, val);
+            return Self::wrap_chain(expr, &remaining);
         }
 
         Err(CoreError::InvalidArgument(format!(
