@@ -1121,9 +1121,28 @@ impl QueryParser {
         // Parse values: (val1, val2, ...) or (v1, v2), (v3, v4), ...
         let values_str = values_str.trim();
 
-        // Count opening parens to detect batch insert
-        let open_count = values_str.matches('(').count();
-        if open_count > 1 && values_str.contains("),") {
+        // Detect batch insert: look for "), " pattern that's not inside nested parens
+        // This is more robust than counting all opening parens
+        let is_batch = {
+            let mut depth = 0i32;
+            let mut found_batch = false;
+            let bytes = values_str.as_bytes();
+            for i in 0..bytes.len() {
+                match bytes[i] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b',' {
+                            found_batch = true;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            found_batch
+        };
+        if is_batch {
             // Batch insert: (vals1), (vals2), ...
             let mut rows = Vec::new();
             let mut remaining = values_str;
@@ -1198,7 +1217,7 @@ impl QueryParser {
         let cols_str = safe_slice(header, paren_start + 1, header.len() - 1);
         let columns: Vec<String> = cols_str
             .split(',')
-            .map(|s| s.trim().to_string())
+            .map(|s| Self::strip_surrounding_quotes(s.trim()))
             .filter(|s| !s.is_empty())
             .collect();
         Ok((class, columns))
@@ -1212,7 +1231,7 @@ impl QueryParser {
                 let s = s.trim();
                 let eq_pos = Self::find_unquoted(s, "=")
                     .ok_or_else(|| CoreError::InvalidArgument("expected '=' in SET".to_string()))?;
-                let col = safe_slice(s, 0, eq_pos).trim().to_string();
+                let col = Self::strip_surrounding_quotes(safe_slice(s, 0, eq_pos).trim());
                 let val = Self::parse_literal(safe_slice_from(s, eq_pos + 1).trim())?;
                 Ok((col, val))
             })
@@ -1222,12 +1241,21 @@ impl QueryParser {
     /// Simple matching paren finder (no quote handling needed for values).
     fn find_matching_paren_simple(input: &str) -> Result<usize> {
         let mut depth = 0;
+        let mut in_quote: Option<char> = None;
         for (i, c) in input.char_indices() {
-            if c == '(' { depth += 1; }
-            if c == ')' {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok(i);
+            if let Some(q) = in_quote {
+                if c == q { in_quote = None; }
+            } else {
+                match c {
+                    '\'' | '"' => in_quote = Some(c),
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Ok(i);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1783,12 +1811,21 @@ impl QueryParser {
     /// Find matching closing parenthesis.
     fn find_matching_paren(input: &str) -> Result<usize> {
         let mut depth = 0;
+        let mut in_quote: Option<char> = None;
         for (i, c) in input.char_indices() {
-            if c == '(' { depth += 1; }
-            if c == ')' {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok(i);
+            if let Some(q) = in_quote {
+                if c == q { in_quote = None; }
+            } else {
+                match c {
+                    '\'' | '"' => in_quote = Some(c),
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Ok(i);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2070,7 +2107,7 @@ impl QueryParser {
                 let s = s.trim();
                 let eq_pos = Self::find_unquoted(s, "=")
                     .ok_or_else(|| CoreError::InvalidArgument("expected '=' in SET".to_string()))?;
-                let col = safe_slice(s, 0, eq_pos).trim().to_string();
+                let col = Self::strip_surrounding_quotes(safe_slice(s, 0, eq_pos).trim());
                 let val = Self::parse_literal(safe_slice_from(s, eq_pos + 1).trim())?;
                 Ok((col, val))
             })
@@ -2233,6 +2270,15 @@ impl QueryParser {
             s[1..s.len()-1].to_string()
         } else {
             s.to_string()
+        }
+    }
+
+    /// Strips surrounding quotes from an identifier. Also handles bracket-quoted [id].
+    fn strip_surrounding_quotes(s: &str) -> String {
+        if s.starts_with('[') && s.ends_with(']') {
+            s[1..s.len()-1].to_string()
+        } else {
+            Self::strip_identifier_quotes(s)
         }
     }
 
@@ -2459,24 +2505,261 @@ impl QueryParser {
     }
 
     /// Wraps an expression with AND/OR if the remaining text starts with AND/OR.
+    /// AND binds tighter than OR: `a OR b AND c` → `a OR (b AND c)`.
     fn wrap_chain(expr: FilterExpr, remaining: &str) -> Result<(Option<FilterExpr>, String)> {
         let remaining = remaining.trim();
         if starts_with_ignore_ascii_case(remaining, "AND ") {
             let rest_after = &remaining[4..];
-            let (right, final_rest) = Self::parse_where(rest_after)?;
-            if let Some(right_expr) = right {
-                return Ok((Some(FilterExpr::And(Box::new(expr), Box::new(right_expr))), final_rest));
+            // AND has higher precedence — parse the right operand as a single comparison,
+            // then continue chaining (so a AND b OR c groups as (a AND b) OR c).
+            let (right_atom, rest2) = Self::parse_where_atom(rest_after)?;
+            if let Some(right_expr) = right_atom {
+                let combined = FilterExpr::And(Box::new(expr), Box::new(right_expr));
+                // Continue chaining at the same precedence level
+                return Self::wrap_chain(combined, &rest2);
             }
-            return Ok((Some(expr), final_rest));
+            return Ok((Some(expr), rest2));
         } else if starts_with_ignore_ascii_case(remaining, "OR ") {
             let rest_after = &remaining[3..];
-            let (right, final_rest) = Self::parse_where(rest_after)?;
+            // OR has lower precedence — parse the right operand as a full AND-chain,
+            // so `a OR b AND c` groups the right side as `(b AND c)`.
+            let (right, rest2) = Self::parse_where_and(rest_after)?;
             if let Some(right_expr) = right {
-                return Ok((Some(FilterExpr::Or(Box::new(expr), Box::new(right_expr))), final_rest));
+                let combined = FilterExpr::Or(Box::new(expr), Box::new(right_expr));
+                // Continue chaining OR left-to-right: a OR b OR c → (a OR b) OR c
+                return Self::wrap_chain(combined, &rest2);
             }
-            return Ok((Some(expr), final_rest));
+            return Ok((Some(expr), rest2));
         }
         Ok((Some(expr), remaining.to_string()))
+    }
+
+    /// Parse an AND-chain: one or more atoms joined by AND.
+    /// Used as the higher-precedence layer: `a AND b AND c`.
+    fn parse_where_and(input: &str) -> Result<(Option<FilterExpr>, String)> {
+        let (mut left, mut rest) = Self::parse_where_atom(input)?;
+        loop {
+            rest = rest.trim().to_string();
+            if starts_with_ignore_ascii_case(&rest, "AND ") {
+                let after = &rest[4..];
+                let (right, new_rest) = Self::parse_where_atom(after)?;
+                if let Some(r) = right {
+                    left = Some(FilterExpr::And(
+                        Box::new(left.unwrap_or(FilterExpr::Eq(String::new(), LiteralValue::Null))),
+                        Box::new(r),
+                    ));
+                }
+                rest = new_rest;
+            } else {
+                break;
+            }
+        }
+        Ok((left, rest))
+    }
+
+    /// Parse a single atom: a comparison, parenthesized expression, NOT, etc.
+    /// Does NOT consume trailing AND/OR — that's handled by `wrap_chain` / `parse_where_and`.
+    fn parse_where_atom(input: &str) -> Result<(Option<FilterExpr>, String)> {
+        let input = input.trim();
+
+        // Handle parenthesized expressions: (expr)
+        if input.starts_with('(') {
+            let mut depth = 0i32;
+            let mut close_pos = None;
+            for (i, c) in input.char_indices() {
+                if c == '(' { depth += 1; }
+                if c == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_pos = Some(i);
+                        break;
+                    }
+                }
+            }
+            if let Some(close) = close_pos {
+                let inner = safe_slice(input, 1, close).trim();
+                let remaining = safe_slice_from(input, close + 1).trim();
+                // Parse the inner expression with full precedence
+                let (inner_expr, _) = Self::parse_where(inner)?;
+                if let Some(expr) = inner_expr {
+                    return Ok((Some(expr), remaining.to_string()));
+                }
+            }
+        }
+
+        // Check for NOT (expr)
+        if starts_with_ignore_ascii_case(input, "NOT ") || starts_with_ignore_ascii_case(input, "NOT(") {
+            let not_len = if starts_with_ignore_ascii_case(input, "NOT(") { 4 } else { 4 };
+            let rest = safe_slice_from(input, not_len).trim();
+            if rest.starts_with('(') {
+                let mut depth = 0i32;
+                let mut close_pos = None;
+                for (i, c) in rest.char_indices() {
+                    if c == '(' { depth += 1; }
+                    if c == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            close_pos = Some(i);
+                            break;
+                        }
+                    }
+                }
+                if let Some(close) = close_pos {
+                    let inner = safe_slice(rest, 1, close).trim();
+                    let remaining = safe_slice_from(rest, close + 1).trim();
+                    let (inner_expr, _) = Self::parse_where(inner)?;
+                    if let Some(expr) = inner_expr {
+                        return Ok((Some(FilterExpr::Not(Box::new(expr))), remaining.to_string()));
+                    }
+                }
+            }
+        }
+
+        // Check for EXISTS (SELECT ...)
+        if starts_with_ignore_ascii_case(input, "EXISTS") || starts_with_ignore_ascii_case(input, "NOT EXISTS") {
+            let (exists_start, is_not) = if starts_with_ignore_ascii_case(input, "NOT EXISTS") {
+                (10, true)
+            } else {
+                (6, false)
+            };
+            let rest = safe_slice_from(input, exists_start).trim();
+            if rest.starts_with('(') {
+                let mut depth = 0i32;
+                let mut close_pos = None;
+                for (i, c) in rest.char_indices() {
+                    if c == '(' { depth += 1; }
+                    if c == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            close_pos = Some(i);
+                            break;
+                        }
+                    }
+                }
+                if let Some(close) = close_pos {
+                    let inner = safe_slice(rest, 1, close).trim();
+                    let remaining = safe_slice_from(rest, close + 1).trim();
+                    let subquery = Self::parse(inner)?;
+                    let expr = if is_not {
+                        FilterExpr::NotExists(Box::new(subquery))
+                    } else {
+                        FilterExpr::Exists(Box::new(subquery))
+                    };
+                    return Ok((Some(expr), remaining.to_string()));
+                }
+            }
+        }
+
+        // Check for IS NULL / IS NOT NULL: column IS [NOT] NULL
+        if let Some(is_pos) = find_unquoted_ignore_ascii_case(input, " IS ") {
+            let col_raw = safe_slice(input, 0, is_pos).trim();
+            let col = Self::strip_identifier_quotes(col_raw);
+            let rest = safe_slice_from(input, is_pos + 4).trim();
+            if starts_with_ignore_ascii_case(rest, "NOT NULL") {
+                let remaining = rest[8..].trim();
+                return Ok((Some(FilterExpr::IsNotNull(col)), remaining.to_string()));
+            } else if starts_with_ignore_ascii_case(rest, "NULL") {
+                let remaining = rest[4..].trim();
+                return Ok((Some(FilterExpr::IsNull(col)), remaining.to_string()));
+            }
+        }
+
+        // Check for LIKE: column LIKE 'pattern'
+        if let Some(like_pos) = find_unquoted_ignore_ascii_case(input, " LIKE ") {
+            let col_raw = safe_slice(input, 0, like_pos).trim();
+            let col = Self::strip_identifier_quotes(col_raw);
+            let rest = safe_slice_from(input, like_pos + 6).trim();
+            let (pattern, remaining) = Self::extract_quoted_or_word(rest);
+            return Ok((Some(FilterExpr::Like(col, pattern)), remaining));
+        }
+
+        // Check for BETWEEN: column BETWEEN low AND high
+        if let Some(between_pos) = find_unquoted_ignore_ascii_case(input, " BETWEEN ") {
+            let col_raw = safe_slice(input, 0, between_pos).trim();
+            let col = Self::strip_identifier_quotes(col_raw);
+            let rest = safe_slice_from(input, between_pos + 9).trim();
+
+            if let Some(and_pos) = find_unquoted_ignore_ascii_case(rest, " AND ") {
+                let low_str = safe_slice(rest, 0, and_pos).trim();
+                let high_rest = safe_slice_from(rest, and_pos + 5).trim();
+                let (high_str, remaining) = Self::extract_quoted_or_word(high_rest);
+                let low = Self::parse_literal(low_str)?;
+                let high = Self::parse_literal(&high_str)?;
+                return Ok((Some(FilterExpr::Between(col, low, high)), remaining));
+            }
+        }
+
+        // Check for IN: column IN (val1, val2, ...) or column IN (SELECT ...)
+        if let Some(in_pos) = find_unquoted_ignore_ascii_case(input, " IN ") {
+            let col_raw = safe_slice(input, 0, in_pos).trim();
+            let col = Self::strip_identifier_quotes(col_raw);
+            let rest = safe_slice_from(input, in_pos + 4).trim();
+            if rest.starts_with('(') {
+                let mut depth = 0i32;
+                let mut close_pos = None;
+                for (i, c) in rest.char_indices() {
+                    if c == '(' { depth += 1; }
+                    if c == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            close_pos = Some(i);
+                            break;
+                        }
+                    }
+                }
+                if let Some(close) = close_pos {
+                    let inner = safe_slice(rest, 1, close).trim();
+                    let remaining = safe_slice_from(rest, close + 1).trim();
+
+                    // Check if it's a subquery
+                    if starts_with_ignore_ascii_case(inner, "SELECT") {
+                        let subquery = Self::parse(inner)?;
+                        return Ok((Some(FilterExpr::InSubquery(col, Box::new(subquery))), remaining.to_string()));
+                    }
+
+                    // Otherwise, parse as value list
+                    let values: Vec<LiteralValue> = inner
+                        .split(',')
+                        .map(|s| Self::parse_literal(s.trim()))
+                        .collect::<Result<Vec<_>>>()?;
+                    return Ok((Some(FilterExpr::In(col, values)), remaining.to_string()));
+                }
+            }
+        }
+
+        // Symbol operators: find the leftmost operator to handle AND/OR correctly.
+        let operators: &[(&str, fn(String, LiteralValue) -> FilterExpr)] = &[
+            (">=", FilterExpr::Gte),
+            ("<=", FilterExpr::Lte),
+            ("!=", FilterExpr::Ne),
+            ("<>", FilterExpr::Ne),
+            (">", FilterExpr::Gt),
+            ("<", FilterExpr::Lt),
+            ("=", FilterExpr::Eq),
+        ];
+        let mut best_op: Option<(usize, &str, fn(String, LiteralValue) -> FilterExpr)> = None;
+        for &(op_str, op_fn) in operators {
+            if let Some(pos) = Self::find_unquoted(input, op_str) {
+                if best_op.is_none() || pos < best_op.unwrap().0 {
+                    best_op = Some((pos, op_str, op_fn));
+                }
+            }
+        }
+        if let Some((pos, op_str, op_fn)) = best_op {
+            let col_raw = safe_slice(input, 0, pos).trim();
+            let col = Self::strip_identifier_quotes(col_raw);
+            let rest = safe_slice_from(input, pos + op_str.len()).trim();
+
+            let (val_str, remaining) = Self::extract_quoted_or_word(rest);
+            let val = Self::parse_literal(&val_str)?;
+            let expr = op_fn(col, val);
+            return Ok((Some(expr), remaining));
+        }
+
+        Err(CoreError::InvalidArgument(format!(
+            "invalid WHERE clause: {}",
+            input
+        )))
     }
 
     /// Extracts a value from the start of input. Handles quoted strings and bare words.
@@ -2702,9 +2985,11 @@ impl QueryParser {
     fn parse_literal(s: &str) -> Result<LiteralValue> {
         let s = s.trim();
 
-        if s.is_empty() || s.eq_ignore_ascii_case("NULL") {
+        if s.eq_ignore_ascii_case("NULL") {
             return Ok(LiteralValue::Null);
         }
+        // Empty string from quoted input (e.g. '') is a valid empty string, not NULL.
+        // Bare empty input is also treated as empty string (caller validates if needed).
         if s.eq_ignore_ascii_case("TRUE") {
             return Ok(LiteralValue::Bool(true));
         }
@@ -2712,10 +2997,8 @@ impl QueryParser {
             return Ok(LiteralValue::Bool(false));
         }
 
-        // String literal
-        if (s.starts_with('\'') && s.ends_with('\''))
-            || (s.starts_with('"') && s.ends_with('"'))
-        {
+        // String literal (single quotes only - double quotes are identifiers in SQL)
+        if s.starts_with('\'') && s.ends_with('\'') {
             return Ok(LiteralValue::String(safe_slice(s, 1, s.len() - 1).to_string()));
         }
 
@@ -2732,6 +3015,27 @@ impl QueryParser {
     }
 
     fn parse_word(input: &str) -> Result<(String, String)> {
+        let input = input.trim_start();
+        if input.is_empty() {
+            return Ok((String::new(), String::new()));
+        }
+        // Double-quoted identifier: "My Table"
+        if input.starts_with('"') {
+            if let Some(end) = input[1..].find('"') {
+                let word = input[1..1 + end].to_string();
+                let rest = safe_slice_from(input, 1 + end + 1).trim_start().to_string();
+                return Ok((word, rest));
+            }
+        }
+        // Bracket-quoted identifier: [My Table]
+        if input.starts_with('[') {
+            if let Some(end) = input[1..].find(']') {
+                let word = input[1..1 + end].to_string();
+                let rest = safe_slice_from(input, 1 + end + 1).trim_start().to_string();
+                return Ok((word, rest));
+            }
+        }
+        // Bare word
         let end = input
             .find(|c: char| c.is_whitespace() || c == ';' || c == ',')
             .unwrap_or(input.len());
@@ -3108,5 +3412,298 @@ mod tests {
     fn test_parse_flush() {
         let ast = QueryParser::parse("FLUSH").unwrap();
         assert!(matches!(ast, QueryAst::Flush));
+    }
+
+    // ===== AND/OR Precedence Tests =====
+
+    fn extract_filter(ast: &QueryAst) -> &Option<FilterExpr> {
+        match ast {
+            QueryAst::Select { filter, .. } => filter,
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_and_binds_tighter_than_or() {
+        // a=1 OR b=2 AND c=3  should be  a=1 OR (b=2 AND c=3)
+        let ast = QueryParser::parse("SELECT * FROM T WHERE a = 1 OR b = 2 AND c = 3").unwrap();
+        let filter = extract_filter(&ast).as_ref().unwrap();
+        match filter {
+            FilterExpr::Or(left, right) => {
+                // left = a=1
+                assert!(matches!(left.as_ref(), FilterExpr::Eq(col, _) if col == "a"));
+                // right = (b=2 AND c=3)
+                match right.as_ref() {
+                    FilterExpr::And(b_left, b_right) => {
+                        assert!(matches!(b_left.as_ref(), FilterExpr::Eq(col, _) if col == "b"));
+                        assert!(matches!(b_right.as_ref(), FilterExpr::Eq(col, _) if col == "c"));
+                    }
+                    other => panic!("expected And on right, got {:?}", other),
+                }
+            }
+            other => panic!("expected Or at top, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_multiple_and_chains_correctly() {
+        // a=1 AND b=2 AND c=3  should be  (a=1 AND b=2) AND c=3
+        let ast = QueryParser::parse("SELECT * FROM T WHERE a = 1 AND b = 2 AND c = 3").unwrap();
+        let filter = extract_filter(&ast).as_ref().unwrap();
+        match filter {
+            FilterExpr::And(left, right) => {
+                assert!(matches!(right.as_ref(), FilterExpr::Eq(col, _) if col == "c"));
+                match left.as_ref() {
+                    FilterExpr::And(l2, r2) => {
+                        assert!(matches!(l2.as_ref(), FilterExpr::Eq(col, _) if col == "a"));
+                        assert!(matches!(r2.as_ref(), FilterExpr::Eq(col, _) if col == "b"));
+                    }
+                    other => panic!("expected nested And, got {:?}", other),
+                }
+            }
+            other => panic!("expected And at top, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_or_left_associative() {
+        // a=1 OR b=2 OR c=3  should be  (a=1 OR b=2) OR c=3
+        let ast = QueryParser::parse("SELECT * FROM T WHERE a = 1 OR b = 2 OR c = 3").unwrap();
+        let filter = extract_filter(&ast).as_ref().unwrap();
+        match filter {
+            FilterExpr::Or(left, right) => {
+                assert!(matches!(right.as_ref(), FilterExpr::Eq(col, _) if col == "c"));
+                match left.as_ref() {
+                    FilterExpr::Or(l2, r2) => {
+                        assert!(matches!(l2.as_ref(), FilterExpr::Eq(col, _) if col == "a"));
+                        assert!(matches!(r2.as_ref(), FilterExpr::Eq(col, _) if col == "b"));
+                    }
+                    other => panic!("expected nested Or, got {:?}", other),
+                }
+            }
+            other => panic!("expected Or at top, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mixed_and_or_precedence() {
+        // a=1 AND b=2 OR c=3 AND d=4  should be  (a=1 AND b=2) OR (c=3 AND d=4)
+        let ast = QueryParser::parse("SELECT * FROM T WHERE a = 1 AND b = 2 OR c = 3 AND d = 4").unwrap();
+        let filter = extract_filter(&ast).as_ref().unwrap();
+        match filter {
+            FilterExpr::Or(left, right) => {
+                match left.as_ref() {
+                    FilterExpr::And(l, r) => {
+                        assert!(matches!(l.as_ref(), FilterExpr::Eq(col, _) if col == "a"));
+                        assert!(matches!(r.as_ref(), FilterExpr::Eq(col, _) if col == "b"));
+                    }
+                    other => panic!("expected And on left, got {:?}", other),
+                }
+                match right.as_ref() {
+                    FilterExpr::And(l, r) => {
+                        assert!(matches!(l.as_ref(), FilterExpr::Eq(col, _) if col == "c"));
+                        assert!(matches!(r.as_ref(), FilterExpr::Eq(col, _) if col == "d"));
+                    }
+                    other => panic!("expected And on right, got {:?}", other),
+                }
+            }
+            other => panic!("expected Or at top, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parenthesized_or_overrides_precedence() {
+        // (a=1 OR b=2) AND c=3  should be  (a=1 OR b=2) AND c=3
+        let ast = QueryParser::parse("SELECT * FROM T WHERE (a = 1 OR b = 2) AND c = 3").unwrap();
+        let filter = extract_filter(&ast).as_ref().unwrap();
+        match filter {
+            FilterExpr::And(left, right) => {
+                assert!(matches!(right.as_ref(), FilterExpr::Eq(col, _) if col == "c"));
+                match left.as_ref() {
+                    FilterExpr::Or(l, r) => {
+                        assert!(matches!(l.as_ref(), FilterExpr::Eq(col, _) if col == "a"));
+                        assert!(matches!(r.as_ref(), FilterExpr::Eq(col, _) if col == "b"));
+                    }
+                    other => panic!("expected Or inside parens, got {:?}", other),
+                }
+            }
+            other => panic!("expected And at top, got {:?}", other),
+        }
+    }
+
+    // ===== Empty String vs NULL Tests =====
+
+    #[test]
+    fn test_empty_string_not_null() {
+        // INSERT INTO T (col) VALUES ('') should store empty string, not NULL
+        let ast = QueryParser::parse("INSERT INTO T (col) VALUES ('')").unwrap();
+        match ast {
+            QueryAst::Insert { values, .. } => {
+                assert_eq!(values.len(), 1);
+                match &values[0] {
+                    LiteralValue::String(s) => assert_eq!(s, ""),
+                    other => panic!("expected String(''), got {:?}", other),
+                }
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_null_still_works() {
+        let ast = QueryParser::parse("INSERT INTO T (col) VALUES (NULL)").unwrap();
+        match ast {
+            QueryAst::Insert { values, .. } => {
+                assert_eq!(values.len(), 1);
+                assert!(matches!(&values[0], LiteralValue::Null));
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_where_empty_string_literal() {
+        let ast = QueryParser::parse("SELECT * FROM T WHERE name = ''").unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => {
+                let f = filter.as_ref().unwrap();
+                match f {
+                    FilterExpr::Eq(col, LiteralValue::String(val)) => {
+                        assert_eq!(col, "name");
+                        assert_eq!(val, "");
+                    }
+                    other => panic!("expected Eq with empty string, got {:?}", other),
+                }
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    // ===== Parenthesis Matching Tests =====
+
+    #[test]
+    fn test_find_matching_paren_simple_skips_quoted() {
+        // VALUES ('hello(world)', 42) should match the outer parens correctly
+        let input = "('hello(world)', 42)";
+        let result = QueryParser::find_matching_paren_simple(input).unwrap();
+        assert_eq!(result, input.len() - 1, "should match the last )");
+    }
+
+    #[test]
+    fn test_find_matching_paren_skips_single_quoted() {
+        let input = "(a, ')', b)";
+        let result = QueryParser::find_matching_paren(input).unwrap();
+        assert_eq!(result, input.len() - 1);
+    }
+
+    #[test]
+    fn test_find_matching_paren_skips_double_quoted() {
+        let input = "(a, \")\", b)";
+        let result = QueryParser::find_matching_paren(input).unwrap();
+        assert_eq!(result, input.len() - 1);
+    }
+
+    #[test]
+    fn test_insert_with_parens_in_string() {
+        // INSERT INTO T (col) VALUES ('hello(world)') should parse correctly
+        let ast = QueryParser::parse("INSERT INTO T (col) VALUES ('hello(world)')").unwrap();
+        match ast {
+            QueryAst::Insert { values, .. } => {
+                assert_eq!(values.len(), 1);
+                match &values[0] {
+                    LiteralValue::String(s) => assert_eq!(s, "hello(world)"),
+                    other => panic!("expected String, got {:?}", other),
+                }
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_select_where_string_with_parens() {
+        let ast = QueryParser::parse("SELECT * FROM T WHERE name = 'foo(bar)'").unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => {
+                let f = filter.as_ref().unwrap();
+                match f {
+                    FilterExpr::Eq(col, LiteralValue::String(val)) => {
+                        assert_eq!(col, "name");
+                        assert_eq!(val, "foo(bar)");
+                    }
+                    other => panic!("expected Eq, got {:?}", other),
+                }
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    // ===== Quoted Identifier Tests =====
+
+    #[test]
+    fn test_parse_word_double_quoted() {
+        let (word, rest) = QueryParser::parse_word("\"My Table\" extra").unwrap();
+        assert_eq!(word, "My Table");
+        assert_eq!(rest, "extra");
+    }
+
+    #[test]
+    fn test_parse_word_bracket_quoted() {
+        let (word, rest) = QueryParser::parse_word("[My Table] extra").unwrap();
+        assert_eq!(word, "My Table");
+        assert_eq!(rest, "extra");
+    }
+
+    #[test]
+    fn test_select_from_quoted_table() {
+        let ast = QueryParser::parse("SELECT * FROM \"My Table\"").unwrap();
+        match ast {
+            QueryAst::Select { from, .. } => assert_eq!(from, "My Table"),
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_insert_quoted_columns() {
+        let ast = QueryParser::parse("INSERT INTO Person (\"name\", \"age\") VALUES ('Alice', 30)").unwrap();
+        match ast {
+            QueryAst::Insert { class, columns, .. } => {
+                assert_eq!(class, "Person");
+                assert_eq!(columns, vec!["name", "age"]);
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn test_update_quoted_columns() {
+        let ast = QueryParser::parse("UPDATE Person SET \"name\" = 'Bob' WHERE \"id\" = 1").unwrap();
+        match ast {
+            QueryAst::Update { class, assignments, .. } => {
+                assert_eq!(class, "Person");
+                assert_eq!(assignments[0].0, "name");
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    // ===== LIKE Pattern Quote Escaping Tests =====
+
+    #[test]
+    fn test_like_pattern_with_single_quote() {
+        // LIKE pattern containing a single quote should be handled
+        let ast = QueryParser::parse("SELECT * FROM T WHERE name LIKE '%test%'").unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => {
+                let f = filter.as_ref().unwrap();
+                match f {
+                    FilterExpr::Like(col, pat) => {
+                        assert_eq!(col, "name");
+                        assert_eq!(pat, "%test%");
+                    }
+                    other => panic!("expected Like, got {:?}", other),
+                }
+            }
+            _ => panic!("expected Select"),
+        }
     }
 }

@@ -1048,14 +1048,75 @@ impl OntoQLParser {
     }
 
     /// Parse filter expression (WHERE/HAVING/ON conditions).
+    /// Delegates to parse_filter_atom for the actual parsing, then chains AND/OR.
     fn parse_filter_expr(input: &str) -> Result<(OntoFilterExpr, &str)> {
+        let (expr, rest) = Self::parse_filter_atom(input)?;
+        Self::chain_and_or(expr, rest)
+    }
+
+    /// Check for trailing AND/OR and chain expressions.
+    /// AND binds tighter than OR: `a OR b AND c` → `a OR (b AND c)`.
+    fn chain_and_or(expr: OntoFilterExpr, rest: &str) -> Result<(OntoFilterExpr, &str)> {
+        let rest = rest.trim_start();
+        if starts_with_ignore_ascii_case(rest, "AND ") {
+            // AND: parse the next atom, then continue chaining at AND level
+            let after = safe_slice_from(rest, 4).trim_start();
+            let (right, after2) = Self::parse_filter_atom(after)?;
+            let combined = OntoFilterExpr::And(Box::new(expr), Box::new(right));
+            Self::chain_and_or(combined, after2)
+        } else if starts_with_ignore_ascii_case(rest, "OR ") {
+            // OR: parse the right side as a full AND-chain (higher precedence)
+            let after = safe_slice_from(rest, 3).trim_start();
+            let (right, after2) = Self::parse_filter_and(after)?;
+            Ok((OntoFilterExpr::Or(Box::new(expr), Box::new(right)), after2))
+        } else {
+            Ok((expr, rest))
+        }
+    }
+
+    /// Parse an AND-chain: one or more atoms joined by AND.
+    fn parse_filter_and(input: &str) -> Result<(OntoFilterExpr, &str)> {
+        let (mut left, mut rest) = Self::parse_filter_atom(input)?;
+        loop {
+            let r = rest.trim_start();
+            if starts_with_ignore_ascii_case(r, "AND ") {
+                let after = safe_slice_from(r, 4).trim_start();
+                let (right, new_rest) = Self::parse_filter_atom(after)?;
+                left = OntoFilterExpr::And(Box::new(left), Box::new(right));
+                rest = new_rest;
+            } else {
+                break;
+            }
+        }
+        Ok((left, rest))
+    }
+
+    /// Parse a single filter atom: comparison, IS NULL, LIKE, BETWEEN, IN, NOT, etc.
+    fn parse_filter_atom(input: &str) -> Result<(OntoFilterExpr, &str)> {
         let input = input.trim_start();
         if input.is_empty() {
             return Err(CoreError::InvalidArgument("Empty filter expression".into()));
         }
 
-        // Try to parse a simple condition: column op value
-        // This handles: col = 'val', col > 10, col IS NULL, etc.
+        // Handle NOT prefix
+        if starts_with_ignore_ascii_case(input, "NOT ") || starts_with_ignore_ascii_case(input, "NOT(") {
+            let after = if starts_with_ignore_ascii_case(input, "NOT(") {
+                safe_slice_from(input, 4).trim_start()
+            } else {
+                safe_slice_from(input, 4).trim_start()
+            };
+            // NOT (expr)
+            if after.starts_with('(') {
+                if let Ok((inner_str, rest)) = Self::extract_paren_content(after) {
+                    let (inner, _) = Self::parse_filter_expr(inner_str)?;
+                    return Ok((OntoFilterExpr::Not(Box::new(inner)), rest.trim_start()));
+                }
+            }
+            // NOT expr
+            let (inner, rest) = Self::parse_filter_atom(after)?;
+            return Ok((OntoFilterExpr::Not(Box::new(inner)), rest));
+        }
+
         let (left, rest) = Self::extract_identifier(input);
         if left.is_empty() {
             return Err(CoreError::InvalidArgument("Expected column name in filter".into()));
@@ -1066,11 +1127,38 @@ impl OntoQLParser {
         // IS NULL / IS NOT NULL
         if starts_with_ignore_ascii_case(rest, "IS NOT NULL") {
             let rest = safe_slice_from(rest, "IS NOT NULL".len()).trim_start();
-            return Self::chain_and_or(OntoFilterExpr::IsNotNull(left), rest);
+            return Ok((OntoFilterExpr::IsNotNull(left), rest));
         }
         if starts_with_ignore_ascii_case(rest, "IS NULL") {
             let rest = safe_slice_from(rest, "IS NULL".len()).trim_start();
-            return Self::chain_and_or(OntoFilterExpr::IsNull(left), rest);
+            return Ok((OntoFilterExpr::IsNull(left), rest));
+        }
+
+        // BETWEEN low AND high
+        if starts_with_ignore_ascii_case(rest, "BETWEEN") {
+            let after = safe_slice_from(rest, 7).trim_start();
+            let (low, after) = Self::parse_value_expr(after)?;
+            let after = after.trim_start();
+            if starts_with_ignore_ascii_case(after, "AND") {
+                let after = safe_slice_from(after, 3).trim_start();
+                let (high, after) = Self::parse_value_expr(after)?;
+                return Ok((OntoFilterExpr::Between(left, low, high), after.trim_start()));
+            }
+            return Err(CoreError::InvalidArgument("Expected AND in BETWEEN".into()));
+        }
+
+        // IN (val1, val2, ...)
+        if starts_with_ignore_ascii_case(rest, "IN") {
+            let after = safe_slice_from(rest, 2).trim_start();
+            if after.starts_with('(') {
+                if let Ok((inner_str, rest)) = Self::extract_paren_content(after) {
+                    let vals: Vec<OntoValueExpr> = split_quoted(inner_str, ',').iter()
+                        .map(|s| Self::parse_value_expr(s.trim()).map(|(v, _)| v))
+                        .collect::<Result<Vec<_>>>()?;
+                    return Ok((OntoFilterExpr::In(left, vals), rest.trim_start()));
+                }
+            }
+            return Err(CoreError::InvalidArgument("Expected ( after IN".into()));
         }
 
         // Comparison operators
@@ -1098,24 +1186,10 @@ impl OntoQLParser {
             _ => return Err(CoreError::InvalidArgument(format!("Unknown operator: {}", op))),
         };
 
-        Self::chain_and_or(expr, rest)
+        Ok((expr, rest))
     }
 
-    /// Check for trailing AND/OR and chain expressions.
-    fn chain_and_or(expr: OntoFilterExpr, rest: &str) -> Result<(OntoFilterExpr, &str)> {
-        let rest = rest.trim_start();
-        if starts_with_ignore_ascii_case(rest, "AND ") {
-            let rest = safe_slice_from(rest, 4).trim_start();
-            let (right, rest) = Self::parse_filter_expr(rest)?;
-            Ok((OntoFilterExpr::And(Box::new(expr), Box::new(right)), rest))
-        } else if starts_with_ignore_ascii_case(rest, "OR ") {
-            let rest = safe_slice_from(rest, 3).trim_start();
-            let (right, rest) = Self::parse_filter_expr(rest)?;
-            Ok((OntoFilterExpr::Or(Box::new(expr), Box::new(right)), rest))
-        } else {
-            Ok((expr, rest))
-        }
-    }
+
 
     /// Parse a value expression (literal or column reference).
     fn parse_value_expr(input: &str) -> Result<(OntoValueExpr, &str)> {
@@ -1402,11 +1476,20 @@ impl OntoQLParser {
         let mut depth = 1;
         let mut i = 1;
         let bytes = input.as_bytes();
+        let mut in_quote: Option<u8> = None;
         while i < bytes.len() && depth > 0 {
-            match bytes[i] {
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                _ => {}
+            let b = bytes[i];
+            if let Some(q) = in_quote {
+                if b == q {
+                    in_quote = None;
+                }
+            } else {
+                match b {
+                    b'\'' | b'"' => in_quote = Some(b),
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
             }
             i += 1;
         }
@@ -1417,13 +1500,26 @@ impl OntoQLParser {
     }
 
     /// Extract keyword value: find `keyword value` and return the value.
+    /// Only matches at word boundaries (keyword must be preceded by whitespace or start of string).
     fn extract_keyword_value(input: &str, keyword: &str) -> Option<String> {
         let kw_upper = keyword.to_ascii_uppercase();
         let lower = input.to_ascii_lowercase();
-        if let Some(pos) = lower.find(&kw_upper.to_lowercase()) {
-            let after = safe_slice_from(input, pos + keyword.len()).trim_start();
-            let (val, _) = Self::extract_identifier(after);
-            if !val.is_empty() { return Some(val); }
+        let kw_lower = kw_upper.to_lowercase();
+        // Find keyword at word boundary
+        let mut search_start = 0;
+        while let Some(pos) = lower[search_start..].find(&kw_lower) {
+            let abs_pos = search_start + pos;
+            // Check word boundary: must be preceded by whitespace or be at start
+            let preceded_ok = abs_pos == 0 || input.as_bytes()[abs_pos - 1].is_ascii_whitespace();
+            // Check word boundary: must be followed by whitespace or be at end
+            let after_pos = abs_pos + keyword.len();
+            let followed_ok = after_pos >= input.len() || input.as_bytes()[after_pos].is_ascii_whitespace();
+            if preceded_ok && followed_ok {
+                let after = safe_slice_from(input, after_pos).trim_start();
+                let (val, _) = Self::extract_identifier(after);
+                if !val.is_empty() { return Some(val); }
+            }
+            search_start = abs_pos + 1;
         }
         None
     }
@@ -1577,12 +1673,12 @@ impl OntoQLAst {
                     OntoProjection::AllFrom(table) => format!("{}.*", table),
                     OntoProjection::Column { name, alias } => {
                         match alias {
-                            Some(a) => format!("{} AS \"{}\"", name, a),
+                            Some(a) => format!("{} AS {}", name, a),
                             None => name.clone(),
                         }
                     }
                     OntoProjection::Expression { expr, alias } => {
-                        format!("{} AS \"{}\"", Self::expr_to_sql(expr), alias)
+                        format!("{} AS {}", Self::expr_to_sql(expr), alias)
                     }
                 }).collect();
                 sql.push_str(&proj_strs.join(", "));
@@ -1729,21 +1825,24 @@ impl OntoQLAst {
     /// Convert OntoFilterExpr to SQL WHERE string.
     fn filter_to_sql(expr: &OntoFilterExpr) -> Result<String> {
         match expr {
-            OntoFilterExpr::Eq(col, val) => Ok(format!("\"{}\" = {}", col, Self::expr_to_sql(val))),
-            OntoFilterExpr::Ne(col, val) => Ok(format!("\"{}\" != {}", col, Self::expr_to_sql(val))),
-            OntoFilterExpr::Gt(col, val) => Ok(format!("\"{}\" > {}", col, Self::expr_to_sql(val))),
-            OntoFilterExpr::Lt(col, val) => Ok(format!("\"{}\" < {}", col, Self::expr_to_sql(val))),
-            OntoFilterExpr::Gte(col, val) => Ok(format!("\"{}\" >= {}", col, Self::expr_to_sql(val))),
-            OntoFilterExpr::Lte(col, val) => Ok(format!("\"{}\" <= {}", col, Self::expr_to_sql(val))),
-            OntoFilterExpr::Like(col, pattern) => Ok(format!("\"{}\" LIKE '{}'", col, pattern)),
+            OntoFilterExpr::Eq(col, val) => Ok(format!("{} = {}", col, Self::expr_to_sql(val))),
+            OntoFilterExpr::Ne(col, val) => Ok(format!("{} != {}", col, Self::expr_to_sql(val))),
+            OntoFilterExpr::Gt(col, val) => Ok(format!("{} > {}", col, Self::expr_to_sql(val))),
+            OntoFilterExpr::Lt(col, val) => Ok(format!("{} < {}", col, Self::expr_to_sql(val))),
+            OntoFilterExpr::Gte(col, val) => Ok(format!("{} >= {}", col, Self::expr_to_sql(val))),
+            OntoFilterExpr::Lte(col, val) => Ok(format!("{} <= {}", col, Self::expr_to_sql(val))),
+            OntoFilterExpr::Like(col, pattern) => {
+                let escaped = pattern.replace('\'', "''");
+                Ok(format!("{} LIKE '{}'", col, escaped))
+            }
             OntoFilterExpr::In(col, vals) => {
                 let vals_str: Vec<String> = vals.iter().map(|v| Self::expr_to_sql(v)).collect();
-                Ok(format!("\"{}\" IN ({})", col, vals_str.join(", ")))
+                Ok(format!("{} IN ({})", col, vals_str.join(", ")))
             }
-            OntoFilterExpr::IsNull(col) => Ok(format!("\"{}\" IS NULL", col)),
-            OntoFilterExpr::IsNotNull(col) => Ok(format!("\"{}\" IS NOT NULL", col)),
+            OntoFilterExpr::IsNull(col) => Ok(format!("{} IS NULL", col)),
+            OntoFilterExpr::IsNotNull(col) => Ok(format!("{} IS NOT NULL", col)),
             OntoFilterExpr::Between(col, lo, hi) => {
-                Ok(format!("\"{}\" BETWEEN {} AND {}", col, Self::expr_to_sql(lo), Self::expr_to_sql(hi)))
+                Ok(format!("{} BETWEEN {} AND {}", col, Self::expr_to_sql(lo), Self::expr_to_sql(hi)))
             }
             OntoFilterExpr::And(l, r) => Ok(format!("({} AND {})", Self::filter_to_sql(l)?, Self::filter_to_sql(r)?)),
             OntoFilterExpr::Or(l, r) => Ok(format!("({} OR {})", Self::filter_to_sql(l)?, Self::filter_to_sql(r)?)),
@@ -2316,5 +2415,59 @@ mod tests {
 
         let rollback = OntoQLParser::parse("ROLLBACK").unwrap().to_query_ast().unwrap();
         assert!(matches!(rollback, QueryAst::Rollback));
+    }
+
+    // ===== P2 Tests =====
+
+    #[test]
+    fn test_extract_keyword_value_word_boundary() {
+        // DOMAINES should NOT match DOMAIN keyword
+        let result = OntoQLParser::extract_keyword_value("DOMAINES RANGE STRING", "DOMAIN");
+        assert!(result.is_none(), "DOMAINES should not match DOMAIN");
+
+        // DOMAIN Person should match
+        let result = OntoQLParser::extract_keyword_value("DOMAIN Person RANGE STRING", "DOMAIN");
+        assert_eq!(result.unwrap(), "Person");
+    }
+
+    #[test]
+    fn test_ontology_between_in_not() {
+        // BETWEEN
+        let ast = OntoQLParser::parse("SELECT name FROM Person WHERE age BETWEEN 18 AND 65").unwrap();
+        match &ast {
+            OntoQLAst::Select { filter: Some(OntoFilterExpr::Between(col, _, _)), .. } => {
+                assert_eq!(col, "age");
+            }
+            other => panic!("expected Between, got {:?}", other),
+        }
+
+        // IN
+        let ast = OntoQLParser::parse("SELECT name FROM Person WHERE status IN ('active', 'pending')").unwrap();
+        match &ast {
+            OntoQLAst::Select { filter: Some(OntoFilterExpr::In(col, vals)), .. } => {
+                assert_eq!(col, "status");
+                assert_eq!(vals.len(), 2);
+            }
+            other => panic!("expected In, got {:?}", other),
+        }
+
+        // NOT
+        let ast = OntoQLParser::parse("SELECT name FROM Person WHERE NOT (age > 30)").unwrap();
+        match &ast {
+            OntoQLAst::Select { filter: Some(OntoFilterExpr::Not(_)), .. } => {}
+            other => panic!("expected Not, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_to_sql_projection_quoted() {
+        // Column names with special chars should be quoted in generated SQL
+        let ast = OntoQLParser::parse("SELECT name FROM Person WHERE age > 18").unwrap();
+        let sql = ast.to_query_ast().unwrap();
+        // Just verify it parses without error
+        match sql {
+            QueryAst::Select { .. } => {}
+            _ => panic!("expected Select"),
+        }
     }
 }

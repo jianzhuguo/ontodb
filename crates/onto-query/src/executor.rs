@@ -3905,13 +3905,18 @@ impl QueryExecutor {
                 })
             }
             FilterExpr::Ne(col, val) => {
-                !doc.get(col).is_some_and(|v| {
-                    if col == "__class__" {
-                        self.class_value_matches_read(engine, v, val)
-                    } else {
-                        self.property_value_matches_read(engine, doc, col, val)
+                // SQL semantics: NULL != anything is NULL (falsy)
+                match doc.get(col) {
+                    Some(v) => {
+                        let eq = if col == "__class__" {
+                            self.class_value_matches_read(engine, v, val)
+                        } else {
+                            self.property_value_matches_read(engine, doc, col, val)
+                        };
+                        !eq
                     }
-                })
+                    None => false,
+                }
             }
             FilterExpr::Gt(col, val) => {
                 doc.get(col).is_some_and(|v| self.value_gt(v, val))
@@ -5862,6 +5867,15 @@ impl QueryExecutor {
                     }
                 })
             }
+            FilterExpr::IsNull(col) => {
+                resolve_val(col).is_none_or(|v| matches!(v, Value::Null))
+            }
+            FilterExpr::IsNotNull(col) => {
+                resolve_val(col).is_some_and(|v| !matches!(v, Value::Null))
+            }
+            FilterExpr::Not(inner) => {
+                !Self::eval_filter_static_with_hierarchy(doc, inner, class_hierarchy)
+            }
             FilterExpr::And(left, right) => {
                 Self::eval_filter_static_with_hierarchy(doc, left, class_hierarchy)
                     && Self::eval_filter_static_with_hierarchy(doc, right, class_hierarchy)
@@ -5975,13 +5989,18 @@ impl QueryExecutor {
                 })
             }
             FilterExpr::Ne(col, val) => {
-                !doc.get(col).is_some_and(|v| {
-                    if col == "__class__" {
-                        self.class_value_matches(engine, v, val)
-                    } else {
-                        self.property_value_matches(engine, doc, col, val)
+                // SQL semantics: NULL != anything is NULL (falsy)
+                match doc.get(col) {
+                    Some(v) => {
+                        let eq = if col == "__class__" {
+                            self.class_value_matches(engine, v, val)
+                        } else {
+                            self.property_value_matches(engine, doc, col, val)
+                        };
+                        !eq
                     }
-                })
+                    None => false, // missing column → NULL → Ne is false
+                }
             }
             FilterExpr::Gt(col, val) => {
                 doc.get(col)
@@ -6387,18 +6406,18 @@ impl QueryExecutor {
 
     /// SQL LIKE pattern matching. Supports % (zero or more chars) and _ (exactly one char).
     fn like_match(text: &str, pattern: &str) -> bool {
+        let t_chars: Vec<char> = text.chars().collect();
+        let p_chars: Vec<char> = pattern.chars().collect();
         let mut ti = 0;
         let mut pi = 0;
         let mut star_pi = usize::MAX;
         let mut star_ti = 0;
-        let t_bytes = text.as_bytes();
-        let p_bytes = pattern.as_bytes();
 
-        while ti < t_bytes.len() {
-            if pi < p_bytes.len() && (p_bytes[pi] == b'_' || p_bytes[pi] == t_bytes[ti]) {
+        while ti < t_chars.len() {
+            if pi < p_chars.len() && (p_chars[pi] == '_' || p_chars[pi] == t_chars[ti]) {
                 ti += 1;
                 pi += 1;
-            } else if pi < p_bytes.len() && p_bytes[pi] == b'%' {
+            } else if pi < p_chars.len() && p_chars[pi] == '%' {
                 star_pi = pi;
                 star_ti = ti;
                 pi += 1;
@@ -6410,10 +6429,10 @@ impl QueryExecutor {
                 return false;
             }
         }
-        while pi < p_bytes.len() && p_bytes[pi] == b'%' {
+        while pi < p_chars.len() && p_chars[pi] == '%' {
             pi += 1;
         }
-        pi == p_bytes.len()
+        pi == p_chars.len()
     }
 
     /// Evaluates a ValueExpr against a row context, returning a JSON Value.
@@ -8637,6 +8656,22 @@ mod tests {
             }
             _ => panic!("expected 1 row for 'iP_d'"),
         }
+    }
+
+    #[test]
+    fn test_like_multibyte_underscore() {
+        // _ should match one CHARACTER, not one byte
+        assert!(QueryExecutor::like_match("中文", "中_"));   // 2 chars, pattern matches
+        assert!(!QueryExecutor::like_match("中文", "中__"));  // 2 chars, pattern expects 3
+        assert!(QueryExecutor::like_match("a中b", "a_b"));   // mixed ASCII + CJK
+        assert!(!QueryExecutor::like_match("a中b", "a__b")); // expects 4 chars
+    }
+
+    #[test]
+    fn test_like_multibyte_percent() {
+        assert!(QueryExecutor::like_match("中文测试", "中%"));
+        assert!(QueryExecutor::like_match("中文测试", "%测试"));
+        assert!(!QueryExecutor::like_match("中文测试", "%英文%"));
     }
 
     // 鈹€鈹€ BETWEEN tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
