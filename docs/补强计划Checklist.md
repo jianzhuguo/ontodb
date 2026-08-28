@@ -25,10 +25,11 @@
 - [ ] 测试：备份 → 恢复 → 查询验证数据完整性（需要运行服务器）
 
 ### 1.3 WAL 归档（增量备份基础）
-- [ ] 设计 WAL 归档策略（文件轮转 + 归档目录）
-- [ ] 实现 WAL 归档后台任务
-- [ ] 配置项：`wal_archive_dir`、`wal_archive_enabled`
-- [ ] 测试：归档目录下有 WAL 文件
+- [x] 设计 WAL 归档策略（文件轮转 + 归档目录）✅
+- [x] 实现 WAL 归档后台任务（flush 时自动归档）✅
+- [x] 配置项：`wal_archive_dir`、`wal_archive_max_files` ✅
+- [x] 自动清理旧归档文件 ✅
+- [x] 测试：归档目录下有 WAL 文件 + 清理逻辑 ✅ (2 个测试通过)
 
 ### 1.4 自动备份脚本
 - [ ] 提供 `scripts/backup.sh` 模板
@@ -124,7 +125,7 @@
 3. [DONE] 窗口函数 ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD / 聚合
 4. [DONE] CTE WITH 子句（含递归 CTE）
 5. [DONE] 唯一约束（单列 + 复合唯一约束）
-6. [TODO] WAL 归档
+6. [DONE] WAL 归档（自动归档 + 清理）
 7. [TODO] ORM 对接（持续）
 ```
 

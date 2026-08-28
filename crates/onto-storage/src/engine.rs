@@ -815,13 +815,23 @@ impl LsmEngine {
 
     /// Resets the WAL file after a successful flush.
     ///
+    /// If WAL archiving is enabled, copies the current WAL to the archive directory
+    /// before resetting. This enables incremental backup.
+    ///
     /// Uses write-new-then-rename for atomicity:
-    /// 1. Create a new WAL at a temp path
-    /// 2. Atomically rename temp �?wal.log
-    /// This ensures the WAL is never missing, even if the process crashes mid-reset.
+    /// 1. Archive current WAL (if enabled)
+    /// 2. Create a new WAL at a temp path
+    /// 3. Atomically rename temp → wal.log
     fn reset_wal_internal(&self, ws: &mut WriteState) -> Result<()> {
         let wal_path = self.options.data_dir.join("wal.log");
         let tmp_path = self.options.data_dir.join("wal.log.tmp");
+
+        // Archive current WAL before resetting (if enabled)
+        if let Some(ref archive_dir) = self.options.wal_archive_dir {
+            if wal_path.exists() {
+                self.archive_wal(&wal_path, archive_dir)?;
+            }
+        }
 
         // If a stale temp file exists from a previous crash, remove it
         if tmp_path.exists() {
@@ -834,10 +844,59 @@ impl LsmEngine {
         // Atomically replace the old WAL
         fs::rename(&tmp_path, &wal_path)?;
 
-        // The file handle still points to the same inode after rename,
-        // so new_wal is valid at the final path. No need to re-open.
         ws.wal = new_wal;
+        Ok(())
+    }
 
+    /// Archives a WAL file by copying it to the archive directory with a timestamp.
+    fn archive_wal(&self, wal_path: &Path, archive_dir: &Path) -> Result<()> {
+        fs::create_dir_all(archive_dir)?;
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let seq = self.seq_counter.load(Ordering::Relaxed);
+        let archive_name = format!("wal_{}_{:08}.log", timestamp, seq);
+        let archive_path = archive_dir.join(&archive_name);
+
+        fs::copy(wal_path, &archive_path)?;
+        tracing::debug!("WAL archived to {}", archive_path.display());
+
+        if self.options.wal_archive_max_files > 0 {
+            self.cleanup_old_archives(archive_dir)?;
+        }
+        Ok(())
+    }
+
+    /// Removes oldest archived WAL files when limit is exceeded.
+    fn cleanup_old_archives(&self, archive_dir: &Path) -> Result<()> {
+        let max_files = self.options.wal_archive_max_files;
+        if max_files == 0 {
+            return Ok(());
+        }
+
+        let mut entries: Vec<_> = fs::read_dir(archive_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("wal_") && n.ends_with(".log"))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if entries.len() <= max_files {
+            return Ok(());
+        }
+
+        entries.sort_by_key(|e| e.file_name());
+        let to_delete = entries.len() - max_files;
+        for entry in entries.iter().take(to_delete) {
+            let _ = fs::remove_file(entry.path());
+            tracing::debug!("Deleted old WAL archive: {:?}", entry.path());
+        }
         Ok(())
     }
 
@@ -2643,5 +2702,109 @@ mod tests {
             assert_eq!(engine.get(b"key3").expect("should be valid"), Some(b"value3".to_vec()));
             assert_eq!(engine.get(b"missing").expect("should be valid"), None);
         }
+    }
+
+    #[test]
+    fn test_wal_archive_on_flush() {
+        let dir = tempdir().expect("should be valid");
+        let data_dir = dir.path().join("data");
+        let archive_dir = dir.path().join("wal_archive");
+
+        let options = StorageOptions {
+            data_dir: data_dir.clone(),
+            memtable_size_limit: 256, // Very small to trigger flush quickly
+            wal_archive_dir: Some(archive_dir.clone()),
+            wal_archive_max_files: 10,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("should be valid");
+
+        // Write enough data to trigger multiple flushes
+        for i in 0..20 {
+            let key = format!("key_{:04}", i).into_bytes();
+            let value = format!("value_{:04}", i).into_bytes();
+            engine.put(key, value).expect("should be valid");
+        }
+        engine.flush().expect("should be valid");
+
+        // Write more to trigger another flush
+        for i in 20..40 {
+            let key = format!("key_{:04}", i).into_bytes();
+            let value = format!("value_{:04}", i).into_bytes();
+            engine.put(key, value).expect("should be valid");
+        }
+        engine.flush().expect("should be valid");
+
+        // Verify archive directory has WAL files
+        assert!(archive_dir.exists(), "archive directory should exist");
+        let archive_files: Vec<_> = std::fs::read_dir(&archive_dir)
+            .expect("should be valid")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("wal_") && n.ends_with(".log"))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        assert!(
+            !archive_files.is_empty(),
+            "should have archived WAL files, found {}",
+            archive_files.len()
+        );
+
+        // Verify data is still accessible
+        for i in 0..40 {
+            let key = format!("key_{:04}", i).into_bytes();
+            let expected = format!("value_{:04}", i).into_bytes();
+            assert_eq!(engine.get(&key).expect("should be valid"), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_wal_archive_cleanup() {
+        let dir = tempdir().expect("should be valid");
+        let data_dir = dir.path().join("data");
+        let archive_dir = dir.path().join("wal_archive");
+
+        let options = StorageOptions {
+            data_dir: data_dir.clone(),
+            memtable_size_limit: 128, // Very small
+            wal_archive_dir: Some(archive_dir.clone()),
+            wal_archive_max_files: 3, // Keep only 3 archives
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("should be valid");
+
+        // Trigger many flushes
+        for batch in 0..10 {
+            for i in 0..10 {
+                let key = format!("key_{}_{}", batch, i).into_bytes();
+                let value = format!("value_{}_{}", batch, i).into_bytes();
+                engine.put(key, value).expect("should be valid");
+            }
+            engine.flush().expect("should be valid");
+        }
+
+        // Verify cleanup: should have at most 3 archive files
+        let archive_files: Vec<_> = std::fs::read_dir(&archive_dir)
+            .expect("should be valid")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("wal_") && n.ends_with(".log"))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        assert!(
+            archive_files.len() <= 3,
+            "should have at most 3 archive files, found {}",
+            archive_files.len()
+        );
     }
 }

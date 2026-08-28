@@ -42,6 +42,14 @@ pub struct StorageOptions {
     /// Hybrid: small indexes in memory, large ones migrated to disk.
     /// None = InMemory (for backward compatibility with existing code).
     pub index_storage_mode: Option<IndexStorageMode>,
+
+    /// WAL archiving: when enabled, WAL files are copied to this directory
+    /// before being reset (after flush to SSTable). Enables incremental backup.
+    pub wal_archive_dir: Option<PathBuf>,
+
+    /// Maximum number of archived WAL files to keep. Oldest are deleted first.
+    /// 0 = unlimited.
+    pub wal_archive_max_files: usize,
 }
 
 impl Default for StorageOptions {
@@ -57,6 +65,8 @@ impl Default for StorageOptions {
             sync_wal_on_commit: true, // Strong durability by default
             compression_level: 3,    // zstd level 3 by default (good balance)
             index_storage_mode: None,
+            wal_archive_dir: None,   // Disabled by default
+            wal_archive_max_files: 100, // Keep last 100 archives
         }
     }
 }
