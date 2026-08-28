@@ -226,6 +226,38 @@ pub struct VerifyBackupRequest {
     pub path: String,
 }
 
+/// Batch query request — execute multiple queries in a single HTTP call.
+#[derive(Debug, Deserialize)]
+pub struct BatchRequest {
+    /// List of queries to execute.
+    pub queries: Vec<String>,
+    /// If true, stop on first error. If false, continue and return all results.
+    #[serde(default)]
+    pub fail_fast: bool,
+    /// Optional: return results as pretty-printed JSON.
+    #[serde(default)]
+    pub pretty: bool,
+}
+
+/// Result of a single query in a batch.
+#[derive(Debug, Serialize)]
+pub struct BatchResult {
+    /// Index of the query in the batch (0-based).
+    pub index: usize,
+    /// The query that was executed.
+    pub query: String,
+    /// Whether the query succeeded.
+    pub success: bool,
+    /// Result data (for SELECT) or null (for INSERT/UPDATE/DELETE).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+    /// Error message (only present if success is false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Execution time in milliseconds.
+    pub elapsed_ms: f64,
+}
+
 /// Hybrid query request: combines SQL filter with vector search.
 #[derive(Debug, Deserialize)]
 pub struct HybridQueryRequest {
@@ -325,6 +357,8 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/metrics", get(metrics_json))
         // SQL query execution
         .route("/api/query", post(execute_query))
+        // Batch query execution
+        .route("/api/batch", post(batch_query))
         // SPARQL query execution
         .route("/sparql", post(sparql_query))
         // Vector search
@@ -401,6 +435,7 @@ pub fn build_router_with_auth(
         .route("/api/metrics", get(metrics_json))
         // Protected routes
         .route("/api/query", post(execute_query))
+        .route("/api/batch", post(batch_query))
         .route("/sparql", post(sparql_query))
         .route("/api/vector/search", post(vector_search))
         .route("/api/hybrid/query", post(hybrid_query))
@@ -1087,6 +1122,136 @@ async fn vector_search(
             (StatusCode::OK, Json(ApiResponse::success(json!({ "message": msg }), elapsed_ms)))
         }
     }
+}
+
+/// POST /api/batch - Execute multiple queries in a single request.
+///
+/// Request body:
+/// ```json
+/// {
+///     "queries": [
+///         "INSERT INTO Product (name, price) VALUES ('iPhone', 999)",
+///         "INSERT INTO Product (name, price) VALUES ('iPad', 799)",
+///         "SELECT * FROM Product"
+///     ],
+///     "fail_fast": false,
+///     "pretty": false
+/// }
+/// ```
+async fn batch_query(
+    State(state): State<AppState>,
+    Json(req): Json<BatchRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    if req.queries.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error("queries array is empty".to_string())),
+        );
+    }
+
+    if req.queries.len() > 1000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error("batch size exceeds maximum of 1000".to_string())),
+        );
+    }
+
+    let mut results: Vec<BatchResult> = Vec::with_capacity(req.queries.len());
+    let mut has_error = false;
+
+    for (i, query) in req.queries.iter().enumerate() {
+        let query_start = std::time::Instant::now();
+        let trimmed = query.trim_end_matches(';').trim();
+
+        if trimmed.is_empty() {
+            results.push(BatchResult {
+                index: i,
+                query: query.clone(),
+                success: true,
+                data: None,
+                error: None,
+                elapsed_ms: 0.0,
+            });
+            continue;
+        }
+
+        // Parse and execute
+        let result = match onto_query::QueryParser::parse(trimmed) {
+            Ok(ast) => state.executor.execute(&ast),
+            Err(e) => Err(e),
+        };
+
+        let elapsed_ms = query_start.elapsed().as_secs_f64() * 1000.0;
+
+        match result {
+            Ok(query_result) => {
+                let data = match query_result {
+                    onto_query::QueryResult::Rows(rows) => Some(json!(rows)),
+                    onto_query::QueryResult::Success(msg) => Some(json!({ "message": msg })),
+                };
+                results.push(BatchResult {
+                    index: i,
+                    query: query.clone(),
+                    success: true,
+                    data,
+                    error: None,
+                    elapsed_ms,
+                });
+            }
+            Err(e) => {
+                has_error = true;
+                results.push(BatchResult {
+                    index: i,
+                    query: query.clone(),
+                    success: false,
+                    data: None,
+                    error: Some(sanitize_error(&e.to_string())),
+                    elapsed_ms,
+                });
+
+                if req.fail_fast {
+                    // Fill remaining queries as skipped
+                    for j in (i + 1)..req.queries.len() {
+                        results.push(BatchResult {
+                            index: j,
+                            query: req.queries[j].clone(),
+                            success: false,
+                            data: None,
+                            error: Some("skipped due to fail_fast".to_string()),
+                            elapsed_ms: 0.0,
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let total_elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    let success_count = results.iter().filter(|r| r.success).count();
+    let error_count = results.iter().filter(|r| !r.success).count();
+
+    let status_code = if has_error && req.fail_fast {
+        StatusCode::MULTI_STATUS
+    } else if has_error {
+        StatusCode::MULTI_STATUS
+    } else {
+        StatusCode::OK
+    };
+
+    let response = json!({
+        "results": results,
+        "summary": {
+            "total": req.queries.len(),
+            "succeeded": success_count,
+            "failed": error_count,
+            "elapsed_ms": total_elapsed
+        }
+    });
+
+    (status_code, Json(ApiResponse::success(response, total_elapsed)))
 }
 
 /// POST /api/hybrid/query - Execute a hybrid SQL + vector search query.

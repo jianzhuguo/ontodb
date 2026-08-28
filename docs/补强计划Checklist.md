@@ -63,10 +63,10 @@
 - [x] 测试：重复插入被拒绝、更新冲突检测 ✅ (6 个测试通过)
 
 ### 2.4 布尔表达式增强
-- [ ] `IN (val1, val2, ...)` 支持
-- [ ] `BETWEEN val1 AND val2` 支持
-- [ ] `IS NULL / IS NOT NULL` 支持（如果缺失）
-- [ ] 测试：各表达式的正确性
+- [x] `IN (val1, val2, ...)` 支持 ✅（已实现，含子查询 IN (SELECT ...)）
+- [x] `BETWEEN val1 AND val2` 支持 ✅（已实现）
+- [x] `IS NULL / IS NOT NULL` 支持 ✅（已实现）
+- [x] 测试：各表达式的正确性 ✅（242 个测试通过）
 
 ---
 
@@ -84,7 +84,7 @@
 - [ ] 测试：SQLx 基本操作
 
 ### 3.3 HTTP API 增强
-- [ ] 批量操作 API：`POST /api/batch`
+- [x] 批量操作 API：`POST /api/batch` ✅
 - [ ] 事务 API：`POST /api/transaction/begin` → `commit` / `rollback`
 - [ ] 游标 API：`POST /api/cursor`（大结果集分页）
 - [ ] OpenAPI 文档自动生成
@@ -126,7 +126,9 @@
 4. [DONE] CTE WITH 子句（含递归 CTE）
 5. [DONE] 唯一约束（单列 + 复合唯一约束）
 6. [DONE] WAL 归档（自动归档 + 清理）
-7. [TODO] ORM 对接（持续）
+7. [DONE] 布尔表达式增强（IN / BETWEEN / IS NULL）
+8. [DONE] 批量操作 API（POST /api/batch）
+9. [TODO] 事务 API / 游标 API / ORM 对接
 ```
 
 ---
