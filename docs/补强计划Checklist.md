@@ -86,7 +86,7 @@
 ### 3.3 HTTP API 增强
 - [x] 批量操作 API：`POST /api/batch` ✅
 - [x] 事务 API：`POST /api/transaction/begin` → `execute` → `commit` / `rollback` ✅
-- [ ] 游标 API：`POST /api/cursor`（大结果集分页）
+- [x] 游标 API：`POST /api/cursor`（大结果集分页）✅
 - [ ] OpenAPI 文档自动生成
 
 ### 3.4 客户端 SDK 增强
@@ -129,7 +129,8 @@
 7. [DONE] 布尔表达式增强（IN / BETWEEN / IS NULL）
 8. [DONE] 批量操作 API（POST /api/batch）
 9. [DONE] 事务 API（begin / execute / commit / rollback）
-10. [TODO] 游标 API / ORM 对接
+10. [DONE] 游标 API（POST /api/cursor）
+11. [TODO] ORM 对接（Python SQLAlchemy）
 ```
 
 ---

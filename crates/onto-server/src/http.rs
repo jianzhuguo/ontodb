@@ -282,6 +282,40 @@ pub struct TransactionActionRequest {
     pub txn_id: u64,
 }
 
+/// Cursor query request — paginated result fetching.
+#[derive(Debug, Deserialize)]
+pub struct CursorRequest {
+    /// SQL or OntoDB query to execute.
+    pub query: String,
+    /// Number of rows to return per page (default: 100).
+    #[serde(default = "default_page_size")]
+    pub page_size: usize,
+    /// Cursor for fetching the next page (returned from previous response).
+    /// If omitted, returns the first page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+fn default_page_size() -> usize {100}
+
+/// Cursor response with pagination support.
+#[derive(Debug, Serialize)]
+pub struct CursorResponse {
+    /// Rows for the current page.
+    pub rows: Vec<Value>,
+    /// Total number of rows (if available, -1 if unknown).
+    pub total: i64,
+    /// Cursor for the next page (null if no more pages).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Whether there are more pages.
+    pub has_more: bool,
+    /// Current page number (0-based).
+    pub page: usize,
+    /// Page size used.
+    pub page_size: usize,
+}
+
 /// Hybrid query request: combines SQL filter with vector search.
 #[derive(Debug, Deserialize)]
 pub struct HybridQueryRequest {
@@ -403,6 +437,8 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/transaction/execute", post(transaction_execute))
         .route("/api/transaction/commit", post(transaction_commit))
         .route("/api/transaction/rollback", post(transaction_rollback))
+        // Cursor pagination
+        .route("/api/cursor", post(cursor_query))
         // Sharding configuration
         .route("/api/sharding/config", get(get_sharding_config).put(update_sharding_config))
         .route("/api/sharding/shard", post(add_shard))
@@ -487,6 +523,8 @@ pub fn build_router_with_auth(
         .route("/api/transaction/execute", post(transaction_execute))
         .route("/api/transaction/commit", post(transaction_commit))
         .route("/api/transaction/rollback", post(transaction_rollback))
+        // Cursor pagination
+        .route("/api/cursor", post(cursor_query))
         // Sharding configuration (Admin only)
         .route("/api/sharding/config", get(get_sharding_config).put(update_sharding_config))
         .route("/api/sharding/shard", post(add_shard))
@@ -1616,6 +1654,121 @@ async fn transaction_rollback(
         }
         Err(e) => (
             StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(sanitize_error(&e.to_string()))),
+        ),
+    }
+}
+
+// ── Cursor API ──────────────────────────────────────────────
+
+/// POST /api/cursor - Execute a query with cursor-based pagination.
+///
+/// Returns a cursor that can be used to fetch subsequent pages.
+///
+/// Request body:
+/// ```json
+/// {
+///     "query": "SELECT * FROM Product",
+///     "page_size": 50,
+///     "cursor": null
+/// }
+/// ```
+async fn cursor_query(
+    State(state): State<AppState>,
+    Json(req): Json<CursorRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let query = req.query.trim_end_matches(';').trim();
+    if query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error("query is empty".to_string())),
+        );
+    }
+
+    let page_size = req.page_size.max(1).min(10000); // Clamp to [1, 10000]
+
+    // Parse cursor to get offset
+    let offset: usize = match &req.cursor {
+        Some(c) => match c.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::<Value>::error("invalid cursor".to_string())),
+                );
+            }
+        },
+        None => 0,
+    };
+
+    // Build paginated query: add LIMIT and OFFSET
+    let paginated_query = if query.to_uppercase().contains("LIMIT") {
+        // Query already has LIMIT, don't modify
+        query.to_string()
+    } else {
+        format!("{} LIMIT {} OFFSET {}", query, page_size + 1, offset)
+        // Fetch one extra row to determine if there are more pages
+    };
+
+    // Parse and execute
+    let ast = match QueryParser::parse(&paginated_query) {
+        Ok(ast) => ast,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!("Parse error: {}", e))),
+            );
+        }
+    };
+
+    let result = if QueryExecutor::is_read_only_query(&ast) {
+        state.executor.execute_read(&ast)
+    } else {
+        state.executor.execute(&ast)
+    };
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    match result {
+        Ok(r) => {
+            match r {
+                onto_query::QueryResult::Rows(mut rows) => {
+                    let has_more = rows.len() > page_size;
+                    if has_more {
+                        rows.truncate(page_size); // Remove the extra row
+                    }
+
+                    let next_cursor = if has_more {
+                        Some((offset + page_size).to_string())
+                    } else {
+                        None
+                    };
+
+                    // Convert Map<String, Value> rows to Value rows
+                    let value_rows: Vec<Value> = rows.into_iter()
+                        .map(|row| serde_json::Value::Object(row))
+                        .collect();
+
+                    let response = CursorResponse {
+                        rows: value_rows,
+                        total: -1, // Unknown without counting all rows
+                        next_cursor,
+                        has_more,
+                        page: offset / page_size,
+                        page_size,
+                    };
+
+                    (StatusCode::OK, Json(ApiResponse::success(json!(response), elapsed_ms)))
+                }
+                onto_query::QueryResult::Success(msg) => {
+                    (StatusCode::OK, Json(ApiResponse::success(json!({ "message": msg }), elapsed_ms)))
+                }
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiResponse::<Value>::error(sanitize_error(&e.to_string()))),
         ),
     }
