@@ -1508,6 +1508,8 @@ name = "onto-cli"
 version = "0.6.2"
 dependencies = [
  "clap",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

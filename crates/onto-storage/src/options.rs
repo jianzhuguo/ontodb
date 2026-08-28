@@ -50,6 +50,16 @@ pub struct StorageOptions {
     /// Maximum number of archived WAL files to keep. Oldest are deleted first.
     /// 0 = unlimited.
     pub wal_archive_max_files: usize,
+
+    /// Default decay rate (λ) for live data value scores, in per-second units.
+    /// Use `LAMBDA_7H`, `LAMBDA_70D`, `LAMBDA_2Y` from `value_meta` module.
+    /// Default: `LAMBDA_2Y` (2-year half-life, data stays "warm" for a long time).
+    pub default_lambda: f64,
+
+    /// Whether to automatically assess value scores on INSERT.
+    /// When true, each INSERT writes a `__val_meta__` key with a score.
+    /// When false (default), no meta keys are written — zero overhead.
+    pub value_scorer_enabled: bool,
 }
 
 impl Default for StorageOptions {
@@ -67,6 +77,8 @@ impl Default for StorageOptions {
             index_storage_mode: None,
             wal_archive_dir: None,   // Disabled by default
             wal_archive_max_files: 100, // Keep last 100 archives
+            default_lambda: crate::value_meta::LAMBDA_2Y, // 2-year half-life by default
+            value_scorer_enabled: false, // Disabled by default, must opt-in
         }
     }
 }

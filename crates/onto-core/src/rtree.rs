@@ -238,11 +238,10 @@ impl RTree {
 
     /// Find k nearest entries to a point.
     pub fn knn(&self, x: f64, y: f64, k: usize) -> Vec<(String, f64)> {
-        let mut results = Vec::new();
-        self.knn_search(self.root, x, y, k, &mut results);
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(k);
-        results
+        if self.nodes.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        self.knn_best_first(x, y, k)
     }
 
     // ── Internal Methods ──
@@ -404,25 +403,102 @@ impl RTree {
         }
     }
 
-    fn knn_search(&self, node_idx: usize, x: f64, y: f64, k: usize, results: &mut Vec<(String, f64)>) {
-        for entry in &self.nodes[node_idx].entries {
-            let dist = entry.bbox.distance_to_point(x, y);
-            match &entry.data {
-                EntryData::Leaf(id) => {
-                    results.push((id.clone(), dist));
+    /// Best-first KNN search using a priority queue (min-heap by MBR distance).
+    ///
+    /// Instead of DFS with post-hoc pruning, we always expand the closest candidate first.
+    /// This guarantees we find the k nearest neighbors with minimal node visits.
+    fn knn_best_first(&self, x: f64, y: f64, k: usize) -> Vec<(String, f64)> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        // Priority queue entry: (Reverse for min-heap on distance, node_index)
+        #[derive(PartialEq)]
+        struct PQEntry {
+            dist: f64,
+            node_idx: usize,
+        }
+        impl Eq for PQEntry {}
+        impl PartialOrd for PQEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                // Reverse: smaller distance = higher priority
+                other.dist.partial_cmp(&self.dist)
+            }
+        }
+        impl Ord for PQEntry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+
+        // Result heap: max-heap by distance (farthest at top for pruning)
+        #[derive(PartialEq)]
+        struct ResultEntry {
+            dist: f64,
+            id: String,
+        }
+        impl Eq for ResultEntry {}
+        impl PartialOrd for ResultEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                // Max-heap: larger distance = higher priority (top = farthest)
+                self.dist.partial_cmp(&other.dist)
+            }
+        }
+        impl Ord for ResultEntry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+
+        let mut pq: BinaryHeap<PQEntry> = BinaryHeap::new();
+        let mut results: BinaryHeap<ResultEntry> = BinaryHeap::new();
+
+        // Start from root
+        pq.push(PQEntry {
+            dist: self.nodes[self.root].entries.iter()
+                .map(|e| e.bbox.distance_to_point(x, y))
+                .fold(f64::INFINITY, f64::min)
+                .min(0.0),
+            node_idx: self.root,
+        });
+
+        while let Some(PQEntry { dist, node_idx }) = pq.pop() {
+            // Prune: if we have k results and this node's MBR is farther than our k-th result
+            if results.len() >= k {
+                if let Some(farthest) = results.peek() {
+                    if dist > farthest.dist {
+                        break; // All remaining candidates are farther
+                    }
                 }
-                EntryData::Internal(child) => {
-                    // Prune if we have k results and this entry is farther
-                    if results.len() >= k {
-                        let max_dist = results.iter().map(|(_, d)| *d).fold(0.0_f64, f64::max);
-                        if dist > max_dist {
-                            continue;
+            }
+
+            for entry in &self.nodes[node_idx].entries {
+                let entry_dist = entry.bbox.distance_to_point(x, y);
+
+                match &entry.data {
+                    EntryData::Leaf(id) => {
+                        if results.len() < k {
+                            results.push(ResultEntry { dist: entry_dist, id: id.clone() });
+                        } else if let Some(farthest) = results.peek() {
+                            if entry_dist < farthest.dist {
+                                results.pop();
+                                results.push(ResultEntry { dist: entry_dist, id: id.clone() });
+                            }
                         }
                     }
-                    self.knn_search(*child, x, y, k, results);
+                    EntryData::Internal(child) => {
+                        // Only enqueue if this child's MBR could contain a closer result
+                        if results.len() < k || entry_dist <= results.peek().unwrap().dist {
+                            pq.push(PQEntry { dist: entry_dist, node_idx: *child });
+                        }
+                    }
                 }
             }
         }
+
+        // Extract results sorted by distance (closest first)
+        let mut out: Vec<(String, f64)> = results.into_iter().map(|e| (e.id, e.dist)).collect();
+        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        out
     }
 
     fn update_parent_bbox(&mut self, _node_idx: usize) {

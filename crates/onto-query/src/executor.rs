@@ -355,13 +355,33 @@ struct InferenceCache {
     property_aliases: std::collections::HashMap<String, HashSet<String>>,
     /// Property name → inverse property name.
     inverse_property: std::collections::HashMap<String, Option<String>>,
+    /// Transitive closure cache: (property, subject) → set of all transitive objects.
+    transitive_closure: std::collections::HashMap<(String, String), HashSet<String>>,
+    /// Cached merged ontology (all ontologies merged into one). Avoids repeated scan_prefix.
+    merged_ontology: Option<onto_ontology::Ontology>,
+    /// Class name → property names (direct + inherited). Fast property lookup.
+    class_properties: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl InferenceCache {
+    #[allow(dead_code)]
     fn clear(&mut self) {
         self.class_hierarchy.clear();
         self.property_aliases.clear();
         self.inverse_property.clear();
+        self.transitive_closure.clear();
+        self.merged_ontology = None;
+        self.class_properties.clear();
+    }
+
+    /// Selective invalidation: clear all caches that depend on ontology structure.
+    fn invalidate_ontology(&mut self, _ontology_name: &str) {
+        self.class_hierarchy.clear();
+        self.property_aliases.clear();
+        self.inverse_property.clear();
+        self.transitive_closure.clear();
+        self.merged_ontology = None; // Must rebuild merged ontology
+        self.class_properties.clear();
     }
 }
 
@@ -492,36 +512,51 @@ impl QueryExecutor {
         let results = self.plan_vector_search(&self.engine, class, column, query_vector, top_k, &None)?;
 
         let Some(ref graph) = self.graph else {
-            return Ok(results); // No graph store, return vector results only
+            return Ok(results);
         };
 
-        let mut enriched = Vec::new();
-        for mut row in results {
-            // Get entity ID from the row
+        // Phase 1: Collect all neighbor IDs across all results (batch)
+        let mut row_neighbors: Vec<(usize, Vec<onto_core::EntityId>)> = Vec::new();
+        let mut all_neighbor_keys: Vec<(onto_core::EntityId, Vec<u8>)> = Vec::new();
+
+        for (i, row) in results.iter().enumerate() {
             if let Some(pk) = row.get("__pk__").and_then(|v| v.as_str()) {
                 let entity_id = onto_core::EntityId::new(class, pk);
-
-                // Get graph neighbors
-                let neighbors = graph.get_entity_neighbors(
-                    &entity_id,
-                    onto_graph::Direction::Out,
-                    edge_label,
-                );
-
-                // Fetch relational attributes for each neighbor
-                let mut neighbor_data = Vec::new();
-                for neighbor_id in &neighbors {
-                    if let Ok(Some(val_bytes)) = self.engine.get(&neighbor_id.to_lsm_key()) {
-                        if let Some(doc) = storage_bytes_to_doc(&val_bytes) {
-                            neighbor_data.push(serde_json::json!({
-                                "entity": neighbor_id.to_string(),
-                                "class": neighbor_id.class(),
-                                "properties": doc,
-                            }));
-                        }
-                    }
+                let neighbors = graph.get_entity_neighbors(&entity_id, onto_graph::Direction::Out, edge_label);
+                for nid in &neighbors {
+                    all_neighbor_keys.push((nid.clone(), nid.to_lsm_key()));
                 }
+                row_neighbors.push((i, neighbors));
+            }
+        }
 
+        // Phase 2: Batch fetch all neighbor properties (single scan pass)
+        let mut neighbor_docs: std::collections::HashMap<String, Map<String, Value>> = std::collections::HashMap::new();
+        for (nid, lsm_key) in &all_neighbor_keys {
+            if neighbor_docs.contains_key(&nid.to_string()) {
+                continue;
+            }
+            if let Ok(Some(val_bytes)) = self.engine.get(lsm_key) {
+                if let Some(doc) = storage_bytes_to_doc(&val_bytes) {
+                    neighbor_docs.insert(nid.to_string(), doc);
+                }
+            }
+        }
+
+        // Phase 3: Assemble enriched results
+        let mut enriched = Vec::new();
+        for (row_idx, row) in results.into_iter().enumerate() {
+            let mut row = row;
+            if let Some((_, neighbors)) = row_neighbors.iter().find(|(i, _)| *i == row_idx) {
+                let neighbor_data: Vec<serde_json::Value> = neighbors.iter().filter_map(|nid| {
+                    neighbor_docs.get(&nid.to_string()).map(|doc| {
+                        serde_json::json!({
+                            "entity": nid.to_string(),
+                            "class": nid.class(),
+                            "properties": doc,
+                        })
+                    })
+                }).collect();
                 row.insert("_neighbors".to_string(), serde_json::json!(neighbor_data));
                 row.insert("_neighbor_count".to_string(), serde_json::json!(neighbors.len()));
             }
@@ -999,6 +1034,13 @@ impl QueryExecutor {
     fn execute_select_read(&self, ast: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
         let start_time = std::time::Instant::now();
 
+        // Intercept system.* views before normal query path
+        if let QueryAst::Select { from, .. } = ast {
+            if from.starts_with("system.") {
+                return self.execute_system_view(from, engine);
+            }
+        }
+
         let result = match ast {
             QueryAst::Select { .. } => {
                 // Check plan cache first
@@ -1084,6 +1126,9 @@ impl QueryExecutor {
             QueryAst::Explain { query } => {
                 self.execute_explain_read(query, engine)
             }
+            QueryAst::ExplainReasoning { query } => {
+                self.execute_explain_reasoning(query, engine)
+            }
             QueryAst::Analyze { table } => {
                 self.execute_analyze_read(table, engine)
             }
@@ -1092,6 +1137,15 @@ impl QueryExecutor {
             }
             QueryAst::VectorSearch { class, column, query_vector, top_k, filter } => {
                 self.execute_vector_search_read(engine, class, column, query_vector, *top_k, filter)
+            }
+            QueryAst::GraphMatch { pattern, filter, returns } => {
+                self.execute_graph_match_read(engine, pattern, filter, returns)
+            }
+            QueryAst::GraphShortestPath { from_id, to_id, max_depth } => {
+                self.execute_graph_shortest_path_read(from_id, to_id, *max_depth)
+            }
+            QueryAst::GraphTraverse { start_id, direction, edge_label, max_depth, filter } => {
+                self.execute_graph_traverse_read(start_id, *direction, edge_label.as_deref(), *max_depth, filter)
             }
             _ => Err(CoreError::Custom("unexpected query type in read path".to_string())),
         };
@@ -1128,6 +1182,9 @@ impl QueryExecutor {
                 // EXPLAIN: generate and return the execution plan
                 self.execute_explain(query, engine)
             }
+            QueryAst::ExplainReasoning { query } => {
+                self.execute_explain_reasoning(query, engine)
+            }
             QueryAst::Analyze { table } => {
                 // ANALYZE: collect table statistics
                 self.execute_analyze(table, engine)
@@ -1139,9 +1196,18 @@ impl QueryExecutor {
             QueryAst::CreateOntology { sql } => {
                 // DDL doesn't need MVCC transaction
                 let ontology = onto_ontology::OntologyParser::parse(sql)?;
+                // Validate ontology before saving (cycle detection, undefined references, etc.)
+                let validation_errors = ontology.validate();
+                if !validation_errors.is_empty() {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "Ontology validation failed:\n  - {}",
+                        validation_errors.join("\n  - ")
+                    )));
+                }
                 self.ontology_store.save_with_engine(engine, &ontology)?;
-                // Invalidate inference cache on ontology changes
-                self.inference_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                // Selective invalidation: only clear caches related to this ontology
+                self.inference_cache.lock().unwrap_or_else(|e| e.into_inner())
+                    .invalidate_ontology(&ontology.name);
                 Ok(QueryResult::Success(format!(
                     "Ontology '{}' created with {} classes and {} properties",
                     ontology.name,
@@ -1401,9 +1467,31 @@ impl QueryExecutor {
                 engine.flush()?;
                 Ok(QueryResult::Success("MemTable flushed to SSTable".to_string()))
             }
+            QueryAst::SystemActivate { entity, reason } => {
+                // Parse entity: "Class::pk" format
+                let (class, pk) = match entity.split_once("::") {
+                    Some((c, p)) => (c, p),
+                    None => return Err(CoreError::InvalidArgument(
+                        format!("expected 'Class::pk' format, got '{}'", entity)
+                    )),
+                };
+                engine.activate(class, pk, 0.5, reason)?;
+                Ok(QueryResult::Success(format!(
+                    "Activated {} (reason: {}, delta: +0.5)", entity, reason
+                )))
+            }
             QueryAst::Copy { class, file_path, format } => {
                 // COPY uses direct bulk load without transaction for maximum speed
                 self.execute_copy(engine, class, file_path, *format)
+            }
+            QueryAst::GraphMatch { pattern, filter, returns } => {
+                self.execute_graph_match_read(engine, pattern, filter, returns)
+            }
+            QueryAst::GraphShortestPath { from_id, to_id, max_depth } => {
+                self.execute_graph_shortest_path_read(from_id, to_id, *max_depth)
+            }
+            QueryAst::GraphTraverse { start_id, direction, edge_label, max_depth, filter } => {
+                self.execute_graph_traverse_read(start_id, *direction, edge_label.as_deref(), *max_depth, filter)
             }
             _ => {
                 // For SELECT queries, check plan cache first
@@ -2318,64 +2406,89 @@ impl QueryExecutor {
         {
             let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.class_hierarchy.get(table) {
-                tracing::debug!("get_class_hierarchy: cache hit for '{}': {:?}", table, cached);
                 return cached.clone();
             }
         }
 
+        // Cache miss: get or build merged ontology
+        let merged_ontology = self.get_merged_ontology(engine);
+
         let mut classes = HashSet::new();
         classes.insert(table.to_string());
 
-        // Scan ALL ontologies to build complete class hierarchy
-        // This handles the case where each class is stored in its own ontology
-        let mut merged_ontology = onto_ontology::Ontology::new("__merged__");
-        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
-        tracing::debug!("get_class_hierarchy: found {} ontology entries", entries.len());
-        for (_key, val_bytes) in entries {
-            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
-                // Merge all classes into a single ontology
-                for (name, class) in &ontology.classes {
-                    if !merged_ontology.classes.contains_key(name) {
-                        merged_ontology.classes.insert(name.clone(), class.clone());
-                    }
-                }
-            }
-        }
-
-        tracing::debug!("get_class_hierarchy: merged ontology has {} classes", merged_ontology.classes.len());
-
-        // Rebuild indexes on merged ontology
-        merged_ontology.rebuild_indexes();
-
-        // Now find subclasses using the merged ontology
+        // Find subclasses using the merged ontology
         if merged_ontology.classes.contains_key(table) {
-            tracing::debug!("get_class_hierarchy: found '{}' in merged ontology", table);
             let reasoner = Reasoner::new(merged_ontology.clone());
             let probe_triple = onto_ontology::Triple::type_of("__probe__", table);
             let result = reasoner.reason(&[probe_triple]);
-
             for triple in &result.all_facts {
                 if triple.subject == "__probe__" && triple.predicate == "rdf:type" {
                     classes.insert(triple.object.clone());
                 }
             }
-
             let subclasses = merged_ontology.get_all_subclasses(table);
-            tracing::debug!("get_class_hierarchy: subclasses of '{}': {:?}", table, subclasses);
             classes.extend(subclasses);
-        } else {
-            tracing::debug!("get_class_hierarchy: '{}' NOT found in merged ontology", table);
         }
 
-        tracing::debug!("get_class_hierarchy: final classes for '{}': {:?}", table, classes);
-
-        // Store in cache
+        // Cache the result
         {
             let mut cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
             cache.class_hierarchy.insert(table.to_string(), classes.clone());
         }
 
         classes
+    }
+
+    /// Returns the cached merged ontology, or builds and caches it.
+    /// This avoids repeated scan_prefix("__ontology__") calls across the codebase.
+    fn get_merged_ontology(&self, engine: &LsmEngine) -> onto_ontology::Ontology {
+        // Check cache first
+        {
+            let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref cached) = cache.merged_ontology {
+                return cached.clone();
+            }
+        }
+
+        // Cache miss: scan all ontologies and merge
+        let mut merged = onto_ontology::Ontology::new("__merged__");
+        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+        for (_key, val_bytes) in entries {
+            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
+                for (name, class) in &ontology.classes {
+                    if !merged.classes.contains_key(name) {
+                        merged.classes.insert(name.clone(), class.clone());
+                    }
+                }
+                for (name, prop) in &ontology.properties {
+                    if !merged.properties.contains_key(name) {
+                        merged.properties.insert(name.clone(), prop.clone());
+                    }
+                }
+            }
+        }
+        merged.rebuild_indexes();
+
+        // Cache inverse property mappings
+        {
+            let mut cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
+            for (name, prop) in &merged.properties {
+                if !cache.inverse_property.contains_key(name) {
+                    cache.inverse_property.insert(name.clone(), prop.inverse_of.clone());
+                }
+            }
+            // Cache class properties for fast lookup
+            for class_name in merged.classes.keys() {
+                if !cache.class_properties.contains_key(class_name) {
+                    let props: Vec<String> = merged.get_class_properties(class_name)
+                        .iter().map(|p| p.name.clone()).collect();
+                    cache.class_properties.insert(class_name.clone(), props);
+                }
+            }
+            cache.merged_ontology = Some(merged.clone());
+        }
+
+        merged
     }
 
     /// Returns classes that are disjoint with the given class.
@@ -2524,6 +2637,139 @@ impl QueryExecutor {
         ])]))
     }
 
+    /// Executes EXPLAIN REASONING: shows ontology reasoning derivation chain.
+    ///
+    /// For a MATCH or SELECT query, shows which inference rules were applied
+    /// and what facts were derived.
+    fn execute_explain_reasoning(&self, query: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
+        // First, collect all facts from the relevant classes
+        let facts = self.collect_facts_for_reasoning(query, engine)?;
+
+        // Get the ontology for reasoning
+        let class_name = match query {
+            QueryAst::Match { class, .. } => Some(class.as_str()),
+            QueryAst::Select { from, .. } => Some(from.as_str()),
+            _ => None,
+        };
+
+        let Some(class) = class_name else {
+            return Err(CoreError::InvalidArgument(
+                "EXPLAIN REASONING requires a MATCH or SELECT query".to_string()
+            ));
+        };
+
+        let ontology = match self.ontology_store.find_ontology_for_class(engine, class)? {
+            Some(o) => o,
+            None => return Ok(QueryResult::Rows(vec![Map::from_iter(vec![
+                ("info".to_string(), Value::String("No ontology found for this class".to_string())),
+            ])])),
+        };
+
+        // Run reasoning
+        let reasoner = onto_ontology::Reasoner::new(ontology.clone());
+        let result = reasoner.reason(&facts);
+
+        // Build explanation output
+        let mut rows = Vec::new();
+
+        // Summary row
+        let mut summary = Map::new();
+        summary.insert("type".to_string(), Value::String("summary".to_string()));
+        summary.insert("ontology".to_string(), Value::String(ontology.name.clone()));
+        summary.insert("original_facts".to_string(), Value::Number(serde_json::Number::from(facts.len())));
+        summary.insert("inferred_facts".to_string(), Value::Number(serde_json::Number::from(result.inferred.len())));
+        summary.insert("total_facts".to_string(), Value::Number(serde_json::Number::from(result.all_facts.len())));
+        summary.insert("iterations".to_string(), Value::Number(serde_json::Number::from(result.iterations)));
+
+        // Rule counts
+        let rule_counts: Map<String, Value> = result.rule_counts.iter().map(|(rule, count)| {
+            (format!("{:?}", rule), Value::Number(serde_json::Number::from(*count)))
+        }).collect();
+        summary.insert("rule_counts".to_string(), Value::Object(rule_counts));
+        rows.push(summary);
+
+        // Each inferred fact as a row
+        for fact in &result.inferred {
+            let mut row = Map::new();
+            row.insert("type".to_string(), Value::String("inferred".to_string()));
+            row.insert("subject".to_string(), Value::String(fact.subject.clone()));
+            row.insert("predicate".to_string(), Value::String(fact.predicate.clone()));
+            row.insert("object".to_string(), Value::String(fact.object.clone()));
+
+            // Find which rule produced this fact
+            let steps = reasoner.explain(&facts, fact);
+            if let Some(step) = steps.first() {
+                row.insert("rule".to_string(), Value::String(format!("{:?}", step.rule)));
+                let premises: Vec<Value> = step.premises.iter().map(|p| {
+                    Value::String(format!("({}, {}, {})", p.subject, p.predicate, p.object))
+                }).collect();
+                row.insert("premises".to_string(), Value::Array(premises));
+            }
+            rows.push(row);
+        }
+
+        // Violations
+        for violation in &result.violations {
+            let mut row = Map::new();
+            row.insert("type".to_string(), Value::String("violation".to_string()));
+            row.insert("message".to_string(), Value::String(violation.clone()));
+            rows.push(row);
+        }
+
+        Ok(QueryResult::Rows(rows))
+    }
+
+    /// Collects all relevant facts (triples) for reasoning from the database.
+    fn collect_facts_for_reasoning(&self, query: &QueryAst, engine: &LsmEngine) -> Result<Vec<onto_ontology::Triple>> {
+        let class_name = match query {
+            QueryAst::Match { class, .. } => class.as_str(),
+            QueryAst::Select { from, .. } => from.as_str(),
+            _ => return Ok(Vec::new()),
+        };
+
+        let class_hierarchy = self.get_class_hierarchy(engine, class_name);
+        let mut facts = Vec::new();
+
+        // Collect rdf:type facts from all classes in the hierarchy
+        for scan_class in &class_hierarchy {
+            let prefix = format!("{}::", scan_class);
+            let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
+            for (key, _) in &entries {
+                let pk = String::from_utf8_lossy(key).to_string();
+                facts.push(onto_ontology::Triple::type_of(&pk, scan_class));
+            }
+        }
+
+        // Collect property facts
+        let ontology = self.ontology_store.find_ontology_for_class(engine, class_name)?;
+        if let Some(onto) = ontology {
+            for scan_class in &class_hierarchy {
+                let prefix = format!("{}::", scan_class);
+                let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
+                for (key, val_bytes) in &entries {
+                    let pk = String::from_utf8_lossy(key).to_string();
+                    if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                        if let Some(obj) = doc.as_object() {
+                            for (prop_name, prop_def) in &onto.properties {
+                                if prop_def.domain == *scan_class || class_hierarchy.contains(&prop_def.domain) {
+                                    if let Some(val) = obj.get(prop_name) {
+                                        let val_str = match val {
+                                            serde_json::Value::String(s) => s.clone(),
+                                            other => other.to_string(),
+                                        };
+                                        facts.push(onto_ontology::Triple::new(&pk, prop_name, &val_str));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(facts)
+    }
+
     /// Executes ANALYZE: collects table statistics for query optimization.
     /// Scans the table, counts rows, and collects column-level statistics.
     /// Uses class hierarchy expansion to include subclass documents.
@@ -2651,6 +2897,118 @@ impl QueryExecutor {
         Ok(QueryResult::Rows(vec![Map::from_iter(vec![
             ("plan".to_string(), plan_json),
         ])]))
+    }
+
+    /// Executes system.* virtual table queries (DBA views for live data).
+    fn execute_system_view(&self, view: &str, engine: &LsmEngine) -> Result<QueryResult> {
+        match view {
+            "system.data_temperature" => self.view_data_temperature(engine),
+            "system.value_events" => self.view_value_events(engine),
+            "system.value_decay_prediction" => self.view_value_decay_prediction(engine),
+            _ => Err(CoreError::InvalidArgument(format!("unknown system view: {}", view))),
+        }
+    }
+
+    /// DBA view: data temperature distribution (hot/warm/cold).
+    fn view_data_temperature(&self, engine: &LsmEngine) -> Result<QueryResult> {
+        let meta_entries = engine.scan_prefix(b"__val_meta__")?;
+        let mut hot = 0u64;
+        let mut warm = 0u64;
+        let mut cold = 0u64;
+        let mut hot_sum = 0.0f64;
+        let mut warm_sum = 0.0f64;
+        let mut cold_sum = 0.0f64;
+
+        for (_key, val_bytes) in &meta_entries {
+            if let Some(meta) = onto_storage::ValueMetadata::from_bytes(val_bytes) {
+                let score = meta.current_score();
+                if score > 0.8 {
+                    hot += 1;
+                    hot_sum += score;
+                } else if score > 0.4 {
+                    warm += 1;
+                    warm_sum += score;
+                } else {
+                    cold += 1;
+                    cold_sum += score;
+                }
+            }
+        }
+
+        let mut rows = Vec::new();
+        let mut row = Map::new();
+        row.insert("tier".to_string(), Value::String("hot (>0.8)".to_string()));
+        row.insert("row_count".to_string(), Value::Number(serde_json::Number::from(hot)));
+        if hot > 0 { row.insert("avg_score".to_string(), Value::Number(serde_json::Number::from_f64(hot_sum / hot as f64).unwrap())); }
+        rows.push(row);
+
+        let mut row = Map::new();
+        row.insert("tier".to_string(), Value::String("warm (0.4-0.8)".to_string()));
+        row.insert("row_count".to_string(), Value::Number(serde_json::Number::from(warm)));
+        if warm > 0 { row.insert("avg_score".to_string(), Value::Number(serde_json::Number::from_f64(warm_sum / warm as f64).unwrap())); }
+        rows.push(row);
+
+        let mut row = Map::new();
+        row.insert("tier".to_string(), Value::String("cold (<0.4)".to_string()));
+        row.insert("row_count".to_string(), Value::Number(serde_json::Number::from(cold)));
+        if cold > 0 { row.insert("avg_score".to_string(), Value::Number(serde_json::Number::from_f64(cold_sum / cold as f64).unwrap())); }
+        rows.push(row);
+
+        Ok(QueryResult::Rows(rows))
+    }
+
+    /// DBA view: value event stream.
+    fn view_value_events(&self, engine: &LsmEngine) -> Result<QueryResult> {
+        let event_entries = engine.scan_prefix(b"__val_event__")?;
+        let mut rows = Vec::new();
+
+        for (_key, val_bytes) in &event_entries {
+            if let Ok(event) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                if let Some(obj) = event.as_object() {
+                    rows.push(obj.clone());
+                }
+            }
+        }
+
+        // Sort by timestamp descending
+        rows.sort_by(|a, b| {
+            let ts_a = a.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+            let ts_b = b.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+            ts_b.cmp(&ts_a)
+        });
+
+        Ok(QueryResult::Rows(rows))
+    }
+
+    /// DBA view: decay prediction (when will data become cold).
+    fn view_value_decay_prediction(&self, engine: &LsmEngine) -> Result<QueryResult> {
+        let meta_entries = engine.scan_prefix(b"__val_meta__")?;
+        let mut rows = Vec::new();
+
+        for (key, val_bytes) in &meta_entries {
+            if let Some(meta) = onto_storage::ValueMetadata::from_bytes(val_bytes) {
+                if let Some((class, pk)) = onto_storage::ValueMetadata::parse_meta_key(key) {
+                    let cur_score = meta.current_score();
+                    // Predict when score drops to 0.4 (cold threshold)
+                    // 0.4 = value_score * e^(-λ * Δt) → Δt = ln(value_score / 0.4) / λ
+                    let predicted_cold_at = if meta.lambda > 0.0 && cur_score > 0.4 {
+                        let dt = (meta.value_score / 0.4).ln() / meta.lambda;
+                        meta.last_activated_at + dt as u64
+                    } else {
+                        0 // Already cold or no decay
+                    };
+
+                    let mut row = Map::new();
+                    row.insert("entity".to_string(), Value::String(format!("{}::{}", class, pk)));
+                    row.insert("cur_score".to_string(), Value::Number(serde_json::Number::from_f64((cur_score * 1000.0).round() / 1000.0).unwrap()));
+                    row.insert("lambda".to_string(), Value::Number(serde_json::Number::from_f64(meta.lambda).unwrap()));
+                    row.insert("predicted_cold_at".to_string(), Value::Number(serde_json::Number::from(predicted_cold_at)));
+                    rows.push(row);
+                }
+            }
+        }
+
+        Ok(QueryResult::Rows(rows))
     }
 
     /// Read-only ANALYZE: collects table statistics without engine mutation.
@@ -3735,6 +4093,410 @@ impl QueryExecutor {
         }
     }
 
+    /// Execute GRAPH MATCH query against the graph store.
+    ///
+    /// Supports single-hop and multi-hop pattern matching:
+    /// `GRAPH MATCH (a:Person) -[e:KNOWS]-> (b:Person) WHERE a.name = 'Alice' RETURN a.name, b.name`
+    fn execute_graph_match_read(
+        &self,
+        engine: &LsmEngine,
+        pattern: &crate::parser::GraphPattern,
+        filter: &Option<FilterExpr>,
+        returns: &[String],
+    ) -> Result<QueryResult> {
+        use onto_graph::traversal::{Direction, TraversalEngine};
+
+        let Some(ref graph) = self.graph else {
+            return Err(CoreError::InvalidArgument(
+                "GRAPH MATCH requires graph store (start server with graph enabled)".to_string()
+            ));
+        };
+
+        let nodes = &pattern.nodes;
+        let edges = &pattern.edges;
+
+        if nodes.is_empty() {
+            return Ok(QueryResult::Rows(Vec::new()));
+        }
+
+        // Load ontology for reasoning (subclass expansion, inverse property derivation)
+        let ontology = if let Some(first_label) = nodes[0].label.as_ref() {
+            self.ontology_store.find_ontology_for_class(engine, first_label).unwrap_or(None)
+        } else {
+            None
+        };
+
+        let traversal = TraversalEngine::new(graph.as_ref());
+        let mut result_rows: Vec<Map<String, Value>> = Vec::new();
+
+        // Get starting vertices — with subclass expansion if ontology is available
+        let first_node = &nodes[0];
+        let start_vertices = if let Some(label) = &first_node.label {
+            // Ontology reasoning: expand subclasses
+            let expanded_labels = if let Some(ref onto) = ontology {
+                let mut labels = vec![label.clone()];
+                let subclasses = onto.get_all_subclasses(label);
+                labels.extend(subclasses);
+                labels
+            } else {
+                vec![label.clone()]
+            };
+
+            let mut all_vertices = Vec::new();
+            for lbl in &expanded_labels {
+                all_vertices.extend(graph.get_vertices_by_label(lbl));
+            }
+            all_vertices
+        } else {
+            graph.get_all_vertices()
+        };
+
+        // For single-node pattern (no edges), just return matching vertices
+        if edges.is_empty() {
+            for vertex in &start_vertices {
+                let mut row = Map::new();
+                if !first_node.variable.is_empty() {
+                    // Prefix all vertex properties with variable name
+                    for (k, v) in &vertex.properties {
+                        row.insert(format!("{}.{}", first_node.variable, k), Self::prop_value_to_json(v));
+                    }
+                    row.insert(format!("{}.id", first_node.variable), Value::String(vertex.id.clone()));
+                } else {
+                    for (k, v) in &vertex.properties {
+                        row.insert(k.clone(), Self::prop_value_to_json(v));
+                    }
+                }
+                result_rows.push(row);
+            }
+        } else {
+            // Multi-hop pattern matching
+            // For each starting vertex, walk the pattern edges
+            for start_vertex in &start_vertices {
+                let mut current_bindings: Vec<Map<String, Value>> = Vec::new();
+                let mut init_row = Map::new();
+                if !first_node.variable.is_empty() {
+                    init_row.insert(format!("{}.id", first_node.variable), Value::String(start_vertex.id.clone()));
+                    for (k, v) in &start_vertex.properties {
+                        init_row.insert(format!("{}.{}", first_node.variable, k), Self::prop_value_to_json(v));
+                    }
+                }
+                current_bindings.push(init_row);
+
+                // Walk each edge in the pattern
+                for (edge_idx, edge) in edges.iter().enumerate() {
+                    let next_node = &nodes[edge_idx + 1];
+                    let mut new_bindings = Vec::new();
+
+                    for binding in &current_bindings {
+                        // Determine the source vertex ID for this hop
+                        let source_var = if edge.direction == crate::parser::GraphDirection::In {
+                            &next_node.variable
+                        } else {
+                            if edge_idx == 0 {
+                                &first_node.variable
+                            } else {
+                                &edges[edge_idx - 1].to
+                            }
+                        };
+
+                        let source_id = binding.get(&format!("{}.id", source_var))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        if source_id.is_empty() {
+                            continue;
+                        }
+
+                        // Get neighbors through this edge
+                        let direction = match edge.direction {
+                            crate::parser::GraphDirection::Out => Direction::Out,
+                            crate::parser::GraphDirection::In => Direction::In,
+                            crate::parser::GraphDirection::Both => Direction::Both,
+                        };
+
+                        let edge_label = edge.label.as_deref();
+
+                        // Ontology reasoning: resolve inverse property
+                        // If edge label is "manages" and ontology defines "managed_by" as INVERSE OF "manages",
+                        // also traverse "managed_by" in the opposite direction
+                        let mut effective_labels: Vec<String> = Vec::new();
+                        let mut effective_directions: Vec<Direction> = Vec::new();
+
+                        if let (Some(label), Some(ref onto)) = (edge_label, &ontology) {
+                            effective_labels.push(label.to_string());
+                            effective_directions.push(direction);
+
+                            // Check if this property has an inverse defined in the ontology
+                            if let Some(prop) = onto.properties.get(label) {
+                                if let Some(ref inverse_name) = prop.inverse_of {
+                                    // Also traverse the inverse property in opposite direction
+                                    let inverse_dir = match direction {
+                                        Direction::Out => Direction::In,
+                                        Direction::In => Direction::Out,
+                                        Direction::Both => Direction::Both,
+                                    };
+                                    effective_labels.push(inverse_name.clone());
+                                    effective_directions.push(inverse_dir);
+                                }
+                            }
+
+                            // Check if any property has this as its inverse
+                            for (prop_name, prop_def) in &onto.properties {
+                                if prop_def.inverse_of.as_deref() == Some(label) {
+                                    let inverse_dir = match direction {
+                                        Direction::Out => Direction::In,
+                                        Direction::In => Direction::Out,
+                                        Direction::Both => Direction::Both,
+                                    };
+                                    if !effective_labels.contains(prop_name) {
+                                        effective_labels.push(prop_name.clone());
+                                        effective_directions.push(inverse_dir);
+                                    }
+                                }
+                            }
+                        } else {
+                            if let Some(label) = edge_label {
+                                effective_labels.push(label.to_string());
+                            }
+                            effective_directions.push(direction);
+                        }
+
+                        // Traverse all effective labels
+                        let mut all_neighbors = Vec::new();
+                        for (lbl, dir) in effective_labels.iter().zip(effective_directions.iter()) {
+                            let neighbors = traversal.hop(&source_id, *dir, Some(lbl.as_str()), None, None)
+                                .unwrap_or_default();
+                            for n in neighbors {
+                                if !all_neighbors.iter().any(|existing: &onto_graph::model::Vertex| existing.id == n.id) {
+                                    all_neighbors.push(n);
+                                }
+                            }
+                        }
+
+                        // Ontology reasoning: expand target node subclasses
+                        let expanded_target_labels = if let (Some(ref target_label), Some(ref onto)) = (&next_node.label, &ontology) {
+                            let mut labels = vec![target_label.clone()];
+                            let subclasses = onto.get_all_subclasses(target_label);
+                            labels.extend(subclasses);
+                            labels
+                        } else {
+                            next_node.label.as_ref().map(|l| vec![l.clone()]).unwrap_or_default()
+                        };
+
+                        for neighbor in &all_neighbors {
+                            // Check label filter on target node (with subclass expansion)
+                            if !expanded_target_labels.is_empty() {
+                                let matches = neighbor.labels.iter().any(|l| expanded_target_labels.contains(l));
+                                if !matches {
+                                    continue;
+                                }
+                            }
+
+                            let mut new_row = binding.clone();
+                            if !next_node.variable.is_empty() {
+                                new_row.insert(format!("{}.id", next_node.variable), Value::String(neighbor.id.clone()));
+                                for (k, v) in &neighbor.properties {
+                                    new_row.insert(format!("{}.{}", next_node.variable, k), Self::prop_value_to_json(v));
+                                }
+                            }
+                            new_bindings.push(new_row);
+                        }
+                    }
+
+                    current_bindings = new_bindings;
+                }
+
+                result_rows.extend(current_bindings);
+            }
+        }
+
+        // Apply WHERE filter
+        if let Some(f) = filter {
+            result_rows.retain(|row| Self::eval_graph_filter(row, f));
+        }
+
+        // Apply RETURN projection
+        if !returns.is_empty() {
+            let projected: Vec<Map<String, Value>> = result_rows.iter().map(|row| {
+                let mut result = Map::new();
+                for col in returns {
+                    let col_trimmed = col.trim();
+                    // Try direct match, then with .name suffix
+                    if let Some(val) = row.get(col_trimmed) {
+                        result.insert(col_trimmed.to_string(), val.clone());
+                    } else if let Some(val) = row.get(&format!("{}.name", col_trimmed)) {
+                        result.insert(col_trimmed.to_string(), val.clone());
+                    } else if let Some(val) = row.get(&format!("{}.id", col_trimmed)) {
+                        result.insert(col_trimmed.to_string(), val.clone());
+                    }
+                }
+                result
+            }).collect();
+            Ok(QueryResult::Rows(projected))
+        } else {
+            Ok(QueryResult::Rows(result_rows))
+        }
+    }
+
+    /// Execute GRAPH SHORTEST PATH query.
+    fn execute_graph_shortest_path_read(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        max_depth: usize,
+    ) -> Result<QueryResult> {
+        use onto_graph::traversal::TraversalEngine;
+
+        let Some(ref graph) = self.graph else {
+            return Err(CoreError::InvalidArgument(
+                "GRAPH SHORTEST PATH requires graph store".to_string()
+            ));
+        };
+
+        let traversal = TraversalEngine::new(graph.as_ref());
+        match traversal.shortest_path(from_id, to_id, max_depth) {
+            Ok(Some(path)) => {
+                let mut row = Map::new();
+                row.insert("path".to_string(), Value::Array(
+                    path.vertex_ids.iter().map(|id| Value::String(id.clone())).collect()
+                ));
+                row.insert("length".to_string(), Value::Number(serde_json::Number::from(path.length)));
+                row.insert("from".to_string(), Value::String(from_id.to_string()));
+                row.insert("to".to_string(), Value::String(to_id.to_string()));
+                Ok(QueryResult::Rows(vec![row]))
+            }
+            Ok(None) => {
+                Ok(QueryResult::Rows(Vec::new()))
+            }
+            Err(e) => Err(CoreError::Custom(format!("graph shortest path error: {}", e))),
+        }
+    }
+
+    /// Execute GRAPH TRAVERSE query.
+    fn execute_graph_traverse_read(
+        &self,
+        start_id: &str,
+        direction: crate::parser::GraphDirection,
+        edge_label: Option<&str>,
+        max_depth: usize,
+        filter: &Option<FilterExpr>,
+    ) -> Result<QueryResult> {
+        use onto_graph::traversal::{Direction, TraversalEngine};
+
+        let Some(ref graph) = self.graph else {
+            return Err(CoreError::InvalidArgument(
+                "GRAPH TRAVERSE requires graph store".to_string()
+            ));
+        };
+
+        let dir = match direction {
+            crate::parser::GraphDirection::Out => Direction::Out,
+            crate::parser::GraphDirection::In => Direction::In,
+            crate::parser::GraphDirection::Both => Direction::Both,
+        };
+
+        let traversal = TraversalEngine::new(graph.as_ref());
+        let result = traversal.traverse_bfs(start_id, max_depth, dir, edge_label, None)
+            .map_err(|e| CoreError::Custom(format!("graph traversal error: {}", e)))?;
+
+        let mut rows: Vec<Map<String, Value>> = Vec::new();
+        for vertex in &result.vertices {
+            let mut row = Map::new();
+            row.insert("id".to_string(), Value::String(vertex.id.clone()));
+            row.insert("labels".to_string(), Value::Array(
+                vertex.labels.iter().map(|l| Value::String(l.clone())).collect()
+            ));
+            for (k, v) in &vertex.properties {
+                row.insert(k.clone(), Self::prop_value_to_json(v));
+            }
+            rows.push(row);
+        }
+
+        if let Some(f) = filter {
+            rows.retain(|row| Self::eval_graph_filter(row, f));
+        }
+
+        Ok(QueryResult::Rows(rows))
+    }
+
+    /// Evaluate a filter expression against a graph match result row.
+    fn eval_graph_filter(row: &Map<String, Value>, filter: &FilterExpr) -> bool {
+        match filter {
+            FilterExpr::Eq(col, val) => {
+                row.get(col).map_or(false, |v| Self::value_matches_literal(v, val))
+            }
+            FilterExpr::Ne(col, val) => {
+                row.get(col).map_or(true, |v| !Self::value_matches_literal(v, val))
+            }
+            FilterExpr::Gt(col, val) => {
+                row.get(col).map_or(false, |v| Self::value_gt_literal(v, val))
+            }
+            FilterExpr::Lt(col, val) => {
+                row.get(col).map_or(false, |v| Self::value_lt_literal(v, val))
+            }
+            FilterExpr::Gte(col, val) => {
+                row.get(col).map_or(false, |v| Self::value_gt_literal(v, val) || Self::value_matches_literal(v, val))
+            }
+            FilterExpr::Lte(col, val) => {
+                row.get(col).map_or(false, |v| Self::value_lt_literal(v, val) || Self::value_matches_literal(v, val))
+            }
+            FilterExpr::And(left, right) => {
+                Self::eval_graph_filter(row, left) && Self::eval_graph_filter(row, right)
+            }
+            FilterExpr::Or(left, right) => {
+                Self::eval_graph_filter(row, left) || Self::eval_graph_filter(row, right)
+            }
+            FilterExpr::Not(inner) => {
+                !Self::eval_graph_filter(row, inner)
+            }
+            _ => true, // Unsupported filters pass through
+        }
+    }
+
+    fn value_matches_literal(value: &Value, literal: &crate::parser::LiteralValue) -> bool {
+        match (value, literal) {
+            (Value::String(s), crate::parser::LiteralValue::String(l)) => s == l,
+            (Value::Number(n), crate::parser::LiteralValue::Int(l)) => n.as_i64() == Some(*l),
+            (Value::Number(n), crate::parser::LiteralValue::Float(l)) => n.as_f64() == Some(*l),
+            (Value::Bool(b), crate::parser::LiteralValue::Bool(l)) => b == l,
+            _ => false,
+        }
+    }
+
+    fn value_gt_literal(value: &Value, literal: &crate::parser::LiteralValue) -> bool {
+        match (value, literal) {
+            (Value::Number(n), crate::parser::LiteralValue::Int(l)) => n.as_i64().map_or(false, |v| v > *l),
+            (Value::Number(n), crate::parser::LiteralValue::Float(l)) => n.as_f64().map_or(false, |v| v > *l),
+            (Value::String(s), crate::parser::LiteralValue::String(l)) => s > l,
+            _ => false,
+        }
+    }
+
+    fn value_lt_literal(value: &Value, literal: &crate::parser::LiteralValue) -> bool {
+        match (value, literal) {
+            (Value::Number(n), crate::parser::LiteralValue::Int(l)) => n.as_i64().map_or(false, |v| v < *l),
+            (Value::Number(n), crate::parser::LiteralValue::Float(l)) => n.as_f64().map_or(false, |v| v < *l),
+            (Value::String(s), crate::parser::LiteralValue::String(l)) => s < l,
+            _ => false,
+        }
+    }
+
+    fn prop_value_to_json(v: &onto_graph::model::PropValue) -> Value {
+        match v {
+            onto_graph::model::PropValue::Null => Value::Null,
+            onto_graph::model::PropValue::Bool(b) => Value::Bool(*b),
+            onto_graph::model::PropValue::Int(i) => Value::Number(serde_json::Number::from(*i)),
+            onto_graph::model::PropValue::Float(f) => {
+                serde_json::Number::from_f64(*f).map(Value::Number).unwrap_or(Value::Null)
+            }
+            onto_graph::model::PropValue::String(s) => Value::String(s.clone()),
+            onto_graph::model::PropValue::List(l) => {
+                Value::Array(l.iter().map(|item| Self::prop_value_to_json(item)).collect())
+            }
+        }
+    }
+
     /// Read-only VectorSearch execution with &LsmEngine.
     fn execute_vector_search_read(
         &self,
@@ -4090,42 +4852,91 @@ impl QueryExecutor {
         ctes: &[crate::parser::CteDefinition],
         query: &QueryAst,
         engine: &LsmEngine,
-        _recursive: bool,
+        recursive: bool,
     ) -> Result<QueryResult> {
-        // Materialize each CTE: execute the query and store results under a temp key
+        const MAX_RECURSION_DEPTH: usize = 100;
+
         for cte in ctes {
-            let cte_result = self.execute_with_engine_inner(&cte.query, engine)?;
-            if let QueryResult::Rows(rows) = cte_result {
-                // Store CTE results as a temporary "table" using a special prefix
-                let prefix = format!("__cte_{}::", cte.name.to_lowercase());
-                // Clear any previous CTE with this name
-                let existing = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
-                for (key, _) in existing {
-                    engine.delete(key)?;
+            let prefix = format!("__cte_{}::", cte.name.to_lowercase());
+            Self::clear_cte(engine, &prefix)?;
+
+            if recursive {
+                // Recursive CTE: query is a UNION [ALL] of base case + recursive part
+                if let QueryAst::Union { left, right, all } = cte.query.as_ref() {
+                    // Step 1: Execute base case
+                    let base_result = self.execute_with_engine_inner(left, engine)?;
+                    let mut all_rows: Vec<Map<String, Value>> = match base_result {
+                        QueryResult::Rows(rows) => rows,
+                        _ => Vec::new(),
+                    };
+                    Self::materialize_cte(engine, &prefix, &all_rows)?;
+
+                    // Step 2: Iteratively execute recursive part until fixed point
+                    for _ in 0..MAX_RECURSION_DEPTH {
+                        let recursive_result = self.execute_with_engine_inner(right, engine)?;
+                        let new_rows = match recursive_result {
+                            QueryResult::Rows(rows) => rows,
+                            _ => break,
+                        };
+                        if new_rows.is_empty() {
+                            break;
+                        }
+                        if !all {
+                            let existing_set: std::collections::HashSet<String> = all_rows
+                                .iter()
+                                .map(|r| serde_json::to_string(r).unwrap_or_default())
+                                .collect();
+                            let truly_new: Vec<Map<String, Value>> = new_rows
+                                .into_iter()
+                                .filter(|r| !existing_set.contains(&serde_json::to_string(r).unwrap_or_default()))
+                                .collect();
+                            if truly_new.is_empty() { break; }
+                            all_rows.extend(truly_new);
+                        } else {
+                            all_rows.extend(new_rows);
+                        }
+                        Self::clear_cte(engine, &prefix)?;
+                        Self::materialize_cte(engine, &prefix, &all_rows)?;
+                    }
+                } else {
+                    let cte_result = self.execute_with_engine_inner(&cte.query, engine)?;
+                    if let QueryResult::Rows(rows) = cte_result {
+                        Self::materialize_cte(engine, &prefix, &rows)?;
+                    }
                 }
-                // Insert each row as a CTE entry
-                for (i, row) in rows.iter().enumerate() {
-                    let key = format!("{}{:010}", prefix, i);
-                    let value = doc_to_storage_bytes(row);
-                    engine.put(key.as_bytes().to_vec(), value)?;
+            } else {
+                // Non-recursive CTE: simple materialization
+                let cte_result = self.execute_with_engine_inner(&cte.query, engine)?;
+                if let QueryResult::Rows(rows) = cte_result {
+                    Self::materialize_cte(engine, &prefix, &rows)?;
                 }
             }
         }
 
-        // Execute the main query 鈥?it will scan CTE tables via the prefix scan path
-        // We need to handle CTE name resolution in the main query
         let result = self.execute_with_engine_inner(query, engine);
 
-        // Clean up CTE temporary data
         for cte in ctes {
-            let prefix = format!("__cte_{}::", cte.name.to_lowercase());
-            let existing = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
-            for (key, _) in existing {
-                engine.delete(key)?;
-            }
+            Self::clear_cte(engine, &format!("__cte_{}::", cte.name.to_lowercase()))?;
         }
 
         result
+    }
+
+    fn materialize_cte(engine: &LsmEngine, prefix: &str, rows: &[Map<String, Value>]) -> Result<()> {
+        for (i, row) in rows.iter().enumerate() {
+            let key = format!("{}{:010}", prefix, i);
+            let value = doc_to_storage_bytes(row);
+            engine.put(key.as_bytes().to_vec(), value)?;
+        }
+        Ok(())
+    }
+
+    fn clear_cte(engine: &LsmEngine, prefix: &str) -> Result<()> {
+        let existing = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
+        for (key, _) in existing {
+            engine.delete(key)?;
+        }
+        Ok(())
     }
 
     /// Executes a statement within an existing transaction, with an optional pre-computed plan.
@@ -4771,7 +5582,7 @@ impl QueryExecutor {
                 }
 
                 // Compute window function values
-                let values = Self::compute_window_values(&window.func, window.arg.as_deref(), &partition_rows, &window.over.frame);
+                let values = Self::compute_window_values(&window.func, window.arg.as_deref(), &partition_rows, &window.over.frame, &window.over.order_by);
 
                 // Write values back to rows
                 for (i, val) in partition_indices.iter().zip(values.iter()) {
@@ -4805,29 +5616,49 @@ impl QueryExecutor {
         arg: Option<&str>,
         partition: &[(usize, Map<String, Value>)],
         _frame: &Option<crate::parser::WindowFrame>,
+        order_by: &[crate::parser::WindowOrderBy],
     ) -> Vec<Value> {
         let n = partition.len();
-        let mut values = Vec::with_capacity(n);
+        let mut values: Vec<Value> = Vec::with_capacity(n);
 
         for idx in 0..n {
             let val = match func {
                 WindowFunc::RowNumber => Value::Number(serde_json::Number::from(idx + 1)),
                 WindowFunc::Rank => {
-                    // Rank: same value gets same rank, then skip
-                    let _rank = 1;
-                    if let Some(_ob) = partition.iter().find_map(|(_, row)| {
-                        // Use the first ORDER BY column for ranking
-                        Some(row)
-                    }) {
-                        // Simple rank: position + 1
+                    // RANK(): same values get same rank, then skip (1,1,3,4)
+                    if order_by.is_empty() || idx == 0 {
                         Value::Number(serde_json::Number::from(idx + 1))
                     } else {
-                        Value::Number(serde_json::Number::from(idx + 1))
+                        let same_as_prev = order_by.iter().all(|ob| {
+                            let a = Self::resolve_column_value(&partition[idx - 1].1, &ob.column).unwrap_or_default();
+                            let b = Self::resolve_column_value(&partition[idx].1, &ob.column).unwrap_or_default();
+                            a == b
+                        });
+                        if same_as_prev {
+                            values[idx - 1].clone()
+                        } else {
+                            Value::Number(serde_json::Number::from(idx + 1))
+                        }
                     }
                 }
                 WindowFunc::DenseRank => {
-                    // Dense rank: same value gets same rank, no skip
-                    Value::Number(serde_json::Number::from(idx + 1))
+                    // DENSE_RANK(): same values get same rank, no skip (1,1,2,3)
+                    if order_by.is_empty() || idx == 0 {
+                        Value::Number(serde_json::Number::from(1))
+                    } else {
+                        let same_as_prev = order_by.iter().all(|ob| {
+                            let a = Self::resolve_column_value(&partition[idx - 1].1, &ob.column).unwrap_or_default();
+                            let b = Self::resolve_column_value(&partition[idx].1, &ob.column).unwrap_or_default();
+                            a == b
+                        });
+                        if same_as_prev {
+                            values[idx - 1].clone()
+                        } else if let Value::Number(prev) = &values[idx - 1] {
+                            Value::Number(serde_json::Number::from(prev.as_u64().unwrap_or(0) + 1))
+                        } else {
+                            Value::Number(serde_json::Number::from(1))
+                        }
+                    }
                 }
                 WindowFunc::Lag => {
                     // LAG(col, offset=1, default=NULL)
@@ -5117,7 +5948,17 @@ impl QueryExecutor {
             }
         }
 
+        // Live data: auto-assess value score on INSERT (if enabled)
+        if engine.options().value_scorer_enabled {
+            if let Ok(pk) = std::str::from_utf8(&key) {
+                let score = onto_storage::ValueScorer::assess(&doc);
+                let meta = onto_storage::ValueMetadata::new(score, engine.options().default_lambda);
+                let _ = engine.put_value_meta(class, pk, &meta);
+            }
+        }
+
         engine.txn_put(txn_id, key, value)?;
+
         Ok(QueryResult::Success("1 row inserted".to_string()))
     }
 

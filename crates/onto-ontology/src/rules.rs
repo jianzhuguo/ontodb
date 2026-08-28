@@ -309,35 +309,40 @@ impl Rule for PrpTrp {
     ) -> Vec<Triple> {
         let mut inferred = Vec::new();
 
+        // Identify transitive predicates once
+        let transitive_preds: Vec<&str> = ontology.properties.iter()
+            .filter(|(_, p)| p.is_transitive)
+            .map(|(name, _)| name.as_str())
+            .collect();
+
+        if transitive_preds.is_empty() {
+            return inferred;
+        }
+
         if new_facts.is_empty() {
-            // First iteration: full scan (same as before)
-            let mut by_predicate: std::collections::HashMap<&str, Vec<(&str, &str)>> =
+            // First iteration: build obj_map from all facts, then do one-hop extension
+            let mut obj_map: std::collections::HashMap<&str, Vec<&str>> =
                 std::collections::HashMap::new();
             for fact in facts {
-                if fact.predicate == "rdf:type" {
+                if transitive_preds.contains(&fact.predicate.as_str()) {
+                    obj_map.entry(fact.subject.as_str()).or_default().push(fact.object.as_str());
+                }
+            }
+            // Iterate facts directly for first iteration
+            for fact in facts {
+                if !transitive_preds.contains(&fact.predicate.as_str()) {
                     continue;
                 }
-                by_predicate
-                    .entry(&fact.predicate)
-                    .or_default()
-                    .push((&fact.subject, &fact.object));
-            }
-            for (pred, pairs) in &by_predicate {
-                if let Some(prop_def) = ontology.properties.get(*pred) {
-                    if prop_def.is_transitive {
-                        let mut obj_map: std::collections::HashMap<&str, Vec<&str>> =
-                            std::collections::HashMap::new();
-                        for (s, o) in pairs {
-                            obj_map.entry(*s).or_default().push(*o);
-                        }
-                        for (a, b) in pairs {
-                            if let Some(c_list) = obj_map.get(b) {
-                                for c in c_list {
-                                    if a != c {
-                                        let t = Triple::new(*a, *pred, *c);
-                                        if !facts.contains(&t) {
-                                            inferred.push(t);
-                                        }
+                let a = &fact.subject;
+                let pred = &fact.predicate;
+                if let Some(b_list) = obj_map.get(a.as_str()) {
+                    for b in b_list {
+                        if let Some(c_list) = obj_map.get(*b) {
+                            for c in c_list {
+                                if a.as_str() != *c {
+                                    let t = Triple::new(a.as_str(), pred.as_str(), *c);
+                                    if !facts.contains(&t) {
+                                        inferred.push(t);
                                     }
                                 }
                             }
@@ -347,37 +352,20 @@ impl Rule for PrpTrp {
             }
         } else {
             // Incremental: only extend from new facts
-            // Build obj_map and subj_map from FULL facts for lookup
-            let mut transitive_preds = HashSet::new();
-            for (name, prop_def) in &ontology.properties {
-                if prop_def.is_transitive {
-                    transitive_preds.insert(name.as_str());
-                }
-            }
-            if transitive_preds.is_empty() {
-                return inferred;
-            }
-
             // Build lookup indexes from full facts (only transitive predicates)
             let mut obj_map: std::collections::HashMap<&str, Vec<&str>> =
-                std::collections::HashMap::new(); // subject -> [objects]
+                std::collections::HashMap::new();
             let mut subj_map: std::collections::HashMap<&str, Vec<&str>> =
-                std::collections::HashMap::new(); // object -> [subjects]
+                std::collections::HashMap::new();
             for fact in facts.iter() {
-                if transitive_preds.contains(fact.predicate.as_str()) {
-                    obj_map
-                        .entry(fact.subject.as_str())
-                        .or_default()
-                        .push(fact.object.as_str());
-                    subj_map
-                        .entry(fact.object.as_str())
-                        .or_default()
-                        .push(fact.subject.as_str());
+                if transitive_preds.contains(&fact.predicate.as_str()) {
+                    obj_map.entry(fact.subject.as_str()).or_default().push(fact.object.as_str());
+                    subj_map.entry(fact.object.as_str()).or_default().push(fact.subject.as_str());
                 }
             }
 
             for fact in new_facts {
-                if !transitive_preds.contains(fact.predicate.as_str()) {
+                if !transitive_preds.contains(&fact.predicate.as_str()) {
                     continue;
                 }
                 let pred = &fact.predicate;

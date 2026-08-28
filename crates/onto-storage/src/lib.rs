@@ -35,9 +35,11 @@ pub mod mvcc;
 pub mod options;
 pub mod tiered_storage;
 pub mod tsm;
+pub mod value_meta;
 pub mod vector;
 
 pub use engine::{LsmEngine, BackupManifest, BackupFile, BackupFileType};
+pub use value_meta::{ValueMetadata, ValueScorer, LAMBDA_7H, LAMBDA_70D, LAMBDA_2Y};
 pub use index::{IndexManager, IndexStorageMode};
 pub use iterator::StorageIterator;
 pub use mvcc::{TxnManager, Transaction, TxnStatus, WriteOp};

@@ -6,7 +6,7 @@
 
 use crate::model::{Individual, Ontology, Triple};
 use crate::rules::{default_rules, Rule, RuleId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// An error that occurred during reasoning.
 #[derive(Debug, Clone)]
@@ -80,21 +80,147 @@ impl Reasoner {
     /// Performs full reasoning over the given facts.
     ///
     /// Applies all rules iteratively until no new triples are derived (fixed point).
+    /// When `parallel` is enabled via `with_parallel()`, independent rules are applied
+    /// concurrently using `std::thread::scope`.
     pub fn reason(&self, facts: &[Triple]) -> ReasoningResult {
+        self.reason_inner(facts, false)
+    }
+
+    /// Performs reasoning with parallel rule application.
+    ///
+    /// Independent rules (e.g., Prp-symp and Prp-inv) are applied concurrently.
+    pub fn reason_parallel(&self, facts: &[Triple]) -> ReasoningResult {
+        self.reason_inner(facts, true)
+    }
+
+    fn reason_inner(&self, facts: &[Triple], parallel: bool) -> ReasoningResult {
         let mut all_facts: HashSet<Triple> = facts.iter().cloned().collect();
         let mut all_inferred: Vec<Triple> = Vec::new();
         let mut rule_counts: HashMap<RuleId, usize> = HashMap::new();
         let mut iterations = 0;
-        let mut new_facts: Vec<Triple> = Vec::new(); // tracks facts added in previous iteration
+        let mut new_facts: Vec<Triple> = Vec::new();
+
+        // Fast path: compute transitive closure using BFS (O(n) instead of O(n² × iterations))
+        let mut transitive_handled: HashSet<String> = HashSet::new();
+        for (prop_name, prop_def) in &self.ontology.properties {
+            if !prop_def.is_transitive {
+                continue;
+            }
+            transitive_handled.insert(prop_name.clone());
+            // Build adjacency list for this transitive property
+            let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+            for fact in &all_facts {
+                if fact.predicate == *prop_name {
+                    adj.entry(fact.subject.as_str()).or_default().push(fact.object.as_str());
+                }
+            }
+            // BFS from each source to compute full transitive closure
+            let mut new_transitive = Vec::new();
+            for (start, targets) in &adj {
+                let mut visited = HashSet::new();
+                let mut queue: VecDeque<&str> = VecDeque::new();
+                for t in targets {
+                    visited.insert(*t);
+                    queue.push_back(t);
+                }
+                while let Some(node) = queue.pop_front() {
+                    let t = Triple::new(*start, prop_name.as_str(), node);
+                    if !all_facts.contains(&t) {
+                        new_transitive.push(t);
+                    }
+                    if let Some(neighbors) = adj.get(node) {
+                        for n in neighbors {
+                            if visited.insert(*n) {
+                                queue.push_back(n);
+                            }
+                        }
+                    }
+                }
+            }
+            let count = new_transitive.len();
+            if count > 0 {
+                rule_counts.insert(RuleId::PrpTrp, count);
+                for t in new_transitive {
+                    all_facts.insert(t.clone());
+                    all_inferred.push(t);
+                }
+            }
+        }
+
+        // Fast path: Cax-sco + Cax-eqc using pre-computed superclass cache
+        {
+            let superclass_cache = self.ontology.build_superclass_cache();
+            let mut cax_new = Vec::new();
+            for fact in &all_facts {
+                if fact.predicate != "rdf:type" {
+                    continue;
+                }
+                // Subclass propagation
+                if let Some(supers) = superclass_cache.get(&fact.object) {
+                    for sup in supers {
+                        let t = Triple::type_of(&fact.subject, sup);
+                        if !all_facts.contains(&t) {
+                            cax_new.push(t);
+                        }
+                    }
+                }
+                // Equivalent class propagation
+                if let Some(class) = self.ontology.classes.get(&fact.object) {
+                    for equiv in &class.equivalent_classes {
+                        let t = Triple::type_of(&fact.subject, equiv);
+                        if !all_facts.contains(&t) {
+                            cax_new.push(t);
+                        }
+                    }
+                }
+            }
+            let count = cax_new.len();
+            if count > 0 {
+                *rule_counts.entry(RuleId::CaxSco).or_insert(0) += count;
+                for t in cax_new {
+                    all_facts.insert(t.clone());
+                    all_inferred.push(t);
+                }
+            }
+        }
+
+        // For the iterative loop, seed new_facts with original property facts
+        // (non-rdf:type) so PrpInv/PrpSymp/PrpSpo/PrpEqp can process them.
+        // The fast paths already handled rdf:type and transitive properties.
+        new_facts = facts.iter()
+            .filter(|t| t.predicate != "rdf:type")
+            .cloned()
+            .collect();
 
         for _iter in 0..self.max_iterations {
             iterations += 1;
             let mut new_this_round: Vec<Triple> = Vec::new();
 
-            for rule in &self.rules {
-                let inferred = rule.apply(&self.ontology, &all_facts, &new_facts);
-                *rule_counts.entry(rule.id()).or_insert(0) += inferred.len();
-                new_this_round.extend(inferred);
+            if parallel && self.rules.len() > 1 {
+                let rule_results: Vec<(RuleId, Vec<Triple>)> = std::thread::scope(|s| {
+                    let handles: Vec<_> = self.rules.iter().map(|rule| {
+                        s.spawn(|| {
+                            let inferred = rule.apply(&self.ontology, &all_facts, &new_facts);
+                            (rule.id(), inferred)
+                        })
+                    }).collect();
+                    handles.into_iter().filter_map(|h| h.join().ok()).collect()
+                });
+                for (rule_id, inferred) in rule_results {
+                    *rule_counts.entry(rule_id).or_insert(0) += inferred.len();
+                    new_this_round.extend(inferred);
+                }
+            } else {
+                for rule in &self.rules {
+                    // Skip rules already handled by fast paths
+                    match rule.id() {
+                        RuleId::CaxSco | RuleId::CaxEqc | RuleId::PrpTrp => continue,
+                        _ => {}
+                    }
+                    let inferred = rule.apply(&self.ontology, &all_facts, &new_facts);
+                    *rule_counts.entry(rule.id()).or_insert(0) += inferred.len();
+                    new_this_round.extend(inferred);
+                }
             }
 
             // Deduplicate: only add triples not already known

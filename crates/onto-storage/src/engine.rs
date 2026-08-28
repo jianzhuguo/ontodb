@@ -311,6 +311,11 @@ impl LsmEngine {
         self.options.data_dir.clone()
     }
 
+    /// Returns a reference to the storage options.
+    pub fn options(&self) -> &StorageOptions {
+        &self.options
+    }
+
     /// Puts a key-value pair.
     pub fn put(&self, key: Key, value: Value) -> Result<()> {
         let seq = self.next_seq();
@@ -647,6 +652,48 @@ impl LsmEngine {
             self.flush_memtable()?;
         }
         Ok(())
+    }
+
+    // ── Value Metadata (Live Data) ──────────────────────────────
+
+    /// Gets value metadata for an entity, computing real-time decay.
+    /// Returns None if no metadata exists (old data without meta → defaults to score 1.0).
+    pub fn get_value_meta(&self, class: &str, pk: &str) -> Result<Option<crate::value_meta::ValueMetadata>> {
+        let key = crate::value_meta::ValueMetadata::meta_key(class, pk);
+        match self.get(&key)? {
+            Some(bytes) => Ok(crate::value_meta::ValueMetadata::from_bytes(&bytes)),
+            None => Ok(None),
+        }
+    }
+
+    /// Gets the current decayed score for an entity.
+    /// Returns 1.0 if no metadata exists (old data is assumed high-value).
+    pub fn get_value_score(&self, class: &str, pk: &str) -> Result<f64> {
+        match self.get_value_meta(class, pk)? {
+            Some(meta) => Ok(meta.current_score()),
+            None => Ok(1.0), // Old data without meta defaults to max score
+        }
+    }
+
+    /// Puts value metadata for an entity.
+    pub fn put_value_meta(&self, class: &str, pk: &str, meta: &crate::value_meta::ValueMetadata) -> Result<()> {
+        let key = crate::value_meta::ValueMetadata::meta_key(class, pk);
+        let value = meta.to_bytes();
+        self.put(key, value)
+    }
+
+    /// Activates an entity: resets decay baseline and boosts value_score.
+    /// Creates metadata if it doesn't exist.
+    pub fn activate(&self, class: &str, pk: &str, delta: f64, _reason: &str) -> Result<()> {
+        let mut meta = match self.get_value_meta(class, pk)? {
+            Some(m) => m,
+            None => crate::value_meta::ValueMetadata::new(
+                self.options.default_lambda,
+                self.options.default_lambda,
+            ),
+        };
+        meta.activate(delta);
+        self.put_value_meta(class, pk, &meta)
     }
 }
 
@@ -2806,5 +2853,112 @@ mod tests {
             "should have at most 3 archive files, found {}",
             archive_files.len()
         );
+    }
+
+    // ── Value Metadata (Live Data) Tests ──
+
+    #[test]
+    fn test_value_meta_put_get() {
+        let dir = tempdir().unwrap();
+        let engine = LsmEngine::open(StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        }).unwrap();
+
+        let meta = crate::value_meta::ValueMetadata::new(0.8, crate::value_meta::LAMBDA_70D);
+        engine.put_value_meta("BioTask", "001", &meta).unwrap();
+
+        let loaded = engine.get_value_meta("BioTask", "001").unwrap().unwrap();
+        assert!((loaded.base_score - 0.8).abs() < 0.001);
+        assert!((loaded.value_score - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_value_meta_not_found() {
+        let dir = tempdir().unwrap();
+        let engine = LsmEngine::open(StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        }).unwrap();
+
+        let result = engine.get_value_meta("Nonexistent", "999").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_value_score_defaults_to_1() {
+        let dir = tempdir().unwrap();
+        let engine = LsmEngine::open(StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        }).unwrap();
+
+        // Old data without meta should default to score 1.0
+        let score = engine.get_value_score("OldClass", "001").unwrap();
+        assert!((score - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_activate_creates_meta() {
+        let dir = tempdir().unwrap();
+        let engine = LsmEngine::open(StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        }).unwrap();
+
+        // Activate an entity without prior meta
+        engine.activate("BioTask", "001", 0.5, "manual_heat").unwrap();
+
+        let meta = engine.get_value_meta("BioTask", "001").unwrap().unwrap();
+        assert!(meta.activation_count == 1);
+        assert!(meta.value_score > 0.0);
+    }
+
+    #[test]
+    fn test_activate_existing_meta() {
+        let dir = tempdir().unwrap();
+        let engine = LsmEngine::open(StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        }).unwrap();
+
+        let mut meta = crate::value_meta::ValueMetadata::new(0.5, crate::value_meta::LAMBDA_7H);
+        engine.put_value_meta("BioTask", "002", &meta).unwrap();
+
+        // Activate
+        engine.activate("BioTask", "002", 0.3, "citation").unwrap();
+
+        let loaded = engine.get_value_meta("BioTask", "002").unwrap().unwrap();
+        assert!(loaded.activation_count == 1);
+        assert!((loaded.value_score - 0.8).abs() < 0.01); // 0.5 + 0.3
+    }
+
+    #[test]
+    fn test_value_meta_decay_over_time() {
+        let dir = tempdir().unwrap();
+        let engine = LsmEngine::open(StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        }).unwrap();
+
+        let mut meta = crate::value_meta::ValueMetadata::new(1.0, crate::value_meta::LAMBDA_7H);
+        // Simulate 7 hours ago
+        meta.last_activated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() - 25200;
+        engine.put_value_meta("BioTask", "003", &meta).unwrap();
+
+        let score = engine.get_value_score("BioTask", "003").unwrap();
+        // After one half-life, score should be ~0.5
+        assert!((score - 0.5).abs() < 0.05, "expected ~0.5, got {}", score);
+    }
+
+    #[test]
+    fn test_storage_options_default_lambda() {
+        let opts = StorageOptions::default();
+        // Default should be LAMBDA_2Y (very slow decay)
+        assert!((opts.default_lambda - crate::value_meta::LAMBDA_2Y).abs() < 1e-15);
+        assert!(!opts.value_scorer_enabled);
     }
 }

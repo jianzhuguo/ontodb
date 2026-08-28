@@ -264,6 +264,11 @@ pub enum QueryAst {
         query: Box<QueryAst>,
     },
 
+    /// EXPLAIN REASONING <query> - Show ontology reasoning derivation chain
+    ExplainReasoning {
+        query: Box<QueryAst>,
+    },
+
     /// WITH <cte_name> AS (<query>) <main_query> - Common Table Expression
     With {
         ctes: Vec<CteDefinition>,
@@ -349,6 +354,9 @@ pub enum QueryAst {
         max_depth: usize,
     },
 
+    /// SYSTEM ACTIVATE '<class>::<pk>' '<reason>' — Activate a live data entity
+    SystemActivate { entity: String, reason: String },
+
     /// BACKUP TO '<path>' — Create a full snapshot backup
     Backup { path: String },
 
@@ -409,6 +417,7 @@ impl QueryAst {
             QueryAst::Match { .. } => true,
             QueryAst::VectorSearch { .. } => true,
             QueryAst::Explain { .. } => true,
+            QueryAst::ExplainReasoning { .. } => true,
 
             // Writes
             QueryAst::Insert { .. } => false,
@@ -454,7 +463,8 @@ impl QueryAst {
             QueryAst::GraphMatch { .. } => true,
             QueryAst::GraphShortestPath { .. } => true,
 
-            // Backup/Restore/Flush
+            // Backup/Restore/Flush/Activate
+            QueryAst::SystemActivate { .. } => false,
             QueryAst::Backup { .. } => false,
             QueryAst::Restore { .. } => false,
             QueryAst::Flush => false,
@@ -781,6 +791,8 @@ impl QueryParser {
             Self::parse_graph_match(input)
         } else if starts_with("GRAPH SHORTEST PATH") {
             Self::parse_graph_shortest_path(input)
+        } else if starts_with("SYSTEM ACTIVATE") {
+            Self::parse_system_activate(input)
         } else if starts_with("BACKUP") {
             Self::parse_backup(input)
         } else if starts_with("RESTORE") {
@@ -795,12 +807,14 @@ impl QueryParser {
         }
     }
 
-    /// Parses EXPLAIN <query>
+    /// Parses EXPLAIN [REASONING] <query>
     fn parse_explain(input: &str) -> Result<QueryAst> {
-        let query_start = if find_ignore_ascii_case(input, "EXPLAIN ANALYZE") == Some(0) {
-            14
+        let (query_start, explain_reasoning) = if find_ignore_ascii_case(input, "EXPLAIN REASONING") == Some(0) {
+            (17, true)
+        } else if find_ignore_ascii_case(input, "EXPLAIN ANALYZE") == Some(0) {
+            (14, false)
         } else if find_ignore_ascii_case(input, "EXPLAIN") == Some(0) {
-            7
+            (7, false)
         } else {
             return Err(CoreError::InvalidArgument("expected EXPLAIN".to_string()));
         };
@@ -813,9 +827,15 @@ impl QueryParser {
         }
 
         let inner_ast = Self::parse(inner_query)?;
-        Ok(QueryAst::Explain {
-            query: Box::new(inner_ast),
-        })
+        if explain_reasoning {
+            Ok(QueryAst::ExplainReasoning {
+                query: Box::new(inner_ast),
+            })
+        } else {
+            Ok(QueryAst::Explain {
+                query: Box::new(inner_ast),
+            })
+        }
     }
 
     /// Parses WITH [RECURSIVE] <cte_name> AS (<query>) <main_query>
@@ -3214,29 +3234,231 @@ impl QueryParser {
     }
 
     /// Parse GRAPH MATCH pattern
+    ///
+    /// Syntax: GRAPH MATCH (a:Label) -[e:edge_label]-> (b:Label) [WHERE ...] RETURN ...
+    ///
+    /// Supports:
+    /// - Single-hop: `(a:Person) -[e:KNOWS]-> (b:Person)`
+    /// - Multi-hop: `(a:Person) -[e1:KNOWS]-> (b:Person) -[e2:WORKS_AT]-> (c:Company)`
+    /// - Incoming: `(a:Person) <-[e:MANAGES]- (b:Manager)`
+    /// - Both directions: `(a:Person) -[e:FRIEND]- (b:Person)`
     fn parse_graph_match(input: &str) -> Result<QueryAst> {
-        // Simplified: GRAPH MATCH (a:Person) -[KNOWS]-> (b:Person) RETURN a.name, b.name
         let rest = input[11..].trim(); // Skip "GRAPH MATCH"
 
-        // For now, return a simple pattern
-        // Full implementation would parse the graph pattern syntax
-        let returns = if let Some(ret_pos) = find_ignore_ascii_case(rest, "RETURN") {
-            safe_slice_from(rest, ret_pos + 6).trim()
-                .split(',')
+        // Split at RETURN (if present) to separate pattern from return clause
+        let (pattern_str, returns_str) = if let Some(ret_pos) = find_ignore_ascii_case(rest, " RETURN ") {
+            (safe_slice(rest, 0, ret_pos).trim(), safe_slice_from(rest, ret_pos + 8).trim())
+        } else if let Some(ret_pos) = find_ignore_ascii_case(rest, "RETURN") {
+            let after = safe_slice_from(rest, ret_pos + 6).trim();
+            (safe_slice(rest, 0, ret_pos).trim(), after)
+        } else {
+            (rest, "")
+        };
+
+        // Split at WHERE to separate pattern from filter
+        let (pattern_part, filter_str) = if let Some(wh_pos) = find_unquoted_ignore_ascii_case(pattern_str, " WHERE ") {
+            (safe_slice(pattern_str, 0, wh_pos).trim(), Some(safe_slice_from(pattern_str, wh_pos + 7).trim()))
+        } else {
+            (pattern_str, None)
+        };
+
+        // Parse the pattern: sequence of nodes and edges
+        // Pattern format: (var:Label) -[var:label]-> (var:Label) <-[var:label]- (var:Label)
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut remaining = pattern_part.trim();
+
+        // Parse first node
+        let (first_node, after_first_node) = Self::parse_graph_node(remaining)?;
+        nodes.push(first_node);
+        remaining = after_first_node.trim();
+
+        // Parse alternating edges and nodes
+        while !remaining.is_empty() {
+            // Try to parse an edge: -[var:label]-> or <-[var:label]-
+            let (edge, after_edge) = match Self::parse_graph_edge(remaining) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+
+            let from_node = nodes.last().unwrap().variable.clone();
+
+            // Parse the next node
+            let (next_node, after_next_node) = Self::parse_graph_node(after_edge.trim())?;
+            let to_node = next_node.variable.clone();
+
+            // Update edge with correct from/to based on direction
+            let mut edge = edge;
+            match edge.direction {
+                GraphDirection::Out => {
+                    edge.from = from_node;
+                    edge.to = to_node;
+                }
+                GraphDirection::In => {
+                    edge.from = to_node;
+                    edge.to = from_node;
+                }
+                GraphDirection::Both => {
+                    edge.from = from_node;
+                    edge.to = to_node;
+                }
+            }
+
+            edges.push(edge);
+            nodes.push(next_node);
+            remaining = after_next_node.trim();
+        }
+
+        // Parse optional WHERE
+        let filter = if let Some(fstr) = filter_str {
+            Self::parse_where(fstr)?.0
+        } else {
+            None
+        };
+
+        // Parse RETURN columns
+        let returns: Vec<String> = if !returns_str.is_empty() {
+            returns_str.split(',')
                 .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
                 .collect()
         } else {
             vec![]
         };
 
         Ok(QueryAst::GraphMatch {
-            pattern: GraphPattern {
-                nodes: vec![],
-                edges: vec![],
-            },
-            filter: None,
+            pattern: GraphPattern { nodes, edges },
+            filter,
             returns,
         })
+    }
+
+    /// Parse a graph node pattern: (variable:Label) or (variable) or (:Label)
+    fn parse_graph_node(input: &str) -> Result<(GraphNode, &str)> {
+        let input = input.trim();
+        if !input.starts_with('(') {
+            return Err(CoreError::InvalidArgument(
+                format!("expected '(' for graph node, got: {}", &input[..input.len().min(20)])
+            ));
+        }
+
+        let close = input.find(')')
+            .ok_or_else(|| CoreError::InvalidArgument("unmatched '(' in graph node".to_string()))?;
+
+        let inner = safe_slice(input, 1, close).trim();
+        let remaining = safe_slice_from(input, close + 1);
+
+        // Parse variable:Label or variable or :Label
+        let (variable, label) = if inner.is_empty() {
+            (String::new(), None)
+        } else if let Some(colon_pos) = inner.find(':') {
+            let var = safe_slice(inner, 0, colon_pos).trim().to_string();
+            let lbl = safe_slice_from(inner, colon_pos + 1).trim().to_string();
+            let lbl = if lbl.is_empty() { None } else { Some(lbl) };
+            (var, lbl)
+        } else {
+            // Just a variable name, no label
+            (inner.trim().to_string(), None)
+        };
+
+        Ok((GraphNode { variable, label }, remaining))
+    }
+
+    /// Parse a graph edge pattern: -[var:label]-> or <-[var:label]- or -[var:label]-
+    fn parse_graph_edge(input: &str) -> Result<(GraphEdge, &str)> {
+        let input = input.trim();
+
+        // Detect direction by checking arrow pattern
+        // Pattern 1: -[...]->  (outgoing)
+        // Pattern 2: <-[...]-  (incoming)
+        // Pattern 3: -[...]-   (both)
+
+        if input.starts_with('<') && input.starts_with("<-") {
+            // Incoming: <-[var:label]-
+            let after_arrow = &input[2..]; // skip <-
+            if !after_arrow.starts_with('[') {
+                return Err(CoreError::InvalidArgument("expected '[' after '<-'".to_string()));
+            }
+            let close_bracket = after_arrow.find(']')
+                .ok_or_else(|| CoreError::InvalidArgument("unmatched '[' in graph edge".to_string()))?;
+            let inner = safe_slice(after_arrow, 1, close_bracket).trim();
+            let after_bracket = safe_slice_from(after_arrow, close_bracket + 1).trim();
+
+            // Expect '-' after ']'
+            if !after_bracket.starts_with('-') {
+                return Err(CoreError::InvalidArgument("expected '-' after ']' in incoming edge".to_string()));
+            }
+            let remaining = safe_slice_from(after_bracket, 1);
+
+            let (var, label) = Self::parse_edge_inner(inner)?;
+            Ok((GraphEdge {
+                variable: var,
+                label,
+                from: String::new(), // filled by caller
+                to: String::new(),   // filled by caller
+                direction: GraphDirection::In,
+            }, remaining))
+        } else if input.starts_with('-') {
+            // Check if outgoing: -[...]-> or both: -[...]-
+            let after_dash = &input[1..]; // skip first -
+            if !after_dash.starts_with('[') {
+                return Err(CoreError::InvalidArgument("expected '[' after '-'".to_string()));
+            }
+            let close_bracket = after_dash.find(']')
+                .ok_or_else(|| CoreError::InvalidArgument("unmatched '[' in graph edge".to_string()))?;
+            let inner = safe_slice(after_dash, 1, close_bracket).trim();
+            let after_bracket = safe_slice_from(after_dash, close_bracket + 1).trim();
+
+            // Check for -> (outgoing) or - (both)
+            if after_bracket.starts_with("->") {
+                let remaining = safe_slice_from(after_bracket, 2);
+                let (var, label) = Self::parse_edge_inner(inner)?;
+                Ok((GraphEdge {
+                    variable: var,
+                    label,
+                    from: String::new(),
+                    to: String::new(),
+                    direction: GraphDirection::Out,
+                }, remaining))
+            } else if after_bracket.starts_with('-') {
+                let remaining = safe_slice_from(after_bracket, 1);
+                let (var, label) = Self::parse_edge_inner(inner)?;
+                Ok((GraphEdge {
+                    variable: var,
+                    label,
+                    from: String::new(),
+                    to: String::new(),
+                    direction: GraphDirection::Both,
+                }, remaining))
+            } else {
+                Err(CoreError::InvalidArgument(
+                    format!("expected '->' or '-' after ']' in graph edge, got: {}", &after_bracket[..after_bracket.len().min(20)])
+                ))
+            }
+        } else {
+            Err(CoreError::InvalidArgument(
+                format!("expected '-' or '<-' for graph edge, got: {}", &input[..input.len().min(20)])
+            ))
+        }
+    }
+
+    /// Parse edge inner content: var:label or var or :label
+    fn parse_edge_inner(inner: &str) -> Result<(Option<String>, Option<String>)> {
+        let inner = inner.trim();
+        if inner.is_empty() {
+            return Ok((None, None));
+        }
+
+        if let Some(colon_pos) = inner.find(':') {
+            let var = safe_slice(inner, 0, colon_pos).trim().to_string();
+            let label = safe_slice_from(inner, colon_pos + 1).trim().to_string();
+            let var = if var.is_empty() { None } else { Some(var) };
+            let label = if label.is_empty() { None } else { Some(label) };
+            Ok((var, label))
+        } else {
+            // Just a variable name
+            Ok((Some(inner.trim().to_string()), None))
+        }
     }
 
     /// Parse GRAPH SHORTEST PATH FROM <id1> TO <id2> [MAX DEPTH <n>]
@@ -3263,6 +3485,23 @@ impl QueryParser {
         }
 
         Ok(QueryAst::GraphShortestPath { from_id, to_id, max_depth })
+    }
+
+    /// Parses SYSTEM ACTIVATE '<class>::<pk>' '<reason>'
+    fn parse_system_activate(input: &str) -> Result<QueryAst> {
+        let rest = input[15..].trim(); // Skip "SYSTEM ACTIVATE"
+        let entity = Self::extract_quoted_path(rest)?;
+        let after_entity = &rest[rest.find(|c: char| c == '\'' || c == '"').unwrap_or(0)..];
+        let after_entity = &after_entity[1..]; // skip opening quote
+        let quote_char = rest.as_bytes()[rest.find(|c: char| c == '\'' || c == '"').unwrap_or(0)] as char;
+        let end = after_entity.find(quote_char).unwrap_or(after_entity.len());
+        let after_entity = safe_slice_from(after_entity, end + 1).trim();
+        let reason = if !after_entity.is_empty() {
+            Self::extract_quoted_path(after_entity)?
+        } else {
+            "manual".to_string()
+        };
+        Ok(QueryAst::SystemActivate { entity, reason })
     }
 
     /// Parses BACKUP TO '<path>'

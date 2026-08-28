@@ -2,8 +2,29 @@
 //!
 //! Stores per-entity value scores in independent LSM keys (`__val_meta__::{class}::{pk}`).
 //! Scores are computed at write time and decay is calculated at read time.
+//!
+//! ## Lambda (λ) unit convention
+//!
+//! Lambda is the **per-second** decay rate. The decay formula is:
+//!
+//!   `current_score = value_score × e^(-λ × elapsed_seconds)`
+//!
+//! Common presets (use `LAMBDA_*` constants):
+//!
+//! | Preset | Half-life | λ (per second) |
+//! |--------|-----------|----------------|
+//! | `LAMBDA_7H`   | 7 hours  | 2.75e-5 |
+//! | `LAMBDA_70D`  | 70 days  | 1.15e-7 |
+//! | `LAMBDA_2Y`   | 2 years  | 1.10e-8 |
 
 use serde::{Deserialize, Serialize};
+
+/// 7-hour half-life: λ = ln(2) / (7 × 3600)
+pub const LAMBDA_7H: f64 = 0.693 / (7.0 * 3600.0);
+/// 70-day half-life: λ = ln(2) / (70 × 86400)
+pub const LAMBDA_70D: f64 = 0.693 / (70.0 * 86400.0);
+/// 2-year half-life: λ = ln(2) / (2 × 365 × 86400)
+pub const LAMBDA_2Y: f64 = 0.693 / (2.0 * 365.0 * 86400.0);
 
 /// Value metadata stored per entity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,8 +33,8 @@ pub struct ValueMetadata {
     pub base_score: f64,
     /// Current score including activation boosts (0.0 ~ 1.0, can be increased by activation).
     pub value_score: f64,
-    /// Decay rate (λ). Higher = faster decay.
-    /// 0.001 ≈ 2 years half-life, 0.01 ≈ 70 days, 0.1 ≈ 7 hours.
+    /// Decay rate (λ) in per-second units.
+    /// Use `LAMBDA_7H`, `LAMBDA_70D`, `LAMBDA_2Y` presets.
     pub lambda: f64,
     /// Timestamp of last activation/reset (seconds since epoch).
     pub last_activated_at: u64,
@@ -47,10 +68,15 @@ impl ValueMetadata {
         decayed.clamp(0.0, 1.0)
     }
 
-    /// Activate: reset decay baseline and boost score.
+    /// Activate: boost from current decayed score and reset decay clock.
+    ///
+    /// Uses `current_score() + delta` as the new base, so activation is
+    /// relative to the data's current temperature, not its original score.
+    /// Example: cold data (0.2) + activate(0.5) → 0.7, not 1.0.
     pub fn activate(&mut self, delta: f64) {
+        let current = self.current_score();
+        self.value_score = (current + delta).min(1.0);
         self.last_activated_at = now_secs();
-        self.value_score = (self.value_score + delta).min(1.0);
         self.activation_count += 1;
     }
 
@@ -132,17 +158,18 @@ mod tests {
 
     #[test]
     fn test_decay_formula() {
-        let mut meta = ValueMetadata::new(1.0, 0.001);
-        // Force last_activated_at to 1000 seconds ago
-        meta.last_activated_at = now_secs() - 1000;
+        // Use LAMBDA_7H: 7-hour half-life
+        let mut meta = ValueMetadata::new(1.0, LAMBDA_7H);
+        // Force last_activated_at to 7 hours ago (25200 seconds)
+        meta.last_activated_at = now_secs() - 25200;
         let score = meta.current_score();
-        // 1.0 * e^(-0.001 * 1000) = e^(-1) ≈ 0.368
-        assert!((score - 0.368).abs() < 0.01);
+        // After one half-life, score should be ~0.5
+        assert!((score - 0.5).abs() < 0.01, "expected ~0.5, got {}", score);
     }
 
     #[test]
     fn test_no_decay_at_zero() {
-        let meta = ValueMetadata::new(0.8, 0.001);
+        let meta = ValueMetadata::new(0.8, LAMBDA_70D);
         // last_activated_at = now, so elapsed ≈ 0
         let score = meta.current_score();
         assert!((score - 0.8).abs() < 0.01);
@@ -150,61 +177,63 @@ mod tests {
 
     #[test]
     fn test_activate_resets_decay() {
-        let mut meta = ValueMetadata::new(0.5, 0.001);
-        meta.last_activated_at = now_secs() - 100000; // old
+        let mut meta = ValueMetadata::new(0.5, LAMBDA_7H);
+        // Simulate 14 hours of decay (2 half-lives)
+        meta.last_activated_at = now_secs() - (14 * 3600);
         let before = meta.current_score();
-        assert!(before < 0.5);
+        // After 2 half-lives: 0.5 × 0.25 = 0.125
+        assert!(before < 0.2, "expected < 0.2, got {}", before);
 
-        meta.activate(0.3); // boost
+        meta.activate(0.3); // boost from current decayed score
         let after = meta.current_score();
-        // value_score = (0.5 + 0.3) = 0.8, decay ≈ 0, so ≈ 0.8
-        assert!(after > before);
-        assert!(after > 0.7);
+        // New behavior: value_score = current_score() + delta = ~0.125 + 0.3 = ~0.425
+        assert!(after > before, "after should be greater than before");
+        assert!(after > 0.3, "expected > 0.3, got {}", after);
+        assert!(after < 0.5, "expected < 0.5 (not jumping to raw value_score), got {}", after);
         assert_eq!(meta.activation_count, 1);
     }
 
     #[test]
     fn test_activate_cap_at_1() {
-        let mut meta = ValueMetadata::new(0.9, 0.001);
+        let mut meta = ValueMetadata::new(0.9, LAMBDA_7H);
         meta.activate(0.5);
         assert!(meta.value_score <= 1.0);
     }
 
     #[test]
-    fn test_default_lambda_slow_decay() {
-        let mut meta = ValueMetadata::new(1.0, 0.001);
-        // 1 year = 31536000 seconds
-        meta.last_activated_at = now_secs() - 31536000;
+    fn test_2year_half_life() {
+        // 2-year half-life preset
+        let mut meta = ValueMetadata::new(1.0, LAMBDA_2Y);
+        // After 2 years, score should be ~0.5
+        let two_years_secs = 2 * 365 * 86400;
+        meta.last_activated_at = now_secs() - two_years_secs;
         let score = meta.current_score();
-        // e^(-0.001 * 31536000) ≈ 0, but lambda=0.001 means very slow
-        // Actually 0.001 * 31536000 = 31536, e^(-31536) ≈ 0
-        // Wait, that's wrong. Let me recalculate.
-        // λ = 0.001 per second? No, we should use per-day or per-hour.
-        // Let me reconsider: if λ = 0.001 and time is in seconds,
-        // then 1 day = 86400s → e^(-86.4) ≈ 0
-        // This means λ should be much smaller for seconds-based calculation.
-        // 
-        // Correct approach: λ in the config is per-second rate.
-        // For "2 years half-life": λ = ln(2) / (2*365*86400) ≈ 1.1e-8
-        // For "70 days half-life": λ = ln(2) / (70*86400) ≈ 1.15e-7
-        // For "7 hours half-life": λ = ln(2) / (7*3600) ≈ 2.75e-5
-        //
-        // So the test with λ=0.001 would decay almost instantly.
-        // This test needs a more realistic lambda.
-        // Skipping assertion for now - just verify it doesn't panic.
-        let _ = score;
+        assert!((score - 0.5).abs() < 0.05, "expected ~0.5 after 2 years, got {}", score);
     }
 
     #[test]
-    fn test_realistic_lambda() {
-        // 70 days half-life: λ = ln(2) / (70 * 86400) ≈ 1.146e-7
-        let lambda_70d = 0.693 / (70.0 * 86400.0);
-        let mut meta = ValueMetadata::new(1.0, lambda_70d);
-        
-        // After 70 days, score should be ~0.5
+    fn test_70day_half_life() {
+        let mut meta = ValueMetadata::new(1.0, LAMBDA_70D);
         meta.last_activated_at = now_secs() - (70 * 86400);
         let score = meta.current_score();
-        assert!((score - 0.5).abs() < 0.05, "expected ~0.5, got {}", score);
+        assert!((score - 0.5).abs() < 0.05, "expected ~0.5 after 70 days, got {}", score);
+    }
+
+    #[test]
+    fn test_7hour_half_life() {
+        let mut meta = ValueMetadata::new(1.0, LAMBDA_7H);
+        meta.last_activated_at = now_secs() - (7 * 3600);
+        let score = meta.current_score();
+        assert!((score - 0.5).abs() < 0.05, "expected ~0.5 after 7 hours, got {}", score);
+    }
+
+    #[test]
+    fn test_multiple_half_lives() {
+        let mut meta = ValueMetadata::new(1.0, LAMBDA_7H);
+        // 3 half-lives = 21 hours → score should be ~0.125
+        meta.last_activated_at = now_secs() - (21 * 3600);
+        let score = meta.current_score();
+        assert!((score - 0.125).abs() < 0.02, "expected ~0.125 after 3 half-lives, got {}", score);
     }
 
     #[test]

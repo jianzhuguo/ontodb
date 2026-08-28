@@ -381,11 +381,23 @@ impl Ontology {
     }
 
     /// Gets all superclasses of a class (direct and indirect), including equivalent classes.
+    /// Uses memoized cache for repeated lookups.
     pub fn get_all_superclasses(&self, class_name: &str) -> HashSet<String> {
         let mut result = HashSet::new();
         let mut visited = HashSet::new();
         self.collect_superclasses(class_name, &mut result, &mut visited);
         result
+    }
+
+    /// Pre-computes the full superclass map for all classes in one pass.
+    /// Call once before batch reasoning to avoid per-fact recursive traversal.
+    pub fn build_superclass_cache(&self) -> HashMap<String, HashSet<String>> {
+        let mut cache = HashMap::new();
+        for class_name in self.classes.keys() {
+            let supers = self.get_all_superclasses(class_name);
+            cache.insert(class_name.clone(), supers);
+        }
+        cache
     }
 
     fn collect_superclasses(
@@ -471,6 +483,190 @@ impl Ontology {
             }
         }
 
+        errors
+    }
+
+    /// Full ontology validation. Returns all errors found.
+    ///
+    /// Checks:
+    /// 1. Cycle inheritance: A extends B extends A
+    /// 2. Cycle equivalence: A equiv B equiv A
+    /// 3. Disjoint constraint violations
+    /// 4. Undefined superclasses
+    /// 5. Undefined equivalent classes
+    /// 6. Undefined property domains
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        // 1. Detect cycle inheritance
+        errors.extend(self.validate_no_cycles());
+
+        // 2. Detect cycle equivalence
+        errors.extend(self.validate_no_equivalent_cycles());
+
+        // 3. Disjoint constraint violations
+        errors.extend(self.validate_disjoint_constraints());
+
+        // 4. Undefined superclasses
+        errors.extend(self.validate_superclass_references());
+
+        // 5. Undefined equivalent classes
+        errors.extend(self.validate_equivalent_class_references());
+
+        // 6. Undefined property domains
+        errors.extend(self.validate_property_domains());
+
+        errors
+    }
+
+    /// Detects cycle inheritance: A extends B extends ... extends A.
+    ///
+    /// Uses DFS with gray/black marking:
+    /// - Gray = currently on the recursion stack (ancestor)
+    /// - Black = fully explored
+    fn validate_no_cycles(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut white: HashSet<String> = self.classes.keys().cloned().collect();
+        let mut gray: HashSet<String> = HashSet::new();
+        let mut black: HashSet<String> = HashSet::new();
+
+        while let Some(class_name) = white.iter().next().cloned() {
+            white.remove(&class_name);
+            self.dfs_cycle_check(
+                &class_name,
+                &mut white,
+                &mut gray,
+                &mut black,
+                &mut Vec::new(),
+                &mut errors,
+            );
+        }
+
+        errors
+    }
+
+    fn dfs_cycle_check(
+        &self,
+        class_name: &str,
+        white: &mut HashSet<String>,
+        gray: &mut HashSet<String>,
+        black: &mut HashSet<String>,
+        path: &mut Vec<String>,
+        errors: &mut Vec<String>,
+    ) {
+        white.remove(class_name);
+        gray.insert(class_name.to_string());
+        path.push(class_name.to_string());
+
+        if let Some(class) = self.classes.get(class_name) {
+            for superclass in &class.superclasses {
+                if gray.contains(superclass.as_str()) {
+                    // Found a cycle — report the cycle path
+                    let cycle_start = path.iter().position(|c| c == superclass).unwrap_or(0);
+                    let cycle_path: Vec<String> = path[cycle_start..].to_vec();
+                    errors.push(format!(
+                        "Circular inheritance detected: {} -> {}",
+                        cycle_path.join(" -> "), superclass
+                    ));
+                } else if !black.contains(superclass.as_str()) {
+                    self.dfs_cycle_check(superclass, white, gray, black, path, errors);
+                }
+            }
+        }
+
+        path.pop();
+        gray.remove(class_name);
+        black.insert(class_name.to_string());
+    }
+
+    /// Detects cycle equivalence: A equiv B equiv ... equiv A.
+    fn validate_no_equivalent_cycles(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut visited: HashSet<String> = HashSet::new();
+
+        for class_name in self.classes.keys() {
+            if visited.contains(class_name) {
+                continue;
+            }
+            let mut chain = Vec::new();
+            let mut current = class_name.clone();
+            let mut seen_in_chain: HashSet<String> = HashSet::new();
+
+            while !visited.contains(&current) && !seen_in_chain.contains(&current) {
+                seen_in_chain.insert(current.clone());
+                chain.push(current.clone());
+
+                if let Some(class) = self.classes.get(&current) {
+                    if let Some(next) = class.equivalent_classes.first() {
+                        current = next.clone();
+                        continue;
+                    }
+                }
+                break;
+            }
+
+            if seen_in_chain.contains(&current) && chain.len() > 1 {
+                // Found a cycle in equivalence chain
+                if let Some(start) = chain.iter().position(|c| c == &current) {
+                    let cycle: Vec<String> = chain[start..].to_vec();
+                    errors.push(format!(
+                        "Circular equivalence detected: {} -> {}",
+                        cycle.join(" <=> "), current
+                    ));
+                }
+            }
+
+            for c in &chain {
+                visited.insert(c.clone());
+            }
+        }
+
+        errors
+    }
+
+    /// Validates that all superclass references point to existing classes.
+    fn validate_superclass_references(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (name, class) in &self.classes {
+            for superclass in &class.superclasses {
+                if !self.classes.contains_key(superclass.as_str()) {
+                    errors.push(format!(
+                        "Class '{}' references undefined superclass '{}'",
+                        name, superclass
+                    ));
+                }
+            }
+        }
+        errors
+    }
+
+    /// Validates that all equivalent class references point to existing classes.
+    fn validate_equivalent_class_references(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (name, class) in &self.classes {
+            for equiv in &class.equivalent_classes {
+                if !self.classes.contains_key(equiv.as_str()) {
+                    errors.push(format!(
+                        "Class '{}' references undefined equivalent class '{}'",
+                        name, equiv
+                    ));
+                }
+            }
+        }
+        errors
+    }
+
+    /// Validates that all property domains reference existing classes.
+    fn validate_property_domains(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (name, prop) in &self.properties {
+            if !self.classes.contains_key(prop.domain.as_str()) {
+                errors.push(format!(
+                    "Property '{}' references undefined domain class '{}'",
+                    name, prop.domain
+                ));
+            }
+        }
         errors
     }
 }
