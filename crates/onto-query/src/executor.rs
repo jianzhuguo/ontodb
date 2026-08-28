@@ -745,6 +745,14 @@ impl QueryExecutor {
         self.engine.flush()
     }
 
+    /// Executes a query within an active transaction (public API for HTTP layer).
+    /// The transaction must have been started with `engine.begin_txn()`.
+    /// Only write queries (INSERT/UPDATE/DELETE) use the transaction context.
+    /// Read queries are executed normally without transaction overhead.
+    pub fn execute_in_transaction(&self, txn_id: u64, ast: &QueryAst) -> Result<QueryResult> {
+        self.execute_in_txn_with_plan(ast, &self.engine, txn_id, None)
+    }
+
     /// Get a reference to the query planner.
     pub fn planner(&self) -> std::sync::RwLockReadGuard<'_, QueryPlanner> {
         self.planner.read().unwrap_or_else(|e| e.into_inner())

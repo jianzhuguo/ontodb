@@ -258,6 +258,30 @@ pub struct BatchResult {
     pub elapsed_ms: f64,
 }
 
+/// Transaction begin request.
+#[derive(Debug, Deserialize)]
+pub struct TransactionBeginRequest {
+    /// Optional: isolation level (default: snapshot).
+    #[serde(default)]
+    pub isolation: Option<String>,
+}
+
+/// Transaction execute request — execute a query within an active transaction.
+#[derive(Debug, Deserialize)]
+pub struct TransactionExecuteRequest {
+    /// Transaction ID returned from /api/transaction/begin.
+    pub txn_id: u64,
+    /// SQL or OntoDB query to execute within the transaction.
+    pub query: String,
+}
+
+/// Transaction commit/rollback request.
+#[derive(Debug, Deserialize)]
+pub struct TransactionActionRequest {
+    /// Transaction ID returned from /api/transaction/begin.
+    pub txn_id: u64,
+}
+
 /// Hybrid query request: combines SQL filter with vector search.
 #[derive(Debug, Deserialize)]
 pub struct HybridQueryRequest {
@@ -374,6 +398,11 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/backup/incremental", post(backup_incremental))
         .route("/api/backup/verify", post(verify_backup_endpoint))
         .route("/api/flush", post(flush))
+        // Transaction endpoints
+        .route("/api/transaction/begin", post(transaction_begin))
+        .route("/api/transaction/execute", post(transaction_execute))
+        .route("/api/transaction/commit", post(transaction_commit))
+        .route("/api/transaction/rollback", post(transaction_rollback))
         // Sharding configuration
         .route("/api/sharding/config", get(get_sharding_config).put(update_sharding_config))
         .route("/api/sharding/shard", post(add_shard))
@@ -453,6 +482,11 @@ pub fn build_router_with_auth(
         .route("/api/backup/incremental", post(backup_incremental))
         .route("/api/backup/verify", post(verify_backup_endpoint))
         .route("/api/flush", post(flush))
+        // Transaction endpoints
+        .route("/api/transaction/begin", post(transaction_begin))
+        .route("/api/transaction/execute", post(transaction_execute))
+        .route("/api/transaction/commit", post(transaction_commit))
+        .route("/api/transaction/rollback", post(transaction_rollback))
         // Sharding configuration (Admin only)
         .route("/api/sharding/config", get(get_sharding_config).put(update_sharding_config))
         .route("/api/sharding/shard", post(add_shard))
@@ -1424,6 +1458,166 @@ async fn get_schema(
             Json(ApiResponse::success(schema, elapsed))
         }
         Err(e) => Json(ApiResponse::error(format!("schema introspection failed: {}", e))),
+    }
+}
+
+// ── Transaction API ──────────────────────────────────────────
+
+/// POST /api/transaction/begin - Begin a new transaction.
+///
+/// Returns a transaction ID that can be used with execute/commit/rollback.
+///
+/// Request body (optional):
+/// ```json
+/// { "isolation": "snapshot" }
+/// ```
+async fn transaction_begin(
+    State(state): State<AppState>,
+    Json(_req): Json<TransactionBeginRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let txn_id = state.executor.engine().begin_txn();
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(json!({
+            "txn_id": txn_id,
+            "message": "Transaction started"
+        }), elapsed_ms)),
+    )
+}
+
+/// POST /api/transaction/execute - Execute a query within a transaction.
+///
+/// Request body:
+/// ```json
+/// {
+///     "txn_id": 12345,
+///     "query": "INSERT INTO Product (name, price) VALUES ('iPhone', 999)"
+/// }
+/// ```
+async fn transaction_execute(
+    State(state): State<AppState>,
+    Json(req): Json<TransactionExecuteRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let query = req.query.trim_end_matches(';').trim();
+    if query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error("query is empty".to_string())),
+        );
+    }
+
+    // Parse the query
+    let ast = match QueryParser::parse(query) {
+        Ok(ast) => ast,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!("Parse error: {}", e))),
+            );
+        }
+    };
+
+    // Check if it's a write query (only write queries can run in transactions)
+    if QueryExecutor::is_read_only_query(&ast) {
+        // Read queries don't need transaction context, execute normally
+        let result = state.executor.execute_read(&ast);
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        return match result {
+            Ok(r) => {
+                let data = match r {
+                    onto_query::QueryResult::Rows(rows) => json!(rows),
+                    onto_query::QueryResult::Success(msg) => json!({ "message": msg }),
+                };
+                (StatusCode::OK, Json(ApiResponse::success(data, elapsed_ms)))
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<Value>::error(sanitize_error(&e.to_string()))),
+            ),
+        };
+    }
+
+    // Write query — execute within transaction
+    let result = state.executor.execute_in_transaction(req.txn_id, &ast);
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    match result {
+        Ok(r) => {
+            let data = match r {
+                onto_query::QueryResult::Rows(rows) => json!(rows),
+                onto_query::QueryResult::Success(msg) => json!({ "message": msg }),
+            };
+            (StatusCode::OK, Json(ApiResponse::success(data, elapsed_ms)))
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(sanitize_error(&e.to_string()))),
+        ),
+    }
+}
+
+/// POST /api/transaction/commit - Commit a transaction.
+///
+/// Request body:
+/// ```json
+/// { "txn_id": 12345 }
+/// ```
+async fn transaction_commit(
+    State(state): State<AppState>,
+    Json(req): Json<TransactionActionRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    match state.executor.engine().commit_txn(req.txn_id) {
+        Ok(()) => {
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(json!({
+                    "txn_id": req.txn_id,
+                    "message": "Transaction committed"
+                }), elapsed_ms)),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(sanitize_error(&e.to_string()))),
+        ),
+    }
+}
+
+/// POST /api/transaction/rollback - Rollback (abort) a transaction.
+///
+/// Request body:
+/// ```json
+/// { "txn_id": 12345 }
+/// ```
+async fn transaction_rollback(
+    State(state): State<AppState>,
+    Json(req): Json<TransactionActionRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    match state.executor.engine().abort_txn(req.txn_id) {
+        Ok(()) => {
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(json!({
+                    "txn_id": req.txn_id,
+                    "message": "Transaction rolled back"
+                }), elapsed_ms)),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(sanitize_error(&e.to_string()))),
+        ),
     }
 }
 
