@@ -2,6 +2,73 @@
 
 All notable changes to OntoDB will be documented in this file.
 
+## [v0.7.0] - 2026-08-29
+
+### GRAPH MATCH Engine (New)
+
+- Implement GRAPH MATCH executor with multi-hop pattern matching
+- Support `(a:Label) -[e:edge]-> (b:Label)` syntax with WHERE/RETURN
+- Integrate ontology reasoning: subclass expansion, inverse property bidirectional traversal
+- Add GRAPH SHORTEST PATH executor with MAX DEPTH support
+- Add GRAPH TRAVERSE executor with direction/label/filter support
+
+### Ontology Validation (New)
+
+- Add `Ontology::validate()` with cycle detection for inheritance and equivalence
+- Auto-validate on CREATE ONTOLOGY, reject invalid definitions
+- Detect undefined superclass/equivalent/property references
+
+### Reasoning Performance Optimization
+
+- **BFS fast path** for transitive closure: 10x improvement (chain=50: 10.3ms → 1.0ms)
+- **Superclass cache** for Cax-sco: 3.6x improvement (500 facts: 12.7ms → 3.5ms)
+- **Parallel rule application** via `std::thread::scope` for independent rules
+- **Merged ontology cache** to avoid repeated `scan_prefix("__ontology__")`
+- **Selective cache invalidation** by ontology name instead of full clear
+
+### R-tree KNN Optimization (3300x)
+
+- Replace brute-force DFS with **priority queue best-first search**
+- R-tree KNN: 81 ops/s → 298K ops/s
+
+### SQL Compatibility
+
+- **Recursive CTE** support with fixed-point iteration (max 100 iterations)
+- Correct **RANK/DENSE_RANK** with ORDER BY value comparison (ties handled properly)
+
+### EXPLAIN REASONING (New)
+
+- New SQL syntax: `EXPLAIN REASONING <query>`
+- Returns derivation chain: rule name + premises → conclusion
+- Summary: original facts, inferred facts, iterations, per-rule counts
+- Latency: ~22µs
+
+### Live Data — 活数据 (New)
+
+- **ValueMetadata**: decay formula `value_score × e^(-λ × Δt)`, computed at read time
+- **Lambda presets**: `LAMBDA_7H` (7h), `LAMBDA_70D` (70d), `LAMBDA_2Y` (2y)
+- **ValueScorer**: 4-rule engine (text content, field completeness, data size, class identifier)
+- **LsmEngine API**: `get_value_meta`, `put_value_meta`, `activate`, `get_value_score`
+- **SQL syntax**: `SYSTEM ACTIVATE 'Class::pk' 'reason'`
+- **DBA views**: `system.data_temperature`, `system.value_events`, `system.value_decay_prediction`
+- **Activate semantics**: uses `current_score() + delta` (not raw value_score)
+- **Zero overhead**: `value_scorer_enabled=false` (default) → no meta keys written, no scorer called
+- **Independent key scheme**: `__val_meta__::{class}::{pk}`, no changes to existing Entry structure
+
+### Documentation
+
+- OntoQL syntax reference manual (21 chapters): `docs/OntoQL语法参考手册.md`
+- OntoQL core capability checklist updated: `docs/OntoQL核心能力Checklist.md`
+- Live data implementation checklist updated: `docs/活数据最小闭环实施Checklist.md`
+
+### Benchmarks
+
+- Full system benchmark covering storage, core, graph, raft, vector, reasoning
+- Reasoning benchmark examples: `bench_reasoning.rs`, `bench_system.rs`
+- All **673 tests pass**, 0 regression
+
+---
+
 ## [v0.6.1] - 2026-08-13
 
 ### Bug Fixes
