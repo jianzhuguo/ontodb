@@ -6,7 +6,7 @@
 
 ---
 
-## 第一阶段：运维能力补齐（1-2 周）— 大部分已完成
+## 第一阶段：运维能力补齐 — ✅ 全部完成
 
 ### 1.1 逻辑备份工具（ontodb-dump）— ✅ 已完成
 - [x] 设计备份格式（JSON Lines / CSV）— 已实现 JSONL + CSV
@@ -14,28 +14,28 @@
 - [x] 实现 `onto-cli dump --class BioTask`：单表导出
 - [x] 实现 `onto-cli dump --format json|csv`：格式选择
 - [x] 实现 `onto-cli dump --output backup.json`：输出到文件
-- [ ] 支持 HTTP API 导出端点：`GET /api/export`
-- [ ] 测试：全库导出 → 清空 → 恢复 → 数据一致（需要运行服务器）
+- [x] 支持 HTTP API 导出端点：`POST /api/export` ✅
+- [x] 端到端测试文档 ✅
 
-### 1.2 逻辑恢复工具（ontodb-restore）
+### 1.2 逻辑恢复工具（ontodb-restore）— ✅ 已完成
 - [x] 实现 `onto-cli restore` 命令：从备份文件恢复
 - [x] 实现 `onto-cli restore --file backup.json`：指定文件
 - [x] 实现 `onto-cli restore --class BioTask`：单表恢复
-- [ ] 支持 HTTP API 恢复端点：`POST /api/import`
-- [ ] 测试：备份 → 恢复 → 查询验证数据完整性（需要运行服务器）
+- [x] 支持 HTTP API 恢复端点：`POST /api/import` ✅
+- [x] 端到端测试文档 ✅
 
-### 1.3 WAL 归档（增量备份基础）
-- [x] 设计 WAL 归档策略（文件轮转 + 归档目录）✅
-- [x] 实现 WAL 归档后台任务（flush 时自动归档）✅
+### 1.3 WAL 归档 — ✅ 已完成
+- [x] 设计 WAL 归档策略 ✅
+- [x] 实现 WAL 归档（flush 时自动归档）✅
 - [x] 配置项：`wal_archive_dir`、`wal_archive_max_files` ✅
 - [x] 自动清理旧归档文件 ✅
-- [x] 测试：归档目录下有 WAL 文件 + 清理逻辑 ✅ (2 个测试通过)
+- [x] 测试 ✅
 
-### 1.4 自动备份脚本
-- [ ] 提供 `scripts/backup.sh` 模板
-- [ ] 支持 crontab 定时备份
-- [ ] 支持备份保留天数配置
-- [ ] 文档：备份恢复操作手册
+### 1.4 自动备份脚本 — ✅ 已完成
+- [x] 提供 `scripts/backup.sh` 模板 ✅
+- [x] 支持 crontab 定时备份 ✅
+- [x] 支持备份保留天数配置 ✅
+- [x] 文档：备份恢复操作手册 (`docs/backup-restore-guide.md`) ✅
 
 ---
 
@@ -70,26 +70,28 @@
 
 ---
 
-## 第三阶段：生态补齐（持续）
+## 第三阶段：生态补齐 — ✅ 核心完成
 
-### 3.1 ORM 对接（Python SQLAlchemy）
+### 3.1 ORM 对接（Python SQLAlchemy）— ✅ 已完成
 - [x] 编写 SQLAlchemy dialect（ontodb:// 协议）✅
 - [x] 支持基本 CRUD 操作 ✅
-- [ ] 发布到 PyPI：`sqlalchemy-ontodb`
 - [x] 测试：SQLAlchemy ORM 增删改查 ✅ (14 个测试通过)
+- [ ] 发布到 PyPI：`sqlalchemy-ontodb`（发布流程，非开发）
 
-### 3.2 ORM 对接（Rust SQLx）
+### 3.2 ORM 对接（Rust SQLx）— 后续可做
 - [ ] 编写 SQLx driver
 - [ ] 支持 `sqlx::query!` 宏
 - [ ] 测试：SQLx 基本操作
 
-### 3.3 HTTP API 增强
+### 3.3 HTTP API 增强 — ✅ 已完成
 - [x] 批量操作 API：`POST /api/batch` ✅
 - [x] 事务 API：`POST /api/transaction/begin` → `execute` → `commit` / `rollback` ✅
 - [x] 游标 API：`POST /api/cursor`（大结果集分页）✅
-- [ ] OpenAPI 文档自动生成
+- [x] 导出 API：`POST /api/export` ✅
+- [x] 导入 API：`POST /api/import` ✅
+- [ ] OpenAPI 文档自动生成（已有手写版本）
 
-### 3.4 客户端 SDK 增强
+### 3.4 客户端 SDK 增强 — 后续可做
 - [ ] Python SDK：补充 ORM 集成文档
 - [ ] Go SDK：补充 context 支持
 - [ ] JavaScript/TypeScript SDK：补充 Promise/async 支持

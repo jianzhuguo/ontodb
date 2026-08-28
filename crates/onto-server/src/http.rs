@@ -316,6 +316,31 @@ pub struct CursorResponse {
     pub page_size: usize,
 }
 
+/// Export request — export data as JSON Lines or CSV.
+#[derive(Debug, Deserialize)]
+pub struct ExportRequest {
+    /// Class (table) to export. If omitted, exports all classes.
+    #[serde(default)]
+    pub class: Option<String>,
+    /// Output format: "jsonl" (default) or "csv".
+    #[serde(default = "default_export_format")]
+    pub format: String,
+}
+
+fn default_export_format() -> String { "jsonl".to_string() }
+
+/// Import request — import data from JSON Lines.
+#[derive(Debug, Deserialize)]
+pub struct ImportRequest {
+    /// Class (table) to import into.
+    pub class: String,
+    /// Rows to import (array of objects).
+    pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
+    /// Skip rows that fail validation (default: false, stops on first error).
+    #[serde(default)]
+    pub skip_errors: bool,
+}
+
 /// Hybrid query request: combines SQL filter with vector search.
 #[derive(Debug, Deserialize)]
 pub struct HybridQueryRequest {
@@ -439,6 +464,9 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/transaction/rollback", post(transaction_rollback))
         // Cursor pagination
         .route("/api/cursor", post(cursor_query))
+        // Export / Import
+        .route("/api/export", post(export_data))
+        .route("/api/import", post(import_data))
         // Sharding configuration
         .route("/api/sharding/config", get(get_sharding_config).put(update_sharding_config))
         .route("/api/sharding/shard", post(add_shard))
@@ -525,6 +553,9 @@ pub fn build_router_with_auth(
         .route("/api/transaction/rollback", post(transaction_rollback))
         // Cursor pagination
         .route("/api/cursor", post(cursor_query))
+        // Export / Import
+        .route("/api/export", post(export_data))
+        .route("/api/import", post(import_data))
         // Sharding configuration (Admin only)
         .route("/api/sharding/config", get(get_sharding_config).put(update_sharding_config))
         .route("/api/sharding/shard", post(add_shard))
@@ -1772,6 +1803,223 @@ async fn cursor_query(
             Json(ApiResponse::<Value>::error(sanitize_error(&e.to_string()))),
         ),
     }
+}
+
+// ── Export / Import API ──────────────────────────────────────
+
+/// POST /api/export - Export data as JSON Lines.
+///
+/// Request body:
+/// ```json
+/// {
+///     "class": "Product",
+///     "format": "jsonl"
+/// }
+/// ```
+async fn export_data(
+    State(state): State<AppState>,
+    Json(req): Json<ExportRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let query = match &req.class {
+        Some(class) => format!("SELECT * FROM {}", class),
+        None => {
+            // Export all classes - get class list first
+            let schema = match state.executor.schema_info() {
+                Ok(s) => s,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiResponse::<Value>::error(format!("Failed to get schema: {}", e))),
+                    );
+                }
+            };
+
+            // For now, return schema info as the export doesn't support multi-class in one call
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::success(json!({
+                    "message": "Use class parameter to export specific class",
+                    "schema": schema
+                }), elapsed_ms)),
+            );
+        }
+    };
+
+    let ast = match QueryParser::parse(&query) {
+        Ok(ast) => ast,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!("Parse error: {}", e))),
+            );
+        }
+    };
+
+    let result = state.executor.execute_read(&ast);
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    match result {
+        Ok(r) => {
+            match r {
+                onto_query::QueryResult::Rows(rows) => {
+                    let count = rows.len();
+
+                    match req.format.as_str() {
+                        "csv" => {
+                            // CSV format
+                            let mut csv_rows = Vec::new();
+                            if !rows.is_empty() {
+                                // Header
+                                let headers: Vec<String> = rows[0].keys().cloned().collect();
+                                csv_rows.push(headers.join(","));
+
+                                // Data rows
+                                for row in &rows {
+                                    let values: Vec<String> = row.values().map(|v| {
+                                        let s = v.to_string();
+                                        if s.contains(',') || s.contains('"') {
+                                            format!("\"{}\"", s.replace('"', "\"\""))
+                                        } else {
+                                            s
+                                        }
+                                    }).collect();
+                                    csv_rows.push(values.join(","));
+                                }
+                            }
+
+                            (
+                                StatusCode::OK,
+                                Json(ApiResponse::success(json!({
+                                    "format": "csv",
+                                    "count": count,
+                                    "data": csv_rows.join("\n")
+                                }), elapsed_ms)),
+                            )
+                        }
+                        _ => {
+                            // JSONL format (default)
+                            (
+                                StatusCode::OK,
+                                Json(ApiResponse::success(json!({
+                                    "format": "jsonl",
+                                    "count": count,
+                                    "class": req.class,
+                                    "rows": rows
+                                }), elapsed_ms)),
+                            )
+                        }
+                    }
+                }
+                onto_query::QueryResult::Success(msg) => {
+                    (StatusCode::OK, Json(ApiResponse::success(json!({ "message": msg }), elapsed_ms)))
+                }
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<Value>::error(sanitize_error(&e.to_string()))),
+        ),
+    }
+}
+
+/// POST /api/import - Import data from JSON array.
+///
+/// Request body:
+/// ```json
+/// {
+///     "class": "Product",
+///     "rows": [
+///         {"name": "iPhone", "price": 999},
+///         {"name": "iPad", "price": 799}
+///     ],
+///     "skip_errors": false
+/// }
+/// ```
+async fn import_data(
+    State(state): State<AppState>,
+    Json(req): Json<ImportRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    if req.rows.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error("rows array is empty".to_string())),
+        );
+    }
+
+    if req.rows.len() > 10000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error("import batch size exceeds maximum of 10000".to_string())),
+        );
+    }
+
+    let mut imported = 0usize;
+    let mut errors = Vec::new();
+
+    for (i, row) in req.rows.iter().enumerate() {
+        // Build INSERT statement
+        let columns: Vec<String> = row.keys().cloned().collect();
+        let values: Vec<String> = row.values().map(|v| {
+            match v {
+                Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+                Value::Null => "NULL".to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::Number(n) => n.to_string(),
+                _ => format!("'{}'", v.to_string().replace('\'', "''")),
+            }
+        }).collect();
+
+        let insert = format!("INSERT INTO {} ({}) VALUES ({})",
+            req.class,
+            columns.join(", "),
+            values.join(", ")
+        );
+
+        match QueryParser::parse(&insert) {
+            Ok(ast) => {
+                match state.executor.execute(&ast) {
+                    Ok(_) => imported += 1,
+                    Err(e) => {
+                        if req.skip_errors {
+                            errors.push(format!("Row {}: {}", i, e));
+                        } else {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ApiResponse::<Value>::error(format!("Row {}: {}", i, e))),
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if req.skip_errors {
+                    errors.push(format!("Row {}: parse error: {}", i, e));
+                } else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::<Value>::error(format!("Row {}: parse error: {}", i, e))),
+                    );
+                }
+            }
+        }
+    }
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(json!({
+            "class": req.class,
+            "imported": imported,
+            "total": req.rows.len(),
+            "errors": errors
+        }), elapsed_ms)),
+    )
 }
 
 // ── API Documentation ────────────────────────────────────────────
