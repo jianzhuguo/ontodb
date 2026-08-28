@@ -853,6 +853,19 @@ impl QueryExecutor {
         }))
     }
 
+    /// Drop an ontology by name — deletes the `__ontology__{name}` LSM key.
+    pub fn drop_ontology(&self, name: &str) -> Result<()> {
+        let key = format!("__ontology__{}", name);
+        let engine = &self.engine;
+        if engine.get(key.as_bytes())?.is_some() {
+            engine.delete(key.as_bytes().to_vec())?;
+            tracing::info!("Dropped ontology '{}'", name);
+            Ok(())
+        } else {
+            Err(onto_core::CoreError::InvalidArgument(format!("Ontology '{}' not found", name)))
+        }
+    }
+
     /// Returns the active transaction ID, if any.
     pub fn active_txn_id(&self) -> Option<onto_core::SeqNo> {
         *self.active_txn.lock().unwrap_or_else(|e| e.into_inner())

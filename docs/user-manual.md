@@ -1,6 +1,6 @@
 # OntoDB 用户手册
 
-> 版本：v0.3.0 | 更新日期：2026-08-10
+> 版本：v0.6.2 | 更新日期：2026-08-27
 
 ---
 
@@ -33,14 +33,14 @@ tar xzf ontodb-v0.3.0-linux-x86_64.tar.gz
 # 2. 启动服务器
 ./ontodb-server --data-dir ./data --http 127.0.0.1:7912
 
-# 3. 创建表并插入数据
+# 3. 创建表并插入数据（OntoQL 语法）
 curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
-  -d '{"query": "CREATE VERTEX TABLE users (name STRING, age INT)"}'
+  -d '{"query": "CREATE CLASS users"}'
 
 curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
-  -d '{"query": "INSERT INTO users (name, age) VALUES (\"Alice\", 30)"}'
+  -d '{"query": "INSERT INTO users SET name = \"Alice\", age = 30"}'
 
 # 4. 查询数据
 curl -X POST http://127.0.0.1:7912/api/query \
@@ -152,20 +152,28 @@ cargo build --release
 ### 3.1 DDL（数据定义）
 
 ```sql
--- 创建顶点表
+-- 创建类（推荐使用 OntoQL 语法）
+CREATE CLASS users
+
+-- 创建带继承的类
+CREATE CLASS Employee EXTENDS Person
+
+-- 创建完整本体（多个类 + 属性）
+CREATE ONTOLOGY MyApp (
+    CLASS Product,
+    CLASS Order,
+    PROPERTY name DOMAIN Product RANGE STRING,
+    PROPERTY price DOMAIN Product RANGE FLOAT64
+)
+
+-- 兼容旧语法（仍可用）
 CREATE VERTEX TABLE users (
     id STRING,
     name STRING,
     age INT,
     email STRING
 );
-
--- 创建边表
-CREATE EDGE TABLE knows (
-    from_id STRING,
-    to_id STRING,
-    since INT
-);
+```
 
 -- 创建索引
 CREATE INDEX ON users (name);
@@ -256,6 +264,151 @@ COPY (SELECT * FROM users) TO '/path/to/export.csv' FORMAT CSV;
 -- 从 JSON 导入
 IMPORT users FROM '/path/to/users.json' FORMAT JSON;
 ```
+
+### 3.5 OntoQL 语法（本体查询语言）
+
+OntoQL 是 OntoDB 的本体查询语言，在 SQL 基础上增加了**类继承、属性语义、三元组操作、本体推理**能力。
+
+#### 3.5.1 本体定义
+
+```sql
+-- 创建单个类（自动创建同名本体）
+CREATE CLASS Dog
+
+-- 创建带继承的类
+CREATE CLASS Dog EXTENDS Animal
+
+-- 创建完整本体（多个类 + 属性 组织在一起）
+CREATE ONTOLOGY BioCompute (
+    CLASS BioTask,
+    CLASS ScreenResult,
+    CLASS ScreenHit EXTENDS MeasurableEntity,
+    PROPERTY task_name DOMAIN BioTask RANGE STRING,
+    PROPERTY data_type DOMAIN BioTask RANGE STRING,
+    PROPERTY status DOMAIN BioTask RANGE STRING,
+    PROPERTY value_density DOMAIN BioTask RANGE FLOAT64
+)
+
+-- 创建共享基类本体
+CREATE ONTOLOGY SharedBase (
+    CLASS TimestampedEntity,
+    CLASS OwnedEntity EXTENDS TimestampedEntity,
+    CLASS MeasurableEntity EXTENDS OwnedEntity,
+    PROPERTY created_at DOMAIN TimestampedEntity RANGE FLOAT64,
+    PROPERTY owner DOMAIN OwnedEntity RANGE STRING,
+    PROPERTY project_id DOMAIN OwnedEntity RANGE STRING,
+    PROPERTY value_score DOMAIN MeasurableEntity RANGE FLOAT64
+)
+```
+
+#### 3.5.2 删除
+
+```sql
+-- 删除单个类（对应 CREATE CLASS）
+DROP CLASS Dog
+
+-- 删除整个本体（对应 CREATE ONTOLOGY）
+DROP ONTOLOGY BioCompute
+```
+
+**对应关系**：`CREATE CLASS` ↔ `DROP CLASS`，`CREATE ONTOLOGY` ↔ `DROP ONTOLOGY`
+
+#### 3.5.3 数据操作（SET 语法）
+
+```sql
+-- INSERT（OntoQL SET 语法，比 SQL VALUES 更简洁）
+INSERT INTO BioTask SET
+    task_name = 'sample.fastq',
+    data_type = 'fastq',
+    status = 'completed',
+    value_density = 0.75,
+    owner = 'lab-01',
+    created_at = 1724800000.0
+
+-- SELECT（与 SQL 相同）
+SELECT * FROM BioTask WHERE status = 'completed'
+SELECT * FROM BioTask WHERE owner = 'lab-01' ORDER BY value_density DESC
+
+-- UPDATE / DELETE（与 SQL 相同）
+UPDATE BioTask SET status = 'archived' WHERE owner = 'lab-01'
+DELETE FROM BioTask WHERE status = 'failed'
+```
+
+#### 3.5.4 继承查询
+
+```sql
+-- 查询 Animal 会自动返回 Dog、Cat、Bird 等所有子类实例
+SELECT * FROM Animal
+
+-- 查询 Device 会自动返回 Sensor、TempSensor、SmartLight 等
+SELECT * FROM Device
+
+-- 查看实体的真实类型
+SELECT name, __class__ FROM Device
+```
+
+#### 3.5.5 三元组操作（RDF）
+
+```sql
+-- 插入三元组
+INSERT TRIPLE SET subject = "dog1", predicate = "rdf:type", object = "Dog"
+INSERT TRIPLE SET subject = "dog1", predicate = "name", object = "Rex"
+
+-- 批量插入
+INSERT TRIPLES (subject, predicate, object) VALUES
+    ("dog1", "rdf:type", "Dog"),
+    ("dog1", "name", "Rex"),
+    ("dog1", "age", "3")
+
+-- 查询三元组
+SELECT TRIPLE
+SELECT TRIPLE WHERE subject = "dog1"
+SELECT TRIPLE WHERE predicate = "rdf:type" LIMIT 10
+
+-- 删除三元组
+DELETE TRIPLE SET subject = "dog1", predicate = "name", object = "Rex"
+```
+
+#### 3.5.6 推理查询
+
+```sql
+-- 使用 INFER 关键字开启 OWL 推理
+SELECT * FROM Animal INFER @onto(scope=SUBCLASS)
+
+-- 推理会自动展开类层次：
+-- Animal → Mammal → Dog, Cat
+-- Animal → Bird → Eagle
+-- 查询 Animal 返回所有子类实例
+```
+
+#### 3.5.7 事务
+
+```sql
+BEGIN
+INSERT INTO BioTask SET task_name = 'txn-test', status = 'new'
+UPDATE BioTask SET status = 'committed' WHERE task_name = 'txn-test'
+COMMIT
+
+-- 或回滚
+BEGIN
+DELETE FROM BioTask WHERE task_name = 'txn-test'
+ROLLBACK
+```
+
+#### 3.5.8 OntoQL vs SQL vs SPARQL 对照
+
+| 操作 | SQL | OntoQL | SPARQL |
+|------|-----|--------|--------|
+| 建表 | `CREATE ONTOLOGY X (CLASS Y)` | `CREATE CLASS Y` | 不支持 |
+| 建库 | `CREATE ONTOLOGY X (...)` | `CREATE ONTOLOGY X (...)` | 不支持 |
+| 删表 | 不支持 | `DROP CLASS Y` | 不支持 |
+| 删库 | 不支持 | `DROP ONTOLOGY X` | 不支持 |
+| 插数据 | `INSERT INTO T (...) VALUES (...)` | `INSERT INTO T SET col=val` | 不支持 |
+| 查数据 | `SELECT * FROM T` | `SELECT * FROM T` | `SELECT ?x WHERE {?x rdf:type T}` |
+| 继承查询 | 不支持 | `SELECT * FROM Animal`（自动展开） | `?x rdf:type/rdfs:subClassOf* Animal` |
+| 三元组 | 不支持 | `INSERT TRIPLE SET ...` | `INSERT DATA { ... }` |
+
+> 应用层日常 CRUD 用 SQL 即可。管理操作（建本体/加属性/DROP）用 OntoQL。SPARQL 适合知识图谱集成。
 
 ---
 

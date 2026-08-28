@@ -726,6 +726,37 @@ async fn execute_query(
                         return (StatusCode::BAD_REQUEST, PrettyJson(ApiResponse::<Value>::error("TripleStore not configured".to_string()), false));
                     }
                 }
+                onto_query::OntoQLAst::DropClass { name } => {
+                    // DROP CLASS deletes the auto-created ontology entry (CREATE CLASS ↔ DROP CLASS)
+                    match state.executor.drop_ontology(name) {
+                        Ok(()) => {
+                            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                            state.metrics.record_query("DROP_CLASS", elapsed_ms / 1000.0, true);
+                            return (
+                                StatusCode::OK,
+                                PrettyJson(ApiResponse::success(json!({"message": format!("Class '{}' dropped", name)}), elapsed_ms), req.pretty),
+                            );
+                        }
+                        Err(e) => {
+                            return (StatusCode::BAD_REQUEST, PrettyJson(ApiResponse::<Value>::error(e.to_string()), false));
+                        }
+                    }
+                }
+                onto_query::OntoQLAst::DropOntology { name } => {
+                    match state.executor.drop_ontology(name) {
+                        Ok(()) => {
+                            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                            state.metrics.record_query("DROP_ONTOLOGY", elapsed_ms / 1000.0, true);
+                            return (
+                                StatusCode::OK,
+                                PrettyJson(ApiResponse::success(json!({"message": format!("Ontology '{}' dropped", name)}), elapsed_ms), req.pretty),
+                            );
+                        }
+                        Err(e) => {
+                            return (StatusCode::BAD_REQUEST, PrettyJson(ApiResponse::<Value>::error(e.to_string()), false));
+                        }
+                    }
+                }
                 onto_query::OntoQLAst::SelectTriples { subject, predicate, object, limit } => {
                     let results = state.executor.query_triples(
                         subject.as_deref(),

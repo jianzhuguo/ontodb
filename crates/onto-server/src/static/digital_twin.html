@@ -52,6 +52,19 @@ canvas{display:block}
 .detail .info-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:12px}
 .detail .info-item{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:6px}
 .detail .info-item .label{font-size:9px;text-transform:uppercase;color:var(--dim)}.detail .info-item .value{font-size:13px;font-weight:600}
+.detail .info-item.editing{border-color:var(--accent);background:#24283b}
+.detail .info-item input{width:100%;background:transparent;border:none;color:var(--text);font-size:13px;font-weight:600;outline:none;font-family:inherit}
+.detail .info-item input:focus{color:var(--accent)}
+.detail .save-bar{display:flex;gap:6px;margin:8px 0}
+.detail .save-bar button{padding:4px 12px;border:1px solid var(--border);border-radius:4px;font-size:11px;cursor:pointer;background:var(--bg);color:var(--text);font-family:inherit}
+.detail .save-bar button:hover{border-color:var(--accent)}
+.detail .save-bar .btn-save{background:var(--accent);color:#1a1b26;border-color:var(--accent);font-weight:600}
+.detail .save-bar .btn-save:hover{opacity:.85}
+.detail .save-bar .btn-cancel{color:var(--dim)}
+.detail .save-bar .btn-cancel:hover{color:var(--text)}
+.save-toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);padding:8px 20px;border-radius:6px;font-size:12px;z-index:100;animation:toastIn .3s ease}
+.save-toast.ok{background:var(--green);color:#1a1b26}.save-toast.err{background:var(--red);color:#1a1b26}
+@keyframes toastIn{from{opacity:0;transform:translateX(-50%) translateY(10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
 .detail .rel-section{margin-top:10px}
 .detail .rel-title{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--dim);margin-bottom:6px}
 .detail .rel-item{display:flex;align-items:center;gap:6px;padding:4px 6px;background:var(--bg);border:1px solid var(--border);border-radius:4px;margin-bottom:4px;cursor:pointer;font-size:11px}
@@ -292,6 +305,26 @@ function draw(){
     if(r>=5){cx.fillStyle='#e2e8f0';cx.font=(n.type==='anchor'?'bold ':'')+Math.max(10,r*.8)+'px Inter,sans-serif';cx.textAlign='center';cx.fillText(n.label,n.x,n.y-r-6);}
     if(n.type==='server'&&n.info){cx.beginPath();cx.arc(n.x+r*.6,n.y-r*.6,2.5,0,Math.PI*2);cx.fillStyle=n.info.status==='online'?'#9ece6a':'#e0af68';cx.fill();}
   }
+  // ── Ripples (write-back propagation) ──
+  var now=Date.now();var activeRipples=[];
+  for(var ri=0;ri<_ripples.length;ri++){
+    var rp=_ripples[ri];var elapsed=now-rp.start;if(elapsed<0){activeRipples.push(rp);continue;}
+    var progress=elapsed/rp.duration;if(progress>1)continue;
+    activeRipples.push(rp);
+    var ease=1-Math.pow(1-progress,3);
+    var r2=rp.node.r+ease*40;
+    var alpha=(1-progress)*0.4;
+    cx.beginPath();cx.arc(rp.node.x,rp.node.y,r2,0,Math.PI*2);
+    cx.strokeStyle=rp.color+Math.round(alpha*255).toString(16).padStart(2,'0');
+    cx.lineWidth=2*(1-progress);cx.stroke();
+    // Inner glow
+    if(progress<0.5){
+      var gl2=cx.createRadialGradient(rp.node.x,rp.node.y,rp.node.r,rp.node.x,rp.node.y,rp.node.r+20);
+      gl2.addColorStop(0,rp.color+'30');gl2.addColorStop(1,rp.color+'00');
+      cx.fillStyle=gl2;cx.beginPath();cx.arc(rp.node.x,rp.node.y,rp.node.r+20,0,Math.PI*2);cx.fill();
+    }
+  }
+  _ripples=activeRipples;
   // Tooltip
   if(hoverN&&hoverN.info){
     var tt=document.getElementById('tooltip'),n=hoverN,html='<div class="tt">'+n.label+'</div>';
@@ -331,20 +364,175 @@ cv.addEventListener('click',function(e){
   }
 });
 
-// ── Node detail & relation expansion ──
+// ── Node detail & relation expansion (editable) ──
+var _editingField=null,_editingNode=null;
+// Fields that are identity/foreign keys (read-only)
+var READONLY_FIELDS={'code':1,'emp_id':1,'node_id':1,'entries':1};
+
 function showNodeDetail(n){
+  _editingField=null;_editingNode=n;
   var panel=document.getElementById('detailPanel');
   var html='<div class="detail"><span class="back" onclick="clearDetail()">← 返回提示</span>';
-  html+='<div class="title">'+n.label+'</div>';
+  html+='<div class="title">'+n.label+' <span style="font-size:10px;color:var(--dim);font-weight:400">('+getTypeLabel(n.type)+')</span></div>';
   html+='<div class="info-grid">';
   if(n.info){for(var k in n.info){if(!n.info.hasOwnProperty(k))continue;
-    var km={code:'编码',head:'负责人',budget:'预算',level:'层级',region:'区域',emp_id:'工号',title:'职位',salary:'薪资',email:'邮箱',node_id:'节点',role:'角色',cpu:'CPU',mem:'内存',storage:'存储',status:'状态',progress:'进度',industry:'行业',contract:'合同额',contact:'联系人',stage:'阶段',value:'金额',entries:'条目数'}[k]||k;
-    html+='<div class="info-item"><div class="label">'+km+'</div><div class="value">'+n.info[k]+'</div></div>';}}
+    var km={code:'编码',head:'负责人',budget:'预算',level:'层级',region:'区域',emp_id:'工号',title:'职位',salary:'薪资',email:'邮箱',node_id:'节点',role:'角色',cpu:'CPU',mem:'内存',storage:'存储',status:'状态',progress:'进度',industry:'行业',contract:'合同额',contact:'联系人',stage:'阶段',value:'金额',entries:'条目数',desc:'说明',name:'名称'}[k]||k;
+    var ro=READONLY_FIELDS[k]||k==='name';
+    html+='<div class="info-item" id="field-'+k+'" data-key="'+k+'" data-readonly="'+ro+'">';
+    html+='<div class="label">'+km+'</div>';
+    html+='<div class="value" onclick="'+(ro?'':'editField(\''+k+'\')')+'" style="'+(ro?'':'cursor:pointer;border-bottom:1px dashed var(--border);')+'">'+n.info[k]+'</div>';
+    html+='</div>';}}
   html+='</div>';
+  html+='<div id="saveBar"></div>';
+  html+='<div style="margin-bottom:8px"><button onclick="refreshFromDb()" style="padding:3px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--dim);font-size:10px;cursor:pointer;font-family:inherit" onmouseover="this.style.borderColor=\'var(--accent)\'" onmouseout="this.style.borderColor=\'var(--border)\'">从 OntoDB 刷新</button></div>';
   // Related entities
   html+='<div class="rel-section"><div class="rel-title">关联实体</div><div id="relatedList">查询中...</div></div>';
   html+='</div>';
   panel.innerHTML=html;
+}
+function getTypeLabel(t){return{anchor:'语义锚点',dept:'部门',emp:'员工',proj:'项目',server:'服务器',customer:'客户',lead:'线索',alert:'告警'}[t]||t;}
+
+function editField(key){
+  var el=document.getElementById('field-'+key);if(!el)return;
+  var val=_editingNode.info[key];
+  el.classList.add('editing');
+  el.querySelector('.value').innerHTML='<input id="edit-input" value="'+String(val).replace(/"/g,'&quot;')+'" onkeydown="if(event.key===\'Enter\')saveField(\''+key+'\');if(event.key===\'Escape\')cancelEdit();">';
+  document.getElementById('edit-input').focus();
+  document.getElementById('edit-input').select();
+  _editingField=key;
+  document.getElementById('saveBar').innerHTML='<div class="save-bar"><button class="btn-save" onclick="saveField(\''+key+'\')">保存到 OntoDB</button><button class="btn-cancel" onclick="cancelEdit()">取消</button><span style="font-size:10px;color:var(--dim)">Enter 保存 / Esc 取消</span></div>';
+}
+
+function cancelEdit(){
+  if(_editingField&&_editingNode){
+    var el=document.getElementById('field-'+_editingField);
+    if(el){el.classList.remove('editing');el.querySelector('.value').textContent=_editingNode.info[_editingField];}
+  }
+  _editingField=null;
+  document.getElementById('saveBar').innerHTML='';
+}
+
+async function saveField(key){
+  var input=document.getElementById('edit-input');if(!input)return;
+  var newVal=input.value.trim();var oldVal=String(_editingNode.info[key]);
+  if(newVal===oldVal){cancelEdit();return;}
+
+  var n=_editingNode;
+  var cls=getClassName(n.type);
+  var pkField=getPkField(n.type);
+  var pkVal=n.info[pkField];
+  if(!cls||!pkField||pkVal===undefined){showToast('无法确定实体类型','err');return;}
+
+  // Determine SQL value
+  var sqlVal=isNaN(Number(newVal))?"'"+newVal.replace(/'/g,"''")+"'":newVal;
+  var sql="UPDATE "+cls+" SET "+key+" = "+sqlVal+" WHERE "+pkField+" = '"+String(pkVal).replace(/'/g,"''")+"'";
+
+  try{
+    var resp=await fetch('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:sql})});
+    var result=await resp.json();
+    if(result.success){
+      // Update local state
+      n.info[key]=isNaN(Number(newVal))?newVal:Number(newVal);
+      // Update label if name changed
+      if(key==='name'||key==='head'||key==='title')n.label=n.info.name||n.info.head||n.label;
+      showNodeDetail(n);showToast(key+' 已更新','ok');
+      // Propagate change to connected nodes
+      propagateChange(n,key,newVal,oldVal);
+    }else{
+      showToast('写入失败: '+(result.error||'unknown'),'err');
+    }
+  }catch(e){
+    showToast('网络错误: '+e.message,'err');
+  }
+}
+
+// ── Change propagation along edges ──
+var _ripples=[]; // {nodeId, startTime, color, duration}
+
+function propagateChange(sourceNode,field,newVal,oldVal){
+  // Visual ripple on source
+  _ripples.push({node:sourceNode,start:Date.now(),color:'#9ece6a',duration:1500});
+  // Find directly connected nodes and add subtle ripple
+  var connected=[];
+  for(var i=0;i<edges.length;i++){
+    var e=edges[i];
+    var other=null;
+    if(e.from===sourceNode.id)other=findN(e.to);
+    else if(e.to===sourceNode.id)other=findN(e.from);
+    if(other&&other!==sourceNode){
+      connected.push(other);
+      _ripples.push({node:other,start:Date.now()+200,color:'#7aa2f7',duration:1200});
+    }
+  }
+  // If the changed field is a foreign key link, update the connected node's display
+  if(field==='department'||field==='source'||field==='parent'){
+    var target=findN(sourceNode.type+'_'+newVal)||findN('d_'+newVal);
+    if(target){
+      _ripples.push({node:target,start:Date.now()+400,color:'#e0af68',duration:1000});
+    }
+  }
+  // Cascade: if this node is a department, update employee/project counts
+  if(sourceNode.type==='dept'){
+    connected.forEach(function(cn){
+      if(cn.type==='emp'&&field==='head'){
+        // Department head changed - ripple employees
+        _ripples.push({node:cn,start:Date.now()+600,color:'#bb9af7',duration:800});
+      }
+    });
+  }
+}
+
+function getClassName(type){
+  return{dept:'Department',emp:'Employee',proj:'Project',server:'Server',customer:'Customer',lead:'Lead',alert:'Alert'}[type]||null;
+}
+function getPkField(type){
+  return{dept:'code',emp:'emp_id',proj:'code',server:'node_id',customer:'name',lead:'company',alert:'time'}[type]||'name';
+}
+
+function showToast(msg,type){
+  var el=document.createElement('div');
+  el.className='save-toast '+(type||'ok');
+  el.textContent=msg;
+  document.body.appendChild(el);
+  setTimeout(function(){el.style.opacity='0';el.style.transition='opacity .3s';},2000);
+  setTimeout(function(){el.remove();},2500);
+}
+
+// ── Refresh selected node from OntoDB ──
+async function refreshFromDb(){
+  var n=_editingNode;if(!n||!n.info)return;
+  var cls=getClassName(n.type);
+  var pkField=getPkField(n.type);
+  var pkVal=n.info[pkField];
+  if(!cls||!pkField||pkVal===undefined){showToast('无法确定实体','err');return;}
+  try{
+    var resp=await fetch('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:"SELECT * FROM "+cls+" WHERE "+pkField+" = '"+String(pkVal).replace(/'/g,"''")+"' LIMIT 1"})});
+    var data=await resp.json();
+    var rows=data.data||[];
+    if(rows.length>0){
+      var fresh=rows[0];
+      var changed=[];
+      for(var k in fresh){
+        if(!fresh.hasOwnProperty(k)||k.startsWith('__'))continue;
+        if(String(fresh[k])!==String(n.info[k]||'')){
+          changed.push(k);
+        }
+        n.info[k]=fresh[k];
+      }
+      n.label=n.info.name||n.info.head||n.label;
+      showNodeDetail(n);
+      if(changed.length>0){
+        showToast('已刷新，'+changed.length+' 个字段变更','ok');
+        changed.forEach(function(k){propagateChange(n,k,n.info[k],'');});
+      }else{
+        showToast('数据无变更','ok');
+      }
+    }else{
+      showToast('OntoDB 中未找到该记录','err');
+    }
+  }catch(e){
+    showToast('刷新失败: '+e.message,'err');
+  }
 }
 
 function clearDetail(){
@@ -391,7 +579,8 @@ async function expandRelations(n){
           var rid=q.type+'_'+(r.emp_id||r.code||r.node_id||r.name||ri);
           var rname=r.name||r.emp_id||r.code||r.node_id||'unknown';
           var alreadyExpanded=expandedNodes[rid];
-          html+='<div class="rel-item'+(alreadyExpanded?'':'')+'" onclick="addToGraph(\''+q.type+'\',\''+rid.replace(/'/g,"\\'")+'\',\''+rname.replace(/'/g,"\\'")+'\')">';
+          var infoJson=JSON.stringify(r).replace(/'/g,"\\'").replace(/"/g,'&quot;');
+          html+='<div class="rel-item'+(alreadyExpanded?'':'')+'" onclick="addToGraph(\''+q.type+'\',\''+rid.replace(/'/g,"\\'")+'\',\''+rname.replace(/'/g,"\\'")+'\',this.dataset.info)" data-info="'+infoJson+'">';
           html+='<div class="dot" style="background:'+(COL[q.type]||'#565f89')+'"></div>';
           html+='<span>'+rname+'</span>';
           html+='<span style="margin-left:auto;color:var(--dim);font-size:9px">'+(alreadyExpanded?'已展开':'点击展开')+'</span>';
@@ -407,18 +596,24 @@ async function expandRelations(n){
   relList.innerHTML=html||'<div style="color:var(--dim);font-size:11px">暂无关联数据</div>';
 }
 
-function addToGraph(type,id,label){
+function addToGraph(type,id,label,infoStr){
   if(expandedNodes[id])return;
   if(findN(id))return;
   var n=selectedNode;if(!n)return;
   var angle=Math.random()*Math.PI*2;
   var r=80+Math.random()*40;
+  // Use real data from query result if available
   var info={};
-  // Copy info from query result
-  if(type==='emp')info={emp_id:id.replace('emp_',''),title:'员工'};
-  else if(type==='proj')info={code:id.replace('p_',''),status:'进行中'};
-  else if(type==='dept')info={code:id.replace('d_','')};
-  else if(type==='alert')info={level:'WARNING'};
+  if(infoStr){
+    try{info=JSON.parse(infoStr);}catch(e){}
+  }
+  if(!info.emp_id&&!info.code&&!info.node_id){
+    // Fallback: extract from id
+    if(type==='emp')info={emp_id:id.replace('emp_',''),title:'员工'};
+    else if(type==='proj')info={code:id.replace('p_',''),status:'进行中'};
+    else if(type==='dept')info={code:id.replace('d_','')};
+    else if(type==='alert')info={level:'WARNING'};
+  }
   nodes.push({id:id,label:label,type:type,x:n.x+Math.cos(angle)*r,y:n.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:6,info:info});
   edges.push({from:n.id,to:id,type:'related'});
   expandedNodes[id]=true;

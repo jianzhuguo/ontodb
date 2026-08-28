@@ -1,0 +1,21 @@
+[package]
+name = "onto-embed"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "OntoDB Embedding 插件 — 数据写入时自动生成语义向量"
+
+[dependencies]
+onto-plugin = { path = "../onto-plugin" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokenizers = "0.22"
+
+# ONNX Runtime（bundled = 自带编译好的 onnxruntime，无需系统安装）
+ort = { version = "=2.0.0-rc.13", features = ["download-binaries"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

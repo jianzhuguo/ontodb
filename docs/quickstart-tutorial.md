@@ -23,23 +23,23 @@ cd ontodb-v0.3.0
 ## 第 2 步：创建表并插入数据
 
 ```bash
-# 创建用户表
+# 创建用户类（OntoQL 语法）
 curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
-  -d '{"query": "CREATE VERTEX TABLE users (name STRING, age INT, city STRING)"}'
+  -d '{"query": "CREATE CLASS users"}'
 
-# 插入数据
+# 插入数据（SET 语法）
 curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
-  -d '{"query": "INSERT INTO users (name, age, city) VALUES (\"Alice\", 30, \"北京\")"}'
-
-curl -X POST http://127.0.0.1:7912/api/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "INSERT INTO users (name, age, city) VALUES (\"Bob\", 25, \"上海\")"}'
+  -d '{"query": "INSERT INTO users SET name = \"Alice\", age = 30, city = \"北京\""}'
 
 curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
-  -d '{"query": "INSERT INTO users (name, age, city) VALUES (\"Charlie\", 35, \"北京\")"}'
+  -d '{"query": "INSERT INTO users SET name = \"Bob\", age = 25, city = \"上海\""}'
+
+curl -X POST http://127.0.0.1:7912/api/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "INSERT INTO users SET name = \"Charlie\", age = 35, city = \"北京\""}'
 ```
 
 ---
@@ -68,15 +68,15 @@ curl -X POST http://127.0.0.1:7912/api/query \
 ## 第 4 步：向量搜索
 
 ```bash
-# 创建文档表
+# 创建文档类
 curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
-  -d '{"query": "CREATE VERTEX TABLE documents (title STRING, content STRING, embedding ARRAY)"}'
+  -d '{"query": "CREATE CLASS documents"}'
 
 # 插入带向量的文档
 curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
-  -d '{"query": "INSERT INTO documents (title, content, embedding) VALUES (\"Rust入门\", \"Rust是系统编程语言\", [0.1, 0.2, 0.3, 0.4, 0.5])"}'
+  -d '{"query": "INSERT INTO documents SET title = \"Rust入门\", content = \"Rust是系统编程语言\", embedding = [0.1, 0.2, 0.3, 0.4, 0.5]"}'
 
 curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
@@ -98,20 +98,15 @@ curl -X POST http://127.0.0.1:7912/api/vector/search \
 ## 第 5 步：图查询
 
 ```bash
-# 创建人物表
+# 创建人物类
 curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
-  -d '{"query": "CREATE VERTEX TABLE Person (name STRING, age INT)"}'
-
-# 创建关系表
-curl -X POST http://127.0.0.1:7912/api/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "CREATE EDGE TABLE knows (from_id STRING, to_id STRING)"}'
+  -d '{"query": "CREATE CLASS Person"}'
 
 # 插入人物
 curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
-  -d '{"query": "INSERT INTO Person (name, age) VALUES (\"Alice\", 30)"}'
+  -d '{"query": "INSERT INTO Person SET name = \"Alice\", age = 30"}'
 
 curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \

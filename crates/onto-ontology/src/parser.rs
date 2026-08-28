@@ -111,12 +111,21 @@ impl OntologyParser {
             .ok_or_else(|| CoreError::InvalidArgument("expected 'CLASS'".to_string()))?
             .trim();
 
-        // Check for SUBCLASS OF
         let upper_rest = rest.to_uppercase();
-        if let Some(sub_pos) = upper_rest.find("SUBCLASS OF") {
-            let class_name = rest[..sub_pos].trim();
-            // Safe: sub_pos found by find(), "SUBCLASS OF" is 11 chars
-            let parent = if sub_pos + 11 < rest.len() { &rest[sub_pos + 11..] } else { "" }.trim();
+
+        // Check for "SUBCLASS OF" or "EXTENDS" (both are valid inheritance keywords)
+        let result = if let Some(pos) = upper_rest.find("SUBCLASS OF") {
+            Some((pos, 11))
+        } else if let Some(pos) = upper_rest.find("EXTENDS") {
+            Some((pos, 7))
+        } else {
+            None
+        };
+
+        if let Some((pos, kw_len)) = result {
+            let class_name = rest[..pos].trim();
+            // Safe: pos found by find(), kw_len is correct
+            let parent = if pos + kw_len < rest.len() { &rest[pos + kw_len..] } else { "" }.trim();
 
             if class_name.is_empty() {
                 return Err(CoreError::InvalidArgument(
@@ -127,6 +136,7 @@ impl OntologyParser {
             return Ok(Class::new(class_name).with_superclass(parent));
         }
 
+        // No inheritance keyword — plain class
         let class_name = rest.trim();
         if class_name.is_empty() {
             return Err(CoreError::InvalidArgument(

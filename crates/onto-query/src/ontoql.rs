@@ -296,6 +296,9 @@ pub enum OntoQLAst {
     DropClass {
         name: String,
     },
+    DropOntology {
+        name: String,
+    },
     CreateProperty {
         name: String,
         kind: PropertyKind,
@@ -421,6 +424,9 @@ impl OntoQLParser {
         if starts_with_ignore_ascii_case(input, "DROP CLASS") {
             return Self::parse_drop_class(input);
         }
+        if starts_with_ignore_ascii_case(input, "DROP ONTOLOGY") {
+            return Self::parse_drop_ontology(input);
+        }
         if starts_with_ignore_ascii_case(input, "SELECT") {
             return Self::parse_select(input);
         }
@@ -510,6 +516,17 @@ impl OntoQLParser {
             return Err(CoreError::InvalidArgument("Missing class name in DROP CLASS".into()));
         }
         Ok(OntoQLAst::DropClass { name })
+    }
+
+    // ── DROP ONTOLOGY ─────────────────────────────────────────────
+
+    fn parse_drop_ontology(input: &str) -> Result<OntoQLAst> {
+        let rest = safe_slice_from(input, "DROP ONTOLOGY".len()).trim_start();
+        let (name, _) = Self::extract_identifier(rest);
+        if name.is_empty() {
+            return Err(CoreError::InvalidArgument("Missing ontology name in DROP ONTOLOGY".into()));
+        }
+        Ok(OntoQLAst::DropOntology { name })
     }
 
     // ── CREATE PROPERTY ───────────────────────────────────────────
@@ -1648,6 +1665,10 @@ impl OntoQLAst {
             }
 
             OntoQLAst::DropClass { name } => {
+                Ok(format!("DELETE FROM \"__ontology__{}\"", name))
+            }
+
+            OntoQLAst::DropOntology { name } => {
                 Ok(format!("DELETE FROM \"__ontology__{}\"", name))
             }
 
