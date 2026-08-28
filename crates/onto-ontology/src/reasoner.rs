@@ -100,24 +100,29 @@ impl Reasoner {
         let mut iterations = 0;
         let mut new_facts: Vec<Triple> = Vec::new();
 
-        // Fast path: compute transitive closure using BFS (O(n) instead of O(n² × iterations))
+        // Fast path: transitive closure using adjacency BFS
         let mut transitive_handled: HashSet<String> = HashSet::new();
         for (prop_name, prop_def) in &self.ontology.properties {
             if !prop_def.is_transitive {
                 continue;
             }
             transitive_handled.insert(prop_name.clone());
-            // Build adjacency list for this transitive property
+
+            // Build adjacency list
             let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
             for fact in &all_facts {
                 if fact.predicate == *prop_name {
                     adj.entry(fact.subject.as_str()).or_default().push(fact.object.as_str());
                 }
             }
-            // BFS from each source to compute full transitive closure
+            if adj.is_empty() {
+                continue;
+            }
+
+            // BFS from each source
             let mut new_transitive = Vec::new();
             for (start, targets) in &adj {
-                let mut visited = HashSet::new();
+                let mut visited: HashSet<&str> = HashSet::new();
                 let mut queue: VecDeque<&str> = VecDeque::new();
                 for t in targets {
                     visited.insert(*t);
@@ -137,6 +142,7 @@ impl Reasoner {
                     }
                 }
             }
+
             let count = new_transitive.len();
             if count > 0 {
                 rule_counts.insert(RuleId::PrpTrp, count);
@@ -147,40 +153,48 @@ impl Reasoner {
             }
         }
 
-        // Fast path: Cax-sco + Cax-eqc using pre-computed superclass cache
+        // Fast path: Cax-sco + Cax-eqc
+        // Optimization: group rdf:type facts by class, batch-process all subjects per class
         {
             let superclass_cache = self.ontology.build_superclass_cache();
-            let mut cax_new = Vec::new();
+
+            // Phase 1: group subjects by class (immutable borrow of all_facts)
+            let mut class_subjects: HashMap<String, Vec<String>> = HashMap::new();
             for fact in &all_facts {
-                if fact.predicate != "rdf:type" {
-                    continue;
+                if fact.predicate == "rdf:type" {
+                    class_subjects.entry(fact.object.clone()).or_default().push(fact.subject.clone());
                 }
-                // Subclass propagation
-                if let Some(supers) = superclass_cache.get(&fact.object) {
+            }
+
+            // Phase 2: generate inferred triples (no borrow of all_facts)
+            let mut cax_new: Vec<Triple> = Vec::new();
+            for (class_name, subjects) in &class_subjects {
+                if let Some(supers) = superclass_cache.get(class_name.as_str()) {
                     for sup in supers {
-                        let t = Triple::type_of(&fact.subject, sup);
-                        if !all_facts.contains(&t) {
-                            cax_new.push(t);
+                        for subj in subjects {
+                            cax_new.push(Triple::type_of(subj, sup));
                         }
                     }
                 }
-                // Equivalent class propagation
-                if let Some(class) = self.ontology.classes.get(&fact.object) {
-                    for equiv in &class.equivalent_classes {
-                        let t = Triple::type_of(&fact.subject, equiv);
-                        if !all_facts.contains(&t) {
-                            cax_new.push(t);
+                if let Some(class_def) = self.ontology.classes.get(class_name.as_str()) {
+                    for equiv in &class_def.equivalent_classes {
+                        for subj in subjects {
+                            cax_new.push(Triple::type_of(subj, equiv));
                         }
                     }
                 }
             }
-            let count = cax_new.len();
+
+            // Phase 3: deduplicate and insert (mutable borrow of all_facts)
+            let mut count = 0;
+            for t in cax_new {
+                if all_facts.insert(t.clone()) {
+                    all_inferred.push(t);
+                    count += 1;
+                }
+            }
             if count > 0 {
                 *rule_counts.entry(RuleId::CaxSco).or_insert(0) += count;
-                for t in cax_new {
-                    all_facts.insert(t.clone());
-                    all_inferred.push(t);
-                }
             }
         }
 
