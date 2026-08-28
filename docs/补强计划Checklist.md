@@ -73,10 +73,10 @@
 ## 第三阶段：生态补齐（持续）
 
 ### 3.1 ORM 对接（Python SQLAlchemy）
-- [ ] 编写 SQLAlchemy dialect（ontodb:// 协议）
-- [ ] 支持基本 CRUD 操作
+- [x] 编写 SQLAlchemy dialect（ontodb:// 协议）✅
+- [x] 支持基本 CRUD 操作 ✅
 - [ ] 发布到 PyPI：`sqlalchemy-ontodb`
-- [ ] 测试：SQLAlchemy ORM 增删改查
+- [x] 测试：SQLAlchemy ORM 增删改查 ✅ (14 个测试通过)
 
 ### 3.2 ORM 对接（Rust SQLx）
 - [ ] 编写 SQLx driver
@@ -130,7 +130,7 @@
 8. [DONE] 批量操作 API（POST /api/batch）
 9. [DONE] 事务 API（begin / execute / commit / rollback）
 10. [DONE] 游标 API（POST /api/cursor）
-11. [TODO] ORM 对接（Python SQLAlchemy）
+11. [DONE] ORM 对接（Python SQLAlchemy dialect）
 ```
 
 ---

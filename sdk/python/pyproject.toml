@@ -36,6 +36,9 @@ dev = [
     "pytest-cov>=4.0",
     "responses>=0.23",
 ]
+sqlalchemy = [
+    "sqlalchemy>=1.4.0",
+]
 
 [project.urls]
 Homepage = "https://ontodb.io"

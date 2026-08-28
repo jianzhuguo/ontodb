@@ -23,9 +23,19 @@ Basic usage::
 
     # Graph traverse
     results = db.graph_traverse("Person::1", direction="out", depth=3)
+
+SQLAlchemy usage::
+
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine("ontodb://localhost:7912")
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT * FROM Product"))
+        for row in result:
+            print(row)
 """
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 from .client import OntoDB
 from .exceptions import (
@@ -35,6 +45,12 @@ from .exceptions import (
     AuthenticationError,
     TimeoutError,
 )
+
+# Import dialect to auto-register with SQLAlchemy
+try:
+    from . import dialect
+except ImportError:
+    pass
 
 __all__ = [
     "OntoDB",
