@@ -70,6 +70,17 @@ impl OntologyParser {
             } else if upper_stmt.starts_with("PROPERTY") {
                 let prop = Self::parse_property(stmt)?;
                 ontology.add_property(prop);
+            } else if upper_stmt.starts_with("UNIQUE") {
+                let (class_name, columns) = Self::parse_unique(stmt)?;
+                // Find or create the class and add unique constraint
+                if let Some(class) = ontology.classes.get_mut(&class_name) {
+                    class.unique_columns.push(columns);
+                } else {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "UNIQUE constraint references unknown class '{}'",
+                        class_name
+                    )));
+                }
             } else {
                 return Err(CoreError::InvalidArgument(format!(
                     "unknown statement: {}",
@@ -145,6 +156,57 @@ impl OntologyParser {
         }
 
         Ok(Class::new(class_name))
+    }
+
+    /// Parses a UNIQUE constraint statement.
+    ///
+    /// Syntax: `UNIQUE(col1, col2)` or `UNIQUE ClassName(col1, col2)`
+    /// Returns (class_name, column_names).
+    fn parse_unique(input: &str) -> Result<(String, Vec<String>)> {
+        let rest = input
+            .strip_prefix("UNIQUE")
+            .or_else(|| input.strip_prefix("unique"))
+            .ok_or_else(|| CoreError::InvalidArgument("expected 'UNIQUE'".to_string()))?
+            .trim();
+
+        // Find the opening parenthesis
+        let paren_pos = rest
+            .find('(')
+            .ok_or_else(|| CoreError::InvalidArgument("expected '(' in UNIQUE constraint".to_string()))?;
+
+        // Extract class name (if present) and columns
+        let class_name = rest[..paren_pos].trim();
+        let after_paren = if paren_pos + 1 < rest.len() { &rest[paren_pos + 1..] } else { "" };
+        let columns_str = after_paren
+            .trim_end_matches(')')
+            .trim_end_matches(';')
+            .trim();
+
+        if columns_str.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "UNIQUE constraint must specify at least one column".to_string(),
+            ));
+        }
+
+        let columns: Vec<String> = columns_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if columns.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "UNIQUE constraint must specify at least one column".to_string(),
+            ));
+        }
+
+        if class_name.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "UNIQUE constraint must specify a class name (e.g., UNIQUE ClassName(col))".to_string(),
+            ));
+        }
+
+        Ok((class_name.to_string(), columns))
     }
 
     fn parse_property(input: &str) -> Result<Property> {
@@ -283,5 +345,73 @@ mod tests {
         let onto = OntologyParser::parse(input).unwrap();
         assert!(onto.properties["name"].required);
         assert!(!onto.properties["price"].required);
+    }
+
+    #[test]
+    fn test_parse_unique_single_column() {
+        let input = r#"
+            CREATE ONTOLOGY shop (
+                CLASS Product,
+                PROPERTY name DOMAIN Product RANGE STRING,
+                PROPERTY email DOMAIN Product RANGE STRING,
+                UNIQUE Product(email)
+            );
+        "#;
+
+        let onto = OntologyParser::parse(input).unwrap();
+        let class = &onto.classes["Product"];
+        assert_eq!(class.unique_columns.len(), 1);
+        assert_eq!(class.unique_columns[0], vec!["email"]);
+    }
+
+    #[test]
+    fn test_parse_unique_composite() {
+        let input = r#"
+            CREATE ONTOLOGY shop (
+                CLASS Product,
+                PROPERTY first_name DOMAIN Product RANGE STRING,
+                PROPERTY last_name DOMAIN Product RANGE STRING,
+                UNIQUE Product(first_name, last_name)
+            );
+        "#;
+
+        let onto = OntologyParser::parse(input).unwrap();
+        let class = &onto.classes["Product"];
+        assert_eq!(class.unique_columns.len(), 1);
+        assert_eq!(class.unique_columns[0], vec!["first_name", "last_name"]);
+    }
+
+    #[test]
+    fn test_parse_unique_multiple_constraints() {
+        let input = r#"
+            CREATE ONTOLOGY shop (
+                CLASS Product,
+                PROPERTY name DOMAIN Product RANGE STRING,
+                PROPERTY email DOMAIN Product RANGE STRING,
+                PROPERTY sku DOMAIN Product RANGE STRING,
+                UNIQUE Product(email),
+                UNIQUE Product(sku)
+            );
+        "#;
+
+        let onto = OntologyParser::parse(input).unwrap();
+        let class = &onto.classes["Product"];
+        assert_eq!(class.unique_columns.len(), 2);
+        assert_eq!(class.unique_columns[0], vec!["email"]);
+        assert_eq!(class.unique_columns[1], vec!["sku"]);
+    }
+
+    #[test]
+    fn test_parse_unique_unknown_class() {
+        let input = r#"
+            CREATE ONTOLOGY shop (
+                CLASS Product,
+                UNIQUE UnknownClass(email)
+            );
+        "#;
+
+        let result = OntologyParser::parse(input);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown class"));
     }
 }

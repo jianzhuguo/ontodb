@@ -6,23 +6,23 @@
 
 ---
 
-## 第一阶段：运维能力补齐（1-2 周）
+## 第一阶段：运维能力补齐（1-2 周）— 大部分已完成
 
-### 1.1 逻辑备份工具（ontodb-dump）
-- [ ] 设计备份格式（JSON Lines / CSV / OntoQL）
-- [ ] 实现 `onto-cli dump` 命令：全库导出
-- [ ] 实现 `onto-cli dump --class BioTask`：单表导出
-- [ ] 实现 `onto-cli dump --format json|csv`：格式选择
-- [ ] 实现 `onto-cli dump --output backup.json`：输出到文件
+### 1.1 逻辑备份工具（ontodb-dump）— ✅ 已完成
+- [x] 设计备份格式（JSON Lines / CSV）— 已实现 JSONL + CSV
+- [x] 实现 `onto-cli dump` 命令：全库导出
+- [x] 实现 `onto-cli dump --class BioTask`：单表导出
+- [x] 实现 `onto-cli dump --format json|csv`：格式选择
+- [x] 实现 `onto-cli dump --output backup.json`：输出到文件
 - [ ] 支持 HTTP API 导出端点：`GET /api/export`
-- [ ] 测试：全库导出 → 清空 → 恢复 → 数据一致
+- [ ] 测试：全库导出 → 清空 → 恢复 → 数据一致（需要运行服务器）
 
 ### 1.2 逻辑恢复工具（ontodb-restore）
-- [ ] 实现 `onto-cli restore` 命令：从备份文件恢复
-- [ ] 实现 `onto-cli restore --file backup.json`：指定文件
-- [ ] 实现 `onto-cli restore --class BioTask`：单表恢复
+- [x] 实现 `onto-cli restore` 命令：从备份文件恢复
+- [x] 实现 `onto-cli restore --file backup.json`：指定文件
+- [x] 实现 `onto-cli restore --class BioTask`：单表恢复
 - [ ] 支持 HTTP API 恢复端点：`POST /api/import`
-- [ ] 测试：备份 → 恢复 → 查询验证数据完整性
+- [ ] 测试：备份 → 恢复 → 查询验证数据完整性（需要运行服务器）
 
 ### 1.3 WAL 归档（增量备份基础）
 - [ ] 设计 WAL 归档策略（文件轮转 + 归档目录）
@@ -41,25 +41,25 @@
 ## 第二阶段：查询能力增强（3-4 周）
 
 ### 2.1 窗口函数
-- [ ] `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)`
-- [ ] `RANK() OVER (...)`
-- [ ] `DENSE_RANK() OVER (...)`
-- [ ] `LAG(col, n) OVER (...)`
-- [ ] `LEAD(col, n) OVER (...)`
-- [ ] `SUM/AVG/COUNT/MIN/MAX(col) OVER (PARTITION BY ... ORDER BY ... ROWS BETWEEN ...)`
-- [ ] 测试：各窗口函数的正确性和边界情况
+- [x] `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` ✅
+- [x] `RANK() OVER (...)` ✅
+- [x] `DENSE_RANK() OVER (...)` ✅
+- [x] `LAG(col, n) OVER (...)` ✅
+- [x] `LEAD(col, n) OVER (...)` ✅
+- [x] `SUM/AVG/COUNT/MIN/MAX(col) OVER (PARTITION BY ... ORDER BY ... ROWS BETWEEN ...)` ✅
+- [x] 测试：各窗口函数的正确性和边界情况 ✅ (5 个测试通过)
 
 ### 2.2 CTE（WITH 子句）
-- [ ] 普通 CTE：`WITH t AS (SELECT ...) SELECT FROM t`
-- [ ] 递归 CTE：`WITH RECURSIVE t AS (...) SELECT FROM t`
-- [ ] 多 CTE 链式引用
-- [ ] 测试：CTE 嵌套、递归深度限制
+- [x] 普通 CTE：`WITH t AS (SELECT ...) SELECT FROM t` ✅
+- [x] 递归 CTE：`WITH RECURSIVE t AS (...) SELECT FROM t` ✅
+- [x] 多 CTE 链式引用 ✅
+- [x] 测试：CTE 嵌套、递归深度限制 ✅ (2 个测试通过)
 
 ### 2.3 唯一约束
-- [ ] 建表时支持 `UNIQUE(col)` 语法
-- [ ] INSERT/UPDATE 时检查唯一性
-- [ ] 唯一索引实现（B-Tree 或 LSM 前缀标记）
-- [ ] 测试：重复插入被拒绝、更新冲突检测
+- [x] 建表时支持 `UNIQUE(col)` 语法 ✅
+- [x] INSERT/UPDATE 时检查唯一性 ✅
+- [x] 唯一索引实现（扫描校验）✅
+- [x] 测试：重复插入被拒绝、更新冲突检测 ✅ (6 个测试通过)
 
 ### 2.4 布尔表达式增强
 - [ ] `IN (val1, val2, ...)` 支持
@@ -119,13 +119,13 @@
 ## 实施顺序
 
 ```
-1. ontodb-dump 逻辑备份工具（第一优先级）
-2. ontodb-restore 恢复工具
-3. 窗口函数 ROW_NUMBER / RANK
-4. CTE WITH 子句
-5. 唯一约束
-6. WAL 归档
-7. ORM 对接（持续）
+1. [DONE] ontodb-dump 逻辑备份工具
+2. [DONE] ontodb-restore 恢复工具
+3. [DONE] 窗口函数 ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD / 聚合
+4. [DONE] CTE WITH 子句（含递归 CTE）
+5. [DONE] 唯一约束（单列 + 复合唯一约束）
+6. [TODO] WAL 归档
+7. [TODO] ORM 对接（持续）
 ```
 
 ---

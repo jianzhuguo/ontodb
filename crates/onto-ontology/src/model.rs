@@ -119,6 +119,11 @@ pub struct Class {
     /// OWL-lite: property restrictions (owl:Restriction).
     #[serde(default)]
     pub restrictions: Vec<Restriction>,
+    /// Unique constraints — each entry is a list of column names that must be unique together.
+    /// Single-column: `UNIQUE(email)` → `vec![vec!["email"]]`
+    /// Composite: `UNIQUE(first_name, last_name)` → `vec![vec!["first_name", "last_name"]]`
+    #[serde(default)]
+    pub unique_columns: Vec<Vec<String>>,
 }
 
 /// A property (attribute) in the ontology.
@@ -481,6 +486,7 @@ impl Class {
             disjoint_with: Vec::new(),
             class_type: ClassType::Normal,
             restrictions: Vec::new(),
+            unique_columns: Vec::new(),
         }
     }
 

@@ -5078,6 +5078,9 @@ impl QueryExecutor {
         // Validate against ontology schema
         self.validate_document(engine, class, &doc)?;
 
+        // Validate unique constraints
+        self.validate_unique_constraints(engine, class, &doc)?;
+
         let value = doc_to_storage_bytes(&doc);
 
         // Sync to graph store (unified entity anchor)
@@ -7110,6 +7113,103 @@ impl QueryExecutor {
         self.validate_disjointness(engine, &ontology, class, doc)?;
 
         Ok(())
+    }
+
+    /// Validates unique constraints on a document during INSERT.
+    ///
+    /// Scans existing records for the same class and checks if any already have
+    /// the same values in the unique-constrained columns.
+    fn validate_unique_constraints(
+        &self,
+        engine: &LsmEngine,
+        class: &str,
+        doc: &Map<String, Value>,
+    ) -> Result<()> {
+        // Find the ontology containing this class
+        let ontology = match self.ontology_store.find_ontology_for_class(engine, class)? {
+            Some(o) => o,
+            None => return Ok(()), // No ontology — no constraints
+        };
+
+        let class_def = match ontology.classes.get(class) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        if class_def.unique_columns.is_empty() {
+            return Ok(());
+        }
+
+        // Scan all existing records of this class
+        let prefix = format!("{}::", class);
+        let entries = engine.scan_prefix(prefix.as_bytes())?;
+
+        // Parse existing documents
+        let existing_docs: Vec<Map<String, Value>> = entries
+            .iter()
+            .filter_map(|(_, val_bytes)| Self::parse_doc_bytes(val_bytes))
+            .collect();
+
+        // Check each unique constraint
+        for unique_cols in &class_def.unique_columns {
+            // Extract the values for the unique columns from the new document
+            let new_values: Vec<Option<&Value>> = unique_cols
+                .iter()
+                .map(|col| doc.get(col.as_str()))
+                .collect();
+
+            // Skip if any unique column is missing from the new document
+            if new_values.iter().any(|v| v.is_none()) {
+                continue;
+            }
+
+            // Compare with existing documents
+            for existing in &existing_docs {
+                let existing_values: Vec<Option<&Value>> = unique_cols
+                    .iter()
+                    .map(|col| existing.get(col.as_str()))
+                    .collect();
+
+                // Check if all unique column values match
+                let all_match = new_values
+                    .iter()
+                    .zip(existing_values.iter())
+                    .all(|(new, existing)| match (new, existing) {
+                        (Some(n), Some(e)) => n == e,
+                        _ => false,
+                    });
+
+                if all_match {
+                    let constraint_desc = unique_cols.join(", ");
+                    let value_desc: Vec<String> = unique_cols
+                        .iter()
+                        .zip(new_values.iter())
+                        .map(|(col, val)| {
+                            format!("{}={}", col, val.map(|v| v.to_string()).unwrap_or_default())
+                        })
+                        .collect();
+                    return Err(CoreError::InvalidArgument(format!(
+                        "duplicate key value violates unique constraint on ({}) for class '{}': {}",
+                        constraint_desc,
+                        class,
+                        value_desc.join(", ")
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parses storage bytes to a JSON Map. Tries binary format first, then JSON.
+    fn parse_doc_bytes(bytes: &[u8]) -> Option<Map<String, Value>> {
+        if let Some(row) = onto_core::binary_row::BinaryRow::parse(bytes) {
+            return row.to_map();
+        }
+        match serde_json::from_slice::<Value>(bytes) {
+            Ok(Value::Object(doc)) => Some(doc),
+            _ => None,
+        }
     }
 
     /// Validates OWL restrictions on a document during INSERT.
@@ -10393,5 +10493,139 @@ mod tests {
             LiteralValue::String(ref s) if s == "hello" => {}
             other => panic!("expected String(\"hello\"), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_unique_constraint_insert_rejects_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
+        let ontology_store = OntologyStore::new(engine.clone());
+        let executor = QueryExecutor::new(engine.clone(), ontology_store);
+
+        // Create ontology with unique constraint on email
+        let ast = QueryParser::parse(r#"
+            CREATE ONTOLOGY shop (
+                CLASS User,
+                PROPERTY name DOMAIN User RANGE STRING,
+                PROPERTY email DOMAIN User RANGE STRING,
+                UNIQUE User(email)
+            )
+        "#).unwrap();
+        executor.execute(&ast).unwrap();
+
+        // First insert should succeed
+        let ast = QueryAst::Insert {
+            class: "User".to_string(),
+            columns: vec!["name".to_string(), "email".to_string()],
+            values: vec![
+                LiteralValue::String("Alice".to_string()),
+                LiteralValue::String("alice@example.com".to_string()),
+            ],
+        };
+        let result = executor.execute(&ast);
+        assert!(result.is_ok(), "first insert should succeed");
+
+        // Second insert with same email should fail
+        let ast = QueryAst::Insert {
+            class: "User".to_string(),
+            columns: vec!["name".to_string(), "email".to_string()],
+            values: vec![
+                LiteralValue::String("Bob".to_string()),
+                LiteralValue::String("alice@example.com".to_string()),
+            ],
+        };
+        let result = executor.execute(&ast);
+        assert!(result.is_err(), "duplicate email should be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unique constraint") || err_msg.contains("duplicate"),
+            "error should mention unique constraint, got: {}",
+            err_msg
+        );
+
+        // Third insert with different email should succeed
+        let ast = QueryAst::Insert {
+            class: "User".to_string(),
+            columns: vec!["name".to_string(), "email".to_string()],
+            values: vec![
+                LiteralValue::String("Charlie".to_string()),
+                LiteralValue::String("charlie@example.com".to_string()),
+            ],
+        };
+        let result = executor.execute(&ast);
+        assert!(result.is_ok(), "different email should succeed");
+    }
+
+    #[test]
+    fn test_unique_constraint_composite() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
+        let ontology_store = OntologyStore::new(engine.clone());
+        let executor = QueryExecutor::new(engine.clone(), ontology_store);
+
+        // Create ontology with composite unique constraint
+        let ast = QueryParser::parse(r#"
+            CREATE ONTOLOGY school (
+                CLASS Enrollment,
+                PROPERTY student DOMAIN Enrollment RANGE STRING,
+                PROPERTY course DOMAIN Enrollment RANGE STRING,
+                UNIQUE Enrollment(student, course)
+            )
+        "#).unwrap();
+        executor.execute(&ast).unwrap();
+
+        // First insert
+        let ast = QueryAst::Insert {
+            class: "Enrollment".to_string(),
+            columns: vec!["student".to_string(), "course".to_string()],
+            values: vec![
+                LiteralValue::String("Alice".to_string()),
+                LiteralValue::String("Math101".to_string()),
+            ],
+        };
+        assert!(executor.execute(&ast).is_ok());
+
+        // Same student + same course → should fail
+        let ast = QueryAst::Insert {
+            class: "Enrollment".to_string(),
+            columns: vec!["student".to_string(), "course".to_string()],
+            values: vec![
+                LiteralValue::String("Alice".to_string()),
+                LiteralValue::String("Math101".to_string()),
+            ],
+        };
+        assert!(executor.execute(&ast).is_err());
+
+        // Same student + different course → should succeed
+        let ast = QueryAst::Insert {
+            class: "Enrollment".to_string(),
+            columns: vec!["student".to_string(), "course".to_string()],
+            values: vec![
+                LiteralValue::String("Alice".to_string()),
+                LiteralValue::String("CS101".to_string()),
+            ],
+        };
+        assert!(executor.execute(&ast).is_ok());
+
+        // Different student + same course → should succeed
+        let ast = QueryAst::Insert {
+            class: "Enrollment".to_string(),
+            columns: vec!["student".to_string(), "course".to_string()],
+            values: vec![
+                LiteralValue::String("Bob".to_string()),
+                LiteralValue::String("Math101".to_string()),
+            ],
+        };
+        assert!(executor.execute(&ast).is_ok());
     }
 }
