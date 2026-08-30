@@ -593,12 +593,13 @@ impl LsmEngine {
             }
         }
 
-        // Filter out tombstones and collect
-        let result: Vec<(Vec<u8>, Vec<u8>)> = seen
+        // Filter out tombstones, sort by key for deterministic output, and collect
+        let mut result: Vec<(Vec<u8>, Vec<u8>)> = seen
             .into_iter()
             .filter(|(_, (_, _, kind))| *kind == EntryKind::Put)
             .map(|(key, (value, _, _))| (key, value))
             .collect();
+        result.sort_by(|a, b| a.0.cmp(&b.0));
 
         Ok(result)
     }
