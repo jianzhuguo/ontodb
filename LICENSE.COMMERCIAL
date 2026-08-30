@@ -1,103 +1,175 @@
-# OntoDB Commercial License
+# OntoDB 商业许可协议
 
-**Version 1.0 — Effective Date: [DATE]**
+**版本 1.0 | 生效日期：[DATE]**
 
-This Commercial License Agreement ("Agreement") is entered into between:
+本商业许可协议（"本协议"）由以下双方签署：
 
-- **Licensor**: OntoDB Technology Co., Ltd. ("OntoDB")
-- **Licensee**: [Company Name] ("You")
-
----
-
-## 1. Definitions
-
-- **Software**: OntoDB database system, including all source code, binaries, documentation, and related materials
-- **Enterprise Features**: OntoQL reasoning engine, OWL inference, Raft consensus, data sharding, encryption, RBAC, audit logging
-- **Production Use**: Any use of the Software in a live environment serving end users or business operations
-- **Authorized Users**: Employees and contractors of Licensee who are registered under this Agreement
+- **许可方**：OntoDB Technology Co., Ltd.（"OntoDB"）
+- **被许可方**：[公司名称]（"贵司"）
 
 ---
 
-## 2. Grant of License
+## 一、功能对比：社区版 vs 企业版
 
-Subject to the terms of this Agreement, OntoDB grants Licensee a non-exclusive, non-transferable, perpetual license to:
+### 社区版（AGPL-3.0，免费）
 
-- Deploy and use the Software in Production Use
-- Modify the Software for internal use
-- Create derivative works for internal use only
-- Distribute the Software within Licensee's organization
+| 功能模块 | 功能清单 |
+|---------|---------|
+| **存储引擎** | LSM-Tree、WAL、Bloom Filter、Block Cache、B+Tree 索引 |
+| **查询引擎** | SQL 全语法、OntoQL 基础语法、JOIN、子查询、CTE、窗口函数 |
+| **图数据库** | 属性图 CRUD、BFS/DFS 遍历、最短路径、属性过滤 |
+| **向量搜索** | HNSW 索引、L2/Cosine/InnerProduct、向量+SQL 混合查询 |
+| **HTTP API** | RESTful API、批量查询、游标分页、导入导出 |
+| **协议兼容** | PostgreSQL Wire Protocol、MySQL Wire Protocol |
+| **监控** | Prometheus 指标、JSON 指标、健康检查 |
+| **Web 控制台** | Schema 浏览、OntoQL 编辑器、Digital Twin 可视化 |
+| **SDK** | Python、JavaScript/TypeScript、Go、Java |
+| **单机部署** | 单节点运行、JSON 持久化 |
 
----
+### 企业标准版（商业许可）
 
-## 3. Restrictions
+**包含社区版全部功能，另加：**
 
-Licensee shall NOT:
+| 功能模块 | 功能清单 | 价值 |
+|---------|---------|------|
+| **本体推理引擎** | OWL 2 RL 推理（7条规则）、子类传播、属性推导、传递闭包、对称推导 | **核心差异化**，PostgreSQL/Milvus 没有 |
+| **OntoQL 完整语法** | CREATE ONTOLOGY、INFER 推理、EXPLAIN REASONING、UNIQUE 约束 | 语义查询能力 |
+| **活数据** | 价值衰减（指数衰减公式）、激活机制、价值评分、DBA 视图 | 数据生命周期管理 |
+| **RDF 三元组存储** | SPO/POS/OSP 三索引、Turtle 解析、N-Triples/JSON-LD 导出 | 知识图谱支持 |
+| **Raft 分布式集群** | 多副本同步、自动故障转移、配置同步 | 高可用 |
+| **数据分片** | 基于类/范围/哈希的分片策略、在线迁移、自动重平衡 | 水平扩展 |
+| **增量备份** | WAL 归档、增量备份、备份校验 | 数据安全 |
+| **滚动升级** | 跨版本兼容、零停机升级 | 运维便利 |
 
-- Distribute the Software to third parties
-- Sublicense or resell the Software
-- Use the Software to provide database-as-a-service to third parties
-- Remove or alter any copyright notices or license terms
-- Reverse engineer the Software (except as permitted by law)
+### 企业政务/金融版（商业许可）
 
----
+**包含企业标准版全部功能，另加：**
 
-## 4. Enterprise Features
-
-Enterprise Features require a separate Enterprise License:
-
-| Tier | Features | Annual Fee |
-|------|----------|------------|
-| **Standard** | Clustering, Sharding, Basic Backup | ¥500,000/year |
-| **Professional** | + Encryption, RBAC, Audit | ¥1,000,000/year |
-| **Enterprise** | + Custom Development, Priority Support | ¥2,000,000/year |
-
----
-
-## 5. Support and Maintenance
-
-- **Standard Support**: Email support, 48-hour response time
-- **Professional Support**: 24/7 phone support, 4-hour response time
-- **Enterprise Support**: Dedicated support engineer, 1-hour response time
-
----
-
-## 6. Term and Termination
-
-- This Agreement is effective upon payment and remains in effect until terminated
-- Either party may terminate with 30 days written notice
-- Upon termination, Licensee must cease all use and destroy all copies
+| 功能模块 | 功能清单 | 价值 |
+|---------|---------|------|
+| **存储加密** | AES-256-GCM 加密、SM4-CBC 国密支持、KMS 密钥管理 | 数据安全合规 |
+| **三权分立 RBAC** | 系统管理员/安全管理员/审计管理员、细粒度权限控制 | 等保 2.0 合规 |
+| **数据脱敏** | 列级脱敏、动态脱敏、脱敏规则配置 | 隐私保护 |
+| **审计日志** | 审计日志保留（默认180天）、日志压缩、合规报告 | 审计追溯 |
+| **CRC 校验** | SSTable 页级 CRC 校验、数据完整性验证 | 数据可靠性 |
+| **LDAP 集成** | LDAP/AD 认证、企业账号对接 | 统一身份管理 |
+| **优先支持** | 7×24 技术支持、1小时响应、专属工程师 | 生产保障 |
 
 ---
 
-## 7. Warranty
+## 二、定价方案
 
-- OntoDB warrants that the Software will perform substantially as documented
-- This warranty is limited to 90 days from delivery
-- Licensee's sole remedy is repair or replacement of the Software
+### 年度订阅
+
+| 版本 | 年费（人民币） | 授权范围 | 包含内容 |
+|------|--------------|---------|---------|
+| **社区版** | 免费 | AGPL-3.0 | 全部社区功能 |
+| **企业标准版** | ¥50万/年/节点 | 商业许可 | 标准版功能 + 邮件支持 |
+| **企业专业版** | ¥100万/年/节点 | 商业许可 | 标准版 + 加密 + RBAC + 审计 |
+| **企业旗舰版** | ¥200万/年/节点 | 商业许可 | 全部功能 + 7×24支持 + 专属工程师 |
+
+### 永久授权
+
+| 版本 | 一次性费用 | 年度维护费 | 授权范围 |
+|------|-----------|-----------|---------|
+| **企业标准版** | ¥150万/节点 | ¥30万/年 | 商业许可，永久使用 |
+| **企业专业版** | ¥300万/节点 | ¥60万/年 | 商业许可，永久使用 |
+| **企业旗舰版** | ¥600万/节点 | ¥120万/年 | 商业许可，永久使用 |
+
+### 附加服务
+
+| 服务 | 价格 |
+|------|------|
+| **定制开发** | ¥5,000/人天 |
+| **技术培训** | ¥3,000/人天 |
+| **企业内训** | ¥5万/期 |
+| **POC 支持** | 免费（限3天） |
+| **架构咨询** | ¥2,000/小时 |
+
+### 批量折扣
+
+| 节点数 | 折扣 |
+|--------|------|
+| 3-5 节点 | 9 折 |
+| 6-10 节点 | 8 折 |
+| 11-20 节点 | 7 折 |
+| 20+ 节点 | 面议 |
 
 ---
 
-## 8. Limitation of Liability
+## 三、被许可方权利
 
-- OntoDB's total liability shall not exceed the fees paid by Licensee
-- OntoDB is not liable for indirect, incidental, or consequential damages
+在遵守本协议条款的前提下，OntoDB 授予被许可方以下非独占、不可转让的权利：
 
----
-
-## 9. Governing Law
-
-This Agreement is governed by the laws of the People's Republic of China.
+- 在生产环境中部署和使用本软件
+- 为内部使用目的修改本软件
+- 为内部使用目的创建衍生作品
+- 在被许可方组织内部分发本软件
 
 ---
 
-## 10. Contact
+## 四、限制条款
 
-For commercial licensing inquiries:
+被许可方不得：
 
-- Email: license@ontodb.ai
-- Website: https://ontodb.ai
-- Address: [Company Address]
+- 向第三方分发本软件
+- 转许可或转售本软件
+- 使用本软件向第三方提供数据库即服务（DBaaS）
+- 移除或更改任何版权声明或许可条款
+- 逆向工程本软件（法律允许的情况除外）
 
 ---
 
-**To purchase a commercial license, contact license@ontodb.ai**
+## 五、技术支持
+
+| 版本 | 支持方式 | 响应时间 | 服务时间 |
+|------|---------|---------|---------|
+| **社区版** | GitHub Issues | 社区响应 | - |
+| **企业标准版** | 邮件 | 48小时 | 工作日 |
+| **企业专业版** | 邮件 + 电话 | 4小时 | 工作日 |
+| **企业旗舰版** | 专属工程师 | 1小时 | 7×24 |
+
+---
+
+## 六、合同期限与终止
+
+- 本协议自付款之日起生效
+- 年度订阅：每年自动续期，任一方可提前30天书面通知终止
+- 永久授权：永久有效，除非违约终止
+- 终止后，被许可方须停止使用并销毁所有副本
+
+---
+
+## 七、保证与免责
+
+- OntoDB 保证本软件在文档所述范围内正常运行
+- 此保证自交付之日起90天内有效
+- 被许可方的唯一补救措施是修复或更换本软件
+- 在适用法律允许的最大范围内，不提供其他任何明示或暗示的保证
+
+---
+
+## 八、责任限制
+
+- OntoDB 的总赔偿责任不超过被许可方已支付的费用
+- OntoDB 不对间接、附带或后果性损害负责
+
+---
+
+## 九、适用法律
+
+本协议受中华人民共和国法律管辖。
+
+---
+
+## 十、联系方式
+
+| 项目 | 信息 |
+|------|------|
+| **邮箱** | license@ontodb.ai |
+| **网站** | https://ontodb.ai |
+| **地址** | [公司地址] |
+
+---
+
+**购买商业许可，请联系 license@ontodb.ai**
