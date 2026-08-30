@@ -16,7 +16,7 @@ Neo4j is a dedicated graph database. OntoDB includes a property graph model alon
 
 ### Is OntoDB production-ready?
 
-OntoDB is currently in alpha (v0.1.0-alpha). It's suitable for development and testing. Production use requires the commercial version with clustering, enterprise security, and support.
+OntoDB is currently in beta (v0.6.2). It's suitable for development and testing. Production use requires the commercial version with clustering, enterprise security, and support.
 
 ## Technical
 

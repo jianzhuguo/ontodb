@@ -4,9 +4,9 @@
 
 ## �?1 步：启动服务�?
 ```bash
-# 下载并解�?wget https://release.ontodb.ai/ontodb-v0.3.0-linux-x86_64.tar.gz
-tar xzf ontodb-v0.3.0-linux-x86_64.tar.gz
-cd ontodb-v0.3.0
+# 下载并解�?wget https://release.ontodb.ai/ontodb-v0.6.2-linux-x86_64.tar.gz
+tar xzf ontodb-v0.6.2-linux-x86_64.tar.gz
+cd ontodb-v0.6.2
 
 # 启动
 ./ontodb-server --data-dir ./data --http 127.0.0.1:7912 --no-rate-limit

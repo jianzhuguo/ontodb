@@ -27,8 +27,8 @@
 
 ```bash
 # 1. 下载并解�?
-wget https://release.ontodb.ai/ontodb-v0.3.0-linux-x86_64.tar.gz
-tar xzf ontodb-v0.3.0-linux-x86_64.tar.gz
+wget https://release.ontodb.ai/ontodb-v0.6.2-linux-x86_64.tar.gz
+tar xzf ontodb-v0.6.2-linux-x86_64.tar.gz
 
 # 2. 启动服务�?
 ./ontodb-server --data-dir ./data --http 127.0.0.1:7912
@@ -92,8 +92,8 @@ ontodb> SELECT * FROM users;
 curl -fsSL https://get.ontodb.ai/install.sh | bash
 
 # 或手动安�?
-wget https://release.ontodb.ai/ontodb-v0.3.0-linux-x86_64.tar.gz
-tar xzf ontodb-v0.3.0-linux-x86_64.tar.gz -C /opt/ontodb
+wget https://release.ontodb.ai/ontodb-v0.6.2-linux-x86_64.tar.gz
+tar xzf ontodb-v0.6.2-linux-x86_64.tar.gz -C /opt/ontodb
 export PATH=$PATH:/opt/ontodb/bin
 ```
 

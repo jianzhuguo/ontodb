@@ -32,7 +32,7 @@ Expected response:
 ```json
 {
   "status": "ok",
-  "version": "0.1.0",
+  "version": "0.6.2",
   "engine": "OntoDB",
   "uptime_seconds": 5,
   "checks": {

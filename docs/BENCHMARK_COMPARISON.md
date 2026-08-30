@@ -1,7 +1,7 @@
 # OntoDB Competitive Benchmark Comparison
 
 **Date:** 2026-08-08
-**Version:** 0.1.0-alpha
+**Version:** 0.6.2
 
 ---
 
