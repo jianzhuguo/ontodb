@@ -1,0 +1,21 @@
+# Dockerfile for cross-compiling onto-edge to Linux ARM64
+FROM rust:1.80-slim as builder
+
+# Install cross-compiler
+RUN apt-get update && apt-get install -y gcc-aarch64-linux-gnu && rm -rf /var/lib/apt/lists/*
+
+# Add ARM64 target
+RUN rustup target add aarch64-unknown-linux-gnu
+
+# Configure linker
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+
+WORKDIR /app
+COPY . .
+
+# Build for ARM64
+RUN cargo build --release -p onto-edge-bin --target aarch64-unknown-linux-gnu
+
+# Output binary
+FROM scratch
+COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/onto-edge /onto-edge
