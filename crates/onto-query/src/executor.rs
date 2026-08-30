@@ -897,10 +897,21 @@ impl QueryExecutor {
     }
 
     /// Drop an ontology by name — deletes the `__ontology__{name}` LSM key.
+    ///
+    /// Uses scan_prefix to check existence instead of get(), because the LSM
+    /// engine may have tombstone inconsistencies where get() returns None but
+    /// scan_prefix() still finds the key (e.g. after memtable flush without
+    /// compaction).
     pub fn drop_ontology(&self, name: &str) -> Result<()> {
         let key = format!("__ontology__{}", name);
         let engine = &self.engine;
-        if engine.get(key.as_bytes())?.is_some() {
+
+        // Check existence via scan_prefix (more reliable than get with tombstones)
+        let prefix = b"__ontology__";
+        let entries = engine.scan_prefix(prefix).unwrap_or_default();
+        let found = entries.iter().any(|(k, _)| k == key.as_bytes());
+
+        if found {
             engine.delete(key.as_bytes().to_vec())?;
             tracing::info!("Dropped ontology '{}'", name);
             Ok(())

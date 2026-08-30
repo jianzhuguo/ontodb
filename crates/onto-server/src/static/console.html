@@ -217,9 +217,9 @@ function rs(){
     h+='<div class="db-group">';
     h+='<div class="db-head" onclick="tg(this)">';
     h+='<span class="db-arrow">\u25b6</span>';
-    h+='<span class="db-icon">\ud83d\udcbb</span>'; // 💻 all ontologies same icon
+    h+='<span class="db-icon">\ud83d\udce6</span>'; // 📦 ontology icon
     h+='<span class="db-name">'+g.name+'</span>';
-    h+='<span class="db-count">'+g.count+' tables</span>';
+    h+='<span class="db-count">'+g.count+' \u7c7b</span>'; // 类
     h+='</div>';
     h+='<div class="db-body" style="display:none">';
 
@@ -235,7 +235,7 @@ function rs(){
       h+='<div class="tbl-group">';
       h+='<div class="tbl-head" onclick="tg(this)">';
       h+='<span class="tbl-arrow">\u25b6</span>';
-      h+='<span class="tbl-icon">\ud83d\udcc4</span>'; // 📄
+      h+='<span class="tbl-icon">\ud83d\udd37</span>'; // 🔷 class icon
       h+='<span class="tbl-name">'+displayCn+'</span>';
       if(sp.length)h+='<span class="tbl-ext" title="extends '+sp[0]+'">\u2190 '+sp[0]+'</span>';
       h+='<span class="tbl-count">'+colCount+'</span>';
