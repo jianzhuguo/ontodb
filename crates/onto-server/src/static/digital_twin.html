@@ -629,6 +629,11 @@ function q(sql){return fetch('/api/query',{method:'POST',headers:{'Content-Type'
 // ── Build graph ──
 function build(d){
   nodes=[];edges=[];expandedNodes={};
+  // Sort all data by stable keys for deterministic graph rendering
+  var sk=function(k){return function(a,b){return(String(a[k]||'')).localeCompare(String(b[k]||''));};};
+  d.depts.sort(sk('code'));d.emps.sort(sk('emp_id'));d.projs.sort(sk('code'));
+  d.srvs.sort(sk('node_id'));d.alerts.sort(function(a,b){return String(a.time||'').localeCompare(String(b.time||''));});
+  d.custs.sort(sk('name'));d.leads.sort(sk('company'));
   var cx0=W/2,cy0=H/2;
   nodes.push({id:'anchor',label:'OntoDB',type:'anchor',x:cx0,y:cy0,vx:0,vy:0,fixed:true,r:24,info:{entries:d.total}});
   var l2=d.depts.filter(function(x){return x.level===2;});
