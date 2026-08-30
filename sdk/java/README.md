@@ -1,6 +1,6 @@
-# OntoDB Java SDK
+﻿# OntoDB Java SDK
 
-Java client for [OntoDB](https://ontodb.ai) �?the ontology-driven semantic multi-modal database.
+Java client for [OntoDB](https://ontovalue.com) 鈥?the ontology-driven semantic multi-modal database.
 
 Requires Java 11+.
 

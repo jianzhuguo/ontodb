@@ -1,4 +1,4 @@
-# OntoDB Enterprise Commercial License
+﻿# OntoDB Enterprise Commercial License
 
 **Copyright (c) 2025 OntoDB Team. All rights reserved.**
 
@@ -56,8 +56,8 @@ IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, 
 
 To obtain a commercial license, contact:
 
-- **Email**: sales@ontodb.ai
-- **Website**: https://ontodb.ai/pricing
+- **Email**: sales@ontovalue.com
+- **Website**: https://ontovalue.com/pricing
 
 ---
 

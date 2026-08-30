@@ -1,29 +1,29 @@
-# OntoDB 常见问题 (FAQ)
+﻿# OntoDB 甯歌闂 (FAQ)
 
 ---
 
-## 安装部署
+## 瀹夎閮ㄧ讲
 
-### Q: 如何安装 OntoDB�?
+### Q: 濡備綍瀹夎 OntoDB锛?
 ```bash
-# Linux 一键安�?curl -fsSL https://get.ontodb.ai/install.sh | bash
+# Linux 涓€閿畨瑁?curl -fsSL https://get.ontovalue.com/install.sh | bash
 
 # Docker
 docker run -d -p 7912:7912 -v ontodb-data:/data ontodb/ontodb:latest
 ```
 
-### Q: 支持哪些操作系统�?
+### Q: 鏀寔鍝簺鎿嶄綔绯荤粺锛?
 - Linux x86_64 (Ubuntu 20.04+, CentOS 8+)
 - Windows 10/11 x86_64
 - macOS (Intel/Apple Silicon)
-- Docker (所有平�?
+- Docker (鎵€鏈夊钩鍙?
 
-### Q: 最低硬件要求？
+### Q: 鏈€浣庣‖浠惰姹傦紵
 
-- CPU: 2 �?- 内存: 2 GB
-- 磁盘: 10 GB SSD
+- CPU: 2 鏍?- 鍐呭瓨: 2 GB
+- 纾佺洏: 10 GB SSD
 
-### Q: 如何启动服务器？
+### Q: 濡備綍鍚姩鏈嶅姟鍣紵
 
 ```bash
 ./ontodb-server --data-dir ./data --http 127.0.0.1:7912
@@ -31,28 +31,28 @@ docker run -d -p 7912:7912 -v ontodb-data:/data ontodb/ontodb:latest
 
 ---
 
-## 连接访问
+## 杩炴帴璁块棶
 
-### Q: 有哪些访问方式？
+### Q: 鏈夊摢浜涜闂柟寮忥紵
 
-| 方式 | 端口 | 说明 |
+| 鏂瑰紡 | 绔彛 | 璇存槑 |
 |------|------|------|
-| HTTP REST API | 7912 | 主要接口 |
+| HTTP REST API | 7912 | 涓昏鎺ュ彛 |
 | PostgreSQL Wire | 7913 | psql/pgAdmin |
 | MySQL Wire | 7914 | mysql/Workbench |
-| Web 控制�?| 7912/console | 浏览�?|
-| CLI | �?| 命令行工�?|
+| Web 鎺у埗鍙?| 7912/console | 娴忚鍣?|
+| CLI | 鈥?| 鍛戒护琛屽伐鍏?|
 
-### Q: 如何使用 psql 连接�?
+### Q: 濡備綍浣跨敤 psql 杩炴帴锛?
 ```bash
 psql -h 127.0.0.1 -p 7913 -U ontodb
 ```
 
-### Q: 如何启用认证�?
+### Q: 濡備綍鍚敤璁よ瘉锛?
 ```bash
 ./ontodb-server --auth --api-key "your-secret-key"
 
-# 使用时带�?API Key
+# 浣跨敤鏃跺甫涓?API Key
 curl -H "Authorization: Bearer your-secret-key" \
   http://127.0.0.1:7912/api/query \
   -d '{"query": "SELECT * FROM users"}'
@@ -60,95 +60,95 @@ curl -H "Authorization: Bearer your-secret-key" \
 
 ---
 
-## SQL 查询
+## SQL 鏌ヨ
 
-### Q: 支持哪些 SQL 语句�?
+### Q: 鏀寔鍝簺 SQL 璇彞锛?
 - DDL: CREATE TABLE, CREATE INDEX, DROP TABLE
 - DML: INSERT, UPDATE, DELETE, BATCH INSERT
 - DQL: SELECT, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT
-- 高级: JOIN, CTE, 窗口函数, 子查�?
-### Q: 如何创建向量索引�?
+- 楂樼骇: JOIN, CTE, 绐楀彛鍑芥暟, 瀛愭煡璇?
+### Q: 濡備綍鍒涘缓鍚戦噺绱㈠紩锛?
 ```sql
 CREATE VECTOR INDEX ON documents (embedding)
     DIMENSIONS 128
     METRIC cosine;
 ```
 
-### Q: 如何进行向量搜索�?
+### Q: 濡備綍杩涜鍚戦噺鎼滅储锛?
 ```sql
 VECTOR SEARCH ON documents (embedding)
     QUERY [0.1, 0.2, 0.3, ...]
     TOP 10;
 ```
 
-### Q: 如何进行图遍历？
+### Q: 濡備綍杩涜鍥鹃亶鍘嗭紵
 
 ```sql
 GRAPH TRAVERSE FROM 'Person::1' OUT LABEL 'knows' DEPTH 3;
 ```
 
-### Q: 查询超时怎么办？
+### Q: 鏌ヨ瓒呮椂鎬庝箞鍔烇紵
 
 ```sql
--- 添加 LIMIT
+-- 娣诲姞 LIMIT
 SELECT * FROM large_table LIMIT 1000;
 
--- 优化 WHERE 条件
-SELECT * FROM users WHERE id = 'u1';  -- 使用索引字段
+-- 浼樺寲 WHERE 鏉′欢
+SELECT * FROM users WHERE id = 'u1';  -- 浣跨敤绱㈠紩瀛楁
 ```
 
 ---
 
-## 性能
+## 鎬ц兘
 
-### Q: 写入性能是多少？
+### Q: 鍐欏叆鎬ц兘鏄灏戯紵
 
-单机�?80 �?ops/s（NVMe SSD）�?
-### Q: 读取性能是多少？
+鍗曟満绾?80 涓?ops/s锛圢VMe SSD锛夈€?
+### Q: 璇诲彇鎬ц兘鏄灏戯紵
 
-单机�?120 �?ops/s�?
-### Q: 如何提升性能�?
-1. 增加 `memtable_size_mb`（减�?flush�?2. 增加 `block_cache_mb`（提升读取）
-3. 使用 NVMe SSD
-4. 批量写入代替逐条写入
+鍗曟満绾?120 涓?ops/s銆?
+### Q: 濡備綍鎻愬崌鎬ц兘锛?
+1. 澧炲姞 `memtable_size_mb`锛堝噺灏?flush锛?2. 澧炲姞 `block_cache_mb`锛堟彁鍗囪鍙栵級
+3. 浣跨敤 NVMe SSD
+4. 鎵归噺鍐欏叆浠ｆ浛閫愭潯鍐欏叆
 
-### Q: 内存占用多少�?
-默认�?400 MB�?4 MB MemTable + 256 MB Cache + 其他）�?
+### Q: 鍐呭瓨鍗犵敤澶氬皯锛?
+榛樿绾?400 MB锛?4 MB MemTable + 256 MB Cache + 鍏朵粬锛夈€?
 ---
 
-## 向量搜索
+## 鍚戦噺鎼滅储
 
-### Q: 支持哪些距离度量�?
-- `cosine` �?余弦相似�?- `euclidean` �?欧氏距离
-- `dot` �?点积
+### Q: 鏀寔鍝簺璺濈搴﹂噺锛?
+- `cosine` 鈥?浣欏鸡鐩镐技搴?- `euclidean` 鈥?娆ф皬璺濈
+- `dot` 鈥?鐐圭Н
 
-### Q: 最大支持多少维�?
-4096 维�?
-### Q: 构建 HNSW 索引需要多久？
+### Q: 鏈€澶ф敮鎸佸灏戠淮锛?
+4096 缁淬€?
+### Q: 鏋勫缓 HNSW 绱㈠紩闇€瑕佸涔咃紵
 
-5000 × 128D 向量�?2.7 秒�?
-### Q: 如何混合 SQL 和向量搜索？
+5000 脳 128D 鍚戦噺绾?2.7 绉掋€?
+### Q: 濡備綍娣峰悎 SQL 鍜屽悜閲忔悳绱紵
 
 ```sql
 SELECT title, VECTOR_DISTANCE(embedding, [0.1, 0.2, ...]) as score
 FROM documents
-WHERE category = '技�?
+WHERE category = '鎶€鏈?
 ORDER BY score
 LIMIT 5;
 ```
 
 ---
 
-## 图查�?
-### Q: 最大遍历深度是多少�?
-默认最�?100 跳�?
-### Q: 如何找最短路径？
+## 鍥炬煡璇?
+### Q: 鏈€澶ч亶鍘嗘繁搴︽槸澶氬皯锛?
+榛樿鏈€澶?100 璺炽€?
+### Q: 濡備綍鎵炬渶鐭矾寰勶紵
 
 ```sql
 GRAPH SHORTEST PATH FROM 'Person::1' TO 'Person::5';
 ```
 
-### Q: 如何过滤边类型？
+### Q: 濡備綍杩囨护杈圭被鍨嬶紵
 
 ```sql
 GRAPH TRAVERSE FROM 'Person::1' OUT LABEL 'knows' DEPTH 2;
@@ -156,35 +156,35 @@ GRAPH TRAVERSE FROM 'Person::1' OUT LABEL 'knows' DEPTH 2;
 
 ---
 
-## 本体推理
+## 鏈綋鎺ㄧ悊
 
-### Q: 支持哪些推理规则�?
-- CaxSco �?类继�?- CaxEqc �?等价�?- PrpSpo �?属性继�?- PrpEqp �?等价属�?- PrpInv �?反向属�?- PrpTrp �?传递属�?- PrpSymp �?对称属�?
-### Q: 如何查看推导链？
+### Q: 鏀寔鍝簺鎺ㄧ悊瑙勫垯锛?
+- CaxSco 鈥?绫荤户鎵?- CaxEqc 鈥?绛変环绫?- PrpSpo 鈥?灞炴€х户鎵?- PrpEqp 鈥?绛変环灞炴€?- PrpInv 鈥?鍙嶅悜灞炴€?- PrpTrp 鈥?浼犻€掑睘鎬?- PrpSymp 鈥?瀵圭О灞炴€?
+### Q: 濡備綍鏌ョ湅鎺ㄥ閾撅紵
 
 ```sql
-EXPLAIN SELECT * FROM Animal WHERE hasName = '旺财';
+EXPLAIN SELECT * FROM Animal WHERE hasName = '鏃鸿储';
 ```
 
 ---
 
-## 备份恢复
+## 澶囦唤鎭㈠
 
-### Q: 如何备份�?
+### Q: 濡備綍澶囦唤锛?
 ```bash
 curl -X POST http://localhost:7912/api/backup \
   -d '{"path": "/backups/backup.ontodb"}'
 ```
 
-### Q: 如何恢复�?
+### Q: 濡備綍鎭㈠锛?
 ```bash
 curl -X POST http://localhost:7912/api/restore \
   -d '{"path": "/backups/backup.ontodb"}'
 ```
 
-### Q: 支持增量备份吗？
+### Q: 鏀寔澧為噺澶囦唤鍚楋紵
 
-支持�?
+鏀寔銆?
 ```bash
 curl -X POST http://localhost:7912/api/backup/incremental \
   -d '{"path": "/backups/incr.ontodb"}'
@@ -192,33 +192,33 @@ curl -X POST http://localhost:7912/api/backup/incremental \
 
 ---
 
-## 集群
+## 闆嗙兢
 
-### Q: 如何部署集群�?
+### Q: 濡備綍閮ㄧ讲闆嗙兢锛?
 ```bash
-# 节点 1
+# 鑺傜偣 1
 ./ontodb-server --raft --raft-id 1 --raft-peers "2@node2:7913"
 
-# 节点 2
+# 鑺傜偣 2
 ./ontodb-server --raft --raft-id 2 --raft-peers "1@node1:7913"
 ```
 
-### Q: 最小集群规模？
+### Q: 鏈€灏忛泦缇よ妯★紵
 
-3 节点（满�?Quorum）�?
-### Q: 如何实现负载均衡�?
-使用 Nginx 反向代理�?
+3 鑺傜偣锛堟弧瓒?Quorum锛夈€?
+### Q: 濡備綍瀹炵幇璐熻浇鍧囪　锛?
+浣跨敤 Nginx 鍙嶅悜浠ｇ悊銆?
 ---
 
 ## SDK
 
-### Q: 支持哪些语言�?
+### Q: 鏀寔鍝簺璇█锛?
 - Python: `pip install ontodb`
 - JavaScript/TypeScript: `npm install ontodb`
 - Go: `go get github.com/ontodb/ontodb-go`
 - Java: Maven `io.ontodb:ontodb-java`
 
-### Q: Python SDK 示例�?
+### Q: Python SDK 绀轰緥锛?
 ```python
 from ontodb import OntoDB
 
@@ -228,32 +228,32 @@ rows = db.query("SELECT * FROM users")
 
 ---
 
-## 故障排查
+## 鏁呴殰鎺掓煡
 
-### Q: 连接被拒绝？
+### Q: 杩炴帴琚嫆缁濓紵
 
-1. 检查服务器是否启动: `ps aux | grep ontodb`
-2. 检查端�? `netstat -tlnp | grep 7912`
-3. 检查防火墙: `ufw status`
+1. 妫€鏌ユ湇鍔″櫒鏄惁鍚姩: `ps aux | grep ontodb`
+2. 妫€鏌ョ鍙? `netstat -tlnp | grep 7912`
+3. 妫€鏌ラ槻鐏: `ufw status`
 
-### Q: 查询超时�?
-1. 添加 LIMIT
-2. 优化 WHERE 条件
-3. 创建索引
+### Q: 鏌ヨ瓒呮椂锛?
+1. 娣诲姞 LIMIT
+2. 浼樺寲 WHERE 鏉′欢
+3. 鍒涘缓绱㈠紩
 
-### Q: 内存不足�?
-减小配置:
+### Q: 鍐呭瓨涓嶈冻锛?
+鍑忓皬閰嶇疆:
 ```toml
 memtable_size_mb = 32
 block_cache_mb = 128
 ```
 
-### Q: 磁盘满？
+### Q: 纾佺洏婊★紵
 
-1. 清理旧数�?2. 扩容磁盘
-3. 启用压缩
+1. 娓呯悊鏃ф暟鎹?2. 鎵╁纾佺洏
+3. 鍚敤鍘嬬缉
 
-### Q: 如何查看日志�?
+### Q: 濡備綍鏌ョ湅鏃ュ織锛?
 ```bash
 # systemd
 journalctl -u ontodb -f

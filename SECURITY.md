@@ -1,4 +1,4 @@
-# Security Policy
+ï»¿# Security Policy
 
 ## Supported Versions
 
@@ -10,7 +10,7 @@
 
 **Please do NOT open a public GitHub issue for security vulnerabilities.**
 
-Instead, report them privately via email to: **security@ontodb.ai**.
+Instead, report them privately via email to: **security@ontovalue.com**.
 
 ### What to include
 
@@ -27,8 +27,8 @@ Instead, report them privately via email to: **security@ontodb.ai**.
 
 ## Security Best Practices for Deployment
 
-1. **Never commit secrets** â€?`.env`, `config/api_keys.json`, TLS keys are in `.gitignore`
-2. **Use TLS in production** â€?see `deploy/nginx/` for TLS proxy configuration
-3. **Rotate API keys** â€?use `config/api_keys.example.json` as a template, rotate keys regularly
-4. **Rate limiting** â€?enabled by default (300 req/min), adjust via `ONTODB_RATE_LIMIT`
-5. **Network isolation** â€?bind to `127.0.0.1` by default; expose `0.0.0.0` only behind a reverse proxy
+1. **Never commit secrets** éˆ¥?`.env`, `config/api_keys.json`, TLS keys are in `.gitignore`
+2. **Use TLS in production** éˆ¥?see `deploy/nginx/` for TLS proxy configuration
+3. **Rotate API keys** éˆ¥?use `config/api_keys.example.json` as a template, rotate keys regularly
+4. **Rate limiting** éˆ¥?enabled by default (300 req/min), adjust via `ONTODB_RATE_LIMIT`
+5. **Network isolation** éˆ¥?bind to `127.0.0.1` by default; expose `0.0.0.0` only behind a reverse proxy

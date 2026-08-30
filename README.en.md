@@ -1,4 +1,4 @@
-# OntoDB — Ontology-Driven Six-Modal Semantic Database
+﻿# OntoDB 鈥?Ontology-Driven Six-Modal Semantic Database
 
 <p align="center">
   <b>The world's first database embedding an OWL reasoning engine in the storage kernel</b>
@@ -11,7 +11,7 @@
 | Feature | Description |
 |---------|-------------|
 | **Six-Modal Unified Storage** | Relational + Graph + Vector + Time-Series + Spatial + Ontology, unified query API |
-| **Semantic-on-Insert** | 7-step pipeline: document → graph vertex → rdf:type triple → property triple → OWL reasoning → vector index → B+Tree index |
+| **Semantic-on-Insert** | 7-step pipeline: document 鈫?graph vertex 鈫?rdf:type triple 鈫?property triple 鈫?OWL reasoning 鈫?vector index 鈫?B+Tree index |
 | **Real-Time Ontology Reasoning** | 7 OWL 2 RL rules, incremental fixpoint algorithm, traceable inference chains |
 | **Semantic-Vector Hybrid Query** | HNSW vector index + SQL/SPARQL joint queries |
 | **Adaptive Memory Management** | MemTable 4-256MB dynamic sizing, Block Cache 16MB-1GB adaptive |
@@ -26,9 +26,9 @@
 | Write throughput | 863,618 ops/s |
 | Read throughput | 1,256,518 ops/s |
 | Batch write | 1,082,230 ops/s |
-| HNSW vector recall | 100% (ef_search=200, 341µs latency) |
+| HNSW vector recall | 100% (ef_search=200, 341碌s latency) |
 | 8-thread speedup | 1.82x |
-| GIS spatial predicate | ≤8µs |
+| GIS spatial predicate | 鈮?碌s |
 
 ## Quick Start
 
@@ -132,4 +132,4 @@ OntoDB uses a dual licensing model:
 - No requirement to open source modifications
 - Includes technical support and SLA
 - See [LICENSE.COMMERCIAL](LICENSE.COMMERCIAL)
-- Contact: license@ontodb.ai
+- Contact: license@ontovalue.com

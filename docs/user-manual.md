@@ -1,39 +1,39 @@
-# OntoDB 用户手册
+﻿# OntoDB 鐢ㄦ埛鎵嬪唽
 
-> 版本：v0.6.2 | 更新日期�?026-08-27
-
----
-
-## 目录
-
-1. [快速入门](#1-快速入�?
-2. [安装部署](#2-安装部署)
-3. [SQL 语法](#3-sql-语法)
-4. [向量搜索](#4-向量搜索)
-5. [图查询](#5-图查�?
-6. [SPARQL 查询](#6-sparql-查询)
-7. [本体推理](#7-本体推理)
-8. [事务管理](#8-事务管理)
-9. [备份恢复](#9-备份恢复)
-10. [安全配置](#10-安全配置)
-11. [性能调优](#11-性能调优)
-12. [故障排查](#12-故障排查)
+> 鐗堟湰锛歷0.6.2 | 鏇存柊鏃ユ湡锛?026-08-27
 
 ---
 
-## 1. 快速入�?
+## 鐩綍
 
-### 1.1 三分钟上�?
+1. [蹇€熷叆闂╙(#1-蹇€熷叆闂?
+2. [瀹夎閮ㄧ讲](#2-瀹夎閮ㄧ讲)
+3. [SQL 璇硶](#3-sql-璇硶)
+4. [鍚戦噺鎼滅储](#4-鍚戦噺鎼滅储)
+5. [鍥炬煡璇(#5-鍥炬煡璇?
+6. [SPARQL 鏌ヨ](#6-sparql-鏌ヨ)
+7. [鏈綋鎺ㄧ悊](#7-鏈綋鎺ㄧ悊)
+8. [浜嬪姟绠＄悊](#8-浜嬪姟绠＄悊)
+9. [澶囦唤鎭㈠](#9-澶囦唤鎭㈠)
+10. [瀹夊叏閰嶇疆](#10-瀹夊叏閰嶇疆)
+11. [鎬ц兘璋冧紭](#11-鎬ц兘璋冧紭)
+12. [鏁呴殰鎺掓煡](#12-鏁呴殰鎺掓煡)
+
+---
+
+## 1. 蹇€熷叆闂?
+
+### 1.1 涓夊垎閽熶笂鎵?
 
 ```bash
-# 1. 下载并解�?
-wget https://release.ontodb.ai/ontodb-v0.6.2-linux-x86_64.tar.gz
+# 1. 涓嬭浇骞惰В鍘?
+wget https://release.ontovalue.com/ontodb-v0.6.2-linux-x86_64.tar.gz
 tar xzf ontodb-v0.6.2-linux-x86_64.tar.gz
 
-# 2. 启动服务�?
+# 2. 鍚姩鏈嶅姟鍣?
 ./ontodb-server --data-dir ./data --http 127.0.0.1:7912
 
-# 3. 创建表并插入数据（OntoQL 语法�?
+# 3. 鍒涘缓琛ㄥ苟鎻掑叆鏁版嵁锛圤ntoQL 璇硶锛?
 curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "CREATE CLASS users"}'
@@ -42,123 +42,123 @@ curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "INSERT INTO users SET name = \"Alice\", age = 30"}'
 
-# 4. 查询数据
+# 4. 鏌ヨ鏁版嵁
 curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "SELECT * FROM users"}'
 ```
 
-### 1.2 使用 CLI
+### 1.2 浣跨敤 CLI
 
 ```bash
-# 连接到服务器
+# 杩炴帴鍒版湇鍔″櫒
 ./ontodb-cli 127.0.0.1:7912
 
-# 交互式查�?
+# 浜や簰寮忔煡璇?
 ontodb> SELECT * FROM users;
-┌─────────┬─────�?
-�?name    �?age �?
-├─────────┼─────�?
-�?Alice   �?30  �?
-└─────────┴─────�?
+鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹?
+鈹?name    鈹?age 鈹?
+鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹尖攢鈹€鈹€鈹€鈹€鈹?
+鈹?Alice   鈹?30  鈹?
+鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹粹攢鈹€鈹€鈹€鈹€鈹?
 (1 row)
 ```
 
-### 1.3 使用 Web 控制�?
+### 1.3 浣跨敤 Web 鎺у埗鍙?
 
-打开浏览器访�?`http://127.0.0.1:7912/console`，支持：
-- SQL 编辑器（语法高亮�?
-- 查询历史
-- Schema 浏览
-- 实时指标
+鎵撳紑娴忚鍣ㄨ闂?`http://127.0.0.1:7912/console`锛屾敮鎸侊細
+- SQL 缂栬緫鍣紙璇硶楂樹寒锛?
+- 鏌ヨ鍘嗗彶
+- Schema 娴忚
+- 瀹炴椂鎸囨爣
 
 ---
 
-## 2. 安装部署
+## 2. 瀹夎閮ㄧ讲
 
-### 2.1 系统要求
+### 2.1 绯荤粺瑕佹眰
 
-| 项目 | 最低要�?| 推荐配置 |
+| 椤圭洰 | 鏈€浣庤姹?| 鎺ㄨ崘閰嶇疆 |
 |------|---------|---------|
-| CPU | 2 �?| 8 �?|
-| 内存 | 2 GB | 16 GB |
-| 磁盘 | 10 GB SSD | 100 GB NVMe SSD |
-| 操作系统 | Linux x86_64 / Windows 10+ | Ubuntu 22.04 / Windows 11 |
+| CPU | 2 鏍?| 8 鏍?|
+| 鍐呭瓨 | 2 GB | 16 GB |
+| 纾佺洏 | 10 GB SSD | 100 GB NVMe SSD |
+| 鎿嶄綔绯荤粺 | Linux x86_64 / Windows 10+ | Ubuntu 22.04 / Windows 11 |
 
-### 2.2 Linux 安装
+### 2.2 Linux 瀹夎
 
 ```bash
-# 一键安�?
-curl -fsSL https://get.ontodb.ai/install.sh | bash
+# 涓€閿畨瑁?
+curl -fsSL https://get.ontovalue.com/install.sh | bash
 
-# 或手动安�?
-wget https://release.ontodb.ai/ontodb-v0.6.2-linux-x86_64.tar.gz
+# 鎴栨墜鍔ㄥ畨瑁?
+wget https://release.ontovalue.com/ontodb-v0.6.2-linux-x86_64.tar.gz
 tar xzf ontodb-v0.6.2-linux-x86_64.tar.gz -C /opt/ontodb
 export PATH=$PATH:/opt/ontodb/bin
 ```
 
-### 2.3 Windows 安装
+### 2.3 Windows 瀹夎
 
 ```powershell
-# PowerShell 一键安�?
-irm https://get.ontodb.ai/install.ps1 | iex
+# PowerShell 涓€閿畨瑁?
+irm https://get.ontovalue.com/install.ps1 | iex
 
-# 或手动解压到目录
+# 鎴栨墜鍔ㄨВ鍘嬪埌鐩綍
 ```
 
-### 2.4 Docker 部署
+### 2.4 Docker 閮ㄧ讲
 
 ```bash
-# 单节�?
+# 鍗曡妭鐐?
 docker run -d --name ontodb \
   -p 7912:7912 -p 7913:7913 \
   -v ontodb-data:/data \
   ontodb/ontodb:latest
 
-# 使用 docker-compose
+# 浣跨敤 docker-compose
 curl -O https://raw.githubusercontent.com/ontodb/ontodb/main/docker-compose.yml
 docker-compose up -d
 ```
 
-### 2.5 源码编译
+### 2.5 婧愮爜缂栬瘧
 
 ```bash
-# 前置要求：Rust 1.70+
+# 鍓嶇疆瑕佹眰锛歊ust 1.70+
 git clone https://github.com/ontodb/ontodb.git
 cd ontodb
 cargo build --release
 
-# 二进制文件位�?target/release/
+# 浜岃繘鍒舵枃浠朵綅浜?target/release/
 ```
 
-### 2.6 启动参数
+### 2.6 鍚姩鍙傛暟
 
-| 参数 | 说明 | 默认�?|
+| 鍙傛暟 | 璇存槑 | 榛樿鍊?|
 |------|------|--------|
-| `--data-dir` | 数据目录 | `./data` |
-| `--http` | HTTP 监听地址 | `127.0.0.1:7912` |
-| `--auth` | 启用 API Key 认证 | `false` |
-| `--api-key` | API 密钥 | 自动生成 |
-| `--no-rate-limit` | 禁用速率限制 | `false` |
-| `--tls-cert` | TLS 证书文件 | �?|
-| `--tls-key` | TLS 私钥文件 | �?|
-| `--encryption-enabled` | 启用存储加密 | `false` |
-| `--master-key-source` | 主密钥来�?| `env:ONTO_MASTER_KEY` |
+| `--data-dir` | 鏁版嵁鐩綍 | `./data` |
+| `--http` | HTTP 鐩戝惉鍦板潃 | `127.0.0.1:7912` |
+| `--auth` | 鍚敤 API Key 璁よ瘉 | `false` |
+| `--api-key` | API 瀵嗛挜 | 鑷姩鐢熸垚 |
+| `--no-rate-limit` | 绂佺敤閫熺巼闄愬埗 | `false` |
+| `--tls-cert` | TLS 璇佷功鏂囦欢 | 鏃?|
+| `--tls-key` | TLS 绉侀挜鏂囦欢 | 鏃?|
+| `--encryption-enabled` | 鍚敤瀛樺偍鍔犲瘑 | `false` |
+| `--master-key-source` | 涓诲瘑閽ユ潵婧?| `env:ONTO_MASTER_KEY` |
 
 ---
 
-## 3. SQL 语法
+## 3. SQL 璇硶
 
-### 3.1 DDL（数据定义）
+### 3.1 DDL锛堟暟鎹畾涔夛級
 
 ```sql
--- 创建类（推荐使用 OntoQL 语法�?
+-- 鍒涘缓绫伙紙鎺ㄨ崘浣跨敤 OntoQL 璇硶锛?
 CREATE CLASS users
 
--- 创建带继承的�?
+-- 鍒涘缓甯︾户鎵跨殑绫?
 CREATE CLASS Employee EXTENDS Person
 
--- 创建完整本体（多个类 + 属性）
+-- 鍒涘缓瀹屾暣鏈綋锛堝涓被 + 灞炴€э級
 CREATE ONTOLOGY MyApp (
     CLASS Product,
     CLASS Order,
@@ -166,7 +166,7 @@ CREATE ONTOLOGY MyApp (
     PROPERTY price DOMAIN Product RANGE FLOAT64
 )
 
--- 兼容旧语法（仍可用）
+-- 鍏煎鏃ц娉曪紙浠嶅彲鐢級
 CREATE VERTEX TABLE users (
     id STRING,
     name STRING,
@@ -175,110 +175,110 @@ CREATE VERTEX TABLE users (
 );
 ```
 
--- 创建索引
+-- 鍒涘缓绱㈠紩
 CREATE INDEX ON users (name);
 CREATE INDEX ON users (age, name);
 
--- 创建向量索引
+-- 鍒涘缓鍚戦噺绱㈠紩
 CREATE VECTOR INDEX ON documents (embedding) DIMENSIONS 128 METRIC cosine;
 
--- 创建物化视图
+-- 鍒涘缓鐗╁寲瑙嗗浘
 CREATE MATERIALIZED VIEW user_stats AS
 SELECT age, COUNT(*) as cnt FROM users GROUP BY age;
 ```
 
-### 3.2 DML（数据操作）
+### 3.2 DML锛堟暟鎹搷浣滐級
 
 ```sql
--- 插入
+-- 鎻掑叆
 INSERT INTO users (id, name, age, email) VALUES
     ('u1', 'Alice', 30, 'alice@example.com'),
     ('u2', 'Bob', 25, 'bob@example.com');
 
--- 批量插入
+-- 鎵归噺鎻掑叆
 BATCH INSERT INTO users (id, name, age) VALUES
     ('u3', 'Charlie', 35),
     ('u4', 'Diana', 28),
     ('u5', 'Eve', 42);
 
--- 更新
+-- 鏇存柊
 UPDATE users SET age = 31 WHERE name = 'Alice';
 
--- 删除
+-- 鍒犻櫎
 DELETE FROM users WHERE age < 20;
 
--- UPSERT (存在则更新，不存在则插入)
+-- UPSERT (瀛樺湪鍒欐洿鏂帮紝涓嶅瓨鍦ㄥ垯鎻掑叆)
 INSERT INTO users (id, name, age) VALUES ('u1', 'Alice Updated', 31)
 ON CONFLICT (id) DO UPDATE SET name = excluded.name, age = excluded.age;
 ```
 
-### 3.3 DQL（数据查询）
+### 3.3 DQL锛堟暟鎹煡璇級
 
 ```sql
--- 基础查询
+-- 鍩虹鏌ヨ
 SELECT * FROM users WHERE age > 25 ORDER BY name LIMIT 10;
 
--- 聚合查询
+-- 鑱氬悎鏌ヨ
 SELECT age, COUNT(*) as count, AVG(age) as avg_age
 FROM users
 GROUP BY age
 HAVING COUNT(*) > 1;
 
--- JOIN 查询
+-- JOIN 鏌ヨ
 SELECT u.name, COUNT(k.to_id) as friend_count
 FROM users u
 LEFT JOIN knows k ON u.id = k.from_id
 GROUP BY u.name;
 
--- 子查�?
+-- 瀛愭煡璇?
 SELECT * FROM users WHERE age > (SELECT AVG(age) FROM users);
 
--- CTE (公共表表达式)
+-- CTE (鍏叡琛ㄨ〃杈惧紡)
 WITH active_users AS (
     SELECT * FROM users WHERE age > 20
 )
 SELECT * FROM active_users WHERE name LIKE 'A%';
 
--- 窗口函数
+-- 绐楀彛鍑芥暟
 SELECT name, age,
     ROW_NUMBER() OVER (ORDER BY age DESC) as rank,
     AVG(age) OVER () as avg_age
 FROM users;
 
--- 图遍历查�?
+-- 鍥鹃亶鍘嗘煡璇?
 GRAPH TRAVERSE FROM 'users::u1' OUT LABEL 'knows' DEPTH 3;
 
--- 最短路�?
+-- 鏈€鐭矾寰?
 GRAPH SHORTEST PATH FROM 'users::u1' TO 'users::u5';
 ```
 
-### 3.4 导入导出
+### 3.4 瀵煎叆瀵煎嚭
 
 ```sql
--- �?CSV 导入
+-- 浠?CSV 瀵煎叆
 COPY users FROM '/path/to/users.csv' FORMAT CSV HEADER;
 
--- 导出到文�?
+-- 瀵煎嚭鍒版枃浠?
 COPY (SELECT * FROM users) TO '/path/to/export.csv' FORMAT CSV;
 
--- �?JSON 导入
+-- 浠?JSON 瀵煎叆
 IMPORT users FROM '/path/to/users.json' FORMAT JSON;
 ```
 
-### 3.5 OntoQL 语法（本体查询语言�?
+### 3.5 OntoQL 璇硶锛堟湰浣撴煡璇㈣瑷€锛?
 
-OntoQL �?OntoDB 的本体查询语言，在 SQL 基础上增加了**类继承、属性语义、三元组操作、本体推�?*能力�?
+OntoQL 鏄?OntoDB 鐨勬湰浣撴煡璇㈣瑷€锛屽湪 SQL 鍩虹涓婂鍔犱簡**绫荤户鎵裤€佸睘鎬ц涔夈€佷笁鍏冪粍鎿嶄綔銆佹湰浣撴帹鐞?*鑳藉姏銆?
 
-#### 3.5.1 本体定义
+#### 3.5.1 鏈綋瀹氫箟
 
 ```sql
--- 创建单个类（自动创建同名本体�?
+-- 鍒涘缓鍗曚釜绫伙紙鑷姩鍒涘缓鍚屽悕鏈綋锛?
 CREATE CLASS Dog
 
--- 创建带继承的�?
+-- 鍒涘缓甯︾户鎵跨殑绫?
 CREATE CLASS Dog EXTENDS Animal
 
--- 创建完整本体（多个类 + 属�?组织在一起）
+-- 鍒涘缓瀹屾暣鏈綋锛堝涓被 + 灞炴€?缁勭粐鍦ㄤ竴璧凤級
 CREATE ONTOLOGY BioCompute (
     CLASS BioTask,
     CLASS ScreenResult,
@@ -289,7 +289,7 @@ CREATE ONTOLOGY BioCompute (
     PROPERTY value_density DOMAIN BioTask RANGE FLOAT64
 )
 
--- 创建共享基类本体
+-- 鍒涘缓鍏变韩鍩虹被鏈綋
 CREATE ONTOLOGY SharedBase (
     CLASS TimestampedEntity,
     CLASS OwnedEntity EXTENDS TimestampedEntity,
@@ -301,22 +301,22 @@ CREATE ONTOLOGY SharedBase (
 )
 ```
 
-#### 3.5.2 删除
+#### 3.5.2 鍒犻櫎
 
 ```sql
--- 删除单个类（对应 CREATE CLASS�?
+-- 鍒犻櫎鍗曚釜绫伙紙瀵瑰簲 CREATE CLASS锛?
 DROP CLASS Dog
 
--- 删除整个本体（对�?CREATE ONTOLOGY�?
+-- 鍒犻櫎鏁翠釜鏈綋锛堝搴?CREATE ONTOLOGY锛?
 DROP ONTOLOGY BioCompute
 ```
 
-**对应关系**：`CREATE CLASS` �?`DROP CLASS`，`CREATE ONTOLOGY` �?`DROP ONTOLOGY`
+**瀵瑰簲鍏崇郴**锛歚CREATE CLASS` 鈫?`DROP CLASS`锛宍CREATE ONTOLOGY` 鈫?`DROP ONTOLOGY`
 
-#### 3.5.3 数据操作（SET 语法�?
+#### 3.5.3 鏁版嵁鎿嶄綔锛圫ET 璇硶锛?
 
 ```sql
--- INSERT（OntoQL SET 语法，比 SQL VALUES 更简洁）
+-- INSERT锛圤ntoQL SET 璇硶锛屾瘮 SQL VALUES 鏇寸畝娲侊級
 INSERT INTO BioTask SET
     task_name = 'sample.fastq',
     data_type = 'fastq',
@@ -325,63 +325,63 @@ INSERT INTO BioTask SET
     owner = 'lab-01',
     created_at = 1724800000.0
 
--- SELECT（与 SQL 相同�?
+-- SELECT锛堜笌 SQL 鐩稿悓锛?
 SELECT * FROM BioTask WHERE status = 'completed'
 SELECT * FROM BioTask WHERE owner = 'lab-01' ORDER BY value_density DESC
 
--- UPDATE / DELETE（与 SQL 相同�?
+-- UPDATE / DELETE锛堜笌 SQL 鐩稿悓锛?
 UPDATE BioTask SET status = 'archived' WHERE owner = 'lab-01'
 DELETE FROM BioTask WHERE status = 'failed'
 ```
 
-#### 3.5.4 继承查询
+#### 3.5.4 缁ф壙鏌ヨ
 
 ```sql
--- 查询 Animal 会自动返�?Dog、Cat、Bird 等所有子类实�?
+-- 鏌ヨ Animal 浼氳嚜鍔ㄨ繑鍥?Dog銆丆at銆丅ird 绛夋墍鏈夊瓙绫诲疄渚?
 SELECT * FROM Animal
 
--- 查询 Device 会自动返�?Sensor、TempSensor、SmartLight �?
+-- 鏌ヨ Device 浼氳嚜鍔ㄨ繑鍥?Sensor銆乀empSensor銆丼martLight 绛?
 SELECT * FROM Device
 
--- 查看实体的真实类�?
+-- 鏌ョ湅瀹炰綋鐨勭湡瀹炵被鍨?
 SELECT name, __class__ FROM Device
 ```
 
-#### 3.5.5 三元组操作（RDF�?
+#### 3.5.5 涓夊厓缁勬搷浣滐紙RDF锛?
 
 ```sql
--- 插入三元�?
+-- 鎻掑叆涓夊厓缁?
 INSERT TRIPLE SET subject = "dog1", predicate = "rdf:type", object = "Dog"
 INSERT TRIPLE SET subject = "dog1", predicate = "name", object = "Rex"
 
--- 批量插入
+-- 鎵归噺鎻掑叆
 INSERT TRIPLES (subject, predicate, object) VALUES
     ("dog1", "rdf:type", "Dog"),
     ("dog1", "name", "Rex"),
     ("dog1", "age", "3")
 
--- 查询三元�?
+-- 鏌ヨ涓夊厓缁?
 SELECT TRIPLE
 SELECT TRIPLE WHERE subject = "dog1"
 SELECT TRIPLE WHERE predicate = "rdf:type" LIMIT 10
 
--- 删除三元�?
+-- 鍒犻櫎涓夊厓缁?
 DELETE TRIPLE SET subject = "dog1", predicate = "name", object = "Rex"
 ```
 
-#### 3.5.6 推理查询
+#### 3.5.6 鎺ㄧ悊鏌ヨ
 
 ```sql
--- 使用 INFER 关键字开�?OWL 推理
+-- 浣跨敤 INFER 鍏抽敭瀛楀紑鍚?OWL 鎺ㄧ悊
 SELECT * FROM Animal INFER @onto(scope=SUBCLASS)
 
--- 推理会自动展开类层次：
--- Animal �?Mammal �?Dog, Cat
--- Animal �?Bird �?Eagle
--- 查询 Animal 返回所有子类实�?
+-- 鎺ㄧ悊浼氳嚜鍔ㄥ睍寮€绫诲眰娆★細
+-- Animal 鈫?Mammal 鈫?Dog, Cat
+-- Animal 鈫?Bird 鈫?Eagle
+-- 鏌ヨ Animal 杩斿洖鎵€鏈夊瓙绫诲疄渚?
 ```
 
-#### 3.5.7 事务
+#### 3.5.7 浜嬪姟
 
 ```sql
 BEGIN
@@ -389,67 +389,67 @@ INSERT INTO BioTask SET task_name = 'txn-test', status = 'new'
 UPDATE BioTask SET status = 'committed' WHERE task_name = 'txn-test'
 COMMIT
 
--- 或回�?
+-- 鎴栧洖婊?
 BEGIN
 DELETE FROM BioTask WHERE task_name = 'txn-test'
 ROLLBACK
 ```
 
-#### 3.5.8 OntoQL vs SQL vs SPARQL 对照
+#### 3.5.8 OntoQL vs SQL vs SPARQL 瀵圭収
 
-| 操作 | SQL | OntoQL | SPARQL |
+| 鎿嶄綔 | SQL | OntoQL | SPARQL |
 |------|-----|--------|--------|
-| 建表 | `CREATE ONTOLOGY X (CLASS Y)` | `CREATE CLASS Y` | 不支�?|
-| 建库 | `CREATE ONTOLOGY X (...)` | `CREATE ONTOLOGY X (...)` | 不支�?|
-| 删表 | 不支�?| `DROP CLASS Y` | 不支�?|
-| 删库 | 不支�?| `DROP ONTOLOGY X` | 不支�?|
-| 插数�?| `INSERT INTO T (...) VALUES (...)` | `INSERT INTO T SET col=val` | 不支�?|
-| 查数�?| `SELECT * FROM T` | `SELECT * FROM T` | `SELECT ?x WHERE {?x rdf:type T}` |
-| 继承查询 | 不支�?| `SELECT * FROM Animal`（自动展开�?| `?x rdf:type/rdfs:subClassOf* Animal` |
-| 三元�?| 不支�?| `INSERT TRIPLE SET ...` | `INSERT DATA { ... }` |
+| 寤鸿〃 | `CREATE ONTOLOGY X (CLASS Y)` | `CREATE CLASS Y` | 涓嶆敮鎸?|
+| 寤哄簱 | `CREATE ONTOLOGY X (...)` | `CREATE ONTOLOGY X (...)` | 涓嶆敮鎸?|
+| 鍒犺〃 | 涓嶆敮鎸?| `DROP CLASS Y` | 涓嶆敮鎸?|
+| 鍒犲簱 | 涓嶆敮鎸?| `DROP ONTOLOGY X` | 涓嶆敮鎸?|
+| 鎻掓暟鎹?| `INSERT INTO T (...) VALUES (...)` | `INSERT INTO T SET col=val` | 涓嶆敮鎸?|
+| 鏌ユ暟鎹?| `SELECT * FROM T` | `SELECT * FROM T` | `SELECT ?x WHERE {?x rdf:type T}` |
+| 缁ф壙鏌ヨ | 涓嶆敮鎸?| `SELECT * FROM Animal`锛堣嚜鍔ㄥ睍寮€锛?| `?x rdf:type/rdfs:subClassOf* Animal` |
+| 涓夊厓缁?| 涓嶆敮鎸?| `INSERT TRIPLE SET ...` | `INSERT DATA { ... }` |
 
-> 应用层日�?CRUD �?SQL 即可。管理操作（建本�?加属�?DROP）用 OntoQL。SPARQL 适合知识图谱集成�?
+> 搴旂敤灞傛棩甯?CRUD 鐢?SQL 鍗冲彲銆傜鐞嗘搷浣滐紙寤烘湰浣?鍔犲睘鎬?DROP锛夌敤 OntoQL銆係PARQL 閫傚悎鐭ヨ瘑鍥捐氨闆嗘垚銆?
 
 ---
 
-## 4. 向量搜索
+## 4. 鍚戦噺鎼滅储
 
-### 4.1 创建向量索引
+### 4.1 鍒涘缓鍚戦噺绱㈠紩
 
 ```sql
--- 创建128维向量索引（余弦相似度）
+-- 鍒涘缓128缁村悜閲忕储寮曪紙浣欏鸡鐩镐技搴︼級
 CREATE VECTOR INDEX ON documents (embedding)
     DIMENSIONS 128
     METRIC cosine;
 
--- 创建256维向量索引（欧氏距离�?
+-- 鍒涘缓256缁村悜閲忕储寮曪紙娆ф皬璺濈锛?
 CREATE VECTOR INDEX ON images (feature_vector)
     DIMENSIONS 256
     METRIC euclidean;
 ```
 
-### 4.2 向量搜索
+### 4.2 鍚戦噺鎼滅储
 
 ```sql
--- 基础向量搜索
+-- 鍩虹鍚戦噺鎼滅储
 VECTOR SEARCH ON documents (embedding)
     QUERY [0.1, 0.2, 0.3, ..., 0.128]
     TOP 10;
 
--- 带过滤条件的向量搜索
+-- 甯﹁繃婊ゆ潯浠剁殑鍚戦噺鎼滅储
 VECTOR SEARCH ON documents (embedding)
     QUERY [0.1, 0.2, 0.3, ..., 0.128]
     TOP 10
-    WHERE category = '技�?;
+    WHERE category = '鎶€鏈?;
 ```
 
-### 4.3 混合查询（SQL + 向量�?
+### 4.3 娣峰悎鏌ヨ锛圫QL + 鍚戦噺锛?
 
 ```sql
--- SQL 过滤 + 向量排序
+-- SQL 杩囨护 + 鍚戦噺鎺掑簭
 SELECT title, VECTOR_DISTANCE(embedding, [0.1, 0.2, ...]) as score
 FROM documents
-WHERE category = '技�? AND year > 2020
+WHERE category = '鎶€鏈? AND year > 2020
 ORDER BY score
 LIMIT 5;
 ```
@@ -457,7 +457,7 @@ LIMIT 5;
 ### 4.4 HTTP API
 
 ```bash
-# 向量搜索
+# 鍚戦噺鎼滅储
 curl -X POST http://127.0.0.1:7912/api/vector/search \
   -H "Content-Type: application/json" \
   -d '{
@@ -465,10 +465,10 @@ curl -X POST http://127.0.0.1:7912/api/vector/search \
     "column": "embedding",
     "query_vector": [0.1, 0.2, 0.3],
     "top_k": 10,
-    "filter": "category = \"技术\""
+    "filter": "category = \"鎶€鏈痋""
   }'
 
-# 混合查询
+# 娣峰悎鏌ヨ
 curl -X POST http://127.0.0.1:7912/api/hybrid/query \
   -H "Content-Type: application/json" \
   -d '{
@@ -482,39 +482,39 @@ curl -X POST http://127.0.0.1:7912/api/hybrid/query \
 
 ---
 
-## 5. 图查�?
+## 5. 鍥炬煡璇?
 
-### 5.1 创建图结�?
+### 5.1 鍒涘缓鍥剧粨鏋?
 
 ```sql
--- 创建顶点
+-- 鍒涘缓椤剁偣
 INSERT VERTEX Person (id, name, age) VALUES ('p1', 'Alice', 30);
 INSERT VERTEX Person (id, name, age) VALUES ('p2', 'Bob', 25);
 
--- 创建�?
+-- 鍒涘缓杈?
 INSERT EDGE knows (from_id, to_id, since) VALUES ('p1', 'p2', 2020);
 ```
 
-### 5.2 图遍�?
+### 5.2 鍥鹃亶鍘?
 
 ```sql
--- BFS 遍历（从 p1 出发�? 跳）
+-- BFS 閬嶅巻锛堜粠 p1 鍑哄彂锛? 璺筹級
 GRAPH TRAVERSE FROM 'Person::p1' OUT LABEL 'knows' DEPTH 3;
 
--- DFS 遍历
+-- DFS 閬嶅巻
 GRAPH TRAVERSE FROM 'Person::p1' OUT DEPTH 5 ALGORITHM dfs;
 
--- 带过滤的遍历
+-- 甯﹁繃婊ょ殑閬嶅巻
 GRAPH TRAVERSE FROM 'Person::p1' OUT DEPTH 2 WHERE age > 25;
 
--- 最短路�?
+-- 鏈€鐭矾寰?
 GRAPH SHORTEST PATH FROM 'Person::p1' TO 'Person::p5';
 ```
 
 ### 5.3 HTTP API
 
 ```bash
-# 图遍�?
+# 鍥鹃亶鍘?
 curl -X POST http://127.0.0.1:7912/api/graph/traverse \
   -H "Content-Type: application/json" \
   -d '{
@@ -525,7 +525,7 @@ curl -X POST http://127.0.0.1:7912/api/graph/traverse \
     "algorithm": "bfs"
   }'
 
-# 最短路�?
+# 鏈€鐭矾寰?
 curl -X POST http://127.0.0.1:7912/api/graph/shortest-path \
   -H "Content-Type: application/json" \
   -d '{"from": "Person::p1", "to": "Person::p5"}'
@@ -533,12 +533,12 @@ curl -X POST http://127.0.0.1:7912/api/graph/shortest-path \
 
 ---
 
-## 6. SPARQL 查询
+## 6. SPARQL 鏌ヨ
 
-### 6.1 基础查询
+### 6.1 鍩虹鏌ヨ
 
 ```sparql
--- 查询所�?Person
+-- 鏌ヨ鎵€鏈?Person
 SELECT ?name ?age
 WHERE {
     ?person rdf:type :Person .
@@ -549,10 +549,10 @@ ORDER BY ?name
 LIMIT 10;
 ```
 
-### 6.2 过滤查询
+### 6.2 杩囨护鏌ヨ
 
 ```sparql
--- 过滤年龄大于 25 �?Person
+-- 杩囨护骞撮緞澶т簬 25 鐨?Person
 SELECT ?name ?age
 WHERE {
     ?person rdf:type :Person .
@@ -563,10 +563,10 @@ WHERE {
 ORDER BY ?age DESC;
 ```
 
-### 6.3 OPTIONAL 查询
+### 6.3 OPTIONAL 鏌ヨ
 
 ```sparql
--- 查询 Person 及其可选的邮箱
+-- 鏌ヨ Person 鍙婂叾鍙€夌殑閭
 SELECT ?name ?email
 WHERE {
     ?person rdf:type :Person .
@@ -575,10 +575,10 @@ WHERE {
 };
 ```
 
-### 6.4 CONSTRUCT 查询
+### 6.4 CONSTRUCT 鏌ヨ
 
 ```sparql
--- 构造新�?RDF �?
+-- 鏋勯€犳柊鐨?RDF 鍥?
 CONSTRUCT {
     ?person :hasFriend ?friend .
 }
@@ -589,10 +589,10 @@ WHERE {
 };
 ```
 
-### 6.5 ASK 查询
+### 6.5 ASK 鏌ヨ
 
 ```sparql
--- 检查是否存�?
+-- 妫€鏌ユ槸鍚﹀瓨鍦?
 ASK {
     ?person rdf:type :Person .
     ?person :name "Alice" .
@@ -601,9 +601,9 @@ ASK {
 
 ---
 
-## 7. 本体推理
+## 7. 鏈綋鎺ㄧ悊
 
-### 7.1 创建本体
+### 7.1 鍒涘缓鏈綋
 
 ```sql
 CREATE ONTOLOGY MyOntology (
@@ -622,82 +622,82 @@ CREATE ONTOLOGY MyOntology (
 );
 ```
 
-### 7.2 自动推理
+### 7.2 鑷姩鎺ㄧ悊
 
 ```sql
--- 插入实例
-INSERT INTO Dog (hasName, hasAge) VALUES ('旺财', 3);
+-- 鎻掑叆瀹炰緥
+INSERT INTO Dog (hasName, hasAge) VALUES ('鏃鸿储', 3);
 
--- 查询所�?Animal（Dog 自动包含在内�?
+-- 鏌ヨ鎵€鏈?Animal锛圖og 鑷姩鍖呭惈鍦ㄥ唴锛?
 SELECT * FROM Animal;
--- 结果包含：旺财（Dog �?Animal 的子类）
+-- 缁撴灉鍖呭惈锛氭椇璐紙Dog 鏄?Animal 鐨勫瓙绫伙級
 
--- 查询所�?Pet（Dog 也是 Pet�?
+-- 鏌ヨ鎵€鏈?Pet锛圖og 涔熸槸 Pet锛?
 SELECT * FROM Pet;
 ```
 
-### 7.3 推理规则
+### 7.3 鎺ㄧ悊瑙勫垯
 
-OntoDB 支持 7 �?OWL 2 RL 推理规则�?
+OntoDB 鏀寔 7 鏉?OWL 2 RL 鎺ㄧ悊瑙勫垯锛?
 
-| 规则 | 说明 | 示例 |
+| 瑙勫垯 | 璇存槑 | 绀轰緥 |
 |------|------|------|
-| CaxSco | 类继承推�?| Dog �?Animal �?旺财 �?Animal |
-| CaxEqc | 等价类推�?| Dog �?Canine �?旺财 �?Canine |
-| PrpSpo | 属性继承推�?| hasOwner �?hasBelonging �?传�?|
-| PrpEqp | 等价属性推�?| hasName �?getName �?语义别名 |
-| PrpInv | 反向属性推�?| owns �?ownedBy |
-| PrpTrp | 传递属性推�?| ancestorOf 传�?|
-| PrpSymp | 对称属性推�?| friendOf 对称 |
+| CaxSco | 绫荤户鎵挎帹鐞?| Dog 鈯?Animal 鈫?鏃鸿储 鈭?Animal |
+| CaxEqc | 绛変环绫绘帹鐞?| Dog 鈮?Canine 鈫?鏃鸿储 鈭?Canine |
+| PrpSpo | 灞炴€х户鎵挎帹鐞?| hasOwner 鈯?hasBelonging 鈫?浼犻€?|
+| PrpEqp | 绛変环灞炴€ф帹鐞?| hasName 鈮?getName 鈫?璇箟鍒悕 |
+| PrpInv | 鍙嶅悜灞炴€ф帹鐞?| owns 鈫?ownedBy |
+| PrpTrp | 浼犻€掑睘鎬ф帹鐞?| ancestorOf 浼犻€?|
+| PrpSymp | 瀵圭О灞炴€ф帹鐞?| friendOf 瀵圭О |
 
-### 7.4 推理解释
+### 7.4 鎺ㄧ悊瑙ｉ噴
 
 ```sql
--- 查看推导�?
-EXPLAIN SELECT * FROM Animal WHERE hasName = '旺财';
+-- 鏌ョ湅鎺ㄥ閾?
+EXPLAIN SELECT * FROM Animal WHERE hasName = '鏃鸿储';
 
--- 输出�?
--- 旺财 �?Dog (直接断言)
--- Dog �?Animal (本体规则)
--- �?旺财 �?Animal (推导)
+-- 杈撳嚭锛?
+-- 鏃鸿储 鈭?Dog (鐩存帴鏂█)
+-- Dog 鈯?Animal (鏈綋瑙勫垯)
+-- 鈫?鏃鸿储 鈭?Animal (鎺ㄥ)
 ```
 
 ---
 
-## 8. 事务管理
+## 8. 浜嬪姟绠＄悊
 
-### 8.1 基础事务
+### 8.1 鍩虹浜嬪姟
 
 ```sql
--- 开始事�?
+-- 寮€濮嬩簨鍔?
 BEGIN;
 
--- 执行操作
+-- 鎵ц鎿嶄綔
 INSERT INTO users (name, age) VALUES ('Alice', 30);
 UPDATE accounts SET balance = balance - 100 WHERE user = 'Alice';
 
--- 提交事务
+-- 鎻愪氦浜嬪姟
 COMMIT;
 
--- 或回�?
+-- 鎴栧洖婊?
 ROLLBACK;
 ```
 
-### 8.2 隔离级别
+### 8.2 闅旂绾у埆
 
-OntoDB 使用 **快照隔离**（Snapshot Isolation）：
-- 每个事务看到一致的数据快照
-- 写入冲突时自动回�?
-- 适合读多写少的场�?
+OntoDB 浣跨敤 **蹇収闅旂**锛圫napshot Isolation锛夛細
+- 姣忎釜浜嬪姟鐪嬪埌涓€鑷寸殑鏁版嵁蹇収
+- 鍐欏叆鍐茬獊鏃惰嚜鍔ㄥ洖婊?
+- 閫傚悎璇诲鍐欏皯鐨勫満鏅?
 
 ---
 
-## 9. 备份恢复
+## 9. 澶囦唤鎭㈠
 
-### 9.1 全量备份
+### 9.1 鍏ㄩ噺澶囦唤
 
 ```sql
--- SQL 方式
+-- SQL 鏂瑰紡
 BACKUP TO '/backups/full-2026-08-10.ontodb';
 
 -- HTTP API
@@ -706,17 +706,17 @@ curl -X POST http://127.0.0.1:7912/api/backup \
   -d '{"path": "/backups/full-2026-08-10.ontodb"}'
 ```
 
-### 9.2 增量备份
+### 9.2 澧為噺澶囦唤
 
 ```sql
--- 增量备份（仅备份变更部分�?
+-- 澧為噺澶囦唤锛堜粎澶囦唤鍙樻洿閮ㄥ垎锛?
 BACKUP INCREMENTAL TO '/backups/incr-2026-08-10.ontodb';
 ```
 
-### 9.3 恢复
+### 9.3 鎭㈠
 
 ```sql
--- SQL 方式
+-- SQL 鏂瑰紡
 RESTORE FROM '/backups/full-2026-08-10.ontodb';
 
 -- HTTP API
@@ -725,11 +725,11 @@ curl -X POST http://127.0.0.1:7912/api/restore \
   -d '{"path": "/backups/full-2026-08-10.ontodb"}'
 ```
 
-### 9.4 自动备份脚本
+### 9.4 鑷姩澶囦唤鑴氭湰
 
 ```bash
 #!/bin/bash
-# 每日凌晨 2 点自动备�?
+# 姣忔棩鍑屾櫒 2 鐐硅嚜鍔ㄥ浠?
 BACKUP_DIR="/backups/ontodb"
 DATE=$(date +%Y%m%d)
 curl -X POST http://127.0.0.1:7912/api/backup \
@@ -739,15 +739,15 @@ curl -X POST http://127.0.0.1:7912/api/backup \
 
 ---
 
-## 10. 安全配置
+## 10. 瀹夊叏閰嶇疆
 
-### 10.1 API Key 认证
+### 10.1 API Key 璁よ瘉
 
 ```bash
-# 启动时启用认�?
+# 鍚姩鏃跺惎鐢ㄨ璇?
 ./ontodb-server --auth --api-key your-secret-key
 
-# 使用 API Key 访问
+# 浣跨敤 API Key 璁块棶
 curl -H "Authorization: Bearer your-secret-key" \
   http://127.0.0.1:7912/api/query \
   -d '{"query": "SELECT * FROM users"}'
@@ -756,14 +756,14 @@ curl -H "Authorization: Bearer your-secret-key" \
 ### 10.2 TLS/HTTPS
 
 ```bash
-# 使用证书启动
+# 浣跨敤璇佷功鍚姩
 ./ontodb-server --tls-cert cert.pem --tls-key key.pem
 
-# 自签名证书（开发环境）
+# 鑷鍚嶈瘉涔︼紙寮€鍙戠幆澧冿級
 ./ontodb-server --tls-cert self-signed.crt --tls-key self-signed.key
 ```
 
-### 10.3 IP 白名�?
+### 10.3 IP 鐧藉悕鍗?
 
 ```json
 // config/api_keys.json
@@ -779,40 +779,40 @@ curl -H "Authorization: Bearer your-secret-key" \
 }
 ```
 
-### 10.4 存储加密
+### 10.4 瀛樺偍鍔犲瘑
 
 ```bash
-# 使用环境变量存储主密�?
+# 浣跨敤鐜鍙橀噺瀛樺偍涓诲瘑閽?
 export ONTO_MASTER_KEY=$(openssl rand -hex 32)
 ./ontodb-server --encryption-enabled --master-key-source env:ONTO_MASTER_KEY
 
-# 使用 KMS
+# 浣跨敤 KMS
 ./ontodb-server --encryption-enabled \
   --master-key-source "kms|https://vault.example.com/v1/transit|ontodb-master|hvs.xxx"
 ```
 
-### 10.5 RBAC（企业版�?
+### 10.5 RBAC锛堜紒涓氱増锛?
 
 ```sql
--- 创建角色
+-- 鍒涘缓瑙掕壊
 CREATE ROLE SystemAdmin;
 CREATE ROLE SecurityAdmin;
 CREATE ROLE AuditAdmin;
 
--- 分配权限
+-- 鍒嗛厤鏉冮檺
 GRANT ALL ON * TO SystemAdmin;
 GRANT READ ON * TO SecurityAdmin;
 GRANT SELECT ON audit_logs TO AuditAdmin;
 
--- 分配用户角色
+-- 鍒嗛厤鐢ㄦ埛瑙掕壊
 GRANT SystemAdmin TO user 'admin';
 ```
 
 ---
 
-## 11. 性能调优
+## 11. 鎬ц兘璋冧紭
 
-### 11.1 配置参数
+### 11.1 閰嶇疆鍙傛暟
 
 ```toml
 # ontodb.toml
@@ -821,123 +821,123 @@ GRANT SystemAdmin TO user 'admin';
 dir = "/data/ontodb"
 
 [performance]
-# MemTable 大小（增大可减少 flush 频率�?
+# MemTable 澶у皬锛堝澶у彲鍑忓皯 flush 棰戠巼锛?
 memtable_size_mb = 128
 
-# Block Cache 大小（增大可提升读取性能�?
+# Block Cache 澶у皬锛堝澶у彲鎻愬崌璇诲彇鎬ц兘锛?
 block_cache_mb = 512
 
-# WAL fsync 策略
-sync_wal_on_commit = false  # 设为 true 可保证持久性，但降低性能
+# WAL fsync 绛栫暐
+sync_wal_on_commit = false  # 璁句负 true 鍙繚璇佹寔涔呮€э紝浣嗛檷浣庢€ц兘
 
-# 后台压缩线程�?
+# 鍚庡彴鍘嬬缉绾跨▼鏁?
 compaction_threads = 4
 
 [server]
-# 连接池大�?
+# 杩炴帴姹犲ぇ灏?
 max_connections = 1000
 
-# 请求超时
+# 璇锋眰瓒呮椂
 request_timeout_secs = 30
 ```
 
-### 11.2 基准测试
+### 11.2 鍩哄噯娴嬭瘯
 
 ```bash
-# 运行基准测试
+# 杩愯鍩哄噯娴嬭瘯
 cargo bench --bench lock_contention -p onto-storage
 cargo bench --bench batch_import -p onto-storage
 
-# 预期结果�?
-# 写入: 767,561 ops/s
-# 读取: 1,176,147 ops/s
-# 批量写入: 967,453 ops/s
+# 棰勬湡缁撴灉锛?
+# 鍐欏叆: 767,561 ops/s
+# 璇诲彇: 1,176,147 ops/s
+# 鎵归噺鍐欏叆: 967,453 ops/s
 ```
 
-### 11.3 监控指标
+### 11.3 鐩戞帶鎸囨爣
 
 ```bash
-# Prometheus 指标
+# Prometheus 鎸囨爣
 curl http://127.0.0.1:7912/metrics
 
-# JSON 指标
+# JSON 鎸囨爣
 curl http://127.0.0.1:7912/api/metrics
 
-# 关键指标�?
-# - ontodb_queries_total: 总查询数
-# - ontodb_query_latency: 查询延迟分布
-# - ontodb_cache_hits: 缓存命中�?
-# - ontodb_memtable_size_bytes: MemTable 大小
-# - ontodb_disk_usage_bytes: 磁盘使用�?
+# 鍏抽敭鎸囨爣锛?
+# - ontodb_queries_total: 鎬绘煡璇㈡暟
+# - ontodb_query_latency: 鏌ヨ寤惰繜鍒嗗竷
+# - ontodb_cache_hits: 缂撳瓨鍛戒腑鏁?
+# - ontodb_memtable_size_bytes: MemTable 澶у皬
+# - ontodb_disk_usage_bytes: 纾佺洏浣跨敤閲?
 ```
 
 ---
 
-## 12. 故障排查
+## 12. 鏁呴殰鎺掓煡
 
-### 12.1 常见问题
+### 12.1 甯歌闂
 
-| 问题 | 原因 | 解决方案 |
+| 闂 | 鍘熷洜 | 瑙ｅ喅鏂规 |
 |------|------|---------|
-| 连接被拒�?| 服务器未启动或端口错�?| 检�?`ps aux | grep ontodb` 和端�?|
-| 查询超时 | 查询太复杂或数据量太�?| 添加 LIMIT，优�?WHERE 条件 |
-| 内存不足 | MemTable �?Cache 太大 | 减小 `memtable_size_mb` �?`block_cache_mb` |
-| 磁盘�?| WAL �?SSTable 累积 | 清理旧数据或扩容磁盘 |
-| 认证失败 | API Key 错误 | 检�?`--api-key` 配置 |
+| 杩炴帴琚嫆缁?| 鏈嶅姟鍣ㄦ湭鍚姩鎴栫鍙ｉ敊璇?| 妫€鏌?`ps aux | grep ontodb` 鍜岀鍙?|
+| 鏌ヨ瓒呮椂 | 鏌ヨ澶鏉傛垨鏁版嵁閲忓お澶?| 娣诲姞 LIMIT锛屼紭鍖?WHERE 鏉′欢 |
+| 鍐呭瓨涓嶈冻 | MemTable 鎴?Cache 澶ぇ | 鍑忓皬 `memtable_size_mb` 鍜?`block_cache_mb` |
+| 纾佺洏婊?| WAL 鎴?SSTable 绱Н | 娓呯悊鏃ф暟鎹垨鎵╁纾佺洏 |
+| 璁よ瘉澶辫触 | API Key 閿欒 | 妫€鏌?`--api-key` 閰嶇疆 |
 
-### 12.2 日志查看
+### 12.2 鏃ュ織鏌ョ湅
 
 ```bash
-# 启用调试日志
+# 鍚敤璋冭瘯鏃ュ織
 RUST_LOG=debug ./ontodb-server --data-dir ./data
 
-# 查看特定模块日志
+# 鏌ョ湅鐗瑰畾妯″潡鏃ュ織
 RUST_LOG=onto_storage=debug,onto_query=info ./ontodb-server
 ```
 
-### 12.3 健康检�?
+### 12.3 鍋ュ悍妫€鏌?
 
 ```bash
-# 健康检�?
+# 鍋ュ悍妫€鏌?
 curl http://127.0.0.1:7912/api/health
 # {"status": "ok", "version": "0.3.0"}
 
-# 就绪检查（K8s�?
+# 灏辩华妫€鏌ワ紙K8s锛?
 curl http://127.0.0.1:7912/api/health/ready
 
-# 存活检查（K8s�?
+# 瀛樻椿妫€鏌ワ紙K8s锛?
 curl http://127.0.0.1:7912/api/health/live
 ```
 
 ---
 
-## 附录
+## 闄勫綍
 
-### A. 错误�?
+### A. 閿欒鐮?
 
-| 错误�?| 说明 | 处理建议 |
+| 閿欒鐮?| 璇存槑 | 澶勭悊寤鸿 |
 |--------|------|---------|
-| 400 | 请求格式错误 | 检�?JSON 格式 |
-| 401 | 认证失败 | 检�?API Key |
-| 429 | 速率限制 | 等待或禁用限�?|
-| 500 | 服务器内部错�?| 查看日志 |
+| 400 | 璇锋眰鏍煎紡閿欒 | 妫€鏌?JSON 鏍煎紡 |
+| 401 | 璁よ瘉澶辫触 | 妫€鏌?API Key |
+| 429 | 閫熺巼闄愬埗 | 绛夊緟鎴栫鐢ㄩ檺娴?|
+| 500 | 鏈嶅姟鍣ㄥ唴閮ㄩ敊璇?| 鏌ョ湅鏃ュ織 |
 
-### B. 端口说明
+### B. 绔彛璇存槑
 
-| 端口 | 协议 | 说明 |
+| 绔彛 | 鍗忚 | 璇存槑 |
 |------|------|------|
 | 7912 | HTTP | REST API |
 | 7913 | TCP | PostgreSQL Wire Protocol |
 | 7914 | TCP | MySQL Wire Protocol |
 
-### C. 数据类型
+### C. 鏁版嵁绫诲瀷
 
-| 类型 | 说明 | 示例 |
+| 绫诲瀷 | 璇存槑 | 绀轰緥 |
 |------|------|------|
-| STRING | 字符�?| `'hello'` |
-| INT | 64位整�?| `42` |
-| DOUBLE | 64位浮点数 | `3.14` |
-| BOOL | 布尔�?| `TRUE` / `FALSE` |
-| ARRAY | 数组 | `[1, 2, 3]` |
-| JSON | JSON 对象 | `{"key": "value"}` |
-| BLOB | 二进制数�?| `'\x010203'` |
+| STRING | 瀛楃涓?| `'hello'` |
+| INT | 64浣嶆暣鏁?| `42` |
+| DOUBLE | 64浣嶆诞鐐规暟 | `3.14` |
+| BOOL | 甯冨皵鍊?| `TRUE` / `FALSE` |
+| ARRAY | 鏁扮粍 | `[1, 2, 3]` |
+| JSON | JSON 瀵硅薄 | `{"key": "value"}` |
+| BLOB | 浜岃繘鍒舵暟鎹?| `'\x010203'` |
