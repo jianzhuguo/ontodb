@@ -1,0 +1,17 @@
+[package]
+name = "onto-edge-esp32"
+version = "0.1.0"
+edition = "2021"
+description = "OntoDB Edge for ESP32 - Ultra-lightweight IoT data collector"
+
+[dependencies]
+serde = { version = "1", features = ["derive"], default-features = false }
+serde_json = { version = "1", features = ["alloc"], default-features = false }
+heapless = "0.8"
+libm = "0.2"
+
+[features]
+default = ["sensor-temp", "sensor-gps", "http-client"]
+sensor-temp = []
+sensor-gps = []
+http-client = []

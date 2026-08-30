@@ -14,6 +14,7 @@ Thumbs.db
 
 # Data directory
 /data/
+/ontodb_data/
 /test_data/*.log
 /test_data/*.dat
 /test_data/wal.log
