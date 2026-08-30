@@ -115,4 +115,21 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Apache License 2.0 - See [LICENSE](LICENSE).
+OntoDB uses a dual licensing model:
+
+| Edition | License | Description |
+|---------|---------|-------------|
+| **Community** | AGPL-3.0 | Free to use, modifications must be open source |
+| **Enterprise** | Commercial | Production use, no open source requirement |
+
+**Community Edition (AGPL-3.0)**:
+- Free to use, modify, and distribute
+- If providing network services, modified code must be open source
+- See [LICENSE](LICENSE)
+
+**Enterprise Edition (Commercial)**:
+- Production environment use
+- No requirement to open source modifications
+- Includes technical support and SLA
+- See [LICENSE.COMMERCIAL](LICENSE.COMMERCIAL)
+- Contact: license@ontodb.ai

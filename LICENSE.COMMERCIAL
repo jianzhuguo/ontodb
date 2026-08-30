@@ -1,0 +1,103 @@
+# OntoDB Commercial License
+
+**Version 1.0 — Effective Date: [DATE]**
+
+This Commercial License Agreement ("Agreement") is entered into between:
+
+- **Licensor**: OntoDB Technology Co., Ltd. ("OntoDB")
+- **Licensee**: [Company Name] ("You")
+
+---
+
+## 1. Definitions
+
+- **Software**: OntoDB database system, including all source code, binaries, documentation, and related materials
+- **Enterprise Features**: OntoQL reasoning engine, OWL inference, Raft consensus, data sharding, encryption, RBAC, audit logging
+- **Production Use**: Any use of the Software in a live environment serving end users or business operations
+- **Authorized Users**: Employees and contractors of Licensee who are registered under this Agreement
+
+---
+
+## 2. Grant of License
+
+Subject to the terms of this Agreement, OntoDB grants Licensee a non-exclusive, non-transferable, perpetual license to:
+
+- Deploy and use the Software in Production Use
+- Modify the Software for internal use
+- Create derivative works for internal use only
+- Distribute the Software within Licensee's organization
+
+---
+
+## 3. Restrictions
+
+Licensee shall NOT:
+
+- Distribute the Software to third parties
+- Sublicense or resell the Software
+- Use the Software to provide database-as-a-service to third parties
+- Remove or alter any copyright notices or license terms
+- Reverse engineer the Software (except as permitted by law)
+
+---
+
+## 4. Enterprise Features
+
+Enterprise Features require a separate Enterprise License:
+
+| Tier | Features | Annual Fee |
+|------|----------|------------|
+| **Standard** | Clustering, Sharding, Basic Backup | ¥500,000/year |
+| **Professional** | + Encryption, RBAC, Audit | ¥1,000,000/year |
+| **Enterprise** | + Custom Development, Priority Support | ¥2,000,000/year |
+
+---
+
+## 5. Support and Maintenance
+
+- **Standard Support**: Email support, 48-hour response time
+- **Professional Support**: 24/7 phone support, 4-hour response time
+- **Enterprise Support**: Dedicated support engineer, 1-hour response time
+
+---
+
+## 6. Term and Termination
+
+- This Agreement is effective upon payment and remains in effect until terminated
+- Either party may terminate with 30 days written notice
+- Upon termination, Licensee must cease all use and destroy all copies
+
+---
+
+## 7. Warranty
+
+- OntoDB warrants that the Software will perform substantially as documented
+- This warranty is limited to 90 days from delivery
+- Licensee's sole remedy is repair or replacement of the Software
+
+---
+
+## 8. Limitation of Liability
+
+- OntoDB's total liability shall not exceed the fees paid by Licensee
+- OntoDB is not liable for indirect, incidental, or consequential damages
+
+---
+
+## 9. Governing Law
+
+This Agreement is governed by the laws of the People's Republic of China.
+
+---
+
+## 10. Contact
+
+For commercial licensing inquiries:
+
+- Email: license@ontodb.ai
+- Website: https://ontodb.ai
+- Address: [Company Address]
+
+---
+
+**To purchase a commercial license, contact license@ontodb.ai**

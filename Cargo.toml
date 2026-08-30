@@ -20,7 +20,7 @@ members = [
 [workspace.package]
 version = "0.6.2"
 edition = "2021"
-license = "Apache-2.0"
+license = "AGPL-3.0"
 authors = ["OntoDB Team"]
 repository = "https://github.com/ontodb/ontodb"
 description = "OntoDB - An ontology-driven semantic multi-modal database"
