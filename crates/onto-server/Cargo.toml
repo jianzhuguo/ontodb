@@ -12,9 +12,9 @@ path = "src/main.rs"
 [dependencies]
 onto-core = { workspace = true }
 onto-storage = { workspace = true }
-onto-ontology = { workspace = true }
 onto-query = { workspace = true }
 onto-graph = { workspace = true }
+onto-ontology = { workspace = true }
 onto-raft = { workspace = true }
 onto-enterprise = { workspace = true }
 onto-sharding = { workspace = true }
@@ -53,25 +53,17 @@ rand = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-default = []
+default = ["ontology", "enterprise", "raft", "sharding"]
 
-# === Enterprise Standard ===
-enterprise-standard = ["onto-enterprise/enterprise-standard"]
+# === Feature flags control RUNTIME behavior, not compilation ===
+# All code is compiled, but features are only activated when enabled.
+# Community edition ships with default features disabled.
 
-# === Enterprise Gov/Finance ===
-enterprise-gov = ["onto-enterprise/enterprise-gov"]
+ontology = []
+raft = []
+sharding = []
+enterprise = []
 
-# === Individual features (for fine-grained control) ===
-cluster = ["onto-enterprise/cluster"]
-sharding = ["onto-enterprise/sharding"]
-security = ["onto-enterprise/security"]
-encryption = ["onto-enterprise/encryption"]
-backup = ["onto-enterprise/backup"]
-observability = ["onto-enterprise/observability"]
-audit-retention = ["onto-enterprise/audit-retention"]
-crc-validation = ["onto-enterprise/crc-validation"]
-rolling-upgrade = ["onto-enterprise/rolling-upgrade"]
-
-# === CDC (Change Data Capture) ===
-cdc-kafka = []    # Enable Kafka CDC publisher (requires rdkafka)
-cdc-webhook = []  # Enable Webhook CDC publisher (requires reqwest)
+# === Enterprise Bundles ===
+enterprise-standard = ["enterprise"]
+enterprise-gov = ["enterprise"]

@@ -1,6 +1,6 @@
 # OntoDB Go SDK
 
-Go client library for [OntoDB](https://ontodb.io) â€” the ontology-driven semantic multi-modal database.
+Go client library for [OntoDB](https://ontodb.ai) â€?the ontology-driven semantic multi-modal database.
 
 ## Installation
 

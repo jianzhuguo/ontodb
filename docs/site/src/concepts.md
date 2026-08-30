@@ -44,3 +44,15 @@ The ontology reasoner is what makes OntoDB unique. It sits between the query lay
 - **Restriction validation**: OWL restrictions (cardinality, value constraints) are enforced on write
 
 See [Ontology Reasoning](./ontology.md) for details.
+
+## Living Data
+
+OntoDB treats data as alive — every entity has a value score that decays over time, like human memory. High-value data is prioritized, low-value data fades.
+
+See [Living Data](./living-data.md) for details.
+
+## Tiered Storage
+
+Data automatically moves between hot (memory), warm (SSD), and cold (HDD) tiers based on access patterns.
+
+See [Tiered Storage](./tiered-storage.md) for details.

@@ -1641,8 +1641,13 @@ impl OntoQLAst {
     /// This two-phase approach (OntoQL → SQL string → QueryAst) guarantees
     /// compatibility with the existing executor and optimizer.
     pub fn to_query_ast(&self) -> Result<QueryAst> {
-        let sql = self.to_sql()?;
-        parser::QueryParser::parse(&sql)
+        match self {
+            OntoQLAst::SqlPassthrough(ast) => Ok(ast.clone()),
+            _ => {
+                let sql = self.to_sql()?;
+                parser::QueryParser::parse(&sql)
+            }
+        }
     }
 
     /// Generate the equivalent SQL string for this OntoQL AST.

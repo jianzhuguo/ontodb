@@ -1,6 +1,6 @@
 # OntoDB Python SDK
 
-Python client library for [OntoDB](https://ontodb.io) — the ontology-driven semantic multi-modal database.
+Python client library for [OntoDB](https://ontodb.ai) �?the ontology-driven semantic multi-modal database.
 
 ## Installation
 
@@ -79,7 +79,7 @@ results = db.hybrid_search(
     table="documents",
     vector_column="embedding",
     vector=[0.1, 0.2, 0.3, ...],
-    sql_filter="category = '技术' AND year > 2020",
+    sql_filter="category = '技�? AND year > 2020",
     top_k=10,
 )
 ```

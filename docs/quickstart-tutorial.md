@@ -1,14 +1,10 @@
-# OntoDB 快速入门教程
-
-> 10 分钟学会 OntoDB 的核心功能
-
+# OntoDB 快速入门教�?
+> 10 分钟学会 OntoDB 的核心功�?
 ---
 
-## 第 1 步：启动服务器
-
+## �?1 步：启动服务�?
 ```bash
-# 下载并解压
-wget https://release.ontodb.io/ontodb-v0.3.0-linux-x86_64.tar.gz
+# 下载并解�?wget https://release.ontodb.ai/ontodb-v0.3.0-linux-x86_64.tar.gz
 tar xzf ontodb-v0.3.0-linux-x86_64.tar.gz
 cd ontodb-v0.3.0
 
@@ -16,20 +12,17 @@ cd ontodb-v0.3.0
 ./ontodb-server --data-dir ./data --http 127.0.0.1:7912 --no-rate-limit
 ```
 
-看到 `HTTP API server listening on 127.0.0.1:7912` 表示启动成功。
-
+看到 `HTTP API server listening on 127.0.0.1:7912` 表示启动成功�?
 ---
 
-## 第 2 步：创建表并插入数据
+## �?2 步：创建表并插入数据
 
 ```bash
-# 创建用户类（OntoQL 语法）
-curl -X POST http://127.0.0.1:7912/api/query \
+# 创建用户类（OntoQL 语法�?curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "CREATE CLASS users"}'
 
-# 插入数据（SET 语法）
-curl -X POST http://127.0.0.1:7912/api/query \
+# 插入数据（SET 语法�?curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "INSERT INTO users SET name = \"Alice\", age = 30, city = \"北京\""}'
 
@@ -44,11 +37,10 @@ curl -X POST http://127.0.0.1:7912/api/query \
 
 ---
 
-## 第 3 步：查询数据
+## �?3 步：查询数据
 
 ```bash
-# 查询所有用户
-curl -X POST http://127.0.0.1:7912/api/query \
+# 查询所有用�?curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "SELECT * FROM users"}'
 
@@ -65,11 +57,10 @@ curl -X POST http://127.0.0.1:7912/api/query \
 
 ---
 
-## 第 4 步：向量搜索
+## �?4 步：向量搜索
 
 ```bash
-# 创建文档类
-curl -X POST http://127.0.0.1:7912/api/query \
+# 创建文档�?curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "CREATE CLASS documents"}'
 
@@ -95,11 +86,9 @@ curl -X POST http://127.0.0.1:7912/api/vector/search \
 
 ---
 
-## 第 5 步：图查询
-
+## �?5 步：图查�?
 ```bash
-# 创建人物类
-curl -X POST http://127.0.0.1:7912/api/query \
+# 创建人物�?curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "CREATE CLASS Person"}'
 
@@ -125,7 +114,7 @@ curl -X POST http://127.0.0.1:7912/api/query \
   -H "Content-Type: application/json" \
   -d '{"query": "INSERT INTO knows (from_id, to_id) VALUES (\"Person::2\", \"Person::3\")"}'
 
-# 图遍历（从 Alice 出发，2 跳）
+# 图遍历（�?Alice 出发�? 跳）
 curl -X POST http://127.0.0.1:7912/api/graph/traverse \
   -H "Content-Type: application/json" \
   -d '{
@@ -137,7 +126,7 @@ curl -X POST http://127.0.0.1:7912/api/graph/traverse \
 
 ---
 
-## 第 6 步：使用 Python SDK
+## �?6 步：使用 Python SDK
 
 ```bash
 pip install ontodb
@@ -152,12 +141,12 @@ db = OntoDB("http://localhost:7912")
 # 查询
 rows = db.query("SELECT * FROM users")
 for row in rows:
-    print(f"{row['name']}: {row['age']}岁, {row['city']}")
+    print(f"{row['name']}: {row['age']}�? {row['city']}")
 
 # 向量搜索
 results = db.vector_search("documents", "embedding", [0.15, 0.25, 0.35, 0.45, 0.55], top_k=2)
 for r in results:
-    print(f"{r['title']} (相似度: {r.get('_score', 'N/A')})")
+    print(f"{r['title']} (相似�? {r.get('_score', 'N/A')})")
 
 # 批量插入
 db.insert_many("users", [
@@ -168,11 +157,10 @@ db.insert_many("users", [
 
 ---
 
-## 第 7 步：查看监控
+## �?7 步：查看监控
 
 ```bash
-# 健康检查
-curl http://127.0.0.1:7912/api/health
+# 健康检�?curl http://127.0.0.1:7912/api/health
 
 # 获取指标
 curl http://127.0.0.1:7912/api/metrics
@@ -180,37 +168,34 @@ curl http://127.0.0.1:7912/api/metrics
 # Prometheus 格式指标
 curl http://127.0.0.1:7912/metrics
 
-# 打开 Web 控制台
-# 浏览器访问 http://127.0.0.1:7912/console
+# 打开 Web 控制�?# 浏览器访�?http://127.0.0.1:7912/console
 ```
 
 ---
 
-## 下一步
-
+## 下一�?
 - 阅读 [用户手册](user-manual.md) 了解更多功能
-- 查看 [API 文档](http://127.0.0.1:7912/api/docs) 了解所有接口
-- 探索 [数字军师](/digital-advisor) 决策智能系统
+- 查看 [API 文档](http://127.0.0.1:7912/api/docs) 了解所有接�?- 探索 [数字军师](/digital-advisor) 决策智能系统
 - 探索 [数字孪生](/digital-twin) 监控大屏
 
 ---
 
 ## 常见问题
 
-**Q: 如何修改端口？**
+**Q: 如何修改端口�?*
 ```bash
 ./ontodb-server --http 0.0.0.0:8080
 ```
 
-**Q: 如何启用认证？**
+**Q: 如何启用认证�?*
 ```bash
 ./ontodb-server --auth --api-key my-secret-key
 ```
 
 **Q: 数据存储在哪里？**
-默认在 `--data-dir` 指定的目录，通常是 `./data/`
+默认�?`--data-dir` 指定的目录，通常�?`./data/`
 
-**Q: 如何备份？**
+**Q: 如何备份�?*
 ```bash
 curl -X POST http://127.0.0.1:7912/api/backup \
   -H "Content-Type: application/json" \
@@ -218,7 +203,6 @@ curl -X POST http://127.0.0.1:7912/api/backup \
 ```
 
 **Q: 支持哪些客户端？**
-- HTTP REST API（任何语言）
-- PostgreSQL 客户端（psql、pgAdmin 等）
+- HTTP REST API（任何语言�?- PostgreSQL 客户端（psql、pgAdmin 等）
 - MySQL 客户端（mysql、MySQL Workbench 等）
 - Python SDK、JavaScript SDK、Go SDK、Java SDK

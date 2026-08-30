@@ -12,6 +12,9 @@ members = [
     "crates/onto-graph",
     "crates/onto-enterprise",
     "crates/onto-plugin",
+    "crates/onto-edge",
+    "crates/onto-edge-bin",
+    "crates/onto-edge-esp32",
 ]
 
 [workspace.package]
@@ -66,6 +69,9 @@ zstd = "0.13"
 
 # Random
 rand = "0.8"
+
+# Time
+chrono = "0.4"
 
 [profile.release]
 opt-level = 3

@@ -1,6 +1,6 @@
 # OntoDB JavaScript/TypeScript SDK
 
-JavaScript/TypeScript client for [OntoDB](https://ontodb.io) — the ontology-driven semantic multi-modal database.
+JavaScript/TypeScript client for [OntoDB](https://ontodb.ai) �?the ontology-driven semantic multi-modal database.
 
 Works in **Node.js** (16+) and **modern browsers**.
 
@@ -74,7 +74,7 @@ const users = await db.query<User>('SELECT * FROM users');
 // Search similar vectors
 const results = await db.vectorSearch('documents', 'embedding', [0.1, 0.2, 0.3, ...], {
   topK: 5,
-  filter: "category = '技术'",
+  filter: "category = '技�?",
 });
 
 for (const r of results) {
@@ -89,7 +89,7 @@ const results = await db.hybridSearch(
   'documents',
   'embedding',
   [0.1, 0.2, 0.3, ...],
-  "category = '技术' AND year > 2020",
+  "category = '技�? AND year > 2020",
   10,
 );
 ```

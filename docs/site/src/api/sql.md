@@ -237,3 +237,157 @@ RESTORE FROM '/backups/2026-08-08'
 -- Flush MemTable to disk
 FLUSH
 ```
+
+## Materialized Views
+
+Pre-computed query results that refresh automatically.
+
+```sql
+-- Create materialized view
+CREATE MATERIALIZED VIEW product_stats AS
+  SELECT category, COUNT(*) as cnt, AVG(price) as avg_price
+  FROM Product
+  GROUP BY category
+
+-- Refresh materialized view
+REFRESH MATERIALIZED VIEW product_stats
+
+-- Query materialized view (same as regular table)
+SELECT * FROM product_stats WHERE cnt > 10
+
+-- Drop materialized view
+DROP MATERIALIZED VIEW product_stats
+```
+
+## System Views
+
+Built-in virtual views for introspection.
+
+```sql
+-- List all ontologies
+SELECT * FROM system.ontologies
+
+-- List all classes
+SELECT * FROM system.classes
+
+-- List all indexes
+SELECT * FROM system.indexes
+
+-- List all vector indexes
+SELECT * FROM system.vector_indexes
+
+-- Show storage statistics
+SELECT * FROM system.storage_stats
+```
+
+## OntoQL Extensions
+
+OntoQL extends SQL with semantic capabilities.
+
+### CREATE ONTOLOGY
+
+Define an ontology with classes and properties:
+
+```sql
+CREATE ONTOLOGY ECommerce (
+  CLASS Product,
+  PROPERTY name DOMAIN Product RANGE STRING,
+  PROPERTY price DOMAIN Product RANGE FLOAT64,
+  PROPERTY category DOMAIN Product RANGE STRING,
+
+  CLASS Order,
+  PROPERTY order_id DOMAIN Order RANGE STRING,
+  PROPERTY total DOMAIN Order RANGE FLOAT64,
+
+  UNIQUE Product(name)
+)
+```
+
+### Class Inheritance
+
+```sql
+CREATE ONTOLOGY Vehicles (
+  CLASS Vehicle,
+  PROPERTY brand DOMAIN Vehicle RANGE STRING,
+
+  CLASS Car EXTENDS Vehicle,
+  PROPERTY doors DOMAIN Car RANGE INT64,
+
+  CLASS Truck EXTENDS Vehicle,
+  PROPERTY payload DOMAIN Truck RANGE FLOAT64
+)
+```
+
+Querying `Vehicle` automatically returns `Car` and `Truck` instances.
+
+### GRAPH MATCH
+
+```sql
+-- Pattern matching on property graph
+GRAPH MATCH (a:Person) -[knows]-> (b:Person)
+  WHERE a.name = "Alice"
+  RETURN b.name, b.age
+
+-- Multi-hop
+GRAPH MATCH (a:Person) -[knows*1..3]-> (b:Person)
+  RETURN b.name
+```
+
+### GRAPH TRAVERSE
+
+```sql
+-- BFS traversal
+GRAPH TRAVERSE FROM 'Person::1' OUT LABEL 'knows' DEPTH 3
+
+-- With filter
+GRAPH TRAVERSE FROM 'Person::1' OUT LABEL 'knows' DEPTH 3 WHERE age > 25
+```
+
+### GRAPH SHORTEST PATH
+
+```sql
+GRAPH SHORTEST PATH FROM 'Person::1' TO 'Person::5'
+GRAPH SHORTEST PATH FROM 'Person::1' TO 'Person::5' LABEL 'knows'
+```
+
+### EXPLAIN REASONING
+
+Explain ontology inference:
+
+```sql
+EXPLAIN REASONING SELECT * FROM Vehicle
+-- Shows: Car instances included via Cax-sco (subclass propagation)
+```
+
+### VECTOR INSERT
+
+Insert vector data separately:
+
+```sql
+VECTOR INSERT ON Product ("prod_1") embedding [0.1, 0.2, 0.3, ...]
+```
+
+### UNIQUE Constraints
+
+```sql
+CREATE ONTOLOGY Users (
+  CLASS User,
+  PROPERTY email DOMAIN User RANGE STRING,
+  UNIQUE User(email)
+)
+```
+
+Duplicate inserts are rejected with an error.
+
+### Property Modifiers
+
+```sql
+CREATE ONTOLOGY Schema (
+  CLASS Person,
+  PROPERTY name DOMAIN Person RANGE STRING REQUIRED,
+  PROPERTY tags DOMAIN Person RANGE STRING MULTI_VALUED
+)
+```
+
+- `REQUIRED` — property must have a value
+- `MULTI_VALUED` — property can have multiple values
