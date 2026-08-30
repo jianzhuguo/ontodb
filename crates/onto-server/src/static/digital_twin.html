@@ -640,7 +640,7 @@ function build(d){
     nodes.push({id:'d_'+dd.code,label:dd.name,type:'dept',x:pn.x+Math.cos(angle)*r,y:pn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:9,info:{code:dd.code,head:dd.head,budget:(dd.budget/10000).toFixed(0)+'万',level:3}});
     edges.push({from:'d_'+dd.parent,to:'d_'+dd.code,type:'contains'});}
   var de={};d.emps.forEach(function(e){if(!de[e.department])de[e.department]=[];de[e.department].push(e);});
-  for(var dept in de){var dn=findN('d_'+dept);if(!dn)continue;var es=de[dept];
+  for(var dept in de){var dn=findN('d_'+dept);if(!dn)continue;var es=de[dept];es.sort(function(a,b){return (a.emp_id||'').localeCompare(b.emp_id||'');});
     for(var j=0;j<Math.min(es.length,5);j++){var e=es[j],angle=2*Math.PI*j/es.length+Math.random()*.3,r=40+Math.random()*15;
       nodes.push({id:'e_'+e.emp_id,label:e.name,type:'emp',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:7,info:{emp_id:e.emp_id,dept:e.department,title:e.title,salary:(e.salary/1000).toFixed(0)+'K',email:e.email}});
       edges.push({from:'d_'+dept,to:'e_'+e.emp_id,type:'belongs'});}}
@@ -823,6 +823,7 @@ async function autoExpand(){
     expandedNodes[dept.id]=true;
     // Add employees for this dept
     var emps=allData.emps.filter(function(e){return e.department===dept.info.code;});
+    emps.sort(function(a,b){return (a.emp_id||'').localeCompare(b.emp_id||'');});
     for(var j=0;j<Math.min(emps.length,3);j++){
       var e=emps[j];var eid='e_'+e.emp_id;
       if(findN(eid))continue;
@@ -833,6 +834,7 @@ async function autoExpand(){
     }
     // Add projects for this dept
     var projs=allData.projs.filter(function(p){return p.department===dept.info.code;});
+    projs.sort(function(a,b){return (a.code||'').localeCompare(b.code||'');});
     for(var j=0;j<Math.min(projs.length,2);j++){
       var p=projs[j];var pid='p_'+p.code;
       if(findN(pid))continue;
@@ -847,6 +849,7 @@ async function autoExpand(){
   for(var i=0;i<srvs.length;i++){
     var srv=srvs[i];
     var alerts=allData.alerts.filter(function(a){return a.source===srv.info.node_id;});
+    alerts.sort(function(a,b){return (a.time||'').localeCompare(b.time||'');});
     for(var j=0;j<Math.min(alerts.length,2);j++){
       var a=alerts[j];var aid='a_'+allData.alerts.indexOf(a);
       if(findN(aid))continue;
