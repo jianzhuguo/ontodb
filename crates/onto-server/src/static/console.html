@@ -82,6 +82,7 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
   <div class="cnt">
     <div class="tabs">
       <div class="tab a" data-tab="query">Query</div>
+      <div class="tab" data-tab="data">Data</div>
       <div class="tab" data-tab="metrics">Metrics</div>
       <div class="tab" data-tab="graph">Graph</div>
       <div class="tab" data-tab="history">History</div>
@@ -106,6 +107,19 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
       </div>
       <div class="res" id="res">
         <div class="msg">Enter a query and press Run or Ctrl+Enter<br><span style="font-size:12px;color:var(--dim);margin-top:8px;display:inline-block">Supports <b>OntoQL</b> (CREATE CLASS, INSERT SET, SELECT, EXPLAIN) and SQL</span></div>
+      </div>
+    </div>
+    <div id="tab-data" style="display:none;flex:1;overflow:auto">
+      <div style="padding:16px">
+        <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+          <select id="dataClass" style="padding:6px 10px;background:var(--bg);border:1px solid var(--bd);color:var(--tx);border-radius:4px;font-size:13px;min-width:200px">
+            <option value="">-- Select Class --</option>
+          </select>
+          <button onclick="loadClassData()" style="padding:6px 14px;background:var(--ac);color:#1a1b26;border:none;border-radius:4px;cursor:pointer;font-size:13px">Load Data</button>
+          <button onclick="insertRow()" style="padding:6px 14px;background:var(--gn);color:#1a1b26;border:none;border-radius:4px;cursor:pointer;font-size:13px">+ Insert</button>
+          <span id="dataInfo" style="margin-left:auto;font-size:12px;color:var(--dim)"></span>
+        </div>
+        <div id="dataTable" style="overflow:auto;max-height:calc(100vh - 200px)"></div>
       </div>
     </div>
     <div id="tab-metrics" style="display:none;flex:1;overflow:auto"><div class="mg" id="mg"></div></div>
@@ -133,11 +147,12 @@ try{H=JSON.parse(localStorage.getItem('ontodb_h')||'[]')}catch(e){}
 document.querySelectorAll('.tab').forEach(function(t){
   t.onclick=function(){
     document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('a')});
-    ['query','metrics','graph','history'].forEach(function(x){document.getElementById('tab-'+x).style.display='none'});
+    ['query','data','metrics','graph','history'].forEach(function(x){document.getElementById('tab-'+x).style.display='none'});
     t.classList.add('a');
     document.getElementById('tab-'+t.dataset.tab).style.display=t.dataset.tab==='query'?'flex':'block';
     if(t.dataset.tab==='metrics')lm();
     if(t.dataset.tab==='history')lh();
+    if(t.dataset.tab==='data')loadClassList();
   };
 });
 
@@ -370,6 +385,70 @@ function eh(s){var d=document.createElement('div');d.textContent=s;return d.inne
 
 // Ctrl+Enter
 E.addEventListener('keydown',function(e){if((e.ctrlKey||e.metaKey)&&e.key==='Enter'){e.preventDefault();run();}});
+
+// ── Data Management ──
+function loadClassList(){
+  api('GET','/api/schema').then(function(d){
+    var sel=document.getElementById('dataClass');
+    sel.innerHTML='<option value="">-- Select Class --</option>';
+    if(d.data&&d.data.ontologies){
+      d.data.ontologies.forEach(function(o){
+        Object.keys(o.classes||{}).forEach(function(c){
+          var opt=document.createElement('option');
+          opt.value=c;opt.textContent=o.name+'/'+c;
+          sel.appendChild(opt);
+        });
+      });
+    }
+  });
+}
+
+function loadClassData(){
+  var cls=document.getElementById('dataClass').value;
+  if(!cls)return;
+  api('POST','/api/query',{query:'SELECT * FROM '+cls+' LIMIT 100'}).then(function(d){
+    var tbl=document.getElementById('dataTable');
+    var info=document.getElementById('dataInfo');
+    if(!d.success||!d.data||!d.data.length){tbl.innerHTML='<div style="color:var(--dim);padding:20px">No data</div>';info.textContent='0 rows';return;}
+    var rows=d.data;var cols=Object.keys(rows[0]).filter(function(k){return !k.startsWith('__')});
+    info.textContent=rows.length+' rows';
+    var h='<table style="width:100%;border-collapse:collapse;font-size:12px">';
+    h+='<thead><tr style="background:var(--bg-s)">';
+    cols.forEach(function(c){h+='<th style="padding:6px 8px;text-align:left;border-bottom:1px solid var(--bd);color:var(--ac)">'+c+'</th>'});
+    h+='<th style="padding:6px 8px;text-align:left;border-bottom:1px solid var(--bd);color:var(--ac)">Actions</th></tr></thead><tbody>';
+    rows.forEach(function(r,i){
+      h+='<tr style="border-bottom:1px solid var(--bd)">';
+      cols.forEach(function(c){h+='<td style="padding:4px 8px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+(r[c]||'')+'">'+(r[c]||'')+'</td>'});
+      h+='<td style="padding:4px 8px"><button onclick="deleteRow(\''+cls+'\',\''+(r.__pk__||'')+'\')" style="padding:2px 8px;background:var(--rd);color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px">Delete</button></td>';
+      h+='</tr>';
+    });
+    h+='</tbody></table>';
+    tbl.innerHTML=h;
+  });
+}
+
+function insertRow(){
+  var cls=document.getElementById('dataClass').value;
+  if(!cls){alert('Select a class first');return;}
+  var json=prompt('Enter JSON data (e.g. {"name":"Alice","age":30}):');
+  if(!json)return;
+  try{
+    var data=JSON.parse(json);
+    var sets=Object.entries(data).map(function(e){return e[0]+" = '"+e[1]+"'"});
+    var sql='INSERT INTO '+cls+' SET '+sets.join(', ');
+    api('POST','/api/query',{query:sql}).then(function(d){
+      if(d.success){loadClassData();}else{alert('Error: '+(d.error||'unknown'));}
+    });
+  }catch(e){alert('Invalid JSON');}
+}
+
+function deleteRow(cls,pk){
+  if(!pk||!confirm('Delete this row?'))return;
+  var sql='DELETE FROM '+cls+' WHERE __pk__ = \''+pk+'\'';
+  api('POST','/api/query',{query:sql}).then(function(d){
+    if(d.success){loadClassData();}else{alert('Error: '+(d.error||'unknown'));}
+  });
+}
 
 // Init
 ck();loadSchema();setInterval(ck,30000);
