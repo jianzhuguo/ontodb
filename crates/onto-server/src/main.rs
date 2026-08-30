@@ -230,19 +230,11 @@ fn main() -> Result<()> {
         std::process::exit(if result.score >= 80 { 0 } else { 1 });
     }
 
-    #[cfg(feature = "enterprise")]
     let tier = onto_enterprise::current_tier();
-    #[cfg(not(feature = "enterprise"))]
-    let tier_str = "Community";
-    #[cfg(feature = "enterprise")]
     let features = onto_enterprise::enabled_features();
-    #[cfg(not(feature = "enterprise"))]
-    let features: Vec<&str> = vec![];
 
     // Initialize enterprise features first (before args are moved)
-    #[cfg(feature = "enterprise")]
     let enterprise_config = build_enterprise_config(&args, tier);
-    #[cfg(feature = "enterprise")]
     let _enterprise_features = onto_enterprise::EnterpriseFeatures::init(&enterprise_config)
         .map_err(|e| onto_core::CoreError::Custom(format!("Enterprise features init failed: {}", e)))?;
 
@@ -253,10 +245,7 @@ fn main() -> Result<()> {
     };
 
     println!("OntoDB v{}", env!("CARGO_PKG_VERSION"));
-    #[cfg(feature = "enterprise")]
     println!("Edition: {:?}", tier);
-    #[cfg(not(feature = "enterprise"))]
-    println!("Edition: Community");
     if !features.is_empty() {
         println!("Enterprise features: {}", features.join(", "));
     }
