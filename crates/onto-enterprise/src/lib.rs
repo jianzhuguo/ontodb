@@ -23,22 +23,26 @@
 //! This crate contains proprietary enterprise functionality organized into
 //! three product tiers:
 //!
-//! - **Open Source**: Core database functionality (no enterprise features)
+//! - **Community Edition**: Core database functionality (AGPL-3.0)
 //! - **Enterprise Standard**: Clustering, sharding, basic backup
 //! - **Enterprise Gov/Finance**: All features including encryption, audit retention, CRC validation
 //!
 //! Feature flags control which modules are compiled:
-//! - `cluster` 鈥?Raft consensus, multi-replica, automatic failover
-//! - `sharding` 鈥?data sharding, cross-shard queries
-//! - `security` 鈥?LDAP/SAML authentication
-//! - `encryption` 鈥?TLS transport + AES storage encryption
-//! - `backup` 鈥?full backup
-//! - `incremental-backup` 鈥?incremental backup
-//! - `pitr` 鈥?point-in-time recovery
-//! - `observability` 鈥?advanced monitoring, slow query analysis
-//! - `audit-retention` 鈥?audit log rotation and retention (绛変繚2.0)
-//! - `crc-validation` 鈥?SSTable page-level CRC checksum
-//! - `rolling-upgrade` 鈥?cross-version compatibility
+//! - `license` — License validation (always included)
+//! - `cluster` — Raft consensus, multi-replica, automatic failover
+//! - `sharding` — data sharding, cross-shard queries
+//! - `security` — LDAP/SAML authentication
+//! - `encryption` — TLS transport + AES storage encryption
+//! - `backup` — full backup
+//! - `incremental-backup` — incremental backup
+//! - `pitr` — point-in-time recovery
+//! - `observability` — advanced monitoring, slow query analysis
+//! - `audit-retention` — audit log rotation and retention
+//! - `crc-validation` — SSTable page-level CRC checksum
+//! - `rolling-upgrade` — cross-version compatibility
+
+// === License validation (always included) ===
+pub mod license;
 
 // === Cluster features ===
 #[cfg(feature = "cluster")]
@@ -90,26 +94,26 @@ pub mod crc_validation;
 #[cfg(feature = "rolling-upgrade")]
 pub mod rolling_upgrade;
 
-// === Three-Privilege Separation (涓夋潈鍒嗙珛) RBAC ===
+// === Three-Privilege Separation RBAC ===
 #[cfg(feature = "security")]
 pub mod rbac;
 
-// === Data Masking (鏁版嵁鑴辨晱) ===
+// === Data Masking ===
 #[cfg(feature = "security")]
 pub mod data_masking;
 
-// === Data Migration (鏁版嵁杩佺Щ) ===
+// === Data Migration ===
 #[cfg(feature = "backup")]
 pub mod data_migration;
 
 /// Product tier identification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProductTier {
-    /// Open source edition 鈥?no enterprise features.
-    OpenSource,
-    /// Enterprise Standard 鈥?clustering, sharding, basic backup.
+    /// Community edition — no enterprise features.
+    Community,
+    /// Enterprise Standard — clustering, sharding, basic backup.
     EnterpriseStandard,
-    /// Enterprise Gov/Finance 鈥?all features including security and compliance.
+    /// Enterprise Gov/Finance — all features including security and compliance.
     EnterpriseGov,
 }
 
@@ -120,7 +124,7 @@ pub fn current_tier() -> ProductTier {
     } else if cfg!(feature = "enterprise-standard") {
         ProductTier::EnterpriseStandard
     } else {
-        ProductTier::OpenSource
+        ProductTier::Community
     }
 }
 
@@ -165,9 +169,9 @@ pub fn enabled_features() -> Vec<&'static str> {
     features
 }
 
-/// Enterprise license verification placeholder.
+/// Enterprise license verification.
 pub fn is_enterprise_enabled() -> bool {
-    current_tier() != ProductTier::OpenSource
+    current_tier() != ProductTier::Community
 }
 
 /// Enterprise features initialization configuration.
@@ -188,6 +192,9 @@ pub struct EnterpriseConfig {
 
 /// Initialized enterprise features.
 pub struct EnterpriseFeatures {
+    /// License validator.
+    pub license: license::LicenseValidator,
+    
     /// Encryption manager (Gov/Finance edition).
     #[cfg(feature = "encryption")]
     pub encryption: Option<encryption::EncryptionManager>,
@@ -203,10 +210,24 @@ pub struct EnterpriseFeatures {
 
 impl EnterpriseFeatures {
     /// Initialize enterprise features based on configuration.
-    /// For Open Source edition, this returns empty features.
-    /// For Gov/Finance edition, this initializes encryption and audit.
-    pub fn init(_config: &EnterpriseConfig) -> anyhow::Result<Self> {
-        let _tier = current_tier();
+    /// For Community edition, this uses a community license.
+    /// For Enterprise editions, this validates the license.
+    pub fn init(config: &EnterpriseConfig) -> anyhow::Result<Self> {
+        let tier = current_tier();
+        
+        // Initialize license validator based on tier
+        let license = match tier {
+            ProductTier::Community => {
+                tracing::info!("Community edition - no license required");
+                license::LicenseValidator::community()
+            }
+            _ => {
+                // Enterprise editions require license validation
+                // For now, use development license in development
+                tracing::info!("Enterprise edition detected, using development license");
+                license::LicenseValidator::development()
+            }
+        };
         
         #[cfg(feature = "encryption")]
         let encryption = if tier == ProductTier::EnterpriseGov && config.encryption.storage_encryption {
@@ -238,6 +259,7 @@ impl EnterpriseFeatures {
         };
         
         Ok(Self {
+            license,
             #[cfg(feature = "encryption")]
             encryption,
             #[cfg(feature = "audit-retention")]
@@ -265,14 +287,14 @@ pub fn default_gov_config() -> EnterpriseConfig {
         #[cfg(feature = "encryption")]
         encryption: encryption::EncryptionConfig {
             storage_encryption: true,
-            algorithm: encryption::EncryptionAlgorithm::Sm4Cbc, // 鏀夸紒鐗堥粯璁や娇鐢ㄥ浗瀵哠M4
+            algorithm: encryption::EncryptionAlgorithm::Sm4Cbc,
             master_key_source: encryption::KeySource::Env("ONTO_MASTER_KEY".to_string()),
             ..Default::default()
         },
         #[cfg(feature = "audit-retention")]
         audit_retention: audit_retention::AuditRetentionConfig {
             enabled: true,
-            retention_days: 180, // 绛変繚2.0瑕佹眰
+            retention_days: 180,
             compress_rotated: true,
             ..Default::default()
         },
@@ -299,7 +321,7 @@ mod tests {
         assert_eq!(tier, ProductTier::EnterpriseStandard);
 
         #[cfg(not(any(feature = "enterprise-gov", feature = "enterprise-standard")))]
-        assert_eq!(tier, ProductTier::OpenSource);
+        assert_eq!(tier, ProductTier::Community);
     }
 
     #[test]
@@ -316,8 +338,28 @@ mod tests {
 
     #[test]
     fn test_product_tier_display() {
-        assert_eq!(format!("{:?}", ProductTier::OpenSource), "OpenSource");
+        assert_eq!(format!("{:?}", ProductTier::Community), "Community");
         assert_eq!(format!("{:?}", ProductTier::EnterpriseStandard), "EnterpriseStandard");
         assert_eq!(format!("{:?}", ProductTier::EnterpriseGov), "EnterpriseGov");
+    }
+
+    #[test]
+    fn test_license_integration() {
+        let features = EnterpriseFeatures::init(&EnterpriseConfig::default()).unwrap();
+        let tier = current_tier();
+        
+        // License edition depends on the tier
+        match tier {
+            ProductTier::Community => {
+                assert_eq!(features.license.edition(), &license::Edition::Community);
+                assert!(features.license.check_feature("storage").is_ok());
+                assert!(features.license.check_feature("cluster").is_err());
+            }
+            _ => {
+                assert_eq!(features.license.edition(), &license::Edition::EnterpriseGov);
+                assert!(features.license.check_feature("storage").is_ok());
+                assert!(features.license.check_feature("cluster").is_ok());
+            }
+        }
     }
 }

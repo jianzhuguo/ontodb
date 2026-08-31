@@ -43,7 +43,10 @@ sha2 = { version = "0.10", optional = true }
 tempfile = { workspace = true }
 
 [features]
-default = []
+default = ["license"]
+
+# === License validation ===
+license = []
 
 # === Base enterprise features ===
 cluster = []

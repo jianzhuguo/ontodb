@@ -235,8 +235,18 @@ fn main() -> Result<()> {
 
     // Initialize enterprise features first (before args are moved)
     let enterprise_config = build_enterprise_config(&args, tier);
-    let _enterprise_features = onto_enterprise::EnterpriseFeatures::init(&enterprise_config)
+    let enterprise_features = onto_enterprise::EnterpriseFeatures::init(&enterprise_config)
         .map_err(|e| onto_core::CoreError::Custom(format!("Enterprise features init failed: {}", e)))?;
+
+    // Validate license for enterprise features
+    if tier != onto_enterprise::ProductTier::Community {
+        let license = enterprise_features.license.license();
+        if !license.is_valid() {
+            return Err(onto_core::CoreError::Custom("Enterprise license has expired. Please contact support.".to_string()));
+        }
+        println!("License: {} edition", license.edition);
+        println!("Features: {}", license.features.join(", "));
+    }
 
     let options = StorageOptions {
         data_dir: args.data_dir,
@@ -253,12 +263,12 @@ fn main() -> Result<()> {
 
     // Log enterprise feature status
     #[cfg(feature = "encryption")]
-    if _enterprise_features.encryption.is_some() {
+    if enterprise_features.encryption.is_some() {
         println!("Storage encryption: ENABLED (AES-256-GCM)");
     }
 
     #[cfg(feature = "audit-retention")]
-    if let Some(ref audit) = _enterprise_features.audit_retention {
+    if let Some(ref audit) = enterprise_features.audit_retention {
         let status = audit.status();
         println!("Audit retention: ENABLED ({} days)", status.retention_days);
     }
