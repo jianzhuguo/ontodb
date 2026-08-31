@@ -8,10 +8,34 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+/// A namespace for organizing ontologies and isolating multi-project data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Namespace {
+    pub name: String,
+    pub created_at: u64,
+    pub metadata: HashMap<String, String>,
+}
+
+impl Namespace {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            metadata: HashMap::new(),
+        }
+    }
+}
+
 /// A named ontology containing classes and properties.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ontology {
     pub name: String,
+    /// Optional namespace this ontology belongs to.
+    #[serde(default)]
+    pub namespace: Option<String>,
     pub classes: HashMap<String, Class>,
     pub properties: HashMap<String, Property>,
     /// Reverse index: parent class → direct children. Rebuilt by `rebuild_indexes()`.
@@ -202,11 +226,18 @@ impl Ontology {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            namespace: None,
             classes: HashMap::new(),
             properties: HashMap::new(),
             children_of: HashMap::new(),
             equiv_of: HashMap::new(),
         }
+    }
+
+    /// Creates a new ontology within a specific namespace.
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.namespace = Some(namespace.into());
+        self
     }
 
     /// Adds a class to the ontology and updates reverse indexes.
@@ -524,7 +555,7 @@ impl Ontology {
     /// Uses DFS with gray/black marking:
     /// - Gray = currently on the recursion stack (ancestor)
     /// - Black = fully explored
-    fn validate_no_cycles(&self) -> Vec<String> {
+    pub fn validate_no_cycles(&self) -> Vec<String> {
         let mut errors = Vec::new();
         let mut white: HashSet<String> = self.classes.keys().cloned().collect();
         let mut gray: HashSet<String> = HashSet::new();

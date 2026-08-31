@@ -303,8 +303,9 @@ pub fn compress_block(data: &[u8]) -> Vec<u8> {
 }
 
 /// Decompress a block using zstd.
-pub fn decompress_block(data: &[u8]) -> Option<Vec<u8>> {
-    zstd::decode_all(data).ok()
+pub fn decompress_block(data: &[u8]) -> onto_core::Result<Vec<u8>> {
+    zstd::decode_all(data)
+        .map_err(|e| onto_core::CoreError::corruption(format!("zstd decompression failed: {}", e)))
 }
 
 // ── TSM Writer ──
@@ -490,10 +491,10 @@ impl TsmReader {
             pos += val_size;
 
             // Decompress and decode
-            let ts_data = decompress_block(ts_compressed)?;
+            let ts_data = decompress_block(ts_compressed).ok()?;
             let timestamps = decode_timestamps(&ts_data, count)?;
 
-            let val_data = decompress_block(val_compressed)?;
+            let val_data = decompress_block(val_compressed).ok()?;
             // For now, assume float values
             let floats = decode_floats(&val_data, count)?;
             let values: Vec<TsValue> = floats.into_iter().map(TsValue::Float).collect();

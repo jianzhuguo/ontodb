@@ -32,6 +32,9 @@ pub enum CoreError {
     #[error("ontology inconsistent: {0}")]
     OntologyInconsistent(String),
 
+    #[error("transaction conflict: {0}")]
+    TransactionConflict(String),
+
     #[error("{0}")]
     Custom(String),
 }

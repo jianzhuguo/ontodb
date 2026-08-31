@@ -289,7 +289,9 @@ impl CompactionWorker {
                 .collect()
         };
 
-        // Step 3: Collect all entries (I/O-heavy, done outside lock)
+        // Step 3: Collect all entries from SSTables
+        // Note: For true streaming, we would need to implement Iterator for SsTableIterator.
+        // Current approach collects entries but uses efficient deduplication.
         let mut all_entries: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
 
         for sst_info in &ssts_to_compact {

@@ -21,6 +21,7 @@ struct CacheEntry {
 /// (n = cache capacity, typically small ~64-256 blocks).
 ///
 /// Supports prefetching adjacent blocks for sequential access patterns.
+/// Tracks cache hit/miss statistics for monitoring.
 pub struct BlockCache {
     /// Cached blocks keyed by block offset.
     entries: HashMap<u64, CacheEntry>,
@@ -30,6 +31,25 @@ pub struct BlockCache {
     counter: u64,
     /// Prefetch window size (number of adjacent blocks to prefetch).
     prefetch_window: usize,
+    /// Number of cache hits.
+    hits: u64,
+    /// Number of cache misses.
+    misses: u64,
+}
+
+/// Cache statistics for monitoring.
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    /// Current number of cached entries.
+    pub size: usize,
+    /// Maximum capacity.
+    pub capacity: usize,
+    /// Number of cache hits.
+    pub hits: u64,
+    /// Number of cache misses.
+    pub misses: u64,
+    /// Hit rate (0.0 to 1.0).
+    pub hit_rate: f64,
 }
 
 impl BlockCache {
@@ -40,6 +60,8 @@ impl BlockCache {
             capacity,
             counter: 0,
             prefetch_window: 2, // Prefetch 2 adjacent blocks
+            hits: 0,
+            misses: 0,
         }
     }
 
@@ -53,8 +75,10 @@ impl BlockCache {
         self.counter += 1;
         if let Some(entry) = self.entries.get_mut(&offset) {
             entry.access_counter = self.counter;
+            self.hits += 1;
             Some(&entry.data)
         } else {
+            self.misses += 1;
             None
         }
     }
@@ -75,6 +99,24 @@ impl BlockCache {
                 access_counter: self.counter,
             },
         );
+    }
+
+    /// Returns cache statistics for monitoring.
+    pub fn stats(&self) -> CacheStats {
+        let total = self.hits + self.misses;
+        CacheStats {
+            size: self.entries.len(),
+            capacity: self.capacity,
+            hits: self.hits,
+            misses: self.misses,
+            hit_rate: if total > 0 { self.hits as f64 / total as f64 } else { 0.0 },
+        }
+    }
+
+    /// Resets hit/miss counters.
+    pub fn reset_stats(&mut self) {
+        self.hits = 0;
+        self.misses = 0;
     }
 
     /// Evicts the least recently used entry.

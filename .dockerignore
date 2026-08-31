@@ -1,14 +1,41 @@
+# Build artifacts
 target/
+*.o
+*.so
+*.dylib
+*.dll
+
+# Git
 .git/
-.github/
+.gitignore
+.gitattributes
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation
 docs/
-benches/
-test_data/
 *.md
-*.docx
-*.txt
-*.py
-.env
-.env.*
+!README.md
+
+# Scripts
+scripts/
 deploy/
-sdk/
+
+# Data
+ontodb_data/
+*.sst
+*.log
+*.bak
+
+# Test files
+tests/
+benches/
+
+# CI/CD
+.github/
+.gitlab-ci.yml

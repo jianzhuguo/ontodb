@@ -84,12 +84,12 @@ fn validate_filter(filter: &str) -> Result<(), String> {
 }
 
 /// Validates a SQL identifier (class name, column name) to prevent injection.
-/// Only allows alphanumeric characters, underscores, and dots (for qualified names).
+/// Allows Unicode alphanumeric characters, underscores, and dots (for qualified names).
 fn validate_identifier(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 128 {
         return Err("identifier must be 1-128 characters".into());
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
         return Err(format!(
             "invalid identifier '{}': only alphanumeric, underscore, and dot allowed",
             name
@@ -223,6 +223,13 @@ pub struct IncrementalBackupRequest {
 #[derive(Debug, Deserialize)]
 pub struct VerifyBackupRequest {
     /// Path to the backup directory to verify.
+    pub path: String,
+}
+
+/// Restore request.
+#[derive(Debug, Deserialize)]
+pub struct RestoreRequest {
+    /// Path to the backup directory to restore from.
     pub path: String,
 }
 
@@ -444,6 +451,7 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/batch", post(batch_query))
         // SPARQL query execution
         .route("/sparql", post(sparql_query))
+        .route("/api/sparql", post(sparql_query))
         // Vector search
         .route("/api/vector/search", post(vector_search))
         // Hybrid query: SQL + vector search
@@ -456,6 +464,7 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/backup", post(backup))
         .route("/api/backup/incremental", post(backup_incremental))
         .route("/api/backup/verify", post(verify_backup_endpoint))
+        .route("/api/restore", post(restore_endpoint))
         .route("/api/flush", post(flush))
         // Transaction endpoints
         .route("/api/transaction/begin", post(transaction_begin))
@@ -529,6 +538,7 @@ pub fn build_router_with_auth(
         .route("/api/query", post(execute_query))
         .route("/api/batch", post(batch_query))
         .route("/sparql", post(sparql_query))
+        .route("/api/sparql", post(sparql_query))
         .route("/api/vector/search", post(vector_search))
         .route("/api/hybrid/query", post(hybrid_query))
         .route("/api/schema", get(get_schema))
@@ -544,6 +554,7 @@ pub fn build_router_with_auth(
         .route("/api/backup", post(backup))
         .route("/api/backup/incremental", post(backup_incremental))
         .route("/api/backup/verify", post(verify_backup_endpoint))
+        .route("/api/restore", post(restore_endpoint))
         .route("/api/flush", post(flush))
         // Transaction endpoints
         .route("/api/transaction/begin", post(transaction_begin))
@@ -1821,7 +1832,16 @@ async fn export_data(
     let start = std::time::Instant::now();
 
     let query = match &req.class {
-        Some(class) => format!("SELECT * FROM {}", class),
+        Some(class) => {
+            // Validate class identifier to prevent SQL injection
+            if let Err(e) = validate_identifier(class) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::<Value>::error(format!("Invalid class name: {}", e))),
+                );
+            }
+            format!("SELECT * FROM {}", class)
+        },
         None => {
             // Export all classes - get class list first
             let schema = match state.executor.schema_info() {
@@ -1942,6 +1962,14 @@ async fn import_data(
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
 
+    // Validate class identifier to prevent SQL injection
+    if let Err(e) = validate_identifier(&req.class) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!("Invalid class name: {}", e))),
+        );
+    }
+
     if req.rows.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -1962,6 +1990,16 @@ async fn import_data(
     for (i, row) in req.rows.iter().enumerate() {
         // Build INSERT statement
         let columns: Vec<String> = row.keys().cloned().collect();
+        
+        // Validate column names to prevent SQL injection
+        let invalid_col = columns.iter().find(|c| validate_identifier(c).is_err());
+        if let Some(col) = invalid_col {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!("Invalid column name '{}' in row {}", col, i))),
+            );
+        }
+        
         let values: Vec<String> = row.values().map(|v| {
             match v {
                 Value::String(s) => format!("'{}'", s.replace('\'', "''")),
@@ -2491,6 +2529,39 @@ async fn verify_backup_endpoint(
         Err(e) => {
             (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
                 format!("Backup verification failed: {}", e)
+            )))
+        }
+    }
+}
+
+/// POST /api/restore - Restore from a backup.
+async fn restore_endpoint(
+    State(state): State<AppState>,
+    Json(req): Json<RestoreRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let backup_dir = match validate_backup_path(&req.path) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!("Invalid restore path: {}", e))),
+            );
+        }
+    };
+
+    match state.executor.restore(&backup_dir) {
+        Ok(manifest) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": "Restore completed",
+                "path": req.path,
+                "files": manifest.files.len(),
+            }), elapsed)))
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
+                format!("Restore failed: {}", e)
             )))
         }
     }

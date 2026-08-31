@@ -394,6 +394,7 @@ impl QueryPlanner {
             has_primary_index: false,
             secondary_indexes: Vec::new(),
             vector_indexes: Vec::new(),
+            histograms: Vec::new(),
         });
 
         // Apply predicate pushdown optimization
@@ -656,6 +657,8 @@ impl QueryPlanner {
         };
 
         // Apply joins - choose between HashJoin and SortMergeJoin
+        // If we have a LIMIT and no GROUP BY, we can push it into the right side of joins
+        let can_push_limit = limit.is_some() && group_by.is_none();
         let ordered_joins = self.reorder_joins(joins);
         for join in &ordered_joins {
             let right_stats = self.stats.get(&join.table).cloned().unwrap_or_else(|| TableStats {
@@ -665,11 +668,19 @@ impl QueryPlanner {
                 has_primary_index: false,
                 secondary_indexes: Vec::new(),
                 vector_indexes: Vec::new(),
+                histograms: Vec::new(),
             });
 
             // Check if join column has an index for potential index scan
             let right_col = join.on.right.split('.').next_back().unwrap_or(&join.on.right);
             let has_index = right_stats.secondary_indexes.iter().any(|i| i.column == right_col);
+
+            // For LIMIT pushdown: if we can push limit, use it for the right side scan
+            let effective_limit = if can_push_limit {
+                limit
+            } else {
+                None
+            };
 
             let right_plan = if has_index {
                 // Use index scan for the right side of join
@@ -683,13 +694,18 @@ impl QueryPlanner {
                     estimated_rows: index_cost.rows,
                 }
             } else {
-                // Use sequential scan
+                // Use sequential scan with optional limit pushdown
                 let right_cost = self.cost_model.seq_scan_cost(&right_stats);
+                let scan_rows = if let Some(lim) = effective_limit {
+                    right_cost.rows.min(lim as u64)
+                } else {
+                    right_cost.rows
+                };
                 PlanNode::SeqScan {
                     table: join.table.clone(),
                     alias: join.alias.clone(),
                     filter: None,
-                    estimated_rows: right_cost.rows,
+                    estimated_rows: scan_rows,
                 }
             };
 
@@ -807,6 +823,7 @@ impl QueryPlanner {
                 has_primary_index: false,
                 secondary_indexes: Vec::new(),
                 vector_indexes: Vec::new(),
+                histograms: Vec::new(),
             });
 
             // Check if join column has an index for potential index scan
@@ -906,6 +923,7 @@ impl QueryPlanner {
             has_primary_index: false,
             secondary_indexes: Vec::new(),
             vector_indexes: Vec::new(),
+            histograms: Vec::new(),
         });
 
         let vector_stats = stats

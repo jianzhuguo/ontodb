@@ -31,12 +31,12 @@ pub mod store;
 pub mod triple_store;
 
 pub use model::{
-    AssertionValue, Class, ClassType, DataType, Individual, Literal, Ontology, Property,
+    AssertionValue, Class, ClassType, DataType, Individual, Literal, Namespace, Ontology, Property,
     PropertyAssertion, Restriction, Triple,
 };
 pub use parser::OntologyParser;
 pub use rdf::{RdfError, RdfTerm, RdfTriple, TurtleParser, to_jsonld, to_ntriples};
 pub use reasoner::{DerivationStep, InferenceError, Reasoner, ReasoningResult};
 pub use rules::{Rule, RuleId};
-pub use store::OntologyStore;
+pub use store::{OntologyStore, DEFAULT_NAMESPACE};
 pub use triple_store::TripleStore;

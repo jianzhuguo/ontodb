@@ -85,10 +85,11 @@ impl MemTable {
         };
 
         let composite = entry.composite_key();
-        let size_delta = key.len() + value.len() + 16;
+        // Size includes key + value + seq_no (8) + kind (1) + BTreeMap node overhead (~48 bytes)
+        let size_delta = key.len() + value.len() + 16 + 48;
         // insert() returns the old value if key existed
         if let Some(old) = self.data.insert(composite, entry) {
-            let old_delta = old.key.len() + old.value.len() + 16;
+            let old_delta = old.key.len() + old.value.len() + 16 + 48;
             self.size = self.size.saturating_sub(old_delta);
         }
         self.size += size_delta;
@@ -110,11 +111,11 @@ impl MemTable {
             kind: EntryKind::Put,
         };
 
-        // insert() returns the old value if key existed — use it to update size atomically
-        let size_delta = entry.key.len() + entry.value.len() + 16;
+        // Size includes key + value + seq_no (8) + kind (1) + BTreeMap node overhead (~48 bytes)
+        let size_delta = entry.key.len() + entry.value.len() + 16 + 48;
         if let Some(old) = self.data.insert(composite, entry) {
             // Overwrite: subtract old size, add new size (net = size_delta - old_delta)
-            let old_delta = old.key.len() + old.value.len() + 16;
+            let old_delta = old.key.len() + old.value.len() + 16 + 48;
             self.size = self.size.saturating_sub(old_delta);
         }
         self.size += size_delta;
@@ -127,7 +128,8 @@ impl MemTable {
 
     /// Marks a key as deleted (tombstone) with a specific sequence number.
     pub fn delete_with_seq(&mut self, key: Key, seq_no: SeqNo) {
-        let size_delta = key.len() + 16;
+        // Size includes key + seq_no (8) + kind (1) + BTreeMap node overhead (~48 bytes)
+        let size_delta = key.len() + 16 + 48;
         self.size += size_delta;
 
         // Build composite key directly (key + inverted seq_no) to avoid extra allocation
@@ -169,23 +171,26 @@ impl MemTable {
     }
 
     /// Gets the latest value for a key.
-    /// Uses BTreeMap range query for O(log n) lookup instead of linear scan.
+    /// Uses BTreeMap range query for O(log n) lookup.
     pub fn get(&self, key: &[u8]) -> Option<(&[u8], SeqNo)> {
         // Composite key format: user_key ++ (!seq_no).to_be_bytes()
         // Since !seq_no inverts bits, higher seq_no → smaller composite.
-        // All versions of a key K are in range [K++0x00*8, K++0xFF*8].
+        // We want the latest version (highest seq_no), which has the smallest composite.
+        
+        // Create lower bound: key + !MAX (= key + 0x0000...0000)
         let mut lower = Vec::with_capacity(key.len() + 8);
         lower.extend_from_slice(key);
-        lower.extend_from_slice(&0u64.to_be_bytes()); // smallest seq part
-
+        lower.extend_from_slice(&0u64.to_be_bytes());
+        
+        // Create upper bound: key + !0 (= key + 0xFFFF...FFFF)
         let mut upper = Vec::with_capacity(key.len() + 8);
         upper.extend_from_slice(key);
-        upper.extend_from_slice(&u64::MAX.to_be_bytes()); // largest seq part
-
+        upper.extend_from_slice(&u64::MAX.to_be_bytes());
+        
         // Iterate versions of this key, newest first (highest seq_no = smallest composite).
         for (_composite, entry) in self.data.range(lower..=upper) {
-            if entry.key != key {
-                continue; // Skip entries with different user keys (e.g., "key\x00")
+            if entry.key.as_slice() != key {
+                continue; // Skip entries with different user keys
             }
             if entry.is_tombstone() {
                 return None;

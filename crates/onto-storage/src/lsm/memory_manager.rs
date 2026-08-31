@@ -127,6 +127,8 @@ pub struct MemoryManager {
     cache_hits: AtomicU64,
     /// Cache miss counter.
     cache_misses: AtomicU64,
+    /// Atomic write counter for minimal overhead.
+    write_counter: AtomicU64,
 }
 
 impl MemoryManager {
@@ -149,6 +151,7 @@ impl MemoryManager {
             last_adjustment: RwLock::new(Instant::now()),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            write_counter: AtomicU64::new(0),
         }
     }
 
@@ -163,8 +166,9 @@ impl MemoryManager {
     }
 
     /// Record a write operation.
+    /// Uses atomic counter for minimal overhead.
     pub fn record_write(&self) {
-        self.write_tracker.write().record_write();
+        self.write_counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a cache hit.

@@ -190,14 +190,14 @@ impl HnswIndex {
             entry_point: self.entry_point,
             max_layer: self.max_layer,
         };
-        serde_json::to_vec(&snapshot).map_err(|e| format!("Failed to serialize HNSW index: {}", e))
+        bincode::serialize(&snapshot).map_err(|e| format!("Failed to serialize HNSW index: {}", e))
     }
 
     /// Load an HNSW index from bytes.
     ///
     /// Restores the full graph structure, avoiding the need to re-insert vectors.
     pub fn load_from_bytes(data: &[u8]) -> Result<Self, String> {
-        let snapshot: HnswSnapshot = serde_json::from_slice(data)
+        let snapshot: HnswSnapshot = bincode::deserialize(data)
             .map_err(|e| format!("Failed to deserialize HNSW index: {}", e))?;
 
         Ok(Self {

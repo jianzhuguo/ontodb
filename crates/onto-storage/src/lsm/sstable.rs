@@ -297,6 +297,10 @@ impl SsTableBuilder {
             buf.extend_from_slice(&entry.size.to_le_bytes());
         }
 
+        // Add CRC32 checksum for integrity verification
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+
         buf
     }
 
@@ -350,7 +354,8 @@ impl SsTable {
             
             // Decompress if needed
             let block = if compressed {
-                zstd::decode_all(&block_data[..]).unwrap_or(block_data)
+                zstd::decode_all(&block_data[..])
+                    .map_err(|e| CoreError::corruption(format!("zstd decompression failed: {}", e)))?
             } else {
                 block_data
             };
@@ -630,28 +635,56 @@ impl SsTable {
             return Vec::new();
         }
 
-        let count = u32::from_le_bytes(data[0..4].try_into().expect("should be valid")) as usize;
+        // Check if data has CRC32 suffix (new format)
+        // New format: [index_data][crc32: u32]
+        // Old format: [index_data] only
+        let (index_data, crc_valid) = if data.len() >= 8 {
+            // Try to detect if last 4 bytes are a CRC
+            let potential_crc = u32::from_le_bytes(
+                data[data.len() - 4..].try_into().expect("should be valid")
+            );
+            let data_without_crc = &data[..data.len() - 4];
+            let computed_crc = crc32fast::hash(data_without_crc);
+            
+            if computed_crc == potential_crc {
+                // New format with valid CRC
+                (data_without_crc, true)
+            } else {
+                // Old format without CRC, or corrupted CRC
+                (data, false)
+            }
+        } else {
+            // Too small to have CRC, treat as old format
+            (data, false)
+        };
+
+        // Log warning if CRC was expected but invalid
+        if data.len() >= 8 && !crc_valid {
+            tracing::warn!("Index block CRC mismatch, data may be corrupted");
+        }
+
+        let count = u32::from_le_bytes(index_data[0..4].try_into().expect("should be valid")) as usize;
         let mut entries = Vec::with_capacity(count);
         let mut pos = 4;
 
         for _ in 0..count {
-            if pos + 4 > data.len() {
+            if pos + 4 > index_data.len() {
                 break;
             }
-            let key_len = u32::from_le_bytes(data[pos..pos + 4].try_into().expect("should be valid")) as usize;
+            let key_len = u32::from_le_bytes(index_data[pos..pos + 4].try_into().expect("should be valid")) as usize;
             pos += 4;
 
-            if pos + key_len > data.len() {
+            if pos + key_len > index_data.len() {
                 break;
             }
-            let last_key = data[pos..pos + key_len].to_vec();
+            let last_key = index_data[pos..pos + key_len].to_vec();
             pos += key_len;
 
-            if pos + 16 > data.len() {
+            if pos + 16 > index_data.len() {
                 break;
             }
-            let offset = u64::from_le_bytes(data[pos..pos + 8].try_into().expect("should be valid"));
-            let size = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().expect("should be valid"));
+            let offset = u64::from_le_bytes(index_data[pos..pos + 8].try_into().expect("should be valid"));
+            let size = u64::from_le_bytes(index_data[pos + 8..pos + 16].try_into().expect("should be valid"));
             pos += 16;
 
             entries.push(BlockIndexEntry {

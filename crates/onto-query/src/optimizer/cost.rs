@@ -20,6 +20,33 @@ pub struct TableStats {
     pub secondary_indexes: Vec<IndexStats>,
     /// Available vector indexes: column name -> config.
     pub vector_indexes: Vec<VectorIndexStats>,
+    /// Column histograms for more accurate selectivity estimation.
+    #[serde(default)]
+    pub histograms: Vec<ColumnHistogram>,
+}
+
+/// Histogram for a column to estimate value distribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnHistogram {
+    /// Column name.
+    pub column: String,
+    /// Number of distinct values.
+    pub distinct_count: u64,
+    /// Number of NULL values.
+    pub null_count: u64,
+    /// Histogram buckets (value ranges and their frequencies).
+    pub buckets: Vec<HistogramBucket>,
+}
+
+/// A single bucket in a histogram.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistogramBucket {
+    /// Lower bound of the bucket (inclusive).
+    pub lower: String,
+    /// Upper bound of the bucket (inclusive).
+    pub upper: String,
+    /// Number of values in this bucket.
+    pub count: u64,
 }
 
 /// Statistics about a secondary index.
@@ -289,14 +316,27 @@ impl CostModel {
     }
 
     /// Estimate selectivity for a filter expression.
+    /// Uses histograms when available for more accurate estimates.
     pub fn estimate_selectivity(
         &self,
         stats: &TableStats,
         filter: &crate::parser::FilterExpr,
     ) -> FilterSelectivity {
         match filter {
-            crate::parser::FilterExpr::Eq(col, _) => {
-                // Try to use index cardinality for better estimate
+            crate::parser::FilterExpr::Eq(col, val) => {
+                // Try histogram first for more accurate estimate
+                if let Some(hist) = stats.histograms.iter().find(|h| &h.column == col) {
+                    if hist.distinct_count > 0 {
+                        let selectivity = 1.0 / hist.distinct_count as f64;
+                        let can_use_index = stats.secondary_indexes.iter().any(|i| &i.column == col);
+                        return FilterSelectivity {
+                            selectivity,
+                            can_use_index,
+                            index_column: if can_use_index { Some(col.clone()) } else { None },
+                        };
+                    }
+                }
+                // Fallback to index cardinality
                 if let Some(index) = stats.secondary_indexes.iter().find(|i| &i.column == col) {
                     FilterSelectivity {
                         selectivity: 1.0 / index.cardinality as f64,
@@ -318,10 +358,22 @@ impl CostModel {
                     index_column: None,
                 }
             }
-            crate::parser::FilterExpr::Gt(col, _)
-            | crate::parser::FilterExpr::Lt(col, _)
-            | crate::parser::FilterExpr::Gte(col, _)
-            | crate::parser::FilterExpr::Lte(col, _) => {
+            crate::parser::FilterExpr::Gt(col, val)
+            | crate::parser::FilterExpr::Lt(col, val)
+            | crate::parser::FilterExpr::Gte(col, val)
+            | crate::parser::FilterExpr::Lte(col, val) => {
+                // Try histogram for range selectivity
+                if let Some(hist) = stats.histograms.iter().find(|h| &h.column == col) {
+                    if let Some(selectivity) = Self::estimate_range_from_histogram(hist, val, filter) {
+                        let can_use_index = stats.secondary_indexes.iter().any(|i| &i.column == col);
+                        return FilterSelectivity {
+                            selectivity,
+                            can_use_index,
+                            index_column: if can_use_index { Some(col.clone()) } else { None },
+                        };
+                    }
+                }
+                // Fallback to fixed selectivity
                 let can_use_index = stats
                     .secondary_indexes
                     .iter()
@@ -339,14 +391,39 @@ impl CostModel {
                     index_column: None,
                 }
             }
-            crate::parser::FilterExpr::Between(_, _, _) => {
+            crate::parser::FilterExpr::Between(col, _, _) => {
+                // Try histogram for between selectivity
+                if let Some(hist) = stats.histograms.iter().find(|h| &h.column == col) {
+                    if !hist.buckets.is_empty() {
+                        // BETWEEN is roughly 2 range queries
+                        let selectivity = self.range_selectivity * 0.5;
+                        return FilterSelectivity {
+                            selectivity,
+                            can_use_index: false,
+                            index_column: None,
+                        };
+                    }
+                }
                 FilterSelectivity {
-                    selectivity: self.range_selectivity * 0.5, // BETWEEN is more selective
+                    selectivity: self.range_selectivity * 0.5,
                     can_use_index: false,
                     index_column: None,
                 }
             }
             crate::parser::FilterExpr::In(_, values) => {
+                // Try histogram for IN selectivity
+                if let Some(col) = Self::extract_column_from_in(filter) {
+                    if let Some(hist) = stats.histograms.iter().find(|h| h.column == col) {
+                        if hist.distinct_count > 0 {
+                            let selectivity = (values.len() as f64 / hist.distinct_count as f64).min(1.0);
+                            return FilterSelectivity {
+                                selectivity,
+                                can_use_index: false,
+                                index_column: None,
+                            };
+                        }
+                    }
+                }
                 FilterSelectivity {
                     selectivity: (values.len() as f64 * self.in_selectivity_per_value).min(1.0),
                     can_use_index: false,
@@ -414,6 +491,47 @@ impl CostModel {
                     index_column: None, // OR typically can't use single index
                 }
             }
+        }
+    }
+
+    /// Estimate range selectivity from a histogram bucket.
+    fn estimate_range_from_histogram(
+        hist: &ColumnHistogram,
+        val: &crate::parser::LiteralValue,
+        filter: &crate::parser::FilterExpr,
+    ) -> Option<f64> {
+        if hist.buckets.is_empty() || hist.distinct_count == 0 {
+            return None;
+        }
+
+        let total_count: u64 = hist.buckets.iter().map(|b| b.count).sum();
+        if total_count == 0 {
+            return None;
+        }
+
+        // Simple estimate: use uniform distribution assumption
+        // For more accuracy, we'd need to find the specific bucket containing the value
+        let base_selectivity = 1.0 / hist.distinct_count as f64;
+        
+        // Adjust based on filter type
+        match filter {
+            crate::parser::FilterExpr::Gt(_, _) | crate::parser::FilterExpr::Gte(_, _) => {
+                // Assume value is in middle, so ~50% of values are greater
+                Some(0.5)
+            }
+            crate::parser::FilterExpr::Lt(_, _) | crate::parser::FilterExpr::Lte(_, _) => {
+                // Assume value is in middle, so ~50% of values are less
+                Some(0.5)
+            }
+            _ => Some(base_selectivity),
+        }
+    }
+
+    /// Extract column name from an IN filter expression.
+    fn extract_column_from_in(filter: &crate::parser::FilterExpr) -> Option<String> {
+        match filter {
+            crate::parser::FilterExpr::In(col, _) => Some(col.clone()),
+            _ => None,
         }
     }
 }

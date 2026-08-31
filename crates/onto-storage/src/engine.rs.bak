@@ -115,15 +115,6 @@ pub struct LsmEngine {
 
     /// Group commit coordinator for batching WAL syncs.
     group_commit: Arc<crate::lsm::group_commit::GroupCommitCoordinator>,
-
-    /// Dynamic memory manager for adaptive MemTable and Block Cache sizing.
-    memory_manager: Arc<crate::lsm::memory_manager::MemoryManager>,
-
-    /// Shutdown flag for background threads.
-    shutdown: Arc<AtomicBool>,
-
-    /// Handle to the background WAL sync thread for graceful shutdown.
-    wal_sync_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Temporary helper for loading WAL + SSTables before spawning the compaction worker.
@@ -261,16 +252,6 @@ impl LsmEngine {
             }
         };
 
-        // Initialize memory manager for adaptive sizing
-        let mm_config = crate::lsm::memory_manager::MemoryManagerConfig::default();
-        let memory_manager = Arc::new(
-            crate::lsm::memory_manager::MemoryManager::with_initial_sizes(
-                mm_config,
-                options.memtable_size_limit,
-                64 * 1024 * 1024, // 64 MB default block cache
-            )
-        );
-
         let engine = LsmEngine {
             write_state: Arc::new(FairRwLock::new(pre_engine.write_state)),
             sst_cache: Mutex::new(pre_engine.sst_cache),
@@ -285,9 +266,6 @@ impl LsmEngine {
             compaction_pending: AtomicBool::new(false),
             worker_handle: Mutex::new(Some(_worker_handle)),
             group_commit: Arc::new(crate::lsm::group_commit::GroupCommitCoordinator::new()),
-            memory_manager,
-            shutdown: Arc::new(AtomicBool::new(false)),
-            wal_sync_handle: Mutex::new(None),
         };
 
         // Spawn background WAL sync thread
@@ -295,11 +273,10 @@ impl LsmEngine {
         // This ensures single put() calls are persisted within 100ms
         let sync_write_state = engine.write_state.clone();
         let sync_wal_on_commit = engine.options.sync_wal_on_commit;
-        let sync_shutdown = engine.shutdown.clone();
         let sync_handle = std::thread::Builder::new()
             .name("ontodb-wal-sync".into())
             .spawn(move || {
-                while !sync_shutdown.load(Ordering::Relaxed) {
+                loop {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     if let Some(mut ws) = sync_write_state.try_write_for(std::time::Duration::from_millis(5)) {
                         if ws.wal_pending_count > 0 {
@@ -315,9 +292,9 @@ impl LsmEngine {
                 }
             })
             .ok();
-        // Save the handle for graceful shutdown
+        // Leak the handle so the thread runs for the lifetime of the engine
         if let Some(h) = sync_handle {
-            *engine.wal_sync_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+            std::mem::forget(h);
         }
 
         // Rebuild secondary indexes from persisted index entries
@@ -339,37 +316,10 @@ impl LsmEngine {
         &self.options
     }
 
-    /// Gets the memory manager for monitoring and control.
-    pub fn memory_manager(&self) -> &Arc<crate::lsm::memory_manager::MemoryManager> {
-        &self.memory_manager
-    }
-
-    /// Gracefully shuts down the engine, stopping background threads.
-    pub fn shutdown(&self) {
-        // Signal background threads to stop
-        self.shutdown.store(true, Ordering::Relaxed);
-
-        // Wait for WAL sync thread to finish
-        if let Some(handle) = self.wal_sync_handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = handle.join();
-        }
-
-        // Flush any remaining data
-        if let Some(mut ws) = self.write_state.try_write_for(std::time::Duration::from_secs(1)) {
-            if ws.wal_pending_count > 0 {
-                let _ = ws.wal.flush_buf();
-                let _ = ws.wal.sync();
-            }
-        }
-    }
-
     /// Puts a key-value pair.
     pub fn put(&self, key: Key, value: Value) -> Result<()> {
         let seq = self.next_seq();
         let entry = Entry::put(key.clone(), value.clone(), seq);
-
-        // Record write for memory manager
-        self.memory_manager.record_write();
 
         let needs_flush = {
             let mut ws = self.write_state.write();
@@ -379,14 +329,9 @@ impl LsmEngine {
             if ws.wal_pending_count >= 64 {
                 ws.wal.flush_buf()?;
                 ws.wal_pending_count = 0;
-                // Check if WAL rotation is needed
-                if ws.wal.needs_rotation() {
-                    let _archive = ws.wal.rotate()?;
-                    tracing::info!("WAL rotated to {:?}", _archive);
-                }
             }
             ws.memtable.put_with_seq(key, value, seq);
-            ws.memtable.size() >= self.memory_manager.memtable_size()
+            ws.memtable.size() >= self.options.memtable_size_limit
         };
         // write_state lock released here
         // WAL sync is handled by background thread (100ms interval)
@@ -413,12 +358,6 @@ impl LsmEngine {
         }
 
         let count = entries.len();
-
-        // Record writes for memory manager
-        for _ in 0..count {
-            self.memory_manager.record_write();
-        }
-
         let (needs_flush, should_sync) = {
             let mut ws = self.write_state.write();
             for (key, value) in entries {
@@ -431,7 +370,7 @@ impl LsmEngine {
             // Flush WAL buffer once for the entire batch
             ws.wal.flush_buf()?;
             ws.wal_pending_count = 0;
-            (ws.memtable.size() >= self.memory_manager.memtable_size(), self.options.sync_wal_on_commit)
+            (ws.memtable.size() >= self.options.memtable_size_limit, self.options.sync_wal_on_commit)
         };
         // write_state lock released here
 

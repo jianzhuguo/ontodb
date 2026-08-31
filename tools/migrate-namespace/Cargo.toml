@@ -1,0 +1,18 @@
+[package]
+name = "migrate-namespace"
+version = "0.1.0"
+edition = "2021"
+description = "OntoDB namespace migration tool"
+
+[[bin]]
+name = "migrate-namespace"
+path = "src/main.rs"
+
+[[bin]]
+name = "rollback-namespace"
+path = "src/rollback.rs"
+
+[dependencies]
+onto-core = { path = "../../crates/onto-core" }
+onto-ontology = { path = "../../crates/onto-ontology" }
+onto-storage = { path = "../../crates/onto-storage" }

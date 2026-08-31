@@ -636,49 +636,49 @@ function build(d){
   d.custs.sort(sk('name'));d.leads.sort(sk('company'));
   var cx0=W/2,cy0=H/2;
   nodes.push({id:'anchor',label:'OntoDB',type:'anchor',x:cx0,y:cy0,vx:0,vy:0,fixed:true,r:24,info:{entries:d.total}});
-  var l2=d.depts.filter(function(x){return x.level===2;});
+  var l2=d.depts.filter(function(x){return x.dept_level===2;});
   for(var i=0;i<l2.length;i++){var dd=l2[i],angle=2*Math.PI*i/l2.length-Math.PI/2,radius=Math.min(W,H)*0.22;
-    nodes.push({id:'d_'+dd.code,label:dd.name,type:'dept',x:cx0+Math.cos(angle)*radius,y:cy0+Math.sin(angle)*radius,vx:0,vy:0,fixed:false,r:14,info:{code:dd.code,head:dd.head,budget:(dd.budget/10000).toFixed(0)+'万',level:2}});
-    edges.push({from:'anchor',to:'d_'+dd.code,type:'semantic'});}
-  var l3=d.depts.filter(function(x){return x.level===3;});
-  for(var i=0;i<l3.length;i++){var dd=l3[i],pn=findN('d_'+dd.parent);if(!pn)continue;var angle=2*Math.PI*i/l3.length,r=60+Math.random()*20;
-    nodes.push({id:'d_'+dd.code,label:dd.name,type:'dept',x:pn.x+Math.cos(angle)*r,y:pn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:9,info:{code:dd.code,head:dd.head,budget:(dd.budget/10000).toFixed(0)+'万',level:3}});
-    edges.push({from:'d_'+dd.parent,to:'d_'+dd.code,type:'contains'});}
-  var de={};d.emps.forEach(function(e){if(!de[e.department])de[e.department]=[];de[e.department].push(e);});
+    nodes.push({id:'d_'+dd.dept_code,label:dd.dept_name,type:'dept',x:cx0+Math.cos(angle)*radius,y:cy0+Math.sin(angle)*radius,vx:0,vy:0,fixed:false,r:14,info:{code:dd.dept_code,head:dd.dept_head,budget:(dd.dept_budget/10000).toFixed(0)+'万',level:2}});
+    edges.push({from:'anchor',to:'d_'+dd.dept_code,type:'semantic'});}
+  var l3=d.depts.filter(function(x){return x.dept_level===3;});
+  for(var i=0;i<l3.length;i++){var dd=l3[i],pn=findN('d_'+dd.dept_parent);if(!pn)continue;var angle=2*Math.PI*i/l3.length,r=60+Math.random()*20;
+    nodes.push({id:'d_'+dd.dept_code,label:dd.dept_name,type:'dept',x:pn.x+Math.cos(angle)*r,y:pn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:9,info:{code:dd.dept_code,head:dd.dept_head,budget:(dd.dept_budget/10000).toFixed(0)+'万',level:3}});
+    edges.push({from:'d_'+dd.dept_parent,to:'d_'+dd.dept_code,type:'contains'});}
+  var de={};d.emps.forEach(function(e){if(!de[e.emp_department])de[e.emp_department]=[];de[e.emp_department].push(e);});
   for(var dept in de){var dn=findN('d_'+dept);if(!dn)continue;var es=de[dept];es.sort(function(a,b){return (a.emp_id||'').localeCompare(b.emp_id||'');});
     for(var j=0;j<Math.min(es.length,5);j++){var e=es[j],angle=2*Math.PI*j/es.length+Math.random()*.3,r=40+Math.random()*15;
-      nodes.push({id:'e_'+e.emp_id,label:e.name,type:'emp',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:7,info:{emp_id:e.emp_id,dept:e.department,title:e.title,salary:(e.salary/1000).toFixed(0)+'K',email:e.email}});
+      nodes.push({id:'e_'+e.emp_id,label:e.emp_name,type:'emp',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:7,info:{emp_id:e.emp_id,dept:e.emp_department,title:e.emp_title,salary:(e.emp_salary/1000).toFixed(0)+'K',email:e.emp_email}});
       edges.push({from:'d_'+dept,to:'e_'+e.emp_id,type:'belongs'});}}
-  for(var i=0;i<d.projs.length;i++){var p=d.projs[i],dn=findN('d_'+p.department);if(!dn)continue;var angle=2*Math.PI*i/d.projs.length+1,r=70+Math.random()*30;
-    nodes.push({id:'p_'+p.code,label:p.name,type:'proj',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:8,info:{code:p.code,dept:p.department,status:p.status,budget:(p.budget/10000).toFixed(0)+'万',progress:p.progress+'%'}});
-    edges.push({from:'d_'+p.department,to:'p_'+p.code,type:'contains'});}
+  for(var i=0;i<d.projs.length;i++){var p=d.projs[i],dn=findN('d_'+p.proj_department);if(!dn)continue;var angle=2*Math.PI*i/d.projs.length+1,r=70+Math.random()*30;
+    nodes.push({id:'p_'+p.proj_code,label:p.proj_name,type:'proj',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:8,info:{code:p.proj_code,dept:p.proj_department,status:p.proj_status,budget:(p.proj_budget/10000).toFixed(0)+'万',progress:p.proj_progress+'%'}});
+    edges.push({from:'d_'+p.proj_department,to:'p_'+p.proj_code,type:'contains'});}
   for(var i=0;i<d.srvs.length;i++){var s=d.srvs[i],angle=2*Math.PI*i/d.srvs.length+0.5,radius=Math.min(W,H)*0.38;
-    nodes.push({id:'s_'+s.node_id,label:s.name,type:'server',x:cx0+Math.cos(angle)*radius,y:cy0+Math.sin(angle)*radius,vx:0,vy:0,fixed:false,r:10,info:{node_id:s.node_id,role:s.role,region:s.region,cpu:s.cpu_cores+'核',mem:s.memory_gb+'G',storage:s.storage_tb+'TB',status:s.status}});
-    edges.push({from:'anchor',to:'s_'+s.node_id,type:'hosts'});}
+    nodes.push({id:'s_'+s.srv_node_id,label:s.srv_name,type:'server',x:cx0+Math.cos(angle)*radius,y:cy0+Math.sin(angle)*radius,vx:0,vy:0,fixed:false,r:10,info:{node_id:s.srv_node_id,role:s.srv_role,region:s.srv_region,cpu:s.srv_cpu_cores+'核',mem:s.srv_memory_gb+'G',storage:s.srv_storage_tb+'TB',status:s.srv_status}});
+    edges.push({from:'anchor',to:'s_'+s.srv_node_id,type:'hosts'});}
   for(var i=0;i<d.custs.length;i++){var c=d.custs[i],dn=findN('d_SALES')||findN('d_SALES_EAST')||nodes[1];var angle=2*Math.PI*i/d.custs.length-0.5,r=80+Math.random()*30;
-    nodes.push({id:'cu_'+i,label:c.name,type:'customer',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:7,info:{industry:c.industry,level:c.level,contract:(c.contract_value/10000).toFixed(0)+'万',status:c.status,contact:c.contact,region:c.region}});
-    var dd={华东:'SALES_EAST',华北:'SALES_NORTH',华南:'SALES_SOUTH',东南亚:'OVERSEA_SEA',中东:'OVERSEA_ME',欧洲:'OVERSEA_EU'}[c.region]||'SALES';
+    nodes.push({id:'cu_'+i,label:c.cust_name,type:'customer',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:7,info:{industry:c.cust_industry,level:c.cust_level,contract:(c.cust_contract_value/10000).toFixed(0)+'万',status:c.cust_status,contact:c.cust_contact,region:c.cust_region}});
+    var dd={华东:'SALES_EAST',华北:'SALES_NORTH',华南:'SALES_SOUTH',东南亚:'OVERSEA_SEA',中东:'OVERSEA_ME',欧洲:'OVERSEA_EU'}[c.cust_region]||'SALES';
     edges.push({from:'d_'+dd,to:'cu_'+i,type:'serves'});}
   for(var i=0;i<d.leads.length;i++){var l=d.leads[i],dn=findN('d_SALES')||nodes[1];var angle=2*Math.PI*i/d.leads.length+1.5,r=100+Math.random()*30;
-    nodes.push({id:'l_'+i,label:l.company,type:'lead',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:6,info:{industry:l.industry,stage:l.stage,value:(l.value/10000).toFixed(0)+'万'}});
+    nodes.push({id:'l_'+i,label:l.lead_company,type:'lead',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:6,info:{industry:l.lead_industry,stage:l.lead_stage,value:(l.lead_value/10000).toFixed(0)+'万'}});
     edges.push({from:'d_SALES',to:'l_'+i,type:'pipeline'});}
-  for(var i=0;i<d.alerts.length;i++){var a=d.alerts[i],sn=findN('s_'+a.source);if(!sn)continue;
-    nodes.push({id:'a_'+i,label:a.level,type:'alert',x:sn.x+Math.cos(Math.random()*6.28)*25,y:sn.y+Math.sin(Math.random()*6.28)*25,vx:0,vy:0,fixed:false,r:3,info:{time:a.time,level:a.level,message:a.message,resolved:a.resolved?'已解决':'未解决'}});
-    edges.push({from:'s_'+a.source,to:'a_'+i,type:'alerted'});}
+  for(var i=0;i<d.alerts.length;i++){var a=d.alerts[i],sn=findN('s_'+a.alert_source);if(!sn)continue;
+    nodes.push({id:'a_'+i,label:a.alert_level,type:'alert',x:sn.x+Math.cos(Math.random()*6.28)*25,y:sn.y+Math.sin(Math.random()*6.28)*25,vx:0,vy:0,fixed:false,r:3,info:{time:a.alert_time,level:a.alert_level,message:a.alert_message,resolved:a.alert_resolved?'已解决':'未解决'}});
+    edges.push({from:'s_'+a.alert_source,to:'a_'+i,type:'alerted'});}
 }
 
 // ── Panel ──
 function mc(l,v,c){return '<div class="mc"><div class="l">'+l+'</div><div class="v"'+(c?' style="color:'+c+'"':'')+'>'+v+'</div></div>';}
 function bar(l,p,col){return '<div class="bar"><span style="min-width:80px;color:#9aa5ce;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+l+'</span><div class="bg"><div class="fl" style="width:'+p+'%;background:'+col+'"></div></div><span class="pct">'+p+'%</span></div>';}
 function rp(d){
-  document.getElementById('ov').innerHTML=[mc('部门',d.depts.filter(function(x){return x.level===2;}).length,'#bb9af7'),mc('员工',d.emps.length,'#9ece6a'),mc('项目',d.projs.length,'#e0af68'),mc('服务器',d.srvs.length,'#f7768e'),mc('客户',d.custs.length,'#f97316'),mc('线索',d.leads.length,'#ec4899'),mc('条目',d.total.toLocaleString(),'#7aa2f7'),mc('告警',d.alerts.length,'#7dcfff')].join('');
-  var l2=d.depts.filter(function(x){return x.level===2;});var seen={};l2=l2.filter(function(x){if(seen[x.code])return false;seen[x.code]=1;return true;});l2.sort(function(a,b){return b.budget-a.budget;});
-  var mx=l2.length?l2[0].budget:1;var h='';l2.forEach(function(x){h+=bar(x.name,Math.round(x.budget/mx*100),'#bb9af7');});document.getElementById('bg').innerHTML=h;
-  var sp=d.projs;var seenP={};sp=sp.filter(function(x){if(seenP[x.code])return false;seenP[x.code]=1;return true;});sp.sort(function(a,b){return b.progress-a.progress;});
-  h='';sp.forEach(function(p){var c=p.status==='已完成'?'#9ece6a':p.status==='规划中'?'#565f89':'#e0af68';h+=bar(p.name,p.progress,c);});document.getElementById('pj').innerHTML=h;
-  h='';var seenS={};d.srvs.forEach(function(s){if(seenS[s.node_id])return;seenS[s.node_id]=1;var c=s.status==='online'?'#9ece6a':'#e0af68';h+='<div class="row"><div class="dot" style="background:'+c+'"></div><div class="nm">'+s.name+'</div><span style="color:#565f89;font-size:9px">'+s.region+'</span></div>';});document.getElementById('sv').innerHTML=h;
-  h='';var seenC={};d.custs.forEach(function(c){if(seenC[c.name])return;seenC[c.name]=1;var lc=c.level==='S'?'#f7768e':c.level==='A'?'#e0af68':'#9ece6a';h+='<div class="row"><span class="tag" style="background:'+lc+';color:#1a1b26">'+c.level+'</span><div class="nm">'+c.name+'</div><span style="color:#f97316">'+(c.contract_value/10000).toFixed(0)+'万</span></div>';});document.getElementById('cu').innerHTML=h;
-  h='';var seenA={};d.alerts.forEach(function(a){var key=a.time+a.source;if(seenA[key])return;seenA[key]=1;var cls=a.level==='CRITICAL'?'c':a.level==='WARNING'?'w':'i';h+='<div class="alt '+cls+'"><b>'+a.level+'</b> ['+a.source+'] '+a.message+(a.resolved?' ✓':'')+'</div>';});document.getElementById('al').innerHTML=h||'<div style="color:#565f89;font-size:10px">无</div>';
+  document.getElementById('ov').innerHTML=[mc('部门',d.depts.filter(function(x){return x.dept_level===2;}).length,'#bb9af7'),mc('员工',d.emps.length,'#9ece6a'),mc('项目',d.projs.length,'#e0af68'),mc('服务器',d.srvs.length,'#f7768e'),mc('客户',d.custs.length,'#f97316'),mc('线索',d.leads.length,'#ec4899'),mc('条目',d.total.toLocaleString(),'#7aa2f7'),mc('告警',d.alerts.length,'#7dcfff')].join('');
+  var l2=d.depts.filter(function(x){return x.dept_level===2;});var seen={};l2=l2.filter(function(x){if(seen[x.dept_code])return false;seen[x.dept_code]=1;return true;});l2.sort(function(a,b){return b.dept_budget-a.dept_budget;});
+  var mx=l2.length?l2[0].dept_budget:1;var h='';l2.forEach(function(x){h+=bar(x.dept_name,Math.round(x.dept_budget/mx*100),'#bb9af7');});document.getElementById('bg').innerHTML=h;
+  var sp=d.projs;var seenP={};sp=sp.filter(function(x){if(seenP[x.proj_code])return false;seenP[x.proj_code]=1;return true;});sp.sort(function(a,b){return b.proj_progress-a.proj_progress;});
+  h='';sp.forEach(function(p){var c=p.proj_status==='已完成'?'#9ece6a':p.proj_status==='规划中'?'#565f89':'#e0af68';h+=bar(p.proj_name,p.proj_progress,c);});document.getElementById('pj').innerHTML=h;
+  h='';var seenS={};d.srvs.forEach(function(s){if(seenS[s.srv_node_id])return;seenS[s.srv_node_id]=1;var c=s.srv_status==='online'?'#9ece6a':'#e0af68';h+='<div class="row"><div class="dot" style="background:'+c+'"></div><div class="nm">'+s.srv_name+'</div><span style="color:#565f89;font-size:9px">'+s.srv_region+'</span></div>';});document.getElementById('sv').innerHTML=h;
+  h='';var seenC={};d.custs.forEach(function(c){if(seenC[c.cust_name])return;seenC[c.cust_name]=1;var lc=c.cust_level==='S'?'#f7768e':c.cust_level==='A'?'#e0af68':'#9ece6a';h+='<div class="row"><span class="tag" style="background:'+lc+';color:#1a1b26">'+c.cust_level+'</span><div class="nm">'+c.cust_name+'</div><span style="color:#f97316">'+(c.cust_contract_value/10000).toFixed(0)+'万</span></div>';});document.getElementById('cu').innerHTML=h;
+  h='';var seenA={};d.alerts.forEach(function(a){var key=a.alert_time+a.alert_source;if(seenA[key])return;seenA[key]=1;var cls=a.alert_level==='CRITICAL'?'c':a.alert_level==='WARNING'?'w':'i';h+='<div class="alt '+cls+'"><b>'+a.alert_level+'</b> ['+a.alert_source+'] '+a.alert_message+(a.alert_resolved?' ✓':'')+'</div>';});document.getElementById('al').innerHTML=h||'<div style="color:#565f89;font-size:10px">无</div>';
 }
 
 // ── Vector Visualization ──
@@ -827,24 +827,24 @@ async function autoExpand(){
     var dept=l2[i];
     expandedNodes[dept.id]=true;
     // Add employees for this dept
-    var emps=allData.emps.filter(function(e){return e.department===dept.info.code;});
+    var emps=allData.emps.filter(function(e){return e.emp_department===dept.info.code;});
     emps.sort(function(a,b){return (a.emp_id||'').localeCompare(b.emp_id||'');});
     for(var j=0;j<Math.min(emps.length,3);j++){
       var e=emps[j];var eid='e_'+e.emp_id;
       if(findN(eid))continue;
       var angle=Math.random()*Math.PI*2,r=50+Math.random()*30;
-      nodes.push({id:eid,label:e.name,type:'emp',x:dept.x+Math.cos(angle)*r,y:dept.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:7,info:{emp_id:e.emp_id,dept:e.department,title:e.title,salary:(e.salary/1000).toFixed(0)+'K',email:e.email}});
+      nodes.push({id:eid,label:e.emp_name,type:'emp',x:dept.x+Math.cos(angle)*r,y:dept.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:7,info:{emp_id:e.emp_id,dept:e.emp_department,title:e.emp_title,salary:(e.emp_salary/1000).toFixed(0)+'K',email:e.emp_email}});
       edges.push({from:dept.id,to:eid,type:'related'});
       expandedNodes[eid]=true;
     }
     // Add projects for this dept
-    var projs=allData.projs.filter(function(p){return p.department===dept.info.code;});
-    projs.sort(function(a,b){return (a.code||'').localeCompare(b.code||'');});
+    var projs=allData.projs.filter(function(p){return p.proj_department===dept.info.code;});
+    projs.sort(function(a,b){return (a.proj_code||'').localeCompare(b.proj_code||'');});
     for(var j=0;j<Math.min(projs.length,2);j++){
-      var p=projs[j];var pid='p_'+p.code;
+      var p=projs[j];var pid='p_'+p.proj_code;
       if(findN(pid))continue;
       var angle=Math.random()*Math.PI*2,r=70+Math.random()*30;
-      nodes.push({id:pid,label:p.name,type:'proj',x:dept.x+Math.cos(angle)*r,y:dept.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:8,info:{code:p.code,dept:p.department,status:p.status,budget:(p.budget/10000).toFixed(0)+'万',progress:p.progress+'%'}});
+      nodes.push({id:pid,label:p.proj_name,type:'proj',x:dept.x+Math.cos(angle)*r,y:dept.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:8,info:{code:p.proj_code,dept:p.proj_department,status:p.proj_status,budget:(p.proj_budget/10000).toFixed(0)+'万',progress:p.proj_progress+'%'}});
       edges.push({from:dept.id,to:pid,type:'related'});
       expandedNodes[pid]=true;
     }
@@ -853,13 +853,13 @@ async function autoExpand(){
   var srvs=nodes.filter(function(n){return n.type==='server';});
   for(var i=0;i<srvs.length;i++){
     var srv=srvs[i];
-    var alerts=allData.alerts.filter(function(a){return a.source===srv.info.node_id;});
-    alerts.sort(function(a,b){return (a.time||'').localeCompare(b.time||'');});
+    var alerts=allData.alerts.filter(function(a){return a.alert_source===srv.info.node_id;});
+    alerts.sort(function(a,b){return (a.alert_time||'').localeCompare(b.alert_time||'');});
     for(var j=0;j<Math.min(alerts.length,2);j++){
       var a=alerts[j];var aid='a_'+allData.alerts.indexOf(a);
       if(findN(aid))continue;
       var angle=Math.random()*Math.PI*2;
-      nodes.push({id:aid,label:a.level,type:'alert',x:srv.x+Math.cos(angle)*30,y:srv.y+Math.sin(angle)*30,vx:0,vy:0,fixed:false,r:4,info:{time:a.time,level:a.level,message:a.message,resolved:a.resolved?'已解决':'未解决'}});
+      nodes.push({id:aid,label:a.alert_level,type:'alert',x:srv.x+Math.cos(angle)*30,y:srv.y+Math.sin(angle)*30,vx:0,vy:0,fixed:false,r:4,info:{time:a.alert_time,level:a.alert_level,message:a.alert_message,resolved:a.alert_resolved?'已解决':'未解决'}});
       edges.push({from:srv.id,to:aid,type:'related'});
       expandedNodes[aid]=true;
     }
@@ -871,7 +871,7 @@ async function autoExpand(){
       var c=allData.custs[i];var cid='cu_'+i;
       if(findN(cid))continue;
       var angle=Math.random()*Math.PI*2,r=60+Math.random()*30;
-      nodes.push({id:cid,label:c.name,type:'customer',x:salesDept.x+Math.cos(angle)*r,y:salesDept.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:6,info:{industry:c.industry,level:c.level,contract:(c.contract_value/10000).toFixed(0)+'万',status:c.status}});
+      nodes.push({id:cid,label:c.cust_name,type:'customer',x:salesDept.x+Math.cos(angle)*r,y:salesDept.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:6,info:{industry:c.cust_industry,level:c.cust_level,contract:(c.cust_contract_value/10000).toFixed(0)+'万',status:c.cust_status}});
       edges.push({from:salesDept.id,to:cid,type:'related'});
       expandedNodes[cid]=true;
     }

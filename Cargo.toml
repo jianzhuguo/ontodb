@@ -15,6 +15,7 @@ members = [
     "crates/onto-edge",
     "crates/onto-edge-bin",
     "crates/onto-edge-esp32",
+    "tools/migrate-namespace",
 ]
 
 [workspace.package]

@@ -14,39 +14,7 @@ use serde::{Deserialize, Serialize};
 
 // ── Reuse helper functions from parser module ──
 use crate::parser::{self, QueryAst};
-
-/// Find a substring case-insensitively (ASCII only).
-fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
-    if needle.is_empty() { return Some(0); }
-    let needle_upper: Vec<u8> = needle.bytes().map(|b| b.to_ascii_uppercase()).collect();
-    let hay_bytes = haystack.as_bytes();
-    let nlen = needle_upper.len();
-    if hay_bytes.len() < nlen { return None; }
-    'outer: for i in 0..=hay_bytes.len() - nlen {
-        for j in 0..nlen {
-            if hay_bytes[i + j].to_ascii_uppercase() != needle_upper[j] { continue 'outer; }
-        }
-        return Some(i);
-    }
-    None
-}
-
-/// Check if `s` starts with `prefix` case-insensitively (ASCII only).
-fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()]
-        .iter().zip(prefix.as_bytes())
-        .all(|(a, b)| a.eq_ignore_ascii_case(b))
-}
-
-/// Safely slice from `start` to end.
-fn safe_slice_from(s: &str, start: usize) -> &str {
-    if start >= s.len() { "" } else { &s[start..] }
-}
-
-/// Safely slice from `start` to `end`.
-fn safe_slice(s: &str, start: usize, end: usize) -> &str {
-    if start >= end || start >= s.len() || end > s.len() { "" } else { &s[start..end] }
-}
+use crate::parser_util::{find_ignore_ascii_case, starts_with_ignore_ascii_case, safe_slice, safe_slice_from};
 
 /// Find unquoted substring (skips content inside single/double quotes).
 fn find_unquoted(haystack: &str, needle: &str) -> Option<usize> {
@@ -382,6 +350,11 @@ pub enum OntoQLAst {
     Commit,
     Rollback,
 
+    // ── Namespace management ──
+    CreateNamespace { name: String },
+    DropNamespace { name: String },
+    UseNamespace { name: String },
+
     // ── Ontology import ──
     ImportOntology { sql: String },
 
@@ -412,6 +385,9 @@ impl OntoQLParser {
         }
 
         // Dispatch by leading keyword
+        if starts_with_ignore_ascii_case(input, "CREATE NAMESPACE") {
+            return Self::parse_create_namespace(input);
+        }
         if starts_with_ignore_ascii_case(input, "CREATE CLASS") {
             return Self::parse_create_class(input);
         }
@@ -421,11 +397,17 @@ impl OntoQLParser {
         {
             return Self::parse_create_property(input);
         }
+        if starts_with_ignore_ascii_case(input, "DROP NAMESPACE") {
+            return Self::parse_drop_namespace(input);
+        }
         if starts_with_ignore_ascii_case(input, "DROP CLASS") {
             return Self::parse_drop_class(input);
         }
         if starts_with_ignore_ascii_case(input, "DROP ONTOLOGY") {
             return Self::parse_drop_ontology(input);
+        }
+        if starts_with_ignore_ascii_case(input, "USE NAMESPACE") {
+            return Self::parse_use_namespace(input);
         }
         if starts_with_ignore_ascii_case(input, "SELECT") {
             return Self::parse_select(input);
@@ -527,6 +509,39 @@ impl OntoQLParser {
             return Err(CoreError::InvalidArgument("Missing ontology name in DROP ONTOLOGY".into()));
         }
         Ok(OntoQLAst::DropOntology { name })
+    }
+
+    // ── CREATE NAMESPACE ─────────────────────────────────────────
+
+    fn parse_create_namespace(input: &str) -> Result<OntoQLAst> {
+        let rest = safe_slice_from(input, "CREATE NAMESPACE".len()).trim_start();
+        let (name, _) = Self::extract_identifier(rest);
+        if name.is_empty() {
+            return Err(CoreError::InvalidArgument("Missing namespace name in CREATE NAMESPACE".into()));
+        }
+        Ok(OntoQLAst::CreateNamespace { name })
+    }
+
+    // ── DROP NAMESPACE ───────────────────────────────────────────
+
+    fn parse_drop_namespace(input: &str) -> Result<OntoQLAst> {
+        let rest = safe_slice_from(input, "DROP NAMESPACE".len()).trim_start();
+        let (name, _) = Self::extract_identifier(rest);
+        if name.is_empty() {
+            return Err(CoreError::InvalidArgument("Missing namespace name in DROP NAMESPACE".into()));
+        }
+        Ok(OntoQLAst::DropNamespace { name })
+    }
+
+    // ── USE NAMESPACE ────────────────────────────────────────────
+
+    fn parse_use_namespace(input: &str) -> Result<OntoQLAst> {
+        let rest = safe_slice_from(input, "USE NAMESPACE".len()).trim_start();
+        let (name, _) = Self::extract_identifier(rest);
+        if name.is_empty() {
+            return Err(CoreError::InvalidArgument("Missing namespace name in USE NAMESPACE".into()));
+        }
+        Ok(OntoQLAst::UseNamespace { name })
     }
 
     // ── CREATE PROPERTY ───────────────────────────────────────────
@@ -1643,6 +1658,12 @@ impl OntoQLAst {
     pub fn to_query_ast(&self) -> Result<QueryAst> {
         match self {
             OntoQLAst::SqlPassthrough(ast) => Ok(ast.clone()),
+            // Namespace operations don't map to SQL — convert directly
+            OntoQLAst::CreateNamespace { name } => Ok(QueryAst::CreateNamespace { name: name.clone() }),
+            OntoQLAst::DropNamespace { name } => Ok(QueryAst::DropNamespace { name: name.clone() }),
+            OntoQLAst::UseNamespace { name } => Ok(QueryAst::UseNamespace { name: name.clone() }),
+            // Ontology drop operations — convert directly
+            OntoQLAst::DropOntology { name } => Ok(QueryAst::DropOntology { name: name.clone() }),
             _ => {
                 let sql = self.to_sql()?;
                 parser::QueryParser::parse(&sql)
@@ -1844,6 +1865,11 @@ impl OntoQLAst {
 
             OntoQLAst::Infer { .. } => {
                 Err(CoreError::InvalidArgument("INFER standalone not yet supported in Phase 1".into()))
+            }
+
+            // Namespace operations don't have SQL representation
+            OntoQLAst::CreateNamespace { .. } | OntoQLAst::DropNamespace { .. } | OntoQLAst::UseNamespace { .. } => {
+                Err(CoreError::InvalidArgument("Namespace operations are handled directly".into()))
             }
         }
     }

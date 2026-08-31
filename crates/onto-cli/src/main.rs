@@ -59,6 +59,14 @@ struct Args {
     #[arg(short, long)]
     file: Option<String>,
 
+    /// TLS certificate file path for secure connections
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    /// API key for authentication
+    #[arg(long)]
+    api_key: Option<String>,
+
     /// Subcommand (dump / restore)
     #[command(subcommand)]
     command: Option<CliCommand>,
@@ -102,14 +110,14 @@ fn main() {
 
     match args.command {
         Some(CliCommand::Dump { output, class, format }) => {
-            run_dump(&args.address, output.as_deref(), class.as_deref(), &format);
+            run_dump(&args.address, output.as_deref(), class.as_deref(), &format, args.tls_cert.as_deref(), args.api_key.as_deref());
         }
         Some(CliCommand::Restore { input, class, skip_errors }) => {
-            run_restore(&args.address, &input, class.as_deref(), skip_errors);
+            run_restore(&args.address, &input, class.as_deref(), skip_errors, args.tls_cert.as_deref(), args.api_key.as_deref());
         }
         None => {
             // Legacy mode: REPL / single query / file
-            let stream = match TcpStream::connect(&args.address) {
+            let stream = match connect(&args.address, args.tls_cert.as_deref(), args.api_key.as_deref()) {
                 Ok(stream) => stream,
                 Err(e) => {
                     eprintln!("Could not connect to {}: {}", args.address, e);
@@ -129,12 +137,34 @@ fn main() {
     }
 }
 
+/// Establish a connection to the OntoDB server with optional TLS and API Key.
+fn connect(address: &str, tls_cert: Option<&str>, api_key: Option<&str>) -> io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(address)?;
+    
+    // If TLS certificate is provided, we would upgrade to TLS here
+    // For now, TLS support requires native-tls or rustls crate
+    if tls_cert.is_some() {
+        eprintln!("Warning: TLS support requires additional dependencies. Connection is unencrypted.");
+        // TODO: Implement TLS upgrade using native-tls or rustls
+    }
+    
+    // If API key is provided, send authentication
+    if let Some(key) = api_key {
+        let auth_msg = format!("AUTH {}\n", key);
+        stream.write_all(auth_msg.as_bytes())?;
+        // Note: Server would need to handle AUTH command
+        // For now, this is a placeholder for the authentication protocol
+    }
+    
+    Ok(stream)
+}
+
 // ─────────────────────────────────────────────────────────────
 //  Dump subcommand
 // ─────────────────────────────────────────────────────────────
 
-fn run_dump(address: &str, output: Option<&str>, class: Option<&str>, format: &str) {
-    let stream = match TcpStream::connect(address) {
+fn run_dump(address: &str, output: Option<&str>, class: Option<&str>, format: &str, tls_cert: Option<&str>, api_key: Option<&str>) {
+    let stream = match connect(address, tls_cert, api_key) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Could not connect to {}: {}", address, e);
@@ -363,8 +393,8 @@ fn parse_cell_value(s: &str) -> serde_json::Value {
 //  Restore subcommand
 // ─────────────────────────────────────────────────────────────
 
-fn run_restore(address: &str, input: &str, class: Option<&str>, skip_errors: bool) {
-    let stream = match TcpStream::connect(address) {
+fn run_restore(address: &str, input: &str, class: Option<&str>, skip_errors: bool, tls_cert: Option<&str>, api_key: Option<&str>) {
+    let stream = match connect(address, tls_cert, api_key) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Could not connect to {}: {}", address, e);

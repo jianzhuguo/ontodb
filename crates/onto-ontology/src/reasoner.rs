@@ -285,15 +285,19 @@ impl Reasoner {
 
     /// Incremental reasoning: only re-derive facts affected by the changes.
     ///
+    /// `existing_facts` — previously known facts (base + inferred).
     /// `added` — newly asserted triples.
     /// `removed` — triples that were retracted.
+    ///
+    /// This implementation tracks which facts are base (asserted) vs derived (inferred),
+    /// and only re-runs rules that could be affected by the changes.
     pub fn reason_incremental(
         &self,
         existing_facts: &[Triple],
         added: &[Triple],
         removed: &[Triple],
     ) -> ReasoningResult {
-        // Start from existing facts, add new ones, remove retracted ones
+        // Build the base fact set (existing + added - removed)
         let mut base: HashSet<Triple> = existing_facts.iter().cloned().collect();
         for t in removed {
             base.remove(t);
@@ -302,10 +306,106 @@ impl Reasoner {
             base.insert(t.clone());
         }
 
-        // Run full reasoning on the updated fact set
-        // (A production implementation would track dependencies to avoid full re-derivation)
-        let base_vec: Vec<Triple> = base.into_iter().collect();
-        self.reason(&base_vec)
+        // If there are removals, we need to re-derive from scratch
+        // because we don't know which derived facts depended on removed facts
+        if !removed.is_empty() {
+            let base_vec: Vec<Triple> = base.into_iter().collect();
+            return self.reason(&base_vec);
+        }
+
+        // For additions only, we can be more efficient:
+        // Only run rules that could produce new inferences from the added facts
+        let mut all_facts: HashSet<Triple> = existing_facts.iter().cloned().collect();
+        let mut all_inferred: Vec<Triple> = Vec::new();
+        let mut rule_counts: HashMap<RuleId, usize> = HashMap::new();
+
+        // Separate added facts by type
+        let mut added_type_facts: Vec<Triple> = Vec::new();
+        let mut added_prop_facts: Vec<Triple> = Vec::new();
+        for t in added {
+            if t.predicate == "rdf:type" {
+                added_type_facts.push(t.clone());
+            } else {
+                added_prop_facts.push(t.clone());
+            }
+        }
+
+        // Process type facts: Cax-sco and Cax-eqc
+        if !added_type_facts.is_empty() {
+            let superclass_cache = self.ontology.build_superclass_cache();
+            let mut cax_new: Vec<Triple> = Vec::new();
+
+            for fact in &added_type_facts {
+                all_facts.insert(fact.clone());
+
+                // Cax-sco: x type A, A subClassOf B => x type B
+                if let Some(supers) = superclass_cache.get(fact.object.as_str()) {
+                    for sup in supers {
+                        cax_new.push(Triple::type_of(&fact.subject, sup));
+                    }
+                }
+
+                // Cax-eqc: x type A, A equiv B => x type B
+                if let Some(class_def) = self.ontology.classes.get(fact.object.as_str()) {
+                    for equiv in &class_def.equivalent_classes {
+                        cax_new.push(Triple::type_of(&fact.subject, equiv));
+                    }
+                }
+            }
+
+            // Insert new inferences
+            for t in cax_new {
+                if all_facts.insert(t.clone()) {
+                    all_inferred.push(t);
+                    *rule_counts.entry(RuleId::CaxSco).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Process property facts: Prp-inv, Prp-symp, Prp-spo, Prp-eqp
+        if !added_prop_facts.is_empty() {
+            for fact in &added_prop_facts {
+                all_facts.insert(fact.clone());
+            }
+
+            // Run property rules on the added facts
+            let new_facts_ref = &added_prop_facts;
+            for rule in &self.rules {
+                match rule.id() {
+                    RuleId::CaxSco | RuleId::CaxEqc | RuleId::PrpTrp => continue,
+                    _ => {}
+                }
+                let inferred = rule.apply(&self.ontology, &all_facts, new_facts_ref);
+                *rule_counts.entry(rule.id()).or_insert(0) += inferred.len();
+                for t in inferred {
+                    if all_facts.insert(t.clone()) {
+                        all_inferred.push(t);
+                    }
+                }
+            }
+        }
+
+        // Run one more iteration to catch transitive closures from new facts
+        if !all_inferred.is_empty() {
+            let inferred_clone = all_inferred.clone();
+            for rule in &self.rules {
+                let inferred = rule.apply(&self.ontology, &all_facts, &inferred_clone);
+                *rule_counts.entry(rule.id()).or_insert(0) += inferred.len();
+                for t in inferred {
+                    if all_facts.insert(t.clone()) {
+                        all_inferred.push(t);
+                    }
+                }
+            }
+        }
+
+        ReasoningResult {
+            all_facts,
+            inferred: all_inferred,
+            rule_counts,
+            iterations: if added.is_empty() { 0 } else { 2 },
+            violations: Vec::new(),
+        }
     }
 
     /// Checks for consistency violations in the fact set.

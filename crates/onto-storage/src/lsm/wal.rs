@@ -1,4 +1,4 @@
-﻿//! Write-Ahead Log (WAL) for crash recovery.
+//! Write-Ahead Log (WAL) for crash recovery.
 //!
 //! Format: [length: u32][crc32: u32][payload: bytes]
 //!
@@ -19,6 +19,10 @@ pub struct Wal {
     serialize_buf: Vec<u8>,
     /// Track if there are unsynced writes.
     dirty: bool,
+    /// Maximum WAL file size before rotation (default: 256 MB).
+    max_size: u64,
+    /// Counter for rotated WAL files.
+    rotation_count: u32,
 }
 
 impl Wal {
@@ -37,7 +41,15 @@ impl Wal {
             offset,
             serialize_buf: Vec::with_capacity(256),
             dirty: false,
+            max_size: 256 * 1024 * 1024, // 256 MB default
+            rotation_count: 0,
         })
+    }
+
+    /// Sets the maximum WAL file size before rotation.
+    pub fn with_max_size(mut self, max_size: u64) -> Self {
+        self.max_size = max_size;
+        self
     }
 
     /// Appends an entry to the WAL.
@@ -91,6 +103,13 @@ impl Wal {
         Ok(())
     }
 
+    /// Flushes and checks if rotation is needed.
+    /// Returns true if the WAL file should be rotated.
+    pub fn flush_and_check_rotation(&mut self) -> Result<bool> {
+        self.flush_buf()?;
+        Ok(self.needs_rotation())
+    }
+
     /// Flushes buffered writes to disk (fsync).
     pub fn sync(&mut self) -> Result<()> {
         self.writer.flush()?;
@@ -105,6 +124,44 @@ impl Wal {
             self.sync()?;
         }
         Ok(())
+    }
+
+    /// Returns true if the WAL file exceeds the maximum size.
+    pub fn needs_rotation(&self) -> bool {
+        self.offset >= self.max_size
+    }
+
+    /// Rotates the WAL file: syncs current file, renames it, creates a new one.
+    /// Returns the path to the archived WAL file.
+    pub fn rotate(&mut self) -> Result<PathBuf> {
+        // Sync current file
+        self.sync()?;
+
+        // Generate archive filename
+        self.rotation_count += 1;
+        let archive_path = self._path.with_extension(
+            format!("{}.wal", self.rotation_count)
+        );
+
+        // Rename current file to archive
+        std::fs::rename(&self._path, &archive_path)?;
+
+        // Create new WAL file
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self._path)?;
+
+        self.writer = BufWriter::new(file);
+        self.offset = 0;
+        self.dirty = false;
+
+        Ok(archive_path)
+    }
+
+    /// Returns the current WAL file size in bytes.
+    pub fn size(&self) -> u64 {
+        self.offset
     }
 
     /// Serializes an entry to bytes for WAL storage.

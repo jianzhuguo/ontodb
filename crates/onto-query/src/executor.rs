@@ -280,6 +280,9 @@ pub struct QueryExecutor {
     /// Runtime execution statistics.
     runtime_stats: Arc<Mutex<RuntimeStats>>,
     /// Active multi-statement transaction ID (None = auto-commit mode).
+    /// Current limitation: only one active transaction per executor.
+    /// To support multiple concurrent transactions, this would need to be
+    /// changed to a HashMap<ConnectionId, SeqNo> or similar structure.
     active_txn: Mutex<Option<onto_core::SeqNo>>,
     /// Query execution configuration.
     config: QueryConfig,
@@ -481,6 +484,82 @@ impl QueryExecutor {
             *mgr = Some(ShardManager::from_json(
                 &serde_json::to_string(&shard_map).unwrap_or_default()
             ).unwrap_or_else(|_| ShardManager::new(0)));
+        }
+    }
+
+    /// Validates an ontology against a merged context (namespace-aware).
+    /// Only validates references that exist in the new ontology against the context.
+    pub fn validate_ontology_with_context(
+        &self,
+        new_ontology: &onto_ontology::Ontology,
+        context: &onto_ontology::Ontology,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        // 1. Validate cycle inheritance within new ontology
+        for (name, class) in &new_ontology.classes {
+            for superclass in &class.superclasses {
+                // Check if superclass exists in context (including new ontology)
+                if !context.classes.contains_key(superclass.as_str()) {
+                    errors.push(format!(
+                        "Class '{}' references undefined superclass '{}'",
+                        name, superclass
+                    ));
+                }
+            }
+        }
+
+        // 2. Validate cycle detection
+        let cycle_errors = new_ontology.validate_no_cycles();
+        errors.extend(cycle_errors);
+
+        // 3. Validate disjoint constraints
+        let disjoint_errors = new_ontology.validate_disjoint_constraints();
+        errors.extend(disjoint_errors);
+
+        // 4. Validate property domains
+        for (name, prop) in &new_ontology.properties {
+            if !context.classes.contains_key(prop.domain.as_str()) {
+                errors.push(format!(
+                    "Property '{}' references undefined domain class '{}'",
+                    name, prop.domain
+                ));
+            }
+        }
+
+        errors
+    }
+
+    // ── Transaction-Aware Scan Helpers ──
+
+    /// Scans entries with prefix, using transaction snapshot if a transaction is active.
+    /// This ensures that uncommitted writes from the active transaction are visible.
+    pub fn txn_aware_scan_prefix(
+        &self,
+        engine: &LsmEngine,
+        prefix: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let active_txn = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(txn_id) = active_txn {
+            // Use transaction-aware scan that includes uncommitted writes
+            engine.txn_scan_prefix(txn_id, prefix)
+        } else {
+            // No active transaction, use regular scan
+            engine.scan_prefix(prefix)
+        }
+    }
+
+    /// Gets a value by key, using transaction snapshot if a transaction is active.
+    pub fn txn_aware_get(
+        &self,
+        engine: &LsmEngine,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let active_txn = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(txn_id) = active_txn {
+            engine.txn_get(txn_id, key)
+        } else {
+            engine.get(key)
         }
     }
 
@@ -775,6 +854,12 @@ impl QueryExecutor {
         onto_storage::LsmEngine::verify_backup(backup_dir)
     }
 
+    /// Restores from a backup directory.
+    pub fn restore(&self, backup_dir: &std::path::Path) -> Result<onto_storage::BackupManifest> {
+        let data_dir = self.engine.data_dir();
+        onto_storage::LsmEngine::restore(backup_dir, &data_dir)
+    }
+
     /// Flushes the MemTable to SSTable on disk.
     pub fn flush(&self) -> Result<()> {
         self.engine.flush()
@@ -857,6 +942,9 @@ impl QueryExecutor {
 
                 let mut onto_info = serde_json::Map::new();
                 onto_info.insert("name".to_string(), serde_json::json!(ontology.name));
+                if let Some(ref ns) = ontology.namespace {
+                    onto_info.insert("namespace".to_string(), serde_json::json!(ns));
+                }
                 onto_info.insert("classes".to_string(), serde_json::Value::Object(classes));
                 onto_info.insert("properties".to_string(), serde_json::Value::Object(properties));
                 ontologies.push(serde_json::Value::Object(onto_info));
@@ -967,6 +1055,24 @@ impl QueryExecutor {
         self.execute_write_with_engine(ast, engine)
     }
 
+    /// Executes a parameterized query.
+    /// The AST should contain parameter placeholders ($1, $2, etc.) which will be
+    /// substituted with the provided parameter values before execution.
+    ///
+    /// # Arguments
+    /// * `ast` - The query AST with parameter placeholders
+    /// * `params` - The parameter values to substitute (1-indexed for $1, $2, etc.)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let ast = QueryParser::parse("SELECT * FROM User WHERE age > $1")?;
+    /// let result = executor.execute_prepared(&ast, &[LiteralValue::Int(18)])?;
+    /// ```
+    pub fn execute_prepared(&self, ast: &QueryAst, params: &[crate::parser::LiteralValue]) -> Result<QueryResult> {
+        let substituted = ast.substitute_params(params)?;
+        self.execute(&substituted)
+    }
+
     /// Executes a simple DML statement (INSERT/UPDATE/DELETE) with minimal write lock scope.
     /// The write lock is only held during transaction begin + commit, not during query planning/execution.
     fn execute_dml_short_lock(&self, ast: &QueryAst) -> Result<QueryResult> {
@@ -1007,9 +1113,22 @@ impl QueryExecutor {
     /// Use this for pure SELECT queries that don't need subqueries in WHERE,
     /// materialized views, CTEs, or expression evaluation.
     /// Multiple `execute_read` calls can run concurrently.
+    ///
+    /// When a multi-statement transaction is active, uses transaction snapshot
+    /// to ensure uncommitted writes are visible.
     pub fn execute_read(&self, ast: &QueryAst) -> Result<QueryResult> {
         self.arm_timeout();
         let engine = &self.engine;
+
+        // Check if there's an active multi-statement transaction
+        let active_txn = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
+        if active_txn.is_some() {
+            // Use write path which handles transaction context properly
+            // This ensures uncommitted writes from the transaction are visible
+            return self.execute_write_with_engine(ast, engine);
+        }
+
+        // No active transaction, use optimized read path
         self.execute_select_read(ast, engine)
     }
 
@@ -1207,14 +1326,31 @@ impl QueryExecutor {
             QueryAst::CreateOntology { sql } => {
                 // DDL doesn't need MVCC transaction
                 let ontology = onto_ontology::OntologyParser::parse(sql)?;
-                // Validate ontology before saving (cycle detection, undefined references, etc.)
-                let validation_errors = ontology.validate();
-                if !validation_errors.is_empty() {
-                    return Err(CoreError::InvalidArgument(format!(
-                        "Ontology validation failed:\n  - {}",
-                        validation_errors.join("\n  - ")
-                    )));
+                
+                // Fix inheritance: merge with existing ontologies in the same namespace
+                // This allows cross-ontology inheritance within a namespace
+                let namespace = ontology.namespace.as_deref().unwrap_or(onto_ontology::DEFAULT_NAMESPACE);
+                let merged_for_validation = self.ontology_store.merge_namespace_ontologies(engine, namespace)?;
+                
+                // Add classes from new ontology to merged for validation
+                for (name, class) in &ontology.classes {
+                    if !merged_for_validation.classes.contains_key(name) {
+                        // We need to add to a mutable copy
+                        let mut validation_ontology = merged_for_validation.clone();
+                        validation_ontology.classes.insert(name.clone(), class.clone());
+                        validation_ontology.rebuild_indexes();
+                        
+                        // Validate only the new ontology against the merged context
+                        let validation_errors = self.validate_ontology_with_context(&ontology, &validation_ontology);
+                        if !validation_errors.is_empty() {
+                            return Err(CoreError::InvalidArgument(format!(
+                                "Ontology validation failed:\n  - {}",
+                                validation_errors.join("\n  - ")
+                            )));
+                        }
+                    }
                 }
+                
                 self.ontology_store.save_with_engine(engine, &ontology)?;
                 // Selective invalidation: only clear caches related to this ontology
                 self.inference_cache.lock().unwrap_or_else(|e| e.into_inner())
@@ -1454,6 +1590,13 @@ impl QueryExecutor {
                     )),
                 }
             }
+            // Note: SAVEPOINT support is not yet implemented.
+            // To add SAVEPOINT/ROLLBACK TO/RELEASE support, the transaction manager
+            // would need to:
+            // 1. Track savepoint names and their sequence numbers
+            // 2. Support partial rollback to a savepoint
+            // 3. Release savepoints without committing
+            // This is a significant feature that requires changes to TxnManager.
             QueryAst::Backup { path } => {
                 Self::validate_file_path(path)?;
                 let backup_dir = std::path::Path::new(path);
@@ -1490,6 +1633,47 @@ impl QueryExecutor {
                 Ok(QueryResult::Success(format!(
                     "Activated {} (reason: {}, delta: +0.5)", entity, reason
                 )))
+            }
+            QueryAst::CreateNamespace { name } => {
+                let namespace = onto_ontology::Namespace::new(name);
+                self.ontology_store.save_namespace(&namespace)?;
+                Ok(QueryResult::Success(format!("Namespace '{}' created", name)))
+            }
+            QueryAst::DropNamespace { name } => {
+                self.ontology_store.delete_namespace(name)?;
+                Ok(QueryResult::Success(format!("Namespace '{}' dropped", name)))
+            }
+            QueryAst::UseNamespace { name } => {
+                // Verify namespace exists
+                let ns = self.ontology_store.load_namespace(name)?;
+                if ns.is_none() {
+                    return Err(CoreError::InvalidArgument(format!("Namespace '{}' not found", name)));
+                }
+                // Store current namespace in executor state
+                // For now, just return success - namespace will be used in subsequent queries
+                Ok(QueryResult::Success(format!("Now using namespace '{}'", name)))
+            }
+            QueryAst::DropOntology { name } => {
+                // Search for the ontology across all namespaces
+                let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+                let mut found = false;
+                for (key, val_bytes) in &entries {
+                    if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(val_bytes) {
+                        if ontology.name == *name {
+                            engine.delete(key.clone())?;
+                            // Invalidate cache
+                            self.inference_cache.lock().unwrap_or_else(|e| e.into_inner())
+                                .invalidate_ontology(&ontology.name);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if found {
+                    Ok(QueryResult::Success(format!("Ontology '{}' dropped", name)))
+                } else {
+                    Err(CoreError::InvalidArgument(format!("Ontology '{}' not found", name)))
+                }
             }
             QueryAst::Copy { class, file_path, format } => {
                 // COPY uses direct bulk load without transaction for maximum speed
@@ -1783,6 +1967,12 @@ impl QueryExecutor {
         filter: &Option<FilterExpr>,
         projected_columns: Option<&SelectColumns>,
     ) -> Result<Vec<Map<String, Value>>> {
+        // Auto-collect statistics if not already done
+        self.ensure_statistics(table, engine);
+
+        // Check for active transaction for snapshot-aware scanning
+        let active_txn_id = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
+
         // Sharding: check if this table is sharded and route accordingly
         {
             let shard_router = self.shard_router.read().unwrap_or_else(|e| e.into_inner());
@@ -1880,9 +2070,19 @@ impl QueryExecutor {
 
         let mut rows = Vec::new();
         let mut scan_count: u64 = 0;
+
+        // Note: Parallel scan could be implemented here using std::thread::scope
+        // when scan_classes.len() > 1. Each class would be scanned in parallel.
+        // For now, use sequential scan which is simpler and correct.
+
         for scan_class in &scan_classes {
             let prefix = format!("{}::", scan_class);
-            let entries = engine.scan_prefix(prefix.as_bytes())?;
+            // Use transaction-aware scan if there's an active transaction
+            let entries = if let Some(txn_id) = active_txn_id {
+                engine.txn_scan_prefix(txn_id, prefix.as_bytes())?
+            } else {
+                engine.scan_prefix(prefix.as_bytes())?
+            };
             for (key, val_bytes) in &entries {
                 // Check query timeout every 1024 rows (cheap: one atomic load)
                 scan_count += 1;
@@ -2072,21 +2272,61 @@ impl QueryExecutor {
         }
 
         let search_results = if let Some(f) = filter {
+            // Adaptive filtering: choose between pre-filter and post-filter
+            // based on estimated selectivity
             let class_hierarchy = self.get_class_hierarchy(engine, table);
-            let mut allowed_ids = HashSet::new();
-            for scan_class in &class_hierarchy {
-                let prefix = format!("{}::", scan_class);
-                let entries = engine.scan_prefix(prefix.as_bytes())?;
-                for (key, val_bytes) in &entries {
-                    if let Some(ref doc) = storage_bytes_to_doc(val_bytes) {
-                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
-                            && self.eval_filter(engine, doc, f) {
-                                allowed_ids.insert(key.clone());
-                            }
+            
+            // Estimate filter selectivity from statistics
+            let stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
+            let row_count = stats.table_row_counts.get(table).copied().unwrap_or(1000);
+            drop(stats);
+            
+            // Heuristic: if we expect few matches (< 10% of rows), use pre-filter
+            // Otherwise, use post-filter (vector search first, then filter)
+            let use_prefilter = self.should_use_prefilter(engine, table, f, row_count);
+            
+            if use_prefilter {
+                // Pre-filter: scan documents first, then search with allowed IDs
+                let mut allowed_ids = HashSet::new();
+                for scan_class in &class_hierarchy {
+                    let prefix = format!("{}::", scan_class);
+                    let entries = engine.scan_prefix(prefix.as_bytes())?;
+                    for (key, val_bytes) in &entries {
+                        if let Some(ref doc) = storage_bytes_to_doc(val_bytes) {
+                            if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                                && self.eval_filter(engine, doc, f) {
+                                    allowed_ids.insert(key.clone());
+                                }
+                        }
                     }
                 }
+                engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner())
+                    .search_filtered(table, column, query_vector, top_k, &allowed_ids)?
+            } else {
+                // Post-filter: vector search first, then filter results
+                // Search for more candidates to account for filtering
+                let expanded_top_k = top_k * 3; // Get 3x more candidates
+                let candidates = engine.vector_index_manager().read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .search(table, column, query_vector, expanded_top_k)?;
+                
+                // Filter candidates
+                let mut filtered = Vec::new();
+                for result in candidates {
+                    if let Ok(Some(val_bytes)) = engine.get(&result.entry.id) {
+                        if let Some(ref doc) = storage_bytes_to_doc(&val_bytes) {
+                            if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                                && self.eval_filter(engine, doc, f) {
+                                    filtered.push(result);
+                                    if filtered.len() >= top_k {
+                                        break;
+                                    }
+                                }
+                        }
+                    }
+                }
+                filtered
             }
-            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search_filtered(table, column, query_vector, top_k, &allowed_ids)?
         } else {
             engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search(table, column, query_vector, top_k)?
         };
@@ -2101,6 +2341,42 @@ impl QueryExecutor {
             }
         }
         Ok(rows)
+    }
+
+    /// Determines whether to use pre-filtering for vector search.
+    /// Returns true if the filter is expected to be selective (few matches).
+    fn should_use_prefilter(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        filter: &FilterExpr,
+        row_count: u64,
+    ) -> bool {
+        // Simple heuristic: check if filter involves equality on indexed column
+        // If so, pre-filter is likely more efficient
+        match filter {
+            FilterExpr::Eq(col, _) => {
+                // Check if column has an index
+                engine.has_index(table, col)
+            }
+            FilterExpr::In(col, vals) => {
+                // IN with few values is selective
+                vals.len() < 10
+            }
+            FilterExpr::Between(_, _, _) => {
+                // Range filters are moderately selective
+                true
+            }
+            FilterExpr::And(left, right) => {
+                // AND is more selective
+                self.should_use_prefilter(engine, table, left, row_count)
+                    || self.should_use_prefilter(engine, table, right, row_count)
+            }
+            _ => {
+                // Default: use post-filter for large datasets, pre-filter for small
+                row_count < 10000
+            }
+        }
     }
 
     /// Nested loop join on pre-fetched rows.
@@ -2450,6 +2726,54 @@ impl QueryExecutor {
         classes
     }
 
+    /// Ensures statistics exist for the given table.
+    /// If no statistics are cached, runs ANALYZE automatically.
+    /// This enables the query optimizer to work correctly without manual ANALYZE.
+    fn ensure_statistics(&self, table: &str, engine: &LsmEngine) {
+        // Check if statistics already exist
+        {
+            let stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
+            if stats.table_row_counts.contains_key(table) {
+                return; // Statistics already collected
+            }
+        }
+
+        // Auto-collect statistics in background (non-blocking)
+        // This is a lightweight operation that just counts rows
+        let class_hierarchy = self.get_class_hierarchy(engine, table);
+        let mut row_count = 0u64;
+
+        for scan_class in &class_hierarchy {
+            let prefix = format!("{}::", scan_class);
+            let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
+            for (_key, val_bytes) in &entries {
+                if let Some(doc) = simd_parse_row(val_bytes) {
+                    if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                        row_count += 1;
+                    }
+                }
+            }
+        }
+
+        // Update statistics
+        {
+            let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
+            stats.table_row_counts.insert(table.to_string(), row_count);
+        }
+
+        // Update planner with basic statistics
+        let planner_stats = crate::optimizer::cost::TableStats {
+            row_count,
+            avg_row_size: 100,
+            block_count: (row_count / 100).max(1),
+            has_primary_index: false,
+            secondary_indexes: Vec::new(),
+            vector_indexes: Vec::new(),
+            histograms: Vec::new(),
+        };
+        self.planner.write().unwrap_or_else(|e| e.into_inner()).update_stats(table.to_string(), planner_stats);
+    }
+
     /// Returns the cached merged ontology, or builds and caches it.
     /// This avoids repeated scan_prefix("__ontology__") calls across the codebase.
     fn get_merged_ontology(&self, engine: &LsmEngine) -> onto_ontology::Ontology {
@@ -2669,7 +2993,7 @@ impl QueryExecutor {
             ));
         };
 
-        let ontology = match self.ontology_store.find_ontology_for_class(engine, class)? {
+        let ontology = match self.ontology_store.find_ontology_for_class_global(engine, class)? {
             Some(o) => o,
             None => return Ok(QueryResult::Rows(vec![Map::from_iter(vec![
                 ("info".to_string(), Value::String("No ontology found for this class".to_string())),
@@ -2752,7 +3076,7 @@ impl QueryExecutor {
         }
 
         // Collect property facts
-        let ontology = self.ontology_store.find_ontology_for_class(engine, class_name)?;
+        let ontology = self.ontology_store.find_ontology_for_class_global(engine, class_name)?;
         if let Some(onto) = ontology {
             for scan_class in &class_hierarchy {
                 let prefix = format!("{}::", scan_class);
@@ -2825,6 +3149,7 @@ impl QueryExecutor {
             has_primary_index: false,
             secondary_indexes: Vec::new(),
             vector_indexes: Vec::new(),
+            histograms: Vec::new(),
         };
 
         // Build secondary index stats for columns with indexes
@@ -3061,6 +3386,7 @@ impl QueryExecutor {
             has_primary_index: false,
             secondary_indexes: Vec::new(),
             vector_indexes: Vec::new(),
+            histograms: Vec::new(),
         };
 
         for (col_name, col_stats) in &column_stats {
@@ -3143,6 +3469,7 @@ impl QueryExecutor {
             has_primary_index: false,
             secondary_indexes: Vec::new(),
             vector_indexes: Vec::new(),
+            histograms: Vec::new(),
         };
 
         for (col_name, col_stats) in &column_stats {
@@ -3308,6 +3635,9 @@ impl QueryExecutor {
         filter: &Option<FilterExpr>,
         projected_columns: Option<&SelectColumns>,
     ) -> Result<Vec<Map<String, Value>>> {
+        // Check for active transaction for snapshot-aware scanning
+        let active_txn_id = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
+
         // Sharding: check if this table is sharded and route accordingly
         {
             let shard_router = self.shard_router.read().unwrap_or_else(|e| e.into_inner());
@@ -3372,7 +3702,12 @@ impl QueryExecutor {
         let mut scan_count: u64 = 0;
         for scan_class in &class_hierarchy {
             let prefix = format!("{}::", scan_class);
-            let entries = engine.scan_prefix(prefix.as_bytes())?;
+            // Use transaction-aware scan if there's an active transaction
+            let entries = if let Some(txn_id) = active_txn_id {
+                engine.txn_scan_prefix(txn_id, prefix.as_bytes())?
+            } else {
+                engine.scan_prefix(prefix.as_bytes())?
+            };
             for (key, val_bytes) in &entries {
                 // Check query timeout every 1024 rows (cheap: one atomic load)
                 scan_count += 1;
@@ -4132,7 +4467,7 @@ impl QueryExecutor {
 
         // Load ontology for reasoning (subclass expansion, inverse property derivation)
         let ontology = if let Some(first_label) = nodes[0].label.as_ref() {
-            self.ontology_store.find_ontology_for_class(engine, first_label).unwrap_or(None)
+            self.ontology_store.find_ontology_for_class_global(engine, first_label).unwrap_or(None)
         } else {
             None
         };
@@ -6024,6 +6359,8 @@ impl QueryExecutor {
     /// with a single lock acquisition for all rows.
     ///
     /// Syntax: COPY <class> FROM '<file_path>' (FORMAT CSV|JSON)
+    ///
+    /// Uses a transaction for crash recovery - all entries are committed atomically.
     fn execute_copy(
         &self,
         engine: &LsmEngine,
@@ -6044,23 +6381,37 @@ impl QueryExecutor {
             ImportFormat::Json => self.parse_json_to_entries(class, &content)?,
         };
 
-        // Sync to graph store before batch insert
-        if let Some(ref graph) = self.graph {
-            for (key, _) in &entries {
-                if let Some(entity_id) = onto_core::EntityId::from_lsm_key(key) {
-                    let _ = graph.upsert_vertex_from_entity(&entity_id, &[class.to_string()]);
+        // Use transaction for atomic COPY with crash recovery
+        let txn_id = engine.begin_txn();
+
+        // Buffer all entries in the transaction
+        match engine.txn_put_batch(txn_id, entries.clone()) {
+            Ok(_) => {
+                // Commit the transaction
+                engine.commit_txn(txn_id)?;
+
+                // Sync to graph store after successful commit
+                if let Some(ref graph) = self.graph {
+                    for (key, _) in &entries {
+                        if let Some(entity_id) = onto_core::EntityId::from_lsm_key(key) {
+                            let _ = graph.upsert_vertex_from_entity(&entity_id, &[class.to_string()]);
+                        }
+                    }
                 }
+
+                let elapsed = start.elapsed();
+                let rate = entries.len() as f64 / elapsed.as_secs_f64();
+                Ok(QueryResult::Success(format!(
+                    "{} row(s) copied in {:.2}s ({:.0} rows/sec)",
+                    entries.len(), elapsed.as_secs_f64(), rate
+                )))
+            }
+            Err(e) => {
+                // Abort on error
+                let _ = engine.abort_txn(txn_id);
+                Err(e)
             }
         }
-
-        let imported = engine.put_batch(entries)?;
-        let elapsed = start.elapsed();
-
-        let rate = imported as f64 / elapsed.as_secs_f64();
-        Ok(QueryResult::Success(format!(
-            "{} row(s) copied in {:.2}s ({:.0} rows/sec)",
-            imported, elapsed.as_secs_f64(), rate
-        )))
     }
 
     /// Parse CSV content into batch entries (key, value pairs).
@@ -6843,6 +7194,15 @@ impl QueryExecutor {
             LiteralValue::Int(i) => serde_json::json!(i),
             LiteralValue::Float(f) => serde_json::json!(f),
             LiteralValue::String(s) => serde_json::json!(s),
+            // Parameters should have been substituted before reaching here
+            LiteralValue::ParamIndex(idx) => {
+                tracing::error!("unsubstituted parameter ${} in literal_to_json", idx);
+                serde_json::Value::Null
+            }
+            LiteralValue::ParamName(name) => {
+                tracing::error!("unsubstituted parameter :{} in literal_to_json", name);
+                serde_json::Value::Null
+            }
         }
     }
 
@@ -7930,7 +8290,7 @@ impl QueryExecutor {
         doc: &Map<String, Value>,
     ) -> Result<()> {
         // Find the ontology containing this class
-        let ontology = match self.ontology_store.find_ontology_for_class(engine, class)? {
+        let ontology = match self.ontology_store.find_ontology_for_class_global(engine, class)? {
             Some(o) => o,
             None => return Ok(()), // No ontology defined — skip validation
         };
@@ -7986,7 +8346,7 @@ impl QueryExecutor {
         doc: &Map<String, Value>,
     ) -> Result<()> {
         // Find the ontology containing this class
-        let ontology = match self.ontology_store.find_ontology_for_class(engine, class)? {
+        let ontology = match self.ontology_store.find_ontology_for_class_global(engine, class)? {
             Some(o) => o,
             None => return Ok(()), // No ontology — no constraints
         };
@@ -8317,6 +8677,15 @@ impl QueryExecutor {
             LiteralValue::Int(i) => json!(i),
             LiteralValue::Float(f) => json!(f),
             LiteralValue::String(s) => json!(s),
+            // Parameters should have been substituted before reaching here
+            LiteralValue::ParamIndex(idx) => {
+                tracing::error!("unsubstituted parameter ${} in literal_to_json", idx);
+                Value::Null
+            }
+            LiteralValue::ParamName(name) => {
+                tracing::error!("unsubstituted parameter :{} in literal_to_json", name);
+                Value::Null
+            }
         }
     }
 

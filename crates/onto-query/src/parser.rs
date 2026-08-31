@@ -7,48 +7,7 @@
 
 use onto_core::{CoreError, Result};
 use serde::{Deserialize, Serialize};
-
-/// Find a substring case-insensitively (ASCII only).
-/// Returns the byte position in `haystack` where `needle` first occurs,
-/// or None if not found. This avoids `to_uppercase()` index misalignment
-/// with non-ASCII characters.
-fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    let needle_upper: Vec<u8> = needle.bytes().map(|b| b.to_ascii_uppercase()).collect();
-    let hay_bytes = haystack.as_bytes();
-    let nlen = needle_upper.len();
-    if hay_bytes.len() < nlen {
-        return None;
-    }
-    'outer: for i in 0..=hay_bytes.len() - nlen {
-        for j in 0..nlen {
-            if hay_bytes[i + j].to_ascii_uppercase() != needle_upper[j] {
-                continue 'outer;
-            }
-        }
-        return Some(i);
-    }
-    None
-}
-
-/// Check if `s` starts with `prefix` case-insensitively (ASCII only).
-/// Avoids allocating a new String via `to_uppercase()`.
-fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()]
-        .iter()
-        .zip(prefix.as_bytes())
-        .all(|(a, b)| a.eq_ignore_ascii_case(b))
-}
-
-/// Check if `s` ends with `suffix` case-insensitively (ASCII only).
-fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
-    s.len() >= suffix.len() && s.as_bytes()[s.len() - suffix.len()..]
-        .iter()
-        .zip(suffix.as_bytes())
-        .all(|(a, b)| a.eq_ignore_ascii_case(b))
-}
+use crate::parser_util::{find_ignore_ascii_case, starts_with_ignore_ascii_case, ends_with_ignore_ascii_case, safe_slice, safe_slice_from, trim_semicolons};
 
 /// Case-insensitive (ASCII) version of `find_unquoted`.
 /// Searches for `needle` in `haystack` while skipping quoted strings,
@@ -86,16 +45,6 @@ fn find_unquoted_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize
         i += 1;
     }
     None
-}
-
-/// Safely slice a string from `start` to end. Returns empty string if out of bounds.
-fn safe_slice_from(s: &str, start: usize) -> &str {
-    if start >= s.len() { "" } else { &s[start..] }
-}
-
-/// Safely slice a string from `start` to `end`. Returns empty string if out of bounds.
-fn safe_slice(s: &str, start: usize, end: usize) -> &str {
-    if start >= end || start >= s.len() || end > s.len() { "" } else { &s[start..end] }
 }
 
 /// File format for IMPORT command.
@@ -365,6 +314,20 @@ pub enum QueryAst {
 
     /// FLUSH — Flush MemTable to SSTable
     Flush,
+
+    // ── Namespace management ──────────────────────────────────────
+
+    /// CREATE NAMESPACE <name>
+    CreateNamespace { name: String },
+
+    /// DROP NAMESPACE <name>
+    DropNamespace { name: String },
+
+    /// USE NAMESPACE <name>
+    UseNamespace { name: String },
+
+    /// DROP ONTOLOGY <name>
+    DropOntology { name: String },
 }
 
 /// Column definition for CREATE TABLE.
@@ -468,6 +431,187 @@ impl QueryAst {
             QueryAst::Backup { .. } => false,
             QueryAst::Restore { .. } => false,
             QueryAst::Flush => false,
+
+            // Namespace operations
+            QueryAst::CreateNamespace { .. } => false,
+            QueryAst::DropNamespace { .. } => false,
+            QueryAst::UseNamespace { .. } => false,
+
+            // Ontology operations
+            QueryAst::DropOntology { .. } => false,
+        }
+    }
+
+    /// Substitutes positional parameters ($1, $2, etc.) with actual values.
+    /// Returns a new AST with all parameters replaced.
+    pub fn substitute_params(&self, params: &[LiteralValue]) -> Result<QueryAst> {
+        let mut substitutor = ParamSubstitutor { params };
+        substitutor.substitute_ast(self)
+    }
+
+    /// Returns true if this AST contains any parameter placeholders.
+    pub fn has_params(&self) -> bool {
+        let checker = ParamChecker { found: false };
+        checker.check_ast(self)
+    }
+}
+
+/// Helper to check if an AST contains parameters.
+struct ParamChecker {
+    found: bool,
+}
+
+impl ParamChecker {
+    fn check_ast(mut self, ast: &QueryAst) -> bool {
+        self.visit_ast(ast);
+        self.found
+    }
+
+    fn visit_ast(&mut self, ast: &QueryAst) {
+        if self.found { return; }
+        match ast {
+            QueryAst::Select { filter, .. } => {
+                if let Some(f) = filter { self.visit_filter(f); }
+            }
+            QueryAst::Insert { values, .. } => {
+                for v in values { self.visit_value(v); }
+            }
+            QueryAst::Update { assignments, filter, .. } => {
+                for (_, v) in assignments { self.visit_value(v); }
+                if let Some(f) = filter { self.visit_filter(f); }
+            }
+            QueryAst::Delete { filter, .. } => {
+                if let Some(f) = filter { self.visit_filter(f); }
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_filter(&mut self, filter: &FilterExpr) {
+        if self.found { return; }
+        match filter {
+            FilterExpr::Eq(_, v) | FilterExpr::Ne(_, v) |
+            FilterExpr::Gt(_, v) | FilterExpr::Lt(_, v) |
+            FilterExpr::Gte(_, v) | FilterExpr::Lte(_, v) => self.visit_value(v),
+            FilterExpr::Between(_, lo, hi) => {
+                self.visit_value(lo);
+                self.visit_value(hi);
+            }
+            FilterExpr::In(_, vals) => {
+                for v in vals { self.visit_value(v); }
+            }
+            FilterExpr::Not(f) => self.visit_filter(f),
+            FilterExpr::And(l, r) | FilterExpr::Or(l, r) => {
+                self.visit_filter(l);
+                self.visit_filter(r);
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_value(&mut self, value: &LiteralValue) {
+        match value {
+            LiteralValue::ParamIndex(_) | LiteralValue::ParamName(_) => {
+                self.found = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Helper to substitute parameters in an AST.
+struct ParamSubstitutor<'a> {
+    params: &'a [LiteralValue],
+}
+
+impl<'a> ParamSubstitutor<'a> {
+    fn substitute_ast(&mut self, ast: &QueryAst) -> Result<QueryAst> {
+        match ast {
+            QueryAst::Select { distinct, columns, from, from_alias, joins, filter, group_by, having, order_by, limit, offset } => {
+                Ok(QueryAst::Select {
+                    distinct: *distinct,
+                    columns: columns.clone(),
+                    from: from.clone(),
+                    from_alias: from_alias.clone(),
+                    joins: joins.clone(),
+                    filter: filter.as_ref().map(|f| self.substitute_filter(f)).transpose()?,
+                    group_by: group_by.clone(),
+                    having: having.as_ref().map(|f| self.substitute_filter(f)).transpose()?,
+                    order_by: order_by.clone(),
+                    limit: *limit,
+                    offset: *offset,
+                })
+            }
+            QueryAst::Insert { class, columns, values } => {
+                Ok(QueryAst::Insert {
+                    class: class.clone(),
+                    columns: columns.clone(),
+                    values: values.iter().map(|v| self.substitute_value(v)).collect::<Result<Vec<_>>>()?,
+                })
+            }
+            QueryAst::Update { class, assignments, filter } => {
+                Ok(QueryAst::Update {
+                    class: class.clone(),
+                    assignments: assignments.iter().map(|(k, v)| {
+                        Ok((k.clone(), self.substitute_value(v)?))
+                    }).collect::<Result<Vec<_>>>()?,
+                    filter: filter.as_ref().map(|f| self.substitute_filter(f)).transpose()?,
+                })
+            }
+            QueryAst::Delete { class, filter } => {
+                Ok(QueryAst::Delete {
+                    class: class.clone(),
+                    filter: filter.as_ref().map(|f| self.substitute_filter(f)).transpose()?,
+                })
+            }
+            // For other AST types, return as-is (no parameter substitution)
+            _ => Ok(ast.clone()),
+        }
+    }
+
+    fn substitute_filter(&mut self, filter: &FilterExpr) -> Result<FilterExpr> {
+        match filter {
+            FilterExpr::Eq(col, v) => Ok(FilterExpr::Eq(col.clone(), self.substitute_value(v)?)),
+            FilterExpr::Ne(col, v) => Ok(FilterExpr::Ne(col.clone(), self.substitute_value(v)?)),
+            FilterExpr::Gt(col, v) => Ok(FilterExpr::Gt(col.clone(), self.substitute_value(v)?)),
+            FilterExpr::Lt(col, v) => Ok(FilterExpr::Lt(col.clone(), self.substitute_value(v)?)),
+            FilterExpr::Gte(col, v) => Ok(FilterExpr::Gte(col.clone(), self.substitute_value(v)?)),
+            FilterExpr::Lte(col, v) => Ok(FilterExpr::Lte(col.clone(), self.substitute_value(v)?)),
+            FilterExpr::Between(col, lo, hi) => {
+                Ok(FilterExpr::Between(col.clone(), self.substitute_value(lo)?, self.substitute_value(hi)?))
+            }
+            FilterExpr::In(col, vals) => {
+                Ok(FilterExpr::In(col.clone(), vals.iter().map(|v| self.substitute_value(v)).collect::<Result<Vec<_>>>()?))
+            }
+            FilterExpr::Not(f) => Ok(FilterExpr::Not(Box::new(self.substitute_filter(f)?))),
+            FilterExpr::And(l, r) => {
+                Ok(FilterExpr::And(Box::new(self.substitute_filter(l)?), Box::new(self.substitute_filter(r)?)))
+            }
+            FilterExpr::Or(l, r) => {
+                Ok(FilterExpr::Or(Box::new(self.substitute_filter(l)?), Box::new(self.substitute_filter(r)?)))
+            }
+            // For other filter types, return as-is
+            _ => Ok(filter.clone()),
+        }
+    }
+
+    fn substitute_value(&mut self, value: &LiteralValue) -> Result<LiteralValue> {
+        match value {
+            LiteralValue::ParamIndex(idx) => {
+                if *idx == 0 || *idx > self.params.len() {
+                    return Err(CoreError::InvalidArgument(
+                        format!("parameter index ${} out of range (1-{})", idx, self.params.len())
+                    ));
+                }
+                Ok(self.params[idx - 1].clone())
+            }
+            LiteralValue::ParamName(name) => {
+                // Named parameters not yet supported in this simple implementation
+                Err(CoreError::InvalidArgument(
+                    format!("named parameter :{} not yet supported, use positional $1, $2, etc.", name)
+                ))
+            }
+            _ => Ok(value.clone()),
         }
     }
 }
@@ -663,6 +807,11 @@ pub enum LiteralValue {
     Int(i64),
     Float(f64),
     String(String),
+    /// Positional parameter placeholder ($1, $2, etc.)
+    /// The value is the 1-based parameter index.
+    ParamIndex(usize),
+    /// Named parameter placeholder (:param_name)
+    ParamName(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,4 +1,4 @@
-﻿//! Runtime metrics collection and Prometheus export for OntoDB.
+//! Runtime metrics collection and Prometheus export for OntoDB.
 //!
 //! Collects and exposes metrics in Prometheus exposition format.
 
@@ -316,6 +316,53 @@ impl Metrics {
         self.sstable_count.set(sstables as u64);
         self.storage_entries.set(entries as u64);
         self.compactions_total.set(compactions);
+    }
+
+    /// Collects system resource metrics (memory, disk, file descriptors).
+    /// This should be called periodically by a background task.
+    #[cfg(target_os = "windows")]
+    pub fn collect_system_metrics(&self) {
+        // Windows: basic memory info via GlobalMemoryStatusEx
+        // For now, just set placeholder values
+        // In production, use windows-sys crate for accurate metrics
+        self.memory_usage_bytes.set(0);
+        self.open_file_descriptors.set(0);
+    }
+
+    /// Collects system resource metrics (memory, disk, file descriptors).
+    /// This should be called periodically by a background task.
+    #[cfg(target_os = "linux")]
+    pub fn collect_system_metrics(&self) {
+        use std::fs;
+        
+        // Read process memory from /proc/self/status
+        if let Ok(status) = fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if line.starts_with("VmRSS:") {
+                    if let Some(kb_str) = line.split_whitespace().nth(1) {
+                        if let Ok(kb) = kb_str.parse::<u64>() {
+                            self.memory_usage_bytes.set(kb * 1024); // Convert KB to bytes
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Count open file descriptors from /proc/self/fd
+        if let Ok(entries) = fs::read_dir("/proc/self/fd") {
+            let count = entries.count();
+            self.open_file_descriptors.set(count as u64);
+        }
+    }
+
+    /// Collects system resource metrics (memory, disk, file descriptors).
+    /// This should be called periodically by a background task.
+    #[cfg(target_os = "macos")]
+    pub fn collect_system_metrics(&self) {
+        // macOS: use sysctl or mach APIs
+        // For now, just set placeholder values
+        self.memory_usage_bytes.set(0);
+        self.open_file_descriptors.set(0);
     }
 
     /// Export all metrics in Prometheus exposition format.
