@@ -52,6 +52,12 @@ try:
 except ImportError:
     pass
 
+# Import AI integrations (optional)
+try:
+    from . import ai
+except ImportError:
+    pass
+
 __all__ = [
     "OntoDB",
     "OntoDBError",
