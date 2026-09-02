@@ -50,6 +50,9 @@ pub struct Reasoner {
     ontology: Ontology,
     rules: Vec<Box<dyn Rule>>,
     max_iterations: usize,
+    /// Maximum number of facts allowed during reasoning.
+    /// Prevents memory explosion from transitive closure.
+    max_facts: usize,
 }
 
 impl Reasoner {
@@ -59,6 +62,7 @@ impl Reasoner {
             ontology,
             rules: default_rules(),
             max_iterations: 100,
+            max_facts: 1_000_000, // Default: 1M facts
         }
     }
 
@@ -68,12 +72,19 @@ impl Reasoner {
             ontology,
             rules,
             max_iterations: 100,
+            max_facts: 1_000_000,
         }
     }
 
     /// Sets the maximum number of inference iterations.
     pub fn with_max_iterations(mut self, max: usize) -> Self {
         self.max_iterations = max;
+        self
+    }
+
+    /// Sets the maximum number of facts allowed during reasoning.
+    pub fn with_max_facts(mut self, max: usize) -> Self {
+        self.max_facts = max;
         self
     }
 
@@ -99,6 +110,7 @@ impl Reasoner {
         let mut rule_counts: HashMap<RuleId, usize> = HashMap::new();
         let mut iterations = 0;
         let mut new_facts: Vec<Triple> = Vec::new();
+        let mut budget_exceeded = false;
 
         // Fast path: transitive closure using adjacency BFS
         let mut transitive_handled: HashSet<String> = HashSet::new();
@@ -106,6 +118,13 @@ impl Reasoner {
             if !prop_def.is_transitive {
                 continue;
             }
+            
+            // Check fact budget before processing transitive property
+            if all_facts.len() >= self.max_facts {
+                budget_exceeded = true;
+                break;
+            }
+            
             transitive_handled.insert(prop_name.clone());
 
             // Build adjacency list
@@ -122,6 +141,12 @@ impl Reasoner {
             // BFS from each source
             let mut new_transitive = Vec::new();
             for (start, targets) in &adj {
+                // Check budget during BFS
+                if all_facts.len() + new_transitive.len() >= self.max_facts {
+                    budget_exceeded = true;
+                    break;
+                }
+                
                 let mut visited: HashSet<&str> = HashSet::new();
                 let mut queue: VecDeque<&str> = VecDeque::new();
                 for t in targets {
@@ -129,6 +154,12 @@ impl Reasoner {
                     queue.push_back(t);
                 }
                 while let Some(node) = queue.pop_front() {
+                    // Check budget during BFS
+                    if all_facts.len() + new_transitive.len() >= self.max_facts {
+                        budget_exceeded = true;
+                        break;
+                    }
+                    
                     let t = Triple::new(*start, prop_name.as_str(), node);
                     if !all_facts.contains(&t) {
                         new_transitive.push(t);
@@ -141,14 +172,20 @@ impl Reasoner {
                         }
                     }
                 }
+                
+                if budget_exceeded {
+                    break;
+                }
             }
 
-            let count = new_transitive.len();
-            if count > 0 {
-                rule_counts.insert(RuleId::PrpTrp, count);
-                for t in new_transitive {
-                    all_facts.insert(t.clone());
-                    all_inferred.push(t);
+            if !budget_exceeded {
+                let count = new_transitive.len();
+                if count > 0 {
+                    rule_counts.insert(RuleId::PrpTrp, count);
+                    for t in new_transitive {
+                        all_facts.insert(t.clone());
+                        all_inferred.push(t);
+                    }
                 }
             }
         }

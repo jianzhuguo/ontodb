@@ -364,12 +364,10 @@ impl LsmEngine {
     }
 
     /// Puts a key-value pair.
+    /// Single writes rely on the background WAL sync thread (100ms window).
     pub fn put(&self, key: Key, value: Value) -> Result<()> {
         let seq = self.next_seq();
         let entry = Entry::put(key.clone(), value.clone(), seq);
-
-        // Record write for memory manager
-        self.memory_manager.record_write();
 
         let needs_flush = {
             let mut ws = self.write_state.write();
@@ -379,17 +377,10 @@ impl LsmEngine {
             if ws.wal_pending_count >= 64 {
                 ws.wal.flush_buf()?;
                 ws.wal_pending_count = 0;
-                // Check if WAL rotation is needed
-                if ws.wal.needs_rotation() {
-                    let _archive = ws.wal.rotate()?;
-                    tracing::info!("WAL rotated to {:?}", _archive);
-                }
             }
             ws.memtable.put_with_seq(key, value, seq);
-            ws.memtable.size() >= self.memory_manager.memtable_size()
+            ws.memtable.size() >= self.options.memtable_size_limit
         };
-        // write_state lock released here
-        // WAL sync is handled by background thread (100ms interval)
 
         if needs_flush {
             self.flush_memtable()?;
@@ -414,11 +405,6 @@ impl LsmEngine {
 
         let count = entries.len();
 
-        // Record writes for memory manager
-        for _ in 0..count {
-            self.memory_manager.record_write();
-        }
-
         let (needs_flush, should_sync) = {
             let mut ws = self.write_state.write();
             for (key, value) in entries {
@@ -431,9 +417,8 @@ impl LsmEngine {
             // Flush WAL buffer once for the entire batch
             ws.wal.flush_buf()?;
             ws.wal_pending_count = 0;
-            (ws.memtable.size() >= self.memory_manager.memtable_size(), self.options.sync_wal_on_commit)
+            (ws.memtable.size() >= self.options.memtable_size_limit, self.options.sync_wal_on_commit)
         };
-        // write_state lock released here
 
         // Group commit: batch sync across concurrent writers
         if should_sync {
@@ -1776,17 +1761,20 @@ impl LsmEngine {
     /// Steps:
     /// 1. Flush MemTable → SSTable (ensure all data persisted)
     /// 2. Flush disk indexes
-    /// 3. Copy all `.sst` files, `wal.log`, and `indexes/*.idx`
-    /// 4. Write a manifest file listing all copied files
+    /// 3. Snapshot SSTable paths (after flush, before copy)
+    /// 4. Copy all `.sst` files, `wal.log`, and `indexes/*.idx`
+    /// 5. Write a manifest file listing all copied files
     ///
-    /// The backup is a consistent snapshot that can be restored with `restore()`.
+    /// The backup is a consistent snapshot because:
+    /// - MemTable is flushed before copying
+    /// - SSTable paths are snapshotted after flush
+    /// - New writes after flush go to a new MemTable (not in backup)
+    /// - WAL is copied after SSTables (captures any post-flush writes)
     pub fn backup(&self, backup_dir: &Path) -> Result<BackupManifest> {
         // Step 1: Flush MemTable to ensure all data is in SSTables
         self.flush()?;
 
         // Step 2: Flush disk indexes
-        // (access via index_manager_mut to flush)
-        // We need a helper to flush all disk indexes
         self.flush_disk_indexes()?;
 
         // Step 3: Create backup directory
@@ -1801,7 +1789,7 @@ impl LsmEngine {
             base_timestamp: None,
         };
 
-        // Step 4: Copy SSTable files
+        // Step 4: Snapshot SSTable paths (consistent point-in-time)
         let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
         let mut sst_paths: Vec<PathBuf> = Vec::new();
         for level in levels.iter() {

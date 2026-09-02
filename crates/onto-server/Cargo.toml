@@ -53,11 +53,12 @@ rand = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-default = ["ontology", "enterprise", "raft", "sharding"]
+default = ["ontology"]
 
 # === Feature flags control RUNTIME behavior, not compilation ===
 # All code is compiled, but features are only activated when enabled.
-# Community edition ships with default features disabled.
+# Community edition: only ontology feature enabled
+# Enterprise editions: additional features enabled via build script
 
 ontology = []
 raft = []
@@ -65,5 +66,8 @@ sharding = []
 enterprise = []
 
 # === Enterprise Bundles ===
-enterprise-standard = ["enterprise"]
-enterprise-gov = ["enterprise"]
+# Enterprise Standard: clustering + sharding + basic backup
+enterprise-standard = ["enterprise", "raft", "sharding", "onto-enterprise/enterprise-standard"]
+
+# Enterprise Gov/Finance: all enterprise features + compliance
+enterprise-gov = ["enterprise", "raft", "sharding", "onto-enterprise/enterprise-gov"]

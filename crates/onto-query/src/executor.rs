@@ -379,12 +379,34 @@ impl InferenceCache {
 
     /// Selective invalidation: clear all caches that depend on ontology structure.
     fn invalidate_ontology(&mut self, _ontology_name: &str) {
+        // For now, clear all caches when ontology changes
+        // TODO: Implement fine-grained invalidation based on affected classes
         self.class_hierarchy.clear();
         self.property_aliases.clear();
         self.inverse_property.clear();
         self.transitive_closure.clear();
         self.merged_ontology = None; // Must rebuild merged ontology
         self.class_properties.clear();
+    }
+
+    /// Fine-grained invalidation: only clear caches related to specific classes.
+    /// This is more efficient than clearing all caches when only a few classes change.
+    pub fn invalidate_classes(&mut self, affected_classes: &[String]) {
+        // Clear class hierarchy cache for affected classes
+        for class in affected_classes {
+            self.class_hierarchy.remove(class);
+        }
+        
+        // Clear property cache for affected classes
+        for class in affected_classes {
+            self.class_properties.remove(class);
+        }
+        
+        // Clear merged ontology (needs rebuild when any class changes)
+        self.merged_ontology = None;
+        
+        // Note: inverse_property and transitive_closure are not class-specific,
+        // so they don't need to be cleared for class-level changes
     }
 }
 
@@ -990,17 +1012,29 @@ impl QueryExecutor {
     /// engine may have tombstone inconsistencies where get() returns None but
     /// scan_prefix() still finds the key (e.g. after memtable flush without
     /// compaction).
+    /// Drops an ontology by name.
+    /// Handles both namespaced and non-namespaced ontology keys.
     pub fn drop_ontology(&self, name: &str) -> Result<()> {
-        let key = format!("__ontology__{}", name);
         let engine = &self.engine;
 
         // Check existence via scan_prefix (more reliable than get with tombstones)
         let prefix = b"__ontology__";
         let entries = engine.scan_prefix(prefix).unwrap_or_default();
-        let found = entries.iter().any(|(k, _)| k == key.as_bytes());
+        
+        // Try to find the ontology with various key formats
+        let mut found_key: Option<Vec<u8>> = None;
+        for (k, _) in &entries {
+            let key_str = String::from_utf8_lossy(k);
+            // Match exact name or namespaced name (e.g., "__ontology___default::ValueHub")
+            if key_str == format!("__ontology__{}", name) || 
+               key_str.ends_with(&format!("::{}", name)) {
+                found_key = Some(k.clone());
+                break;
+            }
+        }
 
-        if found {
-            engine.delete(key.as_bytes().to_vec())?;
+        if let Some(key) = found_key {
+            engine.delete(key)?;
             tracing::info!("Dropped ontology '{}'", name);
             Ok(())
         } else {
@@ -7203,6 +7237,13 @@ impl QueryExecutor {
                 tracing::error!("unsubstituted parameter :{} in literal_to_json", name);
                 serde_json::Value::Null
             }
+            LiteralValue::Array(arr) => {
+                let json_arr: Vec<serde_json::Value> = arr
+                    .iter()
+                    .map(|v| Self::literal_to_json_static(v))
+                    .collect();
+                serde_json::Value::Array(json_arr)
+            }
         }
     }
 
@@ -8685,6 +8726,13 @@ impl QueryExecutor {
             LiteralValue::ParamName(name) => {
                 tracing::error!("unsubstituted parameter :{} in literal_to_json", name);
                 Value::Null
+            }
+            LiteralValue::Array(arr) => {
+                let json_arr: Vec<Value> = arr
+                    .iter()
+                    .map(|v| self.literal_to_json(v))
+                    .collect();
+                Value::Array(json_arr)
             }
         }
     }

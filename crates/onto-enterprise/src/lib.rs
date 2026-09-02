@@ -218,7 +218,7 @@ impl EnterpriseFeatures {
         // Initialize license validator based on tier
         let license = match tier {
             ProductTier::Community => {
-                tracing::info!("Community edition - no license required");
+                // Community edition - silently use community license
                 license::LicenseValidator::community()
             }
             _ => {

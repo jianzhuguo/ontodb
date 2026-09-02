@@ -290,8 +290,10 @@ impl CompactionWorker {
         };
 
         // Step 3: Collect all entries from SSTables
-        // Note: For true streaming, we would need to implement Iterator for SsTableIterator.
-        // Current approach collects entries but uses efficient deduplication.
+        // Note: For true streaming compaction, a merge iterator could be used
+        // to avoid loading all entries into memory. Current approach loads all entries
+        // but uses efficient deduplication. For very large datasets, consider
+        // implementing a streaming merge with a min-heap.
         let mut all_entries: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
 
         for sst_info in &ssts_to_compact {

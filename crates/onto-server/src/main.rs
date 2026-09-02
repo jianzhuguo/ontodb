@@ -83,11 +83,11 @@ struct Args {
     api_keys_file: Option<PathBuf>,
 
     /// Default rate limit (requests per minute)
-    #[arg(long, default_value = "60", env = "RATE_LIMIT_RPM")]
+    #[arg(long, default_value = "600", env = "RATE_LIMIT_RPM")]
     rate_limit: u32,
 
     /// Rate limit burst size
-    #[arg(long, default_value = "10", env = "RATE_LIMIT_BURST")]
+    #[arg(long, default_value = "100", env = "RATE_LIMIT_BURST")]
     burst_size: u32,
 
     /// Disable rate limiting
@@ -248,6 +248,7 @@ fn main() -> Result<()> {
         println!("Features: {}", license.features.join(", "));
     }
 
+    let data_dir = args.data_dir.clone();
     let options = StorageOptions {
         data_dir: args.data_dir,
         memtable_size_limit: args.memtable_size,
@@ -379,7 +380,7 @@ fn main() -> Result<()> {
                 let pg_auth = auth_config.clone();
                 let mysql_auth = auth_config.clone();
                 let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), onto_core::CoreError>> + Send>>> = vec![
-                    Box::pin(run_http_server(&http_addr, executor.clone(), auth_config, rate_limit_config, metrics.clone(), audit_config, args.raft_node_id, args.api_keys_file.clone(), args.cors_origins.clone(), tls_config, graph_store.clone())),
+                    Box::pin(run_http_server(&http_addr, executor.clone(), auth_config, rate_limit_config, metrics.clone(), audit_config, args.raft_node_id, args.api_keys_file.clone(), args.cors_origins.clone(), tls_config, graph_store.clone(), data_dir.clone())),
                     Box::pin(run_tcp_server(&args.listen, executor.clone(), metrics.clone())),
                 ];
 
@@ -538,9 +539,10 @@ async fn run_http_server(
     cors_origins: String,
     tls_config: Option<tls::TlsConfig>,
     graph: Arc<onto_graph::GraphStore>,
+    data_dir: PathBuf,
 ) -> Result<()> {
     let audit = Arc::new(audit::AuditLogger::new(audit_config));
-    let state = http::AppState { executor, metrics, graph, audit, raft_node_id };
+    let state = http::AppState { executor, metrics, graph, audit, raft_node_id, data_dir };
     let auth_state = AuthState::new(&auth_config).with_metrics(state.metrics.clone());
 
     // Enable hot-reload for auth config file (check every 10 seconds)

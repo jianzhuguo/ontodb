@@ -209,6 +209,80 @@ var W=0,H=0,nodes=[],edges=[],hoverN=null,dragN=null,dragOff={x:0,y:0};
 var COL={anchor:'#7aa2f7',dept:'#bb9af7',emp:'#9ece6a',proj:'#e0af68',server:'#f7768e',customer:'#f97316',lead:'#ec4899',alert:'#7dcfff'};
 var selectedNode=null, expandedNodes={};
 var allData={depts:[],emps:[],projs:[],srvs:[],alerts:[],custs:[],leads:[],metrics:[]};
+var currentLayoutId='default';
+var saveTimer=null;
+
+// ── Layout Persistence ──
+function saveLayout(){
+  var layoutData = {
+    layout_id: currentLayoutId,
+    nodes: nodes.map(function(n){ return {id:n.id, type:n.type, x:n.x, y:n.y, fixed:n.fixed||false, info:n.info||{}}; }),
+    edges: edges,
+    metadata: {expandedNodes: expandedNodes, selectedNode: selectedNode?selectedNode.id:null}
+  };
+  
+  fetch('/api/digital-twin/layout', {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(layoutData)
+  }).then(function(r){return r.json();}).then(function(data){
+    if(data.error) console.error('Save failed:', data.error);
+    else console.log('Layout saved:', currentLayoutId);
+  }).catch(function(e){ console.error('Save error:', e); });
+}
+
+function loadLayout(layoutId){
+  layoutId = layoutId || currentLayoutId;
+  currentLayoutId = layoutId;
+  
+  fetch('/api/digital-twin/layout?layout_id=' + encodeURIComponent(layoutId))
+    .then(function(r){return r.json();})
+    .then(function(response){
+      var data = response.data || response;
+      if(data.nodes && Array.isArray(data.nodes) && data.nodes.length > 0){
+        // Restore node positions
+        var savedNodes = {};
+        data.nodes.forEach(function(n){ savedNodes[n.id] = n; });
+        
+        nodes.forEach(function(n){
+          var saved = savedNodes[n.id];
+          if(saved){
+            n.x = saved.x;
+            n.y = saved.y;
+            n.fixed = saved.fixed || false;
+          }
+        });
+        
+        // Restore metadata
+        if(data.metadata){
+          expandedNodes = data.metadata.expandedNodes || {};
+          if(data.metadata.selectedNode){
+            selectedNode = findN(data.metadata.selectedNode);
+          }
+        }
+        
+        console.log('Layout restored:', layoutId);
+      }
+    })
+    .catch(function(e){ console.error('Load error:', e); });
+}
+
+// Auto-save every 30 seconds
+function startAutoSave(){
+  if(saveTimer) clearInterval(saveTimer);
+  saveTimer = setInterval(function(){
+    if(nodes.length > 0) saveLayout();
+  }, 30000);
+}
+
+// Save on significant changes
+function onLayoutChange(){
+  // Debounce: save after 2 seconds of no changes
+  if(saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(function(){
+    if(nodes.length > 0) saveLayout();
+  }, 2000);
+}
 
 function fit(){W=cv.width=cv.parentElement.clientWidth;H=cv.height=cv.parentElement.clientHeight;}
 window.addEventListener('resize',fit);
@@ -346,7 +420,10 @@ cv.addEventListener('mousemove',function(e){
   cv.style.cursor=hoverN?'pointer':'default';
 });
 cv.addEventListener('mousedown',function(e){if(hoverN){dragN=hoverN;var rect=cv.getBoundingClientRect();dragOff={x:hoverN.x-(e.clientX-rect.left),y:hoverN.y-(e.clientY-rect.top)};}});
-cv.addEventListener('mouseup',function(){dragN=null;});
+cv.addEventListener('mouseup',function(){
+  if(dragN && dragN.fixed) onLayoutChange(); // Save when node is moved and fixed
+  dragN=null;
+});
 cv.addEventListener('click',function(e){
   if(dragN)return; // Was a drag, not a click
   var rect=cv.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;
@@ -361,6 +438,18 @@ cv.addEventListener('click',function(e){
     document.getElementById('tab-explore').classList.add('active');
     showNodeDetail(clicked);
     expandRelations(clicked);
+  }
+});
+// Double-click to toggle fixed state
+cv.addEventListener('dblclick',function(e){
+  var rect=cv.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;
+  for(var i=nodes.length-1;i>=0;i--){
+    var n=nodes[i],dx=mx-n.x,dy=my-n.y;
+    if(dx*dx+dy*dy<(n.r+4)*(n.r+4)){
+      n.fixed=!n.fixed;
+      onLayoutChange();
+      break;
+    }
   }
 });
 
@@ -641,29 +730,29 @@ function build(d){
     nodes.push({id:'d_'+dd.dept_code,label:dd.dept_name,type:'dept',x:cx0+Math.cos(angle)*radius,y:cy0+Math.sin(angle)*radius,vx:0,vy:0,fixed:false,r:14,info:{code:dd.dept_code,head:dd.dept_head,budget:(dd.dept_budget/10000).toFixed(0)+'万',level:2}});
     edges.push({from:'anchor',to:'d_'+dd.dept_code,type:'semantic'});}
   var l3=d.depts.filter(function(x){return x.dept_level===3;});
-  for(var i=0;i<l3.length;i++){var dd=l3[i],pn=findN('d_'+dd.dept_parent);if(!pn)continue;var angle=2*Math.PI*i/l3.length,r=60+Math.random()*20;
+  for(var i=0;i<l3.length;i++){var dd=l3[i],pn=findN('d_'+dd.dept_parent);if(!pn)continue;var angle=2*Math.PI*i/l3.length,r=60+i*5;
     nodes.push({id:'d_'+dd.dept_code,label:dd.dept_name,type:'dept',x:pn.x+Math.cos(angle)*r,y:pn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:9,info:{code:dd.dept_code,head:dd.dept_head,budget:(dd.dept_budget/10000).toFixed(0)+'万',level:3}});
     edges.push({from:'d_'+dd.dept_parent,to:'d_'+dd.dept_code,type:'contains'});}
   var de={};d.emps.forEach(function(e){if(!de[e.emp_department])de[e.emp_department]=[];de[e.emp_department].push(e);});
   for(var dept in de){var dn=findN('d_'+dept);if(!dn)continue;var es=de[dept];es.sort(function(a,b){return (a.emp_id||'').localeCompare(b.emp_id||'');});
-    for(var j=0;j<Math.min(es.length,5);j++){var e=es[j],angle=2*Math.PI*j/es.length+Math.random()*.3,r=40+Math.random()*15;
+    for(var j=0;j<Math.min(es.length,5);j++){var e=es[j],angle=2*Math.PI*j/es.length,r=40+j*5;
       nodes.push({id:'e_'+e.emp_id,label:e.emp_name,type:'emp',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:7,info:{emp_id:e.emp_id,dept:e.emp_department,title:e.emp_title,salary:(e.emp_salary/1000).toFixed(0)+'K',email:e.emp_email}});
       edges.push({from:'d_'+dept,to:'e_'+e.emp_id,type:'belongs'});}}
-  for(var i=0;i<d.projs.length;i++){var p=d.projs[i],dn=findN('d_'+p.proj_department);if(!dn)continue;var angle=2*Math.PI*i/d.projs.length+1,r=70+Math.random()*30;
+  for(var i=0;i<d.projs.length;i++){var p=d.projs[i],dn=findN('d_'+p.proj_department);if(!dn)continue;var angle=2*Math.PI*i/d.projs.length+1,r=70+i*10;
     nodes.push({id:'p_'+p.proj_code,label:p.proj_name,type:'proj',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:8,info:{code:p.proj_code,dept:p.proj_department,status:p.proj_status,budget:(p.proj_budget/10000).toFixed(0)+'万',progress:p.proj_progress+'%'}});
     edges.push({from:'d_'+p.proj_department,to:'p_'+p.proj_code,type:'contains'});}
   for(var i=0;i<d.srvs.length;i++){var s=d.srvs[i],angle=2*Math.PI*i/d.srvs.length+0.5,radius=Math.min(W,H)*0.38;
     nodes.push({id:'s_'+s.srv_node_id,label:s.srv_name,type:'server',x:cx0+Math.cos(angle)*radius,y:cy0+Math.sin(angle)*radius,vx:0,vy:0,fixed:false,r:10,info:{node_id:s.srv_node_id,role:s.srv_role,region:s.srv_region,cpu:s.srv_cpu_cores+'核',mem:s.srv_memory_gb+'G',storage:s.srv_storage_tb+'TB',status:s.srv_status}});
     edges.push({from:'anchor',to:'s_'+s.srv_node_id,type:'hosts'});}
-  for(var i=0;i<d.custs.length;i++){var c=d.custs[i],dn=findN('d_SALES')||findN('d_SALES_EAST')||nodes[1];var angle=2*Math.PI*i/d.custs.length-0.5,r=80+Math.random()*30;
+  for(var i=0;i<d.custs.length;i++){var c=d.custs[i],dn=findN('d_SALES')||findN('d_SALES_EAST')||nodes[1];var angle=2*Math.PI*i/d.custs.length-0.5,r=80+i*10;
     nodes.push({id:'cu_'+i,label:c.cust_name,type:'customer',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:7,info:{industry:c.cust_industry,level:c.cust_level,contract:(c.cust_contract_value/10000).toFixed(0)+'万',status:c.cust_status,contact:c.cust_contact,region:c.cust_region}});
     var dd={华东:'SALES_EAST',华北:'SALES_NORTH',华南:'SALES_SOUTH',东南亚:'OVERSEA_SEA',中东:'OVERSEA_ME',欧洲:'OVERSEA_EU'}[c.cust_region]||'SALES';
     edges.push({from:'d_'+dd,to:'cu_'+i,type:'serves'});}
-  for(var i=0;i<d.leads.length;i++){var l=d.leads[i],dn=findN('d_SALES')||nodes[1];var angle=2*Math.PI*i/d.leads.length+1.5,r=100+Math.random()*30;
+  for(var i=0;i<d.leads.length;i++){var l=d.leads[i],dn=findN('d_SALES')||nodes[1];var angle=2*Math.PI*i/d.leads.length+1.5,r=100+i*10;
     nodes.push({id:'l_'+i,label:l.lead_company,type:'lead',x:dn.x+Math.cos(angle)*r,y:dn.y+Math.sin(angle)*r,vx:0,vy:0,fixed:false,r:6,info:{industry:l.lead_industry,stage:l.lead_stage,value:(l.lead_value/10000).toFixed(0)+'万'}});
     edges.push({from:'d_SALES',to:'l_'+i,type:'pipeline'});}
   for(var i=0;i<d.alerts.length;i++){var a=d.alerts[i],sn=findN('s_'+a.alert_source);if(!sn)continue;
-    nodes.push({id:'a_'+i,label:a.alert_level,type:'alert',x:sn.x+Math.cos(Math.random()*6.28)*25,y:sn.y+Math.sin(Math.random()*6.28)*25,vx:0,vy:0,fixed:false,r:3,info:{time:a.alert_time,level:a.alert_level,message:a.alert_message,resolved:a.alert_resolved?'已解决':'未解决'}});
+    nodes.push({id:'a_'+i,label:a.alert_level,type:'alert',x:sn.x+Math.cos(i*1.5)*25,y:sn.y+Math.sin(i*1.5)*25,vx:0,vy:0,fixed:false,r:3,info:{time:a.alert_time,level:a.alert_level,message:a.alert_message,resolved:a.alert_resolved?'已解决':'未解决'}});
     edges.push({from:'s_'+a.alert_source,to:'a_'+i,type:'alerted'});}
 }
 
@@ -800,6 +889,9 @@ function runPCA(){
 
 // ── Fetch ──
 function go(){
+  // First load the saved layout
+  loadLayout(currentLayoutId);
+  
   Promise.all([q('SELECT * FROM Department'),q('SELECT * FROM Employee'),q('SELECT * FROM Project'),q('SELECT * FROM Server'),q('SELECT * FROM Alert'),q('SELECT * FROM BizMetrics'),q('SELECT * FROM Customer'),q('SELECT * FROM Lead')
   ]).then(function(a){
     allData={depts:a[0].data||[],emps:a[1].data||[],projs:a[2].data||[],srvs:a[3].data||[],alerts:a[4].data||[],custs:a[6].data||[],leads:a[7].data||[]};
@@ -811,6 +903,13 @@ function go(){
     document.getElementById('h-rel').textContent=edges.length;
     document.getElementById('o-n').textContent=nodes.length;document.getElementById('o-e').textContent=edges.length;
     rp({depts:allData.depts,emps:allData.emps,projs:allData.projs,srvs:allData.srvs,alerts:allData.alerts,custs:allData.custs,leads:allData.leads,total:total});
+    
+    // Restore saved layout positions after building graph
+    loadLayout(currentLayoutId);
+    
+    // Start auto-save
+    startAutoSave();
+    
     // Auto-expand relationships after initial load
     setTimeout(function(){autoExpand();},500);
   }).catch(function(e){

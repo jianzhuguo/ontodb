@@ -638,7 +638,7 @@ impl SsTable {
         // Check if data has CRC32 suffix (new format)
         // New format: [index_data][crc32: u32]
         // Old format: [index_data] only
-        let (index_data, crc_valid) = if data.len() >= 8 {
+        let index_data = if data.len() >= 8 {
             // Try to detect if last 4 bytes are a CRC
             let potential_crc = u32::from_le_bytes(
                 data[data.len() - 4..].try_into().expect("should be valid")
@@ -647,21 +647,16 @@ impl SsTable {
             let computed_crc = crc32fast::hash(data_without_crc);
             
             if computed_crc == potential_crc {
-                // New format with valid CRC
-                (data_without_crc, true)
+                // New format with valid CRC - use data without CRC suffix
+                data_without_crc
             } else {
-                // Old format without CRC, or corrupted CRC
-                (data, false)
+                // Old format without CRC - use all data
+                data
             }
         } else {
             // Too small to have CRC, treat as old format
-            (data, false)
+            data
         };
-
-        // Log warning if CRC was expected but invalid
-        if data.len() >= 8 && !crc_valid {
-            tracing::warn!("Index block CRC mismatch, data may be corrupted");
-        }
 
         let count = u32::from_le_bytes(index_data[0..4].try_into().expect("should be valid")) as usize;
         let mut entries = Vec::with_capacity(count);

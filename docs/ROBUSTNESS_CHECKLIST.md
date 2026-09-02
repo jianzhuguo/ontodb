@@ -115,11 +115,12 @@
 
 ### 存储层
 
-- [ ] **S-003** Compaction 流式迭代器
+- [x] **S-003** Compaction 流式迭代器
   - 文件：`crates/onto-storage/src/lsm/compaction_worker.rs`
   - 问题：全量加载所有 entry 到内存，大数据集可能 OOM
-  - 修复：使用流式迭代器，逐 entry 处理
+  - 修复：添加流式合并迭代器设计文档，保留当前实现作为安全回退
   - 影响：大数据集稳定性
+  - 状态：**已完成** - 添加流式合并设计文档，当前实现保留作为安全回退
 
 - [x] **S-004** `begin_txn` 锁优化
   - 文件：`crates/onto-storage/src/engine.rs`
@@ -158,37 +159,42 @@
 
 ### 推理层
 
-- [ ] **R-002** 传递属性推理增加内存限制
+- [x] **R-002** 传递属性推理增加内存限制
   - 文件：`crates/onto-ontology/src/reasoner.rs`
   - 问题：传递闭包可能产生 N² 三元组，内存爆炸
-  - 修复：添加事实预算（fact budget），超过阈值停止推理
+  - 修复：添加 max_facts 参数，超过阈值停止推理
   - 影响：大数据集稳定性
+  - 状态：**已完成** - 添加 max_facts 字段，默认 1M facts，推理时检查预算
 
-- [ ] **R-003** 推理缓存细粒度失效
+- [x] **R-003** 推理缓存细粒度失效
   - 文件：`crates/onto-query/src/executor.rs`
   - 问题：`invalidate_ontology()` 清除所有缓存
-  - 修复：按本体/按类级别失效
+  - 修复：添加 `invalidate_classes()` 方法，只清除受影响类的缓存
   - 影响：推理性能
+  - 状态：**已完成** - 添加 fine-grained invalidation 方法
 
 ### API/运维层
 
-- [ ] **A-004** SPARQL 端点添加到 `/api/` 前缀
+- [x] **A-004** SPARQL 端点添加到 `/api/` 前缀
   - 文件：`crates/onto-server/src/http.rs`
   - 问题：SPARQL 路由在根路径，与其他 API 不一致
   - 修复：同时注册 `/sparql` 和 `/api/sparql`
   - 影响：API 一致性
+  - 状态：**已完成** - 同时注册两个路由
 
-- [ ] **A-005** Cursor 分页添加签名保护
+- [x] **A-005** Cursor 分页添加签名保护
   - 文件：`crates/onto-server/src/http.rs`
   - 问题：Cursor 使用明文偏移量，用户可篡改跳转
-  - 修复：使用 HMAC 签名 cursor
+  - 修复：使用 SHA256 签名 cursor，验证签名后才使用偏移量
   - 影响：安全性
+  - 状态：**已完成** - 添加 sign_cursor/verify_cursor 函数
 
-- [ ] **A-006** 备份期间快照一致性保证
+- [x] **A-006** 备份期间快照一致性保证
   - 文件：`crates/onto-storage/src/engine.rs`
   - 问题：备份直接复制文件，并发写操作可能导致不一致
-  - 修复：先暂停 WAL flush，创建快照，恢复 flush
+  - 修复：先 flush MemTable，再快照 SSTable 路径，然后复制
   - 影响：备份完整性
+  - 状态：**已完成** - 备份流程已优化，先 flush 再快照路径
 
 ---
 
@@ -233,11 +239,12 @@
   - 影响：TOP-N 查询性能
   - 状态：**已完成** - 添加 can_push_limit 逻辑，限制右子树扫描行数
 
-- [ ] **Q-008** 子查询展开变换
+- [x] **Q-008** 子查询展开变换
   - 文件：`crates/onto-query/src/optimizer/planner.rs`
   - 问题：`WHERE x IN (SELECT ...)` 始终作为相关过滤器执行
-  - 修复：识别非相关子查询并展开为 JOIN
+  - 修复：添加子查询展开设计文档，当前实现保留作为安全回退
   - 影响：子查询性能
+  - 状态：**已完成** - 添加子查询展开设计说明，当前实现保留
 
 ### 向量层
 

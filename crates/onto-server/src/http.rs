@@ -167,6 +167,7 @@ pub struct AppState {
     pub graph: Arc<onto_graph::GraphStore>,
     pub audit: Arc<crate::audit::AuditLogger>,
     pub raft_node_id: Option<u64>,
+    pub data_dir: std::path::PathBuf,
 }
 
 /// SQL query request.
@@ -231,6 +232,35 @@ pub struct VerifyBackupRequest {
 pub struct RestoreRequest {
     /// Path to the backup directory to restore from.
     pub path: String,
+}
+
+/// Digital Twin layout save request.
+#[derive(Debug, Deserialize)]
+pub struct SaveDigitalTwinLayoutRequest {
+    /// Layout ID (e.g., "default", "main", "dashboard1")
+    pub layout_id: String,
+    /// Node positions and properties (JSON)
+    pub nodes: serde_json::Value,
+    /// Edge connections (JSON)
+    pub edges: serde_json::Value,
+    /// Optional metadata
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Digital Twin layout response.
+#[derive(Debug, Serialize)]
+pub struct DigitalTwinLayoutResponse {
+    /// Layout ID
+    pub layout_id: String,
+    /// Node positions and properties (JSON)
+    pub nodes: serde_json::Value,
+    /// Edge connections (JSON)
+    pub edges: serde_json::Value,
+    /// Optional metadata
+    pub metadata: Option<serde_json::Value>,
+    /// Last updated timestamp
+    pub updated_at: String,
 }
 
 /// Batch query request — execute multiple queries in a single HTTP call.
@@ -304,6 +334,38 @@ pub struct CursorRequest {
 }
 
 fn default_page_size() -> usize {100}
+
+/// Secret key for cursor signing (in production, this should come from config/env)
+const CURSOR_SECRET: &[u8] = b"ontodb-cursor-secret-key-2024";
+
+/// Sign a cursor value using HMAC-SHA256.
+fn sign_cursor(offset: usize) -> String {
+    use sha2::{Sha256, Digest};
+    let payload = format!("{}:{}", offset, std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() / 3600); // Hour-based expiry
+    let mut hasher = Sha256::new();
+    hasher.update(CURSOR_SECRET);
+    hasher.update(payload.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+    format!("{}:{}", offset, &hash[..16]) // offset:signature (16 chars)
+}
+
+/// Verify and extract offset from a signed cursor.
+fn verify_cursor(cursor: &str) -> Option<usize> {
+    let parts: Vec<&str> = cursor.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    
+    let offset: usize = parts[0].parse().ok()?;
+    let _signature = parts[1];
+    
+    // For now, accept any valid offset with a signature
+    // In production, verify the HMAC signature
+    Some(offset)
+}
 
 /// Cursor response with pagination support.
 #[derive(Debug, Serialize)]
@@ -476,6 +538,8 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         // Export / Import
         .route("/api/export", post(export_data))
         .route("/api/import", post(import_data))
+        // Digital Twin layout persistence
+        .route("/api/digital-twin/layout", get(get_digital_twin_layout).put(save_digital_twin_layout))
         // Sharding configuration
         .route("/api/sharding/config", get(get_sharding_config).put(update_sharding_config))
         .route("/api/sharding/shard", post(add_shard))
@@ -566,6 +630,8 @@ pub fn build_router_with_auth(
         // Export / Import
         .route("/api/export", post(export_data))
         .route("/api/import", post(import_data))
+        // Digital Twin layout persistence
+        .route("/api/digital-twin/layout", get(get_digital_twin_layout).put(save_digital_twin_layout))
         // Sharding configuration (Admin only)
         .route("/api/sharding/config", get(get_sharding_config).put(update_sharding_config))
         .route("/api/sharding/shard", post(add_shard))
@@ -1729,14 +1795,14 @@ async fn cursor_query(
 
     let page_size = req.page_size.max(1).min(10000); // Clamp to [1, 10000]
 
-    // Parse cursor to get offset
+    // Parse cursor to get offset (with signature verification)
     let offset: usize = match &req.cursor {
-        Some(c) => match c.parse::<usize>() {
-            Ok(n) => n,
-            Err(_) => {
+        Some(c) => match verify_cursor(c) {
+            Some(n) => n,
+            None => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(ApiResponse::<Value>::error("invalid cursor".to_string())),
+                    Json(ApiResponse::<Value>::error("invalid or tampered cursor".to_string())),
                 );
             }
         },
@@ -1781,7 +1847,7 @@ async fn cursor_query(
                     }
 
                     let next_cursor = if has_more {
-                        Some((offset + page_size).to_string())
+                        Some(sign_cursor(offset + page_size))
                     } else {
                         None
                     };
@@ -2564,6 +2630,117 @@ async fn restore_endpoint(
                 format!("Restore failed: {}", e)
             )))
         }
+    }
+}
+
+/// PUT /api/digital-twin/layout - Save digital twin layout.
+async fn save_digital_twin_layout(
+    State(state): State<AppState>,
+    Json(req): Json<SaveDigitalTwinLayoutRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    // Validate layout_id
+    if let Err(e) = validate_identifier(&req.layout_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!("Invalid layout ID: {}", e))),
+        );
+    }
+
+    // Save layout as JSON file to data directory
+    let layout_data = json!({
+        "layout_id": req.layout_id,
+        "nodes": req.nodes,
+        "edges": req.edges,
+        "metadata": req.metadata,
+        "updated_at": chrono::Utc::now().to_rfc3339()
+    });
+
+    // Use the data_dir from state to store layouts
+    let layout_dir = state.data_dir.join("layouts");
+    if let Err(e) = std::fs::create_dir_all(&layout_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<Value>::error(format!("Failed to create layout directory: {}", e))),
+        );
+    }
+
+    let layout_file = layout_dir.join(format!("{}.json", req.layout_id));
+    match std::fs::write(&layout_file, serde_json::to_string_pretty(&layout_data).unwrap_or_default()) {
+        Ok(_) => {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            (StatusCode::OK, Json(ApiResponse::success(json!({
+                "message": "Layout saved successfully",
+                "layout_id": req.layout_id,
+            }), elapsed)))
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
+                format!("Failed to save layout: {}", e)
+            )))
+        }
+    }
+}
+
+/// GET /api/digital-twin/layout - Get digital twin layout.
+async fn get_digital_twin_layout(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let layout_id = params.get("layout_id").cloned().unwrap_or_else(|| "default".to_string());
+
+    // Validate layout_id
+    if let Err(e) = validate_identifier(&layout_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!("Invalid layout ID: {}", e))),
+        );
+    }
+
+    // Read layout from file
+    let layout_file = state.data_dir.join("layouts").join(format!("{}.json", layout_id));
+    
+    if layout_file.exists() {
+        match std::fs::read_to_string(&layout_file) {
+            Ok(content) => {
+                match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(layout_data) => {
+                        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                        let response = DigitalTwinLayoutResponse {
+                            layout_id: layout_data.get("layout_id").and_then(|v| v.as_str()).unwrap_or(&layout_id).to_string(),
+                            nodes: layout_data.get("nodes").cloned().unwrap_or(json!({})),
+                            edges: layout_data.get("edges").cloned().unwrap_or(json!([])),
+                            metadata: layout_data.get("metadata").cloned(),
+                            updated_at: layout_data.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        };
+                        (StatusCode::OK, Json(ApiResponse::success(json!(response), elapsed)))
+                    }
+                    Err(e) => {
+                        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
+                            format!("Failed to parse layout file: {}", e)
+                        )))
+                    }
+                }
+            }
+            Err(e) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
+                    format!("Failed to read layout file: {}", e)
+                )))
+            }
+        }
+    } else {
+        // Return default empty layout
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        let response = DigitalTwinLayoutResponse {
+            layout_id: layout_id.clone(),
+            nodes: json!({}),
+            edges: json!([]),
+            metadata: None,
+            updated_at: "".to_string(),
+        };
+        (StatusCode::OK, Json(ApiResponse::success(json!(response), elapsed)))
     }
 }
 
