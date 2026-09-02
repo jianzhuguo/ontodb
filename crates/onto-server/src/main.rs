@@ -260,7 +260,7 @@ fn main() -> Result<()> {
     if !features.is_empty() {
         println!("Enterprise features: {}", features.join(", "));
     }
-    println!("Data directory: {:?}", options.data_dir);
+    println!("Data directory: {}", options.data_dir.display());
 
     // Log enterprise feature status
     #[cfg(feature = "encryption")]
