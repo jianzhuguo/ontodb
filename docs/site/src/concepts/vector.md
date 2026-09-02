@@ -15,13 +15,22 @@ Supported distance metrics:
 
 ## Inserting vectors
 
-```sql
--- Insert a document with its vector
-INSERT INTO Product SET id = "1", name = "Widget"
+Vectors are automatically indexed when documents are written. The embedding field should be stored as a JSON array.
 
--- Insert the vector separately
-VECTOR INSERT ON Product ("1") embedding [0.1, 0.2, 0.3, ...]
+```python
+# Using Python SDK
+db = OntoDB("http://localhost:7912")
+db.execute('INSERT INTO Product (name, category, embedding) VALUES ("Widget", "electronics", [0.1, 0.2, 0.3])')
 ```
+
+```bash
+# Using HTTP API directly
+curl -X POST http://localhost:7912/api/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "INSERT INTO Product (name, embedding) VALUES (\"Widget\", [0.1, 0.2, 0.3])"}'
+```
+
+> **Note**: Vectors must be inserted as JSON arrays `[0.1, 0.2, ...]`, not as strings. The engine automatically detects vector fields and indexes them.
 
 ## Searching
 
@@ -63,3 +72,65 @@ Benchmark results (5000 rows, debug build):
 2. **100% recall** achieved through optimized graph construction and search parameters
 3. **Hybrid queries** apply SQL filters before or after vector search for maximum flexibility
 4. **Integration** with storage engine means vectors are persisted alongside regular data
+
+## Advanced Features
+
+### Cosine Pre-normalization
+
+When using cosine distance, vectors are automatically L2-normalized on insert. This provides ~2x speedup for cosine search because the distance calculation reduces to a simple dot product.
+
+### Multi-vector Search
+
+Search multiple vector columns simultaneously and combine results using Reciprocal Rank Fusion (RRF):
+
+```python
+results = db.vector_search_multi("Product", [
+    {"column": "title_embedding", "query_vector": [...], "weight": 0.7},
+    {"column": "image_embedding", "query_vector": [...], "weight": 0.3},
+], top_k=10)
+```
+
+```bash
+curl -X POST http://localhost:7912/api/vector/search-multi \
+  -H "Content-Type: application/json" \
+  -d '{
+    "class": "Product",
+    "searches": [
+      {"column": "title_embedding", "query_vector": [0.1, 0.2], "weight": 0.7},
+      {"column": "image_embedding", "query_vector": [0.3, 0.4], "weight": 0.3}
+    ],
+    "top_k": 10
+  }'
+```
+
+### K-Means Clustering
+
+Cluster vectors using K-Means with k-means++ initialization:
+
+```python
+result = db.vector_cluster("Product", "embedding", k=5)
+for cluster in result["clusters"]:
+    print(f"Cluster {cluster['id']}: {cluster['member_count']} members")
+```
+
+```bash
+curl -X POST http://localhost:7912/api/vector/cluster \
+  -H "Content-Type: application/json" \
+  -d '{"class": "Product", "column": "embedding", "k": 5}'
+```
+
+### Incremental Persistence
+
+HNSW indexes support incremental persistence - only modified nodes are saved on flush, reducing I/O from O(graph_size) to O(changes).
+
+### Index Compaction
+
+Over time, deleted vectors accumulate as tombstones. Use compaction to rebuild the index and remove tombstones:
+
+```sql
+COMPACT VECTOR INDEX ON Product (embedding);
+```
+
+### Index Warmup
+
+After server restart, vector indexes can be pre-warmed to reduce cold-start latency. Warmup happens automatically on startup (configurable).

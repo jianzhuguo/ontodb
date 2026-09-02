@@ -45,6 +45,7 @@ from .exceptions import (
     AuthenticationError,
     TimeoutError,
 )
+from .models import MultiVectorSearchResult, ClusteringResult, ClusterInfo
 
 # Import dialect to auto-register with SQLAlchemy
 try:
@@ -65,4 +66,7 @@ __all__ = [
     "QueryError",
     "AuthenticationError",
     "TimeoutError",
+    "MultiVectorSearchResult",
+    "ClusteringResult",
+    "ClusterInfo",
 ]

@@ -30,6 +30,31 @@ class VectorSearchResult:
 
 
 @dataclass
+class MultiVectorSearchResult:
+    """Multi-vector search result item."""
+    doc_key: str
+    combined_score: float
+    per_column_scores: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class ClusterInfo:
+    """K-Means cluster information."""
+    id: int
+    centroid: List[float] = field(default_factory=list)
+    member_count: int = 0
+
+
+@dataclass
+class ClusteringResult:
+    """K-Means clustering result."""
+    clusters: List[ClusterInfo] = field(default_factory=list)
+    assignments: List[int] = field(default_factory=list)
+    iterations: int = 0
+    converged: bool = False
+
+
+@dataclass
 class GraphVertex:
     """Graph vertex."""
     id: str

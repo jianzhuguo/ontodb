@@ -211,6 +211,73 @@ class OntoDB:
             raise QueryError(result["error"])
         return result.get("data", [])
 
+    def vector_search_multi(
+        self,
+        table: str,
+        searches: List[Dict[str, Any]],
+        top_k: int = 10,
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Multi-vector search: search multiple vector columns and combine results.
+
+        Args:
+            table: Table/class name
+            searches: List of search specs, each with 'column', 'query_vector', 'weight'
+            top_k: Number of results to return
+
+        Returns:
+            List of matching rows with combined scores
+
+        Example::
+
+            results = db.vector_search_multi("Product", [
+                {"column": "title_embedding", "query_vector": [...], "weight": 0.7},
+                {"column": "image_embedding", "query_vector": [...], "weight": 0.3},
+            ], top_k=10)
+        """
+        body = {
+            "class": table,
+            "searches": searches,
+            "top_k": top_k,
+        }
+        result = self._request("POST", "/api/vector/search-multi", json=body, timeout=timeout)
+        if result.get("error"):
+            raise QueryError(result["error"])
+        return result.get("data", [])
+
+    def vector_cluster(
+        self,
+        table: str,
+        column: str,
+        k: int,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Cluster vectors using K-Means.
+
+        Args:
+            table: Table/class name
+            column: Vector column name
+            k: Number of clusters
+
+        Returns:
+            Clustering result with centroids and assignments
+
+        Example::
+
+            result = db.vector_cluster("Product", "embedding", k=5)
+            for cluster in result["clusters"]:
+                print(f"Cluster {cluster['id']}: {cluster['member_count']} members")
+        """
+        body = {
+            "class": table,
+            "column": column,
+            "k": k,
+        }
+        result = self._request("POST", "/api/vector/cluster", json=body, timeout=timeout)
+        if result.get("error"):
+            raise QueryError(result["error"])
+        return result.get("data", {})
+
     def hybrid_search(
         self,
         table: str,

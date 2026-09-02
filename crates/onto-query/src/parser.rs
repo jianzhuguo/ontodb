@@ -812,6 +812,8 @@ pub enum LiteralValue {
     ParamIndex(usize),
     /// Named parameter placeholder (:param_name)
     ParamName(String),
+    /// Array literal ([1.0, 2.0, 3.0])
+    Array(Vec<LiteralValue>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2301,6 +2303,7 @@ impl QueryParser {
         let mut current = String::new();
         let mut in_quote: Option<char> = None;
         let mut paren_depth = 0i32;
+        let mut bracket_depth = 0i32;  // Track square brackets for arrays
 
         for c in input.chars() {
             if let Some(q) = in_quote {
@@ -2317,7 +2320,13 @@ impl QueryParser {
             } else if c == ')' {
                 paren_depth -= 1;
                 current.push(c);
-            } else if c == delim && paren_depth == 0 {
+            } else if c == '[' {
+                bracket_depth += 1;
+                current.push(c);
+            } else if c == ']' {
+                bracket_depth -= 1;
+                current.push(c);
+            } else if c == delim && paren_depth == 0 && bracket_depth == 0 {
                 parts.push(current.clone());
                 current.clear();
             } else {
@@ -3169,6 +3178,19 @@ impl QueryParser {
         // String literal (single quotes only - double quotes are identifiers in SQL)
         if s.starts_with('\'') && s.ends_with('\'') {
             return Ok(LiteralValue::String(safe_slice(s, 1, s.len() - 1).to_string()));
+        }
+
+        // Array literal: [1.0, 2.0, 3.0]
+        if s.starts_with('[') && s.ends_with(']') {
+            let inner = safe_slice(s, 1, s.len() - 1).trim();
+            if inner.is_empty() {
+                return Ok(LiteralValue::Array(Vec::new()));
+            }
+            let elements: Vec<LiteralValue> = inner
+                .split(',')
+                .map(|elem| Self::parse_literal(elem.trim()))
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(LiteralValue::Array(elements));
         }
 
         // Number

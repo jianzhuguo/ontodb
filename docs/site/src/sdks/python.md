@@ -46,6 +46,27 @@ Execute a SPARQL query.
 
 Perform vector similarity search.
 
+### `db.vector_search_multi(class_name, searches, top_k)` → list[dict]
+
+Multi-vector search: search multiple vector columns and combine results using RRF.
+
+```python
+results = db.vector_search_multi("Product", [
+    {"column": "title_embedding", "query_vector": [...], "weight": 0.7},
+    {"column": "image_embedding", "query_vector": [...], "weight": 0.3},
+], top_k=10)
+```
+
+### `db.vector_cluster(class_name, column, k)` → dict
+
+Cluster vectors using K-Means.
+
+```python
+result = db.vector_cluster("Product", "embedding", k=5)
+for cluster in result["clusters"]:
+    print(f"Cluster {cluster['id']}: {cluster['member_count']} members")
+```
+
 ### `db.add_vertex(vertex_dict)`
 
 Add a graph vertex.

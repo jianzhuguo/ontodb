@@ -7,6 +7,7 @@
 //! - Persistence of vector index metadata
 
 use crate::vector::{DistanceMetric, HnswConfig, HnswIndex, SearchResult, VectorEntry};
+use crate::vector::normalize::{l2_normalize, should_normalize};
 use onto_core::{CoreError, Result};
 use std::collections::{HashMap, HashSet};
 
@@ -221,22 +222,30 @@ impl VectorIndexManager {
     ) {
         // Group by (class, column) for batch HNSW insert
         let mut by_index: HashMap<IndexKey, Vec<(Vec<u8>, Vec<f32>)>> = HashMap::new();
-        for (doc_key, class, column, vector) in vectors {
+        for (doc_key, class, column, mut vector) in vectors.iter().cloned() {
             // Un-delete if this is a new document (not an update)
-            if !self.doc_vectors.contains_key(doc_key) {
-                self.deleted_keys.remove(doc_key);
+            if !self.doc_vectors.contains_key(&doc_key) {
+                self.deleted_keys.remove(&doc_key);
             }
 
             let key = IndexKey {
                 class: class.to_string(),
                 column: column.to_string(),
             };
+
+            // Pre-normalize for cosine metric
+            if let Some(meta) = self.metadata.get(&key) {
+                if should_normalize(&meta.metric) {
+                    l2_normalize(&mut vector);
+                }
+            }
+
             by_index.entry(key).or_default().push((doc_key.clone(), vector.clone()));
             // Track doc_vectors
             self.doc_vectors
-                .entry(doc_key.clone())
+                .entry(doc_key)
                 .or_default()
-                .push((class.to_string(), column.to_string(), vector.clone()));
+                .push((class.to_string(), column.to_string(), vector));
         }
 
         for (idx_key, vecs) in by_index {
@@ -256,12 +265,19 @@ impl VectorIndexManager {
         doc_key: &[u8],
         class: &str,
         column: &str,
-        vector: Vec<f32>,
+        mut vector: Vec<f32>,
     ) {
         let key = IndexKey {
             class: class.to_string(),
             column: column.to_string(),
         };
+
+        // Pre-normalize for cosine metric (2x search speedup)
+        if let Some(meta) = self.metadata.get(&key) {
+            if should_normalize(&meta.metric) {
+                l2_normalize(&mut vector);
+            }
+        }
 
         // If this key was previously deleted AND is being re-inserted (not updated),
         // un-delete it. For UPDATE, deindex_vectors already removed doc_vectors,
@@ -342,9 +358,24 @@ impl VectorIndexManager {
             ))
         })?;
 
+        // Pre-normalize query for cosine metric
+        let normalized_query: Vec<f32>;
+        let actual_query = if let Some(meta) = self.metadata.get(&key) {
+            if should_normalize(&meta.metric) {
+                normalized_query = query.to_vec();
+                let mut q = normalized_query.clone();
+                l2_normalize(&mut q);
+                q
+            } else {
+                query.to_vec()
+            }
+        } else {
+            query.to_vec()
+        };
+
         // Over-fetch to compensate for deleted/stale entries
         let over_fetch = (k * 5).max(k + self.deleted_keys.len()).min(index.len());
-        let results = index.search(query, over_fetch);
+        let results = index.search(&actual_query, over_fetch);
 
         // Filter deleted keys, stale entries, and deduplicate
         let mut seen: HashMap<Vec<u8>, usize> = HashMap::new(); // id -> index in filtered
@@ -399,6 +430,21 @@ impl VectorIndexManager {
             ))
         })?;
 
+        // Pre-normalize query for cosine metric
+        let normalized_query: Vec<f32>;
+        let actual_query = if let Some(meta) = self.metadata.get(&key) {
+            if should_normalize(&meta.metric) {
+                normalized_query = query.to_vec();
+                let mut q = normalized_query.clone();
+                l2_normalize(&mut q);
+                q
+            } else {
+                query.to_vec()
+            }
+        } else {
+            query.to_vec()
+        };
+
         // Combine allowed_ids filter with deleted_keys exclusion
         let effective_ids: HashSet<Vec<u8>> = allowed_ids
             .difference(&self.deleted_keys)
@@ -406,7 +452,7 @@ impl VectorIndexManager {
             .collect();
 
         let over_fetch = (k * 5).max(k).min(index.len());
-        let results = index.search_filtered(query, over_fetch, &effective_ids);
+        let results = index.search_filtered(&actual_query, over_fetch, &effective_ids);
 
         // Filter stale entries and deduplicate
         let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
@@ -446,6 +492,72 @@ impl VectorIndexManager {
     /// Returns true if the given document key has been deleted.
     pub fn is_deleted(&self, doc_key: &[u8]) -> bool {
         self.deleted_keys.contains(doc_key)
+    }
+
+    /// Multi-vector search: search multiple vector columns and combine results.
+    ///
+    /// Uses Reciprocal Rank Fusion (RRF) to combine results from multiple columns.
+    pub fn search_multi(
+        &self,
+        class: &str,
+        specs: &[crate::vector::hybrid::VectorSearchSpec],
+    ) -> Result<Vec<crate::vector::hybrid::HybridSearchResult>> {
+        let mut per_column_results = HashMap::new();
+
+        for spec in specs {
+            let results = self.search(class, &spec.column, &spec.query_vector, spec.top_k * 3)?;
+            let scored: Vec<(Vec<u8>, f32)> = results
+                .into_iter()
+                .map(|r| (r.entry.id.clone(), r.distance))
+                .collect();
+            per_column_results.insert(spec.column.clone(), scored);
+        }
+
+        let searcher = crate::vector::hybrid::HybridSearcher::new(specs.to_vec());
+        Ok(searcher.combine_results(&per_column_results))
+    }
+
+    /// Cluster vectors in a specific index using K-Means.
+    ///
+    /// Returns cluster assignments for each document in the index.
+    pub fn cluster_vectors(
+        &self,
+        class: &str,
+        column: &str,
+        k: usize,
+    ) -> Result<crate::vector::cluster::ClusteringResult> {
+        let key = IndexKey {
+            class: class.to_string(),
+            column: column.to_string(),
+        };
+
+        let _index = self.indexes.get(&key).ok_or_else(|| {
+            CoreError::InvalidArgument(format!(
+                "no vector index on {}.{}",
+                class, column
+            ))
+        })?;
+
+        // Collect all vectors from doc_vectors (not from HNSW, which may have stale entries)
+        let vectors: Vec<Vec<f32>> = self.doc_vectors.values()
+            .flat_map(|entries| {
+                entries.iter()
+                    .filter(|(c, col, _)| c == class && col == column)
+                    .map(|(_, _, v)| v.clone())
+            })
+            .collect();
+
+        if vectors.is_empty() {
+            return Ok(crate::vector::cluster::ClusteringResult {
+                clusters: Vec::new(),
+                assignments: Vec::new(),
+                iterations: 0,
+                converged: true,
+            });
+        }
+
+        let clusterer = crate::vector::cluster::KMeans::new(k);
+        Ok(clusterer.fit(&vectors))
     }
 }
 

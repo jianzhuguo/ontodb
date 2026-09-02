@@ -85,11 +85,24 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Inner product distance: -(a . b) (negated so lower = more similar)
+/// Optimized with loop unrolling for better SIMD auto-vectorization.
 fn inner_product_distance(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len();
     let mut dot = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
+    let mut i = 0;
+
+    // Process 4 elements at a time (SIMD-friendly)
+    while i + 4 <= len {
+        dot += a[i] * b[i] + a[i+1] * b[i+1] + a[i+2] * b[i+2] + a[i+3] * b[i+3];
+        i += 4;
     }
+
+    // Handle remaining elements
+    while i < len {
+        dot += a[i] * b[i];
+        i += 1;
+    }
+
     -dot
 }
 
