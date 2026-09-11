@@ -1,0 +1,21 @@
+{
+  "schema_version": "v1",
+  "name_for_human": "OntoDB",
+  "name_for_model": "ontodb",
+  "description_for_human": "Ontology-driven six-modal semantic database with live data management",
+  "description_for_model": "OntoDB is an ontology-driven semantic multi-modal database that unifies relational, graph, vector, time-series, spatial, and ontology data in a single engine. It features a 7-step atomic write pipeline, incremental OWL 2 RL reasoning, live data lifecycle management with exponential decay, kernel-level namespace isolation, and HNSW vector indexing. Use this plugin to query, insert, and manage data in OntoDB via OntoQL or SQL.",
+  "auth": {
+    "type": "api_key",
+    "instructions": "Set the ONTODB_API_KEY environment variable with your API key.",
+    "authorization_type": "header",
+    "authorization_name": "X-API-Key"
+  },
+  "api": {
+    "type": "openapi",
+    "url": "https://ontovalue.com/api/openapi.json",
+    "has_user_authentication": false
+  },
+  "logo_url": "https://ontovalue.com/logo.png",
+  "contact_email": "dev@ontovalue.com",
+  "legal_info_url": "https://ontovalue.com/legal"
+}

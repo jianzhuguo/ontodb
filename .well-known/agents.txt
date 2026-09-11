@@ -1,0 +1,70 @@
+# OntoDB - AI Agent Discovery File
+# https://ontovalue.com
+
+# Agent metadata
+name: OntoDB
+description: Ontology-driven six-modal semantic database with live data management
+version: 0.6.2
+website: https://ontovalue.com
+documentation: https://ontovalue.com/docs
+repository: https://github.com/ontodb/ontodb
+
+# Capabilities
+capabilities:
+  - relational_query
+  - graph_traversal
+  - vector_search
+  - ontology_reasoning
+  - time_series
+  - spatial_query
+  - live_data_management
+  - namespace_isolation
+  - multi_tenant
+  - edge_computing
+
+# API endpoints
+api:
+  base_url: https://ontovalue.com/api
+  health: /health
+  query: /query
+  vector_search: /vector/search
+  schema: /schema
+  metrics: /metrics
+
+# Supported query languages
+query_languages:
+  - SQL
+  - OntoQL
+  - REST API
+
+# Data modalities
+data_modalities:
+  - relational
+  - graph
+  - vector
+  - time_series
+  - spatial
+  - ontology
+
+# Deployment options
+deployment:
+  - software
+  - hardware_accelerated
+  - cloud_service
+  - edge_computing
+
+# Performance
+performance:
+  write_throughput: 863618
+  read_throughput: 1256518
+  vector_recall: 100
+  reasoning_speedup: 100
+
+# License
+license: AGPL-3.0 (Community) / Commercial (Enterprise)
+
+# Contact
+contact:
+  email: dev@ontovalue.com
+  github: https://github.com/ontodb/ontodb
+  gitee: https://gitee.com/ontodb/ontodb

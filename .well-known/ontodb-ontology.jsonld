@@ -1,0 +1,366 @@
+{
+  "@context": {
+    "onto": "https://ontodb.ai/ontology/",
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "owl": "http://www.w3.org/2002/07/owl#",
+    "xsd": "http://www.w3.org/2001/XMLSchema#"
+  },
+  "@graph": [
+    {
+      "@id": "onto:OntoDB",
+      "@type": "owl:NamedIndividual",
+      "rdfs:label": "OntoDB",
+      "rdfs:comment": "An ontology-driven semantic multi-modal database. Version 0.6.2. Supports six data modalities: relational, graph, vector, temporal, spatial, and ontology.",
+      "onto:version": "0.6.2"
+    },
+
+    {
+      "@id": "onto:Database",
+      "@type": "owl:Class",
+      "rdfs:label": "Database",
+      "rdfs:comment": "The top-level container for data in OntoDB. Supports six data modalities: relational, graph, vector, temporal, spatial, and ontology."
+    },
+    {
+      "@id": "onto:Table",
+      "@type": "owl:Class",
+      "rdfs:label": "Table",
+      "rdfs:comment": "A collection of documents sharing the same schema. Each table belongs to a class and supports multi-modal storage."
+    },
+    {
+      "@id": "onto:Field",
+      "@type": "owl:Class",
+      "rdfs:label": "Field",
+      "rdfs:comment": "A named attribute of a document, supporting various data types including scalar, array, and vector."
+    },
+    {
+      "@id": "onto:Index",
+      "@type": "owl:Class",
+      "rdfs:label": "Index",
+      "rdfs:comment": "A data structure that speeds up data retrieval. Supports B+Tree, HNSW (vector), R*Tree (spatial), and full-text indexes."
+    },
+    {
+      "@id": "onto:Query",
+      "@type": "owl:Class",
+      "rdfs:label": "Query",
+      "rdfs:comment": "A request to retrieve, insert, update, or delete data. Supports SQL, OntoQL, and REST API interfaces."
+    },
+    {
+      "@id": "onto:Namespace",
+      "@type": "owl:Class",
+      "rdfs:label": "Namespace",
+      "rdfs:comment": "A logical container for isolating data and schemas. Provides kernel-level physical isolation with independent key-prefix routing."
+    },
+    {
+      "@id": "onto:User",
+      "@type": "owl:Class",
+      "rdfs:label": "User",
+      "rdfs:comment": "An authenticated entity that interacts with the database system."
+    },
+    {
+      "@id": "onto:Role",
+      "@type": "owl:Class",
+      "rdfs:label": "Role",
+      "rdfs:comment": "A set of permissions assigned to users. Supports RBAC (Role-Based Access Control) with three-privilege separation."
+    },
+    {
+      "@id": "onto:Ontology",
+      "@type": "owl:Class",
+      "rdfs:label": "Ontology",
+      "rdfs:comment": "A formal specification of classes, properties, and constraints. Embedded in the database kernel for real-time reasoning."
+    },
+    {
+      "@id": "onto:LiveValue",
+      "@type": "owl:Class",
+      "rdfs:label": "Live Value",
+      "rdfs:comment": "A time-decaying value score associated with each document, used for data lifecycle management via exponential decay."
+    },
+    {
+      "@id": "onto:VectorIndex",
+      "@type": "owl:Class",
+      "rdfs:label": "Vector Index",
+      "rdfs:comment": "An HNSW-based index for approximate nearest neighbor search on high-dimensional vectors."
+    },
+    {
+      "@id": "onto:GraphStore",
+      "@type": "owl:Class",
+      "rdfs:label": "Graph Store",
+      "rdfs:comment": "An adjacency-list based graph storage for entity relationships, automatically linked to relational data via unified entity anchors."
+    },
+    {
+      "@id": "onto:TripleStore",
+      "@type": "owl:Class",
+      "rdfs:label": "Triple Store",
+      "rdfs:comment": "An RDF triple store with SPO/POS/OSP triple-index structure for efficient subject-predicate-object queries."
+    },
+    {
+      "@id": "onto:QueryType",
+      "@type": "owl:Class",
+      "rdfs:label": "Query Type",
+      "rdfs:comment": "Classification of query modes: relational, graph traversal, vector search, and ontology reasoning."
+    },
+    {
+      "@id": "onto:Deployment",
+      "@type": "owl:Class",
+      "rdfs:label": "Deployment",
+      "rdfs:comment": "Deployment mode: software, hardware-accelerated, cloud service, or edge computing."
+    },
+
+    {
+      "@id": "onto:hasTable",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "has table",
+      "rdfs:comment": "A database contains one or more tables.",
+      "rdfs:domain": "onto:Database",
+      "rdfs:range": "onto:Table"
+    },
+    {
+      "@id": "onto:hasField",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "has field",
+      "rdfs:comment": "A table contains one or more fields.",
+      "rdfs:domain": "onto:Table",
+      "rdfs:range": "onto:Field"
+    },
+    {
+      "@id": "onto:hasIndex",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "has index",
+      "rdfs:comment": "A table may have one or more indexes for performance optimization.",
+      "rdfs:domain": "onto:Table",
+      "rdfs:range": "onto:Index"
+    },
+    {
+      "@id": "onto:hasNamespace",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "has namespace",
+      "rdfs:comment": "A database contains one or more namespaces for data isolation.",
+      "rdfs:domain": "onto:Database",
+      "rdfs:range": "onto:Namespace"
+    },
+    {
+      "@id": "onto:hasOntology",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "has ontology",
+      "rdfs:comment": "A namespace contains an ontology definition.",
+      "rdfs:domain": "onto:Namespace",
+      "rdfs:range": "onto:Ontology"
+    },
+    {
+      "@id": "onto:hasLiveValue",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "has live value",
+      "rdfs:comment": "Each document has an associated live value score for lifecycle management.",
+      "rdfs:domain": "onto:Table",
+      "rdfs:range": "onto:LiveValue"
+    },
+    {
+      "@id": "onto:hasVectorIndex",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "has vector index",
+      "rdfs:comment": "A table may have HNSW vector indexes for similarity search.",
+      "rdfs:domain": "onto:Table",
+      "rdfs:range": "onto:VectorIndex"
+    },
+    {
+      "@id": "onto:hasGraphStore",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "has graph store",
+      "rdfs:comment": "The database has an integrated graph store for entity relationships.",
+      "rdfs:domain": "onto:Database",
+      "rdfs:range": "onto:GraphStore"
+    },
+    {
+      "@id": "onto:hasTripleStore",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "has triple store",
+      "rdfs:comment": "The database has an integrated RDF triple store for semantic data.",
+      "rdfs:domain": "onto:Database",
+      "rdfs:range": "onto:TripleStore"
+    },
+    {
+      "@id": "onto:hasRole",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "has role",
+      "rdfs:comment": "A user is assigned one or more roles.",
+      "rdfs:domain": "onto:User",
+      "rdfs:range": "onto:Role"
+    },
+    {
+      "@id": "onto:executesQuery",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "executes query",
+      "rdfs:comment": "A user executes queries against the database.",
+      "rdfs:domain": "onto:User",
+      "rdfs:range": "onto:Query"
+    },
+    {
+      "@id": "onto:targetsTable",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "targets table",
+      "rdfs:comment": "A query targets one or more tables.",
+      "rdfs:domain": "onto:Query",
+      "rdfs:range": "onto:Table"
+    },
+    {
+      "@id": "onto:usesIndex",
+      "@type": "owl:ObjectProperty",
+      "rdfs:label": "uses index",
+      "rdfs:comment": "A query may use one or more indexes for optimization.",
+      "rdfs:domain": "onto:Query",
+      "rdfs:range": "onto:Index"
+    },
+
+    {
+      "@id": "onto:hasName",
+      "@type": "owl:DatatypeProperty",
+      "rdfs:label": "has name",
+      "rdfs:comment": "The name of an entity.",
+      "rdfs:domain": "owl:Thing",
+      "rdfs:range": "xsd:string"
+    },
+    {
+      "@id": "onto:hasDataType",
+      "@type": "owl:DatatypeProperty",
+      "rdfs:label": "has data type",
+      "rdfs:comment": "The data type of a field (STRING, INT64, FLOAT64, BOOL, TIMESTAMP, VECTOR, etc.).",
+      "rdfs:domain": "onto:Field",
+      "rdfs:range": "xsd:string"
+    },
+    {
+      "@id": "onto:hasDimension",
+      "@type": "owl:DatatypeProperty",
+      "rdfs:label": "has dimension",
+      "rdfs:comment": "The dimension of a vector field or vector index.",
+      "rdfs:domain": "onto:VectorIndex",
+      "rdfs:range": "xsd:integer"
+    },
+    {
+      "@id": "onto:hasDistanceMetric",
+      "@type": "owl:DatatypeProperty",
+      "rdfs:label": "has distance metric",
+      "rdfs:comment": "The distance metric for vector search: Cosine, L2, or InnerProduct.",
+      "rdfs:domain": "onto:VectorIndex",
+      "rdfs:range": "xsd:string"
+    },
+    {
+      "@id": "onto:hasDecayRate",
+      "@type": "owl:DatatypeProperty",
+      "rdfs:label": "has decay rate",
+      "rdfs:comment": "The half-life parameter for live value decay (e.g., 7 hours, 70 days, 2 years).",
+      "rdfs:domain": "onto:LiveValue",
+      "rdfs:range": "xsd:string"
+    },
+    {
+      "@id": "onto:hasValueScore",
+      "@type": "owl:DatatypeProperty",
+      "rdfs:label": "has value score",
+      "rdfs:comment": "The current value score (0-1) of a document, computed via exponential decay.",
+      "rdfs:domain": "onto:LiveValue",
+      "rdfs:range": "xsd:float"
+    },
+    {
+      "@id": "onto:hasKeyPrefix",
+      "@type": "owl:DatatypeProperty",
+      "rdfs:label": "has key prefix",
+      "rdfs:comment": "The storage key prefix for namespace isolation.",
+      "rdfs:domain": "onto:Namespace",
+      "rdfs:range": "xsd:string"
+    },
+    {
+      "@id": "onto:hasEntityAnchor",
+      "@type": "owl:DatatypeProperty",
+      "rdfs:label": "has entity anchor",
+      "rdfs:comment": "The unified entity identifier in {class}::{pk} format, shared across all data modalities.",
+      "rdfs:domain": "onto:Table",
+      "rdfs:range": "xsd:string"
+    },
+
+    {
+      "@id": "onto:RelationalQuery",
+      "@type": ["owl:NamedIndividual", "onto:QueryType"],
+      "rdfs:label": "Relational Query",
+      "rdfs:comment": "Standard SQL-like queries on structured data."
+    },
+    {
+      "@id": "onto:GraphTraversal",
+      "@type": ["owl:NamedIndividual", "onto:QueryType"],
+      "rdfs:label": "Graph Traversal",
+      "rdfs:comment": "BFS/DFS traversal of entity relationships in the graph store."
+    },
+    {
+      "@id": "onto:VectorSearch",
+      "@type": ["owl:NamedIndividual", "onto:QueryType"],
+      "rdfs:label": "Vector Search",
+      "rdfs:comment": "Approximate nearest neighbor search using HNSW index."
+    },
+    {
+      "@id": "onto:OntologyReasoning",
+      "@type": ["owl:NamedIndividual", "onto:QueryType"],
+      "rdfs:label": "Ontology Reasoning",
+      "rdfs:comment": "Real-time OWL 2 RL inference with incremental fixed-point algorithm."
+    },
+    {
+      "@id": "onto:HybridQuery",
+      "@type": ["owl:NamedIndividual", "onto:QueryType"],
+      "rdfs:label": "Hybrid Query",
+      "rdfs:comment": "Multi-modal fusion query combining relational, graph, vector, and reasoning in a single statement."
+    },
+
+    {
+      "@id": "onto:SoftwareDeployment",
+      "@type": ["owl:NamedIndividual", "onto:Deployment"],
+      "rdfs:label": "Software Deployment",
+      "rdfs:comment": "Standalone database server with SQL, REST API, PostgreSQL/MySQL protocol compatibility."
+    },
+    {
+      "@id": "onto:CloudDeployment",
+      "@type": ["owl:NamedIndividual", "onto:Deployment"],
+      "rdfs:label": "Cloud Deployment",
+      "rdfs:comment": "SaaS/PaaS deployment with multi-tenant isolation, elastic scaling, and data synchronization."
+    },
+    {
+      "@id": "onto:EdgeDeployment",
+      "@type": ["owl:NamedIndividual", "onto:Deployment"],
+      "rdfs:label": "Edge Deployment",
+      "rdfs:comment": "Three-tier edge deployment: MCU (<100KB), Embedded Linux (~11MB), Edge Server."
+    },
+
+    {
+      "@id": "onto:liveValueDecay",
+      "@type": "owl:NamedIndividual",
+      "rdfs:label": "Live Value Decay",
+      "rdfs:comment": "Exponential decay mechanism: score = value_score * e^(-lambda * delta_t). Automatically manages data lifecycle without background tasks."
+    },
+    {
+      "@id": "onto:incrementalReasoning",
+      "@type": "owl:NamedIndividual",
+      "rdfs:label": "Incremental Fixed-Point Reasoning",
+      "rdfs:comment": "Only re-derives facts affected by data changes. 100x faster than full reasoning. Supports 7 OWL 2 RL rules."
+    },
+    {
+      "@id": "onto:sevenStepPipeline",
+      "@type": "owl:NamedIndividual",
+      "rdfs:label": "Seven-Step Write Pipeline",
+      "rdfs:comment": "Atomic write pipeline: document write -> graph vertex -> rdf:type triple -> property triples -> OWL reasoning -> vector index -> B+Tree index. All in one MVCC transaction."
+    },
+    {
+      "@id": "onto:unifiedEntityAnchor",
+      "@type": "owl:NamedIndividual",
+      "rdfs:label": "Unified Entity Anchor",
+      "rdfs:comment": "Entity identifier in {class}::{pk} format, shared as storage key, graph vertex ID, vector document key, and RDF subject/object."
+    },
+    {
+      "@id": "onto:binaryRowFormat",
+      "@type": "owl:NamedIndividual",
+      "rdfs:label": "BinaryRow Format",
+      "rdfs:comment": "Compact binary storage format with zero-copy filter evaluation. 60% faster than JSON parsing, 40% less storage."
+    },
+    {
+      "@id": "onto:tripleIndex",
+      "@type": "owl:NamedIndividual",
+      "rdfs:label": "SPO/POS/OSP Triple Index",
+      "rdfs:comment": "Triple index structure for RDF triples. Enables efficient lookup by any combination of subject, predicate, and object."
+    }
+  ]
+}

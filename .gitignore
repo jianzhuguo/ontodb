@@ -44,3 +44,43 @@ deploy/nginx/certs/
 ~$*.docx
 ~$*.xlsx
 ~$*.pptx
+
+# Patent documents (local only, not committed)
+docs/patent/
+scripts/generate_patent_docx.py
+scripts/generate_patent_diagrams.py
+scripts/generate_patent_svg.py
+scripts/generate_ontoql_patent_docx.py
+
+# Temporary debug/log output
+*.log
+check_output.txt
+debug_final.txt
+final_check.txt
+final_rebuild.txt
+restart_final*.txt
+restart_output.txt
+run_error.txt
+run_output.txt
+output.txt
+
+# Temporary Python scripts (test/debug/fix/rebuild utilities)
+check_*.py
+test_*.py
+dedupe*.py
+fix_*.py
+rebuild_*.py
+recover_attempt.py
+restore_*.py
+clean_rebuild.py
+fresh_rebuild.py
+count_dt.py
+generate_data.py
+generate_full_data.py
+generate_realistic.py
+demo_reasoning.py
+verify_*.py
+final_rebuild.py
+
+# Obsidian editor config
+docs/.obsidian/
