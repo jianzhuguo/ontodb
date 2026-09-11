@@ -1,4 +1,4 @@
-//! Query executor: runs parsed queries against the storage and ontology engines.
+﻿//! Query executor: runs parsed queries against the storage and ontology engines.
 
 use crate::cache::{PlanCache, QueryCache};
 use crate::optimizer::QueryPlanner;
@@ -622,7 +622,7 @@ impl QueryExecutor {
 
         for (i, row) in results.iter().enumerate() {
             if let Some(pk) = row.get("__pk__").and_then(|v| v.as_str()) {
-                let entity_id = onto_core::EntityId::new(class, pk);
+                let entity_id = onto_core::EntityId::new("default", class, pk);
                 let neighbors = graph.get_entity_neighbors(&entity_id, onto_graph::Direction::Out, edge_label);
                 for nid in &neighbors {
                     all_neighbor_keys.push((nid.clone(), nid.to_lsm_key()));
@@ -683,7 +683,7 @@ impl QueryExecutor {
             return Ok(Vec::new());
         };
 
-        let start_id = onto_core::EntityId::new(start_class, start_pk);
+        let start_id = onto_core::EntityId::new("default", start_class, start_pk);
         let neighbors = graph.get_entity_neighbors(&start_id, direction, edge_label);
 
         let mut results = Vec::new();
@@ -741,7 +741,7 @@ impl QueryExecutor {
         // Step 2: For each vector result, get graph neighbors
         for row in &vector_results {
             if let Some(pk) = row.get("__pk__").and_then(|v| v.as_str()) {
-                let entity_id = onto_core::EntityId::new(class, pk);
+                let entity_id = onto_core::EntityId::new("default", class, pk);
                 all_entities.push((entity_id.to_string(), row.clone()));
 
                 if graph_depth > 0 {
@@ -5641,7 +5641,7 @@ impl QueryExecutor {
                     if let Some(Value::String(pk)) = row.get("__pk__") {
                         // Sync to graph store (unified entity anchor)
                         if let Some(ref graph) = self.graph {
-                            let entity_id = onto_core::EntityId::new(class, pk);
+                            let entity_id = onto_core::EntityId::new("default", class, pk);
                             let _ = graph.delete_vertex_by_entity(&entity_id);
                         }
                         engine.txn_delete(txn_id, pk.as_bytes().to_vec())?;
