@@ -171,6 +171,35 @@ impl Wal {
         buf
     }
 
+    /// Appends a put entry directly from key/value references (zero-clone path).
+    /// Avoids constructing an Entry and cloning key/value.
+    pub fn append_raw_put(&mut self, key: &[u8], value: &[u8], seq_no: u64) -> Result<u64> {
+        self.serialize_buf.clear();
+        // seq_no (8 bytes)
+        self.serialize_buf.extend_from_slice(&seq_no.to_le_bytes());
+        // kind = Put (1 byte)
+        self.serialize_buf.push(0);
+        // key length + key
+        self.serialize_buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        self.serialize_buf.extend_from_slice(key);
+        // value length + value
+        self.serialize_buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.serialize_buf.extend_from_slice(value);
+
+        let crc = crc32fast::hash(&self.serialize_buf);
+        let len = self.serialize_buf.len() as u32;
+        let offset = self.offset;
+
+        self.writer.write_all(&len.to_le_bytes())?;
+        self.writer.write_all(&crc.to_le_bytes())?;
+        self.writer.write_all(&self.serialize_buf)?;
+
+        self.offset += 4 + 4 + self.serialize_buf.len() as u64;
+        self.dirty = true;
+
+        Ok(offset)
+    }
+
     /// Serializes an entry into an existing buffer (zero-allocation path).
     fn serialize_entry_into(entry: &Entry, buf: &mut Vec<u8>) {
         // seq_no (8 bytes)

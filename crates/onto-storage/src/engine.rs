@@ -365,19 +365,23 @@ impl LsmEngine {
 
     /// Puts a key-value pair.
     /// Single writes rely on the background WAL sync thread (100ms window).
+    ///
+    /// Optimized: zero-clone path — WAL serializes directly from key/value
+    /// references, then moves originals into MemTable.
     pub fn put(&self, key: Key, value: Value) -> Result<()> {
         let seq = self.next_seq();
-        let entry = Entry::put(key.clone(), value.clone(), seq);
 
         let needs_flush = {
             let mut ws = self.write_state.write();
-            ws.wal.append(&entry)?;
+            // WAL: serialize directly from references (no Entry clone)
+            ws.wal.append_raw_put(&key, &value, seq)?;
             ws.wal_pending_count += 1;
             // Batch flush: only flush WAL buffer every 64 writes
             if ws.wal_pending_count >= 64 {
                 ws.wal.flush_buf()?;
                 ws.wal_pending_count = 0;
             }
+            // MemTable: move key/value (no clone)
             ws.memtable.put_with_seq(key, value, seq);
             ws.memtable.size() >= self.options.memtable_size_limit
         };
@@ -409,9 +413,10 @@ impl LsmEngine {
             let mut ws = self.write_state.write();
             for (key, value) in entries {
                 let seq = self.next_seq();
-                let entry = Entry::put(key.clone(), value.clone(), seq);
-                ws.wal.append(&entry)?;
+                // WAL: serialize directly (zero-clone)
+                ws.wal.append_raw_put(&key, &value, seq)?;
                 ws.wal_pending_count += 1;
+                // MemTable: move (no clone)
                 ws.memtable.put_with_seq(key, value, seq);
             }
             // Flush WAL buffer once for the entire batch
@@ -1265,8 +1270,7 @@ impl LsmEngine {
             for (key, op, seq) in writes_with_seq {
                 match op {
                     WriteOp::Put(value) => {
-                        let entry = Entry::put(key.clone(), value.clone(), seq);
-                        ws.wal.append(&entry)?;
+                        ws.wal.append_raw_put(&key, &value, seq)?;
                         ws.memtable.put_with_seq(key, value, seq);
                     }
                     WriteOp::Delete => {
@@ -1581,8 +1585,7 @@ impl LsmEngine {
             let mut ws = self.write_state.write();
             for (key, value) in all_index_entries {
                 let seq = self.next_seq();
-                let entry = Entry::put(key.clone(), value.clone(), seq);
-                ws.wal.append(&entry)?;
+                ws.wal.append_raw_put(&key, &value, seq)?;
                 ws.memtable.put_with_seq(key, value, seq);
             }
             ws.wal.flush_buf()?;
