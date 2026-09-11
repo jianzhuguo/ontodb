@@ -1,4 +1,4 @@
-﻿//! Query executor: runs parsed queries against the storage and ontology engines.
+//! Query executor: runs parsed queries against the storage and ontology engines.
 
 use crate::cache::{PlanCache, QueryCache};
 use crate::optimizer::QueryPlanner;
@@ -297,6 +297,10 @@ pub struct QueryExecutor {
     shard_router: std::sync::RwLock<Option<ShardRouter>>,
     /// Shard manager for shard lifecycle management. Optional for backward compatibility.
     shard_manager: Mutex<Option<ShardManager>>,
+    /// Current active namespace for entity creation.
+    /// Set by `USE NAMESPACE <name>`, defaults to "default".
+    /// All EntityId created by this executor use this namespace.
+    current_namespace: Mutex<String>,
 }
 
 /// Column-level statistics collected by ANALYZE.
@@ -432,6 +436,7 @@ impl QueryExecutor {
             query_deadline: AtomicU64::new(0),
             shard_router: std::sync::RwLock::new(None),
             shard_manager: Mutex::new(None),
+            current_namespace: Mutex::new("default".to_string()),
         }
     }
 
@@ -452,6 +457,17 @@ impl QueryExecutor {
             )));
         }
         Ok(())
+    }
+
+    /// Returns the current active namespace.
+    pub fn current_namespace(&self) -> String {
+        self.current_namespace.lock().unwrap().clone()
+    }
+
+    /// Creates an EntityId in the current namespace.
+    fn make_entity_id(&self, class: &str, pk: &str) -> onto_core::EntityId {
+        let ns = self.current_namespace.lock().unwrap().clone();
+        onto_core::EntityId::new(&ns, class, pk)
     }
 
     /// Set the graph store for unified entity anchor (relational ↔ graph sync).
@@ -622,7 +638,7 @@ impl QueryExecutor {
 
         for (i, row) in results.iter().enumerate() {
             if let Some(pk) = row.get("__pk__").and_then(|v| v.as_str()) {
-                let entity_id = onto_core::EntityId::new("default", class, pk);
+                let entity_id = self.make_entity_id(class, pk);
                 let neighbors = graph.get_entity_neighbors(&entity_id, onto_graph::Direction::Out, edge_label);
                 for nid in &neighbors {
                     all_neighbor_keys.push((nid.clone(), nid.to_lsm_key()));
@@ -683,7 +699,7 @@ impl QueryExecutor {
             return Ok(Vec::new());
         };
 
-        let start_id = onto_core::EntityId::new("default", start_class, start_pk);
+        let start_id = self.make_entity_id(start_class, start_pk);
         let neighbors = graph.get_entity_neighbors(&start_id, direction, edge_label);
 
         let mut results = Vec::new();
@@ -741,7 +757,7 @@ impl QueryExecutor {
         // Step 2: For each vector result, get graph neighbors
         for row in &vector_results {
             if let Some(pk) = row.get("__pk__").and_then(|v| v.as_str()) {
-                let entity_id = onto_core::EntityId::new("default", class, pk);
+                let entity_id = self.make_entity_id(class, pk);
                 all_entities.push((entity_id.to_string(), row.clone()));
 
                 if graph_depth > 0 {
@@ -1683,8 +1699,8 @@ impl QueryExecutor {
                 if ns.is_none() {
                     return Err(CoreError::InvalidArgument(format!("Namespace '{}' not found", name)));
                 }
-                // Store current namespace in executor state
-                // For now, just return success - namespace will be used in subsequent queries
+                // Store current namespace — all subsequent EntityId will use this
+                *self.current_namespace.lock().unwrap() = name.to_string();
                 Ok(QueryResult::Success(format!("Now using namespace '{}'", name)))
             }
             QueryAst::DropOntology { name } => {
@@ -5641,7 +5657,7 @@ impl QueryExecutor {
                     if let Some(Value::String(pk)) = row.get("__pk__") {
                         // Sync to graph store (unified entity anchor)
                         if let Some(ref graph) = self.graph {
-                            let entity_id = onto_core::EntityId::new("default", class, pk);
+                            let entity_id = self.make_entity_id(class, pk);
                             let _ = graph.delete_vertex_by_entity(&entity_id);
                         }
                         engine.txn_delete(txn_id, pk.as_bytes().to_vec())?;
@@ -11904,5 +11920,56 @@ mod tests {
             ],
         };
         assert!(executor.execute(&ast).is_ok());
+    }
+
+    #[test]
+    fn test_namespace_flow_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
+        let ontology_store = OntologyStore::new(engine.clone());
+        let executor = QueryExecutor::new(engine.clone(), ontology_store);
+
+        // 默认 namespace 是 "default"
+        assert_eq!(executor.current_namespace(), "default");
+
+        // 创建 namespace "tenant_a"
+        let ast = QueryAst::CreateNamespace { name: "tenant_a".to_string() };
+        executor.execute(&ast).unwrap();
+
+        // 切换到 tenant_a
+        let ast = QueryAst::UseNamespace { name: "tenant_a".to_string() };
+        executor.execute(&ast).unwrap();
+        assert_eq!(executor.current_namespace(), "tenant_a");
+
+        // make_entity_id 应使用当前 namespace
+        let eid = executor.make_entity_id("Device", "001");
+        assert_eq!(eid.namespace(), "tenant_a");
+        assert_eq!(eid.to_lsm_key(), b"tenant_a::Device::001");
+
+        // 创建 namespace "tenant_b" 并切换
+        let ast = QueryAst::CreateNamespace { name: "tenant_b".to_string() };
+        executor.execute(&ast).unwrap();
+        let ast = QueryAst::UseNamespace { name: "tenant_b".to_string() };
+        executor.execute(&ast).unwrap();
+        assert_eq!(executor.current_namespace(), "tenant_b");
+
+        // make_entity_id 应使用新 namespace
+        let eid2 = executor.make_entity_id("Device", "001");
+        assert_eq!(eid2.namespace(), "tenant_b");
+        assert_eq!(eid2.to_lsm_key(), b"tenant_b::Device::001");
+
+        // 同 class+pk 不同 namespace 的 key 不碰撞
+        assert_ne!(eid.to_lsm_key(), eid2.to_lsm_key());
+
+        // 切换到不存在的 namespace 应报错
+        let ast = QueryAst::UseNamespace { name: "nonexistent".to_string() };
+        assert!(executor.execute(&ast).is_err());
+
+        // namespace 不变
+        assert_eq!(executor.current_namespace(), "tenant_b");
     }
 }
