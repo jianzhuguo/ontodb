@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Snapshot visibility rules for MVCC.
 //!
 //! Determines which versions of a key are visible to a given transaction
@@ -59,8 +63,8 @@ mod tests {
         let active = BTreeSet::new();
         let vis = Visibility::new(10, active);
 
-        assert!(vis.is_visible(5));   // committed before snapshot
-        assert!(vis.is_visible(10));  // committed at snapshot time
+        assert!(vis.is_visible(5)); // committed before snapshot
+        assert!(vis.is_visible(10)); // committed at snapshot time
         assert!(!vis.is_visible(15)); // committed after snapshot
     }
 
@@ -70,9 +74,9 @@ mod tests {
         active.insert(7); // txn 7 is still active
         let vis = Visibility::new(10, active);
 
-        assert!(vis.is_visible(5));   // committed by finished txn
-        assert!(!vis.is_visible(7));  // written by active txn, invisible
-        assert!(vis.is_visible(9));   // committed by finished txn
+        assert!(vis.is_visible(5)); // committed by finished txn
+        assert!(!vis.is_visible(7)); // written by active txn, invisible
+        assert!(vis.is_visible(9)); // committed by finished txn
     }
 
     #[test]
@@ -83,11 +87,11 @@ mod tests {
         active.insert(12);
         let vis = Visibility::new(15, active);
 
-        assert!(vis.is_visible(2));   // committed
-        assert!(!vis.is_visible(3));  // active txn
-        assert!(vis.is_visible(5));   // committed
-        assert!(!vis.is_visible(7));  // active txn
-        assert!(vis.is_visible(10));  // committed
+        assert!(vis.is_visible(2)); // committed
+        assert!(!vis.is_visible(3)); // active txn
+        assert!(vis.is_visible(5)); // committed
+        assert!(!vis.is_visible(7)); // active txn
+        assert!(vis.is_visible(10)); // committed
         assert!(!vis.is_visible(12)); // active txn
         assert!(!vis.is_visible(16)); // after snapshot
     }

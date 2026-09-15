@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Query planner: converts AST to physical execution plans.
 //!
 //! Generates multiple candidate plans and selects the lowest-cost one.
@@ -182,59 +186,127 @@ impl ExecutionPlan {
     fn describe_node(&self, node: &PlanNode, depth: usize, output: &mut String) {
         let indent = "  ".repeat(depth);
         match node {
-            PlanNode::SeqScan { table, alias, estimated_rows, .. } => {
+            PlanNode::SeqScan {
+                table,
+                alias,
+                estimated_rows,
+                ..
+            } => {
                 output.push_str(&format!(
                     "{}SeqScan on {}{} (rows: {})\n",
                     indent,
                     table,
-                    alias.as_deref().map(|a| format!(" AS {}", a)).unwrap_or_default(),
+                    alias
+                        .as_deref()
+                        .map(|a| format!(" AS {}", a))
+                        .unwrap_or_default(),
                     estimated_rows
                 ));
             }
-            PlanNode::IndexScan { table, index_column, estimated_rows, .. } => {
+            PlanNode::IndexScan {
+                table,
+                index_column,
+                estimated_rows,
+                ..
+            } => {
                 output.push_str(&format!(
                     "{}IndexScan on {} using {} (rows: {})\n",
                     indent, table, index_column, estimated_rows
                 ));
             }
-            PlanNode::IndexLookup { table, index_column, estimated_rows, .. } => {
+            PlanNode::IndexLookup {
+                table,
+                index_column,
+                estimated_rows,
+                ..
+            } => {
                 output.push_str(&format!(
                     "{}IndexLookup on {} using {} (rows: {})\n",
                     indent, table, index_column, estimated_rows
                 ));
             }
-            PlanNode::VectorSearch { table, column, top_k, estimated_rows, .. } => {
+            PlanNode::VectorSearch {
+                table,
+                column,
+                top_k,
+                estimated_rows,
+                ..
+            } => {
                 output.push_str(&format!(
                     "{}VectorSearch on {}.{} top {} (rows: {})\n",
                     indent, table, column, top_k, estimated_rows
                 ));
             }
-            PlanNode::Filter { input, estimated_rows, .. } => {
+            PlanNode::Filter {
+                input,
+                estimated_rows,
+                ..
+            } => {
                 output.push_str(&format!("{}Filter (rows: {})\n", indent, estimated_rows));
                 self.describe_node(input, depth + 1, output);
             }
-            PlanNode::Projection { input, estimated_rows, .. } => {
-                output.push_str(&format!("{}Projection (rows: {})\n", indent, estimated_rows));
+            PlanNode::Projection {
+                input,
+                estimated_rows,
+                ..
+            } => {
+                output.push_str(&format!(
+                    "{}Projection (rows: {})\n",
+                    indent, estimated_rows
+                ));
                 self.describe_node(input, depth + 1, output);
             }
-            PlanNode::NestedLoopJoin { left, right, estimated_rows, .. } => {
-                output.push_str(&format!("{}NestedLoopJoin (rows: {})\n", indent, estimated_rows));
+            PlanNode::NestedLoopJoin {
+                left,
+                right,
+                estimated_rows,
+                ..
+            } => {
+                output.push_str(&format!(
+                    "{}NestedLoopJoin (rows: {})\n",
+                    indent, estimated_rows
+                ));
                 self.describe_node(left, depth + 1, output);
                 self.describe_node(right, depth + 1, output);
             }
-            PlanNode::HashJoin { left, right, estimated_rows, .. } => {
+            PlanNode::HashJoin {
+                left,
+                right,
+                estimated_rows,
+                ..
+            } => {
                 output.push_str(&format!("{}HashJoin (rows: {})\n", indent, estimated_rows));
                 self.describe_node(left, depth + 1, output);
                 self.describe_node(right, depth + 1, output);
             }
-            PlanNode::SortMergeJoin { left, right, estimated_rows, .. } => {
-                output.push_str(&format!("{}SortMergeJoin (rows: {})\n", indent, estimated_rows));
+            PlanNode::SortMergeJoin {
+                left,
+                right,
+                estimated_rows,
+                ..
+            } => {
+                output.push_str(&format!(
+                    "{}SortMergeJoin (rows: {})\n",
+                    indent, estimated_rows
+                ));
                 self.describe_node(left, depth + 1, output);
                 self.describe_node(right, depth + 1, output);
             }
-            PlanNode::Sort { input, order_by, estimated_rows, .. } => {
-                let ob_desc: Vec<String> = order_by.iter()
-                    .map(|ob| format!("{} {}", ob.column, if ob.ascending { "ASC" } else { "DESC" }))
+            PlanNode::Sort {
+                input,
+                order_by,
+                estimated_rows,
+                ..
+            } => {
+                let ob_desc: Vec<String> = order_by
+                    .iter()
+                    .map(|ob| {
+                        format!(
+                            "{} {}",
+                            ob.column,
+                            if ob.ascending { "ASC" } else { "DESC" }
+                        )
+                    })
                     .collect();
                 output.push_str(&format!(
                     "{}Sort by {} (rows: {})\n",
@@ -244,7 +316,12 @@ impl ExecutionPlan {
                 ));
                 self.describe_node(input, depth + 1, output);
             }
-            PlanNode::Aggregation { input, group_by, estimated_rows, .. } => {
+            PlanNode::Aggregation {
+                input,
+                group_by,
+                estimated_rows,
+                ..
+            } => {
                 output.push_str(&format!(
                     "{}Aggregation GROUP BY {} (rows: {})\n",
                     indent,
@@ -253,14 +330,25 @@ impl ExecutionPlan {
                 ));
                 self.describe_node(input, depth + 1, output);
             }
-            PlanNode::Limit { input, count, estimated_rows, .. } => {
+            PlanNode::Limit {
+                input,
+                count,
+                estimated_rows,
+                ..
+            } => {
                 output.push_str(&format!(
                     "{}Limit {} (rows: {})\n",
                     indent, count, estimated_rows
                 ));
                 self.describe_node(input, depth + 1, output);
             }
-            PlanNode::Union { left, right, all, estimated_rows, .. } => {
+            PlanNode::Union {
+                left,
+                right,
+                all,
+                estimated_rows,
+                ..
+            } => {
                 output.push_str(&format!(
                     "{}Union {} (rows: {})\n",
                     indent,
@@ -270,11 +358,22 @@ impl ExecutionPlan {
                 self.describe_node(left, depth + 1, output);
                 self.describe_node(right, depth + 1, output);
             }
-            PlanNode::WindowFunction { input, windows, estimated_rows, .. } => {
-                let win_desc: Vec<String> = windows.iter()
+            PlanNode::WindowFunction {
+                input,
+                windows,
+                estimated_rows,
+                ..
+            } => {
+                let win_desc: Vec<String> = windows
+                    .iter()
                     .map(|w| {
                         let alias = w.alias.as_deref().unwrap_or("unnamed");
-                        format!("{:?}({}) as {}", w.func, w.arg.as_deref().unwrap_or("*"), alias)
+                        format!(
+                            "{:?}({}) as {}",
+                            w.func,
+                            w.arg.as_deref().unwrap_or("*"),
+                            alias
+                        )
                     })
                     .collect();
                 output.push_str(&format!(
@@ -398,16 +497,26 @@ impl QueryPlanner {
         });
 
         // Apply predicate pushdown optimization
-        let (pushed_filters, remaining_filter) = self.pushdown_predicates(
-            from, from_alias, joins, filter,
-        );
+        let (pushed_filters, remaining_filter) =
+            self.pushdown_predicates(from, from_alias, joins, filter);
 
         // Generate candidate plans
         let mut candidates = Vec::new();
 
         // Candidate 1: Sequential scan with pushed predicates
         let main_filter = pushed_filters.get(from).cloned().flatten();
-        let seq_plan = self.plan_seq_scan(from, from_alias, &stats, &main_filter, joins, group_by, having, order_by, limit, columns);
+        let seq_plan = self.plan_seq_scan(
+            from,
+            from_alias,
+            &stats,
+            &main_filter,
+            joins,
+            group_by,
+            having,
+            order_by,
+            limit,
+            columns,
+        );
         candidates.push(seq_plan);
 
         // Candidate 2: Index scan (if applicable)
@@ -415,7 +524,11 @@ impl QueryPlanner {
             let selectivity = self.cost_model.estimate_selectivity(&stats, filter_expr);
             if selectivity.can_use_index {
                 if let Some(index_col) = &selectivity.index_column {
-                    if let Some(index) = stats.secondary_indexes.iter().find(|i| &i.column == index_col) {
+                    if let Some(index) = stats
+                        .secondary_indexes
+                        .iter()
+                        .find(|i| &i.column == index_col)
+                    {
                         let index_plan = self.plan_index_scan(
                             from,
                             from_alias,
@@ -436,16 +549,24 @@ impl QueryPlanner {
         }
 
         // Select the best plan
-        candidates.sort_by(|a, b| a.cost.total_cost.partial_cmp(&b.cost.total_cost).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            a.cost
+                .total_cost
+                .partial_cmp(&b.cost.total_cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut best_plan = candidates.into_iter().next().unwrap();
 
         // Add remaining filter if any predicates couldn't be pushed down
         if let Some(remaining) = remaining_filter {
-            let filter_cost = self.cost_model.filter_cost(best_plan.cost.rows, &FilterSelectivity {
-                selectivity: 0.5, // Conservative estimate
-                can_use_index: false,
-                index_column: None,
-            });
+            let filter_cost = self.cost_model.filter_cost(
+                best_plan.cost.rows,
+                &FilterSelectivity {
+                    selectivity: 0.5, // Conservative estimate
+                    can_use_index: false,
+                    index_column: None,
+                },
+            );
             best_plan = ExecutionPlan::new(
                 PlanNode::Filter {
                     input: Box::new(best_plan.root),
@@ -462,8 +583,9 @@ impl QueryPlanner {
 
         // Extract window functions from columns (if any)
         let window_funcs = match columns {
-            SelectColumns::Columns(items) => {
-                items.iter().filter_map(|item| {
+            SelectColumns::Columns(items) => items
+                .iter()
+                .filter_map(|item| {
                     if let SelectItem::WindowFunction(w) = item {
                         Some(PlanWindowExpr {
                             func: w.func.clone(),
@@ -474,8 +596,8 @@ impl QueryPlanner {
                     } else {
                         None
                     }
-                }).collect::<Vec<_>>()
-            }
+                })
+                .collect::<Vec<_>>(),
             _ => Vec::new(),
         };
 
@@ -543,10 +665,9 @@ impl QueryPlanner {
                 // Push predicate to the appropriate table
                 let existing = pushed_filters.get_mut(&tbl).unwrap();
                 *existing = Some(match existing.take() {
-                    Some(existing_filter) => FilterExpr::And(
-                        Box::new(existing_filter),
-                        Box::new(pred),
-                    ),
+                    Some(existing_filter) => {
+                        FilterExpr::And(Box::new(existing_filter), Box::new(pred))
+                    }
                     None => pred,
                 });
             } else {
@@ -558,7 +679,12 @@ impl QueryPlanner {
         let remaining = if remaining_predicates.is_empty() {
             None
         } else {
-            Some(remaining_predicates.into_iter().reduce(|a, b| FilterExpr::And(Box::new(a), Box::new(b))).unwrap())
+            Some(
+                remaining_predicates
+                    .into_iter()
+                    .reduce(|a, b| FilterExpr::And(Box::new(a), Box::new(b)))
+                    .unwrap(),
+            )
         };
 
         (pushed_filters, remaining)
@@ -641,7 +767,9 @@ impl QueryPlanner {
         // Estimate filter cost separately for the cost model
         if let Some(filter_expr) = filter {
             let filter_selectivity = self.cost_model.estimate_selectivity(stats, filter_expr);
-            let filter_cost = self.cost_model.filter_cost(current_cost.rows, &filter_selectivity);
+            let filter_cost = self
+                .cost_model
+                .filter_cost(current_cost.rows, &filter_selectivity);
             current_cost = CostEstimate::new(
                 filter_cost.rows,
                 current_cost.io_cost,
@@ -661,31 +789,45 @@ impl QueryPlanner {
         let can_push_limit = limit.is_some() && group_by.is_none();
         let ordered_joins = self.reorder_joins(joins);
         for join in &ordered_joins {
-            let right_stats = self.stats.get(&join.table).cloned().unwrap_or_else(|| TableStats {
-                row_count: 100,
-                avg_row_size: 100,
-                block_count: 1,
-                has_primary_index: false,
-                secondary_indexes: Vec::new(),
-                vector_indexes: Vec::new(),
-                histograms: Vec::new(),
-            });
+            let right_stats = self
+                .stats
+                .get(&join.table)
+                .cloned()
+                .unwrap_or_else(|| TableStats {
+                    row_count: 100,
+                    avg_row_size: 100,
+                    block_count: 1,
+                    has_primary_index: false,
+                    secondary_indexes: Vec::new(),
+                    vector_indexes: Vec::new(),
+                    histograms: Vec::new(),
+                });
 
             // Check if join column has an index for potential index scan
-            let right_col = join.on.right.split('.').next_back().unwrap_or(&join.on.right);
-            let has_index = right_stats.secondary_indexes.iter().any(|i| i.column == right_col);
+            let right_col = join
+                .on
+                .right
+                .split('.')
+                .next_back()
+                .unwrap_or(&join.on.right);
+            let has_index = right_stats
+                .secondary_indexes
+                .iter()
+                .any(|i| i.column == right_col);
 
             // For LIMIT pushdown: if we can push limit, use it for the right side scan
-            let effective_limit = if can_push_limit {
-                limit
-            } else {
-                None
-            };
+            let effective_limit = if can_push_limit { limit } else { None };
 
             let right_plan = if has_index {
                 // Use index scan for the right side of join
-                let index = right_stats.secondary_indexes.iter().find(|i| i.column == right_col).unwrap();
-                let index_cost = self.cost_model.index_range_scan_cost(&right_stats, index, 1.0);
+                let index = right_stats
+                    .secondary_indexes
+                    .iter()
+                    .find(|i| i.column == right_col)
+                    .unwrap();
+                let index_cost = self
+                    .cost_model
+                    .index_range_scan_cost(&right_stats, index, 1.0);
                 PlanNode::IndexScan {
                     table: join.table.clone(),
                     alias: join.alias.clone(),
@@ -712,7 +854,9 @@ impl QueryPlanner {
             // Choose join algorithm based on cost
             let right_cost = self.cost_model.seq_scan_cost(&right_stats);
             let hash_cost = self.cost_model.hash_join_cost(&current_cost, &right_cost);
-            let sort_merge_cost = self.cost_model.sort_merge_join_cost(&current_cost, &right_cost);
+            let sort_merge_cost = self
+                .cost_model
+                .sort_merge_join_cost(&current_cost, &right_cost);
 
             // Prefer SortMergeJoin for large tables or when data is already sorted
             // Prefer HashJoin for smaller tables or when memory is available
@@ -771,7 +915,8 @@ impl QueryPlanner {
                 count: limit_count,
                 estimated_rows: limited_rows,
             };
-            current_cost = CostEstimate::new(limited_rows, current_cost.io_cost, current_cost.cpu_cost);
+            current_cost =
+                CostEstimate::new(limited_rows, current_cost.io_cost, current_cost.cpu_cost);
         }
 
         // Note: Projection is added in plan_select after remaining filter
@@ -803,7 +948,9 @@ impl QueryPlanner {
                 index_column: None,
             });
 
-        let index_cost = self.cost_model.index_range_scan_cost(stats, index, filter_selectivity.selectivity);
+        let index_cost =
+            self.cost_model
+                .index_range_scan_cost(stats, index, filter_selectivity.selectivity);
         let mut current_node = PlanNode::IndexScan {
             table: table.to_string(),
             alias: alias.map(|s| s.to_string()),
@@ -816,24 +963,42 @@ impl QueryPlanner {
         // Apply joins - use hash join for better performance
         let ordered_joins = self.reorder_joins(joins);
         for join in &ordered_joins {
-            let right_stats = self.stats.get(&join.table).cloned().unwrap_or_else(|| TableStats {
-                row_count: 100,
-                avg_row_size: 100,
-                block_count: 1,
-                has_primary_index: false,
-                secondary_indexes: Vec::new(),
-                vector_indexes: Vec::new(),
-                histograms: Vec::new(),
-            });
+            let right_stats = self
+                .stats
+                .get(&join.table)
+                .cloned()
+                .unwrap_or_else(|| TableStats {
+                    row_count: 100,
+                    avg_row_size: 100,
+                    block_count: 1,
+                    has_primary_index: false,
+                    secondary_indexes: Vec::new(),
+                    vector_indexes: Vec::new(),
+                    histograms: Vec::new(),
+                });
 
             // Check if join column has an index for potential index scan
-            let right_col = join.on.right.split('.').next_back().unwrap_or(&join.on.right);
-            let has_index = right_stats.secondary_indexes.iter().any(|i| i.column == right_col);
+            let right_col = join
+                .on
+                .right
+                .split('.')
+                .next_back()
+                .unwrap_or(&join.on.right);
+            let has_index = right_stats
+                .secondary_indexes
+                .iter()
+                .any(|i| i.column == right_col);
 
             let right_plan = if has_index {
                 // Use index scan for the right side of join
-                let index = right_stats.secondary_indexes.iter().find(|i| i.column == right_col).unwrap();
-                let index_cost = self.cost_model.index_range_scan_cost(&right_stats, index, 1.0);
+                let index = right_stats
+                    .secondary_indexes
+                    .iter()
+                    .find(|i| i.column == right_col)
+                    .unwrap();
+                let index_cost = self
+                    .cost_model
+                    .index_range_scan_cost(&right_stats, index, 1.0);
                 PlanNode::IndexScan {
                     table: join.table.clone(),
                     alias: join.alias.clone(),
@@ -899,7 +1064,8 @@ impl QueryPlanner {
                 count: limit_count,
                 estimated_rows: limited_rows,
             };
-            current_cost = CostEstimate::new(limited_rows, current_cost.io_cost, current_cost.cpu_cost);
+            current_cost =
+                CostEstimate::new(limited_rows, current_cost.io_cost, current_cost.cpu_cost);
         }
 
         // Note: Projection is added in plan_select after remaining filter
@@ -916,15 +1082,19 @@ impl QueryPlanner {
         top_k: usize,
         filter: &Option<FilterExpr>,
     ) -> Result<ExecutionPlan> {
-        let stats = self.stats.get(table).cloned().unwrap_or_else(|| TableStats {
-            row_count: 1000,
-            avg_row_size: 100,
-            block_count: 10,
-            has_primary_index: false,
-            secondary_indexes: Vec::new(),
-            vector_indexes: Vec::new(),
-            histograms: Vec::new(),
-        });
+        let stats = self
+            .stats
+            .get(table)
+            .cloned()
+            .unwrap_or_else(|| TableStats {
+                row_count: 1000,
+                avg_row_size: 100,
+                block_count: 10,
+                has_primary_index: false,
+                secondary_indexes: Vec::new(),
+                vector_indexes: Vec::new(),
+                histograms: Vec::new(),
+            });
 
         let vector_stats = stats
             .vector_indexes
@@ -938,7 +1108,9 @@ impl QueryPlanner {
                 layers: 4,
             });
 
-        let cost = self.cost_model.vector_search_cost(&stats, &vector_stats, top_k as u64);
+        let cost = self
+            .cost_model
+            .vector_search_cost(&stats, &vector_stats, top_k as u64);
 
         let node = PlanNode::VectorSearch {
             table: table.to_string(),
@@ -977,12 +1149,7 @@ impl QueryPlanner {
     }
 
     /// Plan a UNION query.
-    fn plan_union(
-        &self,
-        left: &QueryAst,
-        right: &QueryAst,
-        all: bool,
-    ) -> Result<ExecutionPlan> {
+    fn plan_union(&self, left: &QueryAst, right: &QueryAst, all: bool) -> Result<ExecutionPlan> {
         let left_plan = self.plan(left)?;
         let right_plan = self.plan(right)?;
 

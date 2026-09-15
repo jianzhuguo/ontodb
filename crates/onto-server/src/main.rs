@@ -18,6 +18,10 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::doc_lazy_continuation)]
 
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! OntoDB Server - Main entry point.
 //!
 //! Supports three modes:
@@ -26,8 +30,8 @@
 //! - HTTP server (RESTful API with auth, rate limiting, and Prometheus metrics)
 
 pub mod admin;
-mod auth;
 pub mod audit;
+mod auth;
 pub mod cdc;
 mod http;
 mod metrics;
@@ -40,6 +44,7 @@ pub mod tls;
 use auth::{AuthConfig, AuthState, Permission};
 use clap::Parser;
 use onto_core::Result;
+#[cfg(feature = "enterprise")]
 use onto_enterprise::ProductTier;
 use onto_ontology::OntologyStore;
 use onto_query::{QueryExecutor, QueryParser};
@@ -52,7 +57,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 #[derive(Parser, Debug)]
-#[command(name = "ontodb-server", about = "OntoDB - Ontology-driven semantic database")]
+#[command(
+    name = "ontodb-server",
+    about = "OntoDB - Ontology-driven semantic database"
+)]
 struct Args {
     /// Data directory path
     #[arg(short, long, default_value = "./ontodb_data", env = "STORAGE_DATA_DIR")]
@@ -67,7 +75,12 @@ struct Args {
     interactive: bool,
 
     /// TCP listen address (enables TCP server mode)
-    #[arg(short = 'l', long, default_value = "127.0.0.1:7913", env = "SERVER_LISTEN")]
+    #[arg(
+        short = 'l',
+        long,
+        default_value = "127.0.0.1:7913",
+        env = "SERVER_LISTEN"
+    )]
     listen: String,
 
     /// HTTP listen address (enables HTTP API server mode)
@@ -161,6 +174,7 @@ struct Args {
 
     /// Enterprise config file path (JSON format)
     #[arg(long, env = "ENTERPRISE_CONFIG_FILE")]
+    #[cfg(feature = "enterprise")]
     enterprise_config: Option<PathBuf>,
 
     /// Allowed CORS origins (comma-separated). Use "*" for all origins (NOT recommended for production).
@@ -230,19 +244,32 @@ fn main() -> Result<()> {
         std::process::exit(if result.score >= 80 { 0 } else { 1 });
     }
 
+    #[cfg(feature = "enterprise")]
     let tier = onto_enterprise::current_tier();
+    #[cfg(not(feature = "enterprise"))]
+    let tier = "Community";
+    #[cfg(feature = "enterprise")]
     let features = onto_enterprise::enabled_features();
+    #[cfg(not(feature = "enterprise"))]
+    let features: Vec<&str> = vec![];
 
     // Initialize enterprise features first (before args are moved)
+    #[cfg(feature = "enterprise")]
     let enterprise_config = build_enterprise_config(&args, tier);
+    #[cfg(feature = "enterprise")]
     let enterprise_features = onto_enterprise::EnterpriseFeatures::init(&enterprise_config)
-        .map_err(|e| onto_core::CoreError::Custom(format!("Enterprise features init failed: {}", e)))?;
+        .map_err(|e| {
+            onto_core::CoreError::Custom(format!("Enterprise features init failed: {}", e))
+        })?;
 
     // Validate license for enterprise features
+    #[cfg(feature = "enterprise")]
     if tier != onto_enterprise::ProductTier::Community {
         let license = enterprise_features.license.license();
         if !license.is_valid() {
-            return Err(onto_core::CoreError::Custom("Enterprise license has expired. Please contact support.".to_string()));
+            return Err(onto_core::CoreError::Custom(
+                "Enterprise license has expired. Please contact support.".to_string(),
+            ));
         }
         println!("License: {} edition", license.edition);
         println!("Features: {}", license.features.join(", "));
@@ -281,7 +308,8 @@ fn main() -> Result<()> {
 
     // Initialize sharding if enabled
     let executor = if args.sharding_enabled {
-        let shard_config = load_sharding_config(args.sharding_config.as_deref(), args.default_shard)?;
+        let shard_config =
+            load_sharding_config(args.sharding_config.as_deref(), args.default_shard)?;
         println!("Sharding: ENABLED (default shard: {})", args.default_shard);
         println!("  Shards: {}", shard_config.shards.len());
         println!("  Sharded classes: {}", shard_config.class_strategies.len());
@@ -291,13 +319,13 @@ fn main() -> Result<()> {
             QueryExecutor::new(Arc::clone(&engine), ontology_store)
                 .with_graph(graph_store.clone())
                 .with_triple_store(triple_store)
-                .with_shard_router(shard_config, local_shards)
+                .with_shard_router(shard_config, local_shards),
         )
     } else {
         Arc::new(
             QueryExecutor::new(Arc::clone(&engine), ontology_store)
                 .with_graph(graph_store.clone())
-                .with_triple_store(triple_store)
+                .with_triple_store(triple_store),
         )
     };
 
@@ -306,8 +334,9 @@ fn main() -> Result<()> {
     } else {
         let metrics = Arc::new(metrics::Metrics::new());
 
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| onto_core::CoreError::Custom(format!("Failed to create tokio runtime: {}", e)))?;
+        let rt = tokio::runtime::Runtime::new().map_err(|e| {
+            onto_core::CoreError::Custom(format!("Failed to create tokio runtime: {}", e))
+        })?;
 
         // Load auth configuration (needed if HTTP is enabled)
         let auth_config = if args.auth {
@@ -346,7 +375,11 @@ fn main() -> Result<()> {
         let has_raft = args.raft_node_id.is_some() && args.raft_listen.is_some();
 
         if has_raft {
-            println!("Raft node {} enabled, listening on {}", args.raft_node_id.expect("should be valid"), args.raft_listen.as_deref().expect("should be valid"));
+            println!(
+                "Raft node {} enabled, listening on {}",
+                args.raft_node_id.expect("should be valid"),
+                args.raft_listen.as_deref().expect("should be valid")
+            );
             if let Some(ref peers) = args.raft_peers {
                 println!("  Peers: {}", peers);
             }
@@ -363,7 +396,10 @@ fn main() -> Result<()> {
                         };
                         let config = tls::TlsConfig::new(cert.clone(), key.clone())
                             .with_min_version(min_version);
-                        println!("TLS enabled: cert={:?}, key={:?}, min_version={}", cert, key, args.tls_min_version);
+                        println!(
+                            "TLS enabled: cert={:?}, key={:?}, min_version={}",
+                            cert, key, args.tls_min_version
+                        );
                         Some(config)
                     }
                     (Some(_), None) => {
@@ -379,16 +415,43 @@ fn main() -> Result<()> {
 
                 let pg_auth = auth_config.clone();
                 let mysql_auth = auth_config.clone();
-                let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<(), onto_core::CoreError>> + Send>>> = vec![
-                    Box::pin(run_http_server(&http_addr, executor.clone(), auth_config, rate_limit_config, metrics.clone(), audit_config, args.raft_node_id, args.api_keys_file.clone(), args.cors_origins.clone(), tls_config, graph_store.clone(), data_dir.clone())),
-                    Box::pin(run_tcp_server(&args.listen, executor.clone(), metrics.clone())),
+                let mut futs: Vec<
+                    std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = std::result::Result<(), onto_core::CoreError>,
+                                > + Send,
+                        >,
+                    >,
+                > = vec![
+                    Box::pin(run_http_server(
+                        &http_addr,
+                        executor.clone(),
+                        auth_config,
+                        rate_limit_config,
+                        metrics.clone(),
+                        audit_config,
+                        args.raft_node_id,
+                        args.api_keys_file.clone(),
+                        args.cors_origins.clone(),
+                        tls_config,
+                        graph_store.clone(),
+                        data_dir.clone(),
+                    )),
+                    Box::pin(run_tcp_server(
+                        &args.listen,
+                        executor.clone(),
+                        metrics.clone(),
+                    )),
                 ];
 
                 if has_pgwire {
                     let exec = executor.clone();
                     let m = metrics.clone();
                     futs.push(Box::pin(async move {
-                        pgwire::run_pgwire_server(&pgwire_addr, exec, m, pg_auth).await.map_err(|e| onto_core::CoreError::Custom(e.to_string()))
+                        pgwire::run_pgwire_server(&pgwire_addr, exec, m, pg_auth)
+                            .await
+                            .map_err(|e| onto_core::CoreError::Custom(e.to_string()))
                     }));
                 }
 
@@ -396,7 +459,9 @@ fn main() -> Result<()> {
                     let exec = executor.clone();
                     let m = metrics.clone();
                     futs.push(Box::pin(async move {
-                        mysqlwire::run_mysql_server(&mysql_addr, exec, m, mysql_auth).await.map_err(|e| onto_core::CoreError::Custom(e.to_string()))
+                        mysqlwire::run_mysql_server(&mysql_addr, exec, m, mysql_auth)
+                            .await
+                            .map_err(|e| onto_core::CoreError::Custom(e.to_string()))
                     }));
                 }
 
@@ -419,7 +484,11 @@ fn main() -> Result<()> {
                 let failed_name = server_names.get(idx).unwrap_or(&"Unknown");
                 match &res {
                     Ok(()) => tracing::info!("Server {} exited gracefully", failed_name),
-                    Err(e) => tracing::error!("Server {} failed: {} 鈥?initiating shutdown", failed_name, e),
+                    Err(e) => tracing::error!(
+                        "Server {} failed: {} 鈥?initiating shutdown",
+                        failed_name,
+                        e
+                    ),
                 }
                 // Give remaining servers a brief window to finish in-flight requests
                 let shutdown_timeout = std::time::Duration::from_secs(5);
@@ -427,7 +496,8 @@ fn main() -> Result<()> {
                     for fut in remaining {
                         let _ = fut.await;
                     }
-                }).await;
+                })
+                .await;
                 res
             })?;
         } else {
@@ -442,6 +512,7 @@ fn main() -> Result<()> {
 /// Build enterprise configuration from command line arguments.
 /// For Open Source edition, returns default config (features disabled).
 /// For Gov/Finance edition, configures encryption and audit retention.
+#[cfg(feature = "enterprise")]
 fn build_enterprise_config(args: &Args, tier: ProductTier) -> onto_enterprise::EnterpriseConfig {
     // Start with default config based on tier
     let mut config = if tier == ProductTier::EnterpriseGov {
@@ -449,35 +520,39 @@ fn build_enterprise_config(args: &Args, tier: ProductTier) -> onto_enterprise::E
     } else {
         onto_enterprise::EnterpriseConfig::default()
     };
-    
+
     // Override with command line arguments for Gov/Finance edition
+    #[cfg(feature = "enterprise")]
     if tier == ProductTier::EnterpriseGov {
         // Configure encryption
         #[cfg(feature = "encryption")]
         {
             config.encryption.storage_encryption = args.encryption_enabled;
             if let Some(ref key_file) = args.master_key_file {
+    #[cfg(feature = "enterprise")]
                 config.encryption.master_key_source = onto_enterprise::encryption::KeySource::File(
-                    key_file.to_string_lossy().to_string()
+                    key_file.to_string_lossy().to_string(),
                 );
             } else if let Some(ref env_var) = args.master_key_env {
-                config.encryption.master_key_source = onto_enterprise::encryption::KeySource::Env(
-                    env_var.clone()
-                );
+                config.encryption.master_key_source =
+            #[cfg(feature = "enterprise")]
+                    onto_enterprise::encryption::KeySource::Env(env_var.clone());
             }
         }
-        
+
         // Configure audit retention
         #[cfg(feature = "audit-retention")]
         {
+            #[cfg(feature = "enterprise")]
             config.audit_retention.enabled = args.audit || tier == ProductTier::EnterpriseGov;
             config.audit_retention.log_dir = args.audit_dir.clone();
             config.audit_retention.retention_days = args.audit_retention_days;
             config.audit_retention.compress_rotated = !args.audit_no_compress;
         }
     }
-    
+
     // Load from config file if specified
+            #[cfg(feature = "enterprise")]
     if let Some(ref config_path) = args.enterprise_config {
         match std::fs::read_to_string(config_path) {
             Ok(content) => {
@@ -489,7 +564,8 @@ fn build_enterprise_config(args: &Args, tier: ProductTier) -> onto_enterprise::E
                     Err(e) => {
                         tracing::error!(
                             "Failed to parse enterprise config file {:?}: {}. Using defaults.",
-                            config_path, e
+                            config_path,
+                            e
                         );
                     }
                 }
@@ -497,20 +573,20 @@ fn build_enterprise_config(args: &Args, tier: ProductTier) -> onto_enterprise::E
             Err(e) => {
                 tracing::error!(
                     "Failed to read enterprise config file {:?}: {}. Using defaults.",
-                    config_path, e
+                    config_path,
+                    e
                 );
             }
         }
     }
-    
+
     config
 }
 
 /// Loads authentication configuration from file or creates default.
 fn load_auth_config(file_path: Option<&std::path::Path>) -> Result<AuthConfig> {
     if let Some(path) = file_path {
-        let content = std::fs::read_to_string(path)
-            .map_err(onto_core::CoreError::Io)?;
+        let content = std::fs::read_to_string(path).map_err(onto_core::CoreError::Io)?;
         let config: AuthConfig = serde_json::from_str(&content)
             .map_err(|e| onto_core::CoreError::Custom(format!("Invalid auth config: {}", e)))?;
         Ok(config)
@@ -542,17 +618,28 @@ async fn run_http_server(
     data_dir: PathBuf,
 ) -> Result<()> {
     let audit = Arc::new(audit::AuditLogger::new(audit_config));
-    let state = http::AppState { executor, metrics, graph, audit, raft_node_id, data_dir };
+    let state = http::AppState {
+        executor,
+        metrics,
+        graph,
+        audit,
+        raft_node_id,
+        data_dir,
+    };
     let auth_state = AuthState::new(&auth_config).with_metrics(state.metrics.clone());
 
     // Enable hot-reload for auth config file (check every 10 seconds)
     if let Some(ref api_keys_path) = api_keys_file {
         let auth_state_for_reload = auth_state.clone().with_config_path(api_keys_path.clone());
         auth_state_for_reload.start_reload_watcher(10);
-        eprintln!("Auth config hot-reload enabled (checking every 10s): {:?}", api_keys_path);
+        eprintln!(
+            "Auth config hot-reload enabled (checking every 10s): {:?}",
+            api_keys_path
+        );
     }
 
-    let rate_limiter = RateLimiter::new(rate_limit_config.clone()).with_metrics(state.metrics.clone());
+    let rate_limiter =
+        RateLimiter::new(rate_limit_config.clone()).with_metrics(state.metrics.clone());
 
     // Spawn background task to clean up stale rate limit buckets every 5 minutes
     let limiter_cleanup = rate_limiter.clone();
@@ -560,7 +647,9 @@ async fn run_http_server(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             interval.tick().await;
-            limiter_cleanup.cleanup_stale(std::time::Duration::from_secs(600)).await;
+            limiter_cleanup
+                .cleanup_stale(std::time::Duration::from_secs(600))
+                .await;
         }
     });
 
@@ -576,11 +665,22 @@ async fn run_http_server(
             // Update AuthState keys in-memory
             let mut keys = std::collections::HashMap::new();
             for k in &config.keys {
-                keys.insert(k.key.clone(), (k.description.clone(), k.permission.clone(), k.rate_limit, k.allowed_ips.clone()));
+                keys.insert(
+                    k.key.clone(),
+                    (
+                        k.description.clone(),
+                        k.permission.clone(),
+                        k.rate_limit,
+                        k.allowed_ips.clone(),
+                    ),
+                );
             }
             // AuthState uses parking_lot::RwLock, so we can update it directly
             *auth_for_callback.keys.write() = keys;
-            tracing::info!("AuthState updated from config change ({} keys)", config.keys.len());
+            tracing::info!(
+                "AuthState updated from config change ({} keys)",
+                config.keys.len()
+            );
         }
     }));
 
@@ -594,7 +694,13 @@ async fn run_http_server(
         audit: Some(state.audit.clone()),
     };
 
-    let app = http::build_router_with_auth(state, auth_state.clone(), rate_limiter, admin_state, &cors_origins);
+    let app = http::build_router_with_auth(
+        state,
+        auth_state.clone(),
+        rate_limiter,
+        admin_state,
+        &cors_origins,
+    );
 
     println!("HTTP API server listening on {}", addr);
     println!();
@@ -622,7 +728,10 @@ async fn run_http_server(
 
     if rate_limit_config.enabled {
         println!("Rate limiting: ENABLED");
-        println!("  Default: {} requests/minute", rate_limit_config.default_rpm);
+        println!(
+            "  Default: {} requests/minute",
+            rate_limit_config.default_rpm
+        );
         println!("  Burst size: {}", rate_limit_config.burst_size);
     } else {
         println!("Rate limiting: DISABLED");
@@ -630,31 +739,35 @@ async fn run_http_server(
 
     if let Some(tls) = tls_config {
         // TLS-enabled HTTPS server
-        let server_config = tls.build_server_config()
+        let server_config = tls
+            .build_server_config()
             .map_err(|e| onto_core::CoreError::Custom(format!("TLS config error: {}", e)))?;
-        let addr: std::net::SocketAddr = addr.parse()
-            .map_err(|e| onto_core::CoreError::Custom(format!("Invalid address '{}': {}", addr, e)))?;
-        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
+        let addr: std::net::SocketAddr = addr.parse().map_err(|e| {
+            onto_core::CoreError::Custom(format!("Invalid address '{}': {}", addr, e))
+        })?;
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
         axum_server::bind_rustls(addr, rustls_config)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .map_err(|e| onto_core::CoreError::Custom(format!("HTTPS server error: {}", e)))?;
     } else {
         // Plain HTTP server (no TLS)
-        let listener = tokio::net::TcpListener::bind(addr).await
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
             .map_err(onto_core::CoreError::Io)?;
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await
-            .map_err(|e| onto_core::CoreError::Custom(format!("HTTP server error: {}", e)))?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .map_err(|e| onto_core::CoreError::Custom(format!("HTTP server error: {}", e)))?;
     }
     Ok(())
 }
 
 /// Runs a Raft consensus node for distributed replication.
-async fn run_raft_node(
-    node_id: u64,
-    listen_addr: &str,
-    peers_str: &str,
-) -> Result<()> {
+async fn run_raft_node(node_id: u64, listen_addr: &str, peers_str: &str) -> Result<()> {
     use onto_raft::RaftNodeManager;
 
     // Parse peer list: "2=127.0.0.1:9001,3=127.0.0.1:9002"
@@ -663,8 +776,9 @@ async fn run_raft_node(
         for pair in peers_str.split(',') {
             let parts: Vec<&str> = pair.trim().split('=').collect();
             if parts.len() == 2 {
-                let id: u64 = parts[0].trim().parse()
-                    .map_err(|_| onto_core::CoreError::Custom(format!("invalid peer ID: {}", parts[0])))?;
+                let id: u64 = parts[0].trim().parse().map_err(|_| {
+                    onto_core::CoreError::Custom(format!("invalid peer ID: {}", parts[0]))
+                })?;
                 initial_members.insert(id, parts[1].trim().to_string());
             }
         }
@@ -681,7 +795,10 @@ async fn run_raft_node(
 
     // Start Raft TCP server
     let server = onto_raft::network::RaftTcpServer::new(listen_addr);
-    server.start().await.map_err(|e| onto_core::CoreError::Custom(e.to_string()))?;
+    server
+        .start()
+        .await
+        .map_err(|e| onto_core::CoreError::Custom(e.to_string()))?;
 
     Ok(())
 }
@@ -693,8 +810,13 @@ const MAX_TCP_CONNECTIONS: usize = 256;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// Runs the async TCP server, accepting client connections.
-async fn run_tcp_server(addr: &str, executor: Arc<QueryExecutor>, metrics: Arc<metrics::Metrics>) -> Result<()> {
-    let listener = TcpListener::bind(addr).await
+async fn run_tcp_server(
+    addr: &str,
+    executor: Arc<QueryExecutor>,
+    metrics: Arc<metrics::Metrics>,
+) -> Result<()> {
+    let listener = TcpListener::bind(addr)
+        .await
         .map_err(onto_core::CoreError::Io)?;
     let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_TCP_CONNECTIONS));
 
@@ -702,8 +824,7 @@ async fn run_tcp_server(addr: &str, executor: Arc<QueryExecutor>, metrics: Arc<m
     println!("Connect with: ontodb-cli {}", addr);
 
     loop {
-        let (stream, _peer_addr) = listener.accept().await
-            .map_err(onto_core::CoreError::Io)?;
+        let (stream, _peer_addr) = listener.accept().await.map_err(onto_core::CoreError::Io)?;
 
         let permit = match conn_semaphore.clone().acquire_owned().await {
             Ok(p) => p,
@@ -739,7 +860,10 @@ async fn handle_client(
     executor: &QueryExecutor,
     metrics: &metrics::Metrics,
 ) -> Result<()> {
-    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     println!("Client connected: {}", peer);
 
     let (reader, mut writer) = stream.into_split();
@@ -748,14 +872,18 @@ async fn handle_client(
 
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await
+        let n = reader
+            .read_line(&mut line)
+            .await
             .map_err(onto_core::CoreError::Io)?;
         if n == 0 {
             break;
         }
 
         if line.len() > MAX_LINE_BYTES {
-            writer.write_all(b"ERR: line too long (max 1MB)\n\0").await?;
+            writer
+                .write_all(b"ERR: line too long (max 1MB)\n\0")
+                .await?;
             line.clear();
             continue;
         }
@@ -884,8 +1012,7 @@ fn load_sharding_config(
     default_shard: u32,
 ) -> Result<onto_sharding::ShardMap> {
     if let Some(path) = file_path {
-        let content = std::fs::read_to_string(path)
-            .map_err(onto_core::CoreError::Io)?;
+        let content = std::fs::read_to_string(path).map_err(onto_core::CoreError::Io)?;
         let config: onto_sharding::ShardMap = serde_json::from_str(&content)
             .map_err(|e| onto_core::CoreError::Custom(format!("Invalid sharding config: {}", e)))?;
         tracing::info!("Loaded sharding config from {:?}", path);

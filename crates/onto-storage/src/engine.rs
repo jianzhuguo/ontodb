@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! LSM Engine: The main storage engine that orchestrates WAL, MemTable, and SSTables.
 //!
 //! Write path:  WAL -> MemTable -> (when full) flush to SSTable
@@ -10,15 +14,17 @@
 //! invalidate stale SSTable cache entries.
 
 use crate::index::IndexManager;
-use crate::vector::VectorIndexManager;
-use crate::lsm::compaction_worker::{CompactionMsg, CompactionNotification, CompactionWorker, SsTableInfo};
+use crate::lsm::compaction_worker::{
+    CompactionMsg, CompactionNotification, CompactionWorker, SsTableInfo,
+};
 use crate::lsm::memtable::MemTable;
 use crate::lsm::sstable::{SsTable, SsTableBuilder};
 use crate::lsm::wal::{self, Wal};
 use crate::mvcc::{TxnManager, WriteOp};
 use crate::options::StorageOptions;
-use onto_core::{Entry, EntryKind, Key, Result, SeqNo, Value};
+use crate::vector::VectorIndexManager;
 use onto_core::binary_row::BinaryRow;
+use onto_core::{Entry, EntryKind, Key, Result, SeqNo, Value};
 use std::collections::HashMap;
 use std::fs;
 
@@ -32,11 +38,11 @@ fn parse_doc_bytes(bytes: &[u8]) -> Option<serde_json::Map<String, serde_json::V
         _ => None,
     }
 }
+use parking_lot::RwLock as FairRwLock;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
-use parking_lot::RwLock as FairRwLock;
 
 /// Mutable write-path state, protected by RwLock for concurrent read access.
 ///
@@ -146,8 +152,15 @@ impl PreLoadEngine {
         let mut max_seq = 0u64;
         for entry in entries {
             match entry.kind {
-                EntryKind::Put => self.write_state.memtable.put_with_seq(entry.key, entry.value, entry.seq_no),
-                EntryKind::Delete => self.write_state.memtable.delete_with_seq(entry.key, entry.seq_no),
+                EntryKind::Put => {
+                    self.write_state
+                        .memtable
+                        .put_with_seq(entry.key, entry.value, entry.seq_no)
+                }
+                EntryKind::Delete => self
+                    .write_state
+                    .memtable
+                    .delete_with_seq(entry.key, entry.seq_no),
             }
             max_seq = max_seq.max(entry.seq_no);
         }
@@ -241,11 +254,7 @@ impl LsmEngine {
 
         // Spawn the background compaction worker with the loaded levels
         let (levels, compaction_sender, compaction_notif_receiver, _worker_handle) =
-            CompactionWorker::spawn(
-                options.clone(),
-                pre_engine.levels,
-                sst_counter.clone(),
-            );
+            CompactionWorker::spawn(options.clone(), pre_engine.levels, sst_counter.clone());
 
         // Create index manager with disk storage if configured
         let index_manager = match &options.index_storage_mode {
@@ -268,7 +277,7 @@ impl LsmEngine {
                 mm_config,
                 options.memtable_size_limit,
                 64 * 1024 * 1024, // 64 MB default block cache
-            )
+            ),
         );
 
         let engine = LsmEngine {
@@ -301,7 +310,9 @@ impl LsmEngine {
             .spawn(move || {
                 while !sync_shutdown.load(Ordering::Relaxed) {
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                    if let Some(mut ws) = sync_write_state.try_write_for(std::time::Duration::from_millis(5)) {
+                    if let Some(mut ws) =
+                        sync_write_state.try_write_for(std::time::Duration::from_millis(5))
+                    {
                         if ws.wal_pending_count > 0 {
                             let _ = ws.wal.flush_buf();
                             ws.wal_pending_count = 0;
@@ -317,7 +328,10 @@ impl LsmEngine {
             .ok();
         // Save the handle for graceful shutdown
         if let Some(h) = sync_handle {
-            *engine.wal_sync_handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+            *engine
+                .wal_sync_handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(h);
         }
 
         // Rebuild secondary indexes from persisted index entries
@@ -350,12 +364,20 @@ impl LsmEngine {
         self.shutdown.store(true, Ordering::Relaxed);
 
         // Wait for WAL sync thread to finish
-        if let Some(handle) = self.wal_sync_handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(handle) = self
+            .wal_sync_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let _ = handle.join();
         }
 
         // Flush any remaining data
-        if let Some(mut ws) = self.write_state.try_write_for(std::time::Duration::from_secs(1)) {
+        if let Some(mut ws) = self
+            .write_state
+            .try_write_for(std::time::Duration::from_secs(1))
+        {
             if ws.wal_pending_count > 0 {
                 let _ = ws.wal.flush_buf();
                 let _ = ws.wal.sync();
@@ -422,7 +444,10 @@ impl LsmEngine {
             // Flush WAL buffer once for the entire batch
             ws.wal.flush_buf()?;
             ws.wal_pending_count = 0;
-            (ws.memtable.size() >= self.options.memtable_size_limit, self.options.sync_wal_on_commit)
+            (
+                ws.memtable.size() >= self.options.memtable_size_limit,
+                self.options.sync_wal_on_commit,
+            )
         };
 
         // Group commit: batch sync across concurrent writers
@@ -483,13 +508,16 @@ impl LsmEngine {
         // 3. Snapshot SST handles from cache (may lazily open files).
         let sst_handles: Vec<Arc<SsTable>> = {
             let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
-            candidates.iter().filter_map(|path| {
-                if !cache.contains_key(path) {
-                    let sst = SsTable::open(path).ok()?;
-                    cache.insert(path.clone(), Arc::new(sst));
-                }
-                cache.get(path).map(Arc::clone)
-            }).collect()
+            candidates
+                .iter()
+                .filter_map(|path| {
+                    if !cache.contains_key(path) {
+                        let sst = SsTable::open(path).ok()?;
+                        cache.insert(path.clone(), Arc::new(sst));
+                    }
+                    cache.get(path).map(Arc::clone)
+                })
+                .collect()
         };
 
         // 4. Iterate SST handles outside the lock (I/O-heavy).
@@ -709,7 +737,11 @@ impl LsmEngine {
 
     /// Gets value metadata for an entity, computing real-time decay.
     /// Returns None if no metadata exists (old data without meta → defaults to score 1.0).
-    pub fn get_value_meta(&self, class: &str, pk: &str) -> Result<Option<crate::value_meta::ValueMetadata>> {
+    pub fn get_value_meta(
+        &self,
+        class: &str,
+        pk: &str,
+    ) -> Result<Option<crate::value_meta::ValueMetadata>> {
         let key = crate::value_meta::ValueMetadata::meta_key(class, pk);
         match self.get(&key)? {
             Some(bytes) => Ok(crate::value_meta::ValueMetadata::from_bytes(&bytes)),
@@ -727,7 +759,12 @@ impl LsmEngine {
     }
 
     /// Puts value metadata for an entity.
-    pub fn put_value_meta(&self, class: &str, pk: &str, meta: &crate::value_meta::ValueMetadata) -> Result<()> {
+    pub fn put_value_meta(
+        &self,
+        class: &str,
+        pk: &str,
+        meta: &crate::value_meta::ValueMetadata,
+    ) -> Result<()> {
         let key = crate::value_meta::ValueMetadata::meta_key(class, pk);
         let value = meta.to_bytes();
         self.put(key, value)
@@ -751,7 +788,10 @@ impl LsmEngine {
 impl Drop for LsmEngine {
     fn drop(&mut self) {
         // Flush any remaining WAL buffer to OS cache
-        if let Some(mut ws) = self.write_state.try_write_for(std::time::Duration::from_millis(100)) {
+        if let Some(mut ws) = self
+            .write_state
+            .try_write_for(std::time::Duration::from_millis(100))
+        {
             if ws.wal_pending_count > 0 {
                 let _ = ws.wal.flush_buf();
                 ws.wal_pending_count = 0;
@@ -787,8 +827,14 @@ impl LsmEngine {
                     .entries()
                     .map(|e| (e.key.clone(), e.value.clone(), e.seq_no, e.kind))
                     .collect();
-                let min_key = entries.first().map(|(k, _, _, _)| k.clone()).unwrap_or_default();
-                let max_key = entries.last().map(|(k, _, _, _)| k.clone()).unwrap_or_default();
+                let min_key = entries
+                    .first()
+                    .map(|(k, _, _, _)| k.clone())
+                    .unwrap_or_default();
+                let max_key = entries
+                    .last()
+                    .map(|(k, _, _, _)| k.clone())
+                    .unwrap_or_default();
                 (entries, min_key, max_key)
             } else {
                 return Ok(());
@@ -827,7 +873,10 @@ impl LsmEngine {
         // immutable MT cleared and the next lazy SST open.
         let new_sst = SsTable::open(&sst_path)?;
         {
-            self.sst_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(sst_path, Arc::new(new_sst));
+            self.sst_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(sst_path, Arc::new(new_sst));
         }
         {
             let mut ws = self.write_state.write();
@@ -836,11 +885,12 @@ impl LsmEngine {
         }
 
         // Notify the background compaction worker
-        let _ = self.compaction_sender.send(CompactionMsg::Flushed { level: 0 });
+        let _ = self
+            .compaction_sender
+            .send(CompactionMsg::Flushed { level: 0 });
 
         Ok(())
     }
-
 
     /// Drains compaction notifications from the background worker.
     /// Evicts stale SSTable cache entries when compaction replaces files.
@@ -856,10 +906,15 @@ impl LsmEngine {
         // Drain notifications under the receiver lock only (NOT holding write_state).
         let mut evicted_paths: Vec<PathBuf> = Vec::new();
         {
-            let receiver = self.compaction_notif_receiver.lock().unwrap_or_else(|e| e.into_inner());
+            let receiver = self
+                .compaction_notif_receiver
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             while let Ok(notif) = receiver.try_recv() {
                 match notif {
-                    CompactionNotification::Compacted { evicted_paths: paths } => {
+                    CompactionNotification::Compacted {
+                        evicted_paths: paths,
+                    } => {
                         evicted_paths.extend(paths);
                     }
                     CompactionNotification::FlushDone => {}
@@ -886,12 +941,17 @@ impl LsmEngine {
         self.drain_compaction_notifications();
 
         let _ = self.compaction_sender.send(CompactionMsg::FlushAndNotify);
-        let receiver = self.compaction_notif_receiver.lock().unwrap_or_else(|e| e.into_inner());
+        let receiver = self
+            .compaction_notif_receiver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut evicted_paths: Vec<PathBuf> = Vec::new();
         loop {
             match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(CompactionNotification::FlushDone) => break,
-                Ok(CompactionNotification::Compacted { evicted_paths: paths }) => {
+                Ok(CompactionNotification::Compacted {
+                    evicted_paths: paths,
+                }) => {
                     evicted_paths.extend(paths);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -1010,7 +1070,10 @@ impl LsmEngine {
     fn rebuild_indexes(&self) -> Result<()> {
         let index_entries = self.scan_prefix(b"__idx__")?;
         if !index_entries.is_empty() {
-            let mut mgr = self.index_manager.write().unwrap_or_else(|e| e.into_inner());
+            let mut mgr = self
+                .index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             mgr.rebuild_from_entries(&index_entries);
             tracing::info!(
                 "Rebuilt {} index entries across {} indexes",
@@ -1032,7 +1095,15 @@ impl LsmEngine {
         }
 
         // Parse and recreate vector indexes from metadata
-        let mut index_configs: Vec<(String, String, usize, crate::vector::DistanceMetric, usize, usize, usize)> = Vec::new();
+        let mut index_configs: Vec<(
+            String,
+            String,
+            usize,
+            crate::vector::DistanceMetric,
+            usize,
+            usize,
+            usize,
+        )> = Vec::new();
         for (_key, val_bytes) in &meta_entries {
             if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
                 let class = meta["class"].as_str().unwrap_or("").to_string();
@@ -1049,14 +1120,23 @@ impl LsmEngine {
                 let ef_search = meta["ef_search"].as_u64().unwrap_or(100) as usize;
 
                 if !class.is_empty() && !column.is_empty() && dimension > 0 {
-                    index_configs.push((class, column, dimension, metric, m, ef_construction, ef_search));
+                    index_configs.push((
+                        class,
+                        column,
+                        dimension,
+                        metric,
+                        m,
+                        ef_construction,
+                        ef_search,
+                    ));
                 }
             }
         }
 
         // Try to load persisted HNSW graph structures first (fast path)
         let graph_entries = self.scan_prefix(b"__vec_graph__")?;
-        let mut loaded_graphs: std::collections::HashMap<String, &[u8]> = std::collections::HashMap::new();
+        let mut loaded_graphs: std::collections::HashMap<String, &[u8]> =
+            std::collections::HashMap::new();
         for (key, val_bytes) in &graph_entries {
             if let Ok(key_str) = std::str::from_utf8(key) {
                 if let Some(graph_key) = key_str.strip_prefix("__vec_graph__") {
@@ -1071,12 +1151,20 @@ impl LsmEngine {
 
             if let Some(graph_data) = loaded_graphs.get(&graph_key) {
                 // Fast path: load HNSW graph structure directly
-                match self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner()).load_graph(class, column, graph_data) {
+                match self
+                    .vector_index_manager
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .load_graph(class, column, graph_data)
+                {
                     Ok(()) => {
                         tracing::info!(
                             "Loaded vector index graph for {}.{} ({} vectors, fast restore)",
-                            class, column,
-                            self.vector_index_manager.read().unwrap_or_else(|e| e.into_inner())
+                            class,
+                            column,
+                            self.vector_index_manager
+                                .read()
+                                .unwrap_or_else(|e| e.into_inner())
                                 .index_meta(class, column)
                                 .map(|m| m.dimension)
                                 .unwrap_or(0)
@@ -1084,15 +1172,30 @@ impl LsmEngine {
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to load HNSW graph for {}.{}, falling back to rebuild: {}", class, column, e);
+                        tracing::warn!(
+                            "Failed to load HNSW graph for {}.{}, falling back to rebuild: {}",
+                            class,
+                            column,
+                            e
+                        );
                     }
                 }
             }
 
             // Slow path: create empty index and backfill from documents
-            let _ = self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner()).create_index(
-                class, column, *dimension, *metric, *m, *ef_construction, *ef_search,
-            );
+            let _ = self
+                .vector_index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .create_index(
+                    class,
+                    column,
+                    *dimension,
+                    *metric,
+                    *m,
+                    *ef_construction,
+                    *ef_search,
+                );
 
             let prefix = format!("{}::", class);
             let entries = self.scan_prefix(prefix.as_bytes())?;
@@ -1118,23 +1221,34 @@ impl LsmEngine {
                     .iter()
                     .map(|(pk, c, col, v)| (pk.clone(), c.as_str(), col.as_str(), v.clone()))
                     .collect();
-                self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner()).index_vector_batch(&batch_refs);
+                self.vector_index_manager
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .index_vector_batch(&batch_refs);
             }
 
             // Persist the rebuilt HNSW graph structure for next restart
-            if let Some(graph_bytes) = self.vector_index_manager.read().unwrap_or_else(|e| e.into_inner()).save_graph(class, column) {
+            if let Some(graph_bytes) = self
+                .vector_index_manager
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .save_graph(class, column)
+            {
                 let graph_key = format!("__vec_graph__{}_{}", class, column);
                 let seq = self.next_seq();
                 let entry = Entry::put(graph_key.clone().into_bytes(), graph_bytes, seq);
                 let mut ws = self.write_state.write();
                 let _ = ws.wal.append(&entry);
                 let _ = ws.wal.flush_buf();
-                ws.memtable.put_with_seq(graph_key.into_bytes(), Vec::new(), seq);
+                ws.memtable
+                    .put_with_seq(graph_key.into_bytes(), Vec::new(), seq);
             }
 
             tracing::info!(
                 "Rebuilt vector index on {}.{} ({} vectors)",
-                class, column, count
+                class,
+                column,
+                count
             );
         }
 
@@ -1181,7 +1295,8 @@ impl LsmEngine {
             let mut ws = self.write_state.write();
             let writes = ws.txn_manager.commit(txn_id)?;
 
-            let mut writes_with_seq: Vec<(Vec<u8>, WriteOp, SeqNo)> = Vec::with_capacity(writes.len());
+            let mut writes_with_seq: Vec<(Vec<u8>, WriteOp, SeqNo)> =
+                Vec::with_capacity(writes.len());
             let mut old_values: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
             let mut index_entries_batch: Vec<(Vec<u8>, Vec<u8>, SeqNo)> = Vec::new();
 
@@ -1191,15 +1306,25 @@ impl LsmEngine {
                 // Check index existence (brief read locks, dropped immediately)
                 let class = Self::extract_class_from_key(&key);
                 let has_indexes = class.as_ref().is_some_and(|c| {
-                    !self.index_manager.read().unwrap_or_else(|e| e.into_inner()).indexes_for_class(c).is_empty()
+                    !self
+                        .index_manager
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .indexes_for_class(c)
+                        .is_empty()
                 });
                 let has_vector_indexes = class.as_ref().is_some_and(|c| {
-                    self.vector_index_manager.read().unwrap_or_else(|e| e.into_inner()).has_any_index(c)
+                    self.vector_index_manager
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .has_any_index(c)
                 });
 
                 // Read old value for de-indexing (from locked memtable + SST cache snapshot)
                 if has_indexes || has_vector_indexes {
-                    if let Some(old_val) = Self::get_from_locked(&ws, &sst_cache_snapshot, key.as_slice())? {
+                    if let Some(old_val) =
+                        Self::get_from_locked(&ws, &sst_cache_snapshot, key.as_slice())?
+                    {
                         old_values.insert(key.clone(), old_val);
                     }
                 }
@@ -1209,7 +1334,11 @@ impl LsmEngine {
                     if let WriteOp::Put(ref value) = op {
                         if let Some(ref c) = class {
                             if let Some(ref doc) = parse_doc_bytes(value) {
-                                let entries = self.index_manager.read().unwrap_or_else(|e| e.into_inner()).index_document_read_only(c, &key, doc);
+                                let entries = self
+                                    .index_manager
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .index_document_read_only(c, &key, doc);
                                 for (idx_key, idx_val) in entries {
                                     let idx_seq = self.next_seq();
                                     index_entries_batch.push((idx_key, idx_val, idx_seq));
@@ -1227,8 +1356,14 @@ impl LsmEngine {
 
         // ── Phase 2: Index mutations (no write_state held) ──
         {
-            let mut idx_mgr = self.index_manager.write().unwrap_or_else(|e| e.into_inner());
-            let mut vec_mgr = self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner());
+            let mut idx_mgr = self
+                .index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut vec_mgr = self
+                .vector_index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
 
             for (key, op, _) in &writes_with_seq {
                 let class = Self::extract_class_from_key(key);
@@ -1326,7 +1461,11 @@ impl LsmEngine {
 
     /// Gets a value by key from already-locked write state + SST cache.
     /// Used by `commit_txn` which holds the write_state write lock.
-    fn get_from_locked(ws: &WriteState, sst_cache: &HashMap<PathBuf, Arc<SsTable>>, key: &[u8]) -> Result<Option<Value>> {
+    fn get_from_locked(
+        ws: &WriteState,
+        sst_cache: &HashMap<PathBuf, Arc<SsTable>>,
+        key: &[u8],
+    ) -> Result<Option<Value>> {
         if let Some((val, _)) = ws.memtable.get(key) {
             return Ok(Some(val.to_vec()));
         }
@@ -1352,12 +1491,16 @@ impl LsmEngine {
 
     /// Buffers a put operation in a transaction.
     pub fn txn_put(&self, txn_id: SeqNo, key: Key, value: Value) -> Result<()> {
-        self.write_state.write()
+        self.write_state
+            .write()
             .txn_manager
             .get_mut(txn_id)
-            .ok_or_else(|| onto_core::CoreError::InvalidArgument(
-                format!("transaction {} not found or not active", txn_id),
-            ))?
+            .ok_or_else(|| {
+                onto_core::CoreError::InvalidArgument(format!(
+                    "transaction {} not found or not active",
+                    txn_id
+                ))
+            })?
             .put(key, value);
         Ok(())
     }
@@ -1369,11 +1512,12 @@ impl LsmEngine {
     pub fn txn_put_batch(&self, txn_id: SeqNo, entries: Vec<(Key, Value)>) -> Result<usize> {
         let count = entries.len();
         let mut ws = self.write_state.write();
-        let txn = ws.txn_manager
-            .get_mut(txn_id)
-            .ok_or_else(|| onto_core::CoreError::InvalidArgument(
-                format!("transaction {} not found or not active", txn_id),
-            ))?;
+        let txn = ws.txn_manager.get_mut(txn_id).ok_or_else(|| {
+            onto_core::CoreError::InvalidArgument(format!(
+                "transaction {} not found or not active",
+                txn_id
+            ))
+        })?;
         for (key, value) in entries {
             txn.put(key, value);
         }
@@ -1382,12 +1526,16 @@ impl LsmEngine {
 
     /// Buffers a delete operation in a transaction.
     pub fn txn_delete(&self, txn_id: SeqNo, key: Key) -> Result<()> {
-        self.write_state.write()
+        self.write_state
+            .write()
             .txn_manager
             .get_mut(txn_id)
-            .ok_or_else(|| onto_core::CoreError::InvalidArgument(
-                format!("transaction {} not found or not active", txn_id),
-            ))?
+            .ok_or_else(|| {
+                onto_core::CoreError::InvalidArgument(format!(
+                    "transaction {} not found or not active",
+                    txn_id
+                ))
+            })?
             .delete(key);
         Ok(())
     }
@@ -1422,16 +1570,18 @@ impl LsmEngine {
     }
 
     /// Scans all entries with the given prefix, respecting snapshot visibility.
-    pub fn txn_scan_prefix(
-        &self,
-        txn_id: SeqNo,
-        prefix: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn txn_scan_prefix(&self, txn_id: SeqNo, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let (vis, write_buffer) = {
             let ws = self.write_state.read();
             let vis = ws.txn_manager.visibility_for(txn_id);
-            let buf: Vec<(Vec<u8>, WriteOp)> = ws.txn_manager.get(txn_id)
-                .map(|t| t.write_buffer_iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            let buf: Vec<(Vec<u8>, WriteOp)> = ws
+                .txn_manager
+                .get(txn_id)
+                .map(|t| {
+                    t.write_buffer_iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                })
                 .unwrap_or_default();
             (vis, buf)
         };
@@ -1440,7 +1590,7 @@ impl LsmEngine {
         let base_results = self.scan_prefix_with_visibility(prefix, &vis)?;
 
         // Use HashMap for O(1) lookups during write buffer overlay
-        let mut results_map: std::collections::HashMap<Vec<u8>, Vec<u8>> = 
+        let mut results_map: std::collections::HashMap<Vec<u8>, Vec<u8>> =
             base_results.into_iter().collect();
 
         // Overlay the transaction's own write buffer
@@ -1560,7 +1710,10 @@ impl LsmEngine {
     /// Creates a secondary index on a class.column.
     /// Automatically backfills existing data for the class.
     pub fn create_index(&self, class: &str, column: &str) -> Result<()> {
-        self.index_manager.write().unwrap_or_else(|e| e.into_inner()).create_index(class, column);
+        self.index_manager
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .create_index(class, column);
 
         // Backfill: scan all existing entries for this class and index them
         let prefix = format!("{}::", class);
@@ -1568,7 +1721,10 @@ impl LsmEngine {
 
         // Phase 1: Insert into index under a single write lock (not per-document)
         let all_index_entries: Vec<(Vec<u8>, Vec<u8>)> = {
-            let mut mgr = self.index_manager.write().unwrap_or_else(|e| e.into_inner());
+            let mut mgr = self
+                .index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             let mut all = Vec::new();
             for (pk, val_bytes) in &entries {
                 if let Some(doc) = parse_doc_bytes(val_bytes) {
@@ -1596,12 +1752,18 @@ impl LsmEngine {
 
     /// Drops a secondary index.
     pub fn drop_index(&self, class: &str, column: &str) -> bool {
-        self.index_manager.write().unwrap_or_else(|e| e.into_inner()).drop_index(class, column)
+        self.index_manager
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .drop_index(class, column)
     }
 
     /// Returns true if an index exists on the given class.column.
     pub fn has_index(&self, class: &str, column: &str) -> bool {
-        self.index_manager.read().unwrap_or_else(|e| e.into_inner()).has_index(class, column)
+        self.index_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_index(class, column)
     }
 
     /// Returns a reference to the index manager RwLock.
@@ -1624,8 +1786,18 @@ impl LsmEngine {
         ef_construction: usize,
         ef_search: usize,
     ) -> Result<()> {
-        self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner())
-            .create_index(class, column, dimension, metric, m, ef_construction, ef_search)?;
+        self.vector_index_manager
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .create_index(
+                class,
+                column,
+                dimension,
+                metric,
+                m,
+                ef_construction,
+                ef_search,
+            )?;
 
         // Persist vector index metadata to LSM
         let meta_key = Self::make_vec_meta_key(class, column);
@@ -1676,18 +1848,27 @@ impl LsmEngine {
                 .iter()
                 .map(|(pk, v)| (pk.clone(), class, column, v.clone()))
                 .collect();
-            self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner()).index_vector_batch(&batch_refs);
+            self.vector_index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .index_vector_batch(&batch_refs);
         }
 
         // Persist the HNSW graph structure for fast restart
-        if let Some(graph_bytes) = self.vector_index_manager.read().unwrap_or_else(|e| e.into_inner()).save_graph(class, column) {
+        if let Some(graph_bytes) = self
+            .vector_index_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .save_graph(class, column)
+        {
             let graph_key = format!("__vec_graph__{}_{}", class, column);
             let seq = self.next_seq();
             let entry = Entry::put(graph_key.clone().into_bytes(), graph_bytes, seq);
             let mut ws = self.write_state.write();
             let _ = ws.wal.append(&entry);
             let _ = ws.wal.flush_buf();
-            ws.memtable.put_with_seq(graph_key.into_bytes(), Vec::new(), seq);
+            ws.memtable
+                .put_with_seq(graph_key.into_bytes(), Vec::new(), seq);
         }
 
         Ok(())
@@ -1695,7 +1876,11 @@ impl LsmEngine {
 
     /// Drops a vector index.
     pub fn drop_vector_index(&self, class: &str, column: &str) -> bool {
-        let removed = self.vector_index_manager.write().unwrap_or_else(|e| e.into_inner()).drop_index(class, column);
+        let removed = self
+            .vector_index_manager
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .drop_index(class, column);
         if removed {
             // Remove persisted metadata
             let meta_key = Self::make_vec_meta_key(class, column);
@@ -1727,7 +1912,10 @@ impl LsmEngine {
 
     /// Returns true if a vector index exists on the given class.column.
     pub fn has_vector_index(&self, class: &str, column: &str) -> bool {
-        self.vector_index_manager.read().unwrap_or_else(|e| e.into_inner()).has_index(class, column)
+        self.vector_index_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_index(class, column)
     }
 
     /// Returns a reference to the vector index manager RwLock.
@@ -1740,11 +1928,7 @@ impl LsmEngine {
         let ws = self.write_state.read();
         let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
         let total_sstables: usize = levels.iter().map(|l| l.len()).sum();
-        let total_sst_size: u64 = levels
-            .iter()
-            .flat_map(|l| l.iter())
-            .map(|s| s.size)
-            .sum();
+        let total_sst_size: u64 = levels.iter().flat_map(|l| l.iter()).map(|s| s.size).sum();
 
         EngineStats {
             memtable_size: ws.memtable.size(),
@@ -1803,7 +1987,11 @@ impl LsmEngine {
         drop(levels);
 
         for sst_path in &sst_paths {
-            let fname = sst_path.file_name().expect("should be valid").to_str().expect("should be valid");
+            let fname = sst_path
+                .file_name()
+                .expect("should be valid")
+                .to_str()
+                .expect("should be valid");
             let dest = backup_dir.join(fname);
             fs::copy(sst_path, &dest)?;
             let data = fs::read(&dest)?;
@@ -1838,7 +2026,11 @@ impl LsmEngine {
                 let entry = entry?;
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("idx") {
-                    let fname = path.file_name().expect("should be valid").to_str().expect("should be valid");
+                    let fname = path
+                        .file_name()
+                        .expect("should be valid")
+                        .to_str()
+                        .expect("should be valid");
                     let dest = idx_backup_dir.join(fname);
                     fs::copy(&path, &dest)?;
                     let data = fs::read(&dest)?;
@@ -1895,7 +2087,8 @@ impl LsmEngine {
 
             if !src.exists() {
                 return Err(onto_core::CoreError::Custom(format!(
-                    "Backup file missing: {}", file.name
+                    "Backup file missing: {}",
+                    file.name
                 )));
             }
 
@@ -1917,7 +2110,11 @@ impl LsmEngine {
     /// The `since` parameter should be the timestamp from a previous full or incremental backup.
     ///
     /// The incremental backup always includes the WAL file (for point-in-time recovery).
-    pub fn backup_incremental(&self, backup_dir: &Path, since: &std::time::SystemTime) -> Result<BackupManifest> {
+    pub fn backup_incremental(
+        &self,
+        backup_dir: &Path,
+        since: &std::time::SystemTime,
+    ) -> Result<BackupManifest> {
         self.flush()?;
         self.flush_disk_indexes()?;
 
@@ -1948,7 +2145,11 @@ impl LsmEngine {
             let meta = fs::metadata(sst_path)?;
             if let Ok(modified) = meta.modified() {
                 if modified > since_modified {
-                    let fname = sst_path.file_name().expect("should be valid").to_str().expect("should be valid");
+                    let fname = sst_path
+                        .file_name()
+                        .expect("should be valid")
+                        .to_str()
+                        .expect("should be valid");
                     let dest = backup_dir.join(fname);
                     fs::copy(sst_path, &dest)?;
                     let data = fs::read(&dest)?;
@@ -1988,7 +2189,11 @@ impl LsmEngine {
                     if let Ok(meta) = fs::metadata(&path) {
                         if let Ok(modified) = meta.modified() {
                             if modified > since_modified {
-                                let fname = path.file_name().expect("should be valid").to_str().expect("should be valid");
+                                let fname = path
+                                    .file_name()
+                                    .expect("should be valid")
+                                    .to_str()
+                                    .expect("should be valid");
                                 let dest = idx_backup_dir.join(fname);
                                 fs::copy(&path, &dest)?;
                                 let data = fs::read(&dest)?;
@@ -2026,7 +2231,9 @@ impl LsmEngine {
     pub fn verify_backup(backup_dir: &Path) -> Result<()> {
         let manifest_path = backup_dir.join("manifest.json");
         if !manifest_path.exists() {
-            return Err(onto_core::CoreError::Custom("manifest.json not found in backup directory".to_string()));
+            return Err(onto_core::CoreError::Custom(
+                "manifest.json not found in backup directory".to_string(),
+            ));
         }
 
         let manifest_bytes = fs::read(&manifest_path)?;
@@ -2049,7 +2256,9 @@ impl LsmEngine {
             if meta.len() != file.size {
                 errors.push(format!(
                     "size mismatch for {}: expected {} bytes, found {} bytes",
-                    file.name, file.size, meta.len()
+                    file.name,
+                    file.size,
+                    meta.len()
                 ));
                 continue;
             }
@@ -2068,7 +2277,10 @@ impl LsmEngine {
         }
 
         if errors.is_empty() {
-            tracing::info!("Backup verification passed: {} files OK", manifest.files.len());
+            tracing::info!(
+                "Backup verification passed: {} files OK",
+                manifest.files.len()
+            );
             Ok(())
         } else {
             let msg = format!("Backup verification failed:\n  {}", errors.join("\n  "));
@@ -2078,7 +2290,10 @@ impl LsmEngine {
 
     /// Flushes all disk-based indexes to disk (with fsync).
     fn flush_disk_indexes(&self) -> Result<()> {
-        self.index_manager.write().unwrap_or_else(|e| e.into_inner()).flush_disk_indexes();
+        self.index_manager
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .flush_disk_indexes();
         Ok(())
     }
 }
@@ -2137,7 +2352,9 @@ pub enum BackupFileType {
 /// Returns a simple ISO 8601 timestamp string (no external dependency).
 fn chrono_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = dur.as_secs();
     // Convert to approximate date/time (UTC)
     let days = secs / 86400;
@@ -2158,13 +2375,34 @@ fn chrono_timestamp() -> String {
         y += 1;
     }
     let leap = is_leap_year(y);
-    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut m = 0;
     while m < 12 && remaining >= month_days[m] {
         remaining -= month_days[m];
         m += 1;
     }
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m + 1, remaining + 1, hours, minutes, seconds)
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m + 1,
+        remaining + 1,
+        hours,
+        minutes,
+        seconds
+    )
 }
 
 fn is_leap_year(y: u64) -> bool {
@@ -2210,7 +2448,9 @@ mod tests {
         engine
             .put(b"name".to_vec(), b"alice".to_vec())
             .expect("should be valid");
-        engine.put(b"age".to_vec(), b"30".to_vec()).expect("should be valid");
+        engine
+            .put(b"age".to_vec(), b"30".to_vec())
+            .expect("should be valid");
 
         let val = engine.get(b"name").expect("should be valid");
         assert_eq!(val, Some(b"alice".to_vec()));
@@ -2232,8 +2472,12 @@ mod tests {
 
         let engine = LsmEngine::open(options).expect("should be valid");
 
-        engine.put(b"key".to_vec(), b"v1".to_vec()).expect("should be valid");
-        engine.put(b"key".to_vec(), b"v2".to_vec()).expect("should be valid");
+        engine
+            .put(b"key".to_vec(), b"v1".to_vec())
+            .expect("should be valid");
+        engine
+            .put(b"key".to_vec(), b"v2".to_vec())
+            .expect("should be valid");
 
         let val = engine.get(b"key").expect("should be valid");
         assert_eq!(val, Some(b"v2".to_vec()));
@@ -2249,7 +2493,9 @@ mod tests {
 
         let engine = LsmEngine::open(options).expect("should be valid");
 
-        engine.put(b"key".to_vec(), b"value".to_vec()).expect("should be valid");
+        engine
+            .put(b"key".to_vec(), b"value".to_vec())
+            .expect("should be valid");
         assert!(engine.get(b"key").expect("should be valid").is_some());
 
         engine.delete(b"key".to_vec()).expect("should be valid");
@@ -2271,7 +2517,9 @@ mod tests {
         for i in 0..20u32 {
             let key = format!("key_{:04}", i);
             let value = format!("value_{}", i);
-            engine.put(key.into_bytes(), value.into_bytes()).expect("should be valid");
+            engine
+                .put(key.into_bytes(), value.into_bytes())
+                .expect("should be valid");
         }
 
         // All data should still be readable
@@ -2279,7 +2527,10 @@ mod tests {
         assert_eq!(val, Some(b"value_5".to_vec()));
 
         let stats = engine.stats();
-        assert!(stats.total_sstables > 0, "should have flushed at least one SSTable");
+        assert!(
+            stats.total_sstables > 0,
+            "should have flushed at least one SSTable"
+        );
     }
 
     #[test]
@@ -2336,7 +2587,9 @@ mod tests {
         for i in 0..num_keys {
             let key = format!("key_{:04}", i);
             let value = format!("value_{:06}", i); // Larger values to fill memtable faster
-            engine.put(key.into_bytes(), value.into_bytes()).expect("should be valid");
+            engine
+                .put(key.into_bytes(), value.into_bytes())
+                .expect("should be valid");
         }
 
         let stats = engine.stats();
@@ -2382,14 +2635,18 @@ mod tests {
         for i in 0..50u32 {
             let key = format!("key_{:04}", i);
             let value = format!("v1_{:06}", i);
-            engine.put(key.into_bytes(), value.into_bytes()).expect("should be valid");
+            engine
+                .put(key.into_bytes(), value.into_bytes())
+                .expect("should be valid");
         }
 
         // Overwrite all keys with new values
         for i in 0..50u32 {
             let key = format!("key_{:04}", i);
             let value = format!("v2_{:06}", i);
-            engine.put(key.into_bytes(), value.into_bytes()).expect("should be valid");
+            engine
+                .put(key.into_bytes(), value.into_bytes())
+                .expect("should be valid");
         }
 
         // Verify the latest values are returned
@@ -2422,7 +2679,9 @@ mod tests {
         for i in 0..50u32 {
             let key = format!("key_{:04}", i);
             let value = format!("value_{:06}", i);
-            engine.put(key.into_bytes(), value.into_bytes()).expect("should be valid");
+            engine
+                .put(key.into_bytes(), value.into_bytes())
+                .expect("should be valid");
         }
 
         // Delete even-numbered keys
@@ -2439,13 +2698,14 @@ mod tests {
             let key = format!("key_{:04}", i);
             let val = engine.get(key.as_bytes()).expect("should be valid");
             if i % 2 == 0 {
-                assert!(val.is_none(), "deleted key {} should not exist, got {:?}", key, val);
-            } else {
                 assert!(
-                    val.is_some(),
-                    "non-deleted key {} should still exist",
-                    key
+                    val.is_none(),
+                    "deleted key {} should not exist, got {:?}",
+                    key,
+                    val
                 );
+            } else {
+                assert!(val.is_some(), "non-deleted key {} should still exist", key);
             }
         }
     }
@@ -2466,7 +2726,9 @@ mod tests {
         for i in 0..80u32 {
             let key = format!("key_{:04}", i);
             let value = format!("value_{:06}", i);
-            engine.put(key.into_bytes(), value.into_bytes()).expect("should be valid");
+            engine
+                .put(key.into_bytes(), value.into_bytes())
+                .expect("should be valid");
         }
 
         // Delete all but the last 10 keys
@@ -2510,12 +2772,22 @@ mod tests {
         let engine = LsmEngine::open(options).expect("should be valid");
 
         let txn = engine.begin_txn();
-        engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).expect("should be valid");
-        engine.txn_put(txn, b"age".to_vec(), b"30".to_vec()).expect("should be valid");
+        engine
+            .txn_put(txn, b"name".to_vec(), b"alice".to_vec())
+            .expect("should be valid");
+        engine
+            .txn_put(txn, b"age".to_vec(), b"30".to_vec())
+            .expect("should be valid");
         engine.commit_txn(txn).expect("should be valid");
 
-        assert_eq!(engine.get(b"name").expect("should be valid"), Some(b"alice".to_vec()));
-        assert_eq!(engine.get(b"age").expect("should be valid"), Some(b"30".to_vec()));
+        assert_eq!(
+            engine.get(b"name").expect("should be valid"),
+            Some(b"alice".to_vec())
+        );
+        assert_eq!(
+            engine.get(b"age").expect("should be valid"),
+            Some(b"30".to_vec())
+        );
     }
 
     #[test]
@@ -2528,7 +2800,9 @@ mod tests {
         let engine = LsmEngine::open(options).expect("should be valid");
 
         let txn = engine.begin_txn();
-        engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).expect("should be valid");
+        engine
+            .txn_put(txn, b"name".to_vec(), b"alice".to_vec())
+            .expect("should be valid");
         engine.abort_txn(txn).expect("should be valid");
 
         assert_eq!(engine.get(b"name").expect("should be valid"), None);
@@ -2544,11 +2818,21 @@ mod tests {
         let engine = LsmEngine::open(options).expect("should be valid");
 
         let txn = engine.begin_txn();
-        engine.txn_put(txn, b"name".to_vec(), b"alice".to_vec()).expect("should be valid");
-        engine.txn_put(txn, b"age".to_vec(), b"30".to_vec()).expect("should be valid");
+        engine
+            .txn_put(txn, b"name".to_vec(), b"alice".to_vec())
+            .expect("should be valid");
+        engine
+            .txn_put(txn, b"age".to_vec(), b"30".to_vec())
+            .expect("should be valid");
 
-        assert_eq!(engine.txn_get(txn, b"name").expect("should be valid"), Some(b"alice".to_vec()));
-        assert_eq!(engine.txn_get(txn, b"age").expect("should be valid"), Some(b"30".to_vec()));
+        assert_eq!(
+            engine.txn_get(txn, b"name").expect("should be valid"),
+            Some(b"alice".to_vec())
+        );
+        assert_eq!(
+            engine.txn_get(txn, b"age").expect("should be valid"),
+            Some(b"30".to_vec())
+        );
 
         engine.commit_txn(txn).expect("should be valid");
     }
@@ -2562,17 +2846,27 @@ mod tests {
         };
         let engine = LsmEngine::open(options).expect("should be valid");
 
-        engine.put(b"key".to_vec(), b"v1".to_vec()).expect("should be valid");
+        engine
+            .put(b"key".to_vec(), b"v1".to_vec())
+            .expect("should be valid");
 
         let txn1 = engine.begin_txn();
 
-        engine.put(b"key".to_vec(), b"v2".to_vec()).expect("should be valid");
+        engine
+            .put(b"key".to_vec(), b"v2".to_vec())
+            .expect("should be valid");
 
         // txn1 still sees v1 (snapshot isolation)
-        assert_eq!(engine.txn_get(txn1, b"key").expect("should be valid"), Some(b"v1".to_vec()));
+        assert_eq!(
+            engine.txn_get(txn1, b"key").expect("should be valid"),
+            Some(b"v1".to_vec())
+        );
 
         let txn2 = engine.begin_txn();
-        assert_eq!(engine.txn_get(txn2, b"key").expect("should be valid"), Some(b"v2".to_vec()));
+        assert_eq!(
+            engine.txn_get(txn2, b"key").expect("should be valid"),
+            Some(b"v2".to_vec())
+        );
 
         engine.commit_txn(txn1).expect("should be valid");
         engine.commit_txn(txn2).expect("should be valid");
@@ -2590,14 +2884,24 @@ mod tests {
         let txn1 = engine.begin_txn();
         let txn2 = engine.begin_txn();
 
-        engine.txn_put(txn1, b"a".to_vec(), b"1".to_vec()).expect("should be valid");
-        engine.txn_put(txn2, b"b".to_vec(), b"2".to_vec()).expect("should be valid");
+        engine
+            .txn_put(txn1, b"a".to_vec(), b"1".to_vec())
+            .expect("should be valid");
+        engine
+            .txn_put(txn2, b"b".to_vec(), b"2".to_vec())
+            .expect("should be valid");
 
         engine.commit_txn(txn1).expect("should be valid");
         engine.commit_txn(txn2).expect("should be valid");
 
-        assert_eq!(engine.get(b"a").expect("should be valid"), Some(b"1".to_vec()));
-        assert_eq!(engine.get(b"b").expect("should be valid"), Some(b"2".to_vec()));
+        assert_eq!(
+            engine.get(b"a").expect("should be valid"),
+            Some(b"1".to_vec())
+        );
+        assert_eq!(
+            engine.get(b"b").expect("should be valid"),
+            Some(b"2".to_vec())
+        );
     }
 
     #[test]
@@ -2609,10 +2913,14 @@ mod tests {
         };
         let engine = LsmEngine::open(options).expect("should be valid");
 
-        engine.put(b"key".to_vec(), b"value".to_vec()).expect("should be valid");
+        engine
+            .put(b"key".to_vec(), b"value".to_vec())
+            .expect("should be valid");
 
         let txn = engine.begin_txn();
-        engine.txn_delete(txn, b"key".to_vec()).expect("should be valid");
+        engine
+            .txn_delete(txn, b"key".to_vec())
+            .expect("should be valid");
         assert_eq!(engine.txn_get(txn, b"key").expect("should be valid"), None);
 
         engine.commit_txn(txn).expect("should be valid");
@@ -2628,14 +2936,24 @@ mod tests {
         };
         let engine = LsmEngine::open(options).expect("should be valid");
 
-        engine.put(b"user:1".to_vec(), b"alice".to_vec()).expect("should be valid");
-        engine.put(b"user:2".to_vec(), b"bob".to_vec()).expect("should be valid");
-        engine.put(b"item:1".to_vec(), b"widget".to_vec()).expect("should be valid");
+        engine
+            .put(b"user:1".to_vec(), b"alice".to_vec())
+            .expect("should be valid");
+        engine
+            .put(b"user:2".to_vec(), b"bob".to_vec())
+            .expect("should be valid");
+        engine
+            .put(b"item:1".to_vec(), b"widget".to_vec())
+            .expect("should be valid");
 
         let txn = engine.begin_txn();
-        engine.txn_put(txn, b"user:3".to_vec(), b"charlie".to_vec()).expect("should be valid");
+        engine
+            .txn_put(txn, b"user:3".to_vec(), b"charlie".to_vec())
+            .expect("should be valid");
 
-        let results = engine.txn_scan_prefix(txn, b"user:").expect("should be valid");
+        let results = engine
+            .txn_scan_prefix(txn, b"user:")
+            .expect("should be valid");
         assert_eq!(results.len(), 3);
 
         engine.commit_txn(txn).expect("should be valid");
@@ -2651,13 +2969,23 @@ mod tests {
         let engine = LsmEngine::open(options).expect("should be valid");
 
         let txn = engine.begin_txn();
-        engine.txn_put(txn, b"key".to_vec(), b"v1".to_vec()).expect("should be valid");
-        engine.txn_put(txn, b"key".to_vec(), b"v2".to_vec()).expect("should be valid");
+        engine
+            .txn_put(txn, b"key".to_vec(), b"v1".to_vec())
+            .expect("should be valid");
+        engine
+            .txn_put(txn, b"key".to_vec(), b"v2".to_vec())
+            .expect("should be valid");
 
-        assert_eq!(engine.txn_get(txn, b"key").expect("should be valid"), Some(b"v2".to_vec()));
+        assert_eq!(
+            engine.txn_get(txn, b"key").expect("should be valid"),
+            Some(b"v2".to_vec())
+        );
 
         engine.commit_txn(txn).expect("should be valid");
-        assert_eq!(engine.get(b"key").expect("should be valid"), Some(b"v2".to_vec()));
+        assert_eq!(
+            engine.get(b"key").expect("should be valid"),
+            Some(b"v2".to_vec())
+        );
     }
 
     #[test]
@@ -2698,14 +3026,28 @@ mod tests {
             };
             let engine = LsmEngine::open(options).expect("should be valid");
 
-            engine.create_index("Product", "price").expect("should be valid");
+            engine
+                .create_index("Product", "price")
+                .expect("should be valid");
 
             // Insert via transaction so indexes are maintained
             let txn = engine.begin_txn();
             let doc1 = serde_json::json!({"__class__": "Product", "name": "iPhone", "price": 999});
             let doc2 = serde_json::json!({"__class__": "Product", "name": "iPad", "price": 799});
-            engine.txn_put(txn, b"Product::001".to_vec(), serde_json::to_vec(&doc1).expect("should be valid")).expect("should be valid");
-            engine.txn_put(txn, b"Product::002".to_vec(), serde_json::to_vec(&doc2).expect("should be valid")).expect("should be valid");
+            engine
+                .txn_put(
+                    txn,
+                    b"Product::001".to_vec(),
+                    serde_json::to_vec(&doc1).expect("should be valid"),
+                )
+                .expect("should be valid");
+            engine
+                .txn_put(
+                    txn,
+                    b"Product::002".to_vec(),
+                    serde_json::to_vec(&doc2).expect("should be valid"),
+                )
+                .expect("should be valid");
             engine.commit_txn(txn).expect("should be valid");
 
             engine.flush().expect("should be valid");
@@ -2721,24 +3063,31 @@ mod tests {
             let engine = LsmEngine::open(options).expect("should be valid");
 
             // Index should exist after restart
-            assert!(engine.has_index("Product", "price"), "index should persist across restart");
+            assert!(
+                engine.has_index("Product", "price"),
+                "index should persist across restart"
+            );
 
             // Index should be functional: lookup by value
-            let pkeys = engine.index_manager().write().expect("should be valid").lookup_eq(
-                "Product",
-                "price",
-                &serde_json::json!(999),
-            );
+            let pkeys = engine
+                .index_manager()
+                .write()
+                .expect("should be valid")
+                .lookup_eq("Product", "price", &serde_json::json!(999));
             assert!(pkeys.is_some(), "index lookup should work after restart");
             assert_eq!(pkeys.expect("should be valid").len(), 1);
 
             // Range scan should also work
-            let pkeys = engine.index_manager().write().expect("should be valid").lookup_range(
-                "Product",
-                "price",
-                Some(&serde_json::json!(500)),
-                Some(&serde_json::json!(1000)),
-            );
+            let pkeys = engine
+                .index_manager()
+                .write()
+                .expect("should be valid")
+                .lookup_range(
+                    "Product",
+                    "price",
+                    Some(&serde_json::json!(500)),
+                    Some(&serde_json::json!(1000)),
+                );
             assert!(pkeys.is_some());
             assert_eq!(pkeys.expect("should be valid").len(), 2); // both products
         }
@@ -2759,9 +3108,15 @@ mod tests {
             };
             let engine = LsmEngine::open(options).expect("should be valid");
 
-            engine.put(b"key1".to_vec(), b"value1".to_vec()).expect("should be valid");
-            engine.put(b"key2".to_vec(), b"value2".to_vec()).expect("should be valid");
-            engine.put(b"key3".to_vec(), b"value3".to_vec()).expect("should be valid");
+            engine
+                .put(b"key1".to_vec(), b"value1".to_vec())
+                .expect("should be valid");
+            engine
+                .put(b"key2".to_vec(), b"value2".to_vec())
+                .expect("should be valid");
+            engine
+                .put(b"key3".to_vec(), b"value3".to_vec())
+                .expect("should be valid");
             engine.flush().expect("should be valid");
 
             // Create backup
@@ -2771,7 +3126,9 @@ mod tests {
             assert!(backup_dir.join("wal.log").exists());
 
             // Verify at least one SSTable in backup
-            let sst_files: Vec<_> = manifest.files.iter()
+            let sst_files: Vec<_> = manifest
+                .files
+                .iter()
                 .filter(|f| matches!(f.file_type, BackupFileType::SSTable))
                 .collect();
             assert!(!sst_files.is_empty(), "backup should contain SSTable files");
@@ -2796,9 +3153,18 @@ mod tests {
             };
             let engine = LsmEngine::open(options).expect("should be valid");
 
-            assert_eq!(engine.get(b"key1").expect("should be valid"), Some(b"value1".to_vec()));
-            assert_eq!(engine.get(b"key2").expect("should be valid"), Some(b"value2".to_vec()));
-            assert_eq!(engine.get(b"key3").expect("should be valid"), Some(b"value3".to_vec()));
+            assert_eq!(
+                engine.get(b"key1").expect("should be valid"),
+                Some(b"value1".to_vec())
+            );
+            assert_eq!(
+                engine.get(b"key2").expect("should be valid"),
+                Some(b"value2".to_vec())
+            );
+            assert_eq!(
+                engine.get(b"key3").expect("should be valid"),
+                Some(b"value3".to_vec())
+            );
             assert_eq!(engine.get(b"missing").expect("should be valid"), None);
         }
     }
@@ -2915,7 +3281,8 @@ mod tests {
         let engine = LsmEngine::open(StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         let meta = crate::value_meta::ValueMetadata::new(0.8, crate::value_meta::LAMBDA_70D);
         engine.put_value_meta("BioTask", "001", &meta).unwrap();
@@ -2931,7 +3298,8 @@ mod tests {
         let engine = LsmEngine::open(StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         let result = engine.get_value_meta("Nonexistent", "999").unwrap();
         assert!(result.is_none());
@@ -2943,7 +3311,8 @@ mod tests {
         let engine = LsmEngine::open(StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         // Old data without meta should default to score 1.0
         let score = engine.get_value_score("OldClass", "001").unwrap();
@@ -2956,10 +3325,13 @@ mod tests {
         let engine = LsmEngine::open(StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         // Activate an entity without prior meta
-        engine.activate("BioTask", "001", 0.5, "manual_heat").unwrap();
+        engine
+            .activate("BioTask", "001", 0.5, "manual_heat")
+            .unwrap();
 
         let meta = engine.get_value_meta("BioTask", "001").unwrap().unwrap();
         assert!(meta.activation_count == 1);
@@ -2972,7 +3344,8 @@ mod tests {
         let engine = LsmEngine::open(StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut meta = crate::value_meta::ValueMetadata::new(0.5, crate::value_meta::LAMBDA_7H);
         engine.put_value_meta("BioTask", "002", &meta).unwrap();
@@ -2991,14 +3364,16 @@ mod tests {
         let engine = LsmEngine::open(StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
 
         let mut meta = crate::value_meta::ValueMetadata::new(1.0, crate::value_meta::LAMBDA_7H);
         // Simulate 7 hours ago
         meta.last_activated_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_secs() - 25200;
+            .as_secs()
+            - 25200;
         engine.put_value_meta("BioTask", "003", &meta).unwrap();
 
         let score = engine.get_value_score("BioTask", "003").unwrap();

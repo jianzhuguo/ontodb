@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Incremental persistence for HNSW indexes.
 //!
 //! Instead of saving the entire graph on every flush, we track
@@ -112,21 +116,27 @@ impl IncrementalSnapshot {
             if offset + 7 > data.len() {
                 return None;
             }
-            let node_id = u32::from_le_bytes(data[offset..offset+4].try_into().ok()?) as usize;
+            let node_id = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
             offset += 4;
             let layer = data[offset] as usize;
             offset += 1;
-            let num_neighbors = u16::from_le_bytes(data[offset..offset+2].try_into().ok()?) as usize;
+            let num_neighbors =
+                u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?) as usize;
             offset += 2;
             let mut neighbors = Vec::with_capacity(num_neighbors);
             for _ in 0..num_neighbors {
                 if offset + 4 > data.len() {
                     return None;
                 }
-                neighbors.push(u32::from_le_bytes(data[offset..offset+4].try_into().ok()?) as usize);
+                neighbors
+                    .push(u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize);
                 offset += 4;
             }
-            deltas.push(NodeDelta { node_id, layer, neighbors });
+            deltas.push(NodeDelta {
+                node_id,
+                layer,
+                neighbors,
+            });
         }
         Some(IncrementalSnapshot { version, deltas })
     }
@@ -169,10 +179,21 @@ mod tests {
 
     #[test]
     fn test_incremental_snapshot_serialize() {
-        let snapshot = IncrementalSnapshot::new(42, vec![
-            NodeDelta { node_id: 1, layer: 0, neighbors: vec![2, 3] },
-            NodeDelta { node_id: 2, layer: 1, neighbors: vec![1] },
-        ]);
+        let snapshot = IncrementalSnapshot::new(
+            42,
+            vec![
+                NodeDelta {
+                    node_id: 1,
+                    layer: 0,
+                    neighbors: vec![2, 3],
+                },
+                NodeDelta {
+                    node_id: 2,
+                    layer: 1,
+                    neighbors: vec![1],
+                },
+            ],
+        );
 
         let bytes = snapshot.to_bytes();
         let restored = IncrementalSnapshot::from_bytes(&bytes).unwrap();

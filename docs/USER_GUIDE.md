@@ -80,7 +80,7 @@ SELECT name, price FROM Product ORDER BY price DESC LIMIT 10;
 
 ```bash
 # 前置要求：Rust 1.70+
-git clone https://github.com/ontodb/ontodb.git
+git clone https://gitee.com/ontovalue/ontodb.git
 cd ontodb
 cargo build --release
 ```
@@ -555,5 +555,5 @@ ontodb-server \
 
 - [API 文档](http://localhost:7912/api/docs)
 - [OpenAPI 规范](http://localhost:7912/api/openapi.json)
-- [GitHub 仓库](https://github.com/ontodb/ontodb)
-- [问题反馈](https://github.com/ontodb/ontodb/issues)
+- [GitHub 仓库](https://gitee.com/ontovalue/ontodb)
+- [问题反馈](https://gitee.com/ontovalue/ontodb/issues)

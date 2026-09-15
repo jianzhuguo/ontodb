@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! 地理位置路由 - 基于 GPS 坐标自动匹配最佳节点
 
 use super::GeoLocation;
@@ -34,8 +38,18 @@ impl GeoRouter {
     /// 根据 GPS 坐标找最近的节点
     pub fn find_nearest(&self, location: &GeoLocation) -> Option<&RegionNode> {
         self.nodes.iter().min_by(|a, b| {
-            let dist_a = haversine_distance(location.latitude, location.longitude, a.center_lat, a.center_lng);
-            let dist_b = haversine_distance(location.latitude, location.longitude, b.center_lat, b.center_lng);
+            let dist_a = haversine_distance(
+                location.latitude,
+                location.longitude,
+                a.center_lat,
+                a.center_lng,
+            );
+            let dist_b = haversine_distance(
+                location.latitude,
+                location.longitude,
+                b.center_lat,
+                b.center_lng,
+            );
             dist_a.partial_cmp(&dist_b).unwrap()
         })
     }
@@ -79,7 +93,8 @@ fn haversine_distance(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
     let r = 6371000.0;
     let dlat = (lat2 - lat1).to_radians();
     let dlng = (lng2 - lng1).to_radians();
-    let a = (dlat / 2.0).sin().powi(2) + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlng / 2.0).sin().powi(2);
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlng / 2.0).sin().powi(2);
     let c = 2.0 * a.sqrt().asin();
     r * c
 }

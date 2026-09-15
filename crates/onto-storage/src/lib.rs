@@ -18,6 +18,10 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::doc_lazy_continuation)]
 
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! onto-storage: LSM-Tree storage engine for OntoDB.
 //!
 //! Architecture:
@@ -38,14 +42,16 @@ pub mod tsm;
 pub mod value_meta;
 pub mod vector;
 
-pub use engine::{LsmEngine, BackupManifest, BackupFile, BackupFileType};
-pub use value_meta::{ValueMetadata, ValueScorer, LAMBDA_7H, LAMBDA_70D, LAMBDA_2Y};
+pub use engine::{BackupFile, BackupFileType, BackupManifest, LsmEngine};
 pub use index::{IndexManager, IndexStorageMode};
 pub use iterator::StorageIterator;
-pub use mvcc::{TxnManager, Transaction, TxnStatus, WriteOp};
+pub use mvcc::{Transaction, TxnManager, TxnStatus, WriteOp};
 pub use options::StorageOptions;
-pub use vector::{DistanceMetric, HnswConfig, HnswIndex, VectorEntry, SearchResult, VectorIndexManager};
+pub use value_meta::{ValueMetadata, ValueScorer, LAMBDA_2Y, LAMBDA_70D, LAMBDA_7H};
 pub use vector::distance;
+pub use vector::{
+    DistanceMetric, HnswConfig, HnswIndex, SearchResult, VectorEntry, VectorIndexManager,
+};
 
 #[cfg(test)]
 mod fuzz_tests;

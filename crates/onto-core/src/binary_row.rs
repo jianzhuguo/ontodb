@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Binary row format for fast filter evaluation without full JSON deserialization.
 //!
 //! Format layout:
@@ -97,9 +101,9 @@ impl<'a> BinaryRow<'a> {
                     if value_offset + 4 > data.len() {
                         return None;
                     }
-                    let len = u32::from_le_bytes(
-                        data[value_offset..value_offset + 4].try_into().ok()?,
-                    ) as usize;
+                    let len =
+                        u32::from_le_bytes(data[value_offset..value_offset + 4].try_into().ok()?)
+                            as usize;
                     4 + len
                 }
                 _ => return None,
@@ -122,7 +126,12 @@ impl<'a> BinaryRow<'a> {
         }
 
         // name_index is built lazily on first find_field() call
-        Some(BinaryRow { data, num_fields: num_fields as u16, fields, name_index: OnceLock::new() })
+        Some(BinaryRow {
+            data,
+            num_fields: num_fields as u16,
+            fields,
+            name_index: OnceLock::new(),
+        })
     }
 
     /// Number of fields in this row.
@@ -146,7 +155,10 @@ impl<'a> BinaryRow<'a> {
     /// Get the raw value bytes and type tag for a field by index.
     pub fn field_value_raw(&self, idx: usize) -> (u8, &[u8]) {
         let fm = &self.fields[idx];
-        (fm.type_tag, &self.data[fm.value_offset..fm.value_offset + fm.value_size])
+        (
+            fm.type_tag,
+            &self.data[fm.value_offset..fm.value_offset + fm.value_size],
+        )
     }
 
     /// Find a field by name. Returns its index, or None. O(1) via lazily-built HashMap.
@@ -338,16 +350,22 @@ pub fn binary_bytes_to_map(data: &[u8]) -> Option<Map<String, Value>> {
         let value = match type_tag {
             TAG_NULL => Value::Null,
             TAG_BOOL => {
-                if value_offset >= data.len() { return None; }
+                if value_offset >= data.len() {
+                    return None;
+                }
                 Value::Bool(data[value_offset] != 0)
             }
             TAG_INT => {
-                if value_offset + 8 > data.len() { return None; }
+                if value_offset + 8 > data.len() {
+                    return None;
+                }
                 let arr: [u8; 8] = data[value_offset..value_offset + 8].try_into().ok()?;
                 Value::Number(serde_json::Number::from(i64::from_be_bytes(arr)))
             }
             TAG_FLOAT => {
-                if value_offset + 8 > data.len() { return None; }
+                if value_offset + 8 > data.len() {
+                    return None;
+                }
                 let arr: [u8; 8] = data[value_offset..value_offset + 8].try_into().ok()?;
                 let f = f64::from_be_bytes(arr);
                 {
@@ -356,20 +374,27 @@ pub fn binary_bytes_to_map(data: &[u8]) -> Option<Map<String, Value>> {
                 }
             }
             TAG_STRING => {
-                if value_offset + 4 > data.len() { return None; }
-                let slen = u32::from_le_bytes(
-                    data[value_offset..value_offset + 4].try_into().ok()?,
-                ) as usize;
-                if value_offset + 4 + slen > data.len() { return None; }
-                let s = std::str::from_utf8(&data[value_offset + 4..value_offset + 4 + slen]).ok()?;
+                if value_offset + 4 > data.len() {
+                    return None;
+                }
+                let slen = u32::from_le_bytes(data[value_offset..value_offset + 4].try_into().ok()?)
+                    as usize;
+                if value_offset + 4 + slen > data.len() {
+                    return None;
+                }
+                let s =
+                    std::str::from_utf8(&data[value_offset + 4..value_offset + 4 + slen]).ok()?;
                 Value::String(s.to_string())
             }
             TAG_OBJECT => {
-                if value_offset + 4 > data.len() { return None; }
-                let olen = u32::from_le_bytes(
-                    data[value_offset..value_offset + 4].try_into().ok()?,
-                ) as usize;
-                if value_offset + 4 + olen > data.len() { return None; }
+                if value_offset + 4 > data.len() {
+                    return None;
+                }
+                let olen = u32::from_le_bytes(data[value_offset..value_offset + 4].try_into().ok()?)
+                    as usize;
+                if value_offset + 4 + olen > data.len() {
+                    return None;
+                }
                 let inner = &data[value_offset + 4..value_offset + 4 + olen];
                 {
                     let m = binary_bytes_to_map(inner)?;
@@ -377,7 +402,9 @@ pub fn binary_bytes_to_map(data: &[u8]) -> Option<Map<String, Value>> {
                 }
             }
             TAG_ARRAY => {
-                if value_offset + 8 > data.len() { return None; }
+                if value_offset + 8 > data.len() {
+                    return None;
+                }
                 let arr_data = &data[value_offset..];
                 binary_to_serde_value(TAG_ARRAY, arr_data)?
             }
@@ -393,10 +420,11 @@ pub fn binary_bytes_to_map(data: &[u8]) -> Option<Map<String, Value>> {
             TAG_BOOL => 1,
             TAG_INT | TAG_FLOAT => 8,
             TAG_STRING | TAG_OBJECT | TAG_ARRAY => {
-                if value_offset + 4 > data.len() { return None; }
-                4 + u32::from_le_bytes(
-                    data[value_offset..value_offset + 4].try_into().ok()?,
-                ) as usize
+                if value_offset + 4 > data.len() {
+                    return None;
+                }
+                4 + u32::from_le_bytes(data[value_offset..value_offset + 4].try_into().ok()?)
+                    as usize
             }
             _ => return None,
         };
@@ -502,7 +530,9 @@ pub fn binary_to_serde_value(tag: u8, raw: &[u8]) -> Option<Value> {
         TAG_BOOL => Some(Value::Bool(raw.first().is_some_and(|b| *b != 0))),
         TAG_INT => {
             let arr: [u8; 8] = raw.get(..8)?.try_into().ok()?;
-            Some(Value::Number(serde_json::Number::from(i64::from_be_bytes(arr))))
+            Some(Value::Number(serde_json::Number::from(i64::from_be_bytes(
+                arr,
+            ))))
         }
         TAG_FLOAT => {
             let arr: [u8; 8] = raw.get(..8)?.try_into().ok()?;
@@ -583,8 +613,7 @@ pub fn binary_value_eq_serde(tag: u8, raw: &[u8], lit: &Value) -> bool {
         (TAG_INT, Value::Number(n)) => {
             if let Ok(arr) = raw.try_into() as Result<[u8; 8], _> {
                 let v = i64::from_be_bytes(arr);
-                (n.as_i64() == Some(v))
-                    || (n.as_f64() == Some(v as f64))
+                (n.as_i64() == Some(v)) || (n.as_f64() == Some(v as f64))
             } else {
                 false
             }
@@ -592,8 +621,7 @@ pub fn binary_value_eq_serde(tag: u8, raw: &[u8], lit: &Value) -> bool {
         (TAG_FLOAT, Value::Number(n)) => {
             if let Ok(arr) = raw.try_into() as Result<[u8; 8], _> {
                 let v = f64::from_be_bytes(arr);
-                (n.as_f64() == Some(v))
-                    || n.as_i64().is_some_and(|ni| v == ni as f64)
+                (n.as_f64() == Some(v)) || n.as_i64().is_some_and(|ni| v == ni as f64)
             } else {
                 false
             }
@@ -629,9 +657,7 @@ pub fn binary_value_ord_serde(tag: u8, raw: &[u8], lit: &Value) -> Option<std::c
                 None
             }
         }
-        (TAG_STRING, Value::String(s)) => {
-            parse_string_value(raw).map(|v| v.cmp(s.as_str()))
-        }
+        (TAG_STRING, Value::String(s)) => parse_string_value(raw).map(|v| v.cmp(s.as_str())),
         _ => None,
     }
 }

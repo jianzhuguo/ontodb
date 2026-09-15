@@ -2,7 +2,7 @@
 //!
 //! 模拟 ESP32 行为，用于功能验证
 
-use onto_edge_esp32::{SensorCollector, GpsCollector, DataReporter, GeoRouter, GeoLocation};
+use onto_edge_esp32::{DataReporter, GeoLocation, GeoRouter, GpsCollector, SensorCollector};
 
 fn main() {
     println!("=== OntoDB Edge 本地测试 ===\n");
@@ -14,10 +14,10 @@ fn main() {
     let router = GeoRouter::new();
 
     // 2. GPS 定位
-    let lat = 34.7466;  // 郑州
+    let lat = 34.7466; // 郑州
     let lng = 113.6253;
     gps.record(lat, lng);
-    
+
     let nearest = router.find_nearest(lat, lng);
     println!("[1] GPS 定位: ({}, {})", lat, lng);
     println!("    最近节点: {}", nearest);
@@ -28,7 +28,7 @@ fn main() {
     sensors.record("humi_001", "humidity", 65.2, "%");
     sensors.record("press_001", "pressure", 1013.25, "hPa");
     sensors.record("pm25_001", "pm2.5", 35.0, "ug/m3");
-    
+
     for r in sensors.readings() {
         println!("    {}: {:.1} {}", r.sensor_id, r.value, r.unit);
     }
@@ -52,7 +52,7 @@ fn main() {
         (39.9042, 116.4074, "北京"),
         (23.1291, 113.2644, "广州"),
     ];
-    
+
     for (lat, lng, city) in test_locations {
         let node = router.find_nearest(lat, lng);
         println!("    {} ({},{}) → 节点: {}", city, lat, lng, node);

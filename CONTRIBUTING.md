@@ -12,7 +12,7 @@ Thank you for your interest in contributing!
 ### Setup
 
 ```bash
-git clone https://github.com/ontodb/ontodb.git
+git clone https://gitee.com/ontovalue/ontodb.git
 cd ontodb
 cargo build
 cargo test

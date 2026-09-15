@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! K-Means clustering for vector data.
 //!
 //! Supports:
@@ -107,9 +111,15 @@ impl KMeans {
             centroids = new_centroids;
 
             if max_shift < self.tolerance {
-                let clusters = centroids.into_iter().enumerate().map(|(id, centroid)| {
-                    Cluster { id, centroid, member_count: counts[id] }
-                }).collect();
+                let clusters = centroids
+                    .into_iter()
+                    .enumerate()
+                    .map(|(id, centroid)| Cluster {
+                        id,
+                        centroid,
+                        member_count: counts[id],
+                    })
+                    .collect();
                 return ClusteringResult {
                     clusters,
                     assignments,
@@ -124,9 +134,15 @@ impl KMeans {
         for &c in &assignments {
             counts[c] += 1;
         }
-        let clusters = centroids.into_iter().enumerate().map(|(id, centroid)| {
-            Cluster { id, centroid, member_count: counts[id] }
-        }).collect();
+        let clusters = centroids
+            .into_iter()
+            .enumerate()
+            .map(|(id, centroid)| Cluster {
+                id,
+                centroid,
+                member_count: counts[id],
+            })
+            .collect();
         ClusteringResult {
             clusters,
             assignments,
@@ -149,7 +165,8 @@ impl KMeans {
             let mut distances = Vec::with_capacity(vectors.len());
             let mut total = 0.0f32;
             for v in vectors {
-                let min_dist = centroids.iter()
+                let min_dist = centroids
+                    .iter()
                     .map(|c| l2_distance_sq(v, c))
                     .min_by(|a, b| a.partial_cmp(b).unwrap())
                     .unwrap_or(f32::MAX);
@@ -173,10 +190,13 @@ impl KMeans {
     }
 
     fn nearest_centroid(&self, v: &[f32], centroids: &[Vec<f32>]) -> usize {
-        centroids.iter()
+        centroids
+            .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
-                l2_distance_sq(v, a).partial_cmp(&l2_distance_sq(v, b)).unwrap()
+                l2_distance_sq(v, a)
+                    .partial_cmp(&l2_distance_sq(v, b))
+                    .unwrap()
             })
             .map(|(i, _)| i)
             .unwrap_or(0)
@@ -190,7 +210,10 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
 
 /// L2 distance squared (avoids sqrt for comparisons).
 fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum::<f32>()
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f32>()
 }
 
 #[cfg(test)]

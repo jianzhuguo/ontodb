@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Vector index manager for the storage engine.
 //!
 //! Manages HNSW vector indexes per class.column, handling:
@@ -6,8 +10,8 @@
 //! - Vector similarity search (with optional ontology filtering)
 //! - Persistence of vector index metadata
 
-use crate::vector::{DistanceMetric, HnswConfig, HnswIndex, SearchResult, VectorEntry};
 use crate::vector::normalize::{l2_normalize, should_normalize};
+use crate::vector::{DistanceMetric, HnswConfig, HnswIndex, SearchResult, VectorEntry};
 use onto_core::{CoreError, Result};
 use std::collections::{HashMap, HashSet};
 
@@ -69,7 +73,8 @@ impl VectorIndexManager {
     /// Compact the deleted_keys set by removing entries that are no longer
     /// in doc_vectors (i.e., the document has been fully removed).
     pub fn compact_deleted_keys(&mut self) {
-        self.deleted_keys.retain(|k| self.doc_vectors.contains_key(k));
+        self.deleted_keys
+            .retain(|k| self.doc_vectors.contains_key(k));
     }
 
     /// Returns the number of tombstoned keys.
@@ -216,10 +221,7 @@ impl VectorIndexManager {
 
     /// Indexes a batch of vectors under a single lock acquisition.
     /// More efficient than calling `index_vector()` in a loop for bulk operations.
-    pub fn index_vector_batch(
-        &mut self,
-        vectors: &[(Vec<u8>, &str, &str, Vec<f32>)],
-    ) {
+    pub fn index_vector_batch(&mut self, vectors: &[(Vec<u8>, &str, &str, Vec<f32>)]) {
         // Group by (class, column) for batch HNSW insert
         let mut by_index: HashMap<IndexKey, Vec<(Vec<u8>, Vec<f32>)>> = HashMap::new();
         for (doc_key, class, column, mut vector) in vectors.iter().cloned() {
@@ -240,12 +242,16 @@ impl VectorIndexManager {
                 }
             }
 
-            by_index.entry(key).or_default().push((doc_key.clone(), vector.clone()));
-            // Track doc_vectors
-            self.doc_vectors
-                .entry(doc_key)
+            by_index
+                .entry(key)
                 .or_default()
-                .push((class.to_string(), column.to_string(), vector));
+                .push((doc_key.clone(), vector.clone()));
+            // Track doc_vectors
+            self.doc_vectors.entry(doc_key).or_default().push((
+                class.to_string(),
+                column.to_string(),
+                vector,
+            ));
         }
 
         for (idx_key, vecs) in by_index {
@@ -287,10 +293,11 @@ impl VectorIndexManager {
         }
 
         // Track the vector for this document
-        self.doc_vectors
-            .entry(doc_key.to_vec())
-            .or_default()
-            .push((class.to_string(), column.to_string(), vector.clone()));
+        self.doc_vectors.entry(doc_key.to_vec()).or_default().push((
+            class.to_string(),
+            column.to_string(),
+            vector.clone(),
+        ));
 
         if let Some(index) = self.indexes.get_mut(&key) {
             let entry = VectorEntry {
@@ -352,10 +359,7 @@ impl VectorIndexManager {
         };
 
         let index = self.indexes.get(&key).ok_or_else(|| {
-            CoreError::InvalidArgument(format!(
-                "no vector index on {}.{}",
-                class, column
-            ))
+            CoreError::InvalidArgument(format!("no vector index on {}.{}", class, column))
         })?;
 
         // Pre-normalize query for cosine metric
@@ -387,10 +391,16 @@ impl VectorIndexManager {
             // Skip stale entries: if the stored vector differs from the result,
             // the entry is from a previous version (HNSW can't update in place)
             if let Some(stored_vec) = self.doc_vectors.get(&r.entry.id).and_then(|entries| {
-                entries.iter().find(|(c, col, _)| c == class && col == column).map(|(_, _, v)| v)
+                entries
+                    .iter()
+                    .find(|(c, col, _)| c == class && col == column)
+                    .map(|(_, _, v)| v)
             }) {
                 let is_stale = stored_vec.len() == r.entry.vector.len()
-                    && stored_vec.iter().zip(r.entry.vector.iter()).any(|(a, b)| (a - b).abs() > 1e-6);
+                    && stored_vec
+                        .iter()
+                        .zip(r.entry.vector.iter())
+                        .any(|(a, b)| (a - b).abs() > 1e-6);
                 if is_stale {
                     continue; // Stale entry from old vector
                 }
@@ -424,10 +434,7 @@ impl VectorIndexManager {
         };
 
         let index = self.indexes.get(&key).ok_or_else(|| {
-            CoreError::InvalidArgument(format!(
-                "no vector index on {}.{}",
-                class, column
-            ))
+            CoreError::InvalidArgument(format!("no vector index on {}.{}", class, column))
         })?;
 
         // Pre-normalize query for cosine metric
@@ -459,10 +466,16 @@ impl VectorIndexManager {
         let mut filtered = Vec::new();
         for r in results {
             if let Some(stored_vec) = self.doc_vectors.get(&r.entry.id).and_then(|entries| {
-                entries.iter().find(|(c, col, _)| c == class && col == column).map(|(_, _, v)| v)
+                entries
+                    .iter()
+                    .find(|(c, col, _)| c == class && col == column)
+                    .map(|(_, _, v)| v)
             }) {
                 if stored_vec.len() == r.entry.vector.len()
-                    && stored_vec.iter().zip(r.entry.vector.iter()).any(|(a, b)| (a - b).abs() > 1e-6)
+                    && stored_vec
+                        .iter()
+                        .zip(r.entry.vector.iter())
+                        .any(|(a, b)| (a - b).abs() > 1e-6)
                 {
                     continue;
                 }
@@ -532,16 +545,16 @@ impl VectorIndexManager {
         };
 
         let _index = self.indexes.get(&key).ok_or_else(|| {
-            CoreError::InvalidArgument(format!(
-                "no vector index on {}.{}",
-                class, column
-            ))
+            CoreError::InvalidArgument(format!("no vector index on {}.{}", class, column))
         })?;
 
         // Collect all vectors from doc_vectors (not from HNSW, which may have stale entries)
-        let vectors: Vec<Vec<f32>> = self.doc_vectors.values()
+        let vectors: Vec<Vec<f32>> = self
+            .doc_vectors
+            .values()
             .flat_map(|entries| {
-                entries.iter()
+                entries
+                    .iter()
                     .filter(|(c, col, _)| c == class && col == column)
                     .map(|(_, _, v)| v.clone())
             })
@@ -582,7 +595,9 @@ mod tests {
         mgr.index_vector(b"doc3", "Product", "embedding", vec![0.9, 0.1, 0.0]);
 
         // Search
-        let results = mgr.search("Product", "embedding", &[1.0, 0.0, 0.0], 2).unwrap();
+        let results = mgr
+            .search("Product", "embedding", &[1.0, 0.0, 0.0], 2)
+            .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].entry.id, b"doc1");
     }

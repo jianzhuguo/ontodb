@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Change Data Capture (CDC) for OntoDB.
 //!
 //! Publishes database changes to Kafka topics in real-time,
@@ -100,14 +104,25 @@ impl CdcEventBuilder {
     }
 
     /// Create an INSERT event.
-    pub fn insert_event(&self, class: &str, pk: &str, key: &str, value: &serde_json::Value, seq: u64) -> CdcEvent {
+    pub fn insert_event(
+        &self,
+        class: &str,
+        pk: &str,
+        key: &str,
+        value: &serde_json::Value,
+        seq: u64,
+    ) -> CdcEvent {
         CdcEvent {
             ts: now_millis(),
             op: CdcOperation::Insert,
             class: class.to_string(),
             pk: pk.to_string(),
             key: key.to_string(),
-            after: if self.include_after { Some(value.clone()) } else { None },
+            after: if self.include_after {
+                Some(value.clone())
+            } else {
+                None
+            },
             before: None,
             seq,
         }
@@ -129,8 +144,16 @@ impl CdcEventBuilder {
             class: class.to_string(),
             pk: pk.to_string(),
             key: key.to_string(),
-            before: if self.include_before { old_value.cloned() } else { None },
-            after: if self.include_after { Some(new_value.clone()) } else { None },
+            before: if self.include_before {
+                old_value.cloned()
+            } else {
+                None
+            },
+            after: if self.include_after {
+                Some(new_value.clone())
+            } else {
+                None
+            },
             seq,
         }
     }
@@ -150,7 +173,11 @@ impl CdcEventBuilder {
             class: class.to_string(),
             pk: pk.to_string(),
             key: key.to_string(),
-            before: if self.include_before { old_value.cloned() } else { None },
+            before: if self.include_before {
+                old_value.cloned()
+            } else {
+                None
+            },
             after: None,
             seq,
         }
@@ -331,7 +358,8 @@ impl ResilientCdcPublisher {
             match self.inner.publish(&entry.event) {
                 Ok(()) => {
                     // Successfully published — reset failure counter
-                    self.consecutive_failures.store(0, std::sync::atomic::Ordering::Relaxed);
+                    self.consecutive_failures
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(e) => {
                     let mut entry = entry;
@@ -366,18 +394,23 @@ impl CdcPublisher for ResilientCdcPublisher {
         match self.inner.publish(event) {
             Ok(()) => {
                 // Success — reset failure counter and try to flush buffered events
-                self.consecutive_failures.store(0, std::sync::atomic::Ordering::Relaxed);
+                self.consecutive_failures
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
                 self.flush_buffer();
                 Ok(())
             }
             Err(e) => {
                 // Failed — increment failure counter
-                let failures = self.consecutive_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let failures = self
+                    .consecutive_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
 
                 if self.config.log_retries {
                     tracing::warn!(
                         "CDC publish failed (attempt {}): {}. Buffering for retry.",
-                        failures, e
+                        failures,
+                        e
                     );
                 }
 
@@ -477,7 +510,10 @@ impl KafkaCdcPublisher {
             .set("bootstrap.servers", &config.kafka_brokers)
             .set("client.id", &config.client_id)
             .set("message.timeout.ms", "5000")
-            .set("queue.buffering.max.messages", &config.batch_size.to_string())
+            .set(
+                "queue.buffering.max.messages",
+                &config.batch_size.to_string(),
+            )
             .set("linger.ms", &config.flush_interval_ms.to_string())
             .create()
             .map_err(|e| format!("Failed to create Kafka producer: {}", e))?;
@@ -509,11 +545,12 @@ impl CdcPublisher for KafkaCdcPublisher {
             return;
         }
         tokio::spawn(async move {
-            let record = FutureRecord::to(&topic)
-                .key(&key)
-                .payload(&payload);
+            let record = FutureRecord::to(&topic).key(&key).payload(&payload);
 
-            if let Err((e, _)) = producer.send(record, Timeout::After(Duration::from_secs(5))).await {
+            if let Err((e, _)) = producer
+                .send(record, Timeout::After(Duration::from_secs(5)))
+                .await
+            {
                 eprintln!("CDC Kafka publish error: {}", e);
             }
         });
@@ -619,7 +656,14 @@ impl CdcManager {
     }
 
     /// Publish an UPDATE event.
-    pub fn on_update(&self, class: &str, pk: &str, old: Option<&serde_json::Value>, new: &serde_json::Value, seq: u64) {
+    pub fn on_update(
+        &self,
+        class: &str,
+        pk: &str,
+        old: Option<&serde_json::Value>,
+        new: &serde_json::Value,
+        seq: u64,
+    ) {
         if !self.config.enabled {
             return;
         }
@@ -685,7 +729,13 @@ mod tests {
         let (manager, publisher) = CdcManager::new_in_memory();
 
         manager.on_insert("Product", "001", &serde_json::json!({"name": "iPhone"}), 1);
-        manager.on_update("Product", "001", None, &serde_json::json!({"name": "iPhone 15"}), 2);
+        manager.on_update(
+            "Product",
+            "001",
+            None,
+            &serde_json::json!({"name": "iPhone 15"}),
+            2,
+        );
         manager.on_delete("Product", "001", None, 3);
 
         assert_eq!(publisher.count(), 3);
@@ -719,12 +769,24 @@ mod tests {
         };
         let builder = CdcEventBuilder::new(&config);
 
-        let event = builder.insert_event("Product", "001", "Product::001", &serde_json::json!({"name": "iPhone"}), 1);
+        let event = builder.insert_event(
+            "Product",
+            "001",
+            "Product::001",
+            &serde_json::json!({"name": "iPhone"}),
+            1,
+        );
         assert_eq!(event.op, CdcOperation::Insert);
         assert!(event.after.is_some());
         assert!(event.before.is_none());
 
-        let event = builder.delete_event("Product", "001", "Product::001", Some(&serde_json::json!({"name": "iPhone"})), 2);
+        let event = builder.delete_event(
+            "Product",
+            "001",
+            "Product::001",
+            Some(&serde_json::json!({"name": "iPhone"})),
+            2,
+        );
         assert_eq!(event.op, CdcOperation::Delete);
         assert!(event.before.is_some());
         assert!(event.after.is_none());

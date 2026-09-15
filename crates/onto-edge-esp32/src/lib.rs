@@ -6,8 +6,8 @@
 #![no_std]
 
 extern crate alloc;
-use alloc::string::String;
 use alloc::format;
+use alloc::string::String;
 use core::fmt;
 use core::fmt::Write;
 
@@ -94,7 +94,10 @@ impl GpsCollector {
     /// 获取位置
     pub fn location(&self) -> Option<GeoLocation> {
         if self.has_fix {
-            Some(GeoLocation { latitude: self.last_lat, longitude: self.last_lng })
+            Some(GeoLocation {
+                latitude: self.last_lat,
+                longitude: self.last_lng,
+            })
         } else {
             None
         }
@@ -124,7 +127,11 @@ impl DataReporter {
     }
 
     /// 生成上报 JSON
-    pub fn build_report(&self, readings: &[SensorReading], location: Option<GeoLocation>) -> String {
+    pub fn build_report(
+        &self,
+        readings: &[SensorReading],
+        location: Option<GeoLocation>,
+    ) -> String {
         let mut json = String::new();
         json.push_str(r#"{"device_id":""#);
         json.push_str(&self.device_id);
@@ -133,15 +140,17 @@ impl DataReporter {
             json.push_str(&format!("{:.6},{:.6}", loc.latitude, loc.longitude));
         }
         json.push_str(r#"","readings":["#);
-        
+
         for (i, r) in readings.iter().enumerate() {
-            if i > 0 { json.push(','); }
+            if i > 0 {
+                json.push(',');
+            }
             json.push_str(&format!(
                 r#"{{"id":"{}","type":"{}","value":{:.2},"ts":{}}}"#,
                 r.sensor_id, r.sensor_type, r.value, r.timestamp
             ));
         }
-        
+
         json.push_str("]}");
         json
     }
@@ -171,7 +180,7 @@ impl GeoRouter {
     pub fn find_nearest(&self, lat: f64, lng: f64) -> &str {
         let mut min_dist = f64::MAX;
         let mut best = self.nodes[0].0;
-        
+
         for (node_id, node_lat, node_lng) in &self.nodes {
             let d = haversine_distance(lat, lng, *node_lat, *node_lng);
             if d < min_dist {

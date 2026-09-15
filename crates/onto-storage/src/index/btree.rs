@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Disk-oriented B+Tree for secondary index lookups.
 //!
 //! Architecture:
@@ -141,12 +145,16 @@ impl BPlusTree {
 
     /// Get node reference with error instead of panic.
     fn node(&self, id: u64) -> Result<&Node, String> {
-        self.nodes.get(&id).ok_or_else(|| format!("B+Tree node {} not found", id))
+        self.nodes
+            .get(&id)
+            .ok_or_else(|| format!("B+Tree node {} not found", id))
     }
 
     /// Get mutable node reference with error instead of panic.
     fn node_mut(&mut self, id: u64) -> Result<&mut Node, String> {
-        self.nodes.get_mut(&id).ok_or_else(|| format!("B+Tree node {} not found", id))
+        self.nodes
+            .get_mut(&id)
+            .ok_or_else(|| format!("B+Tree node {} not found", id))
     }
 
     // ══════════════════════════════════════════════════════════════�?
@@ -161,8 +169,12 @@ impl BPlusTree {
             let new_root_id = self.alloc_id();
             let old_root = self.root;
             // Update children's parent pointers
-            self.node_mut(old_root).expect("node should exist").set_parent(Some(new_root_id));
-            self.node_mut(new_sibling_id).expect("node should exist").set_parent(Some(new_root_id));
+            self.node_mut(old_root)
+                .expect("node should exist")
+                .set_parent(Some(new_root_id));
+            self.node_mut(new_sibling_id)
+                .expect("node should exist")
+                .set_parent(Some(new_root_id));
             let new_root = Node::Internal(InternalNode {
                 keys: vec![promoted_key],
                 children: vec![old_root, new_sibling_id],
@@ -267,7 +279,9 @@ impl BPlusTree {
             }
 
             // Set parent pointer for new child
-            self.node_mut(new_child_id).expect("node should exist").set_parent(Some(node_id));
+            self.node_mut(new_child_id)
+                .expect("node should exist")
+                .set_parent(Some(node_id));
 
             // Split if over capacity
             if self.node(node_id).expect("node should exist").is_full() {
@@ -322,7 +336,8 @@ impl BPlusTree {
         let new_id = self.alloc_id();
         let parent = self.node(node_id).expect("node should exist").parent_id();
 
-        let (promoted_key, new_internal) = match self.node_mut(node_id).expect("node should exist") {
+        let (promoted_key, new_internal) = match self.node_mut(node_id).expect("node should exist")
+        {
             Node::Internal(n) => {
                 let promoted = n.keys[mid].clone();
                 let new_keys = n.keys.split_off(mid + 1);
@@ -347,7 +362,9 @@ impl BPlusTree {
             _ => unreachable!(),
         };
         for &child_id in &new_children {
-            self.node_mut(child_id).expect("node should exist").set_parent(Some(new_id));
+            self.node_mut(child_id)
+                .expect("node should exist")
+                .set_parent(Some(new_id));
         }
 
         self.nodes.insert(new_id, new_internal);
@@ -395,7 +412,9 @@ impl BPlusTree {
                 if n.keys.is_empty() && !n.children.is_empty() {
                     let new_root = n.children[0];
                     self.root = new_root;
-                    self.node_mut(self.root).expect("node should exist").set_parent(None);
+                    self.node_mut(self.root)
+                        .expect("node should exist")
+                        .set_parent(None);
                 }
             }
         }
@@ -404,16 +423,19 @@ impl BPlusTree {
     /// Handles underflow in a leaf node by borrowing from siblings or merging.
     fn handle_leaf_underflow(&mut self, leaf_id: u64) {
         // O(1) parent lookup via parent pointer
-        let (parent_id, child_idx) = match self.node(leaf_id).expect("node should exist").parent_id() {
-            Some(pid) => {
-                let idx = match self.node(pid).expect("node should exist") {
-                    Node::Internal(n) => n.children.iter().position(|&c| c == leaf_id).unwrap_or(0),
-                    _ => return,
-                };
-                (pid, idx)
-            }
-            None => return,
-        };
+        let (parent_id, child_idx) =
+            match self.node(leaf_id).expect("node should exist").parent_id() {
+                Some(pid) => {
+                    let idx = match self.node(pid).expect("node should exist") {
+                        Node::Internal(n) => {
+                            n.children.iter().position(|&c| c == leaf_id).unwrap_or(0)
+                        }
+                        _ => return,
+                    };
+                    (pid, idx)
+                }
+                None => return,
+            };
 
         let num_children = match self.node(parent_id).expect("node should exist") {
             Node::Internal(n) => n.children.len(),
@@ -426,7 +448,10 @@ impl BPlusTree {
                 Node::Internal(n) => n.children[child_idx - 1],
                 _ => return,
             };
-            let left_key_count = self.node(left_sibling_id).expect("node should exist").key_count();
+            let left_key_count = self
+                .node(left_sibling_id)
+                .expect("node should exist")
+                .key_count();
             if left_key_count > MIN_KEYS {
                 self.redistribute_leaf_from_left(parent_id, child_idx);
                 return;
@@ -439,7 +464,10 @@ impl BPlusTree {
                 Node::Internal(n) => n.children[child_idx + 1],
                 _ => return,
             };
-            let right_key_count = self.node(right_sibling_id).expect("node should exist").key_count();
+            let right_key_count = self
+                .node(right_sibling_id)
+                .expect("node should exist")
+                .key_count();
             if right_key_count > MIN_KEYS {
                 self.redistribute_leaf_from_right(parent_id, child_idx);
                 return;
@@ -561,16 +589,19 @@ impl BPlusTree {
     /// Handles underflow in an internal node.
     fn handle_internal_underflow(&mut self, node_id: u64) {
         // O(1) parent lookup via parent pointer
-        let (parent_id, child_idx) = match self.node(node_id).expect("node should exist").parent_id() {
-            Some(pid) => {
-                let idx = match self.node(pid).expect("node should exist") {
-                    Node::Internal(n) => n.children.iter().position(|&c| c == node_id).unwrap_or(0),
-                    _ => return,
-                };
-                (pid, idx)
-            }
-            None => return,
-        };
+        let (parent_id, child_idx) =
+            match self.node(node_id).expect("node should exist").parent_id() {
+                Some(pid) => {
+                    let idx = match self.node(pid).expect("node should exist") {
+                        Node::Internal(n) => {
+                            n.children.iter().position(|&c| c == node_id).unwrap_or(0)
+                        }
+                        _ => return,
+                    };
+                    (pid, idx)
+                }
+                None => return,
+            };
 
         let num_children = match self.node(parent_id).expect("node should exist") {
             Node::Internal(n) => n.children.len(),
@@ -583,7 +614,10 @@ impl BPlusTree {
                 Node::Internal(n) => n.children[child_idx - 1],
                 _ => return,
             };
-            let left_key_count = self.node(left_sibling_id).expect("node should exist").key_count();
+            let left_key_count = self
+                .node(left_sibling_id)
+                .expect("node should exist")
+                .key_count();
             if left_key_count > MIN_KEYS {
                 self.redistribute_internal_from_left(parent_id, child_idx);
                 return;
@@ -596,7 +630,10 @@ impl BPlusTree {
                 Node::Internal(n) => n.children[child_idx + 1],
                 _ => return,
             };
-            let right_key_count = self.node(right_sibling_id).expect("node should exist").key_count();
+            let right_key_count = self
+                .node(right_sibling_id)
+                .expect("node should exist")
+                .key_count();
             if right_key_count > MIN_KEYS {
                 self.redistribute_internal_from_right(parent_id, child_idx);
                 return;
@@ -640,7 +677,9 @@ impl BPlusTree {
             }
 
             // Update moved child's parent pointer
-            self.node_mut(moved_child).expect("node should exist").set_parent(Some(node_id));
+            self.node_mut(moved_child)
+                .expect("node should exist")
+                .set_parent(Some(node_id));
 
             // Update parent separator
             if let Node::Internal(parent) = self.node_mut(parent_id).expect("node should exist") {
@@ -678,7 +717,9 @@ impl BPlusTree {
             }
 
             // Update moved child's parent pointer
-            self.node_mut(moved_child).expect("node should exist").set_parent(Some(node_id));
+            self.node_mut(moved_child)
+                .expect("node should exist")
+                .set_parent(Some(node_id));
 
             // Update parent separator
             if let Node::Internal(parent) = self.node_mut(parent_id).expect("node should exist") {
@@ -709,7 +750,9 @@ impl BPlusTree {
         if let Some(Node::Internal(right)) = self.nodes.remove(&right_id) {
             // Update parent pointers for right's children to point to left
             for &child_id in &right.children {
-                self.node_mut(child_id).expect("node should exist").set_parent(Some(left_id));
+                self.node_mut(child_id)
+                    .expect("node should exist")
+                    .set_parent(Some(left_id));
             }
 
             if let Node::Internal(left) = self.node_mut(left_id).expect("node should exist") {
@@ -778,11 +821,7 @@ impl BPlusTree {
     /// Range scan: returns all primary keys with values in [low, high].
     /// If low is None, scans from the beginning.
     /// If high is None, scans to the end.
-    pub fn range_scan(
-        &self,
-        low: Option<&[u8]>,
-        high: Option<&[u8]>,
-    ) -> Vec<Vec<u8>> {
+    pub fn range_scan(&self, low: Option<&[u8]>, high: Option<&[u8]>) -> Vec<Vec<u8>> {
         let mut result = Vec::new();
 
         let mut cursor = match low {
@@ -917,7 +956,12 @@ impl BPlusTree {
         let mut current = self.root;
         loop {
             match self.node(current).expect("node should exist") {
-                Node::Leaf(_) => return Cursor { leaf_id: current, idx: 0 },
+                Node::Leaf(_) => {
+                    return Cursor {
+                        leaf_id: current,
+                        idx: 0,
+                    }
+                }
                 Node::Internal(n) => current = n.children[0],
             }
         }
@@ -1211,7 +1255,10 @@ mod tests {
                     continue;
                 }
                 let k = &leaf.keys[cursor.idx];
-                assert!(k.as_slice() > prev_key.as_slice(), "keys must be sorted after merge");
+                assert!(
+                    k.as_slice() > prev_key.as_slice(),
+                    "keys must be sorted after merge"
+                );
                 prev_key = k.clone();
                 count += 1;
                 cursor.idx += 1;
@@ -1259,7 +1306,10 @@ mod tests {
         }
 
         // Root should be internal
-        assert!(!tree.get_node(tree.root).expect("node should exist").is_leaf());
+        assert!(!tree
+            .get_node(tree.root)
+            .expect("node should exist")
+            .is_leaf());
 
         // Remove all but a few entries �?root should collapse back to leaf
         for i in 0..(n - 3) {
@@ -1269,7 +1319,10 @@ mod tests {
 
         assert_eq!(tree.len(), 3);
         // Root should now be a leaf after collapse
-        assert!(tree.get_node(tree.root).expect("node should exist").is_leaf());
+        assert!(tree
+            .get_node(tree.root)
+            .expect("node should exist")
+            .is_leaf());
 
         // Verify remaining
         for i in (n - 3)..n {
@@ -1296,7 +1349,10 @@ mod tests {
         assert_eq!(tree.len(), 0);
         assert!(tree.is_empty());
         // Root should be a leaf (empty tree)
-        assert!(tree.get_node(tree.root).expect("node should exist").is_leaf());
+        assert!(tree
+            .get_node(tree.root)
+            .expect("node should exist")
+            .is_leaf());
     }
 
     #[test]
@@ -1332,7 +1388,12 @@ mod tests {
         assert_eq!(keys.len(), 100, "range [50,149] failed, got {}", keys.len());
 
         let keys = tree.range_scan(Some(b"0000000850"), Some(b"0000000949"));
-        assert_eq!(keys.len(), 100, "range [850,949] failed, got {}", keys.len());
+        assert_eq!(
+            keys.len(),
+            100,
+            "range [850,949] failed, got {}",
+            keys.len()
+        );
     }
 
     #[test]
@@ -1434,13 +1495,23 @@ mod tests {
         }
 
         // Verify root has no parent
-        assert_eq!(tree.get_node(tree.root).expect("node should exist").parent_id(), None);
+        assert_eq!(
+            tree.get_node(tree.root)
+                .expect("node should exist")
+                .parent_id(),
+            None
+        );
 
         // Verify all non-root nodes have valid parent pointers
         let root = tree.root;
         fn verify_parents(tree: &BPlusTree, node_id: u64, expected_parent: Option<u64>) {
             let node = tree.get_node(node_id).expect("node should exist");
-            assert_eq!(node.parent_id(), expected_parent, "node {} has wrong parent", node_id);
+            assert_eq!(
+                node.parent_id(),
+                expected_parent,
+                "node {} has wrong parent",
+                node_id
+            );
             if let Node::Internal(n) = node {
                 for &child_id in &n.children {
                     verify_parents(tree, child_id, Some(node_id));
@@ -1470,7 +1541,12 @@ mod tests {
         let root = tree.root;
         fn verify_parents(tree: &BPlusTree, node_id: u64, expected_parent: Option<u64>) {
             let node = tree.get_node(node_id).expect("node should exist");
-            assert_eq!(node.parent_id(), expected_parent, "node {} has wrong parent", node_id);
+            assert_eq!(
+                node.parent_id(),
+                expected_parent,
+                "node {} has wrong parent",
+                node_id
+            );
             if let Node::Internal(n) = node {
                 for &child_id in &n.children {
                     verify_parents(tree, child_id, Some(node_id));

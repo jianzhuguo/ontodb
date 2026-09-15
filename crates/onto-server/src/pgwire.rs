@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! PostgreSQL wire protocol (v3) connector for OntoDB.
 //!
 //! Allows tools like `psql`, DBeaver, pgAdmin, and any PostgreSQL client
@@ -15,8 +19,8 @@ use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use onto_query::{QueryAst, QueryExecutor, QueryParser};
 use crate::auth::{AuthConfig, AuthState};
+use onto_query::{QueryAst, QueryExecutor, QueryParser};
 
 /// PostgreSQL protocol version: 3.0
 const PROTOCOL_VERSION: u32 = 196608; // 3 << 16 | 0
@@ -55,7 +59,10 @@ pub async fn run_pgwire_server(
     let auth = AuthState::new(&auth_config);
     let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_PGWIRE_CONNECTIONS));
     println!("PG wire protocol listening on {}", addr);
-    println!("Connect with: psql -h 127.0.0.1 -p {} -d ontodb", addr.split(':').next_back().unwrap_or("5432"));
+    println!(
+        "Connect with: psql -h 127.0.0.1 -p {} -d ontodb",
+        addr.split(':').next_back().unwrap_or("5432")
+    );
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -133,7 +140,8 @@ async fn handle_pgwire_client(
         // Step 2: Authenticate (MD5 password)
         if auth.enabled {
             // Extract username from startup params
-            let username = params.iter()
+            let username = params
+                .iter()
                 .find(|(k, _)| k == "user")
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("ontodb");
@@ -141,14 +149,14 @@ async fn handle_pgwire_client(
             // Generate random 4-byte salt for MD5 challenge
             let mut salt = [0u8; 4];
             {
-                
                 // Use time + PID + counter for non-crypto salt (just needs to be unique)
                 let t = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos();
                 let pid = std::process::id();
-                static SALT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                static SALT_COUNTER: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
                 let ctr = SALT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let seed = format!("{}{}{}", t, pid, ctr);
                 let hash = md5::compute(seed.as_bytes());
@@ -247,7 +255,11 @@ async fn handle_pgwire_client(
 
             // Enforce message size limit
             if msg_len > MAX_PGWIRE_MESSAGE_SIZE {
-                return Err(format!("PG wire message too large: {} bytes (max {})", msg_len, MAX_PGWIRE_MESSAGE_SIZE).into());
+                return Err(format!(
+                    "PG wire message too large: {} bytes (max {})",
+                    msg_len, MAX_PGWIRE_MESSAGE_SIZE
+                )
+                .into());
             }
 
             if buf.len() < msg_len + 1 {
@@ -517,16 +529,20 @@ fn value_to_text(value: &serde_json::Value) -> Option<String> {
         serde_json::Value::Number(n) => Some(n.to_string()),
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(|v| {
-                value_to_text(v).unwrap_or_else(|| "NULL".to_string())
-            }).collect();
+            let items: Vec<String> = arr
+                .iter()
+                .map(|v| value_to_text(v).unwrap_or_else(|| "NULL".to_string()))
+                .collect();
             Some(format!("{{{}}}", items.join(",")))
         }
         serde_json::Value::Object(map) => {
-            let items: Vec<String> = map.iter().map(|(k, v)| {
-                let val = value_to_text(v).unwrap_or_else(|| "NULL".to_string());
-                format!("\"{}\"=>\"{}\"", k, val)
-            }).collect();
+            let items: Vec<String> = map
+                .iter()
+                .map(|(k, v)| {
+                    let val = value_to_text(v).unwrap_or_else(|| "NULL".to_string());
+                    format!("\"{}\"=>\"{}\"", k, val)
+                })
+                .collect();
             Some(format!("{{{}}}", items.join(",")))
         }
     }
@@ -536,7 +552,11 @@ fn value_to_text(value: &serde_json::Value) -> Option<String> {
 fn guess_type_oid(value: Option<&serde_json::Value>) -> i32 {
     match value {
         Some(serde_json::Value::Number(n)) => {
-            if n.is_i64() || n.is_u64() { 23 } else { 700 }
+            if n.is_i64() || n.is_u64() {
+                23
+            } else {
+                700
+            }
         }
         Some(serde_json::Value::Bool(_)) => 16,
         Some(serde_json::Value::String(_)) => 25,

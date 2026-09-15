@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Transaction manager: coordinates all active transactions.
 
 use crate::mvcc::transaction::{Transaction, TxnStatus, WriteOp};
@@ -67,17 +71,15 @@ impl TxnManager {
     /// The caller (storage engine) is responsible for actually writing
     /// the operations to the WAL and MemTable.
     pub fn commit(&mut self, txn_id: SeqNo) -> Result<BTreeMap<Key, WriteOp>> {
-        let txn = self
-            .active
-            .get_mut(&txn_id)
-            .ok_or_else(|| onto_core::CoreError::InvalidArgument(
-                format!("transaction {} not found", txn_id),
-            ))?;
+        let txn = self.active.get_mut(&txn_id).ok_or_else(|| {
+            onto_core::CoreError::InvalidArgument(format!("transaction {} not found", txn_id))
+        })?;
 
         if !txn.is_active() {
-            return Err(onto_core::CoreError::InvalidArgument(
-                format!("transaction {} is not active (status: {:?})", txn_id, txn.status),
-            ));
+            return Err(onto_core::CoreError::InvalidArgument(format!(
+                "transaction {} is not active (status: {:?})",
+                txn_id, txn.status
+            )));
         }
 
         txn.status = TxnStatus::Committed;
@@ -97,17 +99,15 @@ impl TxnManager {
 
     /// Aborts a transaction. Discards all pending writes.
     pub fn abort(&mut self, txn_id: SeqNo) -> Result<()> {
-        let txn = self
-            .active
-            .get_mut(&txn_id)
-            .ok_or_else(|| onto_core::CoreError::InvalidArgument(
-                format!("transaction {} not found", txn_id),
-            ))?;
+        let txn = self.active.get_mut(&txn_id).ok_or_else(|| {
+            onto_core::CoreError::InvalidArgument(format!("transaction {} not found", txn_id))
+        })?;
 
         if !txn.is_active() {
-            return Err(onto_core::CoreError::InvalidArgument(
-                format!("transaction {} is not active (status: {:?})", txn_id, txn.status),
-            ));
+            return Err(onto_core::CoreError::InvalidArgument(format!(
+                "transaction {} is not active (status: {:?})",
+                txn_id, txn.status
+            )));
         }
 
         txn.status = TxnStatus::Aborted;
@@ -227,8 +227,8 @@ mod tests {
         mgr.commit(t2).unwrap();
 
         let vis = mgr.visibility_for(t1);
-        assert!(vis.is_visible(3));  // seq=3 <= snapshot_ts=5
-        assert!(vis.is_visible(5));  // seq=5 <= snapshot_ts=5
+        assert!(vis.is_visible(3)); // seq=3 <= snapshot_ts=5
+        assert!(vis.is_visible(5)); // seq=5 <= snapshot_ts=5
         assert!(!vis.is_visible(8)); // seq=8 > snapshot_ts=5
     }
 
@@ -242,7 +242,7 @@ mod tests {
         let t2 = mgr.begin(15); // snapshot_ts = 15
         let vis = mgr.visibility_for(t2);
         assert!(vis.is_visible(10)); // t1 committed, seq=10 <= 15
-        assert!(vis.is_visible(5));  // old data
+        assert!(vis.is_visible(5)); // old data
         assert!(!vis.is_visible(16)); // future
     }
 }

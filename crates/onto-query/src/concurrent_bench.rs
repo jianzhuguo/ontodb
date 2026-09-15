@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Concurrent read-write lock separation benchmark.
 
 use crate::executor::QueryExecutor;
@@ -21,7 +25,11 @@ fn setup_bench(row_count: usize) -> (Arc<QueryExecutor>, tempfile::TempDir) {
     for i in 0..row_count {
         let ast = QueryAst::Insert {
             class: "Product".to_string(),
-            columns: vec!["name".to_string(), "price".to_string(), "category".to_string()],
+            columns: vec![
+                "name".to_string(),
+                "price".to_string(),
+                "category".to_string(),
+            ],
             values: vec![
                 crate::parser::LiteralValue::String(format!("item_{}", i)),
                 crate::parser::LiteralValue::Int((i as i64 * 10) % 10000),
@@ -45,7 +53,12 @@ fn bench_sequential_select(executor: &QueryExecutor, query: &str, iterations: us
 }
 
 /// Concurrent SELECT via execute_read (read lock — allows parallelism).
-fn bench_concurrent_read(executor: Arc<QueryExecutor>, query: &str, iterations: usize, num_threads: usize) -> Duration {
+fn bench_concurrent_read(
+    executor: Arc<QueryExecutor>,
+    query: &str,
+    iterations: usize,
+    num_threads: usize,
+) -> Duration {
     let queries_per_thread = iterations / num_threads;
     let remainder = iterations % num_threads;
 
@@ -72,7 +85,10 @@ fn bench_concurrent_read(executor: Arc<QueryExecutor>, query: &str, iterations: 
 
 /// Concurrent SELECT via execute (write lock — serialized, the old behavior).
 fn bench_concurrent_write_lock_select(
-    executor: Arc<QueryExecutor>, query: &str, iterations: usize, num_threads: usize,
+    executor: Arc<QueryExecutor>,
+    query: &str,
+    iterations: usize,
+    num_threads: usize,
 ) -> Duration {
     let queries_per_thread = iterations / num_threads;
     let remainder = iterations % num_threads;
@@ -100,7 +116,11 @@ fn bench_concurrent_write_lock_select(
 
 /// Mixed read + write concurrently.
 fn bench_mixed_read_write(
-    executor: Arc<QueryExecutor>, select_query: &str, iterations: usize, num_readers: usize, num_writers: usize,
+    executor: Arc<QueryExecutor>,
+    select_query: &str,
+    iterations: usize,
+    num_readers: usize,
+    num_writers: usize,
 ) -> Duration {
     let reads_per_thread = iterations / num_readers;
     let writes_per_thread = iterations / num_writers;
@@ -127,7 +147,11 @@ fn bench_mixed_read_write(
             for j in 0..writes_per_thread {
                 let ast = QueryAst::Insert {
                     class: "Product".to_string(),
-                    columns: vec!["name".to_string(), "price".to_string(), "category".to_string()],
+                    columns: vec![
+                        "name".to_string(),
+                        "price".to_string(),
+                        "category".to_string(),
+                    ],
                     values: vec![
                         crate::parser::LiteralValue::String(format!("bench_{}_{}", i, j)),
                         crate::parser::LiteralValue::Int(999),
@@ -158,8 +182,10 @@ mod tests {
         let (executor, _dir) = setup_bench(ROW_COUNT);
 
         let simple_select = "SELECT * FROM Product WHERE price > 5000";
-        let filter_select = "SELECT name, price FROM Product WHERE category = 'cat_3' AND price > 1000";
-        let order_select = "SELECT name, price FROM Product WHERE price > 2000 ORDER BY price DESC LIMIT 10";
+        let filter_select =
+            "SELECT name, price FROM Product WHERE category = 'cat_3' AND price > 1000";
+        let order_select =
+            "SELECT name, price FROM Product WHERE price > 2000 ORDER BY price DESC LIMIT 10";
         let count_select = "SELECT COUNT(*) FROM Product WHERE price > 3000";
 
         println!();
@@ -184,7 +210,12 @@ mod tests {
             println!("  Sequential (1 thread): {:?}", seq);
 
             for &nt in &[2, 4, 8] {
-                let wt = bench_concurrent_write_lock_select(Arc::clone(&executor), query, ITERATIONS, nt);
+                let wt = bench_concurrent_write_lock_select(
+                    Arc::clone(&executor),
+                    query,
+                    ITERATIONS,
+                    nt,
+                );
                 let rt = bench_concurrent_read(Arc::clone(&executor), query, ITERATIONS, nt);
                 let speedup = if rt.as_micros() > 0 {
                     wt.as_secs_f64() / rt.as_secs_f64()
@@ -200,13 +231,19 @@ mod tests {
         }
 
         // Mixed read + write
-        println!("--- Mixed: 4 readers + 1 writer ({} iters each) ---", ITERATIONS);
+        println!(
+            "--- Mixed: 4 readers + 1 writer ({} iters each) ---",
+            ITERATIONS
+        );
         let mixed = bench_mixed_read_write(Arc::clone(&executor), simple_select, ITERATIONS, 4, 1);
         println!("  Total: {:?}", mixed);
 
         // Write-only baseline for comparison
         println!();
-        println!("--- Write-only baseline: 5 threads INSERT ({} iters each) ---", ITERATIONS);
+        println!(
+            "--- Write-only baseline: 5 threads INSERT ({} iters each) ---",
+            ITERATIONS
+        );
         let write_only = {
             let start = Instant::now();
             let mut handles = Vec::new();
@@ -216,7 +253,11 @@ mod tests {
                     for j in 0..ITERATIONS {
                         let ast = QueryAst::Insert {
                             class: "Product".to_string(),
-                            columns: vec!["name".to_string(), "price".to_string(), "category".to_string()],
+                            columns: vec![
+                                "name".to_string(),
+                                "price".to_string(),
+                                "category".to_string(),
+                            ],
                             values: vec![
                                 crate::parser::LiteralValue::String(format!("wo_{}_{}", i, j)),
                                 crate::parser::LiteralValue::Int(123),
@@ -227,7 +268,9 @@ mod tests {
                     }
                 }));
             }
-            for h in handles { h.join().unwrap(); }
+            for h in handles {
+                h.join().unwrap();
+            }
             start.elapsed()
         };
         println!("  Total: {:?}", write_only);

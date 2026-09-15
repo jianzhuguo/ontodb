@@ -1,4 +1,8 @@
-﻿//! Audit logging for OntoDB — 等保2.0三级合规.
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
+//! Audit logging for OntoDB — 等保2.0三级合规.
 //!
 //! Features:
 //! - Query audit with metadata (user, timestamp, duration, status)
@@ -547,10 +551,9 @@ fn cleanup_old_logs(log_dir: &Path, retention_days: u32) -> usize {
         }
 
         if let Some(file_days) = parse_date_from_filename(&name_str) {
-            if file_days < cutoff
-                && fs::remove_file(entry.path()).is_ok() {
-                    removed += 1;
-                }
+            if file_days < cutoff && fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
         }
     }
     removed
@@ -628,7 +631,14 @@ mod tests {
     use std::fs;
 
     fn temp_config() -> (AuditConfig, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("ontodb_audit_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "ontodb_audit_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
         fs::create_dir_all(&dir).ok();
         let config = AuditConfig {
             enabled: true,
@@ -691,10 +701,19 @@ mod tests {
         let logger = AuditLogger::new(config);
 
         // Log two entries
-        let entry1 = logger.create_query_entry("1.1.1.1", None, "SELECT", "SELECT 1", 1.0, true, None);
+        let entry1 =
+            logger.create_query_entry("1.1.1.1", None, "SELECT", "SELECT 1", 1.0, true, None);
         logger.log(entry1);
 
-        let entry2 = logger.create_query_entry("1.1.1.1", None, "INSERT", "INSERT INTO t VALUES(1)", 2.0, true, None);
+        let entry2 = logger.create_query_entry(
+            "1.1.1.1",
+            None,
+            "INSERT",
+            "INSERT INTO t VALUES(1)",
+            2.0,
+            true,
+            None,
+        );
         logger.log(entry2);
 
         // Verify chain
@@ -712,7 +731,8 @@ mod tests {
         let (config, dir) = temp_config();
         let logger = AuditLogger::new(config);
 
-        let entry = logger.create_query_entry("1.1.1.1", None, "SELECT", "SELECT 1", 1.0, true, None);
+        let entry =
+            logger.create_query_entry("1.1.1.1", None, "SELECT", "SELECT 1", 1.0, true, None);
         logger.log(entry);
 
         // Tamper with the log file

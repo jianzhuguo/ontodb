@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! OntoQL parser — the official query language for OntoDB.
 //!
 //! OntoQL unifies SQL-like syntax with semantic web features:
@@ -14,19 +18,25 @@ use serde::{Deserialize, Serialize};
 
 // ── Reuse helper functions from parser module ──
 use crate::parser::{self, QueryAst};
-use crate::parser_util::{find_ignore_ascii_case, starts_with_ignore_ascii_case, safe_slice, safe_slice_from};
+use crate::parser_util::{
+    find_ignore_ascii_case, safe_slice, safe_slice_from, starts_with_ignore_ascii_case,
+};
 
 /// Find unquoted substring (skips content inside single/double quotes).
 fn find_unquoted(haystack: &str, needle: &str) -> Option<usize> {
     let nlen = needle.len();
-    if nlen == 0 || haystack.len() < nlen { return None; }
+    if nlen == 0 || haystack.len() < nlen {
+        return None;
+    }
     let hay_bytes = haystack.as_bytes();
     let mut in_quote: Option<u8> = None;
     let mut i = 0;
     while i + nlen <= hay_bytes.len() {
         let c = hay_bytes[i];
         if let Some(q) = in_quote {
-            if c == q { in_quote = None; }
+            if c == q {
+                in_quote = None;
+            }
         } else if c == b'\'' || c == b'"' {
             in_quote = Some(c);
         } else if &hay_bytes[i..i + nlen] == needle.as_bytes() {
@@ -41,19 +51,26 @@ fn find_unquoted(haystack: &str, needle: &str) -> Option<usize> {
 fn find_unquoted_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
     let needle_upper: Vec<u8> = needle.bytes().map(|b| b.to_ascii_uppercase()).collect();
     let nlen = needle_upper.len();
-    if nlen == 0 || haystack.len() < nlen { return None; }
+    if nlen == 0 || haystack.len() < nlen {
+        return None;
+    }
     let hay_bytes = haystack.as_bytes();
     let mut in_quote: Option<u8> = None;
     let mut i = 0;
     while i + nlen <= hay_bytes.len() {
         let c = hay_bytes[i];
         if let Some(q) = in_quote {
-            if c == q { in_quote = None; }
+            if c == q {
+                in_quote = None;
+            }
         } else if c == b'\'' || c == b'"' {
             in_quote = Some(c);
         } else {
-            let matched = (0..nlen).all(|j| hay_bytes[i + j].to_ascii_uppercase() == needle_upper[j]);
-            if matched { return Some(i); }
+            let matched =
+                (0..nlen).all(|j| hay_bytes[i + j].to_ascii_uppercase() == needle_upper[j]);
+            if matched {
+                return Some(i);
+            }
         }
         i += 1;
     }
@@ -78,18 +95,28 @@ fn split_quoted(input: &str, delim: char) -> Vec<String> {
                 current.push(c);
             }
             _ if in_quote.is_some() => current.push(c),
-            '(' => { depth += 1; current.push(c); }
-            ')' if depth > 0 => { depth -= 1; current.push(c); }
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' if depth > 0 => {
+                depth -= 1;
+                current.push(c);
+            }
             c if c == delim && depth == 0 => {
                 let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() { parts.push(trimmed); }
+                if !trimmed.is_empty() {
+                    parts.push(trimmed);
+                }
                 current.clear();
             }
             _ => current.push(c),
         }
     }
     let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() { parts.push(trimmed); }
+    if !trimmed.is_empty() {
+        parts.push(trimmed);
+    }
     parts
 }
 
@@ -101,19 +128,31 @@ fn extract_quoted_or_word(input: &str) -> (String, &str) {
         let quote = trimmed.as_bytes()[0] as char;
         if let Some(end) = trimmed[1..].find(quote) {
             let val = &trimmed[1..1 + end];
-            return (val.to_string(), safe_slice_from(trimmed, 1 + end + 1).trim_start());
+            return (
+                val.to_string(),
+                safe_slice_from(trimmed, 1 + end + 1).trim_start(),
+            );
         }
     }
     // Bare word: read until whitespace or special char
-    let end = trimmed.find(|c: char| c.is_whitespace() || c == ',' || c == ')' || c == ';')
+    let end = trimmed
+        .find(|c: char| c.is_whitespace() || c == ',' || c == ')' || c == ';')
         .unwrap_or(trimmed.len());
-    if end == 0 { return (String::new(), trimmed); }
-    (trimmed[..end].to_string(), safe_slice_from(trimmed, end).trim_start())
+    if end == 0 {
+        return (String::new(), trimmed);
+    }
+    (
+        trimmed[..end].to_string(),
+        safe_slice_from(trimmed, end).trim_start(),
+    )
 }
 
 /// Consume input until one of the given keywords is found (case-insensitive).
 /// Returns (consumed_part, remaining_input, keyword_found).
-fn consume_until_keywords<'a>(input: &'a str, keywords: &[&'a str]) -> (&'a str, &'a str, Option<&'a str>) {
+fn consume_until_keywords<'a>(
+    input: &'a str,
+    keywords: &[&'a str],
+) -> (&'a str, &'a str, Option<&'a str>) {
     let lower = input.to_ascii_lowercase();
     let mut earliest: Option<(usize, &str)> = None;
     for kw in keywords {
@@ -177,8 +216,15 @@ pub enum OntoValueExpr {
     Literal(OntoLiteral),
     Column(String),
     Null,
-    Function { name: String, args: Vec<OntoValueExpr> },
-    Arithmetic { op: String, left: Box<OntoValueExpr>, right: Box<OntoValueExpr> },
+    Function {
+        name: String,
+        args: Vec<OntoValueExpr>,
+    },
+    Arithmetic {
+        op: String,
+        left: Box<OntoValueExpr>,
+        right: Box<OntoValueExpr>,
+    },
 }
 
 /// OntoQL literal values.
@@ -214,8 +260,8 @@ pub enum OntoFilterExpr {
 /// OntoQL SELECT projection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum OntoProjection {
-    All,                              // SELECT *
-    AllFrom(String),                  // SELECT p.*
+    All,             // SELECT *
+    AllFrom(String), // SELECT p.*
     Column { name: String, alias: Option<String> },
     Expression { expr: OntoValueExpr, alias: String },
 }
@@ -351,12 +397,20 @@ pub enum OntoQLAst {
     Rollback,
 
     // ── Namespace management ──
-    CreateNamespace { name: String },
-    DropNamespace { name: String },
-    UseNamespace { name: String },
+    CreateNamespace {
+        name: String,
+    },
+    DropNamespace {
+        name: String,
+    },
+    UseNamespace {
+        name: String,
+    },
 
     // ── Ontology import ──
-    ImportOntology { sql: String },
+    ImportOntology {
+        sql: String,
+    },
 
     // ── Pass-through to existing SQL parser ──
     SqlPassthrough(QueryAst),
@@ -365,8 +419,8 @@ pub enum OntoQLAst {
 /// INFER clause attached to SELECT.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InferClause {
-    pub scope: String,       // e.g. "SUBCLASS", "ALL"
-    pub rules: Vec<String>,  // specific rules, empty = all defaults
+    pub scope: String,      // e.g. "SUBCLASS", "ALL"
+    pub rules: Vec<String>, // specific rules, empty = all defaults
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -437,7 +491,9 @@ impl OntoQLParser {
             return Ok(OntoQLAst::Rollback);
         }
         if starts_with_ignore_ascii_case(input, "CREATE ONTOLOGY") {
-            return Ok(OntoQLAst::ImportOntology { sql: input.to_string() });
+            return Ok(OntoQLAst::ImportOntology {
+                sql: input.to_string(),
+            });
         }
 
         // Fallback: pass to SQL parser
@@ -456,7 +512,9 @@ impl OntoQLParser {
         // Find the class name (first word)
         let (name, rest) = Self::extract_identifier(rest);
         if name.is_empty() {
-            return Err(CoreError::InvalidArgument("Missing class name in CREATE CLASS".into()));
+            return Err(CoreError::InvalidArgument(
+                "Missing class name in CREATE CLASS".into(),
+            ));
         }
 
         let mut extends = None;
@@ -473,7 +531,8 @@ impl OntoQLParser {
             let after_parent = after_parent.trim();
             // Check for ABSTRACT after EXTENDS
             if let Some(abs_pos) = find_ignore_ascii_case(after_parent, "ABSTRACT") {
-                let after_abs = safe_slice_from(after_parent, abs_pos + "ABSTRACT".len()).trim_start();
+                let after_abs =
+                    safe_slice_from(after_parent, abs_pos + "ABSTRACT".len()).trim_start();
                 abstract_class = Self::parse_bool_value(after_abs);
             }
         } else if let Some(pos) = find_ignore_ascii_case(remaining, "ABSTRACT") {
@@ -495,7 +554,9 @@ impl OntoQLParser {
         let rest = safe_slice_from(input, "DROP CLASS".len()).trim_start();
         let (name, _) = Self::extract_identifier(rest);
         if name.is_empty() {
-            return Err(CoreError::InvalidArgument("Missing class name in DROP CLASS".into()));
+            return Err(CoreError::InvalidArgument(
+                "Missing class name in DROP CLASS".into(),
+            ));
         }
         Ok(OntoQLAst::DropClass { name })
     }
@@ -506,7 +567,9 @@ impl OntoQLParser {
         let rest = safe_slice_from(input, "DROP ONTOLOGY".len()).trim_start();
         let (name, _) = Self::extract_identifier(rest);
         if name.is_empty() {
-            return Err(CoreError::InvalidArgument("Missing ontology name in DROP ONTOLOGY".into()));
+            return Err(CoreError::InvalidArgument(
+                "Missing ontology name in DROP ONTOLOGY".into(),
+            ));
         }
         Ok(OntoQLAst::DropOntology { name })
     }
@@ -517,7 +580,9 @@ impl OntoQLParser {
         let rest = safe_slice_from(input, "CREATE NAMESPACE".len()).trim_start();
         let (name, _) = Self::extract_identifier(rest);
         if name.is_empty() {
-            return Err(CoreError::InvalidArgument("Missing namespace name in CREATE NAMESPACE".into()));
+            return Err(CoreError::InvalidArgument(
+                "Missing namespace name in CREATE NAMESPACE".into(),
+            ));
         }
         Ok(OntoQLAst::CreateNamespace { name })
     }
@@ -528,7 +593,9 @@ impl OntoQLParser {
         let rest = safe_slice_from(input, "DROP NAMESPACE".len()).trim_start();
         let (name, _) = Self::extract_identifier(rest);
         if name.is_empty() {
-            return Err(CoreError::InvalidArgument("Missing namespace name in DROP NAMESPACE".into()));
+            return Err(CoreError::InvalidArgument(
+                "Missing namespace name in DROP NAMESPACE".into(),
+            ));
         }
         Ok(OntoQLAst::DropNamespace { name })
     }
@@ -539,7 +606,9 @@ impl OntoQLParser {
         let rest = safe_slice_from(input, "USE NAMESPACE".len()).trim_start();
         let (name, _) = Self::extract_identifier(rest);
         if name.is_empty() {
-            return Err(CoreError::InvalidArgument("Missing namespace name in USE NAMESPACE".into()));
+            return Err(CoreError::InvalidArgument(
+                "Missing namespace name in USE NAMESPACE".into(),
+            ));
         }
         Ok(OntoQLAst::UseNamespace { name })
     }
@@ -549,11 +618,20 @@ impl OntoQLParser {
     fn parse_create_property(input: &str) -> Result<OntoQLAst> {
         let input = input.trim();
         let (kind, rest) = if starts_with_ignore_ascii_case(input, "CREATE DATATYPE PROPERTY") {
-            (PropertyKind::Datatype, safe_slice_from(input, "CREATE DATATYPE PROPERTY".len()))
+            (
+                PropertyKind::Datatype,
+                safe_slice_from(input, "CREATE DATATYPE PROPERTY".len()),
+            )
         } else if starts_with_ignore_ascii_case(input, "CREATE OBJECT PROPERTY") {
-            (PropertyKind::Object, safe_slice_from(input, "CREATE OBJECT PROPERTY".len()))
+            (
+                PropertyKind::Object,
+                safe_slice_from(input, "CREATE OBJECT PROPERTY".len()),
+            )
         } else {
-            (PropertyKind::Datatype, safe_slice_from(input, "CREATE PROPERTY".len()))
+            (
+                PropertyKind::Datatype,
+                safe_slice_from(input, "CREATE PROPERTY".len()),
+            )
         };
 
         let rest = rest.trim_start();
@@ -618,10 +696,18 @@ impl OntoQLParser {
             // Check for LIMIT at the end
             if let Some(pos) = find_unquoted_ignore_ascii_case(rest, "LIMIT") {
                 let limit_str = safe_slice_from(rest, pos + "LIMIT".len()).trim_start();
-                limit = limit_str.split_whitespace().next().and_then(|s| s.parse().ok());
+                limit = limit_str
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse().ok());
             }
 
-            return Ok(OntoQLAst::SelectTriples { subject, predicate, object, limit });
+            return Ok(OntoQLAst::SelectTriples {
+                subject,
+                predicate,
+                object,
+                limit,
+            });
         }
 
         // Check DISTINCT
@@ -638,7 +724,9 @@ impl OntoQLParser {
         let (proj_str, rest) = if let Some(pos) = find_unquoted_ignore_ascii_case(rest, " FROM ") {
             (safe_slice(rest, 0, pos), safe_slice_from(rest, pos + 1))
         } else {
-            return Err(CoreError::InvalidArgument("Missing FROM clause in SELECT".into()));
+            return Err(CoreError::InvalidArgument(
+                "Missing FROM clause in SELECT".into(),
+            ));
         };
 
         let projections = Self::parse_projections(proj_str.trim())?;
@@ -661,10 +749,14 @@ impl OntoQLParser {
 
         loop {
             remaining = remaining.trim();
-            if remaining.is_empty() { break; }
+            if remaining.is_empty() {
+                break;
+            }
 
-            if starts_with_ignore_ascii_case(remaining, "JOIN") || starts_with_ignore_ascii_case(remaining, "LEFT JOIN")
-                || starts_with_ignore_ascii_case(remaining, "RIGHT JOIN") || starts_with_ignore_ascii_case(remaining, "FULL JOIN")
+            if starts_with_ignore_ascii_case(remaining, "JOIN")
+                || starts_with_ignore_ascii_case(remaining, "LEFT JOIN")
+                || starts_with_ignore_ascii_case(remaining, "RIGHT JOIN")
+                || starts_with_ignore_ascii_case(remaining, "FULL JOIN")
             {
                 let (join, new_rest) = Self::parse_join_clause(remaining)?;
                 joins.push(join);
@@ -680,8 +772,12 @@ impl OntoQLParser {
                 remaining = new_rest;
             } else if starts_with_ignore_ascii_case(remaining, "GROUP BY") {
                 remaining = safe_slice_from(remaining, "GROUP BY".len()).trim_start();
-                let (gb_str, new_rest, _) = consume_until_keywords(remaining, &["HAVING", "ORDER", "LIMIT", "OFFSET"]);
-                group_by = split_quoted(gb_str, ',').iter().map(|s| s.trim().trim_matches('"').to_string()).collect();
+                let (gb_str, new_rest, _) =
+                    consume_until_keywords(remaining, &["HAVING", "ORDER", "LIMIT", "OFFSET"]);
+                group_by = split_quoted(gb_str, ',')
+                    .iter()
+                    .map(|s| s.trim().trim_matches('"').to_string())
+                    .collect();
                 remaining = new_rest;
             } else if starts_with_ignore_ascii_case(remaining, "HAVING") {
                 remaining = safe_slice_from(remaining, "HAVING".len()).trim_start();
@@ -700,7 +796,8 @@ impl OntoQLParser {
                 remaining = new_rest;
                 // Check for OFFSET after LIMIT
                 if starts_with_ignore_ascii_case(remaining.trim_start(), "OFFSET") {
-                    remaining = safe_slice_from(remaining.trim_start(), "OFFSET".len()).trim_start();
+                    remaining =
+                        safe_slice_from(remaining.trim_start(), "OFFSET".len()).trim_start();
                     let (off_str, new_rest2) = Self::extract_number(remaining);
                     offset = off_str.parse::<usize>().ok();
                     remaining = new_rest2;
@@ -748,7 +845,9 @@ impl OntoQLParser {
                 rest
             };
             if !starts_with_ignore_ascii_case(rest, "VALUES") {
-                return Err(CoreError::InvalidArgument("Expected VALUES in INSERT TRIPLES".into()));
+                return Err(CoreError::InvalidArgument(
+                    "Expected VALUES in INSERT TRIPLES".into(),
+                ));
             }
             let rest = safe_slice_from(rest, "VALUES".len()).trim_start();
             let triples = Self::parse_triple_values(rest)?;
@@ -759,24 +858,34 @@ impl OntoQLParser {
         if starts_with_ignore_ascii_case(rest, "TRIPLE ") {
             let rest = safe_slice_from(rest, "TRIPLE".len()).trim_start();
             if !starts_with_ignore_ascii_case(rest, "SET") {
-                return Err(CoreError::InvalidArgument("Expected SET in INSERT TRIPLE".into()));
+                return Err(CoreError::InvalidArgument(
+                    "Expected SET in INSERT TRIPLE".into(),
+                ));
             }
             let rest = safe_slice_from(rest, "SET".len()).trim_start();
             let assignments = Self::parse_assignments(rest)?;
             let subject = Self::get_assignment_value(&assignments, "subject")?;
             let predicate = Self::get_assignment_value(&assignments, "predicate")?;
             let object = Self::get_assignment_value(&assignments, "object")?;
-            return Ok(OntoQLAst::InsertTriple { subject, predicate, object });
+            return Ok(OntoQLAst::InsertTriple {
+                subject,
+                predicate,
+                object,
+            });
         }
 
         // INSERT INTO class SET ...
         if !starts_with_ignore_ascii_case(rest, "INTO") {
-            return Err(CoreError::InvalidArgument("Expected INTO after INSERT".into()));
+            return Err(CoreError::InvalidArgument(
+                "Expected INTO after INSERT".into(),
+            ));
         }
         let rest = safe_slice_from(rest, "INTO".len()).trim_start();
         let (class, rest) = Self::extract_identifier(rest);
         if class.is_empty() {
-            return Err(CoreError::InvalidArgument("Missing class name in INSERT".into()));
+            return Err(CoreError::InvalidArgument(
+                "Missing class name in INSERT".into(),
+            ));
         }
 
         let rest = rest.trim();
@@ -796,7 +905,9 @@ impl OntoQLParser {
         let rest = safe_slice_from(input, "UPDATE".len()).trim_start();
         let (class, rest) = Self::extract_identifier(rest);
         if class.is_empty() {
-            return Err(CoreError::InvalidArgument("Missing class name in UPDATE".into()));
+            return Err(CoreError::InvalidArgument(
+                "Missing class name in UPDATE".into(),
+            ));
         }
 
         let rest = rest.trim();
@@ -806,8 +917,12 @@ impl OntoQLParser {
         let rest = safe_slice_from(rest, "SET".len()).trim_start();
 
         // Split by WHERE (if present)
-        let (assign_str, rest) = if let Some(pos) = find_unquoted_ignore_ascii_case(rest, " WHERE ") {
-            (safe_slice(rest, 0, pos), safe_slice_from(rest, pos + " WHERE ".len()))
+        let (assign_str, rest) = if let Some(pos) = find_unquoted_ignore_ascii_case(rest, " WHERE ")
+        {
+            (
+                safe_slice(rest, 0, pos),
+                safe_slice_from(rest, pos + " WHERE ".len()),
+            )
         } else {
             (rest, "")
         };
@@ -821,7 +936,11 @@ impl OntoQLParser {
             None
         };
 
-        Ok(OntoQLAst::Update { class, assignments, filter })
+        Ok(OntoQLAst::Update {
+            class,
+            assignments,
+            filter,
+        })
     }
 
     // ── DELETE ────────────────────────────────────────────────────
@@ -833,24 +952,34 @@ impl OntoQLParser {
         if starts_with_ignore_ascii_case(rest, "TRIPLE") {
             let rest = safe_slice_from(rest, "TRIPLE".len()).trim_start();
             if !starts_with_ignore_ascii_case(rest, "SET") {
-                return Err(CoreError::InvalidArgument("Expected SET in DELETE TRIPLE".into()));
+                return Err(CoreError::InvalidArgument(
+                    "Expected SET in DELETE TRIPLE".into(),
+                ));
             }
             let rest = safe_slice_from(rest, "SET".len()).trim_start();
             let assignments = Self::parse_assignments(rest)?;
             let subject = Self::get_assignment_value(&assignments, "subject")?;
             let predicate = Self::get_assignment_value(&assignments, "predicate")?;
             let object = Self::get_assignment_value(&assignments, "object")?;
-            return Ok(OntoQLAst::DeleteTriple { subject, predicate, object });
+            return Ok(OntoQLAst::DeleteTriple {
+                subject,
+                predicate,
+                object,
+            });
         }
 
         // DELETE FROM class [WHERE ...]
         if !starts_with_ignore_ascii_case(rest, "FROM") {
-            return Err(CoreError::InvalidArgument("Expected FROM after DELETE".into()));
+            return Err(CoreError::InvalidArgument(
+                "Expected FROM after DELETE".into(),
+            ));
         }
         let rest = safe_slice_from(rest, "FROM".len()).trim_start();
         let (class, rest) = Self::extract_identifier(rest);
         if class.is_empty() {
-            return Err(CoreError::InvalidArgument("Missing class name in DELETE".into()));
+            return Err(CoreError::InvalidArgument(
+                "Missing class name in DELETE".into(),
+            ));
         }
 
         let rest = rest.trim();
@@ -884,7 +1013,10 @@ impl OntoQLParser {
                     if starts_with_ignore_ascii_case(rest, "USING") {
                         let rest = safe_slice_from(rest, "USING".len()).trim_start();
                         let (rules_str, new_rest, _) = consume_until_keywords(rest, &["REMOTE"]);
-                        rules = split_quoted(rules_str, ',').iter().map(|s| s.trim().to_string()).collect();
+                        rules = split_quoted(rules_str, ',')
+                            .iter()
+                            .map(|s| s.trim().to_string())
+                            .collect();
                         let remaining = new_rest.trim();
                         if starts_with_ignore_ascii_case(remaining, "REMOTE") {
                             let rest = safe_slice_from(remaining, "REMOTE".len()).trim_start();
@@ -900,7 +1032,10 @@ impl OntoQLParser {
                     query: Box::new(OntoQLAst::Select {
                         distinct: false,
                         projections: vec![OntoProjection::All],
-                        from: OntoFromClause::Class { name: "*".into(), alias: None },
+                        from: OntoFromClause::Class {
+                            name: "*".into(),
+                            alias: None,
+                        },
                         joins: vec![],
                         filter: None,
                         infer: None,
@@ -918,7 +1053,9 @@ impl OntoQLParser {
         }
 
         // INFER <subquery> — not yet fully supported in Phase 1
-        Err(CoreError::InvalidArgument("INFER with subquery not yet supported. Use SELECT ... INFER @onto(scope=...)".into()))
+        Err(CoreError::InvalidArgument(
+            "INFER with subquery not yet supported. Use SELECT ... INFER @onto(scope=...)".into(),
+        ))
     }
 
     // ── EXPLAIN ───────────────────────────────────────────────────
@@ -932,7 +1069,9 @@ impl OntoQLParser {
             rest
         };
         let inner = OntoQLParser::parse(rest)?;
-        Ok(OntoQLAst::Explain { query: Box::new(inner) })
+        Ok(OntoQLAst::Explain {
+            query: Box::new(inner),
+        })
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -979,7 +1118,9 @@ impl OntoQLParser {
         let input = input.trim_start();
         if input.starts_with('(') {
             // Subquery
-            return Err(CoreError::InvalidArgument("Subquery in FROM not yet supported".into()));
+            return Err(CoreError::InvalidArgument(
+                "Subquery in FROM not yet supported".into(),
+            ));
         }
 
         // Class name with optional alias
@@ -1003,8 +1144,10 @@ impl OntoQLParser {
                 let rest = safe_slice_from(rest, 3).trim_start();
                 let (alias, rest) = Self::extract_identifier(rest);
                 (Some(alias), rest)
-            } else if starts_with_ignore_ascii_case(rest, "ON ") || starts_with_ignore_ascii_case(rest, "WHERE ")
-                || starts_with_ignore_ascii_case(rest, "JOIN ") || starts_with_ignore_ascii_case(rest, "LEFT ")
+            } else if starts_with_ignore_ascii_case(rest, "ON ")
+                || starts_with_ignore_ascii_case(rest, "WHERE ")
+                || starts_with_ignore_ascii_case(rest, "JOIN ")
+                || starts_with_ignore_ascii_case(rest, "LEFT ")
             {
                 (None, rest)
             } else {
@@ -1054,11 +1197,14 @@ impl OntoQLParser {
         let rest = safe_slice_from(rest, 2).trim_start();
         let (condition, rest) = Self::parse_filter_expr(rest)?;
 
-        Ok((OntoJoinClause {
-            join_type,
-            target: from,
-            on_condition: condition,
-        }, rest))
+        Ok((
+            OntoJoinClause {
+                join_type,
+                target: from,
+                on_condition: condition,
+            },
+            rest,
+        ))
     }
 
     /// Parse INFER clause: `INFER @onto(scope=SUBCLASS)`.
@@ -1068,14 +1214,28 @@ impl OntoQLParser {
         // Parse @onto(scope=...) or just INFER
         if rest.starts_with('@') {
             let (ann, rest) = Self::parse_annotation(rest)?;
-            let scope = ann.params.iter()
+            let scope = ann
+                .params
+                .iter()
                 .find(|(k, _)| k == "scope")
                 .map(|(_, v)| v.clone())
                 .unwrap_or_else(|| "SUBCLASS".into());
-            Ok((InferClause { scope, rules: vec![] }, rest))
+            Ok((
+                InferClause {
+                    scope,
+                    rules: vec![],
+                },
+                rest,
+            ))
         } else {
             // Simple INFER
-            Ok((InferClause { scope: "ALL".into(), rules: vec![] }, rest))
+            Ok((
+                InferClause {
+                    scope: "ALL".into(),
+                    rules: vec![],
+                },
+                rest,
+            ))
         }
     }
 
@@ -1131,7 +1291,9 @@ impl OntoQLParser {
         }
 
         // Handle NOT prefix
-        if starts_with_ignore_ascii_case(input, "NOT ") || starts_with_ignore_ascii_case(input, "NOT(") {
+        if starts_with_ignore_ascii_case(input, "NOT ")
+            || starts_with_ignore_ascii_case(input, "NOT(")
+        {
             let after = if starts_with_ignore_ascii_case(input, "NOT(") {
                 safe_slice_from(input, 4).trim_start()
             } else {
@@ -1151,7 +1313,9 @@ impl OntoQLParser {
 
         let (left, rest) = Self::extract_identifier(input);
         if left.is_empty() {
-            return Err(CoreError::InvalidArgument("Expected column name in filter".into()));
+            return Err(CoreError::InvalidArgument(
+                "Expected column name in filter".into(),
+            ));
         }
 
         let rest = rest.trim_start();
@@ -1184,7 +1348,8 @@ impl OntoQLParser {
             let after = safe_slice_from(rest, 2).trim_start();
             if after.starts_with('(') {
                 if let Ok((inner_str, rest)) = Self::extract_paren_content(after) {
-                    let vals: Vec<OntoValueExpr> = split_quoted(inner_str, ',').iter()
+                    let vals: Vec<OntoValueExpr> = split_quoted(inner_str, ',')
+                        .iter()
                         .map(|s| Self::parse_value_expr(s.trim()).map(|(v, _)| v))
                         .collect::<Result<Vec<_>>>()?;
                     return Ok((OntoFilterExpr::In(left, vals), rest.trim_start()));
@@ -1212,16 +1377,21 @@ impl OntoQLParser {
                 if let OntoValueExpr::Literal(OntoLiteral::String(s)) = value {
                     OntoFilterExpr::Like(left, s)
                 } else {
-                    return Err(CoreError::InvalidArgument("LIKE requires a string pattern".into()));
+                    return Err(CoreError::InvalidArgument(
+                        "LIKE requires a string pattern".into(),
+                    ));
                 }
             }
-            _ => return Err(CoreError::InvalidArgument(format!("Unknown operator: {}", op))),
+            _ => {
+                return Err(CoreError::InvalidArgument(format!(
+                    "Unknown operator: {}",
+                    op
+                )))
+            }
         };
 
         Ok((expr, rest))
     }
-
-
 
     /// Parse a value expression (literal or column reference).
     fn parse_value_expr(input: &str) -> Result<(OntoValueExpr, &str)> {
@@ -1241,12 +1411,18 @@ impl OntoQLParser {
         if starts_with_ignore_ascii_case(input, "TRUE")
             && (input.len() == 4 || !input.as_bytes()[4].is_ascii_alphanumeric())
         {
-            return Ok((OntoValueExpr::Literal(OntoLiteral::Bool(true)), safe_slice_from(input, 4).trim_start()));
+            return Ok((
+                OntoValueExpr::Literal(OntoLiteral::Bool(true)),
+                safe_slice_from(input, 4).trim_start(),
+            ));
         }
         if starts_with_ignore_ascii_case(input, "FALSE")
             && (input.len() == 5 || !input.as_bytes()[5].is_ascii_alphanumeric())
         {
-            return Ok((OntoValueExpr::Literal(OntoLiteral::Bool(false)), safe_slice_from(input, 5).trim_start()));
+            return Ok((
+                OntoValueExpr::Literal(OntoLiteral::Bool(false)),
+                safe_slice_from(input, 5).trim_start(),
+            ));
         }
 
         // String literal
@@ -1254,14 +1430,18 @@ impl OntoQLParser {
             if let Some(end) = input[1..].find('\'') {
                 let val = &input[1..1 + end];
                 let rest = safe_slice_from(input, 1 + end + 1).trim_start();
-                return Ok((OntoValueExpr::Literal(OntoLiteral::String(val.to_string())), rest));
+                return Ok((
+                    OntoValueExpr::Literal(OntoLiteral::String(val.to_string())),
+                    rest,
+                ));
             }
         }
 
         // Number (negative or positive)
         let first = input.as_bytes()[0];
         if first.is_ascii_digit() || first == b'-' {
-            let end = input.find(|c: char| c.is_whitespace() || c == ',' || c == ')' || c == ';')
+            let end = input
+                .find(|c: char| c.is_whitespace() || c == ',' || c == ')' || c == ';')
                 .unwrap_or(input.len());
             let num_str = &input[..end];
             let rest = safe_slice_from(input, end).trim_start();
@@ -1283,7 +1463,8 @@ impl OntoQLParser {
             let args = if args_str.trim().is_empty() {
                 vec![]
             } else {
-                split_quoted(args_str, ',').iter()
+                split_quoted(args_str, ',')
+                    .iter()
                     .map(|a| Self::parse_value_expr(a.trim()).map(|(v, _)| v))
                     .collect::<Result<Vec<_>>>()?
             };
@@ -1302,7 +1483,10 @@ impl OntoQLParser {
             let part = part.trim();
             let eq_pos = find_unquoted(part, "=")
                 .ok_or_else(|| CoreError::InvalidArgument("Expected = in assignment".into()))?;
-            let col = safe_slice(part, 0, eq_pos).trim().trim_matches('"').to_string();
+            let col = safe_slice(part, 0, eq_pos)
+                .trim()
+                .trim_matches('"')
+                .to_string();
             let val_str = safe_slice_from(part, eq_pos + 1).trim();
             let (val, _) = Self::parse_value_expr(val_str)?;
             assignments.push((col, val));
@@ -1318,11 +1502,17 @@ impl OntoQLParser {
                 return match v {
                     OntoValueExpr::Literal(OntoLiteral::String(s)) => Ok(s.clone()),
                     OntoValueExpr::Column(c) => Ok(c.clone()),
-                    _ => Err(CoreError::InvalidArgument(format!("Expected string value for {}", key))),
+                    _ => Err(CoreError::InvalidArgument(format!(
+                        "Expected string value for {}",
+                        key
+                    ))),
                 };
             }
         }
-        Err(CoreError::InvalidArgument(format!("Missing {} in INSERT TRIPLE", key)))
+        Err(CoreError::InvalidArgument(format!(
+            "Missing {} in INSERT TRIPLE",
+            key
+        )))
     }
 
     /// Parse triple values: ("s1","p1","o1"), ("s2","p2","o2"), ...
@@ -1337,7 +1527,7 @@ impl OntoQLParser {
             let part = parts[i].trim();
             // Check if it's a parenthesized tuple
             if part.starts_with('(') && part.ends_with(')') {
-                let inner = &part[1..part.len()-1];
+                let inner = &part[1..part.len() - 1];
                 let vals = split_quoted(inner, ',');
                 if vals.len() == 3 {
                     let s = vals[0].trim().trim_matches('"').to_string();
@@ -1351,12 +1541,14 @@ impl OntoQLParser {
             // Otherwise, treat as flat list: s, p, o, s, p, o, ...
             if i + 2 < parts.len() {
                 let s = parts[i].trim().trim_matches('"').to_string();
-                let p = parts[i+1].trim().trim_matches('"').to_string();
-                let o = parts[i+2].trim().trim_matches('"').to_string();
+                let p = parts[i + 1].trim().trim_matches('"').to_string();
+                let o = parts[i + 2].trim().trim_matches('"').to_string();
                 triples.push((s, p, o));
                 i += 3;
             } else {
-                return Err(CoreError::InvalidArgument("Triple values must be groups of 3".into()));
+                return Err(CoreError::InvalidArgument(
+                    "Triple values must be groups of 3".into(),
+                ));
             }
         }
 
@@ -1364,7 +1556,9 @@ impl OntoQLParser {
     }
 
     /// Parse triple conditions: subject = "s" AND predicate = "p" AND object = "o"
-    fn parse_triple_conditions(input: &str) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    fn parse_triple_conditions(
+        input: &str,
+    ) -> Result<(Option<String>, Option<String>, Option<String>)> {
         let mut subject = None;
         let mut predicate = None;
         let mut object = None;
@@ -1373,8 +1567,9 @@ impl OntoQLParser {
         let parts: Vec<&str> = input.split(" AND ").collect();
         for part in parts {
             let part = part.trim();
-            let eq_pos = find_unquoted(part, "=")
-                .ok_or_else(|| CoreError::InvalidArgument("Expected = in triple condition".into()))?;
+            let eq_pos = find_unquoted(part, "=").ok_or_else(|| {
+                CoreError::InvalidArgument("Expected = in triple condition".into())
+            })?;
             let key = safe_slice(part, 0, eq_pos).trim().to_ascii_lowercase();
             let val_str = safe_slice_from(part, eq_pos + 1).trim();
             let val = val_str.trim_matches('"').to_string();
@@ -1383,7 +1578,12 @@ impl OntoQLParser {
                 "subject" | "s" => subject = Some(val),
                 "predicate" | "p" => predicate = Some(val),
                 "object" | "o" => object = Some(val),
-                _ => return Err(CoreError::InvalidArgument(format!("Unknown triple field: {}", key))),
+                _ => {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "Unknown triple field: {}",
+                        key
+                    )))
+                }
             }
         }
 
@@ -1393,29 +1593,48 @@ impl OntoQLParser {
     /// Parse ORDER BY: `col1 ASC, col2 DESC`.
     fn parse_order_by(input: &str) -> Vec<OntoOrderBy> {
         let parts = split_quoted(input, ',');
-        parts.iter().filter_map(|part| {
-            let part = part.trim();
-            let mut ascending = true;
-            let col = if starts_with_ignore_ascii_case(part, "DESC") {
-                ascending = false;
-                part[4..].trim().trim_matches('"').to_string()
-            } else if starts_with_ignore_ascii_case(part, "ASC") {
-                part[3..].trim().trim_matches('"').to_string()
-            } else {
-                // Split by space and check last word
-                let words: Vec<&str> = part.split_whitespace().collect();
-                if words.len() > 1 {
-                    match words.last().unwrap().to_ascii_uppercase().as_str() {
-                        "DESC" => { ascending = false; words[..words.len()-1].join(" ").trim_matches('"').to_string() }
-                        "ASC" => words[..words.len()-1].join(" ").trim_matches('"').to_string(),
-                        _ => part.trim_matches('"').to_string(),
-                    }
+        parts
+            .iter()
+            .filter_map(|part| {
+                let part = part.trim();
+                let mut ascending = true;
+                let col = if starts_with_ignore_ascii_case(part, "DESC") {
+                    ascending = false;
+                    part[4..].trim().trim_matches('"').to_string()
+                } else if starts_with_ignore_ascii_case(part, "ASC") {
+                    part[3..].trim().trim_matches('"').to_string()
                 } else {
-                    part.trim_matches('"').to_string()
+                    // Split by space and check last word
+                    let words: Vec<&str> = part.split_whitespace().collect();
+                    if words.len() > 1 {
+                        match words.last().unwrap().to_ascii_uppercase().as_str() {
+                            "DESC" => {
+                                ascending = false;
+                                words[..words.len() - 1]
+                                    .join(" ")
+                                    .trim_matches('"')
+                                    .to_string()
+                            }
+                            "ASC" => words[..words.len() - 1]
+                                .join(" ")
+                                .trim_matches('"')
+                                .to_string(),
+                            _ => part.trim_matches('"').to_string(),
+                        }
+                    } else {
+                        part.trim_matches('"').to_string()
+                    }
+                };
+                if col.is_empty() {
+                    None
+                } else {
+                    Some(OntoOrderBy {
+                        column: col,
+                        ascending,
+                    })
                 }
-            };
-            if col.is_empty() { None } else { Some(OntoOrderBy { column: col, ascending }) }
-        }).collect()
+            })
+            .collect()
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -1426,7 +1645,9 @@ impl OntoQLParser {
     /// Supports dotted identifiers like `table.column`.
     fn extract_identifier(input: &str) -> (String, &str) {
         let input = input.trim_start();
-        if input.is_empty() { return (String::new(), input); }
+        if input.is_empty() {
+            return (String::new(), input);
+        }
 
         // Quoted identifier
         if input.starts_with('"') {
@@ -1446,14 +1667,16 @@ impl OntoQLParser {
 
         // @marker identifier (e.g. @onto, @mind)
         if input.starts_with('@') {
-            let end = input[1..].find(|c: char| !c.is_alphanumeric() && c != '_')
+            let end = input[1..]
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
                 .map(|e| e + 1)
                 .unwrap_or(input.len());
             return (input[..end].to_string(), safe_slice_from(input, end));
         }
 
         // Bare identifier
-        let end = input.find(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+        let end = input
+            .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
             .unwrap_or(input.len());
         if end == 0 {
             (String::new(), input)
@@ -1479,23 +1702,41 @@ impl OntoQLParser {
     /// Extract a comparison operator.
     fn extract_operator(input: &str) -> Result<(String, &str)> {
         let input = input.trim_start();
-        if input.starts_with(">=") { return Ok((">=".into(), safe_slice_from(input, 2))); }
-        if input.starts_with("<=") { return Ok(("<=".into(), safe_slice_from(input, 2))); }
-        if input.starts_with("!=") { return Ok(("!=".into(), safe_slice_from(input, 2))); }
-        if input.starts_with("<>") { return Ok(("<>".into(), safe_slice_from(input, 2))); }
-        if input.starts_with('=') { return Ok(("=".into(), safe_slice_from(input, 1))); }
-        if input.starts_with('>') { return Ok((">".into(), safe_slice_from(input, 1))); }
-        if input.starts_with('<') { return Ok(("<".into(), safe_slice_from(input, 1))); }
+        if input.starts_with(">=") {
+            return Ok((">=".into(), safe_slice_from(input, 2)));
+        }
+        if input.starts_with("<=") {
+            return Ok(("<=".into(), safe_slice_from(input, 2)));
+        }
+        if input.starts_with("!=") {
+            return Ok(("!=".into(), safe_slice_from(input, 2)));
+        }
+        if input.starts_with("<>") {
+            return Ok(("<>".into(), safe_slice_from(input, 2)));
+        }
+        if input.starts_with('=') {
+            return Ok(("=".into(), safe_slice_from(input, 1)));
+        }
+        if input.starts_with('>') {
+            return Ok((">".into(), safe_slice_from(input, 1)));
+        }
+        if input.starts_with('<') {
+            return Ok(("<".into(), safe_slice_from(input, 1)));
+        }
         if starts_with_ignore_ascii_case(input, "LIKE") {
             return Ok(("LIKE".into(), safe_slice_from(input, 4)));
         }
-        Err(CoreError::InvalidArgument(format!("Expected operator, found: {}", &input[..input.len().min(20)])))
+        Err(CoreError::InvalidArgument(format!(
+            "Expected operator, found: {}",
+            &input[..input.len().min(20)]
+        )))
     }
 
     /// Extract a number from the start of input.
     fn extract_number(input: &str) -> (String, &str) {
         let input = input.trim_start();
-        let end = input.find(|c: char| !c.is_ascii_digit())
+        let end = input
+            .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(input.len());
         (input[..end].to_string(), safe_slice_from(input, end))
     }
@@ -1545,11 +1786,14 @@ impl OntoQLParser {
             let preceded_ok = abs_pos == 0 || input.as_bytes()[abs_pos - 1].is_ascii_whitespace();
             // Check word boundary: must be followed by whitespace or be at end
             let after_pos = abs_pos + keyword.len();
-            let followed_ok = after_pos >= input.len() || input.as_bytes()[after_pos].is_ascii_whitespace();
+            let followed_ok =
+                after_pos >= input.len() || input.as_bytes()[after_pos].is_ascii_whitespace();
             if preceded_ok && followed_ok {
                 let after = safe_slice_from(input, after_pos).trim_start();
                 let (val, _) = Self::extract_identifier(after);
-                if !val.is_empty() { return Some(val); }
+                if !val.is_empty() {
+                    return Some(val);
+                }
             }
             search_start = abs_pos + 1;
         }
@@ -1604,35 +1848,45 @@ impl OntoQLParser {
         }
 
         // Extract marker name
-        let end = input[1..].find(|c: char| !c.is_alphanumeric() && c != '_')
+        let end = input[1..]
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
             .unwrap_or(input.len() - 1);
         let marker = &input[1..1 + end];
         let rest = safe_slice_from(input, 1 + end).trim_start();
 
         if rest.starts_with('(') {
             let (content, rest) = Self::extract_paren_content(rest)?;
-            Ok((Annotation {
-                marker: marker.to_string(),
-                params: Self::parse_annotation_params(content),
-            }, rest.trim_start()))
+            Ok((
+                Annotation {
+                    marker: marker.to_string(),
+                    params: Self::parse_annotation_params(content),
+                },
+                rest.trim_start(),
+            ))
         } else {
-            Ok((Annotation {
-                marker: marker.to_string(),
-                params: vec![],
-            }, rest))
+            Ok((
+                Annotation {
+                    marker: marker.to_string(),
+                    params: vec![],
+                },
+                rest,
+            ))
         }
     }
 
     /// Parse annotation parameters: `key="val", key2="val2"`.
     fn parse_annotation_params(input: &str) -> Vec<(String, String)> {
         let parts = split_quoted(input, ',');
-        parts.iter().filter_map(|part| {
-            let part = part.trim();
-            let eq_pos = part.find('=')?;
-            let key = part[..eq_pos].trim().to_string();
-            let val = part[eq_pos + 1..].trim().trim_matches('"').to_string();
-            Some((key, val))
-        }).collect()
+        parts
+            .iter()
+            .filter_map(|part| {
+                let part = part.trim();
+                let eq_pos = part.find('=')?;
+                let key = part[..eq_pos].trim().to_string();
+                let val = part[eq_pos + 1..].trim().trim_matches('"').to_string();
+                Some((key, val))
+            })
+            .collect()
     }
 
     /// Parse `@marker(key="val")` as a quoted or word value.
@@ -1659,7 +1913,9 @@ impl OntoQLAst {
         match self {
             OntoQLAst::SqlPassthrough(ast) => Ok(ast.clone()),
             // Namespace operations don't map to SQL — convert directly
-            OntoQLAst::CreateNamespace { name } => Ok(QueryAst::CreateNamespace { name: name.clone() }),
+            OntoQLAst::CreateNamespace { name } => {
+                Ok(QueryAst::CreateNamespace { name: name.clone() })
+            }
             OntoQLAst::DropNamespace { name } => Ok(QueryAst::DropNamespace { name: name.clone() }),
             OntoQLAst::UseNamespace { name } => Ok(QueryAst::UseNamespace { name: name.clone() }),
             // Ontology drop operations — convert directly
@@ -1893,18 +2149,32 @@ impl OntoQLAst {
             }
             OntoFilterExpr::IsNull(col) => Ok(format!("{} IS NULL", col)),
             OntoFilterExpr::IsNotNull(col) => Ok(format!("{} IS NOT NULL", col)),
-            OntoFilterExpr::Between(col, lo, hi) => {
-                Ok(format!("{} BETWEEN {} AND {}", col, Self::expr_to_sql(lo), Self::expr_to_sql(hi)))
-            }
-            OntoFilterExpr::And(l, r) => Ok(format!("({} AND {})", Self::filter_to_sql(l)?, Self::filter_to_sql(r)?)),
-            OntoFilterExpr::Or(l, r) => Ok(format!("({} OR {})", Self::filter_to_sql(l)?, Self::filter_to_sql(r)?)),
+            OntoFilterExpr::Between(col, lo, hi) => Ok(format!(
+                "{} BETWEEN {} AND {}",
+                col,
+                Self::expr_to_sql(lo),
+                Self::expr_to_sql(hi)
+            )),
+            OntoFilterExpr::And(l, r) => Ok(format!(
+                "({} AND {})",
+                Self::filter_to_sql(l)?,
+                Self::filter_to_sql(r)?
+            )),
+            OntoFilterExpr::Or(l, r) => Ok(format!(
+                "({} OR {})",
+                Self::filter_to_sql(l)?,
+                Self::filter_to_sql(r)?
+            )),
             OntoFilterExpr::Not(e) => Ok(format!("NOT ({})", Self::filter_to_sql(e)?)),
-            OntoFilterExpr::AnnotationCondition(ann) => {
-                Ok(format!("@{}({})", ann.marker, ann.params.iter()
+            OntoFilterExpr::AnnotationCondition(ann) => Ok(format!(
+                "@{}({})",
+                ann.marker,
+                ann.params
+                    .iter()
                     .map(|(k, v)| format!("{}=\"{}\"", k, v))
                     .collect::<Vec<_>>()
-                    .join(", ")))
-            }
+                    .join(", ")
+            )),
         }
     }
 
@@ -1916,7 +2186,13 @@ impl OntoQLAst {
                 OntoLiteral::String(s) => format!("'{}'", s.replace('\'', "''")),
                 OntoLiteral::Int(i) => i.to_string(),
                 OntoLiteral::Float(f) => f.to_string(),
-                OntoLiteral::Bool(b) => if *b { "TRUE".into() } else { "FALSE".into() },
+                OntoLiteral::Bool(b) => {
+                    if *b {
+                        "TRUE".into()
+                    } else {
+                        "FALSE".into()
+                    }
+                }
             },
             OntoValueExpr::Column(name) => format!("\"{}\"", name),
             OntoValueExpr::Function { name, args } => {
@@ -1924,7 +2200,12 @@ impl OntoQLAst {
                 format!("{}({})", name, args_str.join(", "))
             }
             OntoValueExpr::Arithmetic { op, left, right } => {
-                format!("({} {} {})", Self::expr_to_sql(left), op, Self::expr_to_sql(right))
+                format!(
+                    "({} {} {})",
+                    Self::expr_to_sql(left),
+                    op,
+                    Self::expr_to_sql(right)
+                )
             }
         }
     }
@@ -1942,7 +2223,12 @@ mod tests {
     fn test_parse_create_class_basic() {
         let ast = OntoQLParser::parse("CREATE CLASS Person").unwrap();
         match ast {
-            OntoQLAst::CreateClass { name, extends, abstract_class, .. } => {
+            OntoQLAst::CreateClass {
+                name,
+                extends,
+                abstract_class,
+                ..
+            } => {
                 assert_eq!(name, "Person");
                 assert_eq!(extends, None);
                 assert!(!abstract_class);
@@ -1967,7 +2253,11 @@ mod tests {
     fn test_parse_create_class_abstract() {
         let ast = OntoQLParser::parse("CREATE CLASS Animal ABSTRACT true").unwrap();
         match ast {
-            OntoQLAst::CreateClass { name, abstract_class, .. } => {
+            OntoQLAst::CreateClass {
+                name,
+                abstract_class,
+                ..
+            } => {
                 assert_eq!(name, "Animal");
                 assert!(abstract_class);
             }
@@ -1977,9 +2267,12 @@ mod tests {
 
     #[test]
     fn test_parse_create_class_with_annotation() {
-        let ast = OntoQLParser::parse("CREATE CLASS Person ANNOTATION(@onto(scope=\"full\"))").unwrap();
+        let ast =
+            OntoQLParser::parse("CREATE CLASS Person ANNOTATION(@onto(scope=\"full\"))").unwrap();
         match ast {
-            OntoQLAst::CreateClass { name, annotations, .. } => {
+            OntoQLAst::CreateClass {
+                name, annotations, ..
+            } => {
                 assert_eq!(name, "Person");
                 assert!(!annotations.is_empty());
             }
@@ -1989,9 +2282,19 @@ mod tests {
 
     #[test]
     fn test_parse_create_datatype_property() {
-        let ast = OntoQLParser::parse("CREATE DATATYPE PROPERTY name DOMAIN Person RANGE STRING REQUIRED").unwrap();
+        let ast = OntoQLParser::parse(
+            "CREATE DATATYPE PROPERTY name DOMAIN Person RANGE STRING REQUIRED",
+        )
+        .unwrap();
         match ast {
-            OntoQLAst::CreateProperty { name, kind, domain, range, required, .. } => {
+            OntoQLAst::CreateProperty {
+                name,
+                kind,
+                domain,
+                range,
+                required,
+                ..
+            } => {
                 assert_eq!(name, "name");
                 assert_eq!(kind, PropertyKind::Datatype);
                 assert_eq!(domain, "Person");
@@ -2008,7 +2311,12 @@ mod tests {
             "CREATE OBJECT PROPERTY worksAt DOMAIN Employee RANGE Company CHARACTERISTICS TRANSITIVE"
         ).unwrap();
         match ast {
-            OntoQLAst::CreateProperty { name, kind, characteristics, .. } => {
+            OntoQLAst::CreateProperty {
+                name,
+                kind,
+                characteristics,
+                ..
+            } => {
                 assert_eq!(name, "worksAt");
                 assert_eq!(kind, PropertyKind::Object);
                 assert!(characteristics.contains(&Characteristic::Transitive));
@@ -2021,7 +2329,9 @@ mod tests {
     fn test_parse_select_basic() {
         let ast = OntoQLParser::parse("SELECT name, age FROM Person").unwrap();
         match ast {
-            OntoQLAst::Select { projections, from, .. } => {
+            OntoQLAst::Select {
+                projections, from, ..
+            } => {
                 assert_eq!(projections.len(), 2);
                 match &from {
                     OntoFromClause::Class { name, .. } => assert_eq!(name, "Person"),
@@ -2058,14 +2368,14 @@ mod tests {
 
     #[test]
     fn test_parse_select_with_and() {
-        let ast = OntoQLParser::parse("SELECT name FROM Person WHERE age > 18 AND city = 'Beijing'").unwrap();
+        let ast =
+            OntoQLParser::parse("SELECT name FROM Person WHERE age > 18 AND city = 'Beijing'")
+                .unwrap();
         match ast {
-            OntoQLAst::Select { filter, .. } => {
-                match filter.unwrap() {
-                    OntoFilterExpr::And(_, _) => {}
-                    _ => panic!("Expected And filter"),
-                }
-            }
+            OntoQLAst::Select { filter, .. } => match filter.unwrap() {
+                OntoFilterExpr::And(_, _) => {}
+                _ => panic!("Expected And filter"),
+            },
             _ => panic!("Expected Select"),
         }
     }
@@ -2098,8 +2408,9 @@ mod tests {
     #[test]
     fn test_parse_select_with_join() {
         let ast = OntoQLParser::parse(
-            "SELECT p.name, c.name FROM Person p JOIN Company c ON p.company_id = c.id"
-        ).unwrap();
+            "SELECT p.name, c.name FROM Person p JOIN Company c ON p.company_id = c.id",
+        )
+        .unwrap();
         match ast {
             OntoQLAst::Select { joins, .. } => {
                 assert_eq!(joins.len(), 1);
@@ -2112,8 +2423,9 @@ mod tests {
     #[test]
     fn test_parse_select_with_left_join() {
         let ast = OntoQLParser::parse(
-            "SELECT p.name, d.name FROM Person p LEFT JOIN Department d ON p.dept_id = d.id"
-        ).unwrap();
+            "SELECT p.name, d.name FROM Person p LEFT JOIN Department d ON p.dept_id = d.id",
+        )
+        .unwrap();
         match ast {
             OntoQLAst::Select { joins, .. } => {
                 assert_eq!(joins.len(), 1);
@@ -2141,7 +2453,11 @@ mod tests {
     fn test_parse_update() {
         let ast = OntoQLParser::parse("UPDATE Person SET name = 'Bob' WHERE id = 1").unwrap();
         match ast {
-            OntoQLAst::Update { class, assignments, filter } => {
+            OntoQLAst::Update {
+                class,
+                assignments,
+                filter,
+            } => {
                 assert_eq!(class, "Person");
                 assert_eq!(assignments.len(), 1);
                 assert!(filter.is_some());
@@ -2178,28 +2494,34 @@ mod tests {
     fn test_parse_explain() {
         let ast = OntoQLParser::parse("EXPLAIN SELECT * FROM Person").unwrap();
         match ast {
-            OntoQLAst::Explain { query } => {
-                match *query {
-                    OntoQLAst::Select { .. } => {}
-                    _ => panic!("Expected Select inside Explain"),
-                }
-            }
+            OntoQLAst::Explain { query } => match *query {
+                OntoQLAst::Select { .. } => {}
+                _ => panic!("Expected Select inside Explain"),
+            },
             _ => panic!("Expected Explain"),
         }
     }
 
     #[test]
     fn test_parse_transactions() {
-        assert!(matches!(OntoQLParser::parse("BEGIN").unwrap(), OntoQLAst::Begin));
-        assert!(matches!(OntoQLParser::parse("COMMIT").unwrap(), OntoQLAst::Commit));
-        assert!(matches!(OntoQLParser::parse("ROLLBACK").unwrap(), OntoQLAst::Rollback));
+        assert!(matches!(
+            OntoQLParser::parse("BEGIN").unwrap(),
+            OntoQLAst::Begin
+        ));
+        assert!(matches!(
+            OntoQLParser::parse("COMMIT").unwrap(),
+            OntoQLAst::Commit
+        ));
+        assert!(matches!(
+            OntoQLParser::parse("ROLLBACK").unwrap(),
+            OntoQLAst::Rollback
+        ));
     }
 
     #[test]
     fn test_parse_select_with_infer() {
-        let ast = OntoQLParser::parse(
-            "SELECT name FROM Person INFER @onto(scope=\"SUBCLASS\")"
-        ).unwrap();
+        let ast =
+            OntoQLParser::parse("SELECT name FROM Person INFER @onto(scope=\"SUBCLASS\")").unwrap();
         match ast {
             OntoQLAst::Select { infer, .. } => {
                 assert!(infer.is_some());
@@ -2226,15 +2548,13 @@ mod tests {
     fn test_parse_select_with_alias() {
         let ast = OntoQLParser::parse("SELECT name AS person_name FROM Person").unwrap();
         match ast {
-            OntoQLAst::Select { projections, .. } => {
-                match &projections[0] {
-                    OntoProjection::Column { name, alias } => {
-                        assert_eq!(name, "name");
-                        assert_eq!(alias.as_deref(), Some("person_name"));
-                    }
-                    _ => panic!("Expected Column projection"),
+            OntoQLAst::Select { projections, .. } => match &projections[0] {
+                OntoProjection::Column { name, alias } => {
+                    assert_eq!(name, "name");
+                    assert_eq!(alias.as_deref(), Some("person_name"));
                 }
-            }
+                _ => panic!("Expected Column projection"),
+            },
             _ => panic!("Expected Select"),
         }
     }
@@ -2243,12 +2563,10 @@ mod tests {
     fn test_parse_filter_is_null() {
         let ast = OntoQLParser::parse("SELECT name FROM Person WHERE email IS NULL").unwrap();
         match ast {
-            OntoQLAst::Select { filter, .. } => {
-                match filter.unwrap() {
-                    OntoFilterExpr::IsNull(col) => assert_eq!(col, "email"),
-                    _ => panic!("Expected IsNull"),
-                }
-            }
+            OntoQLAst::Select { filter, .. } => match filter.unwrap() {
+                OntoFilterExpr::IsNull(col) => assert_eq!(col, "email"),
+                _ => panic!("Expected IsNull"),
+            },
             _ => panic!("Expected Select"),
         }
     }
@@ -2257,22 +2575,21 @@ mod tests {
     fn test_parse_filter_like() {
         let ast = OntoQLParser::parse("SELECT name FROM Person WHERE name LIKE '%alice%'").unwrap();
         match ast {
-            OntoQLAst::Select { filter, .. } => {
-                match filter.unwrap() {
-                    OntoFilterExpr::Like(col, pattern) => {
-                        assert_eq!(col, "name");
-                        assert_eq!(pattern, "%alice%");
-                    }
-                    _ => panic!("Expected Like"),
+            OntoQLAst::Select { filter, .. } => match filter.unwrap() {
+                OntoFilterExpr::Like(col, pattern) => {
+                    assert_eq!(col, "name");
+                    assert_eq!(pattern, "%alice%");
                 }
-            }
+                _ => panic!("Expected Like"),
+            },
             _ => panic!("Expected Select"),
         }
     }
 
     #[test]
     fn test_to_query_ast_select() {
-        let ast = OntoQLParser::parse("SELECT name, age FROM Person WHERE age > 18 LIMIT 10").unwrap();
+        let ast =
+            OntoQLParser::parse("SELECT name, age FROM Person WHERE age > 18 LIMIT 10").unwrap();
         let sql_ast = ast.to_query_ast().unwrap();
         match sql_ast {
             QueryAst::Select { from, limit, .. } => {
@@ -2288,7 +2605,11 @@ mod tests {
         let ast = OntoQLParser::parse("INSERT INTO Person SET name = 'Alice', age = 30").unwrap();
         let sql_ast = ast.to_query_ast().unwrap();
         match sql_ast {
-            QueryAst::Insert { class, columns, values } => {
+            QueryAst::Insert {
+                class,
+                columns,
+                values,
+            } => {
                 assert_eq!(class, "Person");
                 assert_eq!(columns.len(), 2);
                 assert_eq!(values.len(), 2);
@@ -2315,10 +2636,13 @@ mod tests {
     #[test]
     fn test_parse_create_property_with_inverse() {
         let ast = OntoQLParser::parse(
-            "CREATE OBJECT PROPERTY hasChild DOMAIN Person RANGE Person INVERSE OF hasParent"
-        ).unwrap();
+            "CREATE OBJECT PROPERTY hasChild DOMAIN Person RANGE Person INVERSE OF hasParent",
+        )
+        .unwrap();
         match ast {
-            OntoQLAst::CreateProperty { name, inverse_of, .. } => {
+            OntoQLAst::CreateProperty {
+                name, inverse_of, ..
+            } => {
                 assert_eq!(name, "hasChild");
                 assert_eq!(inverse_of, Some("hasParent".into()));
             }
@@ -2328,9 +2652,7 @@ mod tests {
 
     #[test]
     fn test_parse_select_with_group_by() {
-        let ast = OntoQLParser::parse(
-            "SELECT city, COUNT(*) FROM Person GROUP BY city"
-        ).unwrap();
+        let ast = OntoQLParser::parse("SELECT city, COUNT(*) FROM Person GROUP BY city").unwrap();
         match ast {
             OntoQLAst::Select { group_by, .. } => {
                 assert_eq!(group_by.len(), 1);
@@ -2351,7 +2673,8 @@ mod tests {
 
     #[test]
     fn test_to_sql_select() {
-        let ast = OntoQLParser::parse("SELECT name, age FROM Person WHERE age > 18 LIMIT 10").unwrap();
+        let ast =
+            OntoQLParser::parse("SELECT name, age FROM Person WHERE age > 18 LIMIT 10").unwrap();
         let sql = ast.to_sql().unwrap();
         assert!(sql.contains("SELECT"));
         assert!(sql.contains("FROM"));
@@ -2387,7 +2710,8 @@ mod tests {
 
     #[test]
     fn test_to_query_ast_roundtrip_select() {
-        let ast = OntoQLParser::parse("SELECT name, age FROM Person WHERE age > 18 LIMIT 10").unwrap();
+        let ast =
+            OntoQLParser::parse("SELECT name, age FROM Person WHERE age > 18 LIMIT 10").unwrap();
         let query_ast = ast.to_query_ast().unwrap();
         match query_ast {
             QueryAst::Select { from, limit, .. } => {
@@ -2459,13 +2783,22 @@ mod tests {
 
     #[test]
     fn test_to_query_ast_transactions() {
-        let begin = OntoQLParser::parse("BEGIN").unwrap().to_query_ast().unwrap();
+        let begin = OntoQLParser::parse("BEGIN")
+            .unwrap()
+            .to_query_ast()
+            .unwrap();
         assert!(matches!(begin, QueryAst::Begin));
 
-        let commit = OntoQLParser::parse("COMMIT").unwrap().to_query_ast().unwrap();
+        let commit = OntoQLParser::parse("COMMIT")
+            .unwrap()
+            .to_query_ast()
+            .unwrap();
         assert!(matches!(commit, QueryAst::Commit));
 
-        let rollback = OntoQLParser::parse("ROLLBACK").unwrap().to_query_ast().unwrap();
+        let rollback = OntoQLParser::parse("ROLLBACK")
+            .unwrap()
+            .to_query_ast()
+            .unwrap();
         assert!(matches!(rollback, QueryAst::Rollback));
     }
 
@@ -2485,18 +2818,27 @@ mod tests {
     #[test]
     fn test_ontology_between_in_not() {
         // BETWEEN
-        let ast = OntoQLParser::parse("SELECT name FROM Person WHERE age BETWEEN 18 AND 65").unwrap();
+        let ast =
+            OntoQLParser::parse("SELECT name FROM Person WHERE age BETWEEN 18 AND 65").unwrap();
         match &ast {
-            OntoQLAst::Select { filter: Some(OntoFilterExpr::Between(col, _, _)), .. } => {
+            OntoQLAst::Select {
+                filter: Some(OntoFilterExpr::Between(col, _, _)),
+                ..
+            } => {
                 assert_eq!(col, "age");
             }
             other => panic!("expected Between, got {:?}", other),
         }
 
         // IN
-        let ast = OntoQLParser::parse("SELECT name FROM Person WHERE status IN ('active', 'pending')").unwrap();
+        let ast =
+            OntoQLParser::parse("SELECT name FROM Person WHERE status IN ('active', 'pending')")
+                .unwrap();
         match &ast {
-            OntoQLAst::Select { filter: Some(OntoFilterExpr::In(col, vals)), .. } => {
+            OntoQLAst::Select {
+                filter: Some(OntoFilterExpr::In(col, vals)),
+                ..
+            } => {
                 assert_eq!(col, "status");
                 assert_eq!(vals.len(), 2);
             }
@@ -2506,7 +2848,10 @@ mod tests {
         // NOT
         let ast = OntoQLParser::parse("SELECT name FROM Person WHERE NOT (age > 30)").unwrap();
         match &ast {
-            OntoQLAst::Select { filter: Some(OntoFilterExpr::Not(_)), .. } => {}
+            OntoQLAst::Select {
+                filter: Some(OntoFilterExpr::Not(_)),
+                ..
+            } => {}
             other => panic!("expected Not, got {:?}", other),
         }
     }

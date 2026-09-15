@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! HNSW graph compaction for removing deleted/stale entries.
 //!
 //! HNSW doesn't support native deletion. Over time, deleted and stale
@@ -114,9 +118,18 @@ mod tests {
     fn test_compact_with_entries() {
         let config = test_config();
         let entries = vec![
-            VectorEntry { id: vec![1], vector: vec![1.0, 0.0, 0.0] },
-            VectorEntry { id: vec![2], vector: vec![0.0, 1.0, 0.0] },
-            VectorEntry { id: vec![3], vector: vec![0.0, 0.0, 1.0] },
+            VectorEntry {
+                id: vec![1],
+                vector: vec![1.0, 0.0, 0.0],
+            },
+            VectorEntry {
+                id: vec![2],
+                vector: vec![0.0, 1.0, 0.0],
+            },
+            VectorEntry {
+                id: vec![3],
+                vector: vec![0.0, 0.0, 1.0],
+            },
         ];
         let (new_index, result) = compact_index(&config, entries, 5);
         assert_eq!(result.entries_before, 5);
@@ -128,9 +141,18 @@ mod tests {
     #[test]
     fn test_collect_live_entries() {
         let mut doc_vectors = HashMap::new();
-        doc_vectors.insert(vec![1], vec![("Product".into(), "emb".into(), vec![1.0, 0.0])]);
-        doc_vectors.insert(vec![2], vec![("Product".into(), "emb".into(), vec![0.0, 1.0])]);
-        doc_vectors.insert(vec![3], vec![("Product".into(), "emb".into(), vec![0.5, 0.5])]);
+        doc_vectors.insert(
+            vec![1],
+            vec![("Product".into(), "emb".into(), vec![1.0, 0.0])],
+        );
+        doc_vectors.insert(
+            vec![2],
+            vec![("Product".into(), "emb".into(), vec![0.0, 1.0])],
+        );
+        doc_vectors.insert(
+            vec![3],
+            vec![("Product".into(), "emb".into(), vec![0.5, 0.5])],
+        );
 
         let mut deleted = std::collections::HashSet::new();
         deleted.insert(vec![2]); // Delete doc2

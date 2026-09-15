@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Vector normalization for optimized distance computation.
 //!
 //! When cosine distance is used, we L2-normalize each vector on insert.
@@ -112,7 +116,11 @@ mod tests {
         l2_normalize(&mut nb);
         let normalized = normalized_cosine_distance(&na, &nb);
 
-        assert!((raw - normalized).abs() < 1e-5,
-            "raw={}, normalized={}", raw, normalized);
+        assert!(
+            (raw - normalized).abs() < 1e-5,
+            "raw={}, normalized={}",
+            raw,
+            normalized
+        );
     }
 }

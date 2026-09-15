@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Geohash spatial index for OntoDB.
 //!
 //! Geohash encodes 2D coordinates into a string of base-32 characters.
@@ -132,7 +136,13 @@ impl GeohashIndex {
     }
 
     /// Find all entities within a bounding box.
-    pub fn bbox_search(&self, min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) -> Vec<String> {
+    pub fn bbox_search(
+        &self,
+        min_lat: f64,
+        min_lon: f64,
+        max_lat: f64,
+        max_lon: f64,
+    ) -> Vec<String> {
         // Get geohash prefixes that cover the bounding box
         let prefixes = bbox_to_geohashes(min_lat, min_lon, max_lat, max_lon, self.precision);
 
@@ -251,9 +261,14 @@ pub fn geohash_neighbors(hash: &str) -> Vec<String> {
 
     // 8 neighboring cells
     let offsets = [
-        (-1.0, -1.0), (-1.0, 0.0), (-1.0, 1.0),
-        (0.0, -1.0),               (0.0, 1.0),
-        (1.0, -1.0),  (1.0, 0.0),  (1.0, 1.0),
+        (-1.0, -1.0),
+        (-1.0, 0.0),
+        (-1.0, 1.0),
+        (0.0, -1.0),
+        (0.0, 1.0),
+        (1.0, -1.0),
+        (1.0, 0.0),
+        (1.0, 1.0),
     ];
 
     for (dlat, dlon) in &offsets {
@@ -271,19 +286,35 @@ pub fn geohash_neighbors(hash: &str) -> Vec<String> {
 /// Convert meters to appropriate geohash precision.
 fn meters_to_precision(meters: f64) -> usize {
     // Approximate precision for different radii
-    if meters >= 5000000.0 { 1 }
-    else if meters >= 630000.0 { 2 }
-    else if meters >= 78000.0 { 3 }
-    else if meters >= 20000.0 { 4 }
-    else if meters >= 2400.0 { 5 }
-    else if meters >= 610.0 { 6 }
-    else if meters >= 76.0 { 7 }
-    else if meters >= 19.0 { 8 }
-    else { 9 }
+    if meters >= 5000000.0 {
+        1
+    } else if meters >= 630000.0 {
+        2
+    } else if meters >= 78000.0 {
+        3
+    } else if meters >= 20000.0 {
+        4
+    } else if meters >= 2400.0 {
+        5
+    } else if meters >= 610.0 {
+        6
+    } else if meters >= 76.0 {
+        7
+    } else if meters >= 19.0 {
+        8
+    } else {
+        9
+    }
 }
 
 /// Get geohash prefixes that cover a bounding box.
-fn bbox_to_geohashes(min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64, precision: usize) -> Vec<String> {
+fn bbox_to_geohashes(
+    min_lat: f64,
+    min_lon: f64,
+    max_lat: f64,
+    max_lon: f64,
+    precision: usize,
+) -> Vec<String> {
     let mut prefixes = HashSet::new();
 
     // Sample points along the bounding box

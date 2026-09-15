@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Write-Ahead Log (WAL) for crash recovery.
 //!
 //! Format: [length: u32][crc32: u32][payload: bytes]
@@ -139,9 +143,9 @@ impl Wal {
 
         // Generate archive filename
         self.rotation_count += 1;
-        let archive_path = self._path.with_extension(
-            format!("{}.wal", self.rotation_count)
-        );
+        let archive_path = self
+            ._path
+            .with_extension(format!("{}.wal", self.rotation_count));
 
         // Rename current file to archive
         std::fs::rename(&self._path, &archive_path)?;
@@ -180,10 +184,12 @@ impl Wal {
         // kind = Put (1 byte)
         self.serialize_buf.push(0);
         // key length + key
-        self.serialize_buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        self.serialize_buf
+            .extend_from_slice(&(key.len() as u32).to_le_bytes());
         self.serialize_buf.extend_from_slice(key);
         // value length + value
-        self.serialize_buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.serialize_buf
+            .extend_from_slice(&(value.len() as u32).to_le_bytes());
         self.serialize_buf.extend_from_slice(value);
 
         let crc = crc32fast::hash(&self.serialize_buf);
@@ -244,8 +250,11 @@ impl Wal {
         if data.len() < val_offset + 4 {
             return Err(CoreError::corruption("WAL entry value length truncated"));
         }
-        let val_len =
-            u32::from_le_bytes(data[val_offset..val_offset + 4].try_into().expect("should be valid")) as usize;
+        let val_len = u32::from_le_bytes(
+            data[val_offset..val_offset + 4]
+                .try_into()
+                .expect("should be valid"),
+        ) as usize;
         if data.len() < val_offset + 4 + val_len {
             return Err(CoreError::corruption("WAL entry value truncated"));
         }
@@ -277,12 +286,17 @@ pub fn replay_wal(path: impl AsRef<Path>) -> Result<Vec<Entry>> {
     let mut pos = 0;
     while pos + 8 <= buf.len() {
         // Read length
-        let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().expect("should be valid")) as usize;
+        let len =
+            u32::from_le_bytes(buf[pos..pos + 4].try_into().expect("should be valid")) as usize;
         pos += 4;
 
         // Sanity check: length shouldn't be unreasonably large (max 100MB per entry)
         if len > 100 * 1024 * 1024 {
-            tracing::warn!("WAL: unreasonable entry length {} at offset {}, stopping", len, pos - 4);
+            tracing::warn!(
+                "WAL: unreasonable entry length {} at offset {}, stopping",
+                len,
+                pos - 4
+            );
             break;
         }
 
@@ -290,12 +304,18 @@ pub fn replay_wal(path: impl AsRef<Path>) -> Result<Vec<Entry>> {
         if pos + 4 > buf.len() {
             break; // Truncated CRC at end of file
         }
-        let expected_crc = u32::from_le_bytes(buf[pos..pos + 4].try_into().expect("should be valid"));
+        let expected_crc =
+            u32::from_le_bytes(buf[pos..pos + 4].try_into().expect("should be valid"));
         pos += 4;
 
         // Read payload
         if pos + len > buf.len() {
-            tracing::warn!("WAL: truncated payload at offset {} (need {} bytes, have {}), stopping", pos, len, buf.len() - pos);
+            tracing::warn!(
+                "WAL: truncated payload at offset {} (need {} bytes, have {}), stopping",
+                pos,
+                len,
+                buf.len() - pos
+            );
             break; // Truncated payload at end of file (partial write)
         }
         let payload = &buf[pos..pos + len];
@@ -304,14 +324,21 @@ pub fn replay_wal(path: impl AsRef<Path>) -> Result<Vec<Entry>> {
         // Verify CRC — stop on mismatch (corrupted length would cascade errors)
         let actual_crc = crc32fast::hash(payload);
         if expected_crc != actual_crc {
-            tracing::warn!("WAL: CRC mismatch at offset {}, stopping replay", pos - len - 8);
+            tracing::warn!(
+                "WAL: CRC mismatch at offset {}, stopping replay",
+                pos - len - 8
+            );
             break;
         }
 
         match Wal::deserialize_entry(payload) {
             Ok(entry) => entries.push(entry),
             Err(e) => {
-                tracing::warn!("WAL: malformed entry at offset {}: {:?}, stopping", pos - len, e);
+                tracing::warn!(
+                    "WAL: malformed entry at offset {}: {:?}, stopping",
+                    pos - len,
+                    e
+                );
                 break;
             }
         }
@@ -379,9 +406,14 @@ mod tests {
         let bad_payload = b"garbage_data";
         let bad_len = bad_payload.len() as u32;
         let bad_crc = 0xDEADBEEFu32; // Wrong CRC
-        let mut file = std::fs::OpenOptions::new().append(true).open(&wal_path).expect("should be valid");
-        file.write_all(&bad_len.to_le_bytes()).expect("should be valid");
-        file.write_all(&bad_crc.to_le_bytes()).expect("should be valid");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .expect("should be valid");
+        file.write_all(&bad_len.to_le_bytes())
+            .expect("should be valid");
+        file.write_all(&bad_crc.to_le_bytes())
+            .expect("should be valid");
         file.write_all(bad_payload).expect("should be valid");
         file.sync_all().expect("should be valid");
 

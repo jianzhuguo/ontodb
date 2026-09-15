@@ -10,4 +10,4 @@ build-dir = "book"
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/ontodb/ontodb"
+git-repository-url = "https://gitee.com/ontovalue/ontodb"

@@ -11,7 +11,7 @@ fn main() {
     // Setup
     let row_count = 50_000;
     let iterations = 100;
-    
+
     println!("Setting up engine with {} rows...", row_count);
     let dir = tempfile::tempdir().unwrap();
     let options = StorageOptions {
@@ -36,15 +36,19 @@ fn main() {
         let _ = engine.scan_prefix(b"K::").unwrap();
     }
     let seq_time = start.elapsed();
-    println!("  {} scans: {:?} ({:.0} scans/sec)", 
-        iterations, seq_time, iterations as f64 / seq_time.as_secs_f64());
+    println!(
+        "  {} scans: {:?} ({:.0} scans/sec)",
+        iterations,
+        seq_time,
+        iterations as f64 / seq_time.as_secs_f64()
+    );
     println!();
 
     // Test 2: Mixed 8 readers + 1 writer
     println!("─── 2. Mixed: 8 Readers + 1 Writer ───");
     let read_iters = iterations * 4;
     let reads_per = read_iters / 8;
-    
+
     let start = Instant::now();
     let mut handles = Vec::new();
 
@@ -76,7 +80,10 @@ fn main() {
     }
     let mixed_time = start.elapsed();
     println!("  {} reads + 50 writes: {:?}", read_iters, mixed_time);
-    println!("  Read throughput: {:.0} reads/sec", read_iters as f64 / mixed_time.as_secs_f64());
+    println!(
+        "  Read throughput: {:.0} reads/sec",
+        read_iters as f64 / mixed_time.as_secs_f64()
+    );
     println!();
 
     // Test 3: Write throughput
@@ -89,8 +96,12 @@ fn main() {
         let _ = engine.put(key, val);
     }
     let write_time = start.elapsed();
-    println!("  {} writes: {:?} ({:.0} writes/sec)", 
-        write_count, write_time, write_count as f64 / write_time.as_secs_f64());
+    println!(
+        "  {} writes: {:?} ({:.0} writes/sec)",
+        write_count,
+        write_time,
+        write_count as f64 / write_time.as_secs_f64()
+    );
     println!();
 
     // Test 4: Transaction throughput
@@ -105,8 +116,12 @@ fn main() {
         let _ = engine.commit_txn(txn_id);
     }
     let txn_time = start.elapsed();
-    println!("  {} txn commits: {:?} ({:.0} txn/sec)", 
-        txn_count, txn_time, txn_count as f64 / txn_time.as_secs_f64());
+    println!(
+        "  {} txn commits: {:?} ({:.0} txn/sec)",
+        txn_count,
+        txn_time,
+        txn_count as f64 / txn_time.as_secs_f64()
+    );
     println!();
 
     // Test 5: Concurrent read scalability
@@ -115,7 +130,7 @@ fn main() {
         let per_thread = iterations / nt;
         let start = Instant::now();
         let mut handles = Vec::new();
-        
+
         for _ in 0..nt {
             let eng = Arc::clone(&engine);
             handles.push(std::thread::spawn(move || {
@@ -124,26 +139,37 @@ fn main() {
                 }
             }));
         }
-        
+
         for h in handles {
             h.join().unwrap();
         }
         let time = start.elapsed();
         let total = per_thread * nt;
-        println!("  {} threads: {:?} ({:.0} reads/sec, speedup {:.2}x)", 
-            nt, time, total as f64 / time.as_secs_f64(),
-            seq_time.as_secs_f64() / time.as_secs_f64() * nt as f64);
+        println!(
+            "  {} threads: {:?} ({:.0} reads/sec, speedup {:.2}x)",
+            nt,
+            time,
+            total as f64 / time.as_secs_f64(),
+            seq_time.as_secs_f64() / time.as_secs_f64() * nt as f64
+        );
     }
     println!();
 
     // Test 6: Point Lookup (comparable to previous benchmark)
     println!("─── 6. Point Lookup (get by key) ───");
-    
+
     // Check if data is in MemTable
     let first_key = format!("K::{:012}", 0).into_bytes();
     let in_memtable = engine.get(&first_key).is_ok();
-    println!("  Data location: {}", if in_memtable { "MemTable (in-memory)" } else { "SSTable (on-disk)" });
-    
+    println!(
+        "  Data location: {}",
+        if in_memtable {
+            "MemTable (in-memory)"
+        } else {
+            "SSTable (on-disk)"
+        }
+    );
+
     let lookup_count = 50_000; // Match official benchmark
     let start = Instant::now();
     for i in 0..lookup_count {
@@ -151,8 +177,12 @@ fn main() {
         let _ = engine.get(&key);
     }
     let lookup_time = start.elapsed();
-    println!("  {} lookups: {:?} ({:.0} lookups/sec)", 
-        lookup_count, lookup_time, lookup_count as f64 / lookup_time.as_secs_f64());
+    println!(
+        "  {} lookups: {:?} ({:.0} lookups/sec)",
+        lookup_count,
+        lookup_time,
+        lookup_count as f64 / lookup_time.as_secs_f64()
+    );
     println!();
 
     // Summary

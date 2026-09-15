@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Bloom filter for efficient point lookups.
 //!
 //! A probabilistic data structure that tells us if a key is
@@ -74,7 +78,8 @@ impl BloomFilter {
         if data.len() < 8 {
             return None;
         }
-        let num_hashes = u32::from_le_bytes(data[0..4].try_into().expect("should be valid")) as usize;
+        let num_hashes =
+            u32::from_le_bytes(data[0..4].try_into().expect("should be valid")) as usize;
         let num_bits = u32::from_le_bytes(data[4..8].try_into().expect("should be valid")) as usize;
         // Cap allocation size to prevent OOM from malformed data (max ~128MB)
         if num_bits > 128 * 1024 * 1024 * 8 {
@@ -89,7 +94,8 @@ impl BloomFilter {
         let mut bits = Vec::with_capacity(num_u64);
         for i in 0..num_u64 {
             let start = 8 + i * 8;
-            let word = u64::from_le_bytes(data[start..start + 8].try_into().expect("should be valid"));
+            let word =
+                u64::from_le_bytes(data[start..start + 8].try_into().expect("should be valid"));
             bits.push(word);
         }
 

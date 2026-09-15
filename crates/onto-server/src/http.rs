@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! HTTP API for OntoDB.
 //!
 //! Provides RESTful endpoints for SQL queries, vector search, hybrid queries,
@@ -58,21 +62,33 @@ fn validate_filter(filter: &str) -> Result<(), String> {
     let upper: String = filter.chars().flat_map(|c| c.to_uppercase()).collect();
     let upper_chars: Vec<char> = upper.chars().collect();
     let forbidden = [
-        "DROP", "DELETE", "INSERT", "UPDATE", "UNION",
-        "ALTER", "CREATE", "TRUNCATE", "EXEC", "EXECUTE",
-        "SLEEP", "BENCHMARK", "LOAD_FILE", "INTO OUTFILE",
-        "PG_SLEEP", "INFORMATION_SCHEMA",
+        "DROP",
+        "DELETE",
+        "INSERT",
+        "UPDATE",
+        "UNION",
+        "ALTER",
+        "CREATE",
+        "TRUNCATE",
+        "EXEC",
+        "EXECUTE",
+        "SLEEP",
+        "BENCHMARK",
+        "LOAD_FILE",
+        "INTO OUTFILE",
+        "PG_SLEEP",
+        "INFORMATION_SCHEMA",
     ];
     for kw in &forbidden {
         let kw_chars: Vec<char> = kw.chars().collect();
         let mut search_start = 0;
         while search_start + kw_chars.len() <= upper_chars.len() {
             if upper_chars[search_start..search_start + kw_chars.len()] == kw_chars[..] {
-                let before_ok = search_start == 0
-                    || !upper_chars[search_start - 1].is_alphanumeric();
+                let before_ok =
+                    search_start == 0 || !upper_chars[search_start - 1].is_alphanumeric();
                 let after_pos = search_start + kw_chars.len();
-                let after_ok = after_pos >= upper_chars.len()
-                    || !upper_chars[after_pos].is_alphanumeric();
+                let after_ok =
+                    after_pos >= upper_chars.len() || !upper_chars[after_pos].is_alphanumeric();
                 if before_ok && after_ok {
                     return Err(format!("filter must not contain '{}'", kw));
                 }
@@ -89,14 +105,20 @@ fn validate_identifier(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 128 {
         return Err("identifier must be 1-128 characters".into());
     }
-    if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
         return Err(format!(
             "invalid identifier '{}': only alphanumeric, underscore, and dot allowed",
             name
         ));
     }
     if name.starts_with('.') || name.ends_with('.') || name.contains("..") {
-        return Err(format!("invalid identifier '{}': malformed dot usage", name));
+        return Err(format!(
+            "invalid identifier '{}': malformed dot usage",
+            name
+        ));
     }
     Ok(())
 }
@@ -114,7 +136,8 @@ fn sanitize_error(err: &str) -> String {
         return "file not found or inaccessible".to_string();
     }
     // Keep user-facing parse/validation errors, strip internal paths
-    if lower.contains("parse error") || lower.contains("syntax error") || lower.contains("invalid") {
+    if lower.contains("parse error") || lower.contains("syntax error") || lower.contains("invalid")
+    {
         // Sanitize: remove any Windows/Unix path patterns
         let sanitized: String = err
             .split(['\\', '/'])
@@ -333,18 +356,25 @@ pub struct CursorRequest {
     pub cursor: Option<String>,
 }
 
-fn default_page_size() -> usize {100}
+fn default_page_size() -> usize {
+    100
+}
 
 /// Secret key for cursor signing (in production, this should come from config/env)
 const CURSOR_SECRET: &[u8] = b"ontodb-cursor-secret-key-2024";
 
 /// Sign a cursor value using HMAC-SHA256.
 fn sign_cursor(offset: usize) -> String {
-    use sha2::{Sha256, Digest};
-    let payload = format!("{}:{}", offset, std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() / 3600); // Hour-based expiry
+    use sha2::{Digest, Sha256};
+    let payload = format!(
+        "{}:{}",
+        offset,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            / 3600
+    ); // Hour-based expiry
     let mut hasher = Sha256::new();
     hasher.update(CURSOR_SECRET);
     hasher.update(payload.as_bytes());
@@ -358,10 +388,10 @@ fn verify_cursor(cursor: &str) -> Option<usize> {
     if parts.len() != 2 {
         return None;
     }
-    
+
     let offset: usize = parts[0].parse().ok()?;
     let _signature = parts[1];
-    
+
     // For now, accept any valid offset with a signature
     // In production, verify the HMAC signature
     Some(offset)
@@ -396,7 +426,9 @@ pub struct ExportRequest {
     pub format: String,
 }
 
-fn default_export_format() -> String { "jsonl".to_string() }
+fn default_export_format() -> String {
+    "jsonl".to_string()
+}
 
 /// Import request — import data from JSON Lines.
 #[derive(Debug, Deserialize)]
@@ -468,13 +500,23 @@ fn build_cors_layer(origins: &str) -> CorsLayer {
         // Use Any origin without credentials (not permissive() which allows credentials)
         CorsLayer::new()
             .allow_origin(tower_http::cors::Any)
-            .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PUT, axum::http::Method::DELETE])
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::PUT,
+                axum::http::Method::DELETE,
+            ])
             .allow_headers(tower_http::cors::Any)
             .allow_credentials(false)
     } else if origins.trim().is_empty() {
         // Same-origin only �?no cross-origin requests allowed
         CorsLayer::new()
-            .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PUT, axum::http::Method::DELETE])
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::PUT,
+                axum::http::Method::DELETE,
+            ])
             .allow_headers(tower_http::cors::Any)
     } else {
         let allowed: Vec<axum::http::HeaderValue> = origins
@@ -486,7 +528,12 @@ fn build_cors_layer(origins: &str) -> CorsLayer {
         tracing::info!("CORS: allowing origins: {:?}", allowed);
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(allowed))
-            .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PUT, axum::http::Method::DELETE])
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::PUT,
+                axum::http::Method::DELETE,
+            ])
             .allow_headers(tower_http::cors::Any)
     }
 }
@@ -539,15 +586,24 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/export", post(export_data))
         .route("/api/import", post(import_data))
         // Digital Twin layout persistence
-        .route("/api/digital-twin/layout", get(get_digital_twin_layout).put(save_digital_twin_layout))
+        .route(
+            "/api/digital-twin/layout",
+            get(get_digital_twin_layout).put(save_digital_twin_layout),
+        )
         // Sharding configuration
-        .route("/api/sharding/config", get(get_sharding_config).put(update_sharding_config))
+        .route(
+            "/api/sharding/config",
+            get(get_sharding_config).put(update_sharding_config),
+        )
         .route("/api/sharding/shard", post(add_shard))
         .route("/api/sharding/class", post(assign_class_shard))
         .route("/api/sharding/status", get(get_sharding_status))
         // Migration endpoints
         .route("/api/sharding/migrate", post(start_migration))
-        .route("/api/sharding/migrate/progress", put(update_migration_progress))
+        .route(
+            "/api/sharding/migrate/progress",
+            put(update_migration_progress),
+        )
         .route("/api/sharding/migrate/complete", post(complete_migration))
         .route("/api/sharding/migrate/cancel", post(cancel_migration))
         .route("/api/sharding/migrations", get(list_migrations))
@@ -584,9 +640,18 @@ pub fn build_router_with_auth(
 
     // Admin sub-router with its own state
     let admin_routes = Router::new()
-        .route("/api/admin/keys", get(crate::admin::list_keys).post(crate::admin::add_key))
-        .route("/api/admin/keys/:key", put(crate::admin::update_key).delete(crate::admin::delete_key))
-        .route("/api/admin/keys/:key/ips", get(crate::admin::list_ips).post(crate::admin::add_ips))
+        .route(
+            "/api/admin/keys",
+            get(crate::admin::list_keys).post(crate::admin::add_key),
+        )
+        .route(
+            "/api/admin/keys/:key",
+            put(crate::admin::update_key).delete(crate::admin::delete_key),
+        )
+        .route(
+            "/api/admin/keys/:key/ips",
+            get(crate::admin::list_ips).post(crate::admin::add_ips),
+        )
         .route("/api/admin/keys/:key/ips", delete(crate::admin::remove_ip))
         .route("/api/admin/reload", post(crate::admin::force_reload))
         .with_state(admin_state);
@@ -612,7 +677,10 @@ pub fn build_router_with_auth(
         .route("/api/graph/edge", post(add_edge))
         .route("/api/graph/traverse", post(graph_traverse))
         .route("/api/graph/shortest-path", post(graph_shortest_path))
-        .route("/api/graph/vertex/:id", get(get_vertex).delete(delete_vertex))
+        .route(
+            "/api/graph/vertex/:id",
+            get(get_vertex).delete(delete_vertex),
+        )
         .route("/api/graph/neighbors/:id", get(get_neighbors))
         // Backup and flush (Admin only)
         .route("/api/backup", post(backup))
@@ -631,15 +699,24 @@ pub fn build_router_with_auth(
         .route("/api/export", post(export_data))
         .route("/api/import", post(import_data))
         // Digital Twin layout persistence
-        .route("/api/digital-twin/layout", get(get_digital_twin_layout).put(save_digital_twin_layout))
+        .route(
+            "/api/digital-twin/layout",
+            get(get_digital_twin_layout).put(save_digital_twin_layout),
+        )
         // Sharding configuration (Admin only)
-        .route("/api/sharding/config", get(get_sharding_config).put(update_sharding_config))
+        .route(
+            "/api/sharding/config",
+            get(get_sharding_config).put(update_sharding_config),
+        )
         .route("/api/sharding/shard", post(add_shard))
         .route("/api/sharding/class", post(assign_class_shard))
         .route("/api/sharding/status", get(get_sharding_status))
         // Migration endpoints (Admin only)
         .route("/api/sharding/migrate", post(start_migration))
-        .route("/api/sharding/migrate/progress", put(update_migration_progress))
+        .route(
+            "/api/sharding/migrate/progress",
+            put(update_migration_progress),
+        )
         .route("/api/sharding/migrate/complete", post(complete_migration))
         .route("/api/sharding/migrate/cancel", post(cancel_migration))
         .route("/api/sharding/migrations", get(list_migrations))
@@ -682,13 +759,26 @@ async fn security_headers_middleware(
 ) -> axum::response::Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert("x-content-type-options", "nosniff".parse().expect("should be valid"));
+    headers.insert(
+        "x-content-type-options",
+        "nosniff".parse().expect("should be valid"),
+    );
     headers.insert("x-frame-options", "DENY".parse().expect("should be valid"));
-    headers.insert("x-xss-protection", "1; mode=block".parse().expect("should be valid"));
-    headers.insert("referrer-policy", "strict-origin-when-cross-origin".parse().expect("should be valid"));
+    headers.insert(
+        "x-xss-protection",
+        "1; mode=block".parse().expect("should be valid"),
+    );
+    headers.insert(
+        "referrer-policy",
+        "strict-origin-when-cross-origin"
+            .parse()
+            .expect("should be valid"),
+    );
     headers.insert(
         "content-security-policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'".parse().expect("should be valid"),
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+            .parse()
+            .expect("should be valid"),
     );
     response
 }
@@ -730,14 +820,21 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         checks["storage_detail"] = detail;
     }
 
-    let code = if all_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    (code, Json(json!({
-        "status": status,
-        "version": env!("CARGO_PKG_VERSION"),
-        "engine": "OntoDB",
-        "uptime_seconds": uptime,
-        "checks": checks,
-    })))
+    let code = if all_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(json!({
+            "status": status,
+            "version": env!("CARGO_PKG_VERSION"),
+            "engine": "OntoDB",
+            "uptime_seconds": uptime,
+            "checks": checks,
+        })),
+    )
 }
 
 /// GET /api/health/ready - Kubernetes readiness probe.
@@ -752,11 +849,14 @@ async fn health_ready(State(state): State<AppState>) -> impl IntoResponse {
     if engine_ok && parser_ok {
         (StatusCode::OK, Json(json!({"status": "ready"})))
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
-            "status": "not_ready",
-            "engine": engine_ok,
-            "parser": parser_ok,
-        })))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not_ready",
+                "engine": engine_ok,
+                "parser": parser_ok,
+            })),
+        )
     }
 }
 
@@ -881,62 +981,138 @@ async fn execute_query(
         Ok(ontoql_ast) => {
             // Handle triple operations directly via TripleStore
             match &ontoql_ast {
-                onto_query::OntoQLAst::InsertTriple { subject, predicate, object } => {
+                onto_query::OntoQLAst::InsertTriple {
+                    subject,
+                    predicate,
+                    object,
+                } => {
                     if let Some(ts) = state.executor.triple_store() {
                         match ts.add_triple(subject, predicate, object) {
                             Ok(()) => {
                                 let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                                state.metrics.record_query("INSERT_TRIPLE", elapsed_ms / 1000.0, true);
+                                state.metrics.record_query(
+                                    "INSERT_TRIPLE",
+                                    elapsed_ms / 1000.0,
+                                    true,
+                                );
                                 return (
                                     StatusCode::OK,
-                                    PrettyJson(ApiResponse::success(json!({"message": "Triple inserted"}), elapsed_ms), req.pretty),
+                                    PrettyJson(
+                                        ApiResponse::success(
+                                            json!({"message": "Triple inserted"}),
+                                            elapsed_ms,
+                                        ),
+                                        req.pretty,
+                                    ),
                                 );
                             }
                             Err(e) => {
-                                return (StatusCode::INTERNAL_SERVER_ERROR, PrettyJson(ApiResponse::<Value>::error(e), false));
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    PrettyJson(ApiResponse::<Value>::error(e), false),
+                                );
                             }
                         }
                     } else {
-                        return (StatusCode::BAD_REQUEST, PrettyJson(ApiResponse::<Value>::error("TripleStore not configured".to_string()), false));
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            PrettyJson(
+                                ApiResponse::<Value>::error(
+                                    "TripleStore not configured".to_string(),
+                                ),
+                                false,
+                            ),
+                        );
                     }
                 }
                 onto_query::OntoQLAst::InsertTriples { triples } => {
                     if let Some(ts) = state.executor.triple_store() {
                         let count = triples.len();
-                        match ts.add_triples(&triples.iter().map(|(s,p,o)| (s.clone(), p.clone(), o.clone())).collect::<Vec<_>>()) {
+                        match ts.add_triples(
+                            &triples
+                                .iter()
+                                .map(|(s, p, o)| (s.clone(), p.clone(), o.clone()))
+                                .collect::<Vec<_>>(),
+                        ) {
                             Ok(_) => {
                                 let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                                state.metrics.record_query("INSERT_TRIPLES", elapsed_ms / 1000.0, true);
+                                state.metrics.record_query(
+                                    "INSERT_TRIPLES",
+                                    elapsed_ms / 1000.0,
+                                    true,
+                                );
                                 return (
                                     StatusCode::OK,
-                                    PrettyJson(ApiResponse::success(json!({"message": format!("{} triples inserted", count)}), elapsed_ms), req.pretty),
+                                    PrettyJson(
+                                        ApiResponse::success(
+                                            json!({"message": format!("{} triples inserted", count)}),
+                                            elapsed_ms,
+                                        ),
+                                        req.pretty,
+                                    ),
                                 );
                             }
                             Err(e) => {
-                                return (StatusCode::INTERNAL_SERVER_ERROR, PrettyJson(ApiResponse::<Value>::error(e), false));
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    PrettyJson(ApiResponse::<Value>::error(e), false),
+                                );
                             }
                         }
                     } else {
-                        return (StatusCode::BAD_REQUEST, PrettyJson(ApiResponse::<Value>::error("TripleStore not configured".to_string()), false));
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            PrettyJson(
+                                ApiResponse::<Value>::error(
+                                    "TripleStore not configured".to_string(),
+                                ),
+                                false,
+                            ),
+                        );
                     }
                 }
-                onto_query::OntoQLAst::DeleteTriple { subject, predicate, object } => {
+                onto_query::OntoQLAst::DeleteTriple {
+                    subject,
+                    predicate,
+                    object,
+                } => {
                     if let Some(ts) = state.executor.triple_store() {
                         match ts.remove_triple(subject, predicate, object) {
                             Ok(()) => {
                                 let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                                state.metrics.record_query("DELETE_TRIPLE", elapsed_ms / 1000.0, true);
+                                state.metrics.record_query(
+                                    "DELETE_TRIPLE",
+                                    elapsed_ms / 1000.0,
+                                    true,
+                                );
                                 return (
                                     StatusCode::OK,
-                                    PrettyJson(ApiResponse::success(json!({"message": "Triple deleted"}), elapsed_ms), req.pretty),
+                                    PrettyJson(
+                                        ApiResponse::success(
+                                            json!({"message": "Triple deleted"}),
+                                            elapsed_ms,
+                                        ),
+                                        req.pretty,
+                                    ),
                                 );
                             }
                             Err(e) => {
-                                return (StatusCode::INTERNAL_SERVER_ERROR, PrettyJson(ApiResponse::<Value>::error(e), false));
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    PrettyJson(ApiResponse::<Value>::error(e), false),
+                                );
                             }
                         }
                     } else {
-                        return (StatusCode::BAD_REQUEST, PrettyJson(ApiResponse::<Value>::error("TripleStore not configured".to_string()), false));
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            PrettyJson(
+                                ApiResponse::<Value>::error(
+                                    "TripleStore not configured".to_string(),
+                                ),
+                                false,
+                            ),
+                        );
                     }
                 }
                 onto_query::OntoQLAst::DropClass { name } => {
@@ -944,14 +1120,25 @@ async fn execute_query(
                     match state.executor.drop_ontology(name) {
                         Ok(()) => {
                             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                            state.metrics.record_query("DROP_CLASS", elapsed_ms / 1000.0, true);
+                            state
+                                .metrics
+                                .record_query("DROP_CLASS", elapsed_ms / 1000.0, true);
                             return (
                                 StatusCode::OK,
-                                PrettyJson(ApiResponse::success(json!({"message": format!("Class '{}' dropped", name)}), elapsed_ms), req.pretty),
+                                PrettyJson(
+                                    ApiResponse::success(
+                                        json!({"message": format!("Class '{}' dropped", name)}),
+                                        elapsed_ms,
+                                    ),
+                                    req.pretty,
+                                ),
                             );
                         }
                         Err(e) => {
-                            return (StatusCode::BAD_REQUEST, PrettyJson(ApiResponse::<Value>::error(e.to_string()), false));
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                PrettyJson(ApiResponse::<Value>::error(e.to_string()), false),
+                            );
                         }
                     }
                 }
@@ -959,18 +1146,34 @@ async fn execute_query(
                     match state.executor.drop_ontology(name) {
                         Ok(()) => {
                             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                            state.metrics.record_query("DROP_ONTOLOGY", elapsed_ms / 1000.0, true);
+                            state
+                                .metrics
+                                .record_query("DROP_ONTOLOGY", elapsed_ms / 1000.0, true);
                             return (
                                 StatusCode::OK,
-                                PrettyJson(ApiResponse::success(json!({"message": format!("Ontology '{}' dropped", name)}), elapsed_ms), req.pretty),
+                                PrettyJson(
+                                    ApiResponse::success(
+                                        json!({"message": format!("Ontology '{}' dropped", name)}),
+                                        elapsed_ms,
+                                    ),
+                                    req.pretty,
+                                ),
                             );
                         }
                         Err(e) => {
-                            return (StatusCode::BAD_REQUEST, PrettyJson(ApiResponse::<Value>::error(e.to_string()), false));
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                PrettyJson(ApiResponse::<Value>::error(e.to_string()), false),
+                            );
                         }
                     }
                 }
-                onto_query::OntoQLAst::SelectTriples { subject, predicate, object, limit } => {
+                onto_query::OntoQLAst::SelectTriples {
+                    subject,
+                    predicate,
+                    object,
+                    limit,
+                } => {
                     let results = state.executor.query_triples(
                         subject.as_deref(),
                         predicate.as_deref(),
@@ -982,14 +1185,22 @@ async fn execute_query(
                                 rows.truncate(*l);
                             }
                             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                            state.metrics.record_query("SELECT_TRIPLE", elapsed_ms / 1000.0, true);
+                            state
+                                .metrics
+                                .record_query("SELECT_TRIPLE", elapsed_ms / 1000.0, true);
                             return (
                                 StatusCode::OK,
-                                PrettyJson(ApiResponse::success(json!(rows), elapsed_ms), req.pretty),
+                                PrettyJson(
+                                    ApiResponse::success(json!(rows), elapsed_ms),
+                                    req.pretty,
+                                ),
                             );
                         }
                         Err(e) => {
-                            return (StatusCode::INTERNAL_SERVER_ERROR, PrettyJson(ApiResponse::<Value>::error(e.to_string()), false));
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                PrettyJson(ApiResponse::<Value>::error(e.to_string()), false),
+                            );
                         }
                     }
                 }
@@ -1001,7 +1212,13 @@ async fn execute_query(
                             state.metrics.record_parse_error();
                             return (
                                 StatusCode::BAD_REQUEST,
-                                PrettyJson(ApiResponse::<Value>::error(format!("OntoQL translation error: {}", e)), false),
+                                PrettyJson(
+                                    ApiResponse::<Value>::error(format!(
+                                        "OntoQL translation error: {}",
+                                        e
+                                    )),
+                                    false,
+                                ),
                             );
                         }
                     }
@@ -1016,7 +1233,10 @@ async fn execute_query(
                     state.metrics.record_parse_error();
                     return (
                         StatusCode::BAD_REQUEST,
-                        PrettyJson(ApiResponse::<Value>::error(format!("Parse error: {}", e)), false),
+                        PrettyJson(
+                            ApiResponse::<Value>::error(format!("Parse error: {}", e)),
+                            false,
+                        ),
                     );
                 }
             }
@@ -1045,7 +1265,15 @@ async fn execute_query(
             state.metrics.record_query(query_type, elapsed, false);
             // Audit log �?failed query
             let err_msg = e.to_string();
-            let audit_entry = state.audit.create_query_entry(&client_ip, None, query_type, query, elapsed * 1000.0, false, Some(err_msg.clone()));
+            let audit_entry = state.audit.create_query_entry(
+                &client_ip,
+                None,
+                query_type,
+                query,
+                elapsed * 1000.0,
+                false,
+                Some(err_msg.clone()),
+            );
             state.audit.log(audit_entry);
             // Sanitize error message for client: remove file paths and internal details
             let safe_msg = sanitize_error(&err_msg);
@@ -1060,7 +1288,15 @@ async fn execute_query(
     state.metrics.record_query(query_type, elapsed, true);
 
     // Audit log �?successful query
-    let audit_entry = state.audit.create_query_entry(&client_ip, None, query_type, query, elapsed * 1000.0, true, None);
+    let audit_entry = state.audit.create_query_entry(
+        &client_ip,
+        None,
+        query_type,
+        query,
+        elapsed * 1000.0,
+        true,
+        None,
+    );
     state.audit.log(audit_entry);
 
     // Slow query logging
@@ -1105,7 +1341,10 @@ async fn sparql_query(
             state.metrics.record_parse_error();
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<Value>::error(format!("SPARQL parse error: {}", e))),
+                Json(ApiResponse::<Value>::error(format!(
+                    "SPARQL parse error: {}",
+                    e
+                ))),
             );
         }
     };
@@ -1128,7 +1367,10 @@ async fn sparql_query(
             state.metrics.record_parse_error();
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<Value>::error(format!("Generated SQL parse error: {}", e))),
+                Json(ApiResponse::<Value>::error(format!(
+                    "Generated SQL parse error: {}",
+                    e
+                ))),
             );
         }
     };
@@ -1203,19 +1445,27 @@ async fn vector_search(
     if let Err(e) = validate_identifier(&req.class) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<Value>::error(format!("Invalid class name: {}", e))),
+            Json(ApiResponse::<Value>::error(format!(
+                "Invalid class name: {}",
+                e
+            ))),
         );
     }
     if let Err(e) = validate_identifier(&req.column) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<Value>::error(format!("Invalid column name: {}", e))),
+            Json(ApiResponse::<Value>::error(format!(
+                "Invalid column name: {}",
+                e
+            ))),
         );
     }
     if req.query_vector.len() > 4096 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<Value>::error("query_vector too large (max 4096 dimensions)".to_string())),
+            Json(ApiResponse::<Value>::error(
+                "query_vector too large (max 4096 dimensions)".to_string(),
+            )),
         );
     }
 
@@ -1224,7 +1474,10 @@ async fn vector_search(
         if let Err(e) = validate_filter(f) {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<Value>::error(format!("Invalid filter: {}", e))),
+                Json(ApiResponse::<Value>::error(format!(
+                    "Invalid filter: {}",
+                    e
+                ))),
             );
         }
         format!(" WHERE {}", f)
@@ -1294,11 +1547,15 @@ async fn vector_search(
     match result {
         onto_query::QueryResult::Rows(rows) => {
             state.metrics.vector_search_results.add(rows.len() as u64);
-            (StatusCode::OK, Json(ApiResponse::success(json!(rows), elapsed_ms)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(json!(rows), elapsed_ms)),
+            )
         }
-        onto_query::QueryResult::Success(msg) => {
-            (StatusCode::OK, Json(ApiResponse::success(json!({ "message": msg }), elapsed_ms)))
-        }
+        onto_query::QueryResult::Success(msg) => (
+            StatusCode::OK,
+            Json(ApiResponse::success(json!({ "message": msg }), elapsed_ms)),
+        ),
     }
 }
 
@@ -1325,14 +1582,18 @@ async fn batch_query(
     if req.queries.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<Value>::error("queries array is empty".to_string())),
+            Json(ApiResponse::<Value>::error(
+                "queries array is empty".to_string(),
+            )),
         );
     }
 
     if req.queries.len() > 1000 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<Value>::error("batch size exceeds maximum of 1000".to_string())),
+            Json(ApiResponse::<Value>::error(
+                "batch size exceeds maximum of 1000".to_string(),
+            )),
         );
     }
 
@@ -1429,7 +1690,10 @@ async fn batch_query(
         }
     });
 
-    (status_code, Json(ApiResponse::success(response, total_elapsed)))
+    (
+        status_code,
+        Json(ApiResponse::success(response, total_elapsed)),
+    )
 }
 
 /// POST /api/hybrid/query - Execute a hybrid SQL + vector search query.
@@ -1457,14 +1721,20 @@ async fn hybrid_query(
     if let Err(e) = validate_identifier(&req.vector_column) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<Value>::error(format!("Invalid vector_column: {}", e))),
+            Json(ApiResponse::<Value>::error(format!(
+                "Invalid vector_column: {}",
+                e
+            ))),
         );
     }
     if let Some(ref c) = req.class {
         if let Err(e) = validate_identifier(c) {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<Value>::error(format!("Invalid class name: {}", e))),
+                Json(ApiResponse::<Value>::error(format!(
+                    "Invalid class name: {}",
+                    e
+                ))),
             );
         }
     }
@@ -1476,7 +1746,10 @@ async fn hybrid_query(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<Value>::error(format!("SQL parse error: {}", e))),
+                Json(ApiResponse::<Value>::error(format!(
+                    "SQL parse error: {}",
+                    e
+                ))),
             );
         }
     };
@@ -1491,7 +1764,9 @@ async fn hybrid_query(
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<Value>::error("query execution failed".to_string())),
+                Json(ApiResponse::<Value>::error(
+                    "query execution failed".to_string(),
+                )),
             );
         }
     };
@@ -1511,7 +1786,9 @@ async fn hybrid_query(
     if req.query_vector.len() > 4096 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<Value>::error("query_vector too large (max 4096 dimensions)".to_string())),
+            Json(ApiResponse::<Value>::error(
+                "query_vector too large (max 4096 dimensions)".to_string(),
+            )),
         );
     }
 
@@ -1527,7 +1804,9 @@ async fn hybrid_query(
     // For hybrid query, we combine the SQL filter with vector search
     // The SQL filter is applied as a WHERE clause in the vector search
     let filter_clause = match &sql_ast {
-        QueryAst::Select { filter: Some(_), .. } => {
+        QueryAst::Select {
+            filter: Some(_), ..
+        } => {
             // Extract the WHERE clause using case-insensitive char-aware search
             let sql_upper: String = sql_query.chars().flat_map(|c| c.to_uppercase()).collect();
             if let Some(byte_pos) = sql_upper.find(" WHERE ") {
@@ -1538,7 +1817,10 @@ async fn hybrid_query(
                 if let Err(e) = validate_filter(extracted) {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(ApiResponse::<Value>::error(format!("Invalid filter in SQL: {}", e))),
+                        Json(ApiResponse::<Value>::error(format!(
+                            "Invalid filter in SQL: {}",
+                            e
+                        ))),
                     );
                 }
                 format!(" WHERE {}", extracted)
@@ -1559,7 +1841,10 @@ async fn hybrid_query(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<Value>::error(format!("Vector search parse error: {}", e))),
+                Json(ApiResponse::<Value>::error(format!(
+                    "Vector search parse error: {}",
+                    e
+                ))),
             );
         }
     };
@@ -1582,26 +1867,29 @@ async fn hybrid_query(
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     match vector_result {
-        onto_query::QueryResult::Rows(rows) => {
-            (StatusCode::OK, Json(ApiResponse::success(json!(rows), elapsed)))
-        }
-        onto_query::QueryResult::Success(msg) => {
-            (StatusCode::OK, Json(ApiResponse::success(json!({ "message": msg }), elapsed)))
-        }
+        onto_query::QueryResult::Rows(rows) => (
+            StatusCode::OK,
+            Json(ApiResponse::success(json!(rows), elapsed)),
+        ),
+        onto_query::QueryResult::Success(msg) => (
+            StatusCode::OK,
+            Json(ApiResponse::success(json!({ "message": msg }), elapsed)),
+        ),
     }
 }
 
 /// GET /api/schema - Get database schema information.
-async fn get_schema(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn get_schema(State(state): State<AppState>) -> impl IntoResponse {
     let start = std::time::Instant::now();
     match state.executor.schema_info() {
         Ok(schema) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             Json(ApiResponse::success(schema, elapsed))
         }
-        Err(e) => Json(ApiResponse::error(format!("schema introspection failed: {}", e))),
+        Err(e) => Json(ApiResponse::error(format!(
+            "schema introspection failed: {}",
+            e
+        ))),
     }
 }
 
@@ -1625,10 +1913,13 @@ async fn transaction_begin(
 
     (
         StatusCode::OK,
-        Json(ApiResponse::success(json!({
-            "txn_id": txn_id,
-            "message": "Transaction started"
-        }), elapsed_ms)),
+        Json(ApiResponse::success(
+            json!({
+                "txn_id": txn_id,
+                "message": "Transaction started"
+            }),
+            elapsed_ms,
+        )),
     )
 }
 
@@ -1722,10 +2013,13 @@ async fn transaction_commit(
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             (
                 StatusCode::OK,
-                Json(ApiResponse::success(json!({
-                    "txn_id": req.txn_id,
-                    "message": "Transaction committed"
-                }), elapsed_ms)),
+                Json(ApiResponse::success(
+                    json!({
+                        "txn_id": req.txn_id,
+                        "message": "Transaction committed"
+                    }),
+                    elapsed_ms,
+                )),
             )
         }
         Err(e) => (
@@ -1752,10 +2046,13 @@ async fn transaction_rollback(
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             (
                 StatusCode::OK,
-                Json(ApiResponse::success(json!({
-                    "txn_id": req.txn_id,
-                    "message": "Transaction rolled back"
-                }), elapsed_ms)),
+                Json(ApiResponse::success(
+                    json!({
+                        "txn_id": req.txn_id,
+                        "message": "Transaction rolled back"
+                    }),
+                    elapsed_ms,
+                )),
             )
         }
         Err(e) => (
@@ -1802,7 +2099,9 @@ async fn cursor_query(
             None => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(ApiResponse::<Value>::error("invalid or tampered cursor".to_string())),
+                    Json(ApiResponse::<Value>::error(
+                        "invalid or tampered cursor".to_string(),
+                    )),
                 );
             }
         },
@@ -1853,7 +2152,8 @@ async fn cursor_query(
                     };
 
                     // Convert Map<String, Value> rows to Value rows
-                    let value_rows: Vec<Value> = rows.into_iter()
+                    let value_rows: Vec<Value> = rows
+                        .into_iter()
                         .map(|row| serde_json::Value::Object(row))
                         .collect();
 
@@ -1866,11 +2166,15 @@ async fn cursor_query(
                         page_size,
                     };
 
-                    (StatusCode::OK, Json(ApiResponse::success(json!(response), elapsed_ms)))
+                    (
+                        StatusCode::OK,
+                        Json(ApiResponse::success(json!(response), elapsed_ms)),
+                    )
                 }
-                onto_query::QueryResult::Success(msg) => {
-                    (StatusCode::OK, Json(ApiResponse::success(json!({ "message": msg }), elapsed_ms)))
-                }
+                onto_query::QueryResult::Success(msg) => (
+                    StatusCode::OK,
+                    Json(ApiResponse::success(json!({ "message": msg }), elapsed_ms)),
+                ),
             }
         }
         Err(e) => (
@@ -1903,11 +2207,14 @@ async fn export_data(
             if let Err(e) = validate_identifier(class) {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(ApiResponse::<Value>::error(format!("Invalid class name: {}", e))),
+                    Json(ApiResponse::<Value>::error(format!(
+                        "Invalid class name: {}",
+                        e
+                    ))),
                 );
             }
             format!("SELECT * FROM {}", class)
-        },
+        }
         None => {
             // Export all classes - get class list first
             let schema = match state.executor.schema_info() {
@@ -1915,7 +2222,10 @@ async fn export_data(
                 Err(e) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiResponse::<Value>::error(format!("Failed to get schema: {}", e))),
+                        Json(ApiResponse::<Value>::error(format!(
+                            "Failed to get schema: {}",
+                            e
+                        ))),
                     );
                 }
             };
@@ -1924,10 +2234,13 @@ async fn export_data(
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             return (
                 StatusCode::OK,
-                Json(ApiResponse::success(json!({
-                    "message": "Use class parameter to export specific class",
-                    "schema": schema
-                }), elapsed_ms)),
+                Json(ApiResponse::success(
+                    json!({
+                        "message": "Use class parameter to export specific class",
+                        "schema": schema
+                    }),
+                    elapsed_ms,
+                )),
             );
         }
     };
@@ -1962,44 +2275,54 @@ async fn export_data(
 
                                 // Data rows
                                 for row in &rows {
-                                    let values: Vec<String> = row.values().map(|v| {
-                                        let s = v.to_string();
-                                        if s.contains(',') || s.contains('"') {
-                                            format!("\"{}\"", s.replace('"', "\"\""))
-                                        } else {
-                                            s
-                                        }
-                                    }).collect();
+                                    let values: Vec<String> = row
+                                        .values()
+                                        .map(|v| {
+                                            let s = v.to_string();
+                                            if s.contains(',') || s.contains('"') {
+                                                format!("\"{}\"", s.replace('"', "\"\""))
+                                            } else {
+                                                s
+                                            }
+                                        })
+                                        .collect();
                                     csv_rows.push(values.join(","));
                                 }
                             }
 
                             (
                                 StatusCode::OK,
-                                Json(ApiResponse::success(json!({
-                                    "format": "csv",
-                                    "count": count,
-                                    "data": csv_rows.join("\n")
-                                }), elapsed_ms)),
+                                Json(ApiResponse::success(
+                                    json!({
+                                        "format": "csv",
+                                        "count": count,
+                                        "data": csv_rows.join("\n")
+                                    }),
+                                    elapsed_ms,
+                                )),
                             )
                         }
                         _ => {
                             // JSONL format (default)
                             (
                                 StatusCode::OK,
-                                Json(ApiResponse::success(json!({
-                                    "format": "jsonl",
-                                    "count": count,
-                                    "class": req.class,
-                                    "rows": rows
-                                }), elapsed_ms)),
+                                Json(ApiResponse::success(
+                                    json!({
+                                        "format": "jsonl",
+                                        "count": count,
+                                        "class": req.class,
+                                        "rows": rows
+                                    }),
+                                    elapsed_ms,
+                                )),
                             )
                         }
                     }
                 }
-                onto_query::QueryResult::Success(msg) => {
-                    (StatusCode::OK, Json(ApiResponse::success(json!({ "message": msg }), elapsed_ms)))
-                }
+                onto_query::QueryResult::Success(msg) => (
+                    StatusCode::OK,
+                    Json(ApiResponse::success(json!({ "message": msg }), elapsed_ms)),
+                ),
             }
         }
         Err(e) => (
@@ -2032,21 +2355,28 @@ async fn import_data(
     if let Err(e) = validate_identifier(&req.class) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<Value>::error(format!("Invalid class name: {}", e))),
+            Json(ApiResponse::<Value>::error(format!(
+                "Invalid class name: {}",
+                e
+            ))),
         );
     }
 
     if req.rows.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<Value>::error("rows array is empty".to_string())),
+            Json(ApiResponse::<Value>::error(
+                "rows array is empty".to_string(),
+            )),
         );
     }
 
     if req.rows.len() > 10000 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<Value>::error("import batch size exceeds maximum of 10000".to_string())),
+            Json(ApiResponse::<Value>::error(
+                "import batch size exceeds maximum of 10000".to_string(),
+            )),
         );
     }
 
@@ -2056,55 +2386,61 @@ async fn import_data(
     for (i, row) in req.rows.iter().enumerate() {
         // Build INSERT statement
         let columns: Vec<String> = row.keys().cloned().collect();
-        
+
         // Validate column names to prevent SQL injection
         let invalid_col = columns.iter().find(|c| validate_identifier(c).is_err());
         if let Some(col) = invalid_col {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<Value>::error(format!("Invalid column name '{}' in row {}", col, i))),
+                Json(ApiResponse::<Value>::error(format!(
+                    "Invalid column name '{}' in row {}",
+                    col, i
+                ))),
             );
         }
-        
-        let values: Vec<String> = row.values().map(|v| {
-            match v {
+
+        let values: Vec<String> = row
+            .values()
+            .map(|v| match v {
                 Value::String(s) => format!("'{}'", s.replace('\'', "''")),
                 Value::Null => "NULL".to_string(),
                 Value::Bool(b) => b.to_string(),
                 Value::Number(n) => n.to_string(),
                 _ => format!("'{}'", v.to_string().replace('\'', "''")),
-            }
-        }).collect();
+            })
+            .collect();
 
-        let insert = format!("INSERT INTO {} ({}) VALUES ({})",
+        let insert = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
             req.class,
             columns.join(", "),
             values.join(", ")
         );
 
         match QueryParser::parse(&insert) {
-            Ok(ast) => {
-                match state.executor.execute(&ast) {
-                    Ok(_) => imported += 1,
-                    Err(e) => {
-                        if req.skip_errors {
-                            errors.push(format!("Row {}: {}", i, e));
-                        } else {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                Json(ApiResponse::<Value>::error(format!("Row {}: {}", i, e))),
-                            );
-                        }
+            Ok(ast) => match state.executor.execute(&ast) {
+                Ok(_) => imported += 1,
+                Err(e) => {
+                    if req.skip_errors {
+                        errors.push(format!("Row {}: {}", i, e));
+                    } else {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ApiResponse::<Value>::error(format!("Row {}: {}", i, e))),
+                        );
                     }
                 }
-            }
+            },
             Err(e) => {
                 if req.skip_errors {
                     errors.push(format!("Row {}: parse error: {}", i, e));
                 } else {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(ApiResponse::<Value>::error(format!("Row {}: parse error: {}", i, e))),
+                        Json(ApiResponse::<Value>::error(format!(
+                            "Row {}: parse error: {}",
+                            i, e
+                        ))),
                     );
                 }
             }
@@ -2115,12 +2451,15 @@ async fn import_data(
 
     (
         StatusCode::OK,
-        Json(ApiResponse::success(json!({
-            "class": req.class,
-            "imported": imported,
-            "total": req.rows.len(),
-            "errors": errors
-        }), elapsed_ms)),
+        Json(ApiResponse::success(
+            json!({
+                "class": req.class,
+                "imported": imported,
+                "total": req.rows.len(),
+                "errors": errors
+            }),
+            elapsed_ms,
+        )),
     )
 }
 
@@ -2148,19 +2487,21 @@ async fn web_console() -> axum::response::Html<&'static str> {
 /// GET /digital-twin - Enterprise digital twin monitoring dashboard.
 /// Reads from disk at runtime so changes take effect without recompilation.
 async fn digital_twin() -> axum::response::Html<String> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/static/digital_twin.html");
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/static/digital_twin.html");
     match std::fs::read_to_string(&path) {
         Ok(content) => axum::response::Html(content),
-        Err(_) => axum::response::Html("<h1>Digital Twin dashboard unavailable</h1><p>Please check server configuration.</p>".to_string()),
+        Err(_) => axum::response::Html(
+            "<h1>Digital Twin dashboard unavailable</h1><p>Please check server configuration.</p>"
+                .to_string(),
+        ),
     }
 }
 
 // ── Cluster API ──────────────────────────────────────────────────
 
 /// GET /api/cluster - Get cluster information.
-async fn cluster_info(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn cluster_info(State(state): State<AppState>) -> impl IntoResponse {
     let uptime = state.metrics.started_at.elapsed().as_secs();
 
     Json(json!({
@@ -2187,14 +2528,26 @@ async fn add_vertex(
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
 
-    let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let labels: Vec<String> = req.get("labels")
+    let id = req
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let labels: Vec<String> = req
+        .get("labels")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     if id.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(ApiResponse::<serde_json::Value>::error("missing vertex id")));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<serde_json::Value>::error("missing vertex id")),
+        );
     }
 
     let mut vertex = onto_graph::Vertex::new(&id, labels.clone());
@@ -2223,14 +2576,24 @@ async fn add_vertex(
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     match state.graph.add_vertex(vertex) {
-        Ok(()) => (StatusCode::OK, Json(ApiResponse::success(json!({
-            "message": format!("vertex '{}' added", id),
-            "id": id,
-            "labels": labels,
-        }), elapsed))),
-        Err(e) => (StatusCode::CONFLICT, Json(ApiResponse::<serde_json::Value>::error(
-            format!("failed to add vertex: {}", e)
-        ))),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse::success(
+                json!({
+                    "message": format!("vertex '{}' added", id),
+                    "id": id,
+                    "labels": labels,
+                }),
+                elapsed,
+            )),
+        ),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::<serde_json::Value>::error(format!(
+                "failed to add vertex: {}",
+                e
+            ))),
+        ),
     }
 }
 
@@ -2241,13 +2604,34 @@ async fn add_edge(
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
 
-    let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let from = req.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let to = req.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let label = req.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let id = req
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let from = req
+        .get("from")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let to = req
+        .get("to")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let label = req
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     if id.is_empty() || from.is_empty() || to.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(ApiResponse::<serde_json::Value>::error("missing required fields: id, from, to")));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<serde_json::Value>::error(
+                "missing required fields: id, from, to",
+            )),
+        );
     }
 
     let mut edge = onto_graph::Edge::new(&id, &from, &to, &label);
@@ -2276,22 +2660,32 @@ async fn add_edge(
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     match state.graph.add_edge(edge) {
-        Ok(()) => (StatusCode::OK, Json(ApiResponse::success(json!({
-            "message": format!("edge '{}' added", id),
-            "id": id,
-            "from": from,
-            "to": to,
-            "label": label,
-        }), elapsed))),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse::success(
+                json!({
+                    "message": format!("edge '{}' added", id),
+                    "id": id,
+                    "from": from,
+                    "to": to,
+                    "label": label,
+                }),
+                elapsed,
+            )),
+        ),
         Err(e) => {
             let code = if e.to_string().contains("not found") {
                 StatusCode::NOT_FOUND
             } else {
                 StatusCode::CONFLICT
             };
-            (code, Json(ApiResponse::<serde_json::Value>::error(
-                format!("failed to add edge: {}", e)
-            )))
+            (
+                code,
+                Json(ApiResponse::<serde_json::Value>::error(format!(
+                    "failed to add edge: {}",
+                    e
+                ))),
+            )
         }
     }
 }
@@ -2303,14 +2697,33 @@ async fn graph_traverse(
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
 
-    let start_id = req.get("start").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let direction_str = req.get("direction").and_then(|v| v.as_str()).unwrap_or("out");
-    let max_depth = req.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3).min(100) as usize;
+    let start_id = req
+        .get("start")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let direction_str = req
+        .get("direction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("out");
+    let max_depth = req
+        .get("max_depth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3)
+        .min(100) as usize;
     let edge_label = req.get("edge_label").and_then(|v| v.as_str());
-    let algo = req.get("algorithm").and_then(|v| v.as_str()).unwrap_or("bfs");
+    let algo = req
+        .get("algorithm")
+        .and_then(|v| v.as_str())
+        .unwrap_or("bfs");
 
     if start_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(ApiResponse::<serde_json::Value>::error("missing start vertex id")));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<serde_json::Value>::error(
+                "missing start vertex id",
+            )),
+        );
     }
 
     let direction = match direction_str {
@@ -2331,22 +2744,32 @@ async fn graph_traverse(
 
     match result {
         Ok(traversal) => {
-            let vertices: Vec<serde_json::Value> = traversal.vertices.iter().map(|v| {
-                json!({
-                    "id": v.id,
-                    "labels": v.labels,
-                    "properties": v.properties,
+            let vertices: Vec<serde_json::Value> = traversal
+                .vertices
+                .iter()
+                .map(|v| {
+                    json!({
+                        "id": v.id,
+                        "labels": v.labels,
+                        "properties": v.properties,
+                    })
                 })
-            }).collect();
+                .collect();
 
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "start": start_id,
-                "direction": direction_str,
-                "max_depth": max_depth,
-                "algorithm": algo,
-                "visited_count": traversal.visited_count,
-                "vertices": vertices,
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "start": start_id,
+                        "direction": direction_str,
+                        "max_depth": max_depth,
+                        "algorithm": algo,
+                        "visited_count": traversal.visited_count,
+                        "vertices": vertices,
+                    }),
+                    elapsed,
+                )),
+            )
         }
         Err(e) => {
             let code = if e.to_string().contains("not found") {
@@ -2354,9 +2777,13 @@ async fn graph_traverse(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            (code, Json(ApiResponse::<serde_json::Value>::error(
-                format!("traversal failed: {}", e)
-            )))
+            (
+                code,
+                Json(ApiResponse::<serde_json::Value>::error(format!(
+                    "traversal failed: {}",
+                    e
+                ))),
+            )
         }
     }
 }
@@ -2368,47 +2795,76 @@ async fn graph_shortest_path(
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
 
-    let from_id = req.get("from").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let to_id = req.get("to").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let max_depth = req.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(10).min(100) as usize;
+    let from_id = req
+        .get("from")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let to_id = req
+        .get("to")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let max_depth = req
+        .get("max_depth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .min(100) as usize;
 
     if from_id.is_empty() || to_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(ApiResponse::<serde_json::Value>::error("missing from/to vertex ids")));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<serde_json::Value>::error(
+                "missing from/to vertex ids",
+            )),
+        );
     }
 
     let engine = onto_graph::TraversalEngine::new(&state.graph);
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     match engine.shortest_path(&from_id, &to_id, max_depth) {
-        Ok(Some(path)) => {
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "from": from_id,
-                "to": to_id,
-                "found": true,
-                "length": path.length,
-                "path": {
-                    "vertex_ids": path.vertex_ids,
-                    "edge_ids": path.edge_ids,
-                },
-            }), elapsed)))
-        }
-        Ok(None) => {
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "from": from_id,
-                "to": to_id,
-                "found": false,
-                "message": "no path exists between the two vertices",
-            }), elapsed)))
-        }
+        Ok(Some(path)) => (
+            StatusCode::OK,
+            Json(ApiResponse::success(
+                json!({
+                    "from": from_id,
+                    "to": to_id,
+                    "found": true,
+                    "length": path.length,
+                    "path": {
+                        "vertex_ids": path.vertex_ids,
+                        "edge_ids": path.edge_ids,
+                    },
+                }),
+                elapsed,
+            )),
+        ),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(ApiResponse::success(
+                json!({
+                    "from": from_id,
+                    "to": to_id,
+                    "found": false,
+                    "message": "no path exists between the two vertices",
+                }),
+                elapsed,
+            )),
+        ),
         Err(e) => {
             let code = if e.to_string().contains("not found") {
                 StatusCode::NOT_FOUND
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            (code, Json(ApiResponse::<serde_json::Value>::error(
-                format!("shortest path search failed: {}", e)
-            )))
+            (
+                code,
+                Json(ApiResponse::<serde_json::Value>::error(format!(
+                    "shortest path search failed: {}",
+                    e
+                ))),
+            )
         }
     }
 }
@@ -2422,18 +2878,24 @@ async fn get_vertex(
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     match state.graph.get_vertex(&id) {
-        Some(vertex) => {
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "id": vertex.id,
-                "labels": vertex.labels,
-                "properties": vertex.properties,
-            }), elapsed)))
-        }
-        None => {
-            (StatusCode::NOT_FOUND, Json(ApiResponse::<serde_json::Value>::error(
-                format!("vertex '{}' not found", id)
-            )))
-        }
+        Some(vertex) => (
+            StatusCode::OK,
+            Json(ApiResponse::success(
+                json!({
+                    "id": vertex.id,
+                    "labels": vertex.labels,
+                    "properties": vertex.properties,
+                }),
+                elapsed,
+            )),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<serde_json::Value>::error(format!(
+                "vertex '{}' not found",
+                id
+            ))),
+        ),
     }
 }
 
@@ -2446,16 +2908,22 @@ async fn delete_vertex(
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     match state.graph.delete_vertex(&id) {
-        Ok(()) => {
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": format!("vertex '{}' deleted", id)
-            }), elapsed)))
-        }
-        Err(e) => {
-            (StatusCode::NOT_FOUND, Json(ApiResponse::<serde_json::Value>::error(
-                format!("failed to delete vertex: {}", e)
-            )))
-        }
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse::success(
+                json!({
+                    "message": format!("vertex '{}' deleted", id)
+                }),
+                elapsed,
+            )),
+        ),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<serde_json::Value>::error(format!(
+                "failed to delete vertex: {}",
+                e
+            ))),
+        ),
     }
 }
 
@@ -2468,19 +2936,28 @@ async fn get_neighbors(
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     let neighbors = state.graph.get_neighbors(&id);
-    let neighbor_data: Vec<serde_json::Value> = neighbors.iter().map(|v| {
-        json!({
-            "id": v.id,
-            "labels": v.labels,
-            "properties": v.properties,
+    let neighbor_data: Vec<serde_json::Value> = neighbors
+        .iter()
+        .map(|v| {
+            json!({
+                "id": v.id,
+                "labels": v.labels,
+                "properties": v.properties,
+            })
         })
-    }).collect();
+        .collect();
 
-    (StatusCode::OK, Json(ApiResponse::success(json!({
-        "vertex_id": id,
-        "count": neighbor_data.len(),
-        "neighbors": neighbor_data,
-    }), elapsed)))
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(
+            json!({
+                "vertex_id": id,
+                "count": neighbor_data.len(),
+                "neighbors": neighbor_data,
+            }),
+            elapsed,
+        )),
+    )
 }
 
 /// POST /api/backup - Create a full snapshot backup.
@@ -2494,7 +2971,10 @@ async fn backup(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<Value>::error(format!("Invalid backup path: {}", e))),
+                Json(ApiResponse::<Value>::error(format!(
+                    "Invalid backup path: {}",
+                    e
+                ))),
             );
         }
     };
@@ -2503,19 +2983,26 @@ async fn backup(
         Ok(manifest) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": "Backup completed",
-                "path": req.path,
-                "files": manifest.files.len(),
-                "total_bytes": total_bytes,
-                "timestamp": manifest.timestamp,
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": "Backup completed",
+                        "path": req.path,
+                        "files": manifest.files.len(),
+                        "total_bytes": total_bytes,
+                        "timestamp": manifest.timestamp,
+                    }),
+                    elapsed,
+                )),
+            )
         }
         Err(e) => {
             let _elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
-                format!("Backup failed: {}", e)
-            )))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<Value>::error(format!("Backup failed: {}", e))),
+            )
         }
     }
 }
@@ -2531,7 +3018,10 @@ async fn backup_incremental(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<Value>::error(format!("Invalid backup path: {}", e))),
+                Json(ApiResponse::<Value>::error(format!(
+                    "Invalid backup path: {}",
+                    e
+                ))),
             );
         }
     };
@@ -2541,9 +3031,13 @@ async fn backup_incremental(
     let since = match parse_iso_timestamp(&req.since) {
         Ok(t) => t,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                format!("Invalid 'since' timestamp: {}", e)
-            )));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!(
+                    "Invalid 'since' timestamp: {}",
+                    e
+                ))),
+            );
         }
     };
 
@@ -2551,20 +3045,28 @@ async fn backup_incremental(
         Ok(manifest) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": "Incremental backup completed",
-                "path": req.path,
-                "files": manifest.files.len(),
-                "total_bytes": total_bytes,
-                "timestamp": manifest.timestamp,
-                "backup_type": manifest.backup_type,
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": "Incremental backup completed",
+                        "path": req.path,
+                        "files": manifest.files.len(),
+                        "total_bytes": total_bytes,
+                        "timestamp": manifest.timestamp,
+                        "backup_type": manifest.backup_type,
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
-                format!("Incremental backup failed: {}", e)
-            )))
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<Value>::error(format!(
+                "Incremental backup failed: {}",
+                e
+            ))),
+        ),
     }
 }
 
@@ -2579,7 +3081,10 @@ async fn verify_backup_endpoint(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<Value>::error(format!("Invalid backup path: {}", e))),
+                Json(ApiResponse::<Value>::error(format!(
+                    "Invalid backup path: {}",
+                    e
+                ))),
             );
         }
     };
@@ -2587,16 +3092,24 @@ async fn verify_backup_endpoint(
     match onto_query::QueryExecutor::verify_backup(&backup_dir) {
         Ok(()) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": "Backup verification passed",
-                "path": req.path,
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": "Backup verification passed",
+                        "path": req.path,
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                format!("Backup verification failed: {}", e)
-            )))
-        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!(
+                "Backup verification failed: {}",
+                e
+            ))),
+        ),
     }
 }
 
@@ -2611,7 +3124,10 @@ async fn restore_endpoint(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<Value>::error(format!("Invalid restore path: {}", e))),
+                Json(ApiResponse::<Value>::error(format!(
+                    "Invalid restore path: {}",
+                    e
+                ))),
             );
         }
     };
@@ -2619,17 +3135,25 @@ async fn restore_endpoint(
     match state.executor.restore(&backup_dir) {
         Ok(manifest) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": "Restore completed",
-                "path": req.path,
-                "files": manifest.files.len(),
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": "Restore completed",
+                        "path": req.path,
+                        "files": manifest.files.len(),
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
-                format!("Restore failed: {}", e)
-            )))
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<Value>::error(format!(
+                "Restore failed: {}",
+                e
+            ))),
+        ),
     }
 }
 
@@ -2644,7 +3168,10 @@ async fn save_digital_twin_layout(
     if let Err(e) = validate_identifier(&req.layout_id) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<Value>::error(format!("Invalid layout ID: {}", e))),
+            Json(ApiResponse::<Value>::error(format!(
+                "Invalid layout ID: {}",
+                e
+            ))),
         );
     }
 
@@ -2662,24 +3189,38 @@ async fn save_digital_twin_layout(
     if let Err(e) = std::fs::create_dir_all(&layout_dir) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<Value>::error(format!("Failed to create layout directory: {}", e))),
+            Json(ApiResponse::<Value>::error(format!(
+                "Failed to create layout directory: {}",
+                e
+            ))),
         );
     }
 
     let layout_file = layout_dir.join(format!("{}.json", req.layout_id));
-    match std::fs::write(&layout_file, serde_json::to_string_pretty(&layout_data).unwrap_or_default()) {
+    match std::fs::write(
+        &layout_file,
+        serde_json::to_string_pretty(&layout_data).unwrap_or_default(),
+    ) {
         Ok(_) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": "Layout saved successfully",
-                "layout_id": req.layout_id,
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": "Layout saved successfully",
+                        "layout_id": req.layout_id,
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
-                format!("Failed to save layout: {}", e)
-            )))
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<Value>::error(format!(
+                "Failed to save layout: {}",
+                e
+            ))),
+        ),
     }
 }
 
@@ -2689,46 +3230,68 @@ async fn get_digital_twin_layout(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
-    let layout_id = params.get("layout_id").cloned().unwrap_or_else(|| "default".to_string());
+    let layout_id = params
+        .get("layout_id")
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
 
     // Validate layout_id
     if let Err(e) = validate_identifier(&layout_id) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<Value>::error(format!("Invalid layout ID: {}", e))),
+            Json(ApiResponse::<Value>::error(format!(
+                "Invalid layout ID: {}",
+                e
+            ))),
         );
     }
 
     // Read layout from file
-    let layout_file = state.data_dir.join("layouts").join(format!("{}.json", layout_id));
-    
+    let layout_file = state
+        .data_dir
+        .join("layouts")
+        .join(format!("{}.json", layout_id));
+
     if layout_file.exists() {
         match std::fs::read_to_string(&layout_file) {
-            Ok(content) => {
-                match serde_json::from_str::<serde_json::Value>(&content) {
-                    Ok(layout_data) => {
-                        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-                        let response = DigitalTwinLayoutResponse {
-                            layout_id: layout_data.get("layout_id").and_then(|v| v.as_str()).unwrap_or(&layout_id).to_string(),
-                            nodes: layout_data.get("nodes").cloned().unwrap_or(json!({})),
-                            edges: layout_data.get("edges").cloned().unwrap_or(json!([])),
-                            metadata: layout_data.get("metadata").cloned(),
-                            updated_at: layout_data.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        };
-                        (StatusCode::OK, Json(ApiResponse::success(json!(response), elapsed)))
-                    }
-                    Err(e) => {
-                        (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
-                            format!("Failed to parse layout file: {}", e)
-                        )))
-                    }
+            Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(layout_data) => {
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    let response = DigitalTwinLayoutResponse {
+                        layout_id: layout_data
+                            .get("layout_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&layout_id)
+                            .to_string(),
+                        nodes: layout_data.get("nodes").cloned().unwrap_or(json!({})),
+                        edges: layout_data.get("edges").cloned().unwrap_or(json!([])),
+                        metadata: layout_data.get("metadata").cloned(),
+                        updated_at: layout_data
+                            .get("updated_at")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    };
+                    (
+                        StatusCode::OK,
+                        Json(ApiResponse::success(json!(response), elapsed)),
+                    )
                 }
-            }
-            Err(e) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
-                    format!("Failed to read layout file: {}", e)
-                )))
-            }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::<Value>::error(format!(
+                        "Failed to parse layout file: {}",
+                        e
+                    ))),
+                ),
+            },
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<Value>::error(format!(
+                    "Failed to read layout file: {}",
+                    e
+                ))),
+            ),
         }
     } else {
         // Return default empty layout
@@ -2740,7 +3303,10 @@ async fn get_digital_twin_layout(
             metadata: None,
             updated_at: "".to_string(),
         };
-        (StatusCode::OK, Json(ApiResponse::success(json!(response), elapsed)))
+        (
+            StatusCode::OK,
+            Json(ApiResponse::success(json!(response), elapsed)),
+        )
     }
 }
 
@@ -2797,29 +3363,40 @@ fn days_in_month(year: u16, month: u8) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 => if is_leap_year(year) { 29 } else { 28 },
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
         _ => 0,
     }
 }
 
 /// POST /api/flush - Flush MemTable to SSTable.
-async fn flush(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn flush(State(state): State<AppState>) -> impl IntoResponse {
     let start = std::time::Instant::now();
 
     match state.executor.flush() {
         Ok(()) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": "MemTable flushed to SSTable"
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": "MemTable flushed to SSTable"
+                    }),
+                    elapsed,
+                )),
+            )
         }
         Err(e) => {
             let _elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::<Value>::error(
-                format!("Flush failed: {}", e)
-            )))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<Value>::error(format!("Flush failed: {}", e))),
+            )
         }
     }
 }
@@ -2844,7 +3421,9 @@ pub struct ShardConfigRequest {
     pub is_primary: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 /// Class sharding assignment request.
 #[derive(Debug, Deserialize)]
@@ -2868,7 +3447,9 @@ pub struct ClassShardRequest {
     pub slot_map: Option<Vec<u32>>,
 }
 
-fn default_class_strategy() -> String { "class".to_string() }
+fn default_class_strategy() -> String {
+    "class".to_string()
+}
 
 /// Range shard configuration.
 #[derive(Debug, Deserialize, Serialize)]
@@ -2880,9 +3461,7 @@ pub struct RangeShardConfig {
 }
 
 /// GET /api/sharding/config - Get current sharding configuration.
-async fn get_sharding_config(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn get_sharding_config(State(state): State<AppState>) -> impl IntoResponse {
     let start = std::time::Instant::now();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -2890,51 +3469,74 @@ async fn get_sharding_config(
     match mgr.as_ref() {
         Some(shard_mgr) => {
             let config = shard_mgr.shard_map();
-            let shards_json: Vec<serde_json::Value> = config.shards.iter().map(|(id, s)| json!({
-                "id": id,
-                "name": s.name,
-                "raft_group": s.raft_group,
-                "replicas": s.replicas,
-                "is_primary": s.is_primary,
-            })).collect();
-
-            let strategies_json: Vec<serde_json::Value> = config.class_strategies.iter().map(|(class, strategy)| {
-                let strategy_json = match strategy {
-                    onto_sharding::ShardStrategy::ClassBased { shard } => json!({
-                        "type": "class",
-                        "shard": shard,
-                    }),
-                    onto_sharding::ShardStrategy::RangeBased { ranges } => json!({
-                        "type": "range",
-                        "ranges": ranges.iter().map(|r| json!({
-                            "end_key": String::from_utf8_lossy(&r.end_key),
-                            "shard": r.shard,
-                        })).collect::<Vec<_>>(),
-                    }),
-                    onto_sharding::ShardStrategy::HashBased { num_shards, slot_map } => json!({
-                        "type": "hash",
-                        "num_shards": num_shards,
-                        "slot_map": slot_map,
-                    }),
-                };
-                json!({
-                    "class": class,
-                    "strategy": strategy_json,
+            let shards_json: Vec<serde_json::Value> = config
+                .shards
+                .iter()
+                .map(|(id, s)| {
+                    json!({
+                        "id": id,
+                        "name": s.name,
+                        "raft_group": s.raft_group,
+                        "replicas": s.replicas,
+                        "is_primary": s.is_primary,
+                    })
                 })
-            }).collect();
+                .collect();
 
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "default_shard": config.default_shard,
-                "shards": shards_json,
-                "class_strategies": strategies_json,
-            }), elapsed)))
+            let strategies_json: Vec<serde_json::Value> = config
+                .class_strategies
+                .iter()
+                .map(|(class, strategy)| {
+                    let strategy_json = match strategy {
+                        onto_sharding::ShardStrategy::ClassBased { shard } => json!({
+                            "type": "class",
+                            "shard": shard,
+                        }),
+                        onto_sharding::ShardStrategy::RangeBased { ranges } => json!({
+                            "type": "range",
+                            "ranges": ranges.iter().map(|r| json!({
+                                "end_key": String::from_utf8_lossy(&r.end_key),
+                                "shard": r.shard,
+                            })).collect::<Vec<_>>(),
+                        }),
+                        onto_sharding::ShardStrategy::HashBased {
+                            num_shards,
+                            slot_map,
+                        } => json!({
+                            "type": "hash",
+                            "num_shards": num_shards,
+                            "slot_map": slot_map,
+                        }),
+                    };
+                    json!({
+                        "class": class,
+                        "strategy": strategy_json,
+                    })
+                })
+                .collect();
+
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "default_shard": config.default_shard,
+                        "shards": shards_json,
+                        "class_strategies": strategies_json,
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        None => {
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "enabled": false,
-                "message": "Sharding is not configured"
-            }), elapsed)))
-        }
+        None => (
+            StatusCode::OK,
+            Json(ApiResponse::success(
+                json!({
+                    "enabled": false,
+                    "message": "Sharding is not configured"
+                }),
+                elapsed,
+            )),
+        ),
     }
 }
 
@@ -2949,9 +3551,13 @@ async fn update_sharding_config(
     let shard_map: onto_sharding::ShardMap = match serde_json::from_value(config) {
         Ok(m) => m,
         Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                format!("Invalid sharding config: {}", e)
-            )));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!(
+                    "Invalid sharding config: {}",
+                    e
+                ))),
+            );
         }
     };
 
@@ -2959,14 +3565,22 @@ async fn update_sharding_config(
     let local_shards: Vec<u32> = shard_map.shards.keys().cloned().collect();
 
     // Update the executor's shard configuration
-    state.executor.update_shard_config(shard_map.clone(), local_shards);
+    state
+        .executor
+        .update_shard_config(shard_map.clone(), local_shards);
 
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-    (StatusCode::OK, Json(ApiResponse::success(json!({
-        "message": "Sharding configuration updated",
-        "shards": shard_map.shards.len(),
-        "class_strategies": shard_map.class_strategies.len(),
-    }), elapsed)))
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(
+            json!({
+                "message": "Sharding configuration updated",
+                "shards": shard_map.shards.len(),
+                "class_strategies": shard_map.class_strategies.len(),
+            }),
+            elapsed,
+        )),
+    )
 }
 
 /// POST /api/sharding/shard - Add a new shard.
@@ -2996,10 +3610,16 @@ async fn add_shard(
     state.executor.update_shard_config(shard_map, local_shards);
 
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-    (StatusCode::OK, Json(ApiResponse::success(json!({
-        "message": format!("Shard {} added", req.id),
-        "shard_id": req.id,
-    }), elapsed)))
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(
+            json!({
+                "message": format!("Shard {} added", req.id),
+                "shard_id": req.id,
+            }),
+            elapsed,
+        )),
+    )
 }
 
 /// POST /api/sharding/class - Assign a class to a sharding strategy.
@@ -3016,30 +3636,43 @@ async fn assign_class_shard(
         "class" => {
             let shard = req.shard.unwrap_or(0);
             if let Err(e) = shard_mgr.assign_class(&req.class, shard) {
-                return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                    format!("Failed to assign class: {}", e)
-                )));
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::<Value>::error(format!(
+                        "Failed to assign class: {}",
+                        e
+                    ))),
+                );
             }
         }
         "range" => {
             let ranges = req.ranges.unwrap_or_default();
-            let shard_ranges: Vec<onto_sharding::RangeShard> = ranges.iter().map(|r| {
-                onto_sharding::RangeShard {
+            let shard_ranges: Vec<onto_sharding::RangeShard> = ranges
+                .iter()
+                .map(|r| onto_sharding::RangeShard {
                     end_key: r.end_key.as_bytes().to_vec(),
                     shard: r.shard,
-                }
-            }).collect();
-            shard_mgr.shard_map_mut().shard_class_range(&req.class, shard_ranges);
+                })
+                .collect();
+            shard_mgr
+                .shard_map_mut()
+                .shard_class_range(&req.class, shard_ranges);
         }
         "hash" => {
             let num_shards = req.num_shards.unwrap_or(4);
             let slot_map = req.slot_map.unwrap_or_else(|| (0..num_shards).collect());
-            shard_mgr.shard_map_mut().shard_class_hash(&req.class, num_shards, slot_map);
+            shard_mgr
+                .shard_map_mut()
+                .shard_class_hash(&req.class, num_shards, slot_map);
         }
         _ => {
-            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                format!("Unknown strategy '{}': must be 'class', 'range', or 'hash'", req.strategy)
-            )));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error(format!(
+                    "Unknown strategy '{}': must be 'class', 'range', or 'hash'",
+                    req.strategy
+                ))),
+            );
         }
     }
 
@@ -3050,17 +3683,21 @@ async fn assign_class_shard(
     state.executor.update_shard_config(shard_map, local_shards);
 
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-    (StatusCode::OK, Json(ApiResponse::success(json!({
-        "message": format!("Class '{}' assigned to {} sharding", req.class, req.strategy),
-        "class": req.class,
-        "strategy": req.strategy,
-    }), elapsed)))
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(
+            json!({
+                "message": format!("Class '{}' assigned to {} sharding", req.class, req.strategy),
+                "class": req.class,
+                "strategy": req.strategy,
+            }),
+            elapsed,
+        )),
+    )
 }
 
 /// GET /api/sharding/status - Get sharding status and statistics.
-async fn get_sharding_status(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn get_sharding_status(State(state): State<AppState>) -> impl IntoResponse {
     let start = std::time::Instant::now();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -3071,32 +3708,42 @@ async fn get_sharding_status(
             let config = shard_mgr.shard_map();
             let stats = shard_mgr.shard_statistics();
 
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "enabled": true,
-                "active_shards": active,
-                "total_shards": config.shards.len(),
-                "sharded_classes": config.class_strategies.len(),
-                "shards": config.shards.iter().map(|(id, s)| {
-                    let status = shard_mgr.shard_status(*id);
-                    let shard_stats = stats.get(id);
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
                     json!({
-                        "id": id,
-                        "name": s.name,
-                        "status": format!("{:?}", status),
-                        "is_primary": s.is_primary,
-                        "classes_count": shard_stats.map(|s| s.classes_count).unwrap_or(0),
-                    })
-                }).collect::<Vec<_>>(),
-                "active_migrations": shard_mgr.active_migrations().len(),
-                "migration_history": shard_mgr.migration_history().len(),
-            }), elapsed)))
+                        "enabled": true,
+                        "active_shards": active,
+                        "total_shards": config.shards.len(),
+                        "sharded_classes": config.class_strategies.len(),
+                        "shards": config.shards.iter().map(|(id, s)| {
+                            let status = shard_mgr.shard_status(*id);
+                            let shard_stats = stats.get(id);
+                            json!({
+                                "id": id,
+                                "name": s.name,
+                                "status": format!("{:?}", status),
+                                "is_primary": s.is_primary,
+                                "classes_count": shard_stats.map(|s| s.classes_count).unwrap_or(0),
+                            })
+                        }).collect::<Vec<_>>(),
+                        "active_migrations": shard_mgr.active_migrations().len(),
+                        "migration_history": shard_mgr.migration_history().len(),
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        None => {
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "enabled": false,
-                "message": "Sharding is not configured"
-            }), elapsed)))
-        }
+        None => (
+            StatusCode::OK,
+            Json(ApiResponse::success(
+                json!({
+                    "enabled": false,
+                    "message": "Sharding is not configured"
+                }),
+                elapsed,
+            )),
+        ),
     }
 }
 
@@ -3117,7 +3764,9 @@ pub struct MigrationRequest {
     pub key_range: Option<KeyRange>,
 }
 
-fn default_all_classes() -> String { "*".to_string() }
+fn default_all_classes() -> String {
+    "*".to_string()
+}
 
 /// Key range for migration.
 #[derive(Debug, Deserialize)]
@@ -3139,30 +3788,41 @@ async fn start_migration(
     let shard_mgr = match mgr.as_mut() {
         Some(m) => m,
         None => {
-            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                "Sharding is not configured"
-            )));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error("Sharding is not configured")),
+            );
         }
     };
 
-    let key_range = req.key_range.map(|kr| (kr.start.into_bytes(), kr.end.into_bytes()));
+    let key_range = req
+        .key_range
+        .map(|kr| (kr.start.into_bytes(), kr.end.into_bytes()));
 
     match shard_mgr.create_migration(req.source_shard, req.target_shard, &req.class, key_range) {
         Ok(migration_id) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": "Migration started",
-                "migration_id": migration_id,
-                "source_shard": req.source_shard,
-                "target_shard": req.target_shard,
-                "class": req.class,
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": "Migration started",
+                        "migration_id": migration_id,
+                        "source_shard": req.source_shard,
+                        "target_shard": req.target_shard,
+                        "class": req.class,
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                format!("Failed to start migration: {}", e)
-            )))
-        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!(
+                "Failed to start migration: {}",
+                e
+            ))),
+        ),
     }
 }
 
@@ -3188,28 +3848,41 @@ async fn update_migration_progress(
     let shard_mgr = match mgr.as_mut() {
         Some(m) => m,
         None => {
-            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                "Sharding is not configured"
-            )));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error("Sharding is not configured")),
+            );
         }
     };
 
-    match shard_mgr.update_migration_progress(&req.migration_id, req.total_records, req.migrated_records) {
+    match shard_mgr.update_migration_progress(
+        &req.migration_id,
+        req.total_records,
+        req.migrated_records,
+    ) {
         Ok(()) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": "Migration progress updated",
-                "migration_id": req.migration_id,
-                "total_records": req.total_records,
-                "migrated_records": req.migrated_records,
-                "progress_percent": if req.total_records > 0 { (req.migrated_records as f64 / req.total_records as f64 * 100.0) as u64 } else { 0 },
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": "Migration progress updated",
+                        "migration_id": req.migration_id,
+                        "total_records": req.total_records,
+                        "migrated_records": req.migrated_records,
+                        "progress_percent": if req.total_records > 0 { (req.migrated_records as f64 / req.total_records as f64 * 100.0) as u64 } else { 0 },
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                format!("Failed to update migration progress: {}", e)
-            )))
-        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!(
+                "Failed to update migration progress: {}",
+                e
+            ))),
+        ),
     }
 }
 
@@ -3231,9 +3904,10 @@ async fn complete_migration(
     let shard_mgr = match mgr.as_mut() {
         Some(m) => m,
         None => {
-            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                "Sharding is not configured"
-            )));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error("Sharding is not configured")),
+            );
         }
     };
 
@@ -3246,20 +3920,28 @@ async fn complete_migration(
             state.executor.update_shard_config(shard_map, local_shards);
 
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": "Migration completed",
-                "migration_id": result.migration_id,
-                "source_shard": result.source_shard,
-                "target_shard": result.target_shard,
-                "records_migrated": result.records_migrated,
-                "status": format!("{:?}", result.status),
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": "Migration completed",
+                        "migration_id": result.migration_id,
+                        "source_shard": result.source_shard,
+                        "target_shard": result.target_shard,
+                        "records_migrated": result.records_migrated,
+                        "status": format!("{:?}", result.status),
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                format!("Failed to complete migration: {}", e)
-            )))
-        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!(
+                "Failed to complete migration: {}",
+                e
+            ))),
+        ),
     }
 }
 
@@ -3274,62 +3956,83 @@ async fn cancel_migration(
     let shard_mgr = match mgr.as_mut() {
         Some(m) => m,
         None => {
-            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                "Sharding is not configured"
-            )));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error("Sharding is not configured")),
+            );
         }
     };
 
     match shard_mgr.cancel_migration(&req.migration_id) {
         Ok(()) => {
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": "Migration cancelled",
-                "migration_id": req.migration_id,
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": "Migration cancelled",
+                        "migration_id": req.migration_id,
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                format!("Failed to cancel migration: {}", e)
-            )))
-        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!(
+                "Failed to cancel migration: {}",
+                e
+            ))),
+        ),
     }
 }
 
 /// GET /api/sharding/migrations - List all migrations.
-async fn list_migrations(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn list_migrations(State(state): State<AppState>) -> impl IntoResponse {
     let start = std::time::Instant::now();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     let mgr = state.executor.shard_manager();
     match mgr.as_ref() {
         Some(shard_mgr) => {
-            let migrations: Vec<Value> = shard_mgr.list_migrations().iter().map(|m| {
-                json!({
-                    "id": m.id,
-                    "source_shard": m.source_shard,
-                    "target_shard": m.target_shard,
-                    "class": m.class,
-                    "status": format!("{:?}", m.status),
-                    "created_at": m.created_at,
-                    "completed_at": m.completed_at,
+            let migrations: Vec<Value> = shard_mgr
+                .list_migrations()
+                .iter()
+                .map(|m| {
+                    json!({
+                        "id": m.id,
+                        "source_shard": m.source_shard,
+                        "target_shard": m.target_shard,
+                        "class": m.class,
+                        "status": format!("{:?}", m.status),
+                        "created_at": m.created_at,
+                        "completed_at": m.completed_at,
+                    })
                 })
-            }).collect();
+                .collect();
 
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "migrations": migrations,
-                "total": migrations.len(),
-                "active": shard_mgr.active_migrations().len(),
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "migrations": migrations,
+                        "total": migrations.len(),
+                        "active": shard_mgr.active_migrations().len(),
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        None => {
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "enabled": false,
-                "message": "Sharding is not configured"
-            }), elapsed)))
-        }
+        None => (
+            StatusCode::OK,
+            Json(ApiResponse::success(
+                json!({
+                    "enabled": false,
+                    "message": "Sharding is not configured"
+                }),
+                elapsed,
+            )),
+        ),
     }
 }
 
@@ -3354,15 +4057,21 @@ async fn rebalance_shards(
     let shard_mgr = match mgr.as_mut() {
         Some(m) => m,
         None => {
-            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                "Sharding is not configured"
-            )));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error("Sharding is not configured")),
+            );
         }
     };
 
     // If no classes specified, rebalance all
     let classes = if req.classes.is_empty() {
-        shard_mgr.shard_map().class_strategies.keys().cloned().collect()
+        shard_mgr
+            .shard_map()
+            .class_strategies
+            .keys()
+            .cloned()
+            .collect()
     } else {
         req.classes
     };
@@ -3376,19 +4085,27 @@ async fn rebalance_shards(
             state.executor.update_shard_config(shard_map, local_shards);
 
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": "Rebalance completed",
-                "rebalance_id": result.rebalance_id,
-                "classes_rebalanced": result.classes_rebalanced,
-                "new_assignments": result.new_assignments,
-                "status": result.status,
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": "Rebalance completed",
+                        "rebalance_id": result.rebalance_id,
+                        "classes_rebalanced": result.classes_rebalanced,
+                        "new_assignments": result.new_assignments,
+                        "status": result.status,
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                format!("Failed to rebalance: {}", e)
-            )))
-        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!(
+                "Failed to rebalance: {}",
+                e
+            ))),
+        ),
     }
 }
 
@@ -3415,9 +4132,10 @@ async fn add_shard_and_rebalance(
     let shard_mgr = match mgr.as_mut() {
         Some(m) => m,
         None => {
-            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                "Sharding is not configured"
-            )));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error("Sharding is not configured")),
+            );
         }
     };
 
@@ -3438,19 +4156,27 @@ async fn add_shard_and_rebalance(
             state.executor.update_shard_config(shard_map, local_shards);
 
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": result.status,
-                "shard_id": req.shard.id,
-                "rebalance_id": result.rebalance_id,
-                "classes_rebalanced": result.classes_rebalanced,
-                "new_assignments": result.new_assignments,
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": result.status,
+                        "shard_id": req.shard.id,
+                        "rebalance_id": result.rebalance_id,
+                        "classes_rebalanced": result.classes_rebalanced,
+                        "new_assignments": result.new_assignments,
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                format!("Failed to add shard: {}", e)
-            )))
-        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!(
+                "Failed to add shard: {}",
+                e
+            ))),
+        ),
     }
 }
 
@@ -3474,9 +4200,10 @@ async fn remove_shard(
     let shard_mgr = match mgr.as_mut() {
         Some(m) => m,
         None => {
-            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                "Sharding is not configured"
-            )));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error("Sharding is not configured")),
+            );
         }
     };
 
@@ -3489,17 +4216,25 @@ async fn remove_shard(
             state.executor.update_shard_config(shard_map, local_shards);
 
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": message,
-                "removed_shard": req.shard_id,
-                "target_shard": req.target_shard,
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": message,
+                        "removed_shard": req.shard_id,
+                        "target_shard": req.target_shard,
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                format!("Failed to remove shard: {}", e)
-            )))
-        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!(
+                "Failed to remove shard: {}",
+                e
+            ))),
+        ),
     }
 }
 
@@ -3520,7 +4255,9 @@ pub struct SplitRequest {
     pub ranges: Option<Vec<KeyRange>>,
 }
 
-fn default_split_strategy() -> String { "even".to_string() }
+fn default_split_strategy() -> String {
+    "even".to_string()
+}
 
 /// POST /api/sharding/split - Split a shard into multiple new shards.
 async fn split_shard(
@@ -3533,27 +4270,33 @@ async fn split_shard(
     let shard_mgr = match mgr.as_mut() {
         Some(m) => m,
         None => {
-            return (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                "Sharding is not configured"
-            )));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error("Sharding is not configured")),
+            );
         }
     };
 
-    let new_shard_configs: Vec<onto_sharding::ShardConfig> = req.new_shards.iter().map(|s| {
-        onto_sharding::ShardConfig {
+    let new_shard_configs: Vec<onto_sharding::ShardConfig> = req
+        .new_shards
+        .iter()
+        .map(|s| onto_sharding::ShardConfig {
             id: s.id,
             name: s.name.clone(),
             raft_group: s.raft_group,
             replicas: s.replicas.clone(),
             is_primary: s.is_primary,
-        }
-    }).collect();
+        })
+        .collect();
 
     let strategy = match req.strategy.as_str() {
         "range" => {
             let ranges = req.ranges.unwrap_or_default();
             onto_sharding::SplitStrategy::RangeBased {
-                ranges: ranges.iter().map(|r| (r.start.clone().into_bytes(), r.end.clone().into_bytes())).collect(),
+                ranges: ranges
+                    .iter()
+                    .map(|r| (r.start.clone().into_bytes(), r.end.clone().into_bytes()))
+                    .collect(),
             }
         }
         "hash" => onto_sharding::SplitStrategy::HashBased,
@@ -3569,23 +4312,31 @@ async fn split_shard(
             state.executor.update_shard_config(shard_map, local_shards);
 
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-            (StatusCode::OK, Json(ApiResponse::success(json!({
-                "message": format!("Shard {} split initiated", req.source_shard),
-                "source_shard": req.source_shard,
-                "new_shards": req.new_shards.iter().map(|s| s.id).collect::<Vec<_>>(),
-                "migrations_created": migrations.len(),
-                "migrations": migrations.iter().map(|m| json!({
-                    "id": m.id,
-                    "source": m.source_shard,
-                    "target": m.target_shard,
-                    "status": format!("{:?}", m.status),
-                })).collect::<Vec<_>>(),
-            }), elapsed)))
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success(
+                    json!({
+                        "message": format!("Shard {} split initiated", req.source_shard),
+                        "source_shard": req.source_shard,
+                        "new_shards": req.new_shards.iter().map(|s| s.id).collect::<Vec<_>>(),
+                        "migrations_created": migrations.len(),
+                        "migrations": migrations.iter().map(|m| json!({
+                            "id": m.id,
+                            "source": m.source_shard,
+                            "target": m.target_shard,
+                            "status": format!("{:?}", m.status),
+                        })).collect::<Vec<_>>(),
+                    }),
+                    elapsed,
+                )),
+            )
         }
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(ApiResponse::<Value>::error(
-                format!("Failed to split shard: {}", e)
-            )))
-        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<Value>::error(format!(
+                "Failed to split shard: {}",
+                e
+            ))),
+        ),
     }
 }

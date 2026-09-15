@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! STTRL (Spatio-Temporal Rule Language) engine for OntoDB.
 //!
 //! Implements spatio-temporal rules that combine spatial and temporal conditions.
@@ -73,12 +77,17 @@ impl Region {
     /// Check if a point is inside this region.
     pub fn contains(&self, lon: f64, lat: f64) -> bool {
         match self {
-            Region::Circle { center_lon, center_lat, radius_m } => {
-                haversine_distance(*center_lon, *center_lat, lon, lat) <= *radius_m
-            }
-            Region::Rectangle { min_lon, min_lat, max_lon, max_lat } => {
-                lon >= *min_lon && lon <= *max_lon && lat >= *min_lat && lat <= *max_lat
-            }
+            Region::Circle {
+                center_lon,
+                center_lat,
+                radius_m,
+            } => haversine_distance(*center_lon, *center_lat, lon, lat) <= *radius_m,
+            Region::Rectangle {
+                min_lon,
+                min_lat,
+                max_lon,
+                max_lat,
+            } => lon >= *min_lon && lon <= *max_lon && lat >= *min_lat && lat <= *max_lat,
             Region::Polygon(vertices) => point_in_polygon(lon, lat, vertices),
         }
     }
@@ -105,21 +114,43 @@ pub enum RuleType {
     /// Entity exits a region.
     GeofenceExit { region: Region },
     /// Entity stays in a region for a duration.
-    GeofenceDwell { region: Region, min_duration_secs: u64 },
+    GeofenceDwell {
+        region: Region,
+        min_duration_secs: u64,
+    },
     /// Two entities are within distance.
-    Proximity { max_distance_m: f64, other_entity: String },
+    Proximity {
+        max_distance_m: f64,
+        other_entity: String,
+    },
     /// Entity speed exceeds threshold.
     SpeedLimit { max_speed_mps: f64 },
     /// Entity moves in a specific direction.
-    DirectionMove { direction: Direction, region: Region },
+    DirectionMove {
+        direction: Direction,
+        region: Region,
+    },
     /// Entity visits a location repeatedly.
-    RecurringVisit { region: Region, min_visits: usize, period_secs: u64 },
+    RecurringVisit {
+        region: Region,
+        min_visits: usize,
+        period_secs: u64,
+    },
     /// Entity is at an unusual location.
-    UnusualLocation { known_locations: Vec<Region>, tolerance_m: f64 },
+    UnusualLocation {
+        known_locations: Vec<Region>,
+        tolerance_m: f64,
+    },
     /// Entity stops moving for a duration.
-    StopDetection { min_duration_secs: u64, max_distance_m: f64 },
+    StopDetection {
+        min_duration_secs: u64,
+        max_distance_m: f64,
+    },
     /// Entity enters a region at an unusual time.
-    TimeAnomaly { region: Region, expected_hours: Vec<u8> },
+    TimeAnomaly {
+        region: Region,
+        expected_hours: Vec<u8>,
+    },
 }
 
 /// A spatio-temporal rule.
@@ -153,7 +184,11 @@ impl Rule {
     }
 
     /// Evaluate this rule against an event and history.
-    pub fn evaluate(&self, event: &SpatioTemporalEvent, history: &[SpatioTemporalEvent]) -> RuleResult {
+    pub fn evaluate(
+        &self,
+        event: &SpatioTemporalEvent,
+        history: &[SpatioTemporalEvent],
+    ) -> RuleResult {
         if !self.enabled {
             return RuleResult::NotTriggered;
         }
@@ -173,9 +208,9 @@ impl Rule {
             }
             RuleType::GeofenceExit { region } => {
                 // Check if entity was previously inside
-                let was_inside = history.iter().any(|e| {
-                    e.entity_id == event.entity_id && region.contains(e.lon, e.lat)
-                });
+                let was_inside = history
+                    .iter()
+                    .any(|e| e.entity_id == event.entity_id && region.contains(e.lon, e.lat));
                 let is_outside = !region.contains(event.lon, event.lat);
 
                 if was_inside && is_outside {
@@ -189,13 +224,17 @@ impl Rule {
                     RuleResult::NotTriggered
                 }
             }
-            RuleType::GeofenceDwell { region, min_duration_secs } => {
+            RuleType::GeofenceDwell {
+                region,
+                min_duration_secs,
+            } => {
                 if !region.contains(event.lon, event.lat) {
                     return RuleResult::NotTriggered;
                 }
 
                 // Find when entity entered the region
-                let entry_time = history.iter()
+                let entry_time = history
+                    .iter()
                     .rev()
                     .find(|e| e.entity_id == event.entity_id && region.contains(e.lon, e.lat))
                     .map(|e| e.timestamp);
@@ -218,7 +257,10 @@ impl Rule {
 
                 RuleResult::NotTriggered
             }
-            RuleType::Proximity { max_distance_m, other_entity } => {
+            RuleType::Proximity {
+                max_distance_m,
+                other_entity,
+            } => {
                 let is_nearby = history.iter().any(|e| {
                     e.entity_id == *other_entity
                         && haversine_distance(event.lon, event.lat, e.lon, e.lat) <= *max_distance_m
@@ -240,15 +282,14 @@ impl Rule {
             }
             RuleType::SpeedLimit { max_speed_mps } => {
                 // Calculate speed from previous position
-                let prev = history.iter()
+                let prev = history
+                    .iter()
                     .rev()
                     .find(|e| e.entity_id == event.entity_id);
 
                 if let Some(prev_event) = prev {
-                    let distance = haversine_distance(
-                        prev_event.lon, prev_event.lat,
-                        event.lon, event.lat,
-                    );
+                    let distance =
+                        haversine_distance(prev_event.lon, prev_event.lat, event.lon, event.lat);
                     let time_diff = event.timestamp.saturating_sub(prev_event.timestamp);
                     let time_secs = time_diff as f64 / 1_000_000_000.0;
 
@@ -270,12 +311,17 @@ impl Rule {
 
                 RuleResult::NotTriggered
             }
-            RuleType::RecurringVisit { region, min_visits, period_secs } => {
+            RuleType::RecurringVisit {
+                region,
+                min_visits,
+                period_secs,
+            } => {
                 // Count visits within the period
                 let period_ns = *period_secs as i64 * 1_000_000_000;
                 let cutoff = event.timestamp.saturating_sub(period_ns);
 
-                let visits = history.iter()
+                let visits = history
+                    .iter()
                     .filter(|e| {
                         e.entity_id == event.entity_id
                             && e.timestamp >= cutoff
@@ -297,8 +343,13 @@ impl Rule {
                     RuleResult::NotTriggered
                 }
             }
-            RuleType::UnusualLocation { known_locations, tolerance_m: _ } => {
-                let is_known = known_locations.iter().any(|r| r.contains(event.lon, event.lat));
+            RuleType::UnusualLocation {
+                known_locations,
+                tolerance_m: _,
+            } => {
+                let is_known = known_locations
+                    .iter()
+                    .any(|r| r.contains(event.lon, event.lat));
 
                 if !is_known {
                     RuleResult::Triggered {
@@ -314,17 +365,19 @@ impl Rule {
                     RuleResult::NotTriggered
                 }
             }
-            RuleType::StopDetection { min_duration_secs, max_distance_m } => {
+            RuleType::StopDetection {
+                min_duration_secs,
+                max_distance_m,
+            } => {
                 // Check if entity has been stationary
-                let prev = history.iter()
+                let prev = history
+                    .iter()
                     .rev()
                     .find(|e| e.entity_id == event.entity_id);
 
                 if let Some(prev_event) = prev {
-                    let distance = haversine_distance(
-                        prev_event.lon, prev_event.lat,
-                        event.lon, event.lat,
-                    );
+                    let distance =
+                        haversine_distance(prev_event.lon, prev_event.lat, event.lon, event.lat);
                     let time_diff = event.timestamp.saturating_sub(prev_event.timestamp);
                     let time_secs = time_diff / 1_000_000_000;
 
@@ -343,7 +396,10 @@ impl Rule {
 
                 RuleResult::NotTriggered
             }
-            RuleType::TimeAnomaly { region, expected_hours } => {
+            RuleType::TimeAnomaly {
+                region,
+                expected_hours,
+            } => {
                 if !region.contains(event.lon, event.lat) {
                     return RuleResult::NotTriggered;
                 }
@@ -417,7 +473,9 @@ impl RuleEngine {
 
     /// Evaluate all rules against an event.
     pub fn evaluate(&mut self, event: &SpatioTemporalEvent) -> Vec<RuleResult> {
-        let results: Vec<RuleResult> = self.rules.iter()
+        let results: Vec<RuleResult> = self
+            .rules
+            .iter()
             .filter_map(|rule| {
                 let result = rule.evaluate(event, &self.history);
                 match result {
@@ -464,9 +522,7 @@ fn point_in_polygon(lon: f64, lat: f64, polygon: &[(f64, f64)]) -> bool {
     for i in 0..n {
         let (xi, yi) = polygon[i];
         let (xj, yj) = polygon[j];
-        if ((yi > lat) != (yj > lat))
-            && (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi)
-        {
+        if ((yi > lat) != (yj > lat)) && (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi) {
             inside = !inside;
         }
         j = i;
@@ -492,19 +548,28 @@ mod tests {
 
     #[test]
     fn test_geofence_enter() {
-        let rule = Rule::new("enter_zone", RuleType::GeofenceEnter {
-            region: Region::Circle {
-                center_lon: 116.4,
-                center_lat: 39.9,
-                radius_m: 1000.0,
+        let rule = Rule::new(
+            "enter_zone",
+            RuleType::GeofenceEnter {
+                region: Region::Circle {
+                    center_lon: 116.4,
+                    center_lat: 39.9,
+                    radius_m: 1000.0,
+                },
             },
-        });
+        );
 
         let inside = make_event("v1", 116.401, 39.901, 1000);
         let outside = make_event("v1", 117.0, 40.0, 1000);
 
-        assert!(matches!(rule.evaluate(&inside, &[]), RuleResult::Triggered { .. }));
-        assert!(matches!(rule.evaluate(&outside, &[]), RuleResult::NotTriggered));
+        assert!(matches!(
+            rule.evaluate(&inside, &[]),
+            RuleResult::Triggered { .. }
+        ));
+        assert!(matches!(
+            rule.evaluate(&outside, &[]),
+            RuleResult::NotTriggered
+        ));
     }
 
     #[test]
@@ -519,62 +584,96 @@ mod tests {
         let history = vec![make_event("v1", 116.401, 39.901, 100)];
         let exit_event = make_event("v1", 117.0, 40.0, 200);
 
-        assert!(matches!(rule.evaluate(&exit_event, &history), RuleResult::Triggered { .. }));
+        assert!(matches!(
+            rule.evaluate(&exit_event, &history),
+            RuleResult::Triggered { .. }
+        ));
     }
 
     #[test]
     fn test_speed_limit() {
-        let rule = Rule::new("speed_check", RuleType::SpeedLimit { max_speed_mps: 30.0 });
+        let rule = Rule::new(
+            "speed_check",
+            RuleType::SpeedLimit {
+                max_speed_mps: 30.0,
+            },
+        );
 
         let history = vec![make_event("v1", 116.4, 39.9, 1000_000_000_000)];
         // Move ~100m in 1 second = 100 m/s (way over limit)
         let fast_event = make_event("v1", 116.401, 39.9, 1001_000_000_000);
 
-        assert!(matches!(rule.evaluate(&fast_event, &history), RuleResult::Triggered { .. }));
+        assert!(matches!(
+            rule.evaluate(&fast_event, &history),
+            RuleResult::Triggered { .. }
+        ));
     }
 
     #[test]
     fn test_proximity() {
-        let rule = Rule::new("nearby", RuleType::Proximity {
-            max_distance_m: 100.0,
-            other_entity: "v2".to_string(),
-        });
+        let rule = Rule::new(
+            "nearby",
+            RuleType::Proximity {
+                max_distance_m: 100.0,
+                other_entity: "v2".to_string(),
+            },
+        );
 
         let history = vec![make_event("v2", 116.4, 39.9, 100)];
         let event = make_event("v1", 116.4001, 39.9001, 200);
 
-        assert!(matches!(rule.evaluate(&event, &history), RuleResult::Triggered { .. }));
+        assert!(matches!(
+            rule.evaluate(&event, &history),
+            RuleResult::Triggered { .. }
+        ));
     }
 
     #[test]
     fn test_unusual_location() {
-        let rule = Rule::new("unusual", RuleType::UnusualLocation {
-            known_locations: vec![Region::Circle {
-                center_lon: 116.4,
-                center_lat: 39.9,
-                radius_m: 1000.0,
-            }],
-            tolerance_m: 100.0,
-        });
+        let rule = Rule::new(
+            "unusual",
+            RuleType::UnusualLocation {
+                known_locations: vec![Region::Circle {
+                    center_lon: 116.4,
+                    center_lat: 39.9,
+                    radius_m: 1000.0,
+                }],
+                tolerance_m: 100.0,
+            },
+        );
 
         let normal = make_event("v1", 116.401, 39.901, 100);
         let unusual = make_event("v1", 121.5, 31.2, 200);
 
-        assert!(matches!(rule.evaluate(&normal, &[]), RuleResult::NotTriggered));
-        assert!(matches!(rule.evaluate(&unusual, &[]), RuleResult::Triggered { .. }));
+        assert!(matches!(
+            rule.evaluate(&normal, &[]),
+            RuleResult::NotTriggered
+        ));
+        assert!(matches!(
+            rule.evaluate(&unusual, &[]),
+            RuleResult::Triggered { .. }
+        ));
     }
 
     #[test]
     fn test_rule_engine() {
         let mut engine = RuleEngine::new();
-        engine.add_rule(Rule::new("enter", RuleType::GeofenceEnter {
-            region: Region::Circle {
-                center_lon: 116.4,
-                center_lat: 39.9,
-                radius_m: 1000.0,
+        engine.add_rule(Rule::new(
+            "enter",
+            RuleType::GeofenceEnter {
+                region: Region::Circle {
+                    center_lon: 116.4,
+                    center_lat: 39.9,
+                    radius_m: 1000.0,
+                },
             },
-        }));
-        engine.add_rule(Rule::new("speed", RuleType::SpeedLimit { max_speed_mps: 30.0 }));
+        ));
+        engine.add_rule(Rule::new(
+            "speed",
+            RuleType::SpeedLimit {
+                max_speed_mps: 30.0,
+            },
+        ));
 
         let event = make_event("v1", 116.401, 39.901, 1000);
         let results = engine.evaluate(&event);

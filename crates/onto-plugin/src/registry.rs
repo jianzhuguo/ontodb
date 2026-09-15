@@ -1,6 +1,10 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 use std::collections::HashMap;
 use std::sync::RwLock;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::context::PluginContext;
 use crate::error::{PluginError, PluginResult};
@@ -59,20 +63,24 @@ impl PluginRegistry {
         let name = plugin.name().to_string();
         let hooks = plugin.hooks();
 
-        let mut plugins = self.plugins.write().map_err(|e| {
-            PluginError::Other(format!("lock poisoned: {}", e))
-        })?;
-        let mut name_index = self.name_index.write().map_err(|e| {
-            PluginError::Other(format!("lock poisoned: {}", e))
-        })?;
-        let mut hook_index = self.hook_index.write().map_err(|e| {
-            PluginError::Other(format!("lock poisoned: {}", e))
-        })?;
+        let mut plugins = self
+            .plugins
+            .write()
+            .map_err(|e| PluginError::Other(format!("lock poisoned: {}", e)))?;
+        let mut name_index = self
+            .name_index
+            .write()
+            .map_err(|e| PluginError::Other(format!("lock poisoned: {}", e)))?;
+        let mut hook_index = self
+            .hook_index
+            .write()
+            .map_err(|e| PluginError::Other(format!("lock poisoned: {}", e)))?;
 
         // 检查名称冲突
         if name_index.contains_key(&name) {
             return Err(PluginError::Config(format!(
-                "plugin '{}' already registered", name
+                "plugin '{}' already registered",
+                name
             )));
         }
 
@@ -91,16 +99,15 @@ impl PluginRegistry {
 
     /// 初始化所有已注册的插件。
     pub fn init_all(&self) -> PluginResult<()> {
-        let mut plugins = self.plugins.write().map_err(|e| {
-            PluginError::Other(format!("lock poisoned: {}", e))
-        })?;
+        let mut plugins = self
+            .plugins
+            .write()
+            .map_err(|e| PluginError::Other(format!("lock poisoned: {}", e)))?;
         for plugin in plugins.iter_mut() {
             info!("initializing plugin: {}", plugin.name());
-            plugin.init().map_err(|e| {
-                PluginError::Execution {
-                    plugin: plugin.name().to_string(),
-                    message: format!("init failed: {}", e),
-                }
+            plugin.init().map_err(|e| PluginError::Execution {
+                plugin: plugin.name().to_string(),
+                message: format!("init failed: {}", e),
             })?;
         }
         Ok(())
@@ -108,9 +115,10 @@ impl PluginRegistry {
 
     /// 关闭所有已注册的插件。
     pub fn shutdown_all(&self) -> PluginResult<()> {
-        let mut plugins = self.plugins.write().map_err(|e| {
-            PluginError::Other(format!("lock poisoned: {}", e))
-        })?;
+        let mut plugins = self
+            .plugins
+            .write()
+            .map_err(|e| PluginError::Other(format!("lock poisoned: {}", e)))?;
         for plugin in plugins.iter_mut() {
             info!("shutting down plugin: {}", plugin.name());
             if let Err(e) = plugin.shutdown() {
@@ -124,16 +132,13 @@ impl PluginRegistry {
     ///
     /// 按注册顺序依次执行，跳过 `filter()` 返回 false 的插件。
     /// 如果某个插件执行失败，中止并返回错误。
-    pub fn execute_hooks(
-        &self,
-        hook: HookPoint,
-        ctx: &mut PluginContext,
-    ) -> PluginResult<()> {
+    pub fn execute_hooks(&self, hook: HookPoint, ctx: &mut PluginContext) -> PluginResult<()> {
         // 获取此钩子点的插件索引列表
         let indices = {
-            let hook_index = self.hook_index.read().map_err(|e| {
-                PluginError::Other(format!("lock poisoned: {}", e))
-            })?;
+            let hook_index = self
+                .hook_index
+                .read()
+                .map_err(|e| PluginError::Other(format!("lock poisoned: {}", e)))?;
             hook_index.get(&hook).cloned().unwrap_or_default()
         };
 
@@ -141,9 +146,10 @@ impl PluginRegistry {
             return Ok(());
         }
 
-        let plugins = self.plugins.read().map_err(|e| {
-            PluginError::Other(format!("lock poisoned: {}", e))
-        })?;
+        let plugins = self
+            .plugins
+            .read()
+            .map_err(|e| PluginError::Other(format!("lock poisoned: {}", e)))?;
 
         for &idx in &indices {
             let plugin = &plugins[idx];
@@ -155,9 +161,10 @@ impl PluginRegistry {
 
             // 检查依赖是否已执行（简单检查：依赖必须在当前插件之前注册）
             for dep in plugin.dependencies() {
-                let name_index = self.name_index.read().map_err(|e| {
-                    PluginError::Other(format!("lock poisoned: {}", e))
-                })?;
+                let name_index = self
+                    .name_index
+                    .read()
+                    .map_err(|e| PluginError::Other(format!("lock poisoned: {}", e)))?;
                 if !name_index.contains_key(dep) {
                     return Err(PluginError::DependencyMissing {
                         plugin: plugin.name().to_string(),
@@ -182,9 +189,10 @@ impl PluginRegistry {
             Ok(p) => p,
             Err(_) => return vec![],
         };
-        plugins.iter().map(|p| {
-            (p.name().to_string(), p.health())
-        }).collect()
+        plugins
+            .iter()
+            .map(|p| (p.name().to_string(), p.health()))
+            .collect()
     }
 
     /// 已注册的插件数量。

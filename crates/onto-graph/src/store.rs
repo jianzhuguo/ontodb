@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Graph storage - CRUD operations for vertices and edges.
 //!
 //! Supports both in-memory and persistent storage via LSM engine.
@@ -6,9 +10,9 @@
 //! - `__graph_v__{vertex_id}` → serialized Vertex
 //! - `__graph_e__{edge_id}` → serialized Edge
 
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 use onto_core::EntityId;
 
@@ -117,7 +121,8 @@ impl GraphStore {
         };
 
         // Load vertices
-        let vertex_entries = engine.scan_prefix(GRAPH_VERTEX_PREFIX.as_bytes())
+        let vertex_entries = engine
+            .scan_prefix(GRAPH_VERTEX_PREFIX.as_bytes())
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
 
         for (_key, value) in &vertex_entries {
@@ -142,7 +147,8 @@ impl GraphStore {
         }
 
         // Load edges
-        let edge_entries = engine.scan_prefix(GRAPH_EDGE_PREFIX.as_bytes())
+        let edge_entries = engine
+            .scan_prefix(GRAPH_EDGE_PREFIX.as_bytes())
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
 
         for (_key, value) in &edge_entries {
@@ -179,7 +185,11 @@ impl GraphStore {
                     if idx < adj_out.len() {
                         adj_out[idx].push((to_idx, edge_idx));
                     } else {
-                        tracing::warn!("adj_out index {} out of bounds (len={}), skipping", idx, adj_out.len());
+                        tracing::warn!(
+                            "adj_out index {} out of bounds (len={}), skipping",
+                            idx,
+                            adj_out.len()
+                        );
                     }
                 }
                 {
@@ -188,7 +198,11 @@ impl GraphStore {
                     if idx < adj_in.len() {
                         adj_in[idx].push((from_idx, edge_idx));
                     } else {
-                        tracing::warn!("adj_in index {} out of bounds (len={}), skipping", idx, adj_in.len());
+                        tracing::warn!(
+                            "adj_in index {} out of bounds (len={}), skipping",
+                            idx,
+                            adj_in.len()
+                        );
                     }
                 }
             }
@@ -234,9 +248,10 @@ impl GraphStore {
     fn persist_vertex(&self, vertex: &Vertex) -> Result<(), GraphError> {
         if let Some(ref engine) = self.engine {
             let key = format!("{}{}", GRAPH_VERTEX_PREFIX, vertex.id);
-            let value = serde_json::to_vec(vertex)
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
-            engine.put(key.into_bytes(), value)
+            let value =
+                serde_json::to_vec(vertex).map_err(|e| GraphError::StorageError(e.to_string()))?;
+            engine
+                .put(key.into_bytes(), value)
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
         }
         Ok(())
@@ -246,7 +261,8 @@ impl GraphStore {
     fn unpersist_vertex(&self, id: &str) -> Result<(), GraphError> {
         if let Some(ref engine) = self.engine {
             let key = format!("{}{}", GRAPH_VERTEX_PREFIX, id);
-            engine.delete(key.into_bytes())
+            engine
+                .delete(key.into_bytes())
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
         }
         Ok(())
@@ -257,9 +273,10 @@ impl GraphStore {
     fn persist_edge(&self, edge: &Edge) -> Result<(), GraphError> {
         if let Some(ref engine) = self.engine {
             let key = format!("{}{}", GRAPH_EDGE_PREFIX, edge.id);
-            let value = serde_json::to_vec(edge)
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
-            engine.put(key.into_bytes(), value)
+            let value =
+                serde_json::to_vec(edge).map_err(|e| GraphError::StorageError(e.to_string()))?;
+            engine
+                .put(key.into_bytes(), value)
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
         }
         Ok(())
@@ -273,7 +290,8 @@ impl GraphStore {
                 let key = format!("{}{}", GRAPH_EDGE_PREFIX, id);
                 let value = serde_json::to_vec(edge)
                     .map_err(|e| GraphError::StorageError(e.to_string()))?;
-                engine.put(key.into_bytes(), value)
+                engine
+                    .put(key.into_bytes(), value)
                     .map_err(|e| GraphError::StorageError(e.to_string()))?;
             }
         }
@@ -284,7 +302,8 @@ impl GraphStore {
     fn unpersist_edge(&self, id: &str) -> Result<(), GraphError> {
         if let Some(ref engine) = self.engine {
             let key = format!("{}{}", GRAPH_EDGE_PREFIX, id);
-            engine.delete(key.into_bytes())
+            engine
+                .delete(key.into_bytes())
                 .map_err(|e| GraphError::StorageError(e.to_string()))?;
         }
         Ok(())
@@ -300,7 +319,8 @@ impl GraphStore {
         // DoS protection: enforce max vertex count
         if self.vertices.read().len() >= MAX_VERTICES {
             return Err(GraphError::StorageError(format!(
-                "vertex limit reached ({})", MAX_VERTICES
+                "vertex limit reached ({})",
+                MAX_VERTICES
             )));
         }
 
@@ -347,7 +367,9 @@ impl GraphStore {
     /// Update vertex properties.
     pub fn update_vertex(&self, id: &str, properties: PropertyMap) -> Result<(), GraphError> {
         let mut verts = self.vertices.write();
-        let vertex = verts.get_mut(id).ok_or_else(|| GraphError::VertexNotFound(id.to_string()))?;
+        let vertex = verts
+            .get_mut(id)
+            .ok_or_else(|| GraphError::VertexNotFound(id.to_string()))?;
         for (k, v) in properties {
             vertex.properties.insert(k, v);
         }
@@ -368,7 +390,9 @@ impl GraphStore {
         // LOCK 1: vertices (write)
         let vertex = {
             let mut verts = self.vertices.write();
-            verts.remove(id).ok_or_else(|| GraphError::VertexNotFound(id.to_string()))?
+            verts
+                .remove(id)
+                .ok_or_else(|| GraphError::VertexNotFound(id.to_string()))?
         };
 
         // Unpersist vertex from LSM engine (no lock held)
@@ -468,13 +492,15 @@ impl GraphStore {
         // Collect IDs under label_index lock, then release before acquiring vertices lock
         let ids: Vec<String> = {
             let idx = self.label_index.read();
-            idx.get(label).cloned().unwrap_or_default().into_iter().collect()
+            idx.get(label)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
         };
 
         let verts = self.vertices.read();
-        ids.iter()
-            .filter_map(|id| verts.get(id).cloned())
-            .collect()
+        ids.iter().filter_map(|id| verts.get(id).cloned()).collect()
     }
 
     /// Get all vertices.
@@ -565,7 +591,9 @@ impl GraphStore {
     /// Update edge properties.
     pub fn update_edge(&self, id: &str, properties: PropertyMap) -> Result<(), GraphError> {
         let mut edges = self.edges.write();
-        let edge = edges.get_mut(id).ok_or_else(|| GraphError::EdgeNotFound(id.to_string()))?;
+        let edge = edges
+            .get_mut(id)
+            .ok_or_else(|| GraphError::EdgeNotFound(id.to_string()))?;
         for (k, v) in properties {
             edge.properties.insert(k, v);
         }
@@ -595,7 +623,9 @@ impl GraphStore {
     pub fn delete_edge(&self, id: &str) -> Result<(), GraphError> {
         let edge = {
             let mut edges = self.edges.write();
-            edges.remove(id).ok_or_else(|| GraphError::EdgeNotFound(id.to_string()))?
+            edges
+                .remove(id)
+                .ok_or_else(|| GraphError::EdgeNotFound(id.to_string()))?
         };
 
         // Unpersist from LSM engine
@@ -684,21 +714,24 @@ impl GraphStore {
 
     /// Get outgoing neighbors using integer indices (fast path).
     pub fn get_out_neighbors_idx(&self, idx: u32) -> Vec<(u32, u32)> {
-        self.adj_out.read().get(idx as usize).cloned().unwrap_or_default()
+        self.adj_out
+            .read()
+            .get(idx as usize)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Get incoming neighbors using integer indices (fast path).
     pub fn get_in_neighbors_idx(&self, idx: u32) -> Vec<(u32, u32)> {
-        self.adj_in.read().get(idx as usize).cloned().unwrap_or_default()
+        self.adj_in
+            .read()
+            .get(idx as usize)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Fast BFS using integer indices (no string allocations during traversal).
-    pub fn bfs_fast(
-        &self,
-        start_idx: u32,
-        max_depth: usize,
-        direction: Direction,
-    ) -> Vec<u32> {
+    pub fn bfs_fast(&self, start_idx: u32, max_depth: usize, direction: Direction) -> Vec<u32> {
         let num_nodes = self.idx_to_id.read().len();
         if start_idx as usize >= num_nodes {
             return Vec::new();
@@ -824,7 +857,8 @@ impl GraphStore {
         serde_json::to_string(&serde_json::json!({
             "vertices": vertices,
             "edges": edges,
-        })).unwrap_or_default()
+        }))
+        .unwrap_or_default()
     }
 
     /// Import graph data from JSON.
@@ -866,7 +900,8 @@ impl GraphStore {
 
     /// Load graph from file.
     pub fn load_from_file(&self, path: &str) -> Result<(), GraphError> {
-        let json = std::fs::read_to_string(path).map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let json =
+            std::fs::read_to_string(path).map_err(|e| GraphError::StorageError(e.to_string()))?;
         self.import_json(&json)
     }
 
@@ -990,7 +1025,8 @@ impl GraphStore {
             }
         };
 
-        edges.iter()
+        edges
+            .iter()
             .filter(|e| edge_label.is_none_or(|l| e.label == l))
             .filter_map(|e| {
                 let target_id = match direction {
@@ -1045,7 +1081,10 @@ mod tests {
         let retrieved = store.get_vertex("v1").unwrap();
         assert_eq!(retrieved.id, "v1");
         assert_eq!(retrieved.labels, vec!["Person"]);
-        assert_eq!(retrieved.properties.get("name").unwrap(), &PropValue::String("Alice".to_string()));
+        assert_eq!(
+            retrieved.properties.get("name").unwrap(),
+            &PropValue::String("Alice".to_string())
+        );
 
         // Update
         let mut props = PropertyMap::new();
@@ -1064,11 +1103,14 @@ mod tests {
     fn test_edge_crud() {
         let store = GraphStore::new();
 
-        store.add_vertex(Vertex::new("v1", vec!["Person".to_string()])).unwrap();
-        store.add_vertex(Vertex::new("v2", vec!["Person".to_string()])).unwrap();
+        store
+            .add_vertex(Vertex::new("v1", vec!["Person".to_string()]))
+            .unwrap();
+        store
+            .add_vertex(Vertex::new("v2", vec!["Person".to_string()]))
+            .unwrap();
 
-        let e = Edge::new("e1", "v1", "v2", "KNOWS")
-            .with_property("since", PropValue::Int(2020));
+        let e = Edge::new("e1", "v1", "v2", "KNOWS").with_property("since", PropValue::Int(2020));
 
         store.add_edge(e).unwrap();
 
@@ -1089,9 +1131,15 @@ mod tests {
     fn test_label_index() {
         let store = GraphStore::new();
 
-        store.add_vertex(Vertex::new("v1", vec!["Person".to_string()])).unwrap();
-        store.add_vertex(Vertex::new("v2", vec!["Person".to_string()])).unwrap();
-        store.add_vertex(Vertex::new("v3", vec!["Company".to_string()])).unwrap();
+        store
+            .add_vertex(Vertex::new("v1", vec!["Person".to_string()]))
+            .unwrap();
+        store
+            .add_vertex(Vertex::new("v2", vec!["Person".to_string()]))
+            .unwrap();
+        store
+            .add_vertex(Vertex::new("v3", vec!["Company".to_string()]))
+            .unwrap();
 
         let persons = store.get_vertices_by_label("Person");
         assert_eq!(persons.len(), 2);
@@ -1108,9 +1156,15 @@ mod tests {
         store.add_vertex(Vertex::new("v2", vec![])).unwrap();
         store.add_vertex(Vertex::new("v3", vec![])).unwrap();
 
-        store.add_edge(Edge::new("e1", "v1", "v2", "KNOWS")).unwrap();
-        store.add_edge(Edge::new("e2", "v1", "v3", "KNOWS")).unwrap();
-        store.add_edge(Edge::new("e3", "v2", "v3", "KNOWS")).unwrap();
+        store
+            .add_edge(Edge::new("e1", "v1", "v2", "KNOWS"))
+            .unwrap();
+        store
+            .add_edge(Edge::new("e2", "v1", "v3", "KNOWS"))
+            .unwrap();
+        store
+            .add_edge(Edge::new("e3", "v2", "v3", "KNOWS"))
+            .unwrap();
 
         assert_eq!(store.edge_count(), 3);
 
@@ -1129,7 +1183,9 @@ mod tests {
         let store = GraphStore::new();
         let id = EntityId::new("Product", "001");
 
-        store.upsert_vertex_from_entity(&id, &["Product".to_string()]).unwrap();
+        store
+            .upsert_vertex_from_entity(&id, &["Product".to_string()])
+            .unwrap();
 
         assert!(store.has_entity(&id));
         let vertex = store.get_entity_vertex(&id).unwrap();
@@ -1143,9 +1199,13 @@ mod tests {
         let id = EntityId::new("Product", "001");
 
         // First insert
-        store.upsert_vertex_from_entity(&id, &["Product".to_string()]).unwrap();
+        store
+            .upsert_vertex_from_entity(&id, &["Product".to_string()])
+            .unwrap();
         // Second insert should not fail
-        store.upsert_vertex_from_entity(&id, &["Product".to_string()]).unwrap();
+        store
+            .upsert_vertex_from_entity(&id, &["Product".to_string()])
+            .unwrap();
 
         assert!(store.has_entity(&id));
     }
@@ -1155,7 +1215,9 @@ mod tests {
         let store = GraphStore::new();
         let id = EntityId::new("Product", "001");
 
-        store.upsert_vertex_from_entity(&id, &["Product".to_string()]).unwrap();
+        store
+            .upsert_vertex_from_entity(&id, &["Product".to_string()])
+            .unwrap();
         assert!(store.has_entity(&id));
 
         store.delete_vertex_by_entity(&id).unwrap();
@@ -1177,7 +1239,9 @@ mod tests {
         let product = EntityId::new("Product", "001");
         let category = EntityId::new("Category", "electronics");
 
-        store.add_relationship(&product, &category, "belongs_to").unwrap();
+        store
+            .add_relationship(&product, &category, "belongs_to")
+            .unwrap();
 
         let neighbors = store.get_entity_neighbors(&product, Direction::Out, Some("belongs_to"));
         assert_eq!(neighbors.len(), 1);
@@ -1206,7 +1270,9 @@ mod tests {
         let mut props = PropertyMap::new();
         props.insert("since".to_string(), PropValue::Int(2020));
 
-        store.add_relationship_with_props(&from, &to, "knows", props).unwrap();
+        store
+            .add_relationship_with_props(&from, &to, "knows", props)
+            .unwrap();
 
         let neighbors = store.get_entity_neighbors(&from, Direction::Out, Some("knows"));
         assert_eq!(neighbors.len(), 1);
@@ -1257,7 +1323,9 @@ mod tests {
         let company = EntityId::new("Company", "acme");
 
         store.add_relationship(&alice, &bob, "knows").unwrap();
-        store.add_relationship(&alice, &company, "works_at").unwrap();
+        store
+            .add_relationship(&alice, &company, "works_at")
+            .unwrap();
 
         // Filter by label
         let friends = store.get_entity_neighbors(&alice, Direction::Out, Some("knows"));
@@ -1273,18 +1341,18 @@ mod tests {
     fn test_entity_get_entities_by_class() {
         let store = GraphStore::new();
 
-        store.upsert_vertex_from_entity(
-            &EntityId::new("Product", "001"),
-            &["Product".to_string()],
-        ).unwrap();
-        store.upsert_vertex_from_entity(
-            &EntityId::new("Product", "002"),
-            &["Product".to_string()],
-        ).unwrap();
-        store.upsert_vertex_from_entity(
-            &EntityId::new("Category", "electronics"),
-            &["Category".to_string()],
-        ).unwrap();
+        store
+            .upsert_vertex_from_entity(&EntityId::new("Product", "001"), &["Product".to_string()])
+            .unwrap();
+        store
+            .upsert_vertex_from_entity(&EntityId::new("Product", "002"), &["Product".to_string()])
+            .unwrap();
+        store
+            .upsert_vertex_from_entity(
+                &EntityId::new("Category", "electronics"),
+                &["Category".to_string()],
+            )
+            .unwrap();
 
         let products = store.get_entities_by_class("Product");
         assert_eq!(products.len(), 2);
@@ -1311,9 +1379,15 @@ mod tests {
         // Create graph and add data
         {
             let store = GraphStore::with_engine(engine.clone());
-            store.add_vertex(Vertex::new("v1", vec!["Person".to_string()])).unwrap();
-            store.add_vertex(Vertex::new("v2", vec!["Person".to_string()])).unwrap();
-            store.add_edge(Edge::new("e1", "v1", "v2", "knows")).unwrap();
+            store
+                .add_vertex(Vertex::new("v1", vec!["Person".to_string()]))
+                .unwrap();
+            store
+                .add_vertex(Vertex::new("v2", vec!["Person".to_string()]))
+                .unwrap();
+            store
+                .add_edge(Edge::new("e1", "v1", "v2", "knows"))
+                .unwrap();
         }
 
         // Reload from engine
@@ -1356,7 +1430,9 @@ mod tests {
         // Create graph and add relationships
         {
             let store = GraphStore::with_engine(engine.clone());
-            store.add_relationship(&product, &category, "belongs_to").unwrap();
+            store
+                .add_relationship(&product, &category, "belongs_to")
+                .unwrap();
         }
 
         // Reload from engine
@@ -1369,7 +1445,8 @@ mod tests {
             assert!(store.has_entity(&category));
 
             // Verify relationship
-            let neighbors = store.get_entity_neighbors(&product, Direction::Out, Some("belongs_to"));
+            let neighbors =
+                store.get_entity_neighbors(&product, Direction::Out, Some("belongs_to"));
             assert_eq!(neighbors.len(), 1);
             assert_eq!(neighbors[0], category);
         }
@@ -1391,9 +1468,15 @@ mod tests {
         // Create, then delete
         {
             let store = GraphStore::with_engine(engine.clone());
-            store.add_vertex(Vertex::new("v1", vec!["Person".to_string()])).unwrap();
-            store.add_vertex(Vertex::new("v2", vec!["Person".to_string()])).unwrap();
-            store.add_edge(Edge::new("e1", "v1", "v2", "knows")).unwrap();
+            store
+                .add_vertex(Vertex::new("v1", vec!["Person".to_string()]))
+                .unwrap();
+            store
+                .add_vertex(Vertex::new("v2", vec!["Person".to_string()]))
+                .unwrap();
+            store
+                .add_edge(Edge::new("e1", "v1", "v2", "knows"))
+                .unwrap();
 
             // Delete v1 (should cascade e1)
             store.delete_vertex("v1").unwrap();

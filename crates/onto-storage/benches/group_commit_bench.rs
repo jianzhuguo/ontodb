@@ -3,9 +3,9 @@
 //! Tests WAL group commit performance under heavy write contention
 //! with multiple concurrent writer threads.
 
+use onto_storage::{LsmEngine, StorageOptions};
 use std::sync::Arc;
 use std::time::Instant;
-use onto_storage::{LsmEngine, StorageOptions};
 
 fn run_bench(label: &str, engine: Arc<LsmEngine>, num_threads: usize, writes_per_thread: usize) {
     let total = num_threads * writes_per_thread;
@@ -27,8 +27,13 @@ fn run_bench(label: &str, engine: Arc<LsmEngine>, num_threads: usize, writes_per
     }
     let elapsed = start.elapsed();
     let qps = total as f64 / elapsed.as_secs_f64();
-    println!("  {:>30}: {:>8} writes in {:.1}ms  ({:.0} writes/sec)", 
-        label, total, elapsed.as_secs_f64() * 1000.0, qps);
+    println!(
+        "  {:>30}: {:>8} writes in {:.1}ms  ({:.0} writes/sec)",
+        label,
+        total,
+        elapsed.as_secs_f64() * 1000.0,
+        qps
+    );
 }
 
 fn main() {

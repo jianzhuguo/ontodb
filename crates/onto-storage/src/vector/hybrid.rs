@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Multi-vector hybrid query support.
 //!
 //! Supports searching multiple vector columns simultaneously and
@@ -119,11 +123,14 @@ mod tests {
         let searcher = HybridSearcher::new(specs);
 
         let mut results = HashMap::new();
-        results.insert("embedding".to_string(), vec![
-            (vec![1, 2, 3], 0.1),
-            (vec![4, 5, 6], 0.2),
-            (vec![7, 8, 9], 0.3),
-        ]);
+        results.insert(
+            "embedding".to_string(),
+            vec![
+                (vec![1, 2, 3], 0.1),
+                (vec![4, 5, 6], 0.2),
+                (vec![7, 8, 9], 0.3),
+            ],
+        );
 
         let combined = searcher.combine_results(&results);
         assert_eq!(combined.len(), 3);
@@ -151,14 +158,20 @@ mod tests {
         let searcher = HybridSearcher::new(specs);
 
         let mut results = HashMap::new();
-        results.insert("title".to_string(), vec![
-            (vec![1], 0.1),  // doc1 rank 0
-            (vec![2], 0.2),  // doc2 rank 1
-        ]);
-        results.insert("image".to_string(), vec![
-            (vec![2], 0.1),  // doc2 rank 0
-            (vec![3], 0.2),  // doc3 rank 1
-        ]);
+        results.insert(
+            "title".to_string(),
+            vec![
+                (vec![1], 0.1), // doc1 rank 0
+                (vec![2], 0.2), // doc2 rank 1
+            ],
+        );
+        results.insert(
+            "image".to_string(),
+            vec![
+                (vec![2], 0.1), // doc2 rank 0
+                (vec![3], 0.2), // doc3 rank 1
+            ],
+        );
 
         let combined = searcher.combine_results(&results);
 

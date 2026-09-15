@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Fuzz-style stress tests for the SQL and SPARQL parsers.
 //!
 //! These tests generate random inputs and verify that the parsers
@@ -6,7 +10,8 @@
 use rand::Rng;
 
 /// Characters commonly found in SQL queries.
-const SQL_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _=<>(),.'\";*+-/\n\t";
+const SQL_CHARS: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _=<>(),.'\";*+-/\n\t";
 
 /// Generate a random string from the given character set.
 fn random_string(rng: &mut impl Rng, max_len: usize) -> String {
@@ -22,13 +27,44 @@ fn random_string(rng: &mut impl Rng, max_len: usize) -> String {
 /// Generate a random SQL-like query (biased toward valid tokens).
 fn random_sql_biased(rng: &mut impl Rng) -> String {
     let keywords = [
-        "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP",
-        "FROM", "WHERE", "AND", "OR", "NOT", "IN", "LIKE",
-        "ORDER BY", "GROUP BY", "LIMIT", "OFFSET", "JOIN",
-        "VALUES", "SET", "INTO", "TABLE", "INDEX", "CLASS",
-        "BETWEEN", "NULL", "IS", "AS", "ON", "DISTINCT",
-        "COUNT", "SUM", "AVG", "MIN", "MAX",
-        "VECTOR SEARCH", "MATCH", "SPARQL",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "CREATE",
+        "DROP",
+        "FROM",
+        "WHERE",
+        "AND",
+        "OR",
+        "NOT",
+        "IN",
+        "LIKE",
+        "ORDER BY",
+        "GROUP BY",
+        "LIMIT",
+        "OFFSET",
+        "JOIN",
+        "VALUES",
+        "SET",
+        "INTO",
+        "TABLE",
+        "INDEX",
+        "CLASS",
+        "BETWEEN",
+        "NULL",
+        "IS",
+        "AS",
+        "ON",
+        "DISTINCT",
+        "COUNT",
+        "SUM",
+        "AVG",
+        "MIN",
+        "MAX",
+        "VECTOR SEARCH",
+        "MATCH",
+        "SPARQL",
     ];
     let operators = ["=", "!=", ">", "<", ">=", "<=", "AND", "OR"];
     let mut query = String::new();
@@ -65,7 +101,7 @@ fn random_sql_biased(rng: &mut impl Rng) -> String {
                 }
                 _ => {
                     // Wildcard or parens
-                    query.push('*', );
+                    query.push('*');
                 }
             }
         }
@@ -150,10 +186,29 @@ fn fuzz_sparql_parser_biased_queries() {
     let iterations = 3000;
 
     let sparql_keywords = [
-        "SELECT", "WHERE", "PREFIX", "CONSTRUCT", "ASK", "DESCRIBE",
-        "FILTER", "OPTIONAL", "UNION", "GRAPH", "LIMIT", "OFFSET",
-        "ORDER BY", "DISTINCT", "?x", "?y", "?z", "<http://example.org>",
-        "a", ".", "{", "}", "*",
+        "SELECT",
+        "WHERE",
+        "PREFIX",
+        "CONSTRUCT",
+        "ASK",
+        "DESCRIBE",
+        "FILTER",
+        "OPTIONAL",
+        "UNION",
+        "GRAPH",
+        "LIMIT",
+        "OFFSET",
+        "ORDER BY",
+        "DISTINCT",
+        "?x",
+        "?y",
+        "?z",
+        "<http://example.org>",
+        "a",
+        ".",
+        "{",
+        "}",
+        "*",
     ];
 
     for _ in 0..iterations {

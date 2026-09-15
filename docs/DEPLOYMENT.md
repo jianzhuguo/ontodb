@@ -52,7 +52,7 @@ docker compose up -d
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
-git clone https://github.com/ontodb/ontodb.git
+git clone https://gitee.com/ontovalue/ontodb.git
 cd ontodb
 cargo build --release
 

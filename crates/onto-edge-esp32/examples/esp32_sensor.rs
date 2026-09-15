@@ -32,7 +32,7 @@ use esp_hal::{
 use esp_println::println;
 use esp_wifi::wifi::{ClientConfiguration, Configuration, WifiStaDevice};
 use esp_wifi::EspWifiInitFor;
-use onto_edge_esp32::{DataReporter, GeoRouter, GeoLocation, GpsCollector, SensorCollector};
+use onto_edge_esp32::{DataReporter, GeoLocation, GeoRouter, GpsCollector, SensorCollector};
 
 // ========== 配置参数 ==========
 const WIFI_SSID: &str = "your-wifi-ssid";
@@ -76,20 +76,24 @@ fn main() -> ! {
         Ok(init) => init,
         Err(e) => {
             println!("WiFi 初始化失败: {:?}", e);
-            loop { delay.delay_ms(1000); }
+            loop {
+                delay.delay_ms(1000);
+            }
         }
     };
 
     let (wifi, _) = peripherals.WIFI.split();
-    let mut wifi_interface = esp_wifi::wifi::new_with_mode(&wifi_init, wifi, WifiStaDevice)
-        .expect("WiFi 创建失败");
+    let mut wifi_interface =
+        esp_wifi::wifi::new_with_mode(&wifi_init, wifi, WifiStaDevice).expect("WiFi 创建失败");
 
     let config = Configuration::Client(ClientConfiguration {
         ssid: WIFI_SSID.try_into().unwrap(),
         password: WIFI_PASSWORD.try_into().unwrap(),
         ..Default::default()
     });
-    wifi_interface.set_configuration(&config).expect("WiFi 配置失败");
+    wifi_interface
+        .set_configuration(&config)
+        .expect("WiFi 配置失败");
     wifi_interface.connect().expect("WiFi 连接失败");
 
     // 等待连接
@@ -105,14 +109,15 @@ fn main() -> ! {
         .data_bits(esp_hal::uart::DataBits::DataBits8)
         .parity_none()
         .stop_bits(esp_hal::uart::StopBits::STOP1);
-    
+
     let mut gps_uart = Uart::new_with_config(
         peripherals.UART1,
         uart_config,
         peripherals.GPIO16,
         peripherals.GPIO17,
         &clocks,
-    ).expect("UART 初始化失败");
+    )
+    .expect("UART 初始化失败");
 
     let mut gps = GpsCollector::new();
     gps.record(DEFAULT_LAT, DEFAULT_LNG); // 默认坐标
@@ -160,7 +165,12 @@ fn main() -> ! {
         }
 
         // 添加元数据
-        sensors.record("uptime", "uptime", tick as f64 * COLLECT_INTERVAL_SECS as f64, "s");
+        sensors.record(
+            "uptime",
+            "uptime",
+            tick as f64 * COLLECT_INTERVAL_SECS as f64,
+            "s",
+        );
         sensors.record("rssi", "signal", -65.0, "dBm"); // TODO: 读取真实 RSSI
 
         // 每 5 个 tick 上报一次
@@ -182,7 +192,7 @@ fn main() -> ! {
             // let url = format!("http://{}.valuehub.io:7915/api/edge/report", nearest);
             // http_post(&url, &report);
 
-            led.set_low();  // 闪烁指示
+            led.set_low(); // 闪烁指示
             delay.delay_ms(100);
             led.set_high();
 

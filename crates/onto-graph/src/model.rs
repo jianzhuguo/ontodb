@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Graph data model - Property Graph with vertices and edges.
 
 use serde::{Deserialize, Serialize};
@@ -37,7 +41,9 @@ impl std::fmt::Display for PropValue {
             PropValue::List(l) => {
                 write!(f, "[")?;
                 for (i, v) in l.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}", v)?;
                 }
                 write!(f, "]")

@@ -1,9 +1,15 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! OntoDB Edge - 端侧设备主程序
 //!
 //! 轻量级数据采集 + 存储 + 上报组件
 
-use onto_edge::{EdgeConfig, GeoLocation, SensorCollector, GpsCollector, DataReporter, DeviceStatus, GeoRouter};
 use clap::Parser;
+use onto_edge::{
+    DataReporter, DeviceStatus, EdgeConfig, GeoLocation, GeoRouter, GpsCollector, SensorCollector,
+};
 
 #[derive(Parser)]
 #[command(name = "onto-edge", about = "OntoDB Edge - 端侧设备运行时")]
@@ -50,7 +56,10 @@ async fn main() {
         hub_url: args.hub_url.clone(),
         collect_interval_secs: args.interval,
         report_interval_secs: args.interval * 5,
-        location: args.lat.zip(args.lng).map(|(lat, lng)| GeoLocation { latitude: lat, longitude: lng }),
+        location: args.lat.zip(args.lng).map(|(lat, lng)| GeoLocation {
+            latitude: lat,
+            longitude: lng,
+        }),
     };
 
     // 初始化组件
@@ -62,9 +71,12 @@ async fn main() {
     // 设置初始位置
     if let (Some(lat), Some(lng)) = (args.lat, args.lng) {
         gps_collector.record(lat, lng);
-        
+
         // 自动发现最近的区域节点
-        let location = GeoLocation { latitude: lat, longitude: lng };
+        let location = GeoLocation {
+            latitude: lat,
+            longitude: lng,
+        };
         if let Some(node) = geo_router.find_nearest(&location) {
             tracing::info!("最近区域节点: {} ({})", node.node_id, node.region);
             tracing::info!("节点地址: {}", node.hub_url);
@@ -73,7 +85,7 @@ async fn main() {
 
     // 模拟传感器数据采集循环
     tracing::info!("开始数据采集...");
-    
+
     let mut tick = 0u64;
     loop {
         tick += 1;
@@ -81,13 +93,17 @@ async fn main() {
         // 模拟传感器读数
         let temp = 25.0 + (tick as f64 * 0.1).sin() * 5.0;
         let humidity = 50.0 + (tick as f64 * 0.05).cos() * 10.0;
-        
+
         sensor_collector.record("temp_001", "temperature", temp, "°C");
         sensor_collector.record("humi_001", "humidity", humidity, "%");
 
         // 每 10 个 tick 上报一次
         if tick % 10 == 0 {
-            let readings = sensor_collector.get_readings().into_iter().cloned().collect::<Vec<_>>();
+            let readings = sensor_collector
+                .get_readings()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
             let status = DeviceStatus {
                 device_id: args.device_id.clone(),
                 battery_percent: 100.0 - (tick as f64 * 0.01),
@@ -97,7 +113,10 @@ async fn main() {
                 last_report: now_ms(),
             };
 
-            match reporter.report(&readings, gps_collector.get_location(), &status).await {
+            match reporter
+                .report(&readings, gps_collector.get_location(), &status)
+                .await
+            {
                 Ok(_) => tracing::info!("上报成功: {} 条数据", readings.len()),
                 Err(e) => tracing::warn!("上报失败: {}", e),
             }

@@ -50,7 +50,7 @@ None.
 
 ### Build from Source
 ```bash
-git clone https://github.com/ontodb/ontodb.git
+git clone https://gitee.com/ontovalue/ontodb.git
 cd ontodb
 git checkout v0.6.2
 cargo build --release

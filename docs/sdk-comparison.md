@@ -30,7 +30,7 @@
 |------|---------|
 | Python | `pip install ontodb` |
 | JavaScript/TS | `npm install ontodb` |
-| Go | `go get github.com/ontodb/ontodb-go` |
+| Go | `go get gitee.com/ontovalue/ontodb-go` |
 | Java | Maven: `io.ontodb:ontodb-java:0.5.6` |
 
 ## 快速对比

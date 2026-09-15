@@ -1,18 +1,22 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! OntoDB Edge - 端侧设备运行时
 //!
 //! 轻量级数据采集+存储+上报组件，用于端侧设备。
 //! 核心职责：采集传感器数据 → 本地存储 → 自动上报到区域节点
 
 pub mod collector;
-pub mod reporter;
 pub mod geo;
+pub mod reporter;
 
 use serde::{Deserialize, Serialize};
 
 // Re-export 主要类型
-pub use collector::{SensorCollector, GpsCollector};
-pub use reporter::DataReporter;
+pub use collector::{GpsCollector, SensorCollector};
 pub use geo::GeoRouter;
+pub use reporter::DataReporter;
 
 /// 端侧设备配置
 #[derive(Debug, Clone, Serialize, Deserialize)]

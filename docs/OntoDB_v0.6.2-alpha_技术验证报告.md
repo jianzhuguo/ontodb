@@ -507,4 +507,4 @@ a single line of semantic query."
 ---
 
 *OntoDB - An ontology-driven semantic multi-modal database*  
-*https://github.com/ontodb/ontodb*
+*https://gitee.com/ontovalue/ontodb*

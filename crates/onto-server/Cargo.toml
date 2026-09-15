@@ -15,9 +15,9 @@ onto-storage = { workspace = true }
 onto-query = { workspace = true }
 onto-graph = { workspace = true }
 onto-ontology = { workspace = true }
-onto-raft = { workspace = true, optional = true }
+onto-raft = { workspace = true }
 onto-enterprise = { workspace = true, optional = true }
-onto-sharding = { workspace = true, optional = true }
+onto-sharding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -59,8 +59,8 @@ default = []
 # onto-ontology (basic reasoning) is always included
 # Enterprise features are optional
 
-raft = ["dep:onto-raft"]
-sharding = ["dep:onto-sharding"]
+raft = []
+sharding = []
 enterprise = ["dep:onto-enterprise"]
 
 # === Enterprise Bundles ===

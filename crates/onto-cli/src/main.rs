@@ -18,6 +18,10 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::doc_lazy_continuation)]
 
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! OntoDB CLI - Interactive command-line client for OntoDB server.
 //!
 //! Features:
@@ -109,15 +113,41 @@ fn main() {
     let args = Args::parse();
 
     match args.command {
-        Some(CliCommand::Dump { output, class, format }) => {
-            run_dump(&args.address, output.as_deref(), class.as_deref(), &format, args.tls_cert.as_deref(), args.api_key.as_deref());
+        Some(CliCommand::Dump {
+            output,
+            class,
+            format,
+        }) => {
+            run_dump(
+                &args.address,
+                output.as_deref(),
+                class.as_deref(),
+                &format,
+                args.tls_cert.as_deref(),
+                args.api_key.as_deref(),
+            );
         }
-        Some(CliCommand::Restore { input, class, skip_errors }) => {
-            run_restore(&args.address, &input, class.as_deref(), skip_errors, args.tls_cert.as_deref(), args.api_key.as_deref());
+        Some(CliCommand::Restore {
+            input,
+            class,
+            skip_errors,
+        }) => {
+            run_restore(
+                &args.address,
+                &input,
+                class.as_deref(),
+                skip_errors,
+                args.tls_cert.as_deref(),
+                args.api_key.as_deref(),
+            );
         }
         None => {
             // Legacy mode: REPL / single query / file
-            let stream = match connect(&args.address, args.tls_cert.as_deref(), args.api_key.as_deref()) {
+            let stream = match connect(
+                &args.address,
+                args.tls_cert.as_deref(),
+                args.api_key.as_deref(),
+            ) {
                 Ok(stream) => stream,
                 Err(e) => {
                     eprintln!("Could not connect to {}: {}", args.address, e);
@@ -140,14 +170,16 @@ fn main() {
 /// Establish a connection to the OntoDB server with optional TLS and API Key.
 fn connect(address: &str, tls_cert: Option<&str>, api_key: Option<&str>) -> io::Result<TcpStream> {
     let mut stream = TcpStream::connect(address)?;
-    
+
     // If TLS certificate is provided, we would upgrade to TLS here
     // For now, TLS support requires native-tls or rustls crate
     if tls_cert.is_some() {
-        eprintln!("Warning: TLS support requires additional dependencies. Connection is unencrypted.");
+        eprintln!(
+            "Warning: TLS support requires additional dependencies. Connection is unencrypted."
+        );
         // TODO: Implement TLS upgrade using native-tls or rustls
     }
-    
+
     // If API key is provided, send authentication
     if let Some(key) = api_key {
         let auth_msg = format!("AUTH {}\n", key);
@@ -155,7 +187,7 @@ fn connect(address: &str, tls_cert: Option<&str>, api_key: Option<&str>) -> io::
         // Note: Server would need to handle AUTH command
         // For now, this is a placeholder for the authentication protocol
     }
-    
+
     Ok(stream)
 }
 
@@ -163,7 +195,14 @@ fn connect(address: &str, tls_cert: Option<&str>, api_key: Option<&str>) -> io::
 //  Dump subcommand
 // ─────────────────────────────────────────────────────────────
 
-fn run_dump(address: &str, output: Option<&str>, class: Option<&str>, format: &str, tls_cert: Option<&str>, api_key: Option<&str>) {
+fn run_dump(
+    address: &str,
+    output: Option<&str>,
+    class: Option<&str>,
+    format: &str,
+    tls_cert: Option<&str>,
+    api_key: Option<&str>,
+) {
     let stream = match connect(address, tls_cert, api_key) {
         Ok(s) => s,
         Err(e) => {
@@ -238,7 +277,10 @@ fn run_dump(address: &str, output: Option<&str>, class: Option<&str>, format: &s
                         let columns = parse_table_columns(&response);
                         for row in &rows {
                             let mut obj = serde_json::Map::new();
-                            obj.insert("__class__".to_string(), serde_json::Value::String(cls.clone()));
+                            obj.insert(
+                                "__class__".to_string(),
+                                serde_json::Value::String(cls.clone()),
+                            );
                             for (i, col) in columns.iter().enumerate() {
                                 let val = if i < row.len() {
                                     parse_cell_value(&row[i])
@@ -393,7 +435,14 @@ fn parse_cell_value(s: &str) -> serde_json::Value {
 //  Restore subcommand
 // ─────────────────────────────────────────────────────────────
 
-fn run_restore(address: &str, input: &str, class: Option<&str>, skip_errors: bool, tls_cert: Option<&str>, api_key: Option<&str>) {
+fn run_restore(
+    address: &str,
+    input: &str,
+    class: Option<&str>,
+    skip_errors: bool,
+    tls_cert: Option<&str>,
+    api_key: Option<&str>,
+) {
     let stream = match connect(address, tls_cert, api_key) {
         Ok(s) => s,
         Err(e) => {
@@ -635,11 +684,7 @@ fn run_repl(stream: TcpStream, addr: &str) {
     let mut in_query = false;
 
     loop {
-        let prompt = if in_query {
-            "    -> "
-        } else {
-            "ontodb> "
-        };
+        let prompt = if in_query { "    -> " } else { "ontodb> " };
 
         print!("{}", prompt);
         if stdout.flush().is_err() {

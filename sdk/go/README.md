@@ -5,7 +5,7 @@ Go client library for [OntoDB](https://ontovalue.com) 鈥?the ontology-driven se
 ## Installation
 
 ```bash
-go get github.com/ontodb/ontodb-go
+go get gitee.com/ontovalue/ontodb-go
 ```
 
 ## Quick Start
@@ -17,7 +17,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/ontodb/ontodb-go"
+    "gitee.com/ontovalue/ontodb-go"
 )
 
 func main() {

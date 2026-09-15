@@ -1,5 +1,9 @@
-use std::collections::HashMap;
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 
 /// 插件上下文 — 在钩子执行期间在插件间传递数据。
 ///
@@ -87,7 +91,9 @@ impl PluginContext {
 
     /// 获取实体锚点字符串（`{class}::{pk}`）。
     pub fn entity_id(&self) -> Option<String> {
-        std::str::from_utf8(&self.entity_key).ok().map(|s| s.to_string())
+        std::str::from_utf8(&self.entity_key)
+            .ok()
+            .map(|s| s.to_string())
     }
 
     /// 向 shared 字典写入数据。

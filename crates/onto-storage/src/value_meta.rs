@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Value metadata for living data mechanism.
 //!
 //! Stores per-entity value scores in independent LSM keys (`__val_meta__::{class}::{pk}`).
@@ -115,10 +119,12 @@ impl ValueScorer {
         let mut score = 0.5;
 
         // Rule 1: has text content → +0.2
-        let has_text = doc.values().any(|v| {
-            v.as_str().is_some_and(|s| s.len() > 20)
-        });
-        if has_text { score += 0.2; }
+        let has_text = doc
+            .values()
+            .any(|v| v.as_str().is_some_and(|s| s.len() > 20));
+        if has_text {
+            score += 0.2;
+        }
 
         // Rule 2: field completeness → +0.1
         let total_fields = doc.len();
@@ -189,7 +195,11 @@ mod tests {
         // New behavior: value_score = current_score() + delta = ~0.125 + 0.3 = ~0.425
         assert!(after > before, "after should be greater than before");
         assert!(after > 0.3, "expected > 0.3, got {}", after);
-        assert!(after < 0.5, "expected < 0.5 (not jumping to raw value_score), got {}", after);
+        assert!(
+            after < 0.5,
+            "expected < 0.5 (not jumping to raw value_score), got {}",
+            after
+        );
         assert_eq!(meta.activation_count, 1);
     }
 
@@ -208,7 +218,11 @@ mod tests {
         let two_years_secs = 2 * 365 * 86400;
         meta.last_activated_at = now_secs() - two_years_secs;
         let score = meta.current_score();
-        assert!((score - 0.5).abs() < 0.05, "expected ~0.5 after 2 years, got {}", score);
+        assert!(
+            (score - 0.5).abs() < 0.05,
+            "expected ~0.5 after 2 years, got {}",
+            score
+        );
     }
 
     #[test]
@@ -216,7 +230,11 @@ mod tests {
         let mut meta = ValueMetadata::new(1.0, LAMBDA_70D);
         meta.last_activated_at = now_secs() - (70 * 86400);
         let score = meta.current_score();
-        assert!((score - 0.5).abs() < 0.05, "expected ~0.5 after 70 days, got {}", score);
+        assert!(
+            (score - 0.5).abs() < 0.05,
+            "expected ~0.5 after 70 days, got {}",
+            score
+        );
     }
 
     #[test]
@@ -224,7 +242,11 @@ mod tests {
         let mut meta = ValueMetadata::new(1.0, LAMBDA_7H);
         meta.last_activated_at = now_secs() - (7 * 3600);
         let score = meta.current_score();
-        assert!((score - 0.5).abs() < 0.05, "expected ~0.5 after 7 hours, got {}", score);
+        assert!(
+            (score - 0.5).abs() < 0.05,
+            "expected ~0.5 after 7 hours, got {}",
+            score
+        );
     }
 
     #[test]
@@ -233,14 +255,18 @@ mod tests {
         // 3 half-lives = 21 hours → score should be ~0.125
         meta.last_activated_at = now_secs() - (21 * 3600);
         let score = meta.current_score();
-        assert!((score - 0.125).abs() < 0.02, "expected ~0.125 after 3 half-lives, got {}", score);
+        assert!(
+            (score - 0.125).abs() < 0.02,
+            "expected ~0.125 after 3 half-lives, got {}",
+            score
+        );
     }
 
     #[test]
     fn test_meta_key_roundtrip() {
         let key = ValueMetadata::meta_key("BioTask", "001");
         assert_eq!(key, b"__val_meta__::BioTask::001");
-        
+
         let (class, pk) = ValueMetadata::parse_meta_key(&key).unwrap();
         assert_eq!(class, "BioTask");
         assert_eq!(pk, "001");
@@ -253,8 +279,11 @@ mod tests {
             "status": "active",
             "description": "这是一个关于人类基因组测序的实验任务",
             "__class__": "BioTask"
-        }).as_object().unwrap().clone();
-        
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
         let score = ValueScorer::assess(&doc);
         assert!(score >= 0.8, "expected >= 0.8, got {}", score);
     }

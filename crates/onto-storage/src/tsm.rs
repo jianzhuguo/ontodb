@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! TSM (Time-Structured Merge) storage for time series data.
 //!
 //! TSM is a column-oriented storage format optimized for time series workloads.
@@ -336,7 +340,10 @@ impl TsmWriter {
     pub fn write(&mut self, series_key: String, point: TsPoint) {
         let key = series_key.clone();
         let is_full = {
-            let block = self.blocks.entry(series_key).or_insert_with(|| TsBlock::new(key.clone()));
+            let block = self
+                .blocks
+                .entry(series_key)
+                .or_insert_with(|| TsBlock::new(key.clone()));
             block.push(point);
             block.is_full()
         };
@@ -376,15 +383,31 @@ impl TsmWriter {
             // Encode values based on type
             let val_encoded = match block.values.first() {
                 Some(TsValue::Float(_)) => {
-                    let floats: Vec<f64> = block.values.iter().filter_map(|v| {
-                        if let TsValue::Float(f) = v { Some(*f) } else { None }
-                    }).collect();
+                    let floats: Vec<f64> = block
+                        .values
+                        .iter()
+                        .filter_map(|v| {
+                            if let TsValue::Float(f) = v {
+                                Some(*f)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     encode_floats(&floats)
                 }
                 Some(TsValue::Integer(_)) => {
-                    let ints: Vec<i64> = block.values.iter().filter_map(|v| {
-                        if let TsValue::Integer(i) = v { Some(*i) } else { None }
-                    }).collect();
+                    let ints: Vec<i64> = block
+                        .values
+                        .iter()
+                        .filter_map(|v| {
+                            if let TsValue::Integer(i) = v {
+                                Some(*i)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     encode_integers(&ints)
                 }
                 _ => Vec::new(),
@@ -556,8 +579,14 @@ mod tests {
     #[test]
     fn test_block_operations() {
         let mut block = TsBlock::new("cpu.usage".to_string());
-        block.push(TsPoint { timestamp: 1000, value: TsValue::Float(0.5) });
-        block.push(TsPoint { timestamp: 1010, value: TsValue::Float(0.6) });
+        block.push(TsPoint {
+            timestamp: 1000,
+            value: TsValue::Float(0.5),
+        });
+        block.push(TsPoint {
+            timestamp: 1010,
+            value: TsValue::Float(0.6),
+        });
 
         assert_eq!(block.len(), 2);
         assert_eq!(block.min_timestamp, 1000);
@@ -599,11 +628,17 @@ mod tests {
         for i in 0..5 {
             writer.write(
                 "cpu.usage".to_string(),
-                TsPoint { timestamp: 1000 + i, value: TsValue::Float(0.5) },
+                TsPoint {
+                    timestamp: 1000 + i,
+                    value: TsValue::Float(0.5),
+                },
             );
             writer.write(
                 "memory.used".to_string(),
-                TsPoint { timestamp: 1000 + i, value: TsValue::Integer(1024) },
+                TsPoint {
+                    timestamp: 1000 + i,
+                    value: TsValue::Integer(1024),
+                },
             );
         }
 

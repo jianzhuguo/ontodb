@@ -18,6 +18,10 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::doc_lazy_continuation)]
 
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! OntoDB Graph Module - Property Graph data model with traversal support.
 //!
 //! Supports:
@@ -26,12 +30,12 @@
 //! - Property filtering on vertices and edges
 //! - Integration with vector search for hybrid graph+vector queries
 
+pub mod error;
 pub mod model;
 pub mod store;
 pub mod traversal;
-pub mod error;
 
-pub use model::{Vertex, Edge, GraphElement, PropertyMap, PropValue};
-pub use store::GraphStore;
-pub use traversal::{TraversalEngine, TraversalResult, TraversalPath, Direction};
 pub use error::GraphError;
+pub use model::{Edge, GraphElement, PropValue, PropertyMap, Vertex};
+pub use store::GraphStore;
+pub use traversal::{Direction, TraversalEngine, TraversalPath, TraversalResult};

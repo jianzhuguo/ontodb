@@ -18,6 +18,10 @@
 #![allow(clippy::result_large_err)]
 #![allow(clippy::doc_lazy_continuation)]
 
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! onto-query: Query engine for OntoDB.
 //!
 //! Provides SQL parsing, semantic extensions, query optimization, and execution.
@@ -31,13 +35,13 @@ pub mod parser_util;
 pub mod sparql;
 
 #[cfg(test)]
-mod concurrent_bench;
-#[cfg(test)]
 mod binary_row_bench;
+#[cfg(test)]
+mod concurrent_bench;
 #[cfg(test)]
 mod fuzz_tests;
 
-pub use cache::{PlanCache, QueryCache, CacheStats};
+pub use cache::{CacheStats, PlanCache, QueryCache};
 pub use executor::{QueryExecutor, QueryResult};
 pub use ontoql::{OntoQLAst, OntoQLParser};
 pub use optimizer::{CostEstimate, CostModel, ExecutionPlan, PlanNode, QueryPlanner};

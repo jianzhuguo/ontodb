@@ -36,7 +36,7 @@
 
 ```bash
 # Prerequisites: Rust 1.70+
-git clone https://github.com/ontodb/ontodb.git
+git clone https://gitee.com/ontovalue/ontodb.git
 cd ontodb
 cargo build --release
 

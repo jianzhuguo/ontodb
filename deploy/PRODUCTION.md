@@ -11,7 +11,7 @@
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/ontodb/ontodb.git
+git clone https://gitee.com/ontovalue/ontodb.git
 cd ontodb
 
 # 2. Create environment config

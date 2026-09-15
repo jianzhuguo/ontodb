@@ -59,7 +59,7 @@
 
 ```bash
 # 前置要求：Rust 1.70+
-git clone https://github.com/ontodb/ontodb.git
+git clone https://gitee.com/ontovalue/ontodb.git
 cd ontodb
 cargo build --release
 

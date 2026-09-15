@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! HNSW (Hierarchical Navigable Small World) index implementation.
 //!
 //! Implements the algorithm from "Efficient and robust approximate nearest neighbor search
@@ -10,8 +14,8 @@
 
 use super::distance::{distance, DistanceMetric};
 use rand::Rng;
-use std::collections::{BinaryHeap, HashSet};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet};
 
 /// A vector entry in the HNSW index.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -262,7 +266,11 @@ impl HnswIndex {
         // === Phase 2: Connect at layers 0..=min(level, max_layer) ===
         for layer in (0..=level.min(self.max_layer)).rev() {
             let ef_c = self.config.ef_construction;
-            let m = if layer == 0 { self.config.m_max0 } else { self.config.m };
+            let m = if layer == 0 {
+                self.config.m_max0
+            } else {
+                self.config.m
+            };
 
             // Find nearest neighbors at this layer
             let candidates = self.search_layer_beam(&query, curr, ef_c, layer);
@@ -288,7 +296,11 @@ impl HnswIndex {
 
     /// Connect bidirectional edges between node idx and its selected neighbors.
     fn connect_bidirectional(&mut self, idx: usize, neighbors: &[usize], layer: usize) {
-        let m = if layer == 0 { self.config.m_max0 } else { self.config.m };
+        let m = if layer == 0 {
+            self.config.m_max0
+        } else {
+            self.config.m
+        };
 
         for &nbr_idx in neighbors {
             // Add edge: idx -> nbr (skip contains check - selected neighbors are unique)
@@ -317,12 +329,25 @@ impl HnswIndex {
         // Sort neighbors by distance to this node (avoid cloning vector)
         let mut with_dist: Vec<(usize, f32)> = self.nodes[node_idx].neighbors[layer]
             .iter()
-            .map(|&i| (i, distance(&self.nodes[node_idx].entry.vector, &self.nodes[i].entry.vector, self.config.metric)))
+            .map(|&i| {
+                (
+                    i,
+                    distance(
+                        &self.nodes[node_idx].entry.vector,
+                        &self.nodes[i].entry.vector,
+                        self.config.metric,
+                    ),
+                )
+            })
             .collect();
         with_dist.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
         // Keep the nearest max_neighbors
-        let keep: Vec<usize> = with_dist.iter().take(max_neighbors).map(|(i, _)| *i).collect();
+        let keep: Vec<usize> = with_dist
+            .iter()
+            .take(max_neighbors)
+            .map(|(i, _)| *i)
+            .collect();
         let remove: Vec<usize> = self.nodes[node_idx].neighbors[layer]
             .iter()
             .filter(|i| !keep.contains(i))
@@ -332,7 +357,8 @@ impl HnswIndex {
         // Remove edges from removed nodes back to this node
         for removed_idx in remove {
             if let Some(pos) = self.nodes[removed_idx].neighbors[layer]
-                .iter().position(|&x| x == node_idx)
+                .iter()
+                .position(|&x| x == node_idx)
             {
                 self.nodes[removed_idx].neighbors[layer].remove(pos);
             }
@@ -371,7 +397,11 @@ impl HnswIndex {
                 distance: distance(query, &self.nodes[idx].entry.vector, self.config.metric),
             })
             .collect();
-        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        results.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(Ordering::Equal)
+        });
         results.truncate(k);
         results
     }
@@ -410,7 +440,11 @@ impl HnswIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        results.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(Ordering::Equal)
+        });
         results.truncate(k);
         results
     }
@@ -438,16 +472,28 @@ impl HnswIndex {
 
     /// Beam search: find up to ef nearest neighbors at a layer.
     /// Returns candidates sorted by distance (closest first).
-    fn search_layer_beam(&self, query: &[f32], entry: usize, ef: usize, layer: usize) -> Vec<usize> {
+    fn search_layer_beam(
+        &self,
+        query: &[f32],
+        entry: usize,
+        ef: usize,
+        layer: usize,
+    ) -> Vec<usize> {
         let entry_dist = distance(query, &self.nodes[entry].entry.vector, self.config.metric);
 
         // candidates: min-heap (closest first)
         let mut candidates = BinaryHeap::new();
-        candidates.push(MinEntry { idx: entry, dist: entry_dist });
+        candidates.push(MinEntry {
+            idx: entry,
+            dist: entry_dist,
+        });
 
         // results: max-heap (farthest at top for pruning)
         let mut results = BinaryHeap::new();
-        results.push(MaxEntry { idx: entry, dist: entry_dist });
+        results.push(MaxEntry {
+            idx: entry,
+            dist: entry_dist,
+        });
 
         // Use local HashSet for visited tracking (avoids lock contention in hot loop)
         let mut visited = HashSet::new();
@@ -501,7 +547,12 @@ impl HnswIndex {
         }
         let mut with_dist: Vec<(usize, f32)> = candidates
             .iter()
-            .map(|&i| (i, distance(query, &self.nodes[i].entry.vector, self.config.metric)))
+            .map(|&i| {
+                (
+                    i,
+                    distance(query, &self.nodes[i].entry.vector, self.config.metric),
+                )
+            })
             .collect();
         with_dist.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         with_dist.truncate(m);
@@ -542,13 +593,27 @@ mod tests {
     #[test]
     fn test_hnsw_basic() {
         let config = HnswConfig::new(3, DistanceMetric::L2)
-            .with_m(8).with_ef_construction(50).with_ef_search(30);
+            .with_m(8)
+            .with_ef_construction(50)
+            .with_ef_search(30);
         let mut index = HnswIndex::new(config);
 
-        index.insert(VectorEntry { id: b"v1".to_vec(), vector: vec![1.0, 0.0, 0.0] });
-        index.insert(VectorEntry { id: b"v2".to_vec(), vector: vec![0.0, 1.0, 0.0] });
-        index.insert(VectorEntry { id: b"v3".to_vec(), vector: vec![0.0, 0.0, 1.0] });
-        index.insert(VectorEntry { id: b"v4".to_vec(), vector: vec![1.0, 1.0, 0.0] });
+        index.insert(VectorEntry {
+            id: b"v1".to_vec(),
+            vector: vec![1.0, 0.0, 0.0],
+        });
+        index.insert(VectorEntry {
+            id: b"v2".to_vec(),
+            vector: vec![0.0, 1.0, 0.0],
+        });
+        index.insert(VectorEntry {
+            id: b"v3".to_vec(),
+            vector: vec![0.0, 0.0, 1.0],
+        });
+        index.insert(VectorEntry {
+            id: b"v4".to_vec(),
+            vector: vec![1.0, 1.0, 0.0],
+        });
 
         assert_eq!(index.len(), 4);
 
@@ -562,12 +627,23 @@ mod tests {
     #[test]
     fn test_hnsw_filtered() {
         let config = HnswConfig::new(3, DistanceMetric::L2)
-            .with_m(8).with_ef_construction(50).with_ef_search(30);
+            .with_m(8)
+            .with_ef_construction(50)
+            .with_ef_search(30);
         let mut index = HnswIndex::new(config);
 
-        index.insert(VectorEntry { id: b"a".to_vec(), vector: vec![1.0, 0.0, 0.0] });
-        index.insert(VectorEntry { id: b"b".to_vec(), vector: vec![0.9, 0.1, 0.0] });
-        index.insert(VectorEntry { id: b"c".to_vec(), vector: vec![0.0, 1.0, 0.0] });
+        index.insert(VectorEntry {
+            id: b"a".to_vec(),
+            vector: vec![1.0, 0.0, 0.0],
+        });
+        index.insert(VectorEntry {
+            id: b"b".to_vec(),
+            vector: vec![0.9, 0.1, 0.0],
+        });
+        index.insert(VectorEntry {
+            id: b"c".to_vec(),
+            vector: vec![0.0, 1.0, 0.0],
+        });
 
         let mut allowed = HashSet::new();
         allowed.insert(b"a".to_vec());
@@ -590,7 +666,10 @@ mod tests {
     fn test_hnsw_single() {
         let config = HnswConfig::new(3, DistanceMetric::L2);
         let mut index = HnswIndex::new(config);
-        index.insert(VectorEntry { id: b"only".to_vec(), vector: vec![1.0, 2.0, 3.0] });
+        index.insert(VectorEntry {
+            id: b"only".to_vec(),
+            vector: vec![1.0, 2.0, 3.0],
+        });
         let results = index.search(&[1.0, 2.0, 3.0], 1);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry.id, b"only");
@@ -599,12 +678,23 @@ mod tests {
     #[test]
     fn test_hnsw_cosine() {
         let config = HnswConfig::new(3, DistanceMetric::Cosine)
-            .with_m(8).with_ef_construction(50).with_ef_search(30);
+            .with_m(8)
+            .with_ef_construction(50)
+            .with_ef_search(30);
         let mut index = HnswIndex::new(config);
 
-        index.insert(VectorEntry { id: b"x".to_vec(), vector: vec![1.0, 0.0, 0.0] });
-        index.insert(VectorEntry { id: b"y".to_vec(), vector: vec![0.0, 1.0, 0.0] });
-        index.insert(VectorEntry { id: b"z".to_vec(), vector: vec![0.7, 0.7, 0.0] });
+        index.insert(VectorEntry {
+            id: b"x".to_vec(),
+            vector: vec![1.0, 0.0, 0.0],
+        });
+        index.insert(VectorEntry {
+            id: b"y".to_vec(),
+            vector: vec![0.0, 1.0, 0.0],
+        });
+        index.insert(VectorEntry {
+            id: b"z".to_vec(),
+            vector: vec![0.7, 0.7, 0.0],
+        });
 
         let results = index.search(&[1.0, 0.0, 0.0], 2);
         assert_eq!(results[0].entry.id, b"x");

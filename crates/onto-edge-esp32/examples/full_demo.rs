@@ -24,11 +24,9 @@ use esp_hal::{
     timer::TimerGroup,
 };
 use esp_println::println;
-use esp_wifi::wifi::{
-    ClientConfiguration, Configuration, WifiStaDevice,
-};
+use esp_wifi::wifi::{ClientConfiguration, Configuration, WifiStaDevice};
 use esp_wifi::EspWifiInitFor;
-use onto_edge_esp32::{SensorCollector, GpsCollector, DataReporter, GeoRouter, GeoLocation};
+use onto_edge_esp32::{DataReporter, GeoLocation, GeoRouter, GpsCollector, SensorCollector};
 
 // ========== 配置 ==========
 const WIFI_SSID: &str = "your-wifi-ssid";
@@ -39,7 +37,7 @@ const COLLECT_INTERVAL_SECS: u64 = 60;
 const REPORT_INTERVAL_SECS: u64 = 300;
 
 // GPS 坐标（固定位置，实际用 GPS 模块获取）
-const LATITUDE: f64 = 34.7466;  // 郑州
+const LATITUDE: f64 = 34.7466; // 郑州
 const LONGITUDE: f64 = 113.6253;
 
 #[entry]
@@ -66,11 +64,12 @@ fn main() -> ! {
         Rng::new(peripherals.RNG),
         system.radio_clock_control,
         &clocks,
-    ).expect("WiFi 初始化失败");
+    )
+    .expect("WiFi 初始化失败");
 
     let (wifi, _) = peripherals.WIFI.split();
-    let mut wifi_interface = esp_wifi::wifi::new_with_mode(&wifi_init, wifi, WifiStaDevice)
-        .expect("WiFi 接口创建失败");
+    let mut wifi_interface =
+        esp_wifi::wifi::new_with_mode(&wifi_init, wifi, WifiStaDevice).expect("WiFi 接口创建失败");
 
     // 连接 WiFi
     let wifi_config = Configuration::Client(ClientConfiguration {
@@ -78,7 +77,9 @@ fn main() -> ! {
         password: WIFI_PASSWORD.try_into().unwrap(),
         ..Default::default()
     });
-    wifi_interface.set_configuration(&wifi_config).expect("WiFi 配置失败");
+    wifi_interface
+        .set_configuration(&wifi_config)
+        .expect("WiFi 配置失败");
     wifi_interface.connect().expect("WiFi 连接失败");
 
     println!("  连接中...");
@@ -120,7 +121,12 @@ fn main() -> ! {
         }
 
         // 模拟其他传感器
-        sensors.record("uptime", "uptime", tick as f64 * COLLECT_INTERVAL_SECS as f64, "s");
+        sensors.record(
+            "uptime",
+            "uptime",
+            tick as f64 * COLLECT_INTERVAL_SECS as f64,
+            "s",
+        );
 
         // 每 5 个 tick 上报一次
         if tick % 5 == 0 {
@@ -131,7 +137,7 @@ fn main() -> ! {
                 report => {
                     println!("  上报数据: {} 条", readings.len());
                     println!("  JSON: {}", &report[..report.len().min(100)]);
-                    
+
                     // HTTP POST
                     match http_post(HUB_URL, "/api/edge/report", &report) {
                         Ok(resp) => println!("  上报成功: {}", resp),
@@ -154,11 +160,11 @@ fn read_dht22(pin: &Input, delay: &Delay) -> Result<(f64, f64), &'static str> {
     // DHT22 协议实现（简化版）
     // 实际实现需要精确时序控制
     // 这里返回模拟数据
-    
+
     // 发送开始信号
     // 读取 40 位数据
     // 校验并返回
-    
+
     // 模拟数据（实际用真实传感器替换）
     let temp = 25.0 + (rand::random::<f64>() * 5.0 - 2.5);
     let humi = 50.0 + (rand::random::<f64>() * 20.0 - 10.0);
@@ -169,11 +175,11 @@ fn read_dht22(pin: &Input, delay: &Delay) -> Result<(f64, f64), &'static str> {
 fn http_post(base_url: &str, path: &str, body: &str) -> Result<String, &'static str> {
     // ESP32 HTTP 客户端实现
     // 使用 esp-http 或嵌入式 HTTP 库
-    
+
     // 简化实现（实际用真实 HTTP 库）
     println!("  POST {}{}", base_url, path);
     println!("  Body: {} bytes", body.len());
-    
+
     // 模拟成功响应
     Ok("OK".to_string())
 }

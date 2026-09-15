@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! MemTable: In-memory sorted key-value store.
 //!
 //! The MemTable is the write buffer. All writes go here first.
@@ -176,17 +180,17 @@ impl MemTable {
         // Composite key format: user_key ++ (!seq_no).to_be_bytes()
         // Since !seq_no inverts bits, higher seq_no → smaller composite.
         // We want the latest version (highest seq_no), which has the smallest composite.
-        
+
         // Create lower bound: key + !MAX (= key + 0x0000...0000)
         let mut lower = Vec::with_capacity(key.len() + 8);
         lower.extend_from_slice(key);
         lower.extend_from_slice(&0u64.to_be_bytes());
-        
+
         // Create upper bound: key + !0 (= key + 0xFFFF...FFFF)
         let mut upper = Vec::with_capacity(key.len() + 8);
         upper.extend_from_slice(key);
         upper.extend_from_slice(&u64::MAX.to_be_bytes());
-        
+
         // Iterate versions of this key, newest first (highest seq_no = smallest composite).
         for (_composite, entry) in self.data.range(lower..=upper) {
             if entry.key.as_slice() != key {
@@ -201,7 +205,10 @@ impl MemTable {
     }
 
     /// Returns an iterator over all versions of a given key, newest first.
-    pub fn get_versions<'a>(&'a self, key: &'a [u8]) -> impl Iterator<Item = &'a MemTableEntry> + 'a {
+    pub fn get_versions<'a>(
+        &'a self,
+        key: &'a [u8],
+    ) -> impl Iterator<Item = &'a MemTableEntry> + 'a {
         let mut lower = Vec::with_capacity(key.len() + 8);
         lower.extend_from_slice(key);
         lower.extend_from_slice(&0u64.to_be_bytes());
@@ -210,7 +217,8 @@ impl MemTable {
         upper.extend_from_slice(key);
         upper.extend_from_slice(&u64::MAX.to_be_bytes());
 
-        self.data.range(lower..=upper)
+        self.data
+            .range(lower..=upper)
             .filter(move |(_, e)| e.key.as_slice() == key)
             .map(|(_, e)| e)
     }
@@ -237,8 +245,7 @@ impl MemTable {
         // This captures all keys starting with prefix, regardless of seq_no.
         let upper = Self::prefix_upper_bound(prefix);
 
-        self.data.range(lower..upper)
-            .map(|(_, e)| e)
+        self.data.range(lower..upper).map(|(_, e)| e)
     }
 
     /// Compute the exclusive upper bound for a prefix range scan.
@@ -330,7 +337,10 @@ mod tests {
         mt.put(b"c".to_vec(), b"3".to_vec());
 
         let keys: Vec<&[u8]> = mt.entries().map(|e| e.key.as_slice()).collect();
-        assert_eq!(keys, vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]);
+        assert_eq!(
+            keys,
+            vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+        );
     }
 
     #[test]
@@ -341,8 +351,14 @@ mod tests {
         mt.put(b"key".to_vec(), b"v3".to_vec());
         mt.put(b"other".to_vec(), b"x".to_vec());
 
-        let versions: Vec<&[u8]> = mt.get_versions(b"key").map(|e| e.value.as_slice()).collect();
-        assert_eq!(versions, vec![b"v3".as_slice(), b"v2".as_slice(), b"v1".as_slice()]);
+        let versions: Vec<&[u8]> = mt
+            .get_versions(b"key")
+            .map(|e| e.value.as_slice())
+            .collect();
+        assert_eq!(
+            versions,
+            vec![b"v3".as_slice(), b"v2".as_slice(), b"v1".as_slice()]
+        );
     }
 
     #[test]

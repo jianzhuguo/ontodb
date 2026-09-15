@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Fuzz-style stress tests for the storage engine.
 //!
 //! These tests perform random put/get/scan operations to verify
@@ -21,9 +25,7 @@ fn open_test_engine(dir: &std::path::Path) -> LsmEngine {
 /// Generate a random key of variable length.
 fn random_key(rng: &mut impl Rng) -> Vec<u8> {
     let len = rng.gen_range(1..20);
-    (0..len)
-        .map(|_| rng.gen_range(b'a'..=b'z'))
-        .collect()
+    (0..len).map(|_| rng.gen_range(b'a'..=b'z')).collect()
 }
 
 /// Generate a random JSON-like value.
@@ -38,7 +40,13 @@ fn random_value(rng: &mut impl Rng) -> Vec<u8> {
         }
         1 => rng.gen_range(0..100000i64).to_string().into_bytes(),
         2 => format!("{:.4}", rng.gen_range(0.0..100000.0)).into_bytes(),
-        3 => if rng.gen_bool(0.5) { b"true".to_vec() } else { b"false".to_vec() },
+        3 => {
+            if rng.gen_bool(0.5) {
+                b"true".to_vec()
+            } else {
+                b"false".to_vec()
+            }
+        }
         _ => b"null".to_vec(),
     }
 }

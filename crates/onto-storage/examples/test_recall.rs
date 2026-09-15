@@ -40,7 +40,12 @@ fn main() {
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                let dist: f32 = query.iter().zip(v.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+                let dist: f32 = query
+                    .iter()
+                    .zip(v.iter())
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum::<f32>()
+                    .sqrt();
                 (i, dist)
             })
             .collect();
@@ -53,7 +58,11 @@ fn main() {
             .iter()
             .map(|r| {
                 let id_str = String::from_utf8_lossy(&r.entry.id);
-                id_str.strip_prefix("vec_").unwrap().parse::<usize>().unwrap()
+                id_str
+                    .strip_prefix("vec_")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
             })
             .collect();
 
@@ -63,18 +72,37 @@ fn main() {
         total_recall += recall;
 
         if qi < 3 {
-            println!("Query {}: recall = {:.2} ({}/{} found)", qi, recall, hits, k);
+            println!(
+                "Query {}: recall = {:.2} ({}/{} found)",
+                qi, recall, hits, k
+            );
             // Print some debug info
             let bf_top3: Vec<(usize, f32)> = bf_distances.iter().take(3).cloned().collect();
             println!("  BF top-3: {:?}", bf_top3);
-            let hnsw_top3: Vec<(usize, f32)> = results.iter().take(3).map(|r| {
-                let id_str = String::from_utf8_lossy(&r.entry.id);
-                (id_str.strip_prefix("vec_").unwrap().parse::<usize>().unwrap(), r.distance)
-            }).collect();
+            let hnsw_top3: Vec<(usize, f32)> = results
+                .iter()
+                .take(3)
+                .map(|r| {
+                    let id_str = String::from_utf8_lossy(&r.entry.id);
+                    (
+                        id_str
+                            .strip_prefix("vec_")
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap(),
+                        r.distance,
+                    )
+                })
+                .collect();
             println!("  HNSW top-3: {:?}", hnsw_top3);
         }
     }
 
     let avg_recall = total_recall / num_queries as f64;
-    println!("\nAverage recall@{}: {:.4} ({:.1}%)", k, avg_recall, avg_recall * 100.0);
+    println!(
+        "\nAverage recall@{}: {:.4} ({:.1}%)",
+        k,
+        avg_recall,
+        avg_recall * 100.0
+    );
 }

@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Group commit coordinator for WAL durability.
 //!
 //! Multiple transactions batch their WAL writes and share a single fsync,
@@ -6,9 +10,9 @@
 //! Supports hybrid batching: wait up to N microseconds OR until M transactions
 //! are ready, whichever comes first.
 
+use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use parking_lot::{Condvar, Mutex};
 
 /// Group commit configuration.
 pub struct GroupCommitConfig {
@@ -21,8 +25,8 @@ pub struct GroupCommitConfig {
 impl Default for GroupCommitConfig {
     fn default() -> Self {
         Self {
-            wait_timeout_us: 10,   // 10µs
-            batch_threshold: 4,    // 4 transactions
+            wait_timeout_us: 10, // 10µs
+            batch_threshold: 4,  // 4 transactions
         }
     }
 }

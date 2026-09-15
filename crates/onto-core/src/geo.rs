@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! GIS data types for OntoDB.
 //!
 //! Supports:
@@ -212,8 +216,8 @@ pub fn touches(a: &Geometry, b: &Geometry) -> bool {
             if let (Some(outer_a), Some(outer_b)) = (rings_a.first(), rings_b.first()) {
                 let has_boundary_contact = outer_a.iter().any(|p| point_on_boundary(p, outer_b))
                     || outer_b.iter().any(|p| point_on_boundary(p, outer_a));
-                let has_interior_overlap = polygon_intersects_polygon(rings_a, rings_b)
-                    && !has_boundary_contact;
+                let has_interior_overlap =
+                    polygon_intersects_polygon(rings_a, rings_b) && !has_boundary_contact;
                 has_boundary_contact && !has_interior_overlap
             } else {
                 false
@@ -230,9 +234,7 @@ pub fn crosses(a: &Geometry, b: &Geometry) -> bool {
             // Line crosses polygon if it intersects but is not fully contained
             intersects(a, b) && !within(a, b)
         }
-        (Geometry::Polygon(_), Geometry::LineString(_)) => {
-            intersects(a, b) && !within(b, a)
-        }
+        (Geometry::Polygon(_), Geometry::LineString(_)) => intersects(a, b) && !within(b, a),
         (Geometry::LineString(l1), Geometry::LineString(l2)) => {
             // Two lines cross if they intersect at a point (not overlapping)
             line_intersects_line(l1, l2)
@@ -580,7 +582,10 @@ fn decode_wkt(s: &str) -> Option<Geometry> {
         let coords = parse_coord(inner)?;
         return Some(Geometry::Point(coords));
     }
-    if let Some(inner) = s.strip_prefix("LINESTRING(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(inner) = s
+        .strip_prefix("LINESTRING(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         let coords = parse_coord_list(inner)?;
         return Some(Geometry::LineString(coords));
     }

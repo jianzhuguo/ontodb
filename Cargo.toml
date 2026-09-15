@@ -5,22 +5,23 @@ members = [
     "crates/onto-storage",
     "crates/onto-ontology",
     "crates/onto-query",
+    "crates/onto-sharding",
     "crates/onto-server",
     "crates/onto-cli",
     "crates/onto-graph",
     "crates/onto-plugin",
     "crates/onto-edge",
     "crates/onto-edge-bin",
-    "crates/onto-edge-esp32",
+    "crates/ontodb-rules",
     "tools/migrate-namespace",
 ]
 
 [workspace.package]
 version = "0.6.2"
 edition = "2021"
-license = "AGPL-3.0"
+license = "BUSL-1.1"
 authors = ["OntoDB Team"]
-repository = "https://github.com/ontodb/ontodb"
+repository = "https://gitee.com/ontovalue/ontodb"
 description = "OntoDB - An ontology-driven semantic multi-modal database"
 
 [workspace.dependencies]
@@ -73,7 +74,6 @@ chrono = "0.4"
 
 [profile.release]
 opt-level = 3
-lto = true
 codegen-units = 1
 strip = true
 

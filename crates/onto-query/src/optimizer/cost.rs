@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Cost model for query optimization.
 //!
 //! Estimates the cost of different execution strategies based on
@@ -171,11 +175,11 @@ impl Default for CostModel {
             page_read_io: 1.0,
             vector_search_cpu_per_candidate: 0.1,
             distance_compute_cpu: 0.05,
-            eq_selectivity: 0.1,       // 10% by default
-            range_selectivity: 0.333,   // 1/3 by default
-            like_selectivity: 0.1,      // 10% by default
+            eq_selectivity: 0.1,            // 10% by default
+            range_selectivity: 0.333,       // 1/3 by default
+            like_selectivity: 0.1,          // 10% by default
             in_selectivity_per_value: 0.05, // 5% per value
-            join_selectivity: 0.1,      // 10% by default
+            join_selectivity: 0.1,          // 10% by default
         }
     }
 }
@@ -227,11 +231,7 @@ impl CostModel {
     }
 
     /// Estimate the cost of a nested loop join.
-    pub fn nested_loop_join_cost(
-        &self,
-        left: &CostEstimate,
-        right: &CostEstimate,
-    ) -> CostEstimate {
+    pub fn nested_loop_join_cost(&self, left: &CostEstimate, right: &CostEstimate) -> CostEstimate {
         let rows = left.rows * right.rows;
         let io_cost = left.io_cost + right.io_cost + (left.rows as f64 * right.io_cost);
         let cpu_cost = rows as f64 * self.compare_cpu;
@@ -239,11 +239,7 @@ impl CostModel {
     }
 
     /// Estimate the cost of a hash join.
-    pub fn hash_join_cost(
-        &self,
-        left: &CostEstimate,
-        right: &CostEstimate,
-    ) -> CostEstimate {
+    pub fn hash_join_cost(&self, left: &CostEstimate, right: &CostEstimate) -> CostEstimate {
         // Build hash table on smaller side
         let build_cost = std::cmp::min(left.rows, right.rows) as f64 * self.hash_probe_cpu;
         let probe_cost = std::cmp::max(left.rows, right.rows) as f64 * self.hash_probe_cpu;
@@ -255,23 +251,27 @@ impl CostModel {
 
     /// Estimate the cost of a sort-merge join.
     /// Best for: already sorted data, large tables, disk-based joins.
-    pub fn sort_merge_join_cost(
-        &self,
-        left: &CostEstimate,
-        right: &CostEstimate,
-    ) -> CostEstimate {
+    pub fn sort_merge_join_cost(&self, left: &CostEstimate, right: &CostEstimate) -> CostEstimate {
         // Sort cost: O(n log n) for each side
         let left_sort = if left.is_sorted {
             0.0
         } else {
             let n = left.rows as f64;
-            if n > 0.0 { n * n.log2() * self.compare_cpu } else { 0.0 }
+            if n > 0.0 {
+                n * n.log2() * self.compare_cpu
+            } else {
+                0.0
+            }
         };
         let right_sort = if right.is_sorted {
             0.0
         } else {
             let n = right.rows as f64;
-            if n > 0.0 { n * n.log2() * self.compare_cpu } else { 0.0 }
+            if n > 0.0 {
+                n * n.log2() * self.compare_cpu
+            } else {
+                0.0
+            }
         };
 
         // Merge cost: O(n + m) linear scan
@@ -288,9 +288,12 @@ impl CostModel {
     /// Estimate the cost of a sort operation.
     pub fn sort_cost(&self, input: &CostEstimate) -> CostEstimate {
         let n = input.rows as f64;
-        let cpu_cost = if n > 0.0 { n * n.log2() * self.compare_cpu } else { 0.0 };
-        CostEstimate::new(input.rows, input.io_cost, input.cpu_cost + cpu_cost)
-            .with_sorted()
+        let cpu_cost = if n > 0.0 {
+            n * n.log2() * self.compare_cpu
+        } else {
+            0.0
+        };
+        CostEstimate::new(input.rows, input.io_cost, input.cpu_cost + cpu_cost).with_sorted()
     }
 
     /// Estimate the cost of an aggregation (GROUP BY).
@@ -311,8 +314,7 @@ impl CostModel {
         let io_cost = vector_stats.layers as f64 * self.page_read_io;
         let cpu_cost = candidates as f64 * self.vector_search_cpu_per_candidate
             + candidates as f64 * self.distance_compute_cpu;
-        CostEstimate::new(top_k.min(vector_stats.vector_count), io_cost, cpu_cost)
-            .with_index()
+        CostEstimate::new(top_k.min(vector_stats.vector_count), io_cost, cpu_cost).with_index()
     }
 
     /// Estimate selectivity for a filter expression.
@@ -328,11 +330,16 @@ impl CostModel {
                 if let Some(hist) = stats.histograms.iter().find(|h| &h.column == col) {
                     if hist.distinct_count > 0 {
                         let selectivity = 1.0 / hist.distinct_count as f64;
-                        let can_use_index = stats.secondary_indexes.iter().any(|i| &i.column == col);
+                        let can_use_index =
+                            stats.secondary_indexes.iter().any(|i| &i.column == col);
                         return FilterSelectivity {
                             selectivity,
                             can_use_index,
-                            index_column: if can_use_index { Some(col.clone()) } else { None },
+                            index_column: if can_use_index {
+                                Some(col.clone())
+                            } else {
+                                None
+                            },
                         };
                     }
                 }
@@ -351,46 +358,50 @@ impl CostModel {
                     }
                 }
             }
-            crate::parser::FilterExpr::Ne(_, _) => {
-                FilterSelectivity {
-                    selectivity: 1.0 - self.eq_selectivity,
-                    can_use_index: false,
-                    index_column: None,
-                }
-            }
+            crate::parser::FilterExpr::Ne(_, _) => FilterSelectivity {
+                selectivity: 1.0 - self.eq_selectivity,
+                can_use_index: false,
+                index_column: None,
+            },
             crate::parser::FilterExpr::Gt(col, val)
             | crate::parser::FilterExpr::Lt(col, val)
             | crate::parser::FilterExpr::Gte(col, val)
             | crate::parser::FilterExpr::Lte(col, val) => {
                 // Try histogram for range selectivity
                 if let Some(hist) = stats.histograms.iter().find(|h| &h.column == col) {
-                    if let Some(selectivity) = Self::estimate_range_from_histogram(hist, val, filter) {
-                        let can_use_index = stats.secondary_indexes.iter().any(|i| &i.column == col);
+                    if let Some(selectivity) =
+                        Self::estimate_range_from_histogram(hist, val, filter)
+                    {
+                        let can_use_index =
+                            stats.secondary_indexes.iter().any(|i| &i.column == col);
                         return FilterSelectivity {
                             selectivity,
                             can_use_index,
-                            index_column: if can_use_index { Some(col.clone()) } else { None },
+                            index_column: if can_use_index {
+                                Some(col.clone())
+                            } else {
+                                None
+                            },
                         };
                     }
                 }
                 // Fallback to fixed selectivity
-                let can_use_index = stats
-                    .secondary_indexes
-                    .iter()
-                    .any(|i| &i.column == col);
+                let can_use_index = stats.secondary_indexes.iter().any(|i| &i.column == col);
                 FilterSelectivity {
                     selectivity: self.range_selectivity,
                     can_use_index,
-                    index_column: if can_use_index { Some(col.clone()) } else { None },
+                    index_column: if can_use_index {
+                        Some(col.clone())
+                    } else {
+                        None
+                    },
                 }
             }
-            crate::parser::FilterExpr::Like(_, _) => {
-                FilterSelectivity {
-                    selectivity: self.like_selectivity,
-                    can_use_index: false,
-                    index_column: None,
-                }
-            }
+            crate::parser::FilterExpr::Like(_, _) => FilterSelectivity {
+                selectivity: self.like_selectivity,
+                can_use_index: false,
+                index_column: None,
+            },
             crate::parser::FilterExpr::Between(col, _, _) => {
                 // Try histogram for between selectivity
                 if let Some(hist) = stats.histograms.iter().find(|h| &h.column == col) {
@@ -415,7 +426,8 @@ impl CostModel {
                 if let Some(col) = Self::extract_column_from_in(filter) {
                     if let Some(hist) = stats.histograms.iter().find(|h| h.column == col) {
                         if hist.distinct_count > 0 {
-                            let selectivity = (values.len() as f64 / hist.distinct_count as f64).min(1.0);
+                            let selectivity =
+                                (values.len() as f64 / hist.distinct_count as f64).min(1.0);
                             return FilterSelectivity {
                                 selectivity,
                                 can_use_index: false,
@@ -512,7 +524,7 @@ impl CostModel {
         // Simple estimate: use uniform distribution assumption
         // For more accuracy, we'd need to find the specific bucket containing the value
         let base_selectivity = 1.0 / hist.distinct_count as f64;
-        
+
         // Adjust based on filter type
         match filter {
             crate::parser::FilterExpr::Gt(_, _) | crate::parser::FilterExpr::Gte(_, _) => {

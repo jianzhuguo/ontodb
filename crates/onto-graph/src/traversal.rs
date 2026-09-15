@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Graph traversal engine - BFS/DFS with property filtering.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -72,7 +76,8 @@ impl PropertyFilter {
             FilterOp::Gte => val >= &self.value,
             FilterOp::Lte => val <= &self.value,
             FilterOp::Contains => {
-                if let (PropValue::String(haystack), PropValue::String(needle)) = (val, &self.value) {
+                if let (PropValue::String(haystack), PropValue::String(needle)) = (val, &self.value)
+                {
                     haystack.contains(needle.as_str())
                 } else {
                     false
@@ -100,7 +105,9 @@ impl<'a> TraversalEngine<'a> {
         max_depth: usize,
         direction: Direction,
     ) -> Result<Vec<String>, GraphError> {
-        let start_idx = self.store.get_idx(start_id)
+        let start_idx = self
+            .store
+            .get_idx(start_id)
             .ok_or_else(|| GraphError::VertexNotFound(start_id.to_string()))?;
 
         let result_indices = self.store.bfs_fast(start_idx, max_depth, direction);
@@ -190,10 +197,18 @@ impl<'a> TraversalEngine<'a> {
         // For filtered BFS, use the string-based approach
         // For unfiltered BFS, use the fast integer-based approach
         if edge_label.is_some() {
-            return self.traverse_bfs_filtered(start_id, max_depth, direction, edge_label, vertex_filter);
+            return self.traverse_bfs_filtered(
+                start_id,
+                max_depth,
+                direction,
+                edge_label,
+                vertex_filter,
+            );
         }
 
-        let start_idx = self.store.get_idx(start_id)
+        let start_idx = self
+            .store
+            .get_idx(start_id)
             .ok_or_else(|| GraphError::VertexNotFound(start_id.to_string()))?;
 
         let visited_indices = self.store.bfs_fast(start_idx, max_depth, direction);
@@ -201,7 +216,9 @@ impl<'a> TraversalEngine<'a> {
         let mut result_vertices = Vec::new();
 
         for &idx in &visited_indices {
-            let vertex_id = self.store.get_id(idx)
+            let vertex_id = self
+                .store
+                .get_id(idx)
                 .ok_or_else(|| GraphError::VertexNotFound(format!("idx {}", idx)))?;
 
             if let Some(vertex) = self.store.get_vertex(&vertex_id) {
@@ -230,23 +247,33 @@ impl<'a> TraversalEngine<'a> {
         max_depth: usize,
         direction: Direction,
     ) -> Result<TraversalResult, GraphError> {
-        let start_idx = self.store.get_idx(start_id)
+        let start_idx = self
+            .store
+            .get_idx(start_id)
             .ok_or_else(|| GraphError::VertexNotFound(start_id.to_string()))?;
 
         // BFS with parent tracking
-        let (visited_indices, parent_map) = self.store.bfs_fast_with_parents(start_idx, max_depth, direction);
+        let (visited_indices, parent_map) = self
+            .store
+            .bfs_fast_with_parents(start_idx, max_depth, direction);
 
         let mut result_vertices = Vec::new();
         let mut result_paths = Vec::new();
 
         for &idx in &visited_indices {
-            let vertex_id = self.store.get_id(idx)
+            let vertex_id = self
+                .store
+                .get_id(idx)
                 .ok_or_else(|| GraphError::VertexNotFound(format!("idx {}", idx)))?;
 
             if let Some(vertex) = self.store.get_vertex(&vertex_id) {
                 // Reconstruct path lazily
                 let path_ids = self.store.reconstruct_path(&parent_map, start_idx, idx);
-                let path_len = if path_ids.len() > 1 { path_ids.len() - 1 } else { 0 };
+                let path_len = if path_ids.len() > 1 {
+                    path_ids.len() - 1
+                } else {
+                    0
+                };
 
                 result_paths.push(TraversalPath {
                     vertex_ids: path_ids,
@@ -403,7 +430,8 @@ impl<'a> TraversalEngine<'a> {
     ) -> Result<(), GraphError> {
         if depth > Self::MAX_DFS_RECURSION_DEPTH {
             return Err(GraphError::TraversalError(format!(
-                "DFS recursion depth exceeded maximum of {}", Self::MAX_DFS_RECURSION_DEPTH
+                "DFS recursion depth exceeded maximum of {}",
+                Self::MAX_DFS_RECURSION_DEPTH
             )));
         }
         if depth > 0 {
@@ -498,7 +526,9 @@ impl<'a> TraversalEngine<'a> {
 
         while let Some((current_id, depth, path_verts, path_edges)) = queue.pop_front() {
             if current_id == to_id && depth > 0 {
-                let target = self.store.get_vertex(to_id)
+                let target = self
+                    .store
+                    .get_vertex(to_id)
                     .ok_or_else(|| GraphError::VertexNotFound(to_id.to_string()))?;
                 return Ok(Some(TraversalPath {
                     vertex_ids: path_verts,
@@ -542,28 +572,60 @@ mod tests {
         let store = GraphStore::new();
 
         // Add vertices
-        store.add_vertex(Vertex::new("alice", vec!["Person".to_string()])
-            .with_property("name", PropValue::String("Alice".to_string()))
-            .with_property("age", PropValue::Int(30))).unwrap();
-        store.add_vertex(Vertex::new("bob", vec!["Person".to_string()])
-            .with_property("name", PropValue::String("Bob".to_string()))
-            .with_property("age", PropValue::Int(25))).unwrap();
-        store.add_vertex(Vertex::new("charlie", vec!["Person".to_string()])
-            .with_property("name", PropValue::String("Charlie".to_string()))
-            .with_property("age", PropValue::Int(35))).unwrap();
-        store.add_vertex(Vertex::new("dave", vec!["Person".to_string()])
-            .with_property("name", PropValue::String("Dave".to_string()))
-            .with_property("age", PropValue::Int(28))).unwrap();
-        store.add_vertex(Vertex::new("acme", vec!["Company".to_string()])
-            .with_property("name", PropValue::String("Acme Corp".to_string()))).unwrap();
+        store
+            .add_vertex(
+                Vertex::new("alice", vec!["Person".to_string()])
+                    .with_property("name", PropValue::String("Alice".to_string()))
+                    .with_property("age", PropValue::Int(30)),
+            )
+            .unwrap();
+        store
+            .add_vertex(
+                Vertex::new("bob", vec!["Person".to_string()])
+                    .with_property("name", PropValue::String("Bob".to_string()))
+                    .with_property("age", PropValue::Int(25)),
+            )
+            .unwrap();
+        store
+            .add_vertex(
+                Vertex::new("charlie", vec!["Person".to_string()])
+                    .with_property("name", PropValue::String("Charlie".to_string()))
+                    .with_property("age", PropValue::Int(35)),
+            )
+            .unwrap();
+        store
+            .add_vertex(
+                Vertex::new("dave", vec!["Person".to_string()])
+                    .with_property("name", PropValue::String("Dave".to_string()))
+                    .with_property("age", PropValue::Int(28)),
+            )
+            .unwrap();
+        store
+            .add_vertex(
+                Vertex::new("acme", vec!["Company".to_string()])
+                    .with_property("name", PropValue::String("Acme Corp".to_string())),
+            )
+            .unwrap();
 
         // Add edges
-        store.add_edge(Edge::new("e1", "alice", "bob", "KNOWS")).unwrap();
-        store.add_edge(Edge::new("e2", "alice", "charlie", "KNOWS")).unwrap();
-        store.add_edge(Edge::new("e3", "bob", "dave", "KNOWS")).unwrap();
-        store.add_edge(Edge::new("e4", "charlie", "dave", "KNOWS")).unwrap();
-        store.add_edge(Edge::new("e5", "alice", "acme", "WORKS_AT")).unwrap();
-        store.add_edge(Edge::new("e6", "bob", "acme", "WORKS_AT")).unwrap();
+        store
+            .add_edge(Edge::new("e1", "alice", "bob", "KNOWS"))
+            .unwrap();
+        store
+            .add_edge(Edge::new("e2", "alice", "charlie", "KNOWS"))
+            .unwrap();
+        store
+            .add_edge(Edge::new("e3", "bob", "dave", "KNOWS"))
+            .unwrap();
+        store
+            .add_edge(Edge::new("e4", "charlie", "dave", "KNOWS"))
+            .unwrap();
+        store
+            .add_edge(Edge::new("e5", "alice", "acme", "WORKS_AT"))
+            .unwrap();
+        store
+            .add_edge(Edge::new("e6", "bob", "acme", "WORKS_AT"))
+            .unwrap();
 
         store
     }
@@ -574,11 +636,14 @@ mod tests {
         let engine = TraversalEngine::new(&store);
 
         // Alice's friends
-        let friends = engine.hop("alice", Direction::Out, Some("KNOWS"), None, None).unwrap();
+        let friends = engine
+            .hop("alice", Direction::Out, Some("KNOWS"), None, None)
+            .unwrap();
         assert_eq!(friends.len(), 2);
-        let names: Vec<String> = friends.iter().map(|v| {
-            v.properties.get("name").unwrap().to_string()
-        }).collect();
+        let names: Vec<String> = friends
+            .iter()
+            .map(|v| v.properties.get("name").unwrap().to_string())
+            .collect();
         assert!(names.contains(&"Bob".to_string()));
         assert!(names.contains(&"Charlie".to_string()));
     }
@@ -594,7 +659,9 @@ mod tests {
             op: FilterOp::Gt,
             value: PropValue::Int(30),
         };
-        let friends = engine.hop("alice", Direction::Out, Some("KNOWS"), Some(&filter), None).unwrap();
+        let friends = engine
+            .hop("alice", Direction::Out, Some("KNOWS"), Some(&filter), None)
+            .unwrap();
         assert_eq!(friends.len(), 1);
         assert_eq!(friends[0].id, "charlie");
     }
@@ -605,10 +672,12 @@ mod tests {
         let engine = TraversalEngine::new(&store);
 
         // 2-hop from Alice
-        let result = engine.traverse_bfs("alice", 2, Direction::Out, Some("KNOWS"), None).unwrap();
+        let result = engine
+            .traverse_bfs("alice", 2, Direction::Out, Some("KNOWS"), None)
+            .unwrap();
         assert_eq!(result.vertices.len(), 3); // Bob, Charlie, Dave
-        // Paths are not built in the optimized version
-        // assert_eq!(result.paths.len(), 3);
+                                              // Paths are not built in the optimized version
+                                              // assert_eq!(result.paths.len(), 3);
     }
 
     #[test]
@@ -629,7 +698,9 @@ mod tests {
         let engine = TraversalEngine::new(&store);
 
         // Who works at Acme?
-        let employees = engine.hop("acme", Direction::In, Some("WORKS_AT"), None, None).unwrap();
+        let employees = engine
+            .hop("acme", Direction::In, Some("WORKS_AT"), None, None)
+            .unwrap();
         assert_eq!(employees.len(), 2);
     }
 
@@ -639,7 +710,9 @@ mod tests {
         let engine = TraversalEngine::new(&store);
 
         // 2-hop from Alice with path reconstruction
-        let result = engine.traverse_bfs_with_paths("alice", 2, Direction::Out).unwrap();
+        let result = engine
+            .traverse_bfs_with_paths("alice", 2, Direction::Out)
+            .unwrap();
         assert_eq!(result.vertices.len(), 4); // Bob, Charlie, Acme, Dave
         assert_eq!(result.paths.len(), 4);
 

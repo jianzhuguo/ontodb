@@ -43,8 +43,8 @@ sqlalchemy = [
 [project.urls]
 Homepage = "https://ontodb.io"
 Documentation = "https://docs.ontodb.io"
-Repository = "https://github.com/ontodb/ontodb-python"
-Issues = "https://github.com/ontodb/ontodb-python/issues"
+Repository = "https://gitee.com/ontovalue/ontodb-python"
+Issues = "https://gitee.com/ontovalue/ontodb-python/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]

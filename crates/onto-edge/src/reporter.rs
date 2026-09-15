@@ -1,6 +1,10 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! 数据上报器 - 端侧设备向区域节点上报数据
 
-use super::{EdgeConfig, SensorReading, DeviceStatus, GeoLocation};
+use super::{DeviceStatus, EdgeConfig, GeoLocation, SensorReading};
 use serde::{Deserialize, Serialize};
 
 /// 数据上报器
@@ -47,9 +51,13 @@ impl DataReporter {
     }
 
     /// 上报数据到区域节点
-    pub async fn report(&mut self, readings: &[SensorReading], location: Option<&GeoLocation>, status: &DeviceStatus) -> Result<(), String> {
-        let hub_url = self.config.hub_url.as_ref()
-            .ok_or("未配置区域节点地址")?;
+    pub async fn report(
+        &mut self,
+        readings: &[SensorReading],
+        location: Option<&GeoLocation>,
+        status: &DeviceStatus,
+    ) -> Result<(), String> {
+        let hub_url = self.config.hub_url.as_ref().ok_or("未配置区域节点地址")?;
 
         let request = ReportRequest {
             device_id: self.config.device_id.clone(),
@@ -61,7 +69,8 @@ impl DataReporter {
         };
 
         let url = format!("{}/api/edge/report", hub_url);
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .json(&request)
             .send()
@@ -81,7 +90,7 @@ impl DataReporter {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        
+
         let readings: Vec<SensorReading> = self.buffer.drain(..).collect();
         let status = DeviceStatus {
             device_id: self.config.device_id.clone(),
@@ -91,7 +100,7 @@ impl DataReporter {
             readings_count: readings.len() as u64,
             last_report: now_ms(),
         };
-        
+
         self.report(&readings, None, &status).await
     }
 
@@ -109,21 +118,21 @@ impl DataReporter {
 fn classify_region(lat: f64, lng: f64) -> &'static str {
     // 中国主要区域划分（简化）
     if lat >= 39.0 && lng >= 116.0 && lng <= 120.0 {
-        "beijing"  // 华北
+        "beijing" // 华北
     } else if lat >= 30.0 && lat <= 32.0 && lng >= 120.0 && lng <= 123.0 {
-        "shanghai"  // 华东
+        "shanghai" // 华东
     } else if lat >= 34.0 && lat <= 35.0 && lng >= 113.0 && lng <= 114.0 {
-        "zhengzhou"  // 华中
+        "zhengzhou" // 华中
     } else if lat >= 22.0 && lat <= 24.0 && lng >= 113.0 && lng <= 114.0 {
-        "guangzhou"  // 华南
+        "guangzhou" // 华南
     } else if lat >= 30.0 && lat <= 31.0 && lng >= 103.0 && lng <= 105.0 {
-        "chengdu"  // 西南
+        "chengdu" // 西南
     } else if lat >= 34.0 && lat <= 35.0 && lng >= 108.0 && lng <= 110.0 {
-        "xian"  // 西北
+        "xian" // 西北
     } else if lat >= 41.0 && lat <= 43.0 && lng >= 123.0 && lng <= 126.0 {
-        "shenyang"  // 东北
+        "shenyang" // 东北
     } else {
-        "default"  // 默认
+        "default" // 默认
     }
 }
 

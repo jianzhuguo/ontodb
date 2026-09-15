@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Tiered storage for time series data.
 //!
 //! Implements hot/warm/cold data tiering:
@@ -8,9 +12,9 @@
 //! Data automatically migrates between tiers based on age thresholds.
 //! Queries transparently read from all tiers.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 
 use crate::tsm::{TsPoint, TsmWriter};
 
@@ -35,10 +39,10 @@ impl Default for TieredConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("./data/tiered"),
-            hot_to_warm_secs: 3600,      // 1 hour
-            warm_to_cold_secs: 86400 * 7, // 7 days
+            hot_to_warm_secs: 3600,             // 1 hour
+            warm_to_cold_secs: 86400 * 7,       // 7 days
             hot_max_bytes: 100 * 1024 * 1024,   // 100MB
-            warm_max_bytes: 1024 * 1024 * 1024,  // 1GB
+            warm_max_bytes: 1024 * 1024 * 1024, // 1GB
         }
     }
 }
@@ -109,10 +113,7 @@ impl TieredStorage {
         let point_size = std::mem::size_of::<TsPoint>() + series_key.len();
         self.hot_bytes += point_size;
 
-        self.hot_buffer
-            .entry(series_key)
-            .or_default()
-            .push(point);
+        self.hot_buffer.entry(series_key).or_default().push(point);
 
         self.stats.hot_entries += 1;
         self.stats.hot_bytes = self.hot_bytes;
@@ -344,7 +345,11 @@ impl ContinuousQueryEngine {
     pub fn aggregate(values: &[f64], agg: &AggregationType) -> f64 {
         match agg {
             AggregationType::Mean => {
-                if values.is_empty() { 0.0 } else { values.iter().sum::<f64>() / values.len() as f64 }
+                if values.is_empty() {
+                    0.0
+                } else {
+                    values.iter().sum::<f64>() / values.len() as f64
+                }
             }
             AggregationType::Sum => values.iter().sum(),
             AggregationType::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
@@ -352,7 +357,8 @@ impl ContinuousQueryEngine {
             AggregationType::Count => values.len() as f64,
             AggregationType::StdDev => {
                 let mean = values.iter().sum::<f64>() / values.len() as f64;
-                let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+                let var =
+                    values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
                 var.sqrt()
             }
             AggregationType::Percentile(p) => {
@@ -384,13 +390,15 @@ mod tests {
 
         // Write some points
         for i in 0..10 {
-            storage.write(
-                "cpu.usage".to_string(),
-                TsPoint {
-                    timestamp: 1000 + i,
-                    value: TsValue::Float(0.5),
-                },
-            ).expect("should be valid");
+            storage
+                .write(
+                    "cpu.usage".to_string(),
+                    TsPoint {
+                        timestamp: 1000 + i,
+                        value: TsValue::Float(0.5),
+                    },
+                )
+                .expect("should be valid");
         }
 
         assert_eq!(storage.stats().hot_entries, 10);
@@ -408,13 +416,15 @@ mod tests {
 
         // Write enough to trigger flush
         for i in 0..100 {
-            storage.write(
-                "cpu.usage".to_string(),
-                TsPoint {
-                    timestamp: 1000 + i,
-                    value: TsValue::Float(0.5),
-                },
-            ).expect("should be valid");
+            storage
+                .write(
+                    "cpu.usage".to_string(),
+                    TsPoint {
+                        timestamp: 1000 + i,
+                        value: TsValue::Float(0.5),
+                    },
+                )
+                .expect("should be valid");
         }
 
         // Should have flushed to warm tier
@@ -466,10 +476,25 @@ mod tests {
     fn test_aggregation() {
         let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
 
-        assert_eq!(ContinuousQueryEngine::aggregate(&values, &AggregationType::Mean), 3.0);
-        assert_eq!(ContinuousQueryEngine::aggregate(&values, &AggregationType::Sum), 15.0);
-        assert_eq!(ContinuousQueryEngine::aggregate(&values, &AggregationType::Min), 1.0);
-        assert_eq!(ContinuousQueryEngine::aggregate(&values, &AggregationType::Max), 5.0);
-        assert_eq!(ContinuousQueryEngine::aggregate(&values, &AggregationType::Count), 5.0);
+        assert_eq!(
+            ContinuousQueryEngine::aggregate(&values, &AggregationType::Mean),
+            3.0
+        );
+        assert_eq!(
+            ContinuousQueryEngine::aggregate(&values, &AggregationType::Sum),
+            15.0
+        );
+        assert_eq!(
+            ContinuousQueryEngine::aggregate(&values, &AggregationType::Min),
+            1.0
+        );
+        assert_eq!(
+            ContinuousQueryEngine::aggregate(&values, &AggregationType::Max),
+            5.0
+        );
+        assert_eq!(
+            ContinuousQueryEngine::aggregate(&values, &AggregationType::Count),
+            5.0
+        );
     }
 }

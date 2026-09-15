@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Shared utility functions for parsers.
 
 /// Find a substring case-insensitively (ASCII only).
@@ -28,18 +32,20 @@ pub fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
 /// Check if `s` starts with `prefix` case-insensitively (ASCII only).
 /// Avoids allocating a new String via `to_uppercase()`.
 pub fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()]
-        .iter()
-        .zip(prefix.as_bytes())
-        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    s.len() >= prefix.len()
+        && s.as_bytes()[..prefix.len()]
+            .iter()
+            .zip(prefix.as_bytes())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
 /// Check if `s` ends with `suffix` case-insensitively (ASCII only).
 pub fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
-    s.len() >= suffix.len() && s.as_bytes()[s.len() - suffix.len()..]
-        .iter()
-        .zip(suffix.as_bytes())
-        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    s.len() >= suffix.len()
+        && s.as_bytes()[s.len() - suffix.len()..]
+            .iter()
+            .zip(suffix.as_bytes())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
 /// Safe slice from start to end, returning empty string if out of bounds.

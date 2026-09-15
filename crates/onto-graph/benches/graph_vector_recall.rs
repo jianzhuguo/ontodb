@@ -3,14 +3,18 @@
 //! Tests whether using graph relationships to expand vector search results
 //! can improve recall rate.
 
-use onto_graph::{GraphStore, Vertex, Edge, PropValue, TraversalEngine, Direction};
+use onto_graph::{Direction, Edge, GraphStore, PropValue, TraversalEngine, Vertex};
 use onto_storage::vector::{DistanceMetric, HnswConfig, HnswIndex, VectorEntry};
 use rand::Rng;
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 fn distance_l2(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt()
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).powi(2))
+        .sum::<f32>()
+        .sqrt()
 }
 
 fn main() {
@@ -35,7 +39,9 @@ fn main() {
     // Build graph where connected vertices have similar vectors
     let store = GraphStore::new();
     for i in 0..n {
-        store.add_vertex(Vertex::new(format!("v{}", i), vec!["Item".to_string()])).unwrap();
+        store
+            .add_vertex(Vertex::new(format!("v{}", i), vec!["Item".to_string()]))
+            .unwrap();
     }
 
     // Connect each vertex to its nearest neighbors in vector space
@@ -49,20 +55,28 @@ fn main() {
         let num_edges = rng.gen_range(1..=avg_degree * 2).min(distances.len());
         for j in 0..num_edges {
             let (target, _) = distances[j];
-            store.add_edge(Edge::new(
-                format!("e{}_{}", i, target),
-                format!("v{}", i),
-                format!("v{}", target),
-                "SIMILAR"
-            )).unwrap();
+            store
+                .add_edge(Edge::new(
+                    format!("e{}_{}", i, target),
+                    format!("v{}", i),
+                    format!("v{}", target),
+                    "SIMILAR",
+                ))
+                .unwrap();
         }
     }
-    println!("Graph: {} vertices, {} edges", store.vertex_count(), store.edge_count());
+    println!(
+        "Graph: {} vertices, {} edges",
+        store.vertex_count(),
+        store.edge_count()
+    );
 
     // Build HNSW index with LOWER ef_search to simulate imperfect recall
     println!("Building HNSW index (low ef_search for imperfect recall)...");
     let config = HnswConfig::new(dim, DistanceMetric::L2)
-        .with_m(16).with_ef_construction(200).with_ef_search(50);  // Lower ef_search
+        .with_m(16)
+        .with_ef_construction(200)
+        .with_ef_search(50); // Lower ef_search
     let mut index = HnswIndex::new(config);
     for (i, v) in vectors.iter().enumerate() {
         index.insert(VectorEntry {
@@ -77,7 +91,9 @@ fn main() {
     let mut queries = Vec::new();
     for _ in 0..num_queries {
         let query: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
-        let mut bf: Vec<(usize, f32)> = vectors.iter().enumerate()
+        let mut bf: Vec<(usize, f32)> = vectors
+            .iter()
+            .enumerate()
             .map(|(i, v)| (i, distance_l2(&query, v)))
             .collect();
         bf.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
@@ -95,8 +111,15 @@ fn main() {
         let results = index.search(query, k);
         pure_time += start.elapsed();
 
-        let hnsw_ids: HashSet<usize> = results.iter()
-            .map(|r| String::from_utf8_lossy(&r.entry.id).strip_prefix("v").unwrap().parse::<usize>().unwrap())
+        let hnsw_ids: HashSet<usize> = results
+            .iter()
+            .map(|r| {
+                String::from_utf8_lossy(&r.entry.id)
+                    .strip_prefix("v")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
             .collect();
 
         let hits = bf_ids.intersection(&hnsw_ids).count();
@@ -118,7 +141,8 @@ fn main() {
         let initial = index.search(query, k * 3);
 
         // Step 2: Expand via graph
-        let mut candidate_ids: HashSet<Vec<u8>> = initial.iter().map(|r| r.entry.id.clone()).collect();
+        let mut candidate_ids: HashSet<Vec<u8>> =
+            initial.iter().map(|r| r.entry.id.clone()).collect();
         for result in &initial {
             let vid = String::from_utf8_lossy(&result.entry.id).to_string();
             if let Ok(neighbors) = engine.hop(&vid, Direction::Out, Some("SIMILAR"), None, None) {
@@ -132,8 +156,15 @@ fn main() {
         let results = index.search_filtered(query, k, &candidate_ids);
         graph1_time += start.elapsed();
 
-        let hnsw_ids: HashSet<usize> = results.iter()
-            .map(|r| String::from_utf8_lossy(&r.entry.id).strip_prefix("v").unwrap().parse::<usize>().unwrap())
+        let hnsw_ids: HashSet<usize> = results
+            .iter()
+            .map(|r| {
+                String::from_utf8_lossy(&r.entry.id)
+                    .strip_prefix("v")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
             .collect();
 
         let hits = bf_ids.intersection(&hnsw_ids).count();
@@ -155,7 +186,8 @@ fn main() {
         let initial = index.search(query, k * 2);
 
         // Step 2: Expand via graph (2 hops)
-        let mut candidate_ids: HashSet<Vec<u8>> = initial.iter().map(|r| r.entry.id.clone()).collect();
+        let mut candidate_ids: HashSet<Vec<u8>> =
+            initial.iter().map(|r| r.entry.id.clone()).collect();
 
         // First hop
         let mut hop1_ids: Vec<String> = Vec::new();
@@ -183,8 +215,15 @@ fn main() {
         let results = index.search_filtered(query, k, &candidate_ids);
         graph2_time += start.elapsed();
 
-        let hnsw_ids: HashSet<usize> = results.iter()
-            .map(|r| String::from_utf8_lossy(&r.entry.id).strip_prefix("v").unwrap().parse::<usize>().unwrap())
+        let hnsw_ids: HashSet<usize> = results
+            .iter()
+            .map(|r| {
+                String::from_utf8_lossy(&r.entry.id)
+                    .strip_prefix("v")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
             .collect();
 
         let hits = bf_ids.intersection(&hnsw_ids).count();
@@ -203,9 +242,15 @@ fn main() {
     println!("  Graph+Vector 2hop: {:.2}%", graph2_recall_pct);
     println!();
     if graph1_recall_pct > pure_recall_pct {
-        println!("  >> 1-hop graph expansion improved recall by {:.2}%", graph1_recall_pct - pure_recall_pct);
+        println!(
+            "  >> 1-hop graph expansion improved recall by {:.2}%",
+            graph1_recall_pct - pure_recall_pct
+        );
     }
     if graph2_recall_pct > pure_recall_pct {
-        println!("  >> 2-hop graph expansion improved recall by {:.2}%", graph2_recall_pct - pure_recall_pct);
+        println!(
+            "  >> 2-hop graph expansion improved recall by {:.2}%",
+            graph2_recall_pct - pure_recall_pct
+        );
     }
 }

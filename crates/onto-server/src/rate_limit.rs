@@ -1,14 +1,12 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Rate limiting for OntoDB HTTP API.
 //!
 //! Implements token bucket algorithm for per-key rate limiting.
 
-use axum::{
-    extract::Request,
-    http::StatusCode,
-    middleware::Next,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::Request, http::StatusCode, middleware::Next, response::IntoResponse, Json};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -180,10 +178,16 @@ pub async fn rate_limit_middleware(
 ) -> impl IntoResponse {
     // Skip rate limiting for health check and metrics endpoints
     let path = request.uri().path();
-    if path == "/api/health" || path == "/api/health/ready" || path == "/api/health/live"
-        || path == "/metrics" || path == "/api/metrics"
-        || path == "/api/docs" || path == "/api/openapi.json"
-        || path == "/console" || path == "/" {
+    if path == "/api/health"
+        || path == "/api/health/ready"
+        || path == "/api/health/live"
+        || path == "/metrics"
+        || path == "/api/metrics"
+        || path == "/api/docs"
+        || path == "/api/openapi.json"
+        || path == "/console"
+        || path == "/"
+    {
         return next.run(request).await;
     }
 

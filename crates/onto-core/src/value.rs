@@ -1,4 +1,8 @@
-﻿//! Ontology-aware value types for OntoDB.
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
+//! Ontology-aware value types for OntoDB.
 //!
 //! These types represent the semantic data model that sits above raw bytes.
 
@@ -122,15 +126,24 @@ mod tests {
         assert_eq!(OntoValue::from(42i64), OntoValue::Int64(42));
         assert_eq!(OntoValue::from(3.14f64), OntoValue::Float64(3.14));
         assert_eq!(OntoValue::from("hello"), OntoValue::String("hello".into()));
-        assert_eq!(OntoValue::from(String::from("hello")), OntoValue::String("hello".into()));
+        assert_eq!(
+            OntoValue::from(String::from("hello")),
+            OntoValue::String("hello".into())
+        );
     }
 
     #[test]
     fn test_from_json() {
         assert_eq!(OntoValue::from(serde_json::Value::Null), OntoValue::Null);
-        assert_eq!(OntoValue::from(serde_json::json!(true)), OntoValue::Bool(true));
+        assert_eq!(
+            OntoValue::from(serde_json::json!(true)),
+            OntoValue::Bool(true)
+        );
         assert_eq!(OntoValue::from(serde_json::json!(42)), OntoValue::Int64(42));
-        assert_eq!(OntoValue::from(serde_json::json!("hello")), OntoValue::String("hello".into()));
+        assert_eq!(
+            OntoValue::from(serde_json::json!("hello")),
+            OntoValue::String("hello".into())
+        );
     }
 
     #[test]
@@ -174,9 +187,15 @@ mod tests {
         match val {
             OntoValue::Object(obj) => {
                 assert_eq!(obj.len(), 2);
-                let name = obj.iter().find(|(k, _)| k == "name").expect("should be valid");
+                let name = obj
+                    .iter()
+                    .find(|(k, _)| k == "name")
+                    .expect("should be valid");
                 assert_eq!(name.1, OntoValue::String("Alice".into()));
-                let age = obj.iter().find(|(k, _)| k == "age").expect("should be valid");
+                let age = obj
+                    .iter()
+                    .find(|(k, _)| k == "age")
+                    .expect("should be valid");
                 assert_eq!(age.1, OntoValue::Int64(30));
             }
             _ => panic!("expected Object"),

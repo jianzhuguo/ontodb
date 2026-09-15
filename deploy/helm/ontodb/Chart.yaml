@@ -9,9 +9,9 @@ keywords:
   - ontology
   - multi-model
   - semantic
-home: https://github.com/ontodb/ontodb
+home: https://gitee.com/ontovalue/ontodb
 sources:
-  - https://github.com/ontodb/ontodb
+  - https://gitee.com/ontovalue/ontodb
 maintainers:
   - name: ontodb
     email: dev@ontodb.io

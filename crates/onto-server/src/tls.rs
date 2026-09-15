@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! TLS configuration for OntoDB server — 等保2.0三级合规.
 //!
 //! Features:
@@ -118,7 +122,9 @@ impl TlsConfig {
             match &self.ca_cert_path {
                 Some(ca) if ca.exists() => {}
                 Some(ca) => return Err(format!("CA certificate not found: {:?}", ca)),
-                None => return Err("Client auth enabled but no CA certificate provided".to_string()),
+                None => {
+                    return Err("Client auth enabled but no CA certificate provided".to_string())
+                }
             }
         }
         Ok(())
@@ -143,7 +149,9 @@ impl TlsConfig {
             )?;
             let mut root_store = RootCertStore::empty();
             for cert in ca_certs {
-                root_store.add(cert).map_err(|e| format!("Failed to add CA cert: {}", e))?;
+                root_store
+                    .add(cert)
+                    .map_err(|e| format!("Failed to add CA cert: {}", e))?;
             }
             WebPkiClientVerifier::builder(Arc::new(root_store))
                 .build()
@@ -157,14 +165,14 @@ impl TlsConfig {
             TlsVersion::Tls13 => &[&rustls::version::TLS13],
             TlsVersion::Tls12 => &[&rustls::version::TLS12, &rustls::version::TLS13],
         };
-        let config = ServerConfig::builder_with_provider(
-            Arc::new(rustls::crypto::aws_lc_rs::default_provider())
-        )
-            .with_protocol_versions(versions)
-            .map_err(|e| format!("Failed to set TLS protocol versions: {}", e))?
-            .with_client_cert_verifier(client_verifier)
-            .with_single_cert(cert_chain, key)
-            .map_err(|e| format!("Failed to build TLS server config: {}", e))?;
+        let config = ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(versions)
+        .map_err(|e| format!("Failed to set TLS protocol versions: {}", e))?
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(cert_chain, key)
+        .map_err(|e| format!("Failed to build TLS server config: {}", e))?;
 
         Ok(config)
     }
@@ -190,13 +198,13 @@ impl TlsConfig {
             TlsVersion::Tls12 => &[&rustls::version::TLS12, &rustls::version::TLS13],
         };
 
-        let mut config = ClientConfig::builder_with_provider(
-            Arc::new(rustls::crypto::aws_lc_rs::default_provider())
-        )
-            .with_protocol_versions(versions)
-            .map_err(|e| format!("Failed to set TLS protocol versions: {}", e))?
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let mut config = ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_protocol_versions(versions)
+        .map_err(|e| format!("Failed to set TLS protocol versions: {}", e))?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
 
         // Enable HTTPS certificate scraping
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -217,9 +225,9 @@ impl TlsConfig {
 
         let subject = extract_subject_from_der(der).unwrap_or_else(|| "unknown".to_string());
         let issuer = extract_issuer_from_der(der).unwrap_or_else(|| "unknown".to_string());
-        
-        let (not_before, not_after, is_expired, days_until_expiry) = 
-            extract_cert_validity(der).unwrap_or_else(|| (String::new(), String::new(), false, None));
+
+        let (not_before, not_after, is_expired, days_until_expiry) = extract_cert_validity(der)
+            .unwrap_or_else(|| (String::new(), String::new(), false, None));
 
         Ok(CertExpiryInfo {
             subject,
@@ -259,8 +267,8 @@ pub fn generate_self_signed_cert(output_dir: &Path) -> Result<TlsConfig, String>
     let server_key_path = output_dir.join("server.key");
 
     // Generate CA key pair
-    let ca_key = rcgen::KeyPair::generate()
-        .map_err(|e| format!("Failed to generate CA key: {}", e))?;
+    let ca_key =
+        rcgen::KeyPair::generate().map_err(|e| format!("Failed to generate CA key: {}", e))?;
 
     // Generate CA certificate
     let ca_params = rcgen::CertificateParams::new(vec!["OntoDB CA".to_string()])
@@ -270,8 +278,8 @@ pub fn generate_self_signed_cert(output_dir: &Path) -> Result<TlsConfig, String>
         .map_err(|e| format!("Failed to generate CA cert: {}", e))?;
 
     // Generate server key pair
-    let server_key = rcgen::KeyPair::generate()
-        .map_err(|e| format!("Failed to generate server key: {}", e))?;
+    let server_key =
+        rcgen::KeyPair::generate().map_err(|e| format!("Failed to generate server key: {}", e))?;
 
     // Generate server certificate signed by CA
     let mut server_params =
@@ -303,7 +311,8 @@ pub fn generate_self_signed_cert(output_dir: &Path) -> Result<TlsConfig, String>
 
 /// Load certificates from a PEM file.
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("Failed to open cert file {:?}: {}", path, e))?;
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Failed to open cert file {:?}: {}", path, e))?;
     let mut reader = std::io::BufReader::new(file);
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
@@ -318,7 +327,8 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
 
 /// Load a private key from a PEM file.
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("Failed to open key file {:?}: {}", path, e))?;
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Failed to open key file {:?}: {}", path, e))?;
     let mut reader = std::io::BufReader::new(file);
 
     // Try PKCS8 first
@@ -385,16 +395,16 @@ fn extract_issuer_from_der(der: &[u8]) -> Option<String> {
 fn extract_cert_validity(der: &[u8]) -> Option<(String, String, bool, Option<u64>)> {
     use x509_parser::prelude::*;
     use x509_parser::time::ASN1Time;
-    
+
     match X509Certificate::from_der(der) {
         Ok((_, cert)) => {
             let not_before = cert.validity().not_before.to_string();
             let not_after = cert.validity().not_after.to_string();
-            
+
             // Check if expired
             let now = ASN1Time::now();
             let is_expired = cert.validity().not_after < now;
-            
+
             // Calculate days until expiry
             let days_until_expiry = if is_expired {
                 Some(0)
@@ -405,7 +415,7 @@ fn extract_cert_validity(der: &[u8]) -> Option<(String, String, bool, Option<u64
                 // For simplicity, we'll return None if we can't calculate
                 None
             };
-            
+
             Some((not_before, not_after, is_expired, days_until_expiry))
         }
         Err(_) => None,
@@ -476,7 +486,11 @@ mod tests {
     fn test_generate_self_signed_cert() {
         let dir = std::env::temp_dir().join(format!("ontodb_tls_test_{}", std::process::id()));
         let result = generate_self_signed_cert(&dir);
-        assert!(result.is_ok(), "Failed to generate self-signed cert: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to generate self-signed cert: {:?}",
+            result.err()
+        );
 
         let config = result.unwrap();
         assert!(config.cert_path.exists());
@@ -508,7 +522,11 @@ mod tests {
         let config = generate_self_signed_cert(&dir).unwrap();
 
         let server_config = config.build_server_config();
-        assert!(server_config.is_ok(), "Failed to build server config: {:?}", server_config.err());
+        assert!(
+            server_config.is_ok(),
+            "Failed to build server config: {:?}",
+            server_config.err()
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -519,7 +537,11 @@ mod tests {
         let config = generate_self_signed_cert(&dir).unwrap();
 
         let client_config = config.build_client_config();
-        assert!(client_config.is_ok(), "Failed to build client config: {:?}", client_config.err());
+        assert!(
+            client_config.is_ok(),
+            "Failed to build client config: {:?}",
+            client_config.err()
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

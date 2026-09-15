@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Time series data types for OntoDB.
 //!
 //! Supports:
@@ -81,7 +85,11 @@ impl fmt::Display for Timestamp {
         let minutes = (remaining % 3600) / 60;
         let seconds = remaining % 60;
         let year = 1970 + days / 365; // Simplified
-        write!(f, "{}-{:02}:{:02}:{:02}.{:09}", year, hours, minutes, seconds, nanos)
+        write!(
+            f,
+            "{}-{:02}:{:02}:{:02}.{:09}",
+            year, hours, minutes, seconds, nanos
+        )
     }
 }
 
@@ -169,7 +177,10 @@ impl TimeSeries {
         if self.points.is_empty() {
             return None;
         }
-        Some((self.points.first()?.timestamp, self.points.last()?.timestamp))
+        Some((
+            self.points.first()?.timestamp,
+            self.points.last()?.timestamp,
+        ))
     }
 
     /// Filter points by time range [start, end).
@@ -198,12 +209,18 @@ impl TimeSeries {
 
     /// Min value.
     pub fn min(&self) -> f64 {
-        self.points.iter().map(|p| p.value).fold(f64::INFINITY, f64::min)
+        self.points
+            .iter()
+            .map(|p| p.value)
+            .fold(f64::INFINITY, f64::min)
     }
 
     /// Max value.
     pub fn max(&self) -> f64 {
-        self.points.iter().map(|p| p.value).fold(f64::NEG_INFINITY, f64::max)
+        self.points
+            .iter()
+            .map(|p| p.value)
+            .fold(f64::NEG_INFINITY, f64::max)
     }
 }
 
@@ -266,7 +283,11 @@ pub enum Aggregation {
 fn aggregate(values: &[f64], agg: &Aggregation) -> f64 {
     match agg {
         Aggregation::Mean => {
-            if values.is_empty() { 0.0 } else { values.iter().sum::<f64>() / values.len() as f64 }
+            if values.is_empty() {
+                0.0
+            } else {
+                values.iter().sum::<f64>() / values.len() as f64
+            }
         }
         Aggregation::Sum => values.iter().sum(),
         Aggregation::Min => values.iter().copied().fold(f64::INFINITY, f64::min),

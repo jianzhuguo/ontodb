@@ -13,7 +13,7 @@ use onto_core::geohash_index::GeohashIndex;
 use onto_core::rtree::{BBox, RTree};
 use onto_core::spatiotemporal::{STIndex, STPoint, STQuery};
 use onto_core::sttrl::{Region, Rule, RuleEngine, RuleType, SpatioTemporalEvent};
-use onto_core::time_series::{self, TimeSeries, DataPoint, Timestamp};
+use onto_core::time_series::{self, DataPoint, TimeSeries, Timestamp};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -56,12 +56,20 @@ fn bench_gis() {
         let _ = Geometry::from_wkb(&wkb);
     }
     let elapsed = start.elapsed();
-    println!("  WKB roundtrip ({}x): {:.2}s ({:.0}/sec)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
+    println!(
+        "  WKB roundtrip ({}x): {:.2}s ({:.0}/sec)",
+        n,
+        elapsed.as_secs_f64(),
+        n as f64 / elapsed.as_secs_f64()
+    );
 
     // Spatial predicates
     let a = Geometry::Polygon(vec![vec![
-        Coord::new(0.0, 0.0), Coord::new(10.0, 0.0),
-        Coord::new(10.0, 10.0), Coord::new(0.0, 10.0), Coord::new(0.0, 0.0),
+        Coord::new(0.0, 0.0),
+        Coord::new(10.0, 0.0),
+        Coord::new(10.0, 10.0),
+        Coord::new(0.0, 10.0),
+        Coord::new(0.0, 0.0),
     ]]);
     let b = Geometry::Point(Coord::new(5.0, 5.0));
 
@@ -70,14 +78,24 @@ fn bench_gis() {
         let _ = geo::contains(&a, &b);
     }
     let elapsed = start.elapsed();
-    println!("  ST_Contains ({}x): {:.2}s ({:.0}/sec)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
+    println!(
+        "  ST_Contains ({}x): {:.2}s ({:.0}/sec)",
+        n,
+        elapsed.as_secs_f64(),
+        n as f64 / elapsed.as_secs_f64()
+    );
 
     let start = Instant::now();
     for _ in 0..n {
         let _ = geo::intersects(&a, &a);
     }
     let elapsed = start.elapsed();
-    println!("  ST_Intersects ({}x): {:.2}s ({:.0}/sec)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
+    println!(
+        "  ST_Intersects ({}x): {:.2}s ({:.0}/sec)",
+        n,
+        elapsed.as_secs_f64(),
+        n as f64 / elapsed.as_secs_f64()
+    );
 
     // Distance calculation
     let p1 = Geometry::Point(Coord::new(116.4, 39.9));
@@ -88,7 +106,12 @@ fn bench_gis() {
         let _ = geo::distance(&p1, &p2);
     }
     let elapsed = start.elapsed();
-    println!("  ST_Distance ({}x): {:.2}s ({:.0}/sec)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
+    println!(
+        "  ST_Distance ({}x): {:.2}s ({:.0}/sec)",
+        n,
+        elapsed.as_secs_f64(),
+        n as f64 / elapsed.as_secs_f64()
+    );
 
     // Geohash encode
     let start = Instant::now();
@@ -96,7 +119,12 @@ fn bench_gis() {
         let _ = geo::geohash_encode(39.9, 116.4, 8);
     }
     let elapsed = start.elapsed();
-    println!("  Geohash encode ({}x): {:.2}s ({:.0}/sec)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
+    println!(
+        "  Geohash encode ({}x): {:.2}s ({:.0}/sec)",
+        n,
+        elapsed.as_secs_f64(),
+        n as f64 / elapsed.as_secs_f64()
+    );
 
     println!();
 }
@@ -117,7 +145,12 @@ fn bench_rtree() {
         tree.insert(BBox::new(x, y, x + 1.0, y + 1.0), format!("item_{}", i));
     }
     let elapsed = start.elapsed();
-    println!("  Insert ({} items): {:.2}s ({:.0}/sec)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
+    println!(
+        "  Insert ({} items): {:.2}s ({:.0}/sec)",
+        n,
+        elapsed.as_secs_f64(),
+        n as f64 / elapsed.as_secs_f64()
+    );
 
     // Range search
     let start = Instant::now();
@@ -127,7 +160,11 @@ fn bench_rtree() {
         total += results.len();
     }
     let elapsed = start.elapsed();
-    println!("  Range search (1000x): {:.2}s ({:.0}/sec)", elapsed.as_secs_f64(), 1000.0 / elapsed.as_secs_f64());
+    println!(
+        "  Range search (1000x): {:.2}s ({:.0}/sec)",
+        elapsed.as_secs_f64(),
+        1000.0 / elapsed.as_secs_f64()
+    );
 
     // KNN search
     let start = Instant::now();
@@ -135,7 +172,11 @@ fn bench_rtree() {
         let _ = tree.knn(50.0, 50.0, 10);
     }
     let elapsed = start.elapsed();
-    println!("  KNN search (1000x): {:.2}s ({:.0}/sec)", elapsed.as_secs_f64(), 1000.0 / elapsed.as_secs_f64());
+    println!(
+        "  KNN search (1000x): {:.2}s ({:.0}/sec)",
+        elapsed.as_secs_f64(),
+        1000.0 / elapsed.as_secs_f64()
+    );
 
     println!();
 }
@@ -156,7 +197,12 @@ fn bench_geohash() {
         idx.insert(&format!("entity_{}", i), lat, lon);
     }
     let elapsed = start.elapsed();
-    println!("  Insert ({} items): {:.2}s ({:.0}/sec)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
+    println!(
+        "  Insert ({} items): {:.2}s ({:.0}/sec)",
+        n,
+        elapsed.as_secs_f64(),
+        n as f64 / elapsed.as_secs_f64()
+    );
 
     // Exact search
     let start = Instant::now();
@@ -164,7 +210,11 @@ fn bench_geohash() {
         let _ = idx.exact_search(39.5, 116.5);
     }
     let elapsed = start.elapsed();
-    println!("  Exact search (1000x): {:.2}s ({:.0}/sec)", elapsed.as_secs_f64(), 1000.0 / elapsed.as_secs_f64());
+    println!(
+        "  Exact search (1000x): {:.2}s ({:.0}/sec)",
+        elapsed.as_secs_f64(),
+        1000.0 / elapsed.as_secs_f64()
+    );
 
     // Prefix search
     let start = Instant::now();
@@ -172,7 +222,11 @@ fn bench_geohash() {
         let _ = idx.prefix_search("wx4g");
     }
     let elapsed = start.elapsed();
-    println!("  Prefix search (1000x): {:.2}s ({:.0}/sec)", elapsed.as_secs_f64(), 1000.0 / elapsed.as_secs_f64());
+    println!(
+        "  Prefix search (1000x): {:.2}s ({:.0}/sec)",
+        elapsed.as_secs_f64(),
+        1000.0 / elapsed.as_secs_f64()
+    );
 
     println!();
 }
@@ -196,19 +250,31 @@ fn bench_spatiotemporal() {
         });
     }
     let elapsed = start.elapsed();
-    println!("  Insert ({} points): {:.2}s ({:.0}/sec)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
+    println!(
+        "  Insert ({} points): {:.2}s ({:.0}/sec)",
+        n,
+        elapsed.as_secs_f64(),
+        n as f64 / elapsed.as_secs_f64()
+    );
 
     // Range query
     let start = Instant::now();
     for _ in 0..1000 {
         let _ = idx.query(&STQuery {
-            min_lon: 0.0, min_lat: 0.0,
-            max_lon: 90.0, max_lat: 90.0,
-            min_time: 0, max_time: 999999,
+            min_lon: 0.0,
+            min_lat: 0.0,
+            max_lon: 90.0,
+            max_lat: 90.0,
+            min_time: 0,
+            max_time: 999999,
         });
     }
     let elapsed = start.elapsed();
-    println!("  Range query (1000x): {:.2}s ({:.0}/sec)", elapsed.as_secs_f64(), 1000.0 / elapsed.as_secs_f64());
+    println!(
+        "  Range query (1000x): {:.2}s ({:.0}/sec)",
+        elapsed.as_secs_f64(),
+        1000.0 / elapsed.as_secs_f64()
+    );
 
     // Radius query
     let start = Instant::now();
@@ -216,7 +282,11 @@ fn bench_spatiotemporal() {
         let _ = idx.radius_query(50.0, 50.0, 1000.0, 0, 999999);
     }
     let elapsed = start.elapsed();
-    println!("  Radius query (1000x): {:.2}s ({:.0}/sec)", elapsed.as_secs_f64(), 1000.0 / elapsed.as_secs_f64());
+    println!(
+        "  Radius query (1000x): {:.2}s ({:.0}/sec)",
+        elapsed.as_secs_f64(),
+        1000.0 / elapsed.as_secs_f64()
+    );
 
     println!();
 }
@@ -256,7 +326,12 @@ fn bench_sttrl() {
         let _ = engine.evaluate(&event);
     }
     let elapsed = start.elapsed();
-    println!("  Evaluate 100 rules ({} events): {:.2}s ({:.0} events/sec)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
+    println!(
+        "  Evaluate 100 rules ({} events): {:.2}s ({:.0} events/sec)",
+        n,
+        elapsed.as_secs_f64(),
+        n as f64 / elapsed.as_secs_f64()
+    );
 
     println!();
 }
@@ -279,24 +354,44 @@ fn bench_timeseries() {
         let _ = time_series::dtw_distance(&seq_a, &seq_b, None);
     }
     let elapsed = start.elapsed();
-    println!("  DTW distance ({}x, len={}): {:.2}s ({:.0}/sec)", n, seq_len, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
+    println!(
+        "  DTW distance ({}x, len={}): {:.2}s ({:.0}/sec)",
+        n,
+        seq_len,
+        elapsed.as_secs_f64(),
+        n as f64 / elapsed.as_secs_f64()
+    );
 
     // Anomaly detection
-    let values: Vec<f64> = (0..1000).map(|i| {
-        if i == 500 { 100.0 } else { (i as f64 * 0.01).sin() }
-    }).collect();
+    let values: Vec<f64> = (0..1000)
+        .map(|i| {
+            if i == 500 {
+                100.0
+            } else {
+                (i as f64 * 0.01).sin()
+            }
+        })
+        .collect();
 
     let start = Instant::now();
     for _ in 0..n {
         let _ = time_series::detect_anomalies(&values, 2.0);
     }
     let elapsed = start.elapsed();
-    println!("  Anomaly detection ({}x, len=1000): {:.2}s ({:.0}/sec)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
+    println!(
+        "  Anomaly detection ({}x, len=1000): {:.2}s ({:.0}/sec)",
+        n,
+        elapsed.as_secs_f64(),
+        n as f64 / elapsed.as_secs_f64()
+    );
 
     // TimeSeries aggregation
     let mut ts = TimeSeries::new("sensor");
     for i in 0..10000 {
-        ts.push(DataPoint::new(Timestamp::from_secs(i), (i as f64 * 0.01).sin()));
+        ts.push(DataPoint::new(
+            Timestamp::from_secs(i),
+            (i as f64 * 0.01).sin(),
+        ));
     }
 
     let start = Instant::now();
@@ -307,7 +402,12 @@ fn bench_timeseries() {
         let _ = ts.max();
     }
     let elapsed = start.elapsed();
-    println!("  TS aggregations ({}x, 10K points): {:.2}s ({:.0}/sec)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
+    println!(
+        "  TS aggregations ({}x, 10K points): {:.2}s ({:.0}/sec)",
+        n,
+        elapsed.as_secs_f64(),
+        n as f64 / elapsed.as_secs_f64()
+    );
 
     println!();
 }

@@ -1,4 +1,8 @@
-﻿//! Disk-based page structures and buffer pool for B+Tree indexes.
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
+//! Disk-based page structures and buffer pool for B+Tree indexes.
 //!
 //! Each B+Tree index is stored in a dedicated `.idx` file with 4KB pages.
 //! A shared buffer pool caches hot pages in memory with LRU eviction.
@@ -326,9 +330,9 @@ impl DiskPage {
     /// Inserts a raw entry into the page at the given slot position.
     /// Shifts existing slots to make room. Returns Ok(()) or Err if full.
     pub fn insert_entry(&mut self, slot_pos: u16, entry_data: &[u8], key_len: u16) -> Result<()> {
-        let mut header = self.header().ok_or_else(|| {
-            onto_core::CoreError::Corruption("invalid page header".into())
-        })?;
+        let mut header = self
+            .header()
+            .ok_or_else(|| onto_core::CoreError::Corruption("invalid page header".into()))?;
 
         let entry_size = entry_data.len();
         let new_slot_end = Self::slot_offset(header.num_entries + 1);
@@ -394,8 +398,7 @@ impl DiskPage {
         let num = header.num_entries;
         let mut entries: Vec<(Vec<u8>, u16)> = Vec::with_capacity(num as usize);
         for i in 0..num {
-            if let (Some(entry_data), Some((_, key_len))) =
-                (self.entry_data(i), self.read_slot(i))
+            if let (Some(entry_data), Some((_, key_len))) = (self.entry_data(i), self.read_slot(i))
             {
                 entries.push((entry_data.to_vec(), key_len));
             }
@@ -426,19 +429,19 @@ impl DiskPage {
     /// Removes the entry at slot position `slot_pos`.
     /// Shifts slots left. Auto-defrags when fragmentation exceeds 25% of usable space.
     pub fn remove_entry(&mut self, slot_pos: u16) -> Result<()> {
-        let mut header = self.header().ok_or_else(|| {
-            onto_core::CoreError::Corruption("invalid page header".into())
-        })?;
+        let mut header = self
+            .header()
+            .ok_or_else(|| onto_core::CoreError::Corruption("invalid page header".into()))?;
 
         if slot_pos >= header.num_entries {
-            return Err(onto_core::CoreError::InvalidArgument("slot out of bounds".into()));
+            return Err(onto_core::CoreError::InvalidArgument(
+                "slot out of bounds".into(),
+            ));
         }
 
         // Read the entry from the slot and compute its size before shifting
         let (_entry_offset, _key_len) = self.read_slot(slot_pos).expect("should be valid");
-        let entry_size = self.entry_data(slot_pos)
-            .map(|d| d.len())
-            .unwrap_or(0);
+        let entry_size = self.entry_data(slot_pos).map(|d| d.len()).unwrap_or(0);
 
         // Shift slots left
         let num = header.num_entries;
@@ -448,7 +451,9 @@ impl DiskPage {
         }
 
         header.num_entries -= 1;
-        header.free_size = header.free_size.saturating_add((entry_size + SLOT_SIZE) as u16);
+        header.free_size = header
+            .free_size
+            .saturating_add((entry_size + SLOT_SIZE) as u16);
         self.set_header(&header);
 
         // Auto-defrag when fragmented space exceeds 25% of usable page capacity
@@ -483,13 +488,15 @@ impl DiskPage {
                 if pks_offset + 2 > PAGE_SIZE {
                     return None;
                 }
-                let num_pks = u16::from_le_bytes([self.data[pks_offset], self.data[pks_offset + 1]]) as usize;
+                let num_pks =
+                    u16::from_le_bytes([self.data[pks_offset], self.data[pks_offset + 1]]) as usize;
                 let mut offset = pks_offset + 2;
                 for _ in 0..num_pks {
                     if offset + 2 > PAGE_SIZE {
                         return None;
                     }
-                    let pk_len = u16::from_le_bytes([self.data[offset], self.data[offset + 1]]) as usize;
+                    let pk_len =
+                        u16::from_le_bytes([self.data[offset], self.data[offset + 1]]) as usize;
                     offset += 2 + pk_len;
                 }
                 offset - start
@@ -508,12 +515,7 @@ impl DiskPage {
 
     /// Inserts an internal entry (key, child_right) at the given slot position.
     /// The leftmost child pointer is stored via `set_first_child`.
-    pub fn insert_internal(
-        &mut self,
-        slot_pos: u16,
-        key: &[u8],
-        child_right: u32,
-    ) -> Result<()> {
+    pub fn insert_internal(&mut self, slot_pos: u16, key: &[u8], child_right: u32) -> Result<()> {
         let entry = encode_internal_entry(key, child_right);
         self.insert_entry(slot_pos, &entry, key.len() as u16)
     }
@@ -547,7 +549,10 @@ impl DiskPage {
     pub fn get_leaf(&self, i: u16) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
         let data = self.entry_data(i)?;
         let (key, pks) = decode_leaf_entry(data)?;
-        Some((key.to_vec(), pks.into_iter().map(|pk| pk.to_vec()).collect()))
+        Some((
+            key.to_vec(),
+            pks.into_iter().map(|pk| pk.to_vec()).collect(),
+        ))
     }
 
     // ── Binary search ────────────────────────────────────────────
@@ -583,9 +588,9 @@ impl DiskPage {
     /// Splits this leaf page, moving the upper half to `new_page`.
     /// Returns the split key (first key of the new page).
     pub fn split_leaf(&mut self, new_page: &mut DiskPage) -> Result<Vec<u8>> {
-        let header = self.header().ok_or_else(|| {
-            onto_core::CoreError::Corruption("invalid page header".into())
-        })?;
+        let header = self
+            .header()
+            .ok_or_else(|| onto_core::CoreError::Corruption("invalid page header".into()))?;
 
         let num = header.num_entries;
         let mid = num / 2;
@@ -610,9 +615,7 @@ impl DiskPage {
         self.set_header(&h);
 
         // The split key is the first key in the new page
-        let split_key = new_page.get_leaf(0)
-            .map(|(k, _)| k)
-            .unwrap_or_default();
+        let split_key = new_page.get_leaf(0).map(|(k, _)| k).unwrap_or_default();
 
         Ok(split_key)
     }
@@ -626,17 +629,17 @@ impl DiskPage {
     /// - entry[mid].key is promoted up
     /// - Right gets entries [mid+1..), first_child = entry[mid].child_right
     pub fn split_internal(&mut self, new_page: &mut DiskPage) -> Result<Vec<u8>> {
-        let header = self.header().ok_or_else(|| {
-            onto_core::CoreError::Corruption("invalid page header".into())
-        })?;
+        let header = self
+            .header()
+            .ok_or_else(|| onto_core::CoreError::Corruption("invalid page header".into()))?;
 
         let num = header.num_entries;
         let mid = num / 2;
 
         // The promoted key is at position mid
-        let (promoted_key, promoted_child_right) = self.get_internal(mid).ok_or_else(|| {
-            onto_core::CoreError::Corruption("failed to read mid entry".into())
-        })?;
+        let (promoted_key, promoted_child_right) = self
+            .get_internal(mid)
+            .ok_or_else(|| onto_core::CoreError::Corruption("failed to read mid entry".into()))?;
 
         // Right page: first_child = promoted_child_right, entries = mid+1..num
         new_page.set_first_child(promoted_child_right);
@@ -709,11 +712,11 @@ impl IndexMeta {
 
         let class_bytes = self.class.as_bytes();
         let column_bytes = self.column.as_bytes();
-        
+
         // Validate name lengths to prevent silent truncation
         let class_len = class_bytes.len().min(Self::MAX_NAME_LEN);
         let col_len = column_bytes.len().min(Self::MAX_NAME_LEN);
-        
+
         buf[20] = class_len as u8;
         buf[21..21 + class_len].copy_from_slice(&class_bytes[..class_len]);
         let col_offset = 21 + class_len;
@@ -741,7 +744,9 @@ impl IndexMeta {
         if 21 + class_len > PAGE_SIZE {
             return None;
         }
-        let class = std::str::from_utf8(&buf[21..21 + class_len]).ok()?.to_string();
+        let class = std::str::from_utf8(&buf[21..21 + class_len])
+            .ok()?
+            .to_string();
 
         let col_offset = 21 + class_len;
         if col_offset >= PAGE_SIZE {
@@ -836,7 +841,8 @@ impl BufferPool {
                 self.evict(file)?;
             }
 
-            self.cache.insert(page_id, CachedPage { data, dirty: false });
+            self.cache
+                .insert(page_id, CachedPage { data, dirty: false });
         }
 
         self.touch(page_id);
@@ -857,7 +863,8 @@ impl BufferPool {
                 self.evict(file)?;
             }
 
-            self.cache.insert(page_id, CachedPage { data, dirty: false });
+            self.cache
+                .insert(page_id, CachedPage { data, dirty: false });
         }
 
         self.touch(page_id);
@@ -885,7 +892,8 @@ impl BufferPool {
     /// Evicts the least recently used page. Flushes it if dirty.
     fn evict(&mut self, file: &mut File) -> Result<()> {
         // Find the page with the lowest access counter
-        let victim_id = self.access_order
+        let victim_id = self
+            .access_order
             .iter()
             .min_by_key(|(_, &counter)| counter)
             .map(|(&id, _)| id);
@@ -1130,9 +1138,9 @@ impl BTreeIndex {
         };
 
         // Get existing PKs and remove the target
-        let (entry_key, mut pks) = leaf.get_leaf(slot).ok_or_else(|| {
-            onto_core::CoreError::Corruption("failed to read leaf entry".into())
-        })?;
+        let (entry_key, mut pks) = leaf
+            .get_leaf(slot)
+            .ok_or_else(|| onto_core::CoreError::Corruption("failed to read leaf entry".into()))?;
         let pk_pos = pks.iter().position(|p| p.as_slice() == pk);
         let pk_pos = match pk_pos {
             Some(i) => i,
@@ -1181,9 +1189,9 @@ impl BTreeIndex {
     /// Handles underflow in a leaf by borrowing from siblings or merging.
     fn handle_leaf_underflow(&mut self, leaf_id: u32) -> Result<()> {
         let leaf = self.get_page(leaf_id)?;
-        let header = leaf.header().ok_or_else(|| {
-            onto_core::CoreError::Corruption("invalid page header".into())
-        })?;
+        let header = leaf
+            .header()
+            .ok_or_else(|| onto_core::CoreError::Corruption("invalid page header".into()))?;
         let parent_id = header.parent;
         if parent_id == NULL_PAGE {
             return Ok(());
@@ -1227,9 +1235,9 @@ impl BTreeIndex {
     /// Handles underflow in an internal node by borrowing or merging.
     fn handle_internal_underflow(&mut self, node_id: u32) -> Result<()> {
         let node = self.get_page(node_id)?;
-        let header = node.header().ok_or_else(|| {
-            onto_core::CoreError::Corruption("invalid page header".into())
-        })?;
+        let header = node
+            .header()
+            .ok_or_else(|| onto_core::CoreError::Corruption("invalid page header".into()))?;
         let parent_id = header.parent;
         if parent_id == NULL_PAGE {
             return Ok(());
@@ -1415,7 +1423,10 @@ impl BTreeIndex {
             onto_core::CoreError::Corruption("failed to read parent entry".into())
         })?;
         // The separator key is at slot child_idx-1
-        let separator_key = parent.slot_key(child_idx - 1).expect("should be valid").to_vec();
+        let separator_key = parent
+            .slot_key(child_idx - 1)
+            .expect("should be valid")
+            .to_vec();
 
         let mut left = self.get_page(left_id)?;
         let mut node = self.get_page(node_id)?;
@@ -1453,7 +1464,10 @@ impl BTreeIndex {
         let node_id = self.get_child(&parent, child_idx)?;
         let right_id = self.get_child(&parent, child_idx + 1)?;
 
-        let separator_key = parent.slot_key(child_idx).expect("should be valid").to_vec();
+        let separator_key = parent
+            .slot_key(child_idx)
+            .expect("should be valid")
+            .to_vec();
 
         let mut node = self.get_page(node_id)?;
         let mut right = self.get_page(right_id)?;
@@ -1625,7 +1639,9 @@ impl BTreeIndex {
                 return Ok(i + 1);
             }
         }
-        Err(onto_core::CoreError::Corruption("child not found in parent".into()))
+        Err(onto_core::CoreError::Corruption(
+            "child not found in parent".into(),
+        ))
     }
 
     /// Gets the child page ID at the given index within a parent.
@@ -1907,7 +1923,8 @@ impl BTreeIndex {
                                 if i == 0 {
                                     page.first_child()
                                 } else {
-                                    let (_, child) = page.get_internal(i - 1).expect("should be valid");
+                                    let (_, child) =
+                                        page.get_internal(i - 1).expect("should be valid");
                                     child
                                 }
                             }
@@ -1941,7 +1958,10 @@ impl BTreeIndex {
     #[allow(dead_code)]
     fn debug_print(&mut self) {
         eprintln!("=== BTreeIndex debug ===");
-        eprintln!("root_page={}, num_pages={}", self.meta.root_page, self.meta.num_pages);
+        eprintln!(
+            "root_page={}, num_pages={}",
+            self.meta.root_page, self.meta.num_pages
+        );
         self.debug_print_page(self.meta.root_page, 0);
         eprintln!("========================");
     }
@@ -1951,25 +1971,48 @@ impl BTreeIndex {
         let indent = "  ".repeat(depth);
         let page = match self.get_page(page_id) {
             Ok(p) => p,
-            Err(e) => { eprintln!("{}ERROR reading page {}: {:?}", indent, page_id, e); return; }
+            Err(e) => {
+                eprintln!("{}ERROR reading page {}: {:?}", indent, page_id, e);
+                return;
+            }
         };
         match page.page_type() {
             PageType::Leaf => {
                 let num = page.num_entries();
-                let first_key = page.get_leaf(0).map(|(k, _)| String::from_utf8_lossy(&k).to_string()).unwrap_or_default();
-                let last_key = if num > 0 { page.get_leaf(num - 1).map(|(k, _)| String::from_utf8_lossy(&k).to_string()).unwrap_or_default() } else { String::new() };
+                let first_key = page
+                    .get_leaf(0)
+                    .map(|(k, _)| String::from_utf8_lossy(&k).to_string())
+                    .unwrap_or_default();
+                let last_key = if num > 0 {
+                    page.get_leaf(num - 1)
+                        .map(|(k, _)| String::from_utf8_lossy(&k).to_string())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 let parent = page.header().map(|h| h.parent).unwrap_or(0);
-                eprintln!("{}Leaf[{}] parent={} entries={} keys=[{}..{}]", indent, page_id, parent, num, first_key, last_key);
+                eprintln!(
+                    "{}Leaf[{}] parent={} entries={} keys=[{}..{}]",
+                    indent, page_id, parent, num, first_key, last_key
+                );
             }
             PageType::Internal => {
                 let num = page.num_entries();
                 let fc = page.first_child();
                 let parent = page.header().map(|h| h.parent).unwrap_or(0);
-                eprintln!("{}Internal[{}] parent={} first_child={} entries={}", indent, page_id, parent, fc, num);
+                eprintln!(
+                    "{}Internal[{}] parent={} first_child={} entries={}",
+                    indent, page_id, parent, fc, num
+                );
                 self.debug_print_page(fc, depth + 1);
                 for i in 0..num {
                     let (key, child) = page.get_internal(i).expect("should be valid");
-                    eprintln!("{}  key={} -> child={}", indent, String::from_utf8_lossy(&key), child);
+                    eprintln!(
+                        "{}  key={} -> child={}",
+                        indent,
+                        String::from_utf8_lossy(&key),
+                        child
+                    );
                     self.debug_print_page(child, depth + 1);
                 }
             }
@@ -2069,9 +2112,12 @@ mod tests {
         let mut page = DiskPage::new(1, PageType::Leaf);
 
         // Insert entries in sorted order
-        page.append_leaf(b"aaa", &[b"pk1".to_vec()]).expect("should be valid");
-        page.append_leaf(b"bbb", &[b"pk2".to_vec()]).expect("should be valid");
-        page.append_leaf(b"ccc", &[b"pk3".to_vec()]).expect("should be valid");
+        page.append_leaf(b"aaa", &[b"pk1".to_vec()])
+            .expect("should be valid");
+        page.append_leaf(b"bbb", &[b"pk2".to_vec()])
+            .expect("should be valid");
+        page.append_leaf(b"ccc", &[b"pk3".to_vec()])
+            .expect("should be valid");
 
         assert_eq!(page.num_entries(), 3);
 
@@ -2109,11 +2155,14 @@ mod tests {
     fn test_disk_page_insert_at_position() {
         let mut page = DiskPage::new(1, PageType::Leaf);
 
-        page.append_leaf(b"aaa", &[b"pk1".to_vec()]).expect("should be valid");
-        page.append_leaf(b"ccc", &[b"pk3".to_vec()]).expect("should be valid");
+        page.append_leaf(b"aaa", &[b"pk1".to_vec()])
+            .expect("should be valid");
+        page.append_leaf(b"ccc", &[b"pk3".to_vec()])
+            .expect("should be valid");
 
         // Insert "bbb" at position 1
-        page.insert_leaf(1, b"bbb", &[b"pk2".to_vec()]).expect("should be valid");
+        page.insert_leaf(1, b"bbb", &[b"pk2".to_vec()])
+            .expect("should be valid");
 
         assert_eq!(page.num_entries(), 3);
         assert_eq!(page.binary_search(b"bbb"), Ok(1));
@@ -2130,9 +2179,12 @@ mod tests {
     fn test_disk_page_remove() {
         let mut page = DiskPage::new(1, PageType::Leaf);
 
-        page.append_leaf(b"aaa", &[b"pk1".to_vec()]).expect("should be valid");
-        page.append_leaf(b"bbb", &[b"pk2".to_vec()]).expect("should be valid");
-        page.append_leaf(b"ccc", &[b"pk3".to_vec()]).expect("should be valid");
+        page.append_leaf(b"aaa", &[b"pk1".to_vec()])
+            .expect("should be valid");
+        page.append_leaf(b"bbb", &[b"pk2".to_vec()])
+            .expect("should be valid");
+        page.append_leaf(b"ccc", &[b"pk3".to_vec()])
+            .expect("should be valid");
 
         page.remove_entry(1).expect("should be valid");
         assert_eq!(page.num_entries(), 2);
@@ -2151,7 +2203,8 @@ mod tests {
         for i in 0..100u32 {
             let key = format!("{:010}", i);
             let pk = format!("pk_{:04}", i);
-            page.append_leaf(key.as_bytes(), &[pk.into_bytes()]).expect("should be valid");
+            page.append_leaf(key.as_bytes(), &[pk.into_bytes()])
+                .expect("should be valid");
         }
 
         assert_eq!(page.num_entries(), 100);
@@ -2159,7 +2212,11 @@ mod tests {
         // Verify all entries are searchable
         for i in 0..100u32 {
             let key = format!("{:010}", i);
-            assert!(page.binary_search(key.as_bytes()).is_ok(), "key {} not found", key);
+            assert!(
+                page.binary_search(key.as_bytes()).is_ok(),
+                "key {} not found",
+                key
+            );
         }
 
         // Verify sorted order
@@ -2179,7 +2236,8 @@ mod tests {
         for i in 0..50u32 {
             let key = format!("{:010}", i);
             let pk = format!("pk_{}", i);
-            page.append_leaf(key.as_bytes(), &[pk.into_bytes()]).expect("should be valid");
+            page.append_leaf(key.as_bytes(), &[pk.into_bytes()])
+                .expect("should be valid");
         }
 
         let split_key = page.split_leaf(&mut new_page).expect("should be valid");
@@ -2309,7 +2367,8 @@ mod tests {
         assert!(page.binary_search(b"any").is_err());
 
         // Single entry
-        page.append_leaf(b"only", &[b"pk".to_vec()]).expect("should be valid");
+        page.append_leaf(b"only", &[b"pk".to_vec()])
+            .expect("should be valid");
         assert_eq!(page.binary_search(b"only"), Ok(0));
         assert!(page.binary_search(b"a").is_err());
         assert!(page.binary_search(b"z").is_err());
@@ -2325,9 +2384,12 @@ mod tests {
         let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
 
         // Insert entries
-        idx.insert(b"100", b"pk1".to_vec()).expect("should be valid");
-        idx.insert(b"200", b"pk2".to_vec()).expect("should be valid");
-        idx.insert(b"300", b"pk3".to_vec()).expect("should be valid");
+        idx.insert(b"100", b"pk1".to_vec())
+            .expect("should be valid");
+        idx.insert(b"200", b"pk2".to_vec())
+            .expect("should be valid");
+        idx.insert(b"300", b"pk3".to_vec())
+            .expect("should be valid");
 
         // Lookup
         let pks = idx.lookup(b"200").expect("should be valid");
@@ -2351,9 +2413,12 @@ mod tests {
         let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
 
         // Same key, different PKs
-        idx.insert(b"100", b"pk1".to_vec()).expect("should be valid");
-        idx.insert(b"100", b"pk2".to_vec()).expect("should be valid");
-        idx.insert(b"100", b"pk3".to_vec()).expect("should be valid");
+        idx.insert(b"100", b"pk1".to_vec())
+            .expect("should be valid");
+        idx.insert(b"100", b"pk2".to_vec())
+            .expect("should be valid");
+        idx.insert(b"100", b"pk3".to_vec())
+            .expect("should be valid");
 
         let pks = idx.lookup(b"100").expect("should be valid");
         assert_eq!(pks.len(), 3);
@@ -2372,19 +2437,26 @@ mod tests {
         for i in 0..20u32 {
             let key = format!("{:04}", i);
             let pk = format!("pk_{}", i);
-            idx.insert(key.as_bytes(), pk.into_bytes()).expect("should be valid");
+            idx.insert(key.as_bytes(), pk.into_bytes())
+                .expect("should be valid");
         }
 
         // Range scan [0005, 0015]
-        let pks = idx.range_scan(Some(b"0005"), Some(b"0015")).expect("should be valid");
+        let pks = idx
+            .range_scan(Some(b"0005"), Some(b"0015"))
+            .expect("should be valid");
         assert_eq!(pks.len(), 11); // 5..=15
 
         // Unbounded low
-        let pks = idx.range_scan(None, Some(b"0002")).expect("should be valid");
+        let pks = idx
+            .range_scan(None, Some(b"0002"))
+            .expect("should be valid");
         assert_eq!(pks.len(), 3); // 0, 1, 2
 
         // Unbounded high
-        let pks = idx.range_scan(Some(b"0018"), None).expect("should be valid");
+        let pks = idx
+            .range_scan(Some(b"0018"), None)
+            .expect("should be valid");
         assert_eq!(pks.len(), 2); // 18, 19
     }
 
@@ -2399,7 +2471,8 @@ mod tests {
         for i in 0..200u32 {
             let key = format!("{:06}", i);
             let pk = format!("pk_{:04}", i);
-            idx.insert(key.as_bytes(), pk.into_bytes()).expect("should be valid");
+            idx.insert(key.as_bytes(), pk.into_bytes())
+                .expect("should be valid");
         }
 
         // Verify all entries are still accessible
@@ -2412,7 +2485,9 @@ mod tests {
         }
 
         // Range scan across split boundaries
-        let pks = idx.range_scan(Some(b"000050"), Some(b"000150")).expect("should be valid");
+        let pks = idx
+            .range_scan(Some(b"000050"), Some(b"000150"))
+            .expect("should be valid");
         assert_eq!(pks.len(), 101); // 50..=150
     }
 
@@ -2427,7 +2502,8 @@ mod tests {
         for i in 0..500u32 {
             let key = format!("{:08}", i);
             let pk = format!("pk_{:04}", i);
-            idx.insert(key.as_bytes(), pk.into_bytes()).expect("should be valid");
+            idx.insert(key.as_bytes(), pk.into_bytes())
+                .expect("should be valid");
         }
 
         // Verify all
@@ -2438,7 +2514,9 @@ mod tests {
         }
 
         // Range scan
-        let pks = idx.range_scan(Some(b"00000100"), Some(b"00000200")).expect("should be valid");
+        let pks = idx
+            .range_scan(Some(b"00000100"), Some(b"00000200"))
+            .expect("should be valid");
         assert_eq!(pks.len(), 101);
     }
 
@@ -2453,7 +2531,8 @@ mod tests {
             for i in 0..100u32 {
                 let key = format!("{:06}", i);
                 let pk = format!("pk_{}", i);
-                idx.insert(key.as_bytes(), pk.into_bytes()).expect("should be valid");
+                idx.insert(key.as_bytes(), pk.into_bytes())
+                    .expect("should be valid");
             }
             idx.flush().expect("should be valid");
         }
@@ -2483,7 +2562,8 @@ mod tests {
         for i in 0..n {
             let key = format!("{:010}", i);
             let pk = format!("pk_{:08}", i);
-            idx.insert(key.as_bytes(), pk.into_bytes()).expect("should be valid");
+            idx.insert(key.as_bytes(), pk.into_bytes())
+                .expect("should be valid");
         }
 
         // Point lookup
@@ -2491,7 +2571,9 @@ mod tests {
         assert_eq!(pks.len(), 1);
 
         // Range scan
-        let pks = idx.range_scan(Some(b"0000000500"), Some(b"0000000599")).expect("should be valid");
+        let pks = idx
+            .range_scan(Some(b"0000000500"), Some(b"0000000599"))
+            .expect("should be valid");
         assert_eq!(pks.len(), 100);
     }
 
@@ -2502,9 +2584,12 @@ mod tests {
 
         let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
 
-        idx.insert(b"100", b"pk1".to_vec()).expect("should be valid");
-        idx.insert(b"200", b"pk2".to_vec()).expect("should be valid");
-        idx.insert(b"300", b"pk3".to_vec()).expect("should be valid");
+        idx.insert(b"100", b"pk1".to_vec())
+            .expect("should be valid");
+        idx.insert(b"200", b"pk2".to_vec())
+            .expect("should be valid");
+        idx.insert(b"300", b"pk3".to_vec())
+            .expect("should be valid");
 
         // Remove one
         let removed = idx.remove(b"200", b"pk2").expect("should be valid");
@@ -2523,9 +2608,12 @@ mod tests {
 
         let mut idx = BTreeIndex::create(&path, "Order", "status").expect("should be valid");
 
-        idx.insert(b"active", b"o1".to_vec()).expect("should be valid");
-        idx.insert(b"active", b"o2".to_vec()).expect("should be valid");
-        idx.insert(b"active", b"o3".to_vec()).expect("should be valid");
+        idx.insert(b"active", b"o1".to_vec())
+            .expect("should be valid");
+        idx.insert(b"active", b"o2".to_vec())
+            .expect("should be valid");
+        idx.insert(b"active", b"o3".to_vec())
+            .expect("should be valid");
 
         idx.remove(b"active", b"o2").expect("should be valid");
         let pks = idx.lookup(b"active").expect("should be valid");
@@ -2544,7 +2632,8 @@ mod tests {
         let path = dir.path().join("remove_none.idx");
 
         let mut idx = BTreeIndex::create(&path, "Product", "price").expect("should be valid");
-        idx.insert(b"100", b"pk1".to_vec()).expect("should be valid");
+        idx.insert(b"100", b"pk1".to_vec())
+            .expect("should be valid");
 
         // Remove non-existent key
         let removed = idx.remove(b"999", b"pk999").expect("should be valid");
@@ -2568,13 +2657,15 @@ mod tests {
         for i in 0..n {
             let key = format!("{:010}", i);
             let pk = format!("pk_{}", i);
-            idx.insert(key.as_bytes(), pk.into_bytes()).expect("should be valid");
+            idx.insert(key.as_bytes(), pk.into_bytes())
+                .expect("should be valid");
         }
 
         // Remove most entries to trigger underflow and merges
         for i in 0..(n - 5) {
             let key = format!("{:010}", i);
-            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes()).expect("should be valid");
+            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes())
+                .expect("should be valid");
         }
 
         // Verify remaining entries
@@ -2598,31 +2689,43 @@ mod tests {
 
         for i in 0..200u32 {
             let key = format!("{:010}", i);
-            idx.insert(key.as_bytes(), format!("pk_{}", i).into_bytes()).expect("should be valid");
+            idx.insert(key.as_bytes(), format!("pk_{}", i).into_bytes())
+                .expect("should be valid");
         }
 
         // Remove even keys
         for i in (0..200u32).step_by(2) {
             let key = format!("{:010}", i);
-            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes()).expect("should be valid");
+            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes())
+                .expect("should be valid");
         }
         // Verify odd keys remain
         for i in (1..200u32).step_by(2) {
             let key = format!("{:010}", i);
-            assert_eq!(idx.lookup(key.as_bytes()).expect("should be valid").len(), 1);
+            assert_eq!(
+                idx.lookup(key.as_bytes()).expect("should be valid").len(),
+                1
+            );
         }
         // Verify even keys are gone
         for i in (0..200u32).step_by(2) {
             let key = format!("{:010}", i);
-            assert!(idx.lookup(key.as_bytes()).expect("should be valid").is_empty());
+            assert!(idx
+                .lookup(key.as_bytes())
+                .expect("should be valid")
+                .is_empty());
         }
 
         // Re-insert even keys
         for i in (0..200u32).step_by(2) {
             let key = format!("{:010}", i);
-            idx.insert(key.as_bytes(), format!("new_{}", i).into_bytes()).expect("should be valid");
+            idx.insert(key.as_bytes(), format!("new_{}", i).into_bytes())
+                .expect("should be valid");
         }
-        assert_eq!(idx.range_scan(None, None).expect("should be valid").len(), 200);
+        assert_eq!(
+            idx.range_scan(None, None).expect("should be valid").len(),
+            200
+        );
     }
 
     #[test]
@@ -2634,14 +2737,19 @@ mod tests {
 
         for i in 0..100u32 {
             let key = format!("{:010}", i);
-            idx.insert(key.as_bytes(), format!("pk_{}", i).into_bytes()).expect("should be valid");
+            idx.insert(key.as_bytes(), format!("pk_{}", i).into_bytes())
+                .expect("should be valid");
         }
 
         for i in 0..100u32 {
             let key = format!("{:010}", i);
-            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes()).expect("should be valid");
+            idx.remove(key.as_bytes(), format!("pk_{}", i).as_bytes())
+                .expect("should be valid");
         }
 
-        assert!(idx.range_scan(None, None).expect("should be valid").is_empty());
+        assert!(idx
+            .range_scan(None, None)
+            .expect("should be valid")
+            .is_empty());
     }
 }

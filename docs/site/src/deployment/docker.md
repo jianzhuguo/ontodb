@@ -42,7 +42,7 @@ volumes:
 ## Building from Dockerfile
 
 ```bash
-git clone https://github.com/ontodb/ontodb.git
+git clone https://gitee.com/ontovalue/ontodb.git
 cd ontodb
 docker build -t ontodb .
 docker run -p 7912:7912 ontodb

@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Vector index warmup for reducing cold-start latency.
 //!
 //! After server restart, vector indexes need to be loaded from disk.
@@ -70,7 +74,11 @@ impl WarmupManager {
 
     /// Mark an index as warmed.
     pub fn mark_warmed(&mut self, class: &str, column: &str, duration_ms: u64) {
-        if let Some(state) = self.states.iter_mut().find(|s| s.class == class && s.column == column) {
+        if let Some(state) = self
+            .states
+            .iter_mut()
+            .find(|s| s.class == class && s.column == column)
+        {
             state.warmed = true;
             state.last_warmup = Some(Instant::now());
             state.warmup_duration_ms = duration_ms;

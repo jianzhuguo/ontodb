@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Spatio-temporal index for OntoDB.
 //!
 //! Combines spatial indexing (quadtree) with temporal indexing (timeline)
@@ -84,14 +88,15 @@ impl STNode {
     /// Check if a point is within this node's bounds.
     #[allow(dead_code)]
     fn contains(&self, lon: f64, lat: f64) -> bool {
-        lon >= self.min_lon && lon <= self.max_lon
-            && lat >= self.min_lat && lat <= self.max_lat
+        lon >= self.min_lon && lon <= self.max_lon && lat >= self.min_lat && lat <= self.max_lat
     }
 
     /// Check if this node's bounds overlap with a query box.
     fn overlaps(&self, q: &STQuery) -> bool {
-        self.min_lon <= q.max_lon && self.max_lon >= q.min_lon
-            && self.min_lat <= q.max_lat && self.max_lat >= q.min_lat
+        self.min_lon <= q.max_lon
+            && self.max_lon >= q.min_lon
+            && self.min_lat <= q.max_lat
+            && self.max_lat >= q.min_lat
     }
 
     /// Subdivide this node into 4 children.
@@ -100,10 +105,10 @@ impl STNode {
         let mid_lat = (self.min_lat + self.max_lat) / 2.0;
 
         self.children = Some(Box::new([
-            STNode::new(self.min_lon, self.min_lat, mid_lon, mid_lat),  // SW
-            STNode::new(mid_lon, self.min_lat, self.max_lon, mid_lat),  // SE
-            STNode::new(self.min_lon, mid_lat, mid_lon, self.max_lat),  // NW
-            STNode::new(mid_lon, mid_lat, self.max_lon, self.max_lat),  // NE
+            STNode::new(self.min_lon, self.min_lat, mid_lon, mid_lat), // SW
+            STNode::new(mid_lon, self.min_lat, self.max_lon, mid_lat), // SE
+            STNode::new(self.min_lon, mid_lat, mid_lon, self.max_lat), // NW
+            STNode::new(mid_lon, mid_lat, self.max_lon, self.max_lat), // NE
         ]));
     }
 
@@ -209,7 +214,15 @@ impl STIndex {
         max_time: i64,
     ) -> Vec<(&STPoint, f64)> {
         let mut results: Vec<(&STPoint, f64)> = Vec::new();
-        Self::knn_node(&self.root, center_lon, center_lat, k, min_time, max_time, &mut results);
+        Self::knn_node(
+            &self.root,
+            center_lon,
+            center_lat,
+            k,
+            min_time,
+            max_time,
+            &mut results,
+        );
         results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(k);
         results
@@ -219,10 +232,7 @@ impl STIndex {
 
     fn insert_into(node: &mut STNode, point: STPoint, depth: usize) {
         // Check if we should subdivide
-        if node.children.is_none()
-            && node.count >= MAX_ENTRIES
-            && depth < MAX_DEPTH
-        {
+        if node.children.is_none() && node.count >= MAX_ENTRIES && depth < MAX_DEPTH {
             node.subdivide();
 
             // Re-insert existing entries into children
@@ -296,7 +306,11 @@ impl STIndex {
                     if let Some(max_pos) = results
                         .iter()
                         .enumerate()
-                        .max_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap_or(std::cmp::Ordering::Equal))
+                        .max_by(|a, b| {
+                            a.1 .1
+                                .partial_cmp(&b.1 .1)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|(i, _)| i)
                     {
                         if d < results[max_pos].1 {
@@ -310,7 +324,9 @@ impl STIndex {
         // Recurse into children
         if let Some(ref children) = node.children {
             for child in children.iter() {
-                Self::knn_node(child, center_lon, center_lat, k, min_time, max_time, results);
+                Self::knn_node(
+                    child, center_lon, center_lat, k, min_time, max_time, results,
+                );
             }
         }
     }
@@ -392,7 +408,11 @@ mod tests {
             max_time: 1500,
         });
         // Should find p2, p3, p4 (timestamps 1200, 1300, 1400)
-        assert!(results.len() >= 1, "expected at least 1 result, got {}", results.len());
+        assert!(
+            results.len() >= 1,
+            "expected at least 1 result, got {}",
+            results.len()
+        );
     }
 
     #[test]
@@ -458,6 +478,10 @@ mod tests {
             min_time: 0,
             max_time: 999999,
         });
-        assert!(results.len() >= 10, "expected at least 10 results, got {}", results.len());
+        assert!(
+            results.len() >= 10,
+            "expected at least 10 results, got {}",
+            results.len()
+        );
     }
 }

@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! MySQL wire protocol (v4.1) connector for OntoDB.
 //!
 //! Allows tools like `mysql` CLI, DBeaver, Navicat, MySQL Workbench,
@@ -22,8 +26,8 @@ use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use onto_query::{QueryExecutor, QueryParser};
 use crate::auth::{AuthConfig, AuthState};
+use onto_query::{QueryExecutor, QueryParser};
 
 // ── MySQL Protocol Constants ──
 
@@ -31,8 +35,7 @@ use crate::auth::{AuthConfig, AuthState};
 const MYSQL_VERSION: &str = "8.0.35-ontodb\0";
 
 /// Server capability flags (CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | etc.)
-const SERVER_CAPABILITIES: u32 =
-    0x00000200  // CLIENT_PROTOCOL_41
+const SERVER_CAPABILITIES: u32 = 0x00000200  // CLIENT_PROTOCOL_41
     | 0x00008000  // CLIENT_SECURE_CONNECTION
     | 0x00000001  // CLIENT_LONG_PASSWORD
     | 0x00000002  // CLIENT_FOUND_ROWS
@@ -89,7 +92,10 @@ pub async fn run_mysql_server(
     let auth = AuthState::new(&auth_config);
     let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_MYSQL_CONNECTIONS));
     println!("MySQL protocol listening on {}", addr);
-    println!("Connect with: mysql -h 127.0.0.1 -P {} -u root", addr.split(':').next_back().unwrap_or("3306"));
+    println!(
+        "Connect with: mysql -h 127.0.0.1 -P {} -u root",
+        addr.split(':').next_back().unwrap_or("3306")
+    );
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -155,7 +161,14 @@ async fn handle_mysql_client(
     if auth.enabled {
         let password_str = std::str::from_utf8(provided_password).unwrap_or("");
         if auth.validate(password_str).is_none() {
-            send_error_packet(&mut stream, seq + 1, 1045, "28000", "Access denied for user").await?;
+            send_error_packet(
+                &mut stream,
+                seq + 1,
+                1045,
+                "28000",
+                "Access denied for user",
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -215,7 +228,14 @@ async fn handle_mysql_client(
                 }
                 _ => {
                     // Unknown command — send error
-                    send_error_packet(&mut stream, 1, 1047, "08S01", &format!("Unknown command: 0x{:02X}", cmd)).await?;
+                    send_error_packet(
+                        &mut stream,
+                        1,
+                        1047,
+                        "08S01",
+                        &format!("Unknown command: 0x{:02X}", cmd),
+                    )
+                    .await?;
                 }
             }
         }
@@ -241,20 +261,18 @@ async fn handle_mysql_query(
             };
 
             match result {
-                Ok(query_result) => {
-                    match query_result {
-                        onto_query::QueryResult::Rows(rows) => {
-                            if rows.is_empty() {
-                                send_ok_packet(stream, 0).await?;
-                            } else {
-                                send_result_set(stream, &rows).await?;
-                            }
-                        }
-                        onto_query::QueryResult::Success(msg) => {
-                            send_ok_packet_with_message(stream, 0, &msg).await?;
+                Ok(query_result) => match query_result {
+                    onto_query::QueryResult::Rows(rows) => {
+                        if rows.is_empty() {
+                            send_ok_packet(stream, 0).await?;
+                        } else {
+                            send_result_set(stream, &rows).await?;
                         }
                     }
-                }
+                    onto_query::QueryResult::Success(msg) => {
+                        send_ok_packet_with_message(stream, 0, &msg).await?;
+                    }
+                },
                 Err(e) => {
                     send_error_packet(stream, 1, 1105, "HY000", &format!("{}", e)).await?;
                 }
@@ -290,7 +308,9 @@ async fn send_result_set(
     // 2. Column definitions
     for (i, col_name) in columns.iter().enumerate() {
         let mut seq = (i as u8) + 2;
-        if seq > 250 { seq %= 250; }
+        if seq > 250 {
+            seq %= 250;
+        }
         let col_def = build_column_definition(col_name, MYSQL_TYPE_VAR_STRING);
         write_packet(stream, seq, &col_def).await?;
     }

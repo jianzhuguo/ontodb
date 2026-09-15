@@ -1,6 +1,6 @@
 # OntoDB TypeScript/JavaScript SDK
 
-Official client library for the [OntoDB](https://github.com/ontodb/ontodb) HTTP API.
+Official client library for the [OntoDB](https://gitee.com/ontovalue/ontodb) HTTP API.
 
 ## Installation
 

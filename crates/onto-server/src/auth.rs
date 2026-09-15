@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! API Key authentication for OntoDB HTTP API.
 //!
 //! Supports multiple API keys with configurable permissions.
@@ -103,7 +107,9 @@ pub struct IpWhitelistConfig {
     pub allow_localhost: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 impl Default for IpWhitelistConfig {
     fn default() -> Self {
@@ -120,7 +126,11 @@ impl Default for IpWhitelistConfig {
 pub struct AuthState {
     /// Map of API key -> (description, permission, rate_limit, allowed_ips)
     /// Wrapped in RwLock for hot-reload without server restart.
-    pub keys: Arc<parking_lot::RwLock<HashMap<String, (String, Permission, Option<u32>, Option<Vec<String>>)>>>,
+    pub keys: Arc<
+        parking_lot::RwLock<
+            HashMap<String, (String, Permission, Option<u32>, Option<Vec<String>>)>,
+        >,
+    >,
     /// Whether auth is enabled.
     pub enabled: bool,
     /// Metrics counters for auth events.
@@ -231,7 +241,11 @@ impl AuthState {
         *self.keys.write() = new_keys;
         *self.last_modified.write() = Some(mod_time);
 
-        eprintln!("Auth config reloaded from {} ({} keys)", path.display(), config.keys.len());
+        eprintln!(
+            "Auth config reloaded from {} ({} keys)",
+            path.display(),
+            config.keys.len()
+        );
         true
     }
 
@@ -254,7 +268,11 @@ impl AuthState {
         let config: AuthConfig = match serde_json::from_str(&data) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Auth force_reload failed to parse {}: {}", path.display(), e);
+                eprintln!(
+                    "Auth force_reload failed to parse {}: {}",
+                    path.display(),
+                    e
+                );
                 return false;
             }
         };
@@ -263,7 +281,12 @@ impl AuthState {
         for key_config in &config.keys {
             new_keys.insert(
                 key_config.key.clone(),
-                (key_config.description.clone(), key_config.permission.clone(), key_config.rate_limit, key_config.allowed_ips.clone()),
+                (
+                    key_config.description.clone(),
+                    key_config.permission.clone(),
+                    key_config.rate_limit,
+                    key_config.allowed_ips.clone(),
+                ),
             );
         }
 
@@ -276,7 +299,11 @@ impl AuthState {
             }
         }
 
-        eprintln!("Auth config force-reloaded from {} ({} keys)", path.display(), config.keys.len());
+        eprintln!(
+            "Auth config force-reloaded from {} ({} keys)",
+            path.display(),
+            config.keys.len()
+        );
         true
     }
 
@@ -300,7 +327,10 @@ impl AuthState {
 
     /// Validate an API key and return its permission level.
     /// Uses constant-time comparison to prevent timing attacks.
-    pub fn validate(&self, key: &str) -> Option<(String, Permission, Option<u32>, Option<Vec<String>>)> {
+    pub fn validate(
+        &self,
+        key: &str,
+    ) -> Option<(String, Permission, Option<u32>, Option<Vec<String>>)> {
         let keys = self.keys.read();
         for (stored_key, value) in keys.iter() {
             if constant_time_eq(stored_key.as_bytes(), key.as_bytes()) {
@@ -315,7 +345,12 @@ impl AuthState {
     /// The client sends: "md5" + hex(md5(md5(password + username) + salt))
     /// where inner md5 produces a 32-char hex string, and the outer md5
     /// takes those 32 ASCII bytes + 4 raw salt bytes.
-    pub fn validate_md5(&self, client_hash: &str, username: &str, salt: &[u8; 4]) -> Option<(String, Permission, Option<u32>, Option<Vec<String>>)> {
+    pub fn validate_md5(
+        &self,
+        client_hash: &str,
+        username: &str,
+        salt: &[u8; 4],
+    ) -> Option<(String, Permission, Option<u32>, Option<Vec<String>>)> {
         let hash_hex = client_hash.strip_prefix("md5").unwrap_or(client_hash);
         if hash_hex.len() != 32 {
             return None;
@@ -343,7 +378,9 @@ impl AuthState {
         if !wl.enabled {
             return true;
         }
-        if wl.allow_localhost && (client_ip == "127.0.0.1" || client_ip == "::1" || client_ip.starts_with("127.")) {
+        if wl.allow_localhost
+            && (client_ip == "127.0.0.1" || client_ip == "::1" || client_ip.starts_with("127."))
+        {
             return true;
         }
         if wl.allowed_ips.is_empty() {
@@ -377,7 +414,10 @@ impl AuthState {
     /// Get the rate limit for a specific key, or None if not configured.
     #[allow(dead_code)]
     pub fn get_rate_limit(&self, key: &str) -> Option<u32> {
-        self.keys.read().get(key).and_then(|(_, _, limit, _)| *limit)
+        self.keys
+            .read()
+            .get(key)
+            .and_then(|(_, _, limit, _)| *limit)
     }
 }
 
@@ -401,7 +441,8 @@ pub async fn auth_middleware(
                 "success": false,
                 "error": format!("IP {} is not in the server whitelist", client_ip)
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Skip auth if disabled
@@ -469,7 +510,8 @@ pub async fn auth_middleware(
                 "success": false,
                 "error": format!("IP {} is not allowed for this API key", client_ip)
             })),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Check permission for this endpoint
@@ -540,7 +582,9 @@ fn extract_client_ip(request: &Request) -> String {
 fn is_valid_ip(s: &str) -> bool {
     s.parse::<std::net::Ipv4Addr>().is_ok()
         || s.parse::<std::net::Ipv6Addr>().is_ok()
-        || (s.starts_with('[') && s.ends_with(']') && s[1..s.len()-1].parse::<std::net::Ipv6Addr>().is_ok())
+        || (s.starts_with('[')
+            && s.ends_with(']')
+            && s[1..s.len() - 1].parse::<std::net::Ipv6Addr>().is_ok())
 }
 
 /// Constant-time byte comparison to prevent timing attacks.

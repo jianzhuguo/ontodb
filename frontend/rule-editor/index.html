@@ -1,0 +1,1283 @@
+<!-- Copyright (c) 2024-2026 OntoDB Team -->
+<!-- Licensed under the Business Source License 1.1 (BUSL-1.1). -->
+<!-- See LICENSE for details. Change Date: 2031-09-15. -->
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OntoDB 规则编辑器</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+            background: #0f1419;
+            color: #e7e9ea;
+            min-height: 100vh;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            padding: 20px 30px;
+            border-bottom: 1px solid #2f3336;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .header h1 {
+            font-size: 20px;
+            font-weight: 600;
+            color: #ffffff;
+        }
+
+        .header .subtitle {
+            font-size: 12px;
+            color: #71767b;
+            margin-top: 4px;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border-radius: 6px;
+            border: none;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: #1d9bf0;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #1a8cd8;
+        }
+
+        .btn-secondary {
+            background: #2f3336;
+            color: #e7e9ea;
+        }
+
+        .btn-secondary:hover {
+            background: #3a3d41;
+        }
+
+        .btn-success {
+            background: #00ba7c;
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: #00a06b;
+        }
+
+        .btn-danger {
+            background: #f4212e;
+            color: white;
+        }
+
+        .main-container {
+            display: grid;
+            grid-template-columns: 280px 1fr 320px;
+            height: calc(100vh - 70px);
+        }
+
+        /* 左侧组件面板 */
+        .component-panel {
+            background: #16181c;
+            border-right: 1px solid #2f3336;
+            padding: 16px;
+            overflow-y: auto;
+        }
+
+        .panel-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #71767b;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #2f3336;
+        }
+
+        .component-group {
+            margin-bottom: 20px;
+        }
+
+        .component-item {
+            background: #1e2028;
+            border: 1px solid #2f3336;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 8px;
+            cursor: grab;
+            transition: all 0.2s;
+            user-select: none;
+        }
+
+        .component-item:hover {
+            border-color: #1d9bf0;
+            background: #1e2732;
+        }
+
+        .component-item:active {
+            cursor: grabbing;
+            transform: scale(0.98);
+        }
+
+        .component-item .icon {
+            font-size: 16px;
+            margin-bottom: 6px;
+        }
+
+        .component-item .name {
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .component-item .desc {
+            font-size: 11px;
+            color: #71767b;
+            margin-top: 4px;
+        }
+
+        /* 中央画布区域 */
+        .canvas-area {
+            background: #16181c;
+            padding: 20px;
+            overflow: auto;
+            position: relative;
+        }
+
+        .canvas {
+            background: #1a1d21;
+            border: 2px dashed #2f3336;
+            border-radius: 12px;
+            min-height: 500px;
+            padding: 20px;
+            position: relative;
+        }
+
+        .canvas.drag-over {
+            border-color: #1d9bf0;
+            background: #1a2332;
+        }
+
+        .canvas-placeholder {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            color: #71767b;
+        }
+
+        .canvas-placeholder .icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+
+        .canvas-placeholder .text {
+            font-size: 14px;
+        }
+
+        /* 规则块 */
+        .rule-block {
+            background: #1e2028;
+            border: 1px solid #2f3336;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 12px;
+            position: relative;
+        }
+
+        .rule-block .rule-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 12px;
+        }
+
+        .rule-block .rule-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: #1d9bf0;
+        }
+
+        .rule-block .rule-badge {
+            font-size: 10px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 600;
+        }
+
+        .badge-condition {
+            background: #1d4ed8;
+            color: white;
+        }
+
+        .badge-action {
+            background: #00ba7c;
+            color: white;
+        }
+
+        .condition-item, .action-item {
+            background: #252830;
+            border-radius: 6px;
+            padding: 10px 12px;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .condition-item select, .action-item select {
+            background: #1a1d21;
+            border: 1px solid #2f3336;
+            color: #e7e9ea;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+
+        .condition-item input, .action-item input {
+            background: #1a1d21;
+            border: 1px solid #2f3336;
+            color: #e7e9ea;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 13px;
+            width: 120px;
+        }
+
+        .remove-btn {
+            background: none;
+            border: none;
+            color: #f4212e;
+            cursor: pointer;
+            font-size: 16px;
+            padding: 4px;
+        }
+
+        .add-btn {
+            background: none;
+            border: 1px dashed #2f3336;
+            color: #71767b;
+            cursor: pointer;
+            font-size: 12px;
+            padding: 8px;
+            border-radius: 6px;
+            width: 100%;
+            margin-top: 8px;
+        }
+
+        .add-btn:hover {
+            border-color: #1d9bf0;
+            color: #1d9bf0;
+        }
+
+        /* 右侧预览面板 */
+        .preview-panel {
+            background: #16181c;
+            border-left: 1px solid #2f3336;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .preview-header {
+            padding: 16px;
+            border-bottom: 1px solid #2f3336;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .preview-content {
+            flex: 1;
+            overflow: auto;
+            padding: 16px;
+        }
+
+        .dsl-preview {
+            background: #1a1d21;
+            border-radius: 8px;
+            padding: 16px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            color: #e7e9ea;
+            min-height: 200px;
+        }
+
+        .dsl-preview .keyword {
+            color: #ff7b72;
+        }
+
+        .dsl-preview .string {
+            color: #a5d6ff;
+        }
+
+        .dsl-preview .number {
+            color: #79c0ff;
+        }
+
+        .dsl-preview .comment {
+            color: #71767b;
+        }
+
+        /* 规则列表 */
+        .rule-list {
+            margin-top: 16px;
+        }
+
+        .rule-list-item {
+            background: #1e2028;
+            border-radius: 8px;
+            padding: 12px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .rule-list-item:hover {
+            background: #252830;
+        }
+
+        .rule-list-item.active {
+            border: 1px solid #1d9bf0;
+        }
+
+        .rule-list-item .rule-name {
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .rule-list-item .rule-meta {
+            font-size: 11px;
+            color: #71767b;
+            margin-top: 4px;
+        }
+
+        /* 测试区域 */
+        .test-area {
+            margin-top: 16px;
+            padding: 16px;
+            background: #1e2028;
+            border-radius: 8px;
+        }
+
+        .test-area h3 {
+            font-size: 13px;
+            font-weight: 600;
+            margin-bottom: 12px;
+        }
+
+        .test-input {
+            width: 100%;
+            background: #1a1d21;
+            border: 1px solid #2f3336;
+            color: #e7e9ea;
+            padding: 10px;
+            border-radius: 6px;
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+            resize: vertical;
+            min-height: 80px;
+        }
+
+        .test-result {
+            margin-top: 12px;
+            padding: 12px;
+            background: #1a1d21;
+            border-radius: 6px;
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+            min-height: 60px;
+        }
+
+        .test-result.success {
+            border-left: 3px solid #00ba7c;
+        }
+
+        .test-result.error {
+            border-left: 3px solid #f4212e;
+        }
+
+        /* 设置区域 */
+        .settings-group {
+            margin-bottom: 16px;
+        }
+
+        .settings-group label {
+            display: block;
+            font-size: 12px;
+            font-weight: 500;
+            margin-bottom: 6px;
+            color: #71767b;
+        }
+
+        .settings-group input, .settings-group select {
+            width: 100%;
+            background: #1a1d21;
+            border: 1px solid #2f3336;
+            color: #e7e9ea;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+        }
+
+        /* 通知 */
+        .notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #1e2028;
+            border: 1px solid #2f3336;
+            border-radius: 8px;
+            padding: 16px 20px;
+            display: none;
+            z-index: 1000;
+            animation: slideIn 0.3s ease;
+        }
+
+        .notification.show {
+            display: block;
+        }
+
+        .notification.success {
+            border-left: 3px solid #00ba7c;
+        }
+
+        .notification.error {
+            border-left: 3px solid #f4212e;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
+            }
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+
+        /* 模态框 */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 100;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal.show {
+            display: flex;
+        }
+
+        .modal-content {
+            background: #16181c;
+            border: 1px solid #2f3336;
+            border-radius: 12px;
+            padding: 24px;
+            width: 500px;
+            max-width: 90%;
+        }
+
+        .modal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+        }
+
+        .modal-header h2 {
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            color: #71767b;
+            font-size: 24px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <!-- 头部 -->
+    <div class="header">
+        <div>
+            <h1>OntoDB 规则编辑器</h1>
+            <div class="subtitle">拖拽组件创建规则，实时预览DSL输出</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 16px;">
+            <div style="text-align: right;">
+                <div style="font-size: 11px; color: #71767b;">API状态</div>
+                <div id="apiStatus" style="font-size: 12px; color: #71767b;">检查中...</div>
+            </div>
+            <div class="header-actions">
+                <button class="btn btn-secondary" onclick="loadRules()">📂 加载规则</button>
+                <button class="btn btn-secondary" onclick="exportDSL()">📋 导出DSL</button>
+                <button class="btn btn-success" onclick="saveRule()">💾 保存规则</button>
+                <button class="btn btn-primary" onclick="testRule()">▶ 测试规则</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="main-container">
+        <!-- 左侧组件面板 -->
+        <div class="component-panel">
+            <div class="component-group">
+                <div class="panel-title">条件组件 (WHEN)</div>
+                <div class="component-item" draggable="true" data-type="condition" data-type2="number">
+                    <div class="icon">🔢</div>
+                    <div class="name">数值条件</div>
+                    <div class="desc">属性 > 值</div>
+                </div>
+                <div class="component-item" draggable="true" data-type="condition" data-type2="text">
+                    <div class="icon">📝</div>
+                    <div class="name">文本条件</div>
+                    <div class="desc">属性 = 值</div>
+                </div>
+                <div class="component-item" draggable="true" data-type="condition" data-type2="contains">
+                    <div class="icon">🔍</div>
+                    <div class="name">包含条件</div>
+                    <div class="desc">属性 包含 值</div>
+                </div>
+            </div>
+
+            <div class="component-group">
+                <div class="panel-title">动作组件 (THEN)</div>
+                <div class="component-item" draggable="true" data-type="action" data-type2="set">
+                    <div class="icon">✏️</div>
+                    <div class="name">设置属性</div>
+                    <div class="desc">属性 = 值</div>
+                </div>
+                <div class="component-item" draggable="true" data-type="action" data-type2="notify">
+                    <div class="icon">🔔</div>
+                    <div class="name">发送通知</div>
+                    <div class="desc">通知.级别 = 值</div>
+                </div>
+            </div>
+
+            <div class="component-group">
+                <div class="panel-title">模板</div>
+                <div class="component-item" onclick="loadTemplate('temperature')">
+                    <div class="icon">🌡️</div>
+                    <div class="name">温度预警</div>
+                    <div class="desc">IoT温度监控</div>
+                </div>
+                <div class="component-item" onclick="loadTemplate('security')">
+                    <div class="icon">🔒</div>
+                    <div class="name">安全检测</div>
+                    <div class="desc">异常行为检测</div>
+                </div>
+                <div class="component-item" onclick="loadTemplate('health')">
+                    <div class="icon">❤️</div>
+                    <div class="name">健康监控</div>
+                    <div class="desc">医疗健康预警</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 中央画布 -->
+        <div class="canvas-area">
+            <div class="canvas" id="canvas" ondrop="handleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)">
+                <div class="canvas-placeholder" id="placeholder">
+                    <div class="icon">📋</div>
+                    <div class="text">拖拽左侧组件到此处创建规则</div>
+                    <div class="text" style="margin-top: 8px; font-size: 12px; color: #536471;">或点击模板快速开始</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 右侧预览面板 -->
+        <div class="preview-panel">
+            <div class="preview-header">
+                <span style="font-weight: 600;">规则预览</span>
+                <button class="btn btn-secondary" onclick="copyDSL()" style="padding: 4px 10px; font-size: 11px;">📋 复制</button>
+            </div>
+            <div class="preview-content">
+                <div class="settings-group">
+                    <label>规则名称</label>
+                    <input type="text" id="ruleName" placeholder="输入规则名称" value="我的规则">
+                </div>
+                <div class="settings-group">
+                    <label>规则ID</label>
+                    <input type="text" id="ruleId" placeholder="自动生成">
+                </div>
+                <div class="settings-group">
+                    <label>优先级</label>
+                    <select id="priority">
+                        <option value="低">低</option>
+                        <option value="中" selected>中</option>
+                        <option value="高">高</option>
+                        <option value="紧急">紧急</option>
+                    </select>
+                </div>
+
+                <div class="panel-title" style="margin-top: 16px;">DSL 预览</div>
+                <div class="dsl-preview" id="dslPreview">
+                    <span class="comment"># 在画布中添加条件和动作</span>
+                    <br>
+                    <span class="comment"># DSL 预览将在此显示</span>
+                </div>
+
+                <div class="test-area">
+                    <h3>🧪 规则测试</h3>
+                    <textarea class="test-input" id="testInput" placeholder='输入测试数据，例如：
+{
+  "设备": {"温度": 90, "运行时间": 30},
+  "通知": {"级别": ""}
+}'></textarea>
+                    <button class="btn btn-primary" onclick="runTest()" style="width: 100%; margin-top: 8px;">▶ 运行测试</button>
+                    <div class="test-result" id="testResult"></div>
+                </div>
+
+                <div class="rule-list">
+                    <div class="panel-title">已保存的规则</div>
+                    <div id="ruleList"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 通知 -->
+    <div class="notification" id="notification"></div>
+
+    <!-- 导出模态框 -->
+    <div class="modal" id="exportModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>导出 DSL</h2>
+                <button class="modal-close" onclick="closeModal('exportModal')">×</button>
+            </div>
+            <textarea id="exportContent" style="width: 100%; height: 300px; background: #1a1d21; border: 1px solid #2f3336; color: #e7e9ea; padding: 12px; border-radius: 8px; font-family: monospace; font-size: 13px;" readonly></textarea>
+            <div style="margin-top: 16px; display: flex; gap: 10px; justify-content: flex-end;">
+                <button class="btn btn-secondary" onclick="closeModal('exportModal')">关闭</button>
+                <button class="btn btn-primary" onclick="downloadDSL()">下载 .dsl 文件</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // API 配置 - 连接 ontodb-rules 服务 (端口7912)
+        const API_BASE = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+            ? `http://${window.location.hostname}:7912`
+            : `http://${window.location.hostname}:7912`;
+
+        // 状态管理
+        let currentRule = {
+            name: '我的规则',
+            id: '',
+            priority: '中',
+            conditions: [],
+            actions: []
+        };
+        let savedRules = [];
+        let apiConnected = false;
+
+        // 检查API连接状态
+        async function checkApiConnection() {
+            try {
+                const response = await fetch(`${API_BASE}/api/rules/stats`, { 
+                    method: 'GET',
+                    signal: AbortSignal.timeout(3000)
+                });
+                if (response.ok) {
+                    const data = await response.json();
+                    apiConnected = true;
+                    const statusEl = document.getElementById('apiStatus');
+                    if (statusEl) {
+                        statusEl.textContent = `已连接 (${data.total} 条规则)`;
+                        statusEl.style.color = '#00ba7c';
+                    }
+                    return true;
+                }
+            } catch (e) {
+                // 连接失败
+            }
+            apiConnected = false;
+            const statusEl = document.getElementById('apiStatus');
+            if (statusEl) {
+                statusEl.textContent = '离线模式';
+                statusEl.style.color = '#71767b';
+            }
+            return false;
+        }
+
+        // 拖拽处理
+        function handleDragOver(e) {
+            e.preventDefault();
+            e.currentTarget.classList.add('drag-over');
+        }
+
+        function handleDragLeave(e) {
+            e.currentTarget.classList.remove('drag-over');
+        }
+
+        function handleDrop(e) {
+            e.preventDefault();
+            e.currentTarget.classList.remove('drag-over');
+
+            const type = e.dataTransfer.getData('type');
+            const type2 = e.dataTransfer.getData('type2');
+
+            if (type === 'condition') {
+                addCondition(type2);
+            } else if (type === 'action') {
+                addAction(type2);
+            }
+
+            updatePreview();
+        }
+
+        // 组件拖拽事件
+        document.querySelectorAll('.component-item[draggable]').forEach(item => {
+            item.addEventListener('dragstart', (e) => {
+                e.dataTransfer.setData('type', item.dataset.type);
+                e.dataTransfer.setData('type2', item.dataset.type2);
+            });
+        });
+
+        // 添加条件
+        function addCondition(type) {
+            const placeholder = document.getElementById('placeholder');
+            if (placeholder) placeholder.remove();
+
+            const id = 'cond_' + Date.now();
+            currentRule.conditions.push({
+                id,
+                entity: '设备',
+                attribute: '温度',
+                operator: '>',
+                value: '80'
+            });
+
+            renderCanvas();
+        }
+
+        // 添加动作
+        function addAction(type) {
+            const placeholder = document.getElementById('placeholder');
+            if (placeholder) placeholder.remove();
+
+            const id = 'action_' + Date.now();
+            currentRule.actions.push({
+                id,
+                entity: '设备',
+                attribute: '状态',
+                value: '警告'
+            });
+
+            renderCanvas();
+        }
+
+        // 渲染画布
+        function renderCanvas() {
+            const canvas = document.getElementById('canvas');
+            let html = '';
+
+            if (currentRule.conditions.length === 0 && currentRule.actions.length === 0) {
+                html = `
+                    <div class="canvas-placeholder" id="placeholder">
+                        <div class="icon">📋</div>
+                        <div class="text">拖拽左侧组件到此处创建规则</div>
+                    </div>`;
+            } else {
+                // 条件块
+                if (currentRule.conditions.length > 0) {
+                    html += `
+                        <div class="rule-block">
+                            <div class="rule-header">
+                                <span class="rule-title">WHEN (条件)</span>
+                                <span class="rule-badge badge-condition">条件</span>
+                            </div>`;
+
+                    currentRule.conditions.forEach((cond, i) => {
+                        html += `
+                            <div class="condition-item">
+                                <input type="text" value="${cond.entity}" onchange="updateCondition(${i}, 'entity', this.value)" style="width: 80px;" placeholder="实体">
+                                <span style="color: #71767b;">.</span>
+                                <input type="text" value="${cond.attribute}" onchange="updateCondition(${i}, 'attribute', this.value)" style="width: 100px;" placeholder="属性">
+                                <select onchange="updateCondition(${i}, 'operator', this.value)">
+                                    <option ${cond.operator === '>' ? 'selected' : ''}>></option>
+                                    <option ${cond.operator === '<' ? 'selected' : ''}><</option>
+                                    <option ${cond.operator === '=' ? 'selected' : ''}>=</option>
+                                    <option ${cond.operator === '>=' ? 'selected' : ''}>>=</option>
+                                    <option ${cond.operator === '<=' ? 'selected' : ''}><=</option>
+                                    <option ${cond.operator === '!=' ? 'selected' : ''}>!=</option>
+                                    <option ${cond.operator === 'contains' ? 'selected' : ''}>contains</option>
+                                </select>
+                                <input type="text" value="${cond.value}" onchange="updateCondition(${i}, 'value', this.value)" style="width: 100px;" placeholder="值">
+                                <button class="remove-btn" onclick="removeCondition(${i})">✕</button>
+                            </div>`;
+                    });
+
+                    html += `
+                        <button class="add-btn" onclick="addCondition()">+ 添加条件</button>
+                    </div>`;
+                }
+
+                // 动作块
+                if (currentRule.actions.length > 0) {
+                    html += `
+                        <div class="rule-block">
+                            <div class="rule-header">
+                                <span class="rule-title">THEN (动作)</span>
+                                <span class="rule-badge badge-action">动作</span>
+                            </div>`;
+
+                    currentRule.actions.forEach((action, i) => {
+                        html += `
+                            <div class="action-item">
+                                <input type="text" value="${action.entity}" onchange="updateAction(${i}, 'entity', this.value)" style="width: 80px;" placeholder="实体">
+                                <span style="color: #71767b;">.</span>
+                                <input type="text" value="${action.attribute}" onchange="updateAction(${i}, 'attribute', this.value)" style="width: 100px;" placeholder="属性">
+                                <span style="color: #71767b;">=</span>
+                                <input type="text" value="${action.value}" onchange="updateAction(${i}, 'value', this.value)" style="width: 120px;" placeholder="值">
+                                <button class="remove-btn" onclick="removeAction(${i})">✕</button>
+                            </div>`;
+                    });
+
+                    html += `
+                        <button class="add-btn" onclick="addAction()">+ 添加动作</button>
+                    </div>`;
+                }
+            }
+
+            canvas.innerHTML = html;
+        }
+
+        // 更新条件
+        function updateCondition(index, field, value) {
+            currentRule.conditions[index][field] = value;
+            updatePreview();
+        }
+
+        // 更新动作
+        function updateAction(index, field, value) {
+            currentRule.actions[index][field] = value;
+            updatePreview();
+        }
+
+        // 移除条件
+        function removeCondition(index) {
+            currentRule.conditions.splice(index, 1);
+            renderCanvas();
+            updatePreview();
+        }
+
+        // 移除动作
+        function removeAction(index) {
+            currentRule.actions.splice(index, 1);
+            renderCanvas();
+            updatePreview();
+        }
+
+        // 更新预览
+        function updatePreview() {
+            const name = document.getElementById('ruleName').value || '未命名规则';
+            const priority = document.getElementById('priority').value;
+
+            let dsl = `<span class="comment"># ${name}</span>\n`;
+            dsl += `<span class="keyword">RULE:</span> ${name}\n`;
+            dsl += `<span class="keyword">ID:</span> ${document.getElementById('ruleId').value || 'auto_' + Date.now()}\n`;
+
+            if (currentRule.conditions.length > 0) {
+                dsl += `<span class="keyword">WHEN:</span>\n`;
+                currentRule.conditions.forEach(cond => {
+                    dsl += `    ${cond.entity}.${cond.attribute} ${cond.operator} <span class="number">${cond.value}</span>\n`;
+                });
+            }
+
+            if (currentRule.actions.length > 0) {
+                dsl += `<span class="keyword">THEN:</span>\n`;
+                currentRule.actions.forEach(action => {
+                    dsl += `    ${action.entity}.${action.attribute} = <span class="string">"${action.value}"</span>\n`;
+                });
+            }
+
+            dsl += `<span class="keyword">PRIORITY:</span> ${priority}\n`;
+            dsl += `<span class="keyword">ENABLED:</span> true`;
+
+            document.getElementById('dslPreview').innerHTML = dsl;
+        }
+
+        // 模板加载
+        function loadTemplate(type) {
+            currentRule.conditions = [];
+            currentRule.actions = [];
+
+            if (type === 'temperature') {
+                document.getElementById('ruleName').value = '高温设备预警';
+                document.getElementById('priority').value = '高';
+                currentRule.conditions = [
+                    { id: 'c1', entity: '设备', attribute: '温度', operator: '>', value: '80' }
+                ];
+                currentRule.actions = [
+                    { id: 'a1', entity: '设备', attribute: '状态', value: '需维护' },
+                    { id: 'a2', entity: '通知', attribute: '级别', value: '高' }
+                ];
+            } else if (type === 'security') {
+                document.getElementById('ruleName').value = '异常访问检测';
+                document.getElementById('priority').value = '紧急';
+                currentRule.conditions = [
+                    { id: 'c1', entity: '用户', attribute: '失败次数', operator: '>', value: '5' },
+                    { id: 'c2', entity: '用户', attribute: 'IP地区', operator: '!=', value: '常用地区' }
+                ];
+                currentRule.actions = [
+                    { id: 'a1', entity: '安全', attribute: '风险等级', value: '极高' },
+                    { id: 'a2', entity: '通知', attribute: '级别', value: '紧急' }
+                ];
+            } else if (type === 'health') {
+                document.getElementById('ruleName').value = '心率异常预警';
+                document.getElementById('priority').value = '高';
+                currentRule.conditions = [
+                    { id: 'c1', entity: '患者', attribute: '心率', operator: '>', value: '100' }
+                ];
+                currentRule.actions = [
+                    { id: 'a1', entity: '患者', attribute: '风险等级', value: '心动过速' },
+                    { id: 'a2', entity: '通知', attribute: '级别', value: '高' }
+                ];
+            }
+
+            renderCanvas();
+            updatePreview();
+            showNotification('模板已加载', 'success');
+        }
+
+        // 生成DSL文本
+        function generateDSL() {
+            const name = document.getElementById('ruleName').value || '未命名规则';
+            const id = document.getElementById('ruleId').value || 'auto_' + Date.now();
+            const priority = document.getElementById('priority').value;
+
+            let dsl = `RULE: ${name}\n`;
+            dsl += `ID: ${id}\n`;
+
+            if (currentRule.conditions.length > 0) {
+                dsl += `WHEN:\n`;
+                currentRule.conditions.forEach(cond => {
+                    dsl += `    ${cond.entity}.${cond.attribute} ${cond.operator} ${cond.value}\n`;
+                });
+            }
+
+            if (currentRule.actions.length > 0) {
+                dsl += `THEN:\n`;
+                currentRule.actions.forEach(action => {
+                    dsl += `    ${action.entity}.${action.attribute} = "${action.value}"\n`;
+                });
+            }
+
+            dsl += `PRIORITY: ${priority}\n`;
+            dsl += `ENABLED: true\n`;
+
+            return dsl;
+        }
+
+        // 保存规则 (调用API)
+        async function saveRule() {
+            if (currentRule.conditions.length === 0 || currentRule.actions.length === 0) {
+                showNotification('请添加至少一个条件和一个动作', 'error');
+                return;
+            }
+
+            const dsl = generateDSL();
+            const name = document.getElementById('ruleName').value;
+
+            try {
+                const response = await fetch(`${API_BASE}/api/rules`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, dsl })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    savedRules.push(data.rule);
+                    updateRuleList();
+                    showNotification(`规则 "${name}" 已保存到服务器`, 'success');
+                } else {
+                    showNotification('保存失败: ' + response.statusText, 'error');
+                }
+            } catch (e) {
+                // 离线模式：保存到本地
+                const rule = {
+                    ...currentRule,
+                    name,
+                    id: document.getElementById('ruleId').value || 'rule_' + Date.now(),
+                    priority: document.getElementById('priority').value,
+                    dsl
+                };
+                savedRules.push(rule);
+                updateRuleList();
+                showNotification(`规则 "${name}" 已保存（本地）`, 'success');
+            }
+        }
+
+        // 更新规则列表
+        function updateRuleList() {
+            const list = document.getElementById('ruleList');
+            list.innerHTML = savedRules.map((rule, i) => `
+                <div class="rule-list-item" onclick="loadSavedRule(${i})">
+                    <div class="rule-name">${rule.name}</div>
+                    <div class="rule-meta">${rule.conditions.length} 个条件 · ${rule.actions.length} 个动作 · ${rule.priority}</div>
+                </div>
+            `).join('');
+        }
+
+        // 加载已保存规则
+        function loadSavedRule(index) {
+            const rule = savedRules[index];
+            document.getElementById('ruleName').value = rule.name;
+            document.getElementById('priority').value = rule.priority;
+            currentRule.conditions = [...rule.conditions];
+            currentRule.actions = [...rule.actions];
+            renderCanvas();
+            updatePreview();
+        }
+
+        // 测试规则 (调用API)
+        async function testRule() {
+            const input = document.getElementById('testInput').value;
+            if (!input.trim()) {
+                showNotification('请输入测试数据', 'error');
+                return;
+            }
+
+            const resultDiv = document.getElementById('testResult');
+
+            try {
+                const facts = JSON.parse(input);
+
+                // 先尝试API测试
+                try {
+                    const response = await fetch(`${API_BASE}/api/rules/test`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ facts })
+                    });
+
+                    if (response.ok) {
+                        const data = await response.json();
+                        resultDiv.className = 'test-result success';
+                        resultDiv.innerHTML = `<strong>API测试结果:</strong><br>` +
+                            `触发规则: ${data.triggered}/${data.total}<br>` +
+                            `<pre>${JSON.stringify(data.results, null, 2)}</pre>`;
+                        return;
+                    }
+                } catch (e) {
+                    // API不可用，回退到本地测试
+                }
+
+                // 回退：本地测试
+                const result = evaluateRule(facts);
+                resultDiv.className = 'test-result success';
+                resultDiv.innerHTML = `<strong>本地测试结果:</strong><br>${JSON.stringify(result, null, 2)}`;
+            } catch (e) {
+                resultDiv.className = 'test-result error';
+                resultDiv.innerHTML = `<strong>错误:</strong><br>${e.message}`;
+            }
+        }
+
+        // 规则评估
+        function evaluateRule(facts) {
+            const actions = [];
+
+            // 检查条件
+            const allConditionsMet = currentRule.conditions.every(cond => {
+                const entityFacts = facts[cond.entity];
+                if (!entityFacts) return false;
+
+                const value = entityFacts[cond.attribute];
+                if (value === undefined) return false;
+
+                const numValue = parseFloat(value);
+                const numCondValue = parseFloat(cond.value);
+
+                switch (cond.operator) {
+                    case '>': return numValue > numCondValue;
+                    case '<': return numValue < numCondValue;
+                    case '=': return value == cond.value;
+                    case '>=': return numValue >= numCondValue;
+                    case '<=': return numValue <= numCondValue;
+                    case '!=': return value != cond.value;
+                    case 'contains': return String(value).includes(cond.value);
+                    default: return false;
+                }
+            });
+
+            if (allConditionsMet) {
+                currentRule.actions.forEach(action => {
+                    actions.push({
+                        entity: action.entity,
+                        attribute: action.attribute,
+                        value: action.value
+                    });
+                });
+            }
+
+            return {
+                rule: document.getElementById('ruleName').value,
+                triggered: allConditionsMet,
+                actions: actions
+            };
+        }
+
+        // 导出DSL
+        function exportDSL() {
+            const dsl = generateDSL();
+            document.getElementById('exportContent').value = dsl;
+            document.getElementById('exportModal').classList.add('show');
+        }
+
+        // 下载DSL
+        function downloadDSL() {
+            const dsl = generateDSL();
+            const blob = new Blob([dsl], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${document.getElementById('ruleName').value || 'rule'}.dsl`;
+            a.click();
+            URL.revokeObjectURL(url);
+            showNotification('DSL文件已下载', 'success');
+        }
+
+        // 复制DSL
+        function copyDSL() {
+            const dsl = generateDSL();
+            navigator.clipboard.writeText(dsl).then(() => {
+                showNotification('DSL已复制到剪贴板', 'success');
+            });
+        }
+
+        // 加载规则 (从服务器或文件)
+        async function loadRules() {
+            try {
+                const response = await fetch(`${API_BASE}/api/rules`);
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.rules && data.rules.length > 0) {
+                        savedRules = data.rules;
+                        updateRuleList();
+                        showNotification(`从服务器加载 ${data.rules.length} 条规则`, 'success');
+                        return;
+                    }
+                }
+            } catch (e) {
+                // 服务器不可用，回退到文件加载
+            }
+
+            // 回退：从文件加载
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.dsl,.txt';
+            input.multiple = true;
+            input.onchange = (e) => {
+                Array.from(e.target.files).forEach(file => {
+                    const reader = new FileReader();
+                    reader.onload = (ev) => {
+                        const content = ev.target.result;
+                        parseDSL(content);
+                        updateRuleList();
+                    };
+                    reader.readAsText(file);
+                });
+                showNotification('规则文件已加载', 'success');
+            };
+            input.click();
+        }
+
+        // 解析DSL
+        function parseDSL(content) {
+            const lines = content.split('\n');
+            let currentRule = null;
+
+            lines.forEach(line => {
+                line = line.trim();
+                if (line.startsWith('RULE:')) {
+                    if (currentRule) savedRules.push(currentRule);
+                    currentRule = {
+                        name: line.substring(5).trim(),
+                        conditions: [],
+                        actions: [],
+                        priority: '中'
+                    };
+                } else if (currentRule) {
+                    if (line.startsWith('PRIORITY:')) {
+                        currentRule.priority = line.substring(9).trim();
+                    } else if (line.includes('>') || line.includes('<') || line.includes('=')) {
+                        // 简单解析条件
+                        const parts = line.split(/(>|<|=)/);
+                        if (parts.length >= 3) {
+                            const entityAttr = parts[0].trim().split('.');
+                            if (entityAttr.length === 2) {
+                                currentRule.conditions.push({
+                                    id: 'c_' + Date.now(),
+                                    entity: entityAttr[0],
+                                    attribute: entityAttr[1],
+                                    operator: parts[1].trim(),
+                                    value: parts[2].trim().replace(/"/g, '')
+                                });
+                            }
+                        }
+                    }
+                }
+            });
+
+            if (currentRule) savedRules.push(currentRule);
+            updateRuleList();
+        }
+
+        // 显示通知
+        function showNotification(message, type = 'success') {
+            const notification = document.getElementById('notification');
+            notification.textContent = message;
+            notification.className = `notification ${type} show`;
+            setTimeout(() => {
+                notification.classList.remove('show');
+            }, 3000);
+        }
+
+        // 关闭模态框
+        function closeModal(id) {
+            document.getElementById(id).classList.remove('show');
+        }
+
+        // 初始化
+        document.addEventListener('DOMContentLoaded', async () => {
+            updatePreview();
+            await checkApiConnection();
+            if (apiConnected) {
+                await loadRules();
+            }
+        });
+    </script>
+</body>
+</html>

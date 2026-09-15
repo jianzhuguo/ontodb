@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Dynamic memory manager for OntoDB storage engine.
 //!
 //! Provides:
@@ -6,10 +10,10 @@
 //! - Adaptive Block Cache sizing based on hit rate
 //! - Memory pressure detection and response
 
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use parking_lot::RwLock;
 
 /// Memory manager configuration.
 #[derive(Debug, Clone)]
@@ -32,10 +36,10 @@ pub struct MemoryManagerConfig {
 impl Default for MemoryManagerConfig {
     fn default() -> Self {
         Self {
-            min_memtable_size: 4 * 1024 * 1024,      // 4 MB
+            min_memtable_size: 4 * 1024 * 1024,       // 4 MB
             max_memtable_size: 256 * 1024 * 1024,     // 256 MB
             min_block_cache_size: 16 * 1024 * 1024,   // 16 MB
-            max_block_cache_size: 1024 * 1024 * 1024,  // 1 GB
+            max_block_cache_size: 1024 * 1024 * 1024, // 1 GB
             pressure_threshold: 0.85,
             adjustment_interval_secs: 30,
         }
@@ -140,7 +144,11 @@ impl MemoryManager {
     }
 
     /// Create with specific initial sizes (from StorageOptions).
-    pub fn with_initial_sizes(config: MemoryManagerConfig, memtable_size: usize, cache_size: usize) -> Self {
+    pub fn with_initial_sizes(
+        config: MemoryManagerConfig,
+        memtable_size: usize,
+        cache_size: usize,
+    ) -> Self {
         Self {
             initial_memtable_size: memtable_size,
             config,
@@ -186,7 +194,11 @@ impl MemoryManager {
         let hits = self.cache_hits.load(Ordering::Relaxed);
         let misses = self.cache_misses.load(Ordering::Relaxed);
         let total = hits + misses;
-        if total == 0 { 0.0 } else { hits as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
     }
 
     /// Periodic adjustment based on workload.
@@ -241,9 +253,11 @@ impl MemoryManager {
     /// Respond to memory pressure (called when system memory is low).
     pub fn shrink(&self) {
         // Shrink MemTable to minimum
-        self.memtable_size.store(self.config.min_memtable_size, Ordering::Relaxed);
+        self.memtable_size
+            .store(self.config.min_memtable_size, Ordering::Relaxed);
         // Shrink Block Cache to minimum
-        self.block_cache_size.store(self.config.min_block_cache_size, Ordering::Relaxed);
+        self.block_cache_size
+            .store(self.config.min_block_cache_size, Ordering::Relaxed);
     }
 
     /// Get current memory stats.

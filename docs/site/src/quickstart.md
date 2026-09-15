@@ -16,7 +16,7 @@ docker run -d \
 ## Option 2: Build from source
 
 ```bash
-git clone https://github.com/ontodb/ontodb.git
+git clone https://gitee.com/ontovalue/ontodb.git
 cd ontodb
 cargo build --release
 ./target/release/ontodb-server --http 127.0.0.1:7912 --data-dir ./data

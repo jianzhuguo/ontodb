@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Background compaction worker.
 //!
 //! Runs compaction in a separate thread to avoid blocking the write path.
@@ -18,8 +22,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
 use std::sync::Mutex;
+use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -129,7 +133,9 @@ impl CompactionWorker {
                     loop {
                         let score = {
                             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-                            if levels.len() < 2 { break; }
+                            if levels.len() < 2 {
+                                break;
+                            }
                             let mut best = 0.0f64;
                             for level in 0..levels.len() - 1 {
                                 let s = self.compaction_score(&levels, level);
@@ -222,8 +228,8 @@ impl CompactionWorker {
         if level == 0 {
             (self.options.memtable_size_limit as u64) * 4
         } else {
-            let l1_base = (self.options.memtable_size_limit as u64)
-                * (self.options.size_ratio as u64);
+            let l1_base =
+                (self.options.memtable_size_limit as u64) * (self.options.size_ratio as u64);
             let mut target = l1_base;
             for _ in 1..level {
                 target *= self.options.size_ratio as u64;
@@ -461,7 +467,11 @@ impl CompactionWorker {
         Ok(())
     }
 
-    fn can_drop_tombstone_static(key: &[u8], from_level: usize, levels: &[Vec<SsTableInfo>]) -> bool {
+    fn can_drop_tombstone_static(
+        key: &[u8],
+        from_level: usize,
+        levels: &[Vec<SsTableInfo>],
+    ) -> bool {
         for level in (from_level + 1)..levels.len() {
             for sst_info in &levels[level] {
                 if key >= sst_info.min_key.as_slice() && key <= sst_info.max_key.as_slice() {

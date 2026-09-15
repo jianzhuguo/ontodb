@@ -8,18 +8,18 @@
 //!   cargo run --bin migrate-namespace -- --data-dir ./ontodb_data --dry-run
 
 use onto_core::Result;
-use onto_ontology::{OntologyStore, Namespace, Ontology, DEFAULT_NAMESPACE};
+use onto_ontology::{Namespace, Ontology, OntologyStore, DEFAULT_NAMESPACE};
 use onto_storage::{LsmEngine, StorageOptions};
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    
+
     let mut data_dir = "./ontodb_data".to_string();
     let mut dry_run = false;
     let mut target_namespace = DEFAULT_NAMESPACE.to_string();
-    
+
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -58,7 +58,14 @@ fn main() -> Result<()> {
     println!("Configuration:");
     println!("  Data directory: {}", data_dir);
     println!("  Target namespace: {}", target_namespace);
-    println!("  Dry run: {}", if dry_run { "YES (no changes will be made)" } else { "NO" });
+    println!(
+        "  Dry run: {}",
+        if dry_run {
+            "YES (no changes will be made)"
+        } else {
+            "NO"
+        }
+    );
     println!();
     println!("Note: Only ontologies are migrated. Documents keep original format.");
     println!();
@@ -72,7 +79,10 @@ fn main() -> Result<()> {
     let store = OntologyStore::new(engine.clone());
 
     // Step 1: Create target namespace
-    println!("Step 1: Creating target namespace '{}'...", target_namespace);
+    println!(
+        "Step 1: Creating target namespace '{}'...",
+        target_namespace
+    );
     if !dry_run {
         let ns = Namespace::new(&target_namespace);
         store.save_namespace(&ns)?;
@@ -92,7 +102,7 @@ fn main() -> Result<()> {
 
     for (key, val_bytes) in &entries {
         let key_str = String::from_utf8_lossy(key);
-        
+
         // Skip namespaced ontologies (they have :: in the key after prefix)
         let ontology_key = &key_str[prefix.len()..];
         if ontology_key.contains("::") {
@@ -113,18 +123,18 @@ fn main() -> Result<()> {
 
                 let new_key = format!("__ontology__{}::{}", target_namespace, ontology.name);
                 println!("  → Migrating '{}' -> '{}'", ontology.name, new_key);
-                
+
                 if !dry_run {
                     // Delete old key
                     engine.delete(key.clone())?;
-                    
+
                     // Add namespace
                     ontology.namespace = Some(target_namespace.clone());
-                    
+
                     // Save with new key
                     store.save_with_engine(&engine, &ontology)?;
                 }
-                
+
                 migrated += 1;
             }
             Err(e) => {
@@ -146,7 +156,7 @@ fn main() -> Result<()> {
     println!("  Target namespace: '{}'", target_namespace);
     println!("  Documents: NOT migrated (keep original format)");
     println!();
-    
+
     if dry_run {
         println!("  ⚠️  DRY RUN - No changes were made");
         println!("  Run without --dry-run to apply migration");

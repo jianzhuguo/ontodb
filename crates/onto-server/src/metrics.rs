@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Runtime metrics collection and Prometheus export for OntoDB.
 //!
 //! Collects and exposes metrics in Prometheus exposition format.
@@ -88,7 +92,10 @@ impl Histogram {
             }
         }
         // +Inf bucket
-        self.counts.last().expect("should be valid").fetch_add(1, Ordering::Relaxed);
+        self.counts
+            .last()
+            .expect("should be valid")
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the total sum in seconds.
@@ -113,7 +120,11 @@ impl Histogram {
             output.push_str(&format!("{}{{le=\"{}\"}} {}\n", name, boundary, cumulative));
         }
         // +Inf
-        cumulative += self.counts.last().expect("should be valid").load(Ordering::Relaxed);
+        cumulative += self
+            .counts
+            .last()
+            .expect("should be valid")
+            .load(Ordering::Relaxed);
         output.push_str(&format!("{}{{le=\"+Inf\"}} {}\n", name, cumulative));
         output.push_str(&format!("{}_sum {}\n", name, self.sum()));
         output.push_str(&format!("{}_count {}\n", name, self.count()));
@@ -334,7 +345,7 @@ impl Metrics {
     #[cfg(target_os = "linux")]
     pub fn collect_system_metrics(&self) {
         use std::fs;
-        
+
         // Read process memory from /proc/self/status
         if let Ok(status) = fs::read_to_string("/proc/self/status") {
             for line in status.lines() {
@@ -347,7 +358,7 @@ impl Metrics {
                 }
             }
         }
-        
+
         // Count open file descriptors from /proc/self/fd
         if let Ok(entries) = fs::read_dir("/proc/self/fd") {
             let count = entries.count();
@@ -385,7 +396,10 @@ impl Metrics {
         // ── Query counters ──
         output.push_str("# HELP ontodb_queries_total Total queries received\n");
         output.push_str("# TYPE ontodb_queries_total counter\n");
-        output.push_str(&format!("ontodb_queries_total {}\n", self.queries_total.get()));
+        output.push_str(&format!(
+            "ontodb_queries_total {}\n",
+            self.queries_total.get()
+        ));
 
         output.push_str("# HELP ontodb_queries_by_type Total queries by type\n");
         output.push_str("# TYPE ontodb_queries_by_type counter\n");
@@ -534,71 +548,112 @@ impl Metrics {
         // ── System resources ──
         output.push_str("# HELP ontodb_memory_usage_bytes Process memory usage (RSS)\n");
         output.push_str("# TYPE ontodb_memory_usage_bytes gauge\n");
-        output.push_str(&format!("ontodb_memory_usage_bytes {}\n", self.memory_usage_bytes.get()));
+        output.push_str(&format!(
+            "ontodb_memory_usage_bytes {}\n",
+            self.memory_usage_bytes.get()
+        ));
 
         output.push_str("# HELP ontodb_open_file_descriptors Open file descriptors\n");
         output.push_str("# TYPE ontodb_open_file_descriptors gauge\n");
-        output.push_str(&format!("ontodb_open_file_descriptors {}\n", self.open_file_descriptors.get()));
+        output.push_str(&format!(
+            "ontodb_open_file_descriptors {}\n",
+            self.open_file_descriptors.get()
+        ));
 
         // ── Storage engine details ──
         output.push_str("# HELP ontodb_wal_size_bytes WAL file size\n");
         output.push_str("# TYPE ontodb_wal_size_bytes gauge\n");
-        output.push_str(&format!("ontodb_wal_size_bytes {}\n", self.wal_size_bytes.get()));
+        output.push_str(&format!(
+            "ontodb_wal_size_bytes {}\n",
+            self.wal_size_bytes.get()
+        ));
 
         output.push_str("# HELP ontodb_memtable_size_bytes MemTable size\n");
         output.push_str("# TYPE ontodb_memtable_size_bytes gauge\n");
-        output.push_str(&format!("ontodb_memtable_size_bytes {}\n", self.memtable_size_bytes.get()));
+        output.push_str(&format!(
+            "ontodb_memtable_size_bytes {}\n",
+            self.memtable_size_bytes.get()
+        ));
 
         output.push_str("# HELP ontodb_disk_usage_bytes Total disk usage\n");
         output.push_str("# TYPE ontodb_disk_usage_bytes gauge\n");
-        output.push_str(&format!("ontodb_disk_usage_bytes {}\n", self.disk_usage_bytes.get()));
+        output.push_str(&format!(
+            "ontodb_disk_usage_bytes {}\n",
+            self.disk_usage_bytes.get()
+        ));
 
         // ── Cache ──
         output.push_str("# HELP ontodb_block_cache_hits_total Block cache hits\n");
         output.push_str("# TYPE ontodb_block_cache_hits_total counter\n");
-        output.push_str(&format!("ontodb_block_cache_hits_total {}\n", self.block_cache_hits_total.get()));
+        output.push_str(&format!(
+            "ontodb_block_cache_hits_total {}\n",
+            self.block_cache_hits_total.get()
+        ));
 
         output.push_str("# HELP ontodb_block_cache_misses_total Block cache misses\n");
         output.push_str("# TYPE ontodb_block_cache_misses_total counter\n");
-        output.push_str(&format!("ontodb_block_cache_misses_total {}\n", self.block_cache_misses_total.get()));
+        output.push_str(&format!(
+            "ontodb_block_cache_misses_total {}\n",
+            self.block_cache_misses_total.get()
+        ));
 
         output.push_str("# HELP ontodb_block_cache_evictions_total Block cache evictions\n");
         output.push_str("# TYPE ontodb_block_cache_evictions_total counter\n");
-        output.push_str(&format!("ontodb_block_cache_evictions_total {}\n", self.block_cache_evictions_total.get()));
+        output.push_str(&format!(
+            "ontodb_block_cache_evictions_total {}\n",
+            self.block_cache_evictions_total.get()
+        ));
 
         // ── Transactions ──
         output.push_str("# HELP ontodb_active_transactions Active MVCC transactions\n");
         output.push_str("# TYPE ontodb_active_transactions gauge\n");
-        output.push_str(&format!("ontodb_active_transactions {}\n", self.active_transactions.get()));
+        output.push_str(&format!(
+            "ontodb_active_transactions {}\n",
+            self.active_transactions.get()
+        ));
 
         // ── WAL ──
         output.push_str("# HELP ontodb_wal_writes_total Total WAL writes\n");
         output.push_str("# TYPE ontodb_wal_writes_total counter\n");
-        output.push_str(&format!("ontodb_wal_writes_total {}\n", self.wal_writes_total.get()));
-
-        output.push_str(&self.wal_sync_latency.to_prometheus(
-            "ontodb_wal_sync_duration_seconds",
-            "WAL fsync latency",
+        output.push_str(&format!(
+            "ontodb_wal_writes_total {}\n",
+            self.wal_writes_total.get()
         ));
+
+        output.push_str(
+            &self
+                .wal_sync_latency
+                .to_prometheus("ontodb_wal_sync_duration_seconds", "WAL fsync latency"),
+        );
 
         // ── Compaction ──
         output.push_str("# HELP ontodb_compaction_pending Pending compaction tasks\n");
         output.push_str("# TYPE ontodb_compaction_pending gauge\n");
-        output.push_str(&format!("ontodb_compaction_pending {}\n", self.compaction_pending.get()));
-
-        output.push_str(&self.compaction_latency.to_prometheus(
-            "ontodb_compaction_duration_seconds",
-            "Compaction latency",
+        output.push_str(&format!(
+            "ontodb_compaction_pending {}\n",
+            self.compaction_pending.get()
         ));
+
+        output.push_str(
+            &self
+                .compaction_latency
+                .to_prometheus("ontodb_compaction_duration_seconds", "Compaction latency"),
+        );
 
         // ── Backup ──
         output.push_str("# HELP ontodb_last_backup_timestamp Last backup Unix timestamp\n");
         output.push_str("# TYPE ontodb_last_backup_timestamp gauge\n");
-        output.push_str(&format!("ontodb_last_backup_timestamp {}\n", self.last_backup_timestamp.get()));
+        output.push_str(&format!(
+            "ontodb_last_backup_timestamp {}\n",
+            self.last_backup_timestamp.get()
+        ));
 
         output.push_str("# HELP ontodb_last_backup_size_bytes Last backup size\n");
         output.push_str("# TYPE ontodb_last_backup_size_bytes gauge\n");
-        output.push_str(&format!("ontodb_last_backup_size_bytes {}\n", self.last_backup_size_bytes.get()));
+        output.push_str(&format!(
+            "ontodb_last_backup_size_bytes {}\n",
+            self.last_backup_size_bytes.get()
+        ));
 
         // ── Raft ──
         output.push_str("# HELP ontodb_raft_state Raft state (0=follower, 1=leader, 2=candidate, 3=standalone)\n");
@@ -607,7 +662,10 @@ impl Metrics {
 
         output.push_str("# HELP ontodb_raft_log_lag Raft log entries behind leader\n");
         output.push_str("# TYPE ontodb_raft_log_lag gauge\n");
-        output.push_str(&format!("ontodb_raft_log_lag {}\n", self.raft_log_lag.get()));
+        output.push_str(&format!(
+            "ontodb_raft_log_lag {}\n",
+            self.raft_log_lag.get()
+        ));
 
         output
     }

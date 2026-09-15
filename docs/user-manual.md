@@ -124,7 +124,7 @@ docker-compose up -d
 
 ```bash
 # 鍓嶇疆瑕佹眰锛歊ust 1.70+
-git clone https://github.com/ontodb/ontodb.git
+git clone https://gitee.com/ontovalue/ontodb.git
 cd ontodb
 cargo build --release
 

@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
+.cargo/config.toml
 
 # IDE
 .idea/
@@ -45,6 +46,11 @@ deploy/nginx/certs/
 ~$*.xlsx
 ~$*.pptx
 
+# Office documents (use Git LFS or external storage)
+*.docx
+*.xlsx
+*.pptx
+
 # Patent documents (local only, not committed)
 docs/patent/
 scripts/generate_patent_docx.py
@@ -54,8 +60,6 @@ scripts/generate_ontoql_patent_docx.py
 
 # Enterprise edition (commercial, not open source)
 crates/onto-enterprise/
-crates/onto-raft/
-crates/onto-sharding/
 
 # Temporary debug/log output
 *.log

@@ -21,12 +21,21 @@ fn main() {
         let start = Instant::now();
         for i in 0..row_count {
             let key = format!("Product::{:020}", i).into_bytes();
-            let val = format!(r#"{{"__class__":"Product","name":"item_{}","price":{}}}"#, i, (i * 10) % 10000).into_bytes();
+            let val = format!(
+                r#"{{"__class__":"Product","name":"item_{}","price":{}}}"#,
+                i,
+                (i * 10) % 10000
+            )
+            .into_bytes();
             engine.put(key, val).unwrap();
         }
         let elapsed = start.elapsed();
         let rate = row_count as f64 / elapsed.as_secs_f64();
-        println!("Individual put():  {:>8.2}s  ({:.0} rows/sec)", elapsed.as_secs_f64(), rate);
+        println!(
+            "Individual put():  {:>8.2}s  ({:.0} rows/sec)",
+            elapsed.as_secs_f64(),
+            rate
+        );
     }
 
     // ── Test 2: Batch put_batch ──
@@ -41,17 +50,28 @@ fn main() {
         let engine = LsmEngine::open(options).unwrap();
 
         // Build all entries
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..row_count).map(|i| {
-            let key = format!("Product::{:020}", i).into_bytes();
-            let val = format!(r#"{{"__class__":"Product","name":"item_{}","price":{}}}"#, i, (i * 10) % 10000).into_bytes();
-            (key, val)
-        }).collect();
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..row_count)
+            .map(|i| {
+                let key = format!("Product::{:020}", i).into_bytes();
+                let val = format!(
+                    r#"{{"__class__":"Product","name":"item_{}","price":{}}}"#,
+                    i,
+                    (i * 10) % 10000
+                )
+                .into_bytes();
+                (key, val)
+            })
+            .collect();
 
         let start = Instant::now();
         let imported = engine.put_batch(entries).unwrap();
         let elapsed = start.elapsed();
         let rate = imported as f64 / elapsed.as_secs_f64();
-        println!("put_batch():       {:>8.2}s  ({:.0} rows/sec)", elapsed.as_secs_f64(), rate);
+        println!(
+            "put_batch():       {:>8.2}s  ({:.0} rows/sec)",
+            elapsed.as_secs_f64(),
+            rate
+        );
     }
 
     // ── Test 3: Batch put_batch in chunks of 1000 ──
@@ -70,16 +90,27 @@ fn main() {
         let mut total = 0;
         for chunk_start in (0..row_count).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(row_count);
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = (chunk_start..chunk_end).map(|i| {
-                let key = format!("Product::{:020}", i).into_bytes();
-                let val = format!(r#"{{"__class__":"Product","name":"item_{}","price":{}}}"#, i, (i * 10) % 10000).into_bytes();
-                (key, val)
-            }).collect();
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = (chunk_start..chunk_end)
+                .map(|i| {
+                    let key = format!("Product::{:020}", i).into_bytes();
+                    let val = format!(
+                        r#"{{"__class__":"Product","name":"item_{}","price":{}}}"#,
+                        i,
+                        (i * 10) % 10000
+                    )
+                    .into_bytes();
+                    (key, val)
+                })
+                .collect();
             total += engine.put_batch(entries).unwrap();
         }
         let elapsed = start.elapsed();
         let rate = total as f64 / elapsed.as_secs_f64();
-        println!("put_batch(1000):   {:>8.2}s  ({:.0} rows/sec)", elapsed.as_secs_f64(), rate);
+        println!(
+            "put_batch(1000):   {:>8.2}s  ({:.0} rows/sec)",
+            elapsed.as_secs_f64(),
+            rate
+        );
     }
 
     println!("\n=== Benchmark complete ===");

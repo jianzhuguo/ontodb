@@ -17,7 +17,12 @@ fn brute_force_search(
     let mut distances: Vec<(usize, f32)> = vectors
         .iter()
         .enumerate()
-        .map(|(i, v)| (i, onto_storage::vector::distance::distance(query, v, metric)))
+        .map(|(i, v)| {
+            (
+                i,
+                onto_storage::vector::distance::distance(query, v, metric),
+            )
+        })
         .collect();
     distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     distances.truncate(k);
@@ -124,7 +129,11 @@ fn main() {
 
             println!(
                 "  ef_search={:>3}: recall@{} = {:.4}  ({:.1}%)  avg_latency = {:?}",
-                ef_search, k, avg_recall, avg_recall * 100.0, avg_latency
+                ef_search,
+                k,
+                avg_recall,
+                avg_recall * 100.0,
+                avg_latency
             );
         }
         println!();
@@ -147,7 +156,10 @@ fn main() {
         .map(|i| format!("vec_{}", i).into_bytes())
         .collect();
 
-    for (metric_name, metric) in &[("L2", DistanceMetric::L2), ("Cosine", DistanceMetric::Cosine)] {
+    for (metric_name, metric) in &[
+        ("L2", DistanceMetric::L2),
+        ("Cosine", DistanceMetric::Cosine),
+    ] {
         let ground_truth: Vec<Vec<(usize, f32)>> = queries
             .iter()
             .map(|q| brute_force_search(&vectors, q, k, *metric))
@@ -188,7 +200,11 @@ fn main() {
 
         println!(
             "  {}: recall@{} = {:.4}  ({:.1}%)  avg_latency = {:?}",
-            metric_name, k, avg_recall, avg_recall * 100.0, avg_latency
+            metric_name,
+            k,
+            avg_recall,
+            avg_recall * 100.0,
+            avg_latency
         );
     }
 

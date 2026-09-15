@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Index manager: manages secondary indexes and integrates with the LSM engine.
 //!
 //! Supports both in-memory B+Trees (for small indexes) and disk-based B+Trees
@@ -19,8 +23,7 @@ use std::path::{Path, PathBuf};
 const INDEX_PREFIX: &[u8] = b"__idx__";
 
 /// Configuration for index storage mode.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum IndexStorageMode {
     /// All indexes stored in memory (default, fast but limited by RAM).
     #[default]
@@ -30,7 +33,6 @@ pub enum IndexStorageMode {
     /// Hybrid: small indexes in memory, large ones on disk based on threshold.
     Hybrid { threshold_entries: usize },
 }
-
 
 /// Manages all secondary indexes.
 pub struct IndexManager {
@@ -67,9 +69,9 @@ impl IndexManager {
 
     /// Returns the path for a disk-based index file.
     fn index_path(&self, class: &str, column: &str) -> Option<PathBuf> {
-        self.data_dir.as_ref().map(|dir| {
-            dir.join(format!("{}_{}.idx", class, column))
-        })
+        self.data_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{}_{}.idx", class, column)))
     }
 
     /// Creates a new index on a class.column.
@@ -90,7 +92,10 @@ impl IndexManager {
                         e.insert(idx);
                     }
                     Err(e) => {
-                        eprintln!("Warning: failed to create disk index for {}.{}: {}", class, column, e);
+                        eprintln!(
+                            "Warning: failed to create disk index for {}.{}: {}",
+                            class, column, e
+                        );
                     }
                 }
             }
@@ -119,7 +124,10 @@ impl IndexManager {
                 if let Some((class, column)) = filename.split_once('_') {
                     // Validate before opening — if corrupted, delete and skip
                     if !BTreeIndex::validate(&path) {
-                        eprintln!("Warning: corrupted disk index {}, deleting for rebuild", path.display());
+                        eprintln!(
+                            "Warning: corrupted disk index {}, deleting for rebuild",
+                            path.display()
+                        );
                         let _ = std::fs::remove_file(&path);
                         continue;
                     }
@@ -133,7 +141,11 @@ impl IndexManager {
                                 .or_insert_with(|| BPlusTree::new(class, column));
                         }
                         Err(e) => {
-                            eprintln!("Warning: failed to open disk index {}, deleting: {}", path.display(), e);
+                            eprintln!(
+                                "Warning: failed to open disk index {}, deleting: {}",
+                                path.display(),
+                                e
+                            );
                             let _ = std::fs::remove_file(&path);
                         }
                     }
@@ -186,7 +198,9 @@ impl IndexManager {
         let mut index_entries = Vec::new();
 
         // Collect keys to avoid borrow issues
-        let index_keys: Vec<(String, String)> = self.indexes.keys()
+        let index_keys: Vec<(String, String)> = self
+            .indexes
+            .keys()
             .filter(|(c, _)| c == class)
             .cloned()
             .collect();
@@ -201,9 +215,15 @@ impl IndexManager {
                 }
 
                 // Insert into disk-based index
-                if let Some(disk_idx) = self.disk_indexes.get_mut(&(idx_class.clone(), idx_col.clone())) {
+                if let Some(disk_idx) = self
+                    .disk_indexes
+                    .get_mut(&(idx_class.clone(), idx_col.clone()))
+                {
                     if let Err(e) = disk_idx.insert(&encoded, primary_key.to_vec()) {
-                        eprintln!("Warning: disk index insert failed for {}.{}: {}", idx_class, idx_col, e);
+                        eprintln!(
+                            "Warning: disk index insert failed for {}.{}: {}",
+                            idx_class, idx_col, e
+                        );
                     }
                 }
 
@@ -256,7 +276,9 @@ impl IndexManager {
         let mut removed_keys = Vec::new();
 
         // Collect keys to avoid borrow issues
-        let index_keys: Vec<(String, String)> = self.indexes.keys()
+        let index_keys: Vec<(String, String)> = self
+            .indexes
+            .keys()
             .filter(|(c, _)| c == class)
             .cloned()
             .collect();
@@ -271,9 +293,15 @@ impl IndexManager {
                 }
 
                 // Remove from disk-based index
-                if let Some(disk_idx) = self.disk_indexes.get_mut(&(idx_class.clone(), idx_col.clone())) {
+                if let Some(disk_idx) = self
+                    .disk_indexes
+                    .get_mut(&(idx_class.clone(), idx_col.clone()))
+                {
                     if let Err(e) = disk_idx.remove(&encoded, primary_key) {
-                        eprintln!("Warning: disk index remove failed for {}.{}: {}", idx_class, idx_col, e);
+                        eprintln!(
+                            "Warning: disk index remove failed for {}.{}: {}",
+                            idx_class, idx_col, e
+                        );
                     }
                 }
 
@@ -286,7 +314,8 @@ impl IndexManager {
 
     /// Returns all indexes for a given class (both in-memory and disk-based).
     pub fn indexes_for_class(&self, class: &str) -> Vec<&str> {
-        let mut cols: Vec<&str> = self.indexes
+        let mut cols: Vec<&str> = self
+            .indexes
             .keys()
             .filter(|(c, _)| c == class)
             .map(|(_, col)| col.as_str())
@@ -322,7 +351,12 @@ impl IndexManager {
     /// Looks up primary keys for a given class, column, and value using the index.
     /// Returns None if no index exists on that column.
     /// Checks both in-memory and disk-based indexes.
-    pub fn lookup_eq(&mut self, class: &str, column: &str, value: &serde_json::Value) -> Option<Vec<Vec<u8>>> {
+    pub fn lookup_eq(
+        &mut self,
+        class: &str,
+        column: &str,
+        value: &serde_json::Value,
+    ) -> Option<Vec<Vec<u8>>> {
         let key = (class.to_string(), column.to_string());
         let encoded = Self::encode_value(value);
 
@@ -360,7 +394,9 @@ impl IndexManager {
 
         // Fall back to disk-based index
         if let Some(disk_idx) = self.disk_indexes.get_mut(&key) {
-            return disk_idx.range_scan(low_bytes.as_deref(), high_bytes.as_deref()).ok();
+            return disk_idx
+                .range_scan(low_bytes.as_deref(), high_bytes.as_deref())
+                .ok();
         }
 
         None
@@ -368,7 +404,12 @@ impl IndexManager {
 
     /// Looks up primary keys for a GT condition.
     /// Checks both in-memory and disk-based indexes.
-    pub fn lookup_gt(&mut self, class: &str, column: &str, value: &serde_json::Value) -> Option<Vec<Vec<u8>>> {
+    pub fn lookup_gt(
+        &mut self,
+        class: &str,
+        column: &str,
+        value: &serde_json::Value,
+    ) -> Option<Vec<Vec<u8>>> {
         let key = (class.to_string(), column.to_string());
         let encoded = Self::encode_value(value);
 
@@ -392,7 +433,12 @@ impl IndexManager {
 
     /// Looks up primary keys for a LT condition.
     /// Checks both in-memory and disk-based indexes.
-    pub fn lookup_lt(&mut self, class: &str, column: &str, value: &serde_json::Value) -> Option<Vec<Vec<u8>>> {
+    pub fn lookup_lt(
+        &mut self,
+        class: &str,
+        column: &str,
+        value: &serde_json::Value,
+    ) -> Option<Vec<Vec<u8>>> {
         let key = (class.to_string(), column.to_string());
         let encoded = Self::encode_value(value);
 
@@ -412,7 +458,12 @@ impl IndexManager {
     // ── Read-only lookup methods (for concurrent read path, &self) ──
 
     /// Read-only equality lookup using in-memory index only.
-    pub fn lookup_eq_read(&self, class: &str, column: &str, value: &serde_json::Value) -> Option<Vec<Vec<u8>>> {
+    pub fn lookup_eq_read(
+        &self,
+        class: &str,
+        column: &str,
+        value: &serde_json::Value,
+    ) -> Option<Vec<Vec<u8>>> {
         let key = (class.to_string(), column.to_string());
         let encoded = Self::encode_value(value);
         self.indexes.get(&key).map(|tree| tree.lookup(&encoded))
@@ -429,18 +480,30 @@ impl IndexManager {
         let key = (class.to_string(), column.to_string());
         let low_bytes = low.map(Self::encode_value);
         let high_bytes = high.map(Self::encode_value);
-        self.indexes.get(&key).map(|tree| tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref()))
+        self.indexes
+            .get(&key)
+            .map(|tree| tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref()))
     }
 
     /// Read-only GT lookup using in-memory index only.
-    pub fn lookup_gt_read(&self, class: &str, column: &str, value: &serde_json::Value) -> Option<Vec<Vec<u8>>> {
+    pub fn lookup_gt_read(
+        &self,
+        class: &str,
+        column: &str,
+        value: &serde_json::Value,
+    ) -> Option<Vec<Vec<u8>>> {
         let key = (class.to_string(), column.to_string());
         let encoded = Self::encode_value(value);
         self.indexes.get(&key).map(|tree| tree.gt_scan(&encoded))
     }
 
     /// Read-only LT lookup using in-memory index only.
-    pub fn lookup_lt_read(&self, class: &str, column: &str, value: &serde_json::Value) -> Option<Vec<Vec<u8>>> {
+    pub fn lookup_lt_read(
+        &self,
+        class: &str,
+        column: &str,
+        value: &serde_json::Value,
+    ) -> Option<Vec<Vec<u8>>> {
         let key = (class.to_string(), column.to_string());
         let encoded = Self::encode_value(value);
         self.indexes.get(&key).map(|tree| tree.lt_scan(&encoded))
@@ -479,9 +542,7 @@ impl IndexManager {
                     n.to_string().into_bytes()
                 }
             }
-            serde_json::Value::Bool(b) => {
-                if *b { b"1" } else { b"0" }.to_vec()
-            }
+            serde_json::Value::Bool(b) => if *b { b"1" } else { b"0" }.to_vec(),
             _ => val.to_string().into_bytes(),
         }
     }
@@ -513,7 +574,10 @@ impl IndexManager {
                                 self.disk_indexes.insert(disk_key.clone(), idx);
                             }
                             Err(e) => {
-                                eprintln!("Warning: failed to create disk index {}.{}: {}", class, column, e);
+                                eprintln!(
+                                    "Warning: failed to create disk index {}.{}: {}",
+                                    class, column, e
+                                );
                                 continue;
                             }
                         }
@@ -521,7 +585,10 @@ impl IndexManager {
                 }
                 if let Some(disk_idx) = self.disk_indexes.get_mut(&disk_key) {
                     if let Err(e) = disk_idx.insert(&encoded_val, pk) {
-                        eprintln!("Warning: disk index rebuild failed for {}.{}: {}", class, column, e);
+                        eprintln!(
+                            "Warning: disk index rebuild failed for {}.{}: {}",
+                            class, column, e
+                        );
                     }
                 }
             }
@@ -665,10 +732,14 @@ mod tests {
         // Now rebuild from LSM entries (use current encode_value format)
         let encoded_100 = IndexManager::encode_value(&json!(100));
         let encoded_200 = IndexManager::encode_value(&json!(200));
-        let key1 = format!("__idx__Product__price::{}::pk1",
-            String::from_utf8_lossy(&encoded_100));
-        let key2 = format!("__idx__Product__price::{}::pk2",
-            String::from_utf8_lossy(&encoded_200));
+        let key1 = format!(
+            "__idx__Product__price::{}::pk1",
+            String::from_utf8_lossy(&encoded_100)
+        );
+        let key2 = format!(
+            "__idx__Product__price::{}::pk2",
+            String::from_utf8_lossy(&encoded_200)
+        );
         let entries = vec![
             (key1.into_bytes(), Vec::new()),
             (key2.into_bytes(), Vec::new()),
@@ -676,7 +747,10 @@ mod tests {
         mgr.rebuild_from_entries(&entries);
 
         // Disk index should be recreated
-        assert!(idx_path.exists(), ".idx file should be recreated after rebuild");
+        assert!(
+            idx_path.exists(),
+            ".idx file should be recreated after rebuild"
+        );
         assert!(mgr.has_index("Product", "price"));
 
         // Verify data is accessible

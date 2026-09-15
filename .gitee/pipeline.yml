@@ -1,0 +1,75 @@
+name: OntoDB Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+stages:
+  - test
+  - build
+  - release
+
+test:
+  stage: test
+  image: rust:1.77-bookworm
+  script:
+    - cargo test -p onto-core -p onto-storage -p onto-ontology -p onto-query -p onto-graph -p onto-enterprise -p onto-sharding -p onto-raft -p onto-cli
+  only:
+    - merge_requests
+    - tags
+    - triggers
+
+build-linux-amd64:
+  stage: build
+  image: rust:1.77-bookworm
+  script:
+    - cargo build --release -p onto-server -p onto-cli -p ontodb-rules
+    - mkdir -p dist
+    - cp target/release/ontodb-server dist/
+    - cp target/release/ontodb dist/
+    - cp target/release/ontodb-rules dist/
+    - cp LICENSE NOTICE README.md dist/
+    - cp -r rules dist/
+    - tar czf ontodb-linux-amd64.tar.gz -C dist .
+  artifacts:
+    paths:
+      - ontodb-linux-amd64.tar.gz
+  only:
+    - tags
+
+build-linux-arm64:
+  stage: build
+  image: rust:1.77-bookworm
+  before_script:
+    - apt-get update && apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+    - rustup target add aarch64-unknown-linux-gnu
+  script:
+    - cargo build --release --target aarch64-unknown-linux-gnu -p onto-server -p onto-cli -p ontodb-rules
+    - mkdir -p dist
+    - cp target/aarch64-unknown-linux-gnu/release/ontodb-server dist/
+    - cp target/aarch64-unknown-linux-gnu/release/ontodb dist/
+    - cp target/aarch64-unknown-linux-gnu/release/ontodb-rules dist/
+    - cp LICENSE NOTICE README.md dist/
+    - cp -r rules dist/
+    - tar czf ontodb-linux-arm64.tar.gz -C dist .
+  artifacts:
+    paths:
+      - ontodb-linux-arm64.tar.gz
+  variables:
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+  only:
+    - tags
+
+release:
+  stage: release
+  image: curlimages/curl:latest
+  script:
+    - echo "Release artifacts: ontodb-linux-amd64.tar.gz, ontodb-linux-arm64.tar.gz"
+  dependencies:
+    - build-linux-amd64
+    - build-linux-arm64
+  only:
+    - tags

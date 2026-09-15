@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Security audit module for OntoDB.
 //!
 //! Performs automated security checks on the running system configuration,
@@ -113,8 +117,16 @@ pub fn run_security_audit(target: &AuditTarget) -> SecurityAuditResult {
     } else {
         // Weighted scoring: Critical=0, High=10, Medium=5, Low=2, Info=1
         let max_score: u32 = findings.iter().map(|f| severity_weight(&f.severity)).sum();
-        let earned: u32 = findings.iter().filter(|f| f.passed).map(|f| severity_weight(&f.severity)).sum();
-        if max_score > 0 { (earned * 100) / max_score } else { 100 }
+        let earned: u32 = findings
+            .iter()
+            .filter(|f| f.passed)
+            .map(|f| severity_weight(&f.severity))
+            .sum();
+        if max_score > 0 {
+            (earned * 100) / max_score
+        } else {
+            100
+        }
     };
 
     SecurityAuditResult {
@@ -145,7 +157,8 @@ fn check_auth_enabled(target: &AuditTarget) -> SecurityFinding {
         severity: Severity::Critical,
         category: "Authentication".to_string(),
         title: "Authentication enabled".to_string(),
-        description: "API key authentication should be enabled to prevent unauthorized access.".to_string(),
+        description: "API key authentication should be enabled to prevent unauthorized access."
+            .to_string(),
         remediation: "Start server with --auth flag and configure --api-keys-file.".to_string(),
         passed: target.auth_enabled,
     }
@@ -170,7 +183,8 @@ fn check_default_credentials(target: &AuditTarget) -> SecurityFinding {
         category: "Authentication".to_string(),
         title: "No default credentials".to_string(),
         description: "Default or CHANGE_ME credentials should not be used.".to_string(),
-        remediation: "Replace all default passwords and keys with strong, unique values.".to_string(),
+        remediation: "Replace all default passwords and keys with strong, unique values."
+            .to_string(),
         passed: !target.has_default_credentials,
     }
 }
@@ -188,7 +202,8 @@ fn check_tls_enabled(target: &AuditTarget) -> SecurityFinding {
 }
 
 fn check_tls_version(target: &AuditTarget) -> SecurityFinding {
-    let passed = !target.tls_enabled || target.tls_min_version == "1.2" || target.tls_min_version == "1.3";
+    let passed =
+        !target.tls_enabled || target.tls_min_version == "1.2" || target.tls_min_version == "1.3";
     SecurityFinding {
         id: "TLS-002".to_string(),
         severity: Severity::Medium,
@@ -226,7 +241,9 @@ fn check_cors_config(target: &AuditTarget) -> SecurityFinding {
 }
 
 fn check_exposed_ports(target: &AuditTarget) -> SecurityFinding {
-    let dangerous_ports: Vec<u16> = target.exposed_ports.iter()
+    let dangerous_ports: Vec<u16> = target
+        .exposed_ports
+        .iter()
         .filter(|p| **p == 0 || **p > 1024 || **p == 3306 || **p == 5432)
         .copied()
         .collect();
@@ -292,23 +309,54 @@ pub fn format_report(result: &SecurityAuditResult) -> String {
     report.push_str(&format!("Score: {}/100\n\n", result.score));
 
     // Summary by severity
-    let critical = result.findings.iter().filter(|f| f.severity == Severity::Critical && !f.passed).count();
-    let high = result.findings.iter().filter(|f| f.severity == Severity::High && !f.passed).count();
-    let medium = result.findings.iter().filter(|f| f.severity == Severity::Medium && !f.passed).count();
-    let low = result.findings.iter().filter(|f| f.severity == Severity::Low && !f.passed).count();
+    let critical = result
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Critical && !f.passed)
+        .count();
+    let high = result
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::High && !f.passed)
+        .count();
+    let medium = result
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Medium && !f.passed)
+        .count();
+    let low = result
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Low && !f.passed)
+        .count();
 
     report.push_str("Summary:\n");
-    report.push_str(&format!("  Passed: {}/{}\n", result.passed, result.total_checks));
-    if critical > 0 { report.push_str(&format!("  🔴 Critical: {}\n", critical)); }
-    if high > 0 { report.push_str(&format!("  🟠 High: {}\n", high)); }
-    if medium > 0 { report.push_str(&format!("  🟡 Medium: {}\n", medium)); }
-    if low > 0 { report.push_str(&format!("  🟢 Low: {}\n", low)); }
+    report.push_str(&format!(
+        "  Passed: {}/{}\n",
+        result.passed, result.total_checks
+    ));
+    if critical > 0 {
+        report.push_str(&format!("  🔴 Critical: {}\n", critical));
+    }
+    if high > 0 {
+        report.push_str(&format!("  🟠 High: {}\n", high));
+    }
+    if medium > 0 {
+        report.push_str(&format!("  🟡 Medium: {}\n", medium));
+    }
+    if low > 0 {
+        report.push_str(&format!("  🟢 Low: {}\n", low));
+    }
     report.push('\n');
 
     // Findings
     report.push_str("Findings:\n");
     for finding in &result.findings {
-        let status = if finding.passed { "✅ PASS" } else { "❌ FAIL" };
+        let status = if finding.passed {
+            "✅ PASS"
+        } else {
+            "❌ FAIL"
+        };
         let severity_icon = match finding.severity {
             Severity::Critical => "🔴",
             Severity::High => "🟠",
@@ -316,7 +364,10 @@ pub fn format_report(result: &SecurityAuditResult) -> String {
             Severity::Low => "🟢",
             Severity::Info => "ℹ️",
         };
-        report.push_str(&format!("\n{} [{}] {} {}\n", severity_icon, finding.id, status, finding.title));
+        report.push_str(&format!(
+            "\n{} [{}] {} {}\n",
+            severity_icon, finding.id, status, finding.title
+        ));
         report.push_str(&format!("  Category: {}\n", finding.category));
         report.push_str(&format!("  {}\n", finding.description));
         if !finding.passed {

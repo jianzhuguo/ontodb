@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Storage engine configuration options.
 
 use crate::index::IndexStorageMode;
@@ -67,18 +71,18 @@ impl Default for StorageOptions {
         Self {
             data_dir: PathBuf::from("./ontodb_data"),
             memtable_size_limit: 4 * 1024 * 1024, // 4MB
-            block_size: 4096,                       // 4KB
+            block_size: 4096,                     // 4KB
             num_levels: 7,
             size_ratio: 10,
             use_bloom_filter: true,
             bloom_filter_fp_rate: 0.01,
             sync_wal_on_commit: true, // Strong durability by default
-            compression_level: 3,    // zstd level 3 by default (good balance)
+            compression_level: 3,     // zstd level 3 by default (good balance)
             index_storage_mode: None,
-            wal_archive_dir: None,   // Disabled by default
-            wal_archive_max_files: 100, // Keep last 100 archives
+            wal_archive_dir: None,                        // Disabled by default
+            wal_archive_max_files: 100,                   // Keep last 100 archives
             default_lambda: crate::value_meta::LAMBDA_2Y, // 2-year half-life by default
-            value_scorer_enabled: false, // Disabled by default, must opt-in
+            value_scorer_enabled: false,                  // Disabled by default, must opt-in
         }
     }
 }

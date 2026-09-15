@@ -7,10 +7,10 @@
 //! Note: Documents are NOT affected - they keep original format.
 
 use onto_core::Result;
-use onto_ontology::{OntologyStore, Ontology, DEFAULT_NAMESPACE};
+use onto_ontology::{Ontology, OntologyStore, DEFAULT_NAMESPACE};
 use onto_storage::{LsmEngine, StorageOptions};
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn main() -> Result<()> {
     let data_dir = std::env::args()
@@ -43,7 +43,7 @@ fn main() -> Result<()> {
     for (key, val_bytes) in &entries {
         let key_str = String::from_utf8_lossy(key);
         let ontology_key = &key_str[prefix.len()..];
-        
+
         // Only process namespaced ontologies
         if !ontology_key.contains("::") {
             println!("  ⊘ Skipping non-namespaced: {}", ontology_key);
@@ -56,18 +56,21 @@ fn main() -> Result<()> {
             Ok(mut ontology) => {
                 let old_name = ontology.name.clone();
                 let namespace = ontology.namespace.clone().unwrap_or_default();
-                
-                println!("  → Rolling back '{}::{}' -> '{}'", namespace, old_name, old_name);
-                
+
+                println!(
+                    "  → Rolling back '{}::{}' -> '{}'",
+                    namespace, old_name, old_name
+                );
+
                 // Delete namespaced key
                 engine.delete(key.clone())?;
-                
+
                 // Remove namespace
                 ontology.namespace = None;
-                
+
                 // Save with original key
                 store.save_with_engine(&engine, &ontology)?;
-                
+
                 rolled_back += 1;
             }
             Err(e) => {

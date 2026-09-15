@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! R*tree spatial index for OntoDB.
 //!
 //! R*tree is a balanced tree structure optimized for spatial range queries.
@@ -38,12 +42,22 @@ pub struct BBox {
 
 impl BBox {
     pub fn new(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Self {
-        Self { min_x, min_y, max_x, max_y }
+        Self {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        }
     }
 
     /// Create a bounding box for a point.
     pub fn from_point(x: f64, y: f64) -> Self {
-        Self { min_x: x, min_y: y, max_x: x, max_y: y }
+        Self {
+            min_x: x,
+            min_y: y,
+            max_x: x,
+            max_y: y,
+        }
     }
 
     /// Expand this bbox to include another bbox.
@@ -81,14 +95,18 @@ impl BBox {
 
     /// Check if this bbox intersects another bbox.
     pub fn intersects(&self, other: &BBox) -> bool {
-        self.min_x <= other.max_x && self.max_x >= other.min_x
-            && self.min_y <= other.max_y && self.max_y >= other.min_y
+        self.min_x <= other.max_x
+            && self.max_x >= other.min_x
+            && self.min_y <= other.max_y
+            && self.max_y >= other.min_y
     }
 
     /// Check if this bbox fully contains another bbox.
     pub fn contains(&self, other: &BBox) -> bool {
-        self.min_x <= other.min_x && self.max_x >= other.max_x
-            && self.min_y <= other.min_y && self.max_y >= other.max_y
+        self.min_x <= other.min_x
+            && self.max_x >= other.max_x
+            && self.min_y <= other.min_y
+            && self.max_y >= other.max_y
     }
 
     /// Distance from this bbox to a point (0 if inside).
@@ -308,7 +326,9 @@ impl RTree {
 
         // Update child parent pointers if internal node
         if !is_leaf {
-            let child_indices: Vec<usize> = self.nodes[new_node_idx].entries.iter()
+            let child_indices: Vec<usize> = self.nodes[new_node_idx]
+                .entries
+                .iter()
                 .filter_map(|e| match &e.data {
                     EntryData::Internal(child) => Some(*child),
                     _ => None,
@@ -454,7 +474,9 @@ impl RTree {
 
         // Start from root
         pq.push(PQEntry {
-            dist: self.nodes[self.root].entries.iter()
+            dist: self.nodes[self.root]
+                .entries
+                .iter()
                 .map(|e| e.bbox.distance_to_point(x, y))
                 .fold(f64::INFINITY, f64::min)
                 .min(0.0),
@@ -477,18 +499,27 @@ impl RTree {
                 match &entry.data {
                     EntryData::Leaf(id) => {
                         if results.len() < k {
-                            results.push(ResultEntry { dist: entry_dist, id: id.clone() });
+                            results.push(ResultEntry {
+                                dist: entry_dist,
+                                id: id.clone(),
+                            });
                         } else if let Some(farthest) = results.peek() {
                             if entry_dist < farthest.dist {
                                 results.pop();
-                                results.push(ResultEntry { dist: entry_dist, id: id.clone() });
+                                results.push(ResultEntry {
+                                    dist: entry_dist,
+                                    id: id.clone(),
+                                });
                             }
                         }
                     }
                     EntryData::Internal(child) => {
                         // Only enqueue if this child's MBR could contain a closer result
                         if results.len() < k || entry_dist <= results.peek().unwrap().dist {
-                            pq.push(PQEntry { dist: entry_dist, node_idx: *child });
+                            pq.push(PQEntry {
+                                dist: entry_dist,
+                                node_idx: *child,
+                            });
                         }
                     }
                 }

@@ -1,3 +1,7 @@
+// Copyright (c) 2024-2026 OntoDB Team
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE for details. Change Date: 2031-09-15.
+// On the Change Date, this file will be licensed under Apache License 2.0.
 //! Distance metrics for vector similarity search.
 
 /// Distance metric used for vector comparison.
@@ -33,10 +37,10 @@ fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
     // Process 4 elements at a time (SIMD-friendly)
     while i + 4 <= len {
         let d0 = a[i] - b[i];
-        let d1 = a[i+1] - b[i+1];
-        let d2 = a[i+2] - b[i+2];
-        let d3 = a[i+3] - b[i+3];
-        sum += d0*d0 + d1*d1 + d2*d2 + d3*d3;
+        let d1 = a[i + 1] - b[i + 1];
+        let d2 = a[i + 2] - b[i + 2];
+        let d3 = a[i + 3] - b[i + 3];
+        sum += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
         i += 4;
     }
 
@@ -61,11 +65,11 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 
     // Process 4 elements at a time
     while i + 4 <= len {
-        let (a0, a1, a2, a3) = (a[i], a[i+1], a[i+2], a[i+3]);
-        let (b0, b1, b2, b3) = (b[i], b[i+1], b[i+2], b[i+3]);
-        dot += a0*b0 + a1*b1 + a2*b2 + a3*b3;
-        norm_a += a0*a0 + a1*a1 + a2*a2 + a3*a3;
-        norm_b += b0*b0 + b1*b1 + b2*b2 + b3*b3;
+        let (a0, a1, a2, a3) = (a[i], a[i + 1], a[i + 2], a[i + 3]);
+        let (b0, b1, b2, b3) = (b[i], b[i + 1], b[i + 2], b[i + 3]);
+        dot += a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3;
+        norm_a += a0 * a0 + a1 * a1 + a2 * a2 + a3 * a3;
+        norm_b += b0 * b0 + b1 * b1 + b2 * b2 + b3 * b3;
         i += 4;
     }
 
@@ -93,7 +97,7 @@ fn inner_product_distance(a: &[f32], b: &[f32]) -> f32 {
 
     // Process 4 elements at a time (SIMD-friendly)
     while i + 4 <= len {
-        dot += a[i] * b[i] + a[i+1] * b[i+1] + a[i+2] * b[i+2] + a[i+3] * b[i+3];
+        dot += a[i] * b[i] + a[i + 1] * b[i + 1] + a[i + 2] * b[i + 2] + a[i + 3] * b[i + 3];
         i += 4;
     }
 

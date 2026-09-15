@@ -81,7 +81,9 @@ fn start_test_server() -> (u16, thread::JoinHandle<()>) {
                                 continue;
                             }
 
-                            if input.eq_ignore_ascii_case("quit") || input.eq_ignore_ascii_case("exit") {
+                            if input.eq_ignore_ascii_case("quit")
+                                || input.eq_ignore_ascii_case("exit")
+                            {
                                 break;
                             }
 
@@ -132,7 +134,9 @@ fn test_e2e_full_lifecycle() {
 
     // Connect multiple clients to verify concurrent access
     let mut client = TcpStream::connect(&addr).unwrap();
-    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     // 1. CREATE ONTOLOGY
     let resp = send_query(
@@ -141,19 +145,35 @@ fn test_e2e_full_lifecycle() {
     );
     assert!(resp.contains("created"), "CREATE ONTOLOGY failed: {}", resp);
     assert!(resp.contains("1 classes"), "wrong class count: {}", resp);
-    assert!(resp.contains("2 properties"), "wrong property count: {}", resp);
+    assert!(
+        resp.contains("2 properties"),
+        "wrong property count: {}",
+        resp
+    );
 
     // 2. INSERT rows
-    let resp = send_query(&mut client, "INSERT INTO Product (name, price) VALUES ('iPhone', 999)");
+    let resp = send_query(
+        &mut client,
+        "INSERT INTO Product (name, price) VALUES ('iPhone', 999)",
+    );
     assert!(resp.contains("1 row inserted"), "INSERT failed: {}", resp);
 
-    let resp = send_query(&mut client, "INSERT INTO Product (name, price) VALUES ('iPad', 799)");
+    let resp = send_query(
+        &mut client,
+        "INSERT INTO Product (name, price) VALUES ('iPad', 799)",
+    );
     assert!(resp.contains("1 row inserted"), "INSERT failed: {}", resp);
 
-    let resp = send_query(&mut client, "INSERT INTO Product (name, price) VALUES ('MacBook', 1999)");
+    let resp = send_query(
+        &mut client,
+        "INSERT INTO Product (name, price) VALUES ('MacBook', 1999)",
+    );
     assert!(resp.contains("1 row inserted"), "INSERT failed: {}", resp);
 
-    let resp = send_query(&mut client, "INSERT INTO Product (name, price) VALUES ('AirPods', 249)");
+    let resp = send_query(
+        &mut client,
+        "INSERT INTO Product (name, price) VALUES ('AirPods', 249)",
+    );
     assert!(resp.contains("1 row inserted"), "INSERT failed: {}", resp);
 
     // 3. SELECT all
@@ -165,7 +185,10 @@ fn test_e2e_full_lifecycle() {
     assert!(resp.contains("AirPods"), "missing AirPods: {}", resp);
 
     // 4. SELECT with WHERE
-    let resp = send_query(&mut client, "SELECT name, price FROM Product WHERE price > 900");
+    let resp = send_query(
+        &mut client,
+        "SELECT name, price FROM Product WHERE price > 900",
+    );
     assert!(resp.contains("(2 rows)"), "expected 2 rows: {}", resp);
     assert!(resp.contains("iPhone"), "missing iPhone: {}", resp);
     assert!(resp.contains("MacBook"), "missing MacBook: {}", resp);
@@ -175,11 +198,17 @@ fn test_e2e_full_lifecycle() {
     assert!(resp.contains("(2 rows)"), "expected 2 rows: {}", resp);
 
     // 6. UPDATE
-    let resp = send_query(&mut client, "UPDATE Product SET price = 1099 WHERE name = 'iPhone'");
+    let resp = send_query(
+        &mut client,
+        "UPDATE Product SET price = 1099 WHERE name = 'iPhone'",
+    );
     assert!(resp.contains("1 row(s) updated"), "UPDATE failed: {}", resp);
 
     // 7. Verify UPDATE
-    let resp = send_query(&mut client, "SELECT price FROM Product WHERE name = 'iPhone'");
+    let resp = send_query(
+        &mut client,
+        "SELECT price FROM Product WHERE name = 'iPhone'",
+    );
     assert!(resp.contains("1099"), "price not updated: {}", resp);
     assert!(!resp.contains("999"), "old price still present: {}", resp);
 
@@ -189,11 +218,22 @@ fn test_e2e_full_lifecycle() {
 
     // 9. Verify DELETE
     let resp = send_query(&mut client, "SELECT * FROM Product");
-    assert!(resp.contains("(3 rows)"), "expected 3 rows after delete: {}", resp);
-    assert!(!resp.contains("AirPods"), "AirPods should be deleted: {}", resp);
+    assert!(
+        resp.contains("(3 rows)"),
+        "expected 3 rows after delete: {}",
+        resp
+    );
+    assert!(
+        !resp.contains("AirPods"),
+        "AirPods should be deleted: {}",
+        resp
+    );
 
     // 10. MATCH semantic query
-    let resp = send_query(&mut client, "MATCH (p: Product) WHERE price > 1000 RETURN name");
+    let resp = send_query(
+        &mut client,
+        "MATCH (p: Product) WHERE price > 1000 RETURN name",
+    );
     assert!(resp.contains("(2 rows)"), "MATCH expected 2 rows: {}", resp);
     assert!(resp.contains("iPhone"), "MATCH missing iPhone: {}", resp);
     assert!(resp.contains("MacBook"), "MATCH missing MacBook: {}", resp);
@@ -204,7 +244,11 @@ fn test_e2e_full_lifecycle() {
 
     // 12. Empty query
     let resp = send_query(&mut client, "");
-    assert!(resp.is_empty(), "expected empty response for empty query: {}", resp);
+    assert!(
+        resp.is_empty(),
+        "expected empty response for empty query: {}",
+        resp
+    );
 
     // Disconnect
     send_query(&mut client, "quit");
@@ -236,7 +280,11 @@ fn test_e2e_multiple_clients() {
     c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     let resp = send_query(&mut c2, "SELECT * FROM Item");
-    assert!(resp.contains("(10 rows)"), "expected 10 rows from concurrent read: {}", resp);
+    assert!(
+        resp.contains("(10 rows)"),
+        "expected 10 rows from concurrent read: {}",
+        resp
+    );
 
     // Client 1: disconnects
     send_query(&mut c1, "quit");
@@ -254,7 +302,9 @@ fn test_e2e_update_and_delete_lifecycle() {
     let addr = format!("127.0.0.1:{}", port);
 
     let mut client = TcpStream::connect(&addr).unwrap();
-    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     // Setup
     send_query(
@@ -262,16 +312,29 @@ fn test_e2e_update_and_delete_lifecycle() {
         "CREATE ONTOLOGY test (CLASS User, PROPERTY name DOMAIN User RANGE STRING, PROPERTY age DOMAIN User RANGE INT64)",
     );
 
-    send_query(&mut client, "INSERT INTO User (name, age) VALUES ('Alice', 30)");
-    send_query(&mut client, "INSERT INTO User (name, age) VALUES ('Bob', 25)");
-    send_query(&mut client, "INSERT INTO User (name, age) VALUES ('Charlie', 35)");
+    send_query(
+        &mut client,
+        "INSERT INTO User (name, age) VALUES ('Alice', 30)",
+    );
+    send_query(
+        &mut client,
+        "INSERT INTO User (name, age) VALUES ('Bob', 25)",
+    );
+    send_query(
+        &mut client,
+        "INSERT INTO User (name, age) VALUES ('Charlie', 35)",
+    );
 
     // UPDATE multiple rows
     let resp = send_query(&mut client, "UPDATE User SET age = 31 WHERE name = 'Alice'");
     assert!(resp.contains("1 row(s) updated"), "UPDATE failed: {}", resp);
 
     let resp = send_query(&mut client, "UPDATE User SET age = 26 WHERE age = 25");
-    assert!(resp.contains("1 row(s) updated"), "UPDATE by age failed: {}", resp);
+    assert!(
+        resp.contains("1 row(s) updated"),
+        "UPDATE by age failed: {}",
+        resp
+    );
 
     // Verify updates
     let resp = send_query(&mut client, "SELECT age FROM User WHERE name = 'Alice'");
@@ -286,12 +349,20 @@ fn test_e2e_update_and_delete_lifecycle() {
 
     // Verify delete
     let resp = send_query(&mut client, "SELECT * FROM User");
-    assert!(resp.contains("(1 rows)"), "expected 1 row after delete: {}", resp);
+    assert!(
+        resp.contains("(1 rows)"),
+        "expected 1 row after delete: {}",
+        resp
+    );
     assert!(resp.contains("Bob"), "Bob should remain: {}", resp);
 
     // DELETE all remaining
     let resp = send_query(&mut client, "DELETE FROM User");
-    assert!(resp.contains("1 row(s) deleted"), "DELETE all failed: {}", resp);
+    assert!(
+        resp.contains("1 row(s) deleted"),
+        "DELETE all failed: {}",
+        resp
+    );
 
     let resp = send_query(&mut client, "SELECT * FROM User");
     assert!(resp.contains("(0 rows)"), "expected 0 rows: {}", resp);

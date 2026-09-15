@@ -210,10 +210,7 @@ fn main() {
     for &nt in &[2, 4, 8] {
         let ct = bench_concurrent_scan(Arc::clone(&engine), iterations, nt);
         let speedup = seq.as_secs_f64() / ct.as_secs_f64();
-        println!(
-            "    {} threads:  {:>8?}  speedup={:.2}x",
-            nt, ct, speedup
-        );
+        println!("    {} threads:  {:>8?}  speedup={:.2}x", nt, ct, speedup);
     }
     println!();
 
