@@ -81,7 +81,7 @@ All data linked via **unified semantic anchor** (`{Class}::{PrimaryKey}`), zero 
 
 ---
 
-## 30 Core Technologies
+## 33 Core Technologies
 
 ### Storage Engine
 
@@ -201,6 +201,9 @@ Traditional TTL: fixed expiry, no value awareness. Living Data: **data lives lik
 |---|-----------|-----------|
 | 29 | **CDC Change Capture** | Kernel-integrated, WAL real-time extraction, Flink/Spark compatible |
 | 30 | **Namespace Kernel Isolation** | `{namespace}::{class}::{pk}` 5-layer full-stack isolation, key-prefix routing zero overhead |
+| 31 | **GB/T 22239 Separation of Duties** | System/Security/Audit admins mutually exclusive, meets China gov/finance compliance |
+| 32 | **Data Masking Engine** | Kernel-level dynamic + static masking, auto-detect ID card/phone/bank card patterns |
+| 33 | **CRC Auto-Repair** | SSTable page-level CRC validation, auto-repair from Raft replicas on corruption |
 
 ### Namespace: Kernel-Level Multi-Tenant Isolation
 
