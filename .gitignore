@@ -55,6 +55,9 @@ deploy/nginx/certs/
 # Patent documents (local only, not committed)
 docs/patent/
 docs/marketing/
+docs/OntoQL计算传输一体化可行性分析.md
+docs/OntoQL语法参考手册.md
+docs/OntoQL核心能力Checklist.md
 scripts/generate_patent_docx.py
 scripts/generate_patent_diagrams.py
 scripts/generate_patent_svg.py
