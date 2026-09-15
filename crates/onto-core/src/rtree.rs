@@ -311,7 +311,7 @@ impl RTree {
     }
 
     fn split_node(&mut self, node_idx: usize) {
-        let entries: Vec<Entry> = self.nodes[node_idx].entries.drain(..).collect();
+        let entries: Vec<Entry> = std::mem::take(&mut self.nodes[node_idx].entries);
         let (group1, group2) = self.split_entries(entries);
 
         // Create new node

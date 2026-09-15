@@ -535,7 +535,7 @@ fn run_restore(
         }
 
         // Progress indicator every 1000 rows
-        if (ok + err) % 1000 == 0 && (ok + err) > 0 {
+        if (ok + err).is_multiple_of(1000) && (ok + err) > 0 {
             eprint!("\r  Progress: {} rows...", ok + err);
         }
     }

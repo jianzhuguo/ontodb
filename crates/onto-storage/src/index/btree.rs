@@ -486,15 +486,14 @@ impl BPlusTree {
 
     /// Redistributes keys from left sibling to the underflowing leaf.
     fn redistribute_leaf_from_left(&mut self, parent_id: u64, child_idx: usize) {
-        let left_sibling_id;
-        let leaf_id;
-        match self.node(parent_id).expect("node should exist") {
+        
+        
+        let (left_sibling_id, leaf_id) = match self.node(parent_id).expect("node should exist") {
             Node::Internal(n) => {
-                left_sibling_id = n.children[child_idx - 1];
-                leaf_id = n.children[child_idx];
+                (n.children[child_idx - 1], n.children[child_idx])
             }
             _ => return,
-        }
+        };
 
         // Move last key from left sibling to front of current leaf
         if let Node::Leaf(left) = self.node_mut(left_sibling_id).expect("node should exist") {
@@ -518,15 +517,14 @@ impl BPlusTree {
 
     /// Redistributes keys from right sibling to the underflowing leaf.
     fn redistribute_leaf_from_right(&mut self, parent_id: u64, child_idx: usize) {
-        let leaf_id;
-        let right_sibling_id;
-        match self.node(parent_id).expect("node should exist") {
+        
+        
+        let (leaf_id, right_sibling_id) = match self.node(parent_id).expect("node should exist") {
             Node::Internal(n) => {
-                leaf_id = n.children[child_idx];
-                right_sibling_id = n.children[child_idx + 1];
+                (n.children[child_idx], n.children[child_idx + 1])
             }
             _ => return,
-        }
+        };
 
         // Move first key from right sibling to end of current leaf
         if let Node::Leaf(right) = self.node_mut(right_sibling_id).expect("node should exist") {
@@ -550,15 +548,14 @@ impl BPlusTree {
 
     /// Merges two adjacent leaf nodes. The left leaf absorbs the right leaf.
     fn merge_leaves(&mut self, parent_id: u64, left_idx: usize, right_idx: usize) {
-        let left_id;
-        let right_id;
-        match self.node(parent_id).expect("node should exist") {
+        
+        
+        let (left_id, right_id) = match self.node(parent_id).expect("node should exist") {
             Node::Internal(n) => {
-                left_id = n.children[left_idx];
-                right_id = n.children[right_idx];
+                (n.children[left_idx], n.children[right_idx])
             }
             _ => return,
-        }
+        };
 
         // Remove right node from storage and take its data (no clone needed)
         if let Some(Node::Leaf(right)) = self.nodes.remove(&right_id) {
@@ -650,15 +647,14 @@ impl BPlusTree {
 
     /// Redistributes keys from left internal sibling.
     fn redistribute_internal_from_left(&mut self, parent_id: u64, child_idx: usize) {
-        let left_id;
-        let node_id;
-        match self.node(parent_id).expect("node should exist") {
+        
+        
+        let (left_id, node_id) = match self.node(parent_id).expect("node should exist") {
             Node::Internal(n) => {
-                left_id = n.children[child_idx - 1];
-                node_id = n.children[child_idx];
+                (n.children[child_idx - 1], n.children[child_idx])
             }
             _ => return,
-        }
+        };
 
         // Get separator from parent
         let separator = match self.node(parent_id).expect("node should exist") {
@@ -690,15 +686,14 @@ impl BPlusTree {
 
     /// Redistributes keys from right internal sibling.
     fn redistribute_internal_from_right(&mut self, parent_id: u64, child_idx: usize) {
-        let node_id;
-        let right_id;
-        match self.node(parent_id).expect("node should exist") {
+        
+        
+        let (node_id, right_id) = match self.node(parent_id).expect("node should exist") {
             Node::Internal(n) => {
-                node_id = n.children[child_idx];
-                right_id = n.children[child_idx + 1];
+                (n.children[child_idx], n.children[child_idx + 1])
             }
             _ => return,
-        }
+        };
 
         // Get separator from parent
         let separator = match self.node(parent_id).expect("node should exist") {
@@ -730,15 +725,14 @@ impl BPlusTree {
 
     /// Merges two adjacent internal nodes. The left node absorbs the right node.
     fn merge_internals(&mut self, parent_id: u64, left_idx: usize, right_idx: usize) {
-        let left_id;
-        let right_id;
-        match self.node(parent_id).expect("node should exist") {
+        
+        
+        let (left_id, right_id) = match self.node(parent_id).expect("node should exist") {
             Node::Internal(n) => {
-                left_id = n.children[left_idx];
-                right_id = n.children[right_idx];
+                (n.children[left_idx], n.children[right_idx])
             }
             _ => return,
-        }
+        };
 
         // Get separator from parent
         let separator = match self.node(parent_id).expect("node should exist") {

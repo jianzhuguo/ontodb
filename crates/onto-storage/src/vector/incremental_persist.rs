@@ -40,7 +40,7 @@ impl DirtyTracker {
 
     /// Get all dirty node IDs and clear the dirty set.
     pub fn drain_dirty(&mut self) -> HashSet<usize> {
-        let dirty = self.dirty_nodes.drain().collect();
+        let dirty = std::mem::take(&mut self.dirty_nodes);
         self.base_version = self.current_version;
         dirty
     }

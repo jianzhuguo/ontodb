@@ -213,7 +213,7 @@ async fn reload_rules(State(state): State<Arc<RuleEngineState>>) -> impl IntoRes
 
     for entry in std::fs::read_dir(&dir).unwrap().flatten() {
         let path = entry.path();
-        if path.extension().map_or(true, |e| e != "dsl") { continue; }
+        if path.extension().is_none_or(|e| e != "dsl") { continue; }
         if let Ok(content) = std::fs::read_to_string(&path) {
             for rule in parse_dsl_file(&content) {
                 rules.insert(rule.rule_id.clone(), rule);
@@ -295,7 +295,7 @@ fn evaluate(conditions: &[ConditionDto], facts: &HashMap<String, HashMap<String,
     conditions.iter().all(|c| {
         facts.get(&c.entity)
             .and_then(|m| m.get(&c.attribute))
-            .map_or(false, |v| compare(&c.operator, v, &c.value))
+            .is_some_and(|v| compare(&c.operator, v, &c.value))
     })
 }
 
@@ -448,7 +448,7 @@ fn parse_dsl_file(content: &str) -> Vec<RuleDto> {
                     created_at: String::new(), updated_at: String::new(),
                 });
             }
-            name = t[5..].trim().to_string();
+            name = t.strip_prefix("RULE:").unwrap_or(t).trim().to_string();
             lines.clear();
             lines.push(line.to_string());
             in_rule = true;
@@ -491,7 +491,7 @@ async fn main() {
             let mut rules = state.rules.lock().unwrap();
             for entry in std::fs::read_dir(&dir).unwrap().flatten() {
                 let path = entry.path();
-                if path.extension().map_or(true, |e| e != "dsl") { continue; }
+                if path.extension().is_none_or(|e| e != "dsl") { continue; }
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     for rule in parse_dsl_file(&content) {
                         rules.insert(rule.rule_id.clone(), rule);

@@ -2144,7 +2144,7 @@ impl OntoQLAst {
                 Ok(format!("{} LIKE '{}'", col, escaped))
             }
             OntoFilterExpr::In(col, vals) => {
-                let vals_str: Vec<String> = vals.iter().map(|v| Self::expr_to_sql(v)).collect();
+                let vals_str: Vec<String> = vals.iter().map(Self::expr_to_sql).collect();
                 Ok(format!("{} IN ({})", col, vals_str.join(", ")))
             }
             OntoFilterExpr::IsNull(col) => Ok(format!("{} IS NULL", col)),
@@ -2196,7 +2196,7 @@ impl OntoQLAst {
             },
             OntoValueExpr::Column(name) => format!("\"{}\"", name),
             OntoValueExpr::Function { name, args } => {
-                let args_str: Vec<String> = args.iter().map(|a| Self::expr_to_sql(a)).collect();
+                let args_str: Vec<String> = args.iter().map(Self::expr_to_sql).collect();
                 format!("{}({})", name, args_str.join(", "))
             }
             OntoValueExpr::Arithmetic { op, left, right } => {

@@ -4825,22 +4825,22 @@ impl QueryExecutor {
     fn eval_graph_filter(row: &Map<String, Value>, filter: &FilterExpr) -> bool {
         match filter {
             FilterExpr::Eq(col, val) => {
-                row.get(col).map_or(false, |v| Self::value_matches_literal(v, val))
+                row.get(col).is_some_and(|v| Self::value_matches_literal(v, val))
             }
             FilterExpr::Ne(col, val) => {
-                row.get(col).map_or(true, |v| !Self::value_matches_literal(v, val))
+                row.get(col).is_none_or(|v| !Self::value_matches_literal(v, val))
             }
             FilterExpr::Gt(col, val) => {
-                row.get(col).map_or(false, |v| Self::value_gt_literal(v, val))
+                row.get(col).is_some_and(|v| Self::value_gt_literal(v, val))
             }
             FilterExpr::Lt(col, val) => {
-                row.get(col).map_or(false, |v| Self::value_lt_literal(v, val))
+                row.get(col).is_some_and(|v| Self::value_lt_literal(v, val))
             }
             FilterExpr::Gte(col, val) => {
-                row.get(col).map_or(false, |v| Self::value_gt_literal(v, val) || Self::value_matches_literal(v, val))
+                row.get(col).is_some_and(|v| Self::value_gt_literal(v, val) || Self::value_matches_literal(v, val))
             }
             FilterExpr::Lte(col, val) => {
-                row.get(col).map_or(false, |v| Self::value_lt_literal(v, val) || Self::value_matches_literal(v, val))
+                row.get(col).is_some_and(|v| Self::value_lt_literal(v, val) || Self::value_matches_literal(v, val))
             }
             FilterExpr::And(left, right) => {
                 Self::eval_graph_filter(row, left) && Self::eval_graph_filter(row, right)
@@ -4867,8 +4867,8 @@ impl QueryExecutor {
 
     fn value_gt_literal(value: &Value, literal: &crate::parser::LiteralValue) -> bool {
         match (value, literal) {
-            (Value::Number(n), crate::parser::LiteralValue::Int(l)) => n.as_i64().map_or(false, |v| v > *l),
-            (Value::Number(n), crate::parser::LiteralValue::Float(l)) => n.as_f64().map_or(false, |v| v > *l),
+            (Value::Number(n), crate::parser::LiteralValue::Int(l)) => n.as_i64().is_some_and(|v| v > *l),
+            (Value::Number(n), crate::parser::LiteralValue::Float(l)) => n.as_f64().is_some_and(|v| v > *l),
             (Value::String(s), crate::parser::LiteralValue::String(l)) => s > l,
             _ => false,
         }
@@ -4876,8 +4876,8 @@ impl QueryExecutor {
 
     fn value_lt_literal(value: &Value, literal: &crate::parser::LiteralValue) -> bool {
         match (value, literal) {
-            (Value::Number(n), crate::parser::LiteralValue::Int(l)) => n.as_i64().map_or(false, |v| v < *l),
-            (Value::Number(n), crate::parser::LiteralValue::Float(l)) => n.as_f64().map_or(false, |v| v < *l),
+            (Value::Number(n), crate::parser::LiteralValue::Int(l)) => n.as_i64().is_some_and(|v| v < *l),
+            (Value::Number(n), crate::parser::LiteralValue::Float(l)) => n.as_f64().is_some_and(|v| v < *l),
             (Value::String(s), crate::parser::LiteralValue::String(l)) => s < l,
             _ => false,
         }
@@ -4893,7 +4893,7 @@ impl QueryExecutor {
             }
             onto_graph::model::PropValue::String(s) => Value::String(s.clone()),
             onto_graph::model::PropValue::List(l) => {
-                Value::Array(l.iter().map(|item| Self::prop_value_to_json(item)).collect())
+                Value::Array(l.iter().map(Self::prop_value_to_json).collect())
             }
         }
     }
@@ -7261,7 +7261,7 @@ impl QueryExecutor {
             LiteralValue::Array(arr) => {
                 let json_arr: Vec<serde_json::Value> = arr
                     .iter()
-                    .map(|v| Self::literal_to_json_static(v))
+                    .map(Self::literal_to_json_static)
                     .collect();
                 serde_json::Value::Array(json_arr)
             }

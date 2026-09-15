@@ -2092,7 +2092,7 @@ async fn cursor_query(
         );
     }
 
-    let page_size = req.page_size.max(1).min(10000); // Clamp to [1, 10000]
+    let page_size = req.page_size.clamp(1, 10000);
 
     // Parse cursor to get offset (with signature verification)
     let offset: usize = match &req.cursor {
@@ -2156,7 +2156,7 @@ async fn cursor_query(
                     // Convert Map<String, Value> rows to Value rows
                     let value_rows: Vec<Value> = rows
                         .into_iter()
-                        .map(|row| serde_json::Value::Object(row))
+                        .map(serde_json::Value::Object)
                         .collect();
 
                     let response = CursorResponse {

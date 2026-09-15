@@ -126,7 +126,7 @@ impl MediaRegistry {
     /// Search by custom attribute.
     pub fn search_by_attr(&self, key: &str, value: &str) -> Vec<&MediaMetadata> {
         self.media.values()
-            .filter(|m| m.custom.get(key).map_or(false, |v| v == value))
+            .filter(|m| m.custom.get(key).is_some_and(|v| v == value))
             .collect()
     }
 

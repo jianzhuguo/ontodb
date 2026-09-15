@@ -138,11 +138,7 @@ impl OntologyParser {
         // Check for "SUBCLASS OF" or "EXTENDS" (both are valid inheritance keywords)
         let result = if let Some(pos) = upper_rest.find("SUBCLASS OF") {
             Some((pos, 11))
-        } else if let Some(pos) = upper_rest.find("EXTENDS") {
-            Some((pos, 7))
-        } else {
-            None
-        };
+        } else { upper_rest.find("EXTENDS").map(|pos| (pos, 7)) };
 
         if let Some((pos, kw_len)) = result {
             let class_name = rest[..pos].trim();
