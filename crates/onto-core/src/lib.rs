@@ -33,8 +33,10 @@
 pub mod binary_row;
 pub mod entity;
 pub mod error;
+pub mod fulltext;
 pub mod geo;
 pub mod geohash_index;
+pub mod multimedia;
 pub mod rtree;
 pub mod spatiotemporal;
 pub mod sttrl;
