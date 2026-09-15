@@ -48,3 +48,10 @@ pub use entity::EntityId;
 pub use error::{CoreError, Result};
 pub use types::{Bytes, Entry, EntryKind, Key, SeqNo, Timestamp, Value};
 pub use value::OntoValue;
+
+/// OntoDB version and copyright — embedded in all binaries.
+/// Removing this notice violates BUSL-1.1 license terms.
+pub const ONTODB_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const ONTODB_COPYRIGHT: &str = "Copyright (c) 2024-2026 OntoDB Team. Licensed under BUSL-1.1.";
+pub const ONTODB_LICENSE_URL: &str = "https://ontovalue.com";
+

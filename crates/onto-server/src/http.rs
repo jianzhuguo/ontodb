@@ -627,7 +627,20 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .layer(build_cors_layer(cors_origins))
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(ontodb_headers_mw))
         .with_state(state)
+}
+
+/// Middleware: add OntoDB copyright headers to every response.
+async fn ontodb_headers_mw(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert("X-Powered-By", "OntoDB".parse().unwrap());
+    headers.insert("X-OntoDB-Version", onto_core::ONTODB_VERSION.parse().unwrap());
+    response
 }
 
 /// Builds the HTTP router with authentication and rate limiting.
