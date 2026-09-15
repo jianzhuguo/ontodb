@@ -106,6 +106,29 @@ OntoDB 在单一存储引擎中融合 12 种数据类型：
 | 10 | **SPARQL 支持** | 标准 SPARQL 1.1 查询，FILTER/OPTIONAL/UNION/EXISTS 全支持 |
 | 11 | **推理子句** | 查询时实时推理，`SELECT * FROM Device` 自动包含所有子类实例 |
 
+### OntoQL：统一查询语言
+
+开发者只需学一种语言，就能操作所有数据模态。传统方案需要 SQL + Cypher + 专用向量 API + SPARQL 四种语言。
+
+```sql
+-- 关系查询
+SELECT * FROM users WHERE age > 25;
+
+-- 图遍历
+GRAPH TRAVERSE FROM 'Person::1' OUT LABEL 'knows' DEPTH 3;
+
+-- 向量搜索
+VECTOR SEARCH ON documents (embedding) QUERY [0.1, 0.2] TOP 10;
+
+-- 本体推理（自动展开子类）
+SELECT * FROM Device;  -- 自动包含 Sensor, TemperatureSensor 等所有子类
+
+-- 时空查询
+SELECT * FROM pois WHERE ST_Distance(location, ST_Point(116.4, 39.9)) < 1000;
+
+-- 上述模态可在同一查询中组合使用
+```
+
 ### 活数据管理
 
 | # | 创新 | 一句话 |
