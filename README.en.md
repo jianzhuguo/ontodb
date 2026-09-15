@@ -374,43 +374,32 @@ The Enterprise edition adds three core capabilities on top of Community:
 
 ### Ontology-Driven Rule Engine (World First)
 
-Traditional rule engines require manual rule authoring. OntoDB Enterprise fuses OWL reasoning with the rule engine: **ontology knowledge auto-triggers business rules. Domain experts only define ontology, rules activate automatically.**
-
-```
-Traditional: Domain expert -> find developer -> write rule code -> test -> deploy (weeks)
-OntoDB:      Domain expert -> define ontology (OWL) -> reasoning auto-triggers rules -> instant (minutes)
-```
+**Ontology knowledge auto-triggers business rules. Domain experts only define ontology, rules activate automatically.** Unlike traditional rule engines that require manual rule authoring, OntoDB Enterprise fuses OWL reasoning with the rule engine to achieve "knowledge as rules."
 
 | Capability | Description |
 |-----------|-------------|
-| **OWL Integration** | Reasoning results auto-inject into rule engine, ontology changes auto-trigger re-evaluation |
-| **Full DSL Syntax** | AND/OR/nested/time window(FOR 5min)/wildcard/units |
-| **Distributed Reasoning** | Multi-thread parallel, 4 sharding strategies, 1000 rules < 2ms |
-| **Performance Profiling** | Per-rule avg/p99/p95 latency, slow rule alerting |
-| **Rule Versioning** | 50 versions per rule, rollback support |
-| **Conflict Detection** | SameAttribute + PriorityOverride auto-detection |
+| **Ontology → Rules** | OWL reasoning results auto-inject into rule engine, no coding needed |
+| **Enterprise Rule Engine** | Full DSL syntax, distributed reasoning, conflict detection, versioning, profiling |
 
 ### Security & Compliance
 
+Meets compliance requirements for government, financial, and healthcare industries.
+
 | Capability | Description |
 |-----------|-------------|
-| **RBAC Separation of Duties** | System admin / Security admin / Audit admin |
-| **LDAP/SAML** | Enterprise directory integration |
-| **Data Masking** | Dynamic + static masking |
-| **SM4/AES Encryption** | SM4 national standard + AES-256 storage encryption |
-| **KMS Key Management** | External key management service integration |
-| **Audit Log Rotation** | Compliance retention + auto-cleanup |
-| **CRC Validation** | SSTable page-level integrity check |
+| **Identity & Access** | RBAC separation of duties, LDAP/SAML integration |
+| **Data Protection** | SM4 + AES encryption, data masking, key management |
+| **Audit & Compliance** | Audit logging, compliance retention, integrity validation |
 
 ### High Availability
 
+Enterprise-grade reliability.
+
 | Capability | Description |
 |-----------|-------------|
-| **Auto Failover** | Raft consensus + replica management + read/write split routing |
-| **Cross-Shard Query** | Distributed aggregation, cross-shard JOIN |
-| **Full Backup** | Consistent snapshot + compression + checksum |
-| **Observability** | Slow query analysis + metrics collection + alerting |
-| **Rolling Upgrade** | Cross-version compatibility, zero downtime |
+| **Cluster HA** | Auto failover, read/write split, rolling upgrade |
+| **Distributed Query** | Cross-shard aggregation, distributed backup/restore |
+| **Observability** | Slow query analysis, metrics collection, alerting |
 
 Contact: license@ontovalue.com
 
