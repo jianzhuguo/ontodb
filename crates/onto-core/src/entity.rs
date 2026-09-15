@@ -91,7 +91,7 @@ impl EntityId {
     ///
     /// Format: `{class}::{pk}` (namespace-agnostic for graph traversal)
     pub fn to_vertex_id(&self) -> String {
-        format!("{}::{}", self.class, self.pk)
+        format!("{}::{}::{}", self.namespace, self.class, self.pk)
     }
 
     /// Parses an `EntityId` from LSM key bytes.
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn test_entity_id_to_vertex_id() {
         let id = EntityId::new("hr", "Employee", "alice");
-        assert_eq!(id.to_vertex_id(), "Employee::alice");
+        assert_eq!(id.to_vertex_id(), "hr::Employee::alice");
     }
 
     #[test]
@@ -290,7 +290,7 @@ mod tests {
     fn test_entity_id_with_special_chars() {
         let id = EntityId::new("my-ns", "My-Class", "key/with/slashes");
         assert_eq!(id.to_lsm_key(), b"my-ns::My-Class::key/with/slashes");
-        assert_eq!(id.to_vertex_id(), "My-Class::key/with/slashes");
+        assert_eq!(id.to_vertex_id(), "my-ns::My-Class::key/with/slashes");
     }
 
     #[test]

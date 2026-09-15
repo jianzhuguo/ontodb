@@ -28,10 +28,13 @@
 
 pub mod cache;
 pub mod executor;
+pub mod federated;
+pub mod fusion_optimizer;
 pub mod ontoql;
 pub mod optimizer;
 pub mod parser;
 pub mod parser_util;
+pub mod semantic_cache;
 pub mod sparql;
 
 #[cfg(test)]

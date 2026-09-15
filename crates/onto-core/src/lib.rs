@@ -36,6 +36,7 @@ pub mod error;
 pub mod fulltext;
 pub mod geo;
 pub mod geohash_index;
+pub mod lineage;
 pub mod multimedia;
 pub mod rtree;
 pub mod spatiotemporal;

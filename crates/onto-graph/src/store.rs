@@ -1181,7 +1181,7 @@ mod tests {
     #[test]
     fn test_entity_upsert_vertex() {
         let store = GraphStore::new();
-        let id = EntityId::new("Product", "001");
+        let id = EntityId::new("default", "Product", "001");
 
         store
             .upsert_vertex_from_entity(&id, &["Product".to_string()])
@@ -1189,14 +1189,14 @@ mod tests {
 
         assert!(store.has_entity(&id));
         let vertex = store.get_entity_vertex(&id).unwrap();
-        assert_eq!(vertex.id, "Product::001");
+        assert_eq!(vertex.id, "default::Product::001");
         assert_eq!(vertex.labels, vec!["Product"]);
     }
 
     #[test]
     fn test_entity_upsert_idempotent() {
         let store = GraphStore::new();
-        let id = EntityId::new("Product", "001");
+        let id = EntityId::new("default", "Product", "001");
 
         // First insert
         store
@@ -1213,7 +1213,7 @@ mod tests {
     #[test]
     fn test_entity_delete_vertex() {
         let store = GraphStore::new();
-        let id = EntityId::new("Product", "001");
+        let id = EntityId::new("default", "Product", "001");
 
         store
             .upsert_vertex_from_entity(&id, &["Product".to_string()])
@@ -1227,7 +1227,7 @@ mod tests {
     #[test]
     fn test_entity_delete_nonexistent() {
         let store = GraphStore::new();
-        let id = EntityId::new("Product", "999");
+        let id = EntityId::new("default", "Product", "999");
 
         // Should not fail
         store.delete_vertex_by_entity(&id).unwrap();
@@ -1236,8 +1236,8 @@ mod tests {
     #[test]
     fn test_entity_add_relationship() {
         let store = GraphStore::new();
-        let product = EntityId::new("Product", "001");
-        let category = EntityId::new("Category", "electronics");
+        let product = EntityId::new("default", "Product", "001");
+        let category = EntityId::new("default", "Category", "electronics");
 
         store
             .add_relationship(&product, &category, "belongs_to")
@@ -1251,8 +1251,8 @@ mod tests {
     #[test]
     fn test_entity_add_relationship_creates_vertices() {
         let store = GraphStore::new();
-        let from = EntityId::new("Employee", "alice");
-        let to = EntityId::new("Employee", "bob");
+        let from = EntityId::new("default", "Employee", "alice");
+        let to = EntityId::new("default", "Employee", "bob");
 
         store.add_relationship(&from, &to, "reports_to").unwrap();
 
@@ -1264,8 +1264,8 @@ mod tests {
     #[test]
     fn test_entity_add_relationship_with_props() {
         let store = GraphStore::new();
-        let from = EntityId::new("Person", "alice");
-        let to = EntityId::new("Person", "bob");
+        let from = EntityId::new("default", "Person", "alice");
+        let to = EntityId::new("default", "Person", "bob");
 
         let mut props = PropertyMap::new();
         props.insert("since".to_string(), PropValue::Int(2020));
@@ -1282,8 +1282,8 @@ mod tests {
     #[test]
     fn test_entity_delete_relationship() {
         let store = GraphStore::new();
-        let from = EntityId::new("Product", "001");
-        let to = EntityId::new("Category", "electronics");
+        let from = EntityId::new("default", "Product", "001");
+        let to = EntityId::new("default", "Category", "electronics");
 
         store.add_relationship(&from, &to, "belongs_to").unwrap();
         assert_eq!(store.edge_count(), 1);
@@ -1295,8 +1295,8 @@ mod tests {
     #[test]
     fn test_entity_get_neighbors_both_directions() {
         let store = GraphStore::new();
-        let alice = EntityId::new("Person", "alice");
-        let bob = EntityId::new("Person", "bob");
+        let alice = EntityId::new("default", "Person", "alice");
+        let bob = EntityId::new("default", "Person", "bob");
 
         store.add_relationship(&alice, &bob, "knows").unwrap();
 
@@ -1318,9 +1318,9 @@ mod tests {
     #[test]
     fn test_entity_get_neighbors_filter_label() {
         let store = GraphStore::new();
-        let alice = EntityId::new("Person", "alice");
-        let bob = EntityId::new("Person", "bob");
-        let company = EntityId::new("Company", "acme");
+        let alice = EntityId::new("default", "Person", "alice");
+        let bob = EntityId::new("default", "Person", "bob");
+        let company = EntityId::new("default", "Company", "acme");
 
         store.add_relationship(&alice, &bob, "knows").unwrap();
         store
@@ -1342,14 +1342,14 @@ mod tests {
         let store = GraphStore::new();
 
         store
-            .upsert_vertex_from_entity(&EntityId::new("Product", "001"), &["Product".to_string()])
+            .upsert_vertex_from_entity(&EntityId::new("default", "Product", "001"), &["Product".to_string()])
             .unwrap();
         store
-            .upsert_vertex_from_entity(&EntityId::new("Product", "002"), &["Product".to_string()])
+            .upsert_vertex_from_entity(&EntityId::new("default", "Product", "002"), &["Product".to_string()])
             .unwrap();
         store
             .upsert_vertex_from_entity(
-                &EntityId::new("Category", "electronics"),
+                &EntityId::new("default", "Category", "electronics"),
                 &["Category".to_string()],
             )
             .unwrap();
@@ -1424,8 +1424,8 @@ mod tests {
         };
         let engine = Arc::new(LsmEngine::open(options).unwrap());
 
-        let product = EntityId::new("Product", "001");
-        let category = EntityId::new("Category", "electronics");
+        let product = EntityId::new("default", "Product", "001");
+        let category = EntityId::new("default", "Category", "electronics");
 
         // Create graph and add relationships
         {
