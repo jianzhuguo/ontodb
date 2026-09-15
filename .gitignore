@@ -35,6 +35,7 @@ dist/
 *.key
 *.env
 .env.local
+.env.alerting
 config/api_keys.json
 test_cluster_keys.json
 
