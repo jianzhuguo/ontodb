@@ -763,6 +763,7 @@ pub fn build_router_with_auth(
         ))
         .layer(build_cors_layer(cors_origins))
         .layer(axum::middleware::from_fn(security_headers_middleware))
+        .layer(axum::middleware::from_fn(ontodb_headers_mw))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
