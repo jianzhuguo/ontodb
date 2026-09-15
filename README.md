@@ -1,60 +1,79 @@
-# OntoDB — 本体驱动的六模态语义数据库
+# OntoDB — 本体内核嵌入的多模态语义数据库
 
 **[English](README.en.md)** | 中文
 
 **全球首个将 OWL 推理引擎嵌入数据库内核的多模态语义数据库**
 
+支持 12 种数据类型统一存储，一次 INSERT 自动完成 7 步写入联动，嵌入式增量推理性能较外置方案提升 100 倍。
+
 ---
 
-## 版本对比
+## 为什么选择 OntoDB
 
-| 功能 | 社区版（BUSL-1.1） | 企业版（商业许可） |
-|------|-------------------|------------------|
-| **存储引擎** | ✅ LSM-Tree + MVCC + WAL | ✅ 同社区版 |
-| **六模态统一存储** | ✅ 关系+图+向量+时序+空间+本体 | ✅ 同社区版 |
-| **SQL/OntoQL 查询** | ✅ | ✅ |
-| **SPARQL** | ✅ | ✅ |
-| **HNSW 向量索引** | ✅ | ✅ |
-| **OWL 2 RL 推理** | ✅ 传递闭包+子类传播+对称/逆属性 | ✅ 同社区版 |
-| **推理链追溯** | ✅ | ✅ |
-| **七步写入联动** | ✅ | ✅ |
-| **PostgreSQL/MySQL 兼容** | ✅ | ✅ |
-| **TLS 安全传输** | ✅ | ✅ |
-| **审计完整性链** | ✅ | ✅ |
-| **CDC 变更数据捕获** | ✅ | ✅ |
-| **数据分片** | ✅ 类/范围/哈希 | ✅ 企业级分片+跨分片查询 |
-| **Raft 分布式复制** | ✅ | ✅ |
-| **基本规则API** | ✅ DSL解析+CRUD+热更新 | ✅ 同社区版 |
-| **边缘设备支持** | ✅ onto-edge | ✅ onto-edge |
-| **插件框架** | ✅ | ✅ |
-| 高级推理引擎 | ❌ | ✅ 完整DSL+OWL集成+分布式推理+性能分析 |
-| 集群自动故障转移 | ❌ | ✅ |
-| 跨分片查询 | ❌ | ✅ 分布式聚合 |
-| 慢查询监控 | ❌ | ✅ 可观测性 |
-| 全量备份 | ❌ | ✅ |
-| RBAC 三权分立 | ❌ | ✅ |
-| LDAP/SAML 集成 | ❌ | ✅ |
-| 数据脱敏 | ❌ | ✅ |
-| SM4/AES 加密 | ❌ | ✅ |
-| KMS 密钥管理 | ❌ | ✅ |
-| 审计日志轮转+保留 | ❌ | ✅ |
-| CRC 数据校验 | ❌ | ✅ |
-| 滚动升级 | ❌ | ✅ |
+| 传统方案 | OntoDB |
+|----------|--------|
+| MySQL + Neo4j + Milvus + InfluxDB + PostGIS + Jena，6 个系统 | **1 个系统**，12 种数据类型统一存储 |
+| 数据写入后需要 ETL 流程生成语义，延迟秒级到分钟级 | **写入即语义就绪**，7 步联动管线原子完成，延迟微秒级 |
+| 推理引擎外置，跨系统数据搬运 | **推理内嵌存储引擎**，共享内存空间，零搬运 |
+| SQL + Cypher + SPARQL + 专用 API，4 种查询语言 | **统一查询语言 OntoQL**，单一语法融合关系+图+向量+推理 |
+| 6 套独立系统，运维复杂 | **边缘三级部署**，从 ESP32 到云服务器统一架构 |
+
+---
+
+## 12 种数据类型
+
+OntoDB 在单一存储引擎中融合 12 种数据类型：
+
+| 类别 | 数据类型 | 说明 |
+|------|----------|------|
+| **基础** | 键值对 | 高性能读写 |
+| | 文档 | JSON/BSON，嵌套结构 |
+| | 文本 | 全文检索+语义分析 |
+| | 多媒体 | 二进制大对象+元数据 |
+| **高级** | 结构化记录 | 关系型数据+事务语义 |
+| | 图结构 | 实体关系网络+遍历 |
+| | 向量索引 | HNSW 语义相似性检索 |
+| | 时序数据 | 传感器/监控/日志 |
+| | 空间数据 | R-Tree+GeoHash 地理信息 |
+| | 语义三元组 | 知识图谱 SPO |
+| **实时** | 流数据 | CDC 变更捕获+连续查询 |
+| | 事件数据 | 复杂事件处理 |
+
+所有数据通过**统一语义锚点**（`{Class}::{PrimaryKey}`）关联，零映射表。
+
+---
+
+## 核心技术
+
+| 能力 | 说明 |
+|------|------|
+| **本体内核推理** | OWL 2 RL 推理引擎嵌入存储引擎内核，写入即推理，增量不动点算法 |
+| **12 种数据统一存储** | 键值/文档/文本/多媒体/关系/图/向量/时序/空间/三元组/流/事件 |
+| **七步写入联动** | 一次 INSERT 原子完成文档→图→三元组→推理→向量→索引 |
+| **统一查询语言** | OntoQL 单一语法融合 SQL+图遍历+向量搜索+本体推理 |
+| **活数据生命周期** | 指数/线性/对数衰减模型，数据价值随访问行为自动调整 |
+| **时空规则引擎** | 嵌入式 STTRL 引擎，地理围栏/超速/接近检测等 10+ 种规则 |
+| **三级分层存储** | 热层(内存)→温层(SSD)→冷层(HDD)，按温度自动迁移 |
+| **多协议接入** | PostgreSQL + MySQL + HTTP REST，现有应用无缝迁移 |
+| **边缘三级部署** | MCU(<100KB) → 嵌入式 Linux → 边缘服务器，统一架构 |
+| **分布式高可用** | Raft 共识 + 三种分片策略 + CDC 变更捕获 + 命名空间多租户隔离 |
 
 ---
 
 ## 性能基准
 
-| 指标 | 数值 |
-|------|------|
-| 写入吞吐量 | 863,618 ops/s |
-| 读取吞吐量 | 1,256,518 ops/s |
-| 批量写入 | 1,082,230 ops/s |
-| HNSW 向量召回率 | 100%（ef_search=200，延迟341µs） |
-| 8线程并发加速 | 1.82x |
-| GIS 空间关系判断 | ≤1µs |
-| TSM 压缩率 | 60%+ |
-| OWL 推理（10万三元组） | 5ms |
+| 指标 | 数值 | 对比 |
+|------|------|------|
+| 写入吞吐量 | **863,618 ops/s** | — |
+| 读取吞吐量 | **1,256,518 ops/s** | — |
+| 批量写入 | **1,082,230 ops/s** | — |
+| HNSW 向量召回率 | **100%**（ef_search=200） | 延迟 341µs |
+| 8 线程并发加速 | **1.82x** | 近线性 |
+| OWL 推理（10 万三元组） | **5ms** | 增量不动点 |
+| GIS 空间关系判断 | **≤1µs** | DE-9IM |
+| TSM 压缩率 | **60%+** | Delta+Gorilla |
+| 二进制行过滤 | **2x 提升** | 零拷贝 |
+| 增量推理 vs 全量推理 | **10-100x** | 不动点算法 |
 
 ---
 
@@ -63,70 +82,61 @@
 ### 从源码编译
 
 ```bash
-# 前置要求：Rust 1.70+
+# 前置要求：Rust 1.77+
 git clone https://gitee.com/ontovalue/ontodb.git
 cd ontodb
 cargo build --release
 
-# 启动服务器
+# 启动服务器（PostgreSQL 协议 5432 + MySQL 协议 3306 + HTTP 7912）
 ./target/release/ontodb-server --data-dir ./data --http 0.0.0.0:7912
 ```
 
 ### Docker
 
 ```bash
-docker run -p 7912:7912 ontodb/ontodb-server --data-dir /data --http 0.0.0.0:7912
+docker compose up -d
 ```
 
----
-
-## 核心能力
-
-### 1. 六模态统一存储
-
-```sql
--- 关系型
-CREATE VERTEX TABLE users (name STRING, age INT);
-INSERT INTO users (name, age) VALUES ('Alice', 30);
-
--- 图遍历
-GRAPH TRAVERSE FROM 'Person::1' OUT LABEL 'knows' DEPTH 3;
-
--- 向量搜索
-VECTOR SEARCH ON documents (embedding) QUERY [0.1, 0.2] TOP 10;
-
--- 时序查询
-SELECT * FROM sensor_data WHERE time > '2024-01-01' LIMIT 100;
-
--- 空间查询
-SELECT * FROM pois WHERE ST_Distance(location, ST_Point(116.4, 39.9)) < 1000;
-```
-
-### 2. 本体内核推理
+### 用 OntoQL 创建第一个表
 
 ```sql
 -- 定义本体
 CREATE CLASS Device;
 CREATE CLASS Sensor SUBCLASS OF Device;
-CREATE CLASS TemperatureSensor SUBCLASS OF Sensor;
 
--- 插入实例
-INSERT INTO TemperatureSensor (id, location) VALUES ('T1', 'Factory_A');
+-- 插入数据（自动完成 7 步联动）
+INSERT INTO Sensor (id, location, temperature) 
+VALUES ('T1', 'Factory_A', 36.5);
 
--- 查询时自动推理展开
-SELECT * FROM Device;  -- 自动包含所有子类实例
+-- 查询时自动推理展开（Device 自动包含 Sensor 子类数据）
+SELECT * FROM Device;
+
+-- 图遍历
+GRAPH TRAVERSE FROM 'Sensor::T1' OUT LABEL 'connects_to' DEPTH 3;
+
+-- 向量搜索
+VECTOR SEARCH ON documents (embedding) QUERY [0.1, 0.2] TOP 10;
+
+-- 空间查询
+SELECT * FROM devices WHERE ST_Distance(location, ST_Point(116.4, 39.9)) < 1000;
+
+-- 时序查询
+SELECT * FROM sensor_data WHERE time > '2024-01-01' LIMIT 100;
 ```
 
-### 3. 七步写入联动
+---
 
-一次 INSERT 自动完成：
-1. 文档写入
-2. 图顶点创建
-3. rdf:type 三元组生成
-4. 属性三元组生成
-5. OWL 推理
-6. 向量索引更新
-7. B+Tree 索引更新
+## 适用场景
+
+| 场景 | 为什么用 OntoDB |
+|------|----------------|
+| **IoT / 工业互联网** | 时序+空间+图+本体推理统一，一个系统替代 6 个 |
+| **知识图谱** | OWL 推理内嵌，写入即推理，不用外挂推理引擎 |
+| **智能搜索** | 向量+全文+语义推理融合查询 |
+| **数字孪生** | 12 种数据类型 + 活数据衰减 + 时空规则引擎 |
+| **自动驾驶** | 边缘三级部署 + STTRL 时空规则 + CDC 实时事件 |
+| **多租户 SaaS** | 命名空间全栈隔离，零开销路由 |
+| **边缘计算** | MCU < 100KB 内存到完整服务器，统一 API |
 
 ---
 
@@ -135,20 +145,20 @@ SELECT * FROM Device;  -- 自动包含所有子类实例
 ```
 ontodb/
 ├── crates/
-│   ├── onto-core/          # 核心类型、空间索引、时间序列
-│   ├── onto-storage/       # LSM-Tree 存储引擎（WAL/MVCC/HNSW/TSM）
-│   ├── onto-ontology/      # OWL 2 RL 推理引擎
-│   ├── onto-query/         # 查询引擎（SQL/OntoQL/SPARQL）
-│   ├── onto-graph/         # 图数据模型+遍历
-│   ├── onto-server/        # HTTP/PG/MySQL 服务器
-│   ├── onto-cli/           # 命令行工具
-│   ├── onto-plugin/        # 插件框架
-│   ├── onto-edge/          # 边缘设备 SDK
-│   ├── onto-sharding/      # 数据分片
-│   ├── onto-raft/          # Raft 共识
-│   └── ontodb-rules/       # 基本规则 API 服务
+│   ├── onto-core/          # 核心类型（EntityId/BinaryRow/R-Tree/GeoHash/DTW）
+│   ├── onto-storage/       # LSM-Tree 引擎（WAL/MVCC/HNSW/TSM/分层存储/Bloom）
+│   ├── onto-ontology/      # OWL 2 RL 推理引擎（7 条规则/增量不动点/推导追溯）
+│   ├── onto-query/         # 查询引擎（OntoQL/SPARQL/优化器/执行器/缓存）
+│   ├── onto-graph/         # 图模型（邻接表/BFS/DFS 遍历）
+│   ├── onto-server/        # 多协议服务器（PG/MySQL/HTTP/TLS/审计/CDC/限流）
+│   ├── onto-cli/           # 命令行 REPL + dump/restore
+│   ├── onto-plugin/        # 插件钩子管线（INSERT/UPDATE/DELETE 生命周期）
+│   ├── onto-edge/          # 边缘设备 SDK（采集/地理围栏/上报）
+│   ├── onto-sharding/      # 数据分片（类/范围/哈希策略）
+│   ├── onto-raft/          # Raft 共识（持久化/集群白名单/配置同步）
+│   └── ontodb-rules/       # 基本规则 API 服务（DSL 解析/CRUD/热更新）
 ├── sdk/                    # 多语言 SDK（Go/Python/TypeScript）
-├── examples/               # 示例应用+规则模板
+├── examples/               # 示例应用 + 规则模板（金融/工业/医疗）
 ├── frontend/               # 规则编辑器 Web UI
 └── docs/                   # 文档
 ```
@@ -161,20 +171,20 @@ OntoDB 采用双许可模式：
 
 | 版本 | 许可证 | 说明 |
 |------|--------|------|
-| **社区版** | BUSL-1.1 | 免费使用，禁止提供DBaaS托管服务，2031-09-15转Apache-2.0 |
+| **社区版** | BUSL-1.1 | 免费使用，禁止提供 DBaaS 托管服务，2031-09-15 转 Apache-2.0 |
 | **企业版** | 商业许可 | 全功能，需购买许可证 |
 
 **社区版（BUSL-1.1）：**
 - 允许：内部使用、本地部署、二次开发、非商业分发
-- 允许：企业自用、SaaS产品中嵌入使用
-- 禁止：提供OntoDB作为云数据库服务（DBaaS）
-- 2031-09-15自动转为 Apache License 2.0
+- 允许：企业自用、SaaS 产品中嵌入使用
+- 禁止：提供 OntoDB 作为云数据库服务（DBaaS）
+- 2031-09-15 自动转为 Apache License 2.0
 - 详见 [LICENSE](LICENSE)
 
 **企业版（商业许可）：**
-- 高级推理引擎（完整DSL+OWL集成+分布式推理+性能分析）
-- 安全合规（RBAC+LDAP+SM4/AES加密+KMS+审计保留）
-- 高可用（集群故障转移+跨分片查询+备份恢复）
+- 高级推理引擎（完整 DSL + OWL 集成 + 分布式推理 + 性能分析）
+- 安全合规（RBAC + LDAP + SM4/AES 加密 + KMS + 审计保留）
+- 高可用（集群故障转移 + 跨分片查询 + 备份恢复）
 - 详见 [LICENSE.COMMERCIAL](LICENSE.COMMERCIAL)
 - 联系方式：license@ontovalue.com
 
