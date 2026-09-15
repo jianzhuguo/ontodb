@@ -81,7 +81,7 @@ All data linked via **unified semantic anchor** (`{Class}::{PrimaryKey}`), zero 
 
 ---
 
-## 29 Core Technologies
+## 30 Core Technologies
 
 ### Storage Engine
 
@@ -92,14 +92,15 @@ All data linked via **unified semantic anchor** (`{Class}::{PrimaryKey}`), zero 
 | 3 | **Full-Modal Unified Storage** | LSM-Tree + key-prefix routing, 12 data types coexist in one engine |
 | 4 | **Binary Row Zero-Copy Filtering** | Filter on binary data without deserialization, 60% parse time reduction |
 | 5 | **3-Phase Lock Commit** | Prepare -> pre-commit -> commit, avoids write/index lock deadlock |
+| 7 | **4-Layer Cache Kernel Embedding** | Block cache + query cache + semantic cache + adaptive memory, zero network overhead, shared memory |
 
 ### Reasoning Engine
 
 | # | Innovation | One-liner |
 |---|-----------|-----------|
-| 6 | **Embedded Incremental Reasoning** | OWL 2 RL embedded in storage kernel, incremental fixpoint, 10-100x speedup |
-| 7 | **Reasoning Safety** | Fact budget control, parallel thread pool, cycle detection |
-| 8 | **Derivation Chain Tracing** | Every derived fact records source rule and input facts |
+| 7 | **Embedded Incremental Reasoning** | OWL 2 RL embedded in storage kernel, incremental fixpoint, 10-100x speedup |
+| 8 | **Reasoning Safety** | Fact budget control, parallel thread pool, cycle detection |
+| 9 | **Derivation Chain Tracing** | Every derived fact records source rule and input facts |
 
 ### Ontology Kernel: OWL 2 RL Reasoning Engine
 
@@ -128,13 +129,13 @@ OntoDB:      Data write -> kernel auto-reasoning -> instant persist (microsecond
 
 | # | Innovation | One-liner |
 |---|-----------|-----------|
-| 9 | **OntoQL Unified Query** | One syntax for SQL + graph traversal + vector search + ontology reasoning + temporal + spatial |
-| 10 | **SPARQL Support** | Standard SPARQL 1.1, FILTER/OPTIONAL/UNION/EXISTS |
-| 11 | **Inference Clause** | Real-time reasoning in queries, `SELECT * FROM Device` auto-includes all subclasses |
-| 12 | **Semantic Cache** | Queries with same semantic meaning hit same cache, regardless of text differences |
-| 13 | **Multi-Modal Fusion Optimizer** | Vector+relational, spatial+temporal, text+vector auto-select optimal execution plan |
-| 14 | **Data Lineage** | Kernel-level provenance tracking, traces to original write + every reasoning step |
-| 15 | **Federated Query** | External sources (PG/MySQL/REST/CSV/JSON) mapped as namespaces, unified query |
+| 10 | **OntoQL Unified Query** | One syntax for SQL + graph traversal + vector search + ontology reasoning + temporal + spatial |
+| 11 | **SPARQL Support** | Standard SPARQL 1.1, FILTER/OPTIONAL/UNION/EXISTS |
+| 12 | **Inference Clause** | Real-time reasoning in queries, `SELECT * FROM Device` auto-includes all subclasses |
+| 13 | **Semantic Cache** | Queries with same semantic meaning hit same cache, regardless of text differences |
+| 14 | **Multi-Modal Fusion Optimizer** | Vector+relational, spatial+temporal, text+vector auto-select optimal execution plan |
+| 15 | **Data Lineage** | Kernel-level provenance tracking, traces to original write + every reasoning step |
+| 16 | **Federated Query** | External sources (PG/MySQL/REST/CSV/JSON) mapped as namespaces, unified query |
 
 ### OntoQL: Unified Query Language
 
@@ -161,8 +162,8 @@ SELECT * FROM pois WHERE ST_Distance(location, ST_Point(116.4, 39.9)) < 1000;
 
 | # | Innovation | One-liner |
 |---|-----------|-----------|
-| 16 | **Living Data Lifecycle** | Exponential/linear/logarithmic decay, 3-tier half-life (7h/70d/2yr), auto-activate on access |
-| 17 | **Value-Driven Query** | Filter and sort by value score, high-frequency data auto-promotes |
+| 17 | **Living Data Lifecycle** | Exponential/linear/logarithmic decay, 3-tier half-life (7h/70d/2yr), auto-activate on access |
+| 18 | **Value-Driven Query** | Filter and sort by value score, high-frequency data auto-promotes |
 
 Traditional TTL: fixed expiry, no value awareness. Living Data: **data lives like a living thing** — unused data slowly "dies", accessed data "revives".
 
@@ -178,28 +179,28 @@ Traditional TTL: fixed expiry, no value awareness. Living Data: **data lives lik
 
 | # | Innovation | One-liner |
 |---|-----------|-----------|
-| 18 | **TSM Columnar Storage** | Timestamp Delta encoding + float Gorilla encoding, 60%+ storage reduction |
-| 19 | **Spatio-Temporal Joint Index** | Quadtree spatial partition + timeline sort in single data structure |
-| 20 | **Embedded STTRL Engine** | 10+ spatio-temporal rules (geofence/speed/proximity/anomaly) at database level |
-| 21 | **3-Tier Storage** | Hot(memory) -> Warm(SSD) -> Cold(HDD), auto-migration by data temperature |
-| 22 | **Advanced Time Series** | DTW distance, streaming anomaly detection, tumbling/hopping/session windows |
+| 19 | **TSM Columnar Storage** | Timestamp Delta encoding + float Gorilla encoding, 60%+ storage reduction |
+| 20 | **Spatio-Temporal Joint Index** | Quadtree spatial partition + timeline sort in single data structure |
+| 21 | **Embedded STTRL Engine** | 10+ spatio-temporal rules (geofence/speed/proximity/anomaly) at database level |
+| 22 | **3-Tier Storage** | Hot(memory) -> Warm(SSD) -> Cold(HDD), auto-migration by data temperature |
+| 23 | **Advanced Time Series** | DTW distance, streaming anomaly detection, tumbling/hopping/session windows |
 
 ### Distributed & Scaling
 
 | # | Innovation | One-liner |
 |---|-----------|-----------|
-| 23 | **Data Sharding** | Class/Range/Hash strategies, runtime scaling and rebalancing |
-| 24 | **Raft Consensus** | Multi-node cluster consistency, persistent log, cluster whitelist |
-| 25 | **Multi-Protocol Access** | PostgreSQL + MySQL + HTTP REST simultaneously |
-| 26 | **Embedded API Gateway** | Load balancing, rate limiting, circuit breaking, auth |
-| 27 | **3-Tier Edge Deployment** | MCU(<100KB) -> Embedded Linux -> Edge server, unified model and API |
+| 24 | **Data Sharding** | Class/Range/Hash strategies, runtime scaling and rebalancing |
+| 25 | **Raft Consensus** | Multi-node cluster consistency, persistent log, cluster whitelist |
+| 26 | **Multi-Protocol Access** | PostgreSQL + MySQL + HTTP REST simultaneously |
+| 27 | **Embedded API Gateway** | Load balancing, rate limiting, circuit breaking, auth |
+| 28 | **3-Tier Edge Deployment** | MCU(<100KB) -> Embedded Linux -> Edge server, unified model and API |
 
 ### Security & Operations
 
 | # | Innovation | One-liner |
 |---|-----------|-----------|
-| 28 | **CDC Change Capture** | Kernel-integrated, WAL real-time extraction, Flink/Spark compatible |
-| 29 | **Namespace Kernel Isolation** | `{namespace}::{class}::{pk}` 5-layer full-stack isolation, key-prefix routing zero overhead |
+| 29 | **CDC Change Capture** | Kernel-integrated, WAL real-time extraction, Flink/Spark compatible |
+| 30 | **Namespace Kernel Isolation** | `{namespace}::{class}::{pk}` 5-layer full-stack isolation, key-prefix routing zero overhead |
 
 ### Namespace: Kernel-Level Multi-Tenant Isolation
 
