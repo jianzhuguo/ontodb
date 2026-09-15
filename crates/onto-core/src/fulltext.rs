@@ -7,7 +7,7 @@
 //!
 //! Supports Chinese (character-level n-gram) and English (whitespace) tokenization.
 
-use std::collections::{HashMap, BTreeMap};
+use std::collections::HashMap;
 
 /// Document stored in the full-text index.
 #[derive(Debug, Clone)]
@@ -173,7 +173,7 @@ impl FullTextIndex {
 
     /// Remove a document from the index.
     pub fn remove_document(&mut self, doc_id: &str) {
-        if let Some(doc) = self.documents.remove(doc_id) {
+        if let Some(_doc) = self.documents.remove(doc_id) {
             // Rebuild affected posting lists
             for list in self.inverted_index.values_mut() {
                 list.postings.retain(|p| p.doc_id != doc_id);

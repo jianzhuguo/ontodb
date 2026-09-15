@@ -12,7 +12,6 @@
 
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
 
 /// Memory manager configuration.
@@ -87,6 +86,7 @@ impl WriteRateTracker {
         }
     }
 
+    #[allow(dead_code)]
     fn record_write(&mut self) {
         self.current_count += 1;
     }
@@ -115,6 +115,7 @@ impl WriteRateTracker {
 /// Dynamic memory manager.
 pub struct MemoryManager {
     config: MemoryManagerConfig,
+    #[allow(dead_code)]
     /// Initial MemTable size (from options).
     initial_memtable_size: usize,
     /// Current MemTable size limit.

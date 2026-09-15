@@ -428,7 +428,7 @@ impl RTree {
     /// Instead of DFS with post-hoc pruning, we always expand the closest candidate first.
     /// This guarantees we find the k nearest neighbors with minimal node visits.
     fn knn_best_first(&self, x: f64, y: f64, k: usize) -> Vec<(String, f64)> {
-        use std::cmp::Reverse;
+        
         use std::collections::BinaryHeap;
 
         // Priority queue entry: (Reverse for min-heap on distance, node_index)

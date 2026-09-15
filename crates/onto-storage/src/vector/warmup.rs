@@ -12,8 +12,6 @@
 //! - Background thread: periodically re-warm recently used indexes
 //! - Per-index warmup state tracking
 
-use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Instant;
 
 /// Warmup state for a single vector index.

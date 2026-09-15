@@ -296,6 +296,7 @@ pub struct BatchRequest {
     pub fail_fast: bool,
     /// Optional: return results as pretty-printed JSON.
     #[serde(default)]
+    #[allow(dead_code)]
     pub pretty: bool,
 }
 
@@ -323,6 +324,7 @@ pub struct BatchResult {
 pub struct TransactionBeginRequest {
     /// Optional: isolation level (default: snapshot).
     #[serde(default)]
+    #[allow(dead_code)]
     pub isolation: Option<String>,
 }
 

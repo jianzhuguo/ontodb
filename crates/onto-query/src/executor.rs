@@ -399,6 +399,7 @@ impl InferenceCache {
 
     /// Fine-grained invalidation: only clear caches related to specific classes.
     /// This is more efficient than clearing all caches when only a few classes change.
+    #[allow(dead_code)]
     pub fn invalidate_classes(&mut self, affected_classes: &[String]) {
         // Clear class hierarchy cache for affected classes
         for class in affected_classes {
@@ -2413,7 +2414,7 @@ impl QueryExecutor {
                 // Check if column has an index
                 engine.has_index(table, col)
             }
-            FilterExpr::In(col, vals) => {
+            FilterExpr::In(_col, vals) => {
                 // IN with few values is selective
                 vals.len() < 10
             }

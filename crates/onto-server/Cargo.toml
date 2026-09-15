@@ -62,6 +62,10 @@ default = []
 raft = []
 sharding = []
 enterprise = ["dep:onto-enterprise"]
+cdc-kafka = []
+cdc-webhook = []
+encryption = []
+audit-retention = []
 
 # === Enterprise Bundles ===
 enterprise-standard = ["enterprise", "raft", "sharding"]

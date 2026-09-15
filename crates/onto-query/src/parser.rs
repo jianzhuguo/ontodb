@@ -11,7 +11,7 @@
 
 use crate::parser_util::{
     ends_with_ignore_ascii_case, find_ignore_ascii_case, safe_slice, safe_slice_from,
-    starts_with_ignore_ascii_case, trim_semicolons,
+    starts_with_ignore_ascii_case,
 };
 use onto_core::{CoreError, Result};
 use serde::{Deserialize, Serialize};

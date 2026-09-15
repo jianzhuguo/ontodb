@@ -110,12 +110,14 @@ impl Reasoner {
         self.reason_inner(facts, true)
     }
 
+    #[allow(unused_assignments)]
     fn reason_inner(&self, facts: &[Triple], parallel: bool) -> ReasoningResult {
         let mut all_facts: HashSet<Triple> = facts.iter().cloned().collect();
         let mut all_inferred: Vec<Triple> = Vec::new();
         let mut rule_counts: HashMap<RuleId, usize> = HashMap::new();
         let mut iterations = 0;
         let mut new_facts: Vec<Triple> = Vec::new();
+        #[allow(unused_assignments)]
         let mut budget_exceeded = false;
 
         // Fast path: transitive closure using adjacency BFS

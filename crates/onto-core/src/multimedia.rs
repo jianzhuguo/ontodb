@@ -150,7 +150,7 @@ impl MediaRegistry {
 
 /// Simple SHA-256 hex hash (using built-in).
 pub fn content_hash(data: &[u8]) -> String {
-    use std::io::Write;
+    
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex_encode(hasher.finalize())

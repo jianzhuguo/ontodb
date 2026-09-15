@@ -325,7 +325,7 @@ impl CostModel {
         filter: &crate::parser::FilterExpr,
     ) -> FilterSelectivity {
         match filter {
-            crate::parser::FilterExpr::Eq(col, val) => {
+            crate::parser::FilterExpr::Eq(col, _val) => {
                 // Try histogram first for more accurate estimate
                 if let Some(hist) = stats.histograms.iter().find(|h| &h.column == col) {
                     if hist.distinct_count > 0 {
@@ -509,7 +509,7 @@ impl CostModel {
     /// Estimate range selectivity from a histogram bucket.
     fn estimate_range_from_histogram(
         hist: &ColumnHistogram,
-        val: &crate::parser::LiteralValue,
+        _val: &crate::parser::LiteralValue,
         filter: &crate::parser::FilterExpr,
     ) -> Option<f64> {
         if hist.buckets.is_empty() || hist.distinct_count == 0 {
