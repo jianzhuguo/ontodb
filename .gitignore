@@ -53,6 +53,7 @@ deploy/nginx/certs/
 
 # Patent documents (local only, not committed)
 docs/patent/
+docs/marketing/
 scripts/generate_patent_docx.py
 scripts/generate_patent_diagrams.py
 scripts/generate_patent_svg.py
