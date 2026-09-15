@@ -94,20 +94,27 @@ impl TurtleParser {
             let predicate = self.resolve_iri(&triple.predicate);
 
             // Check for TransitiveProperty and SymmetricProperty type declarations first
-            if predicate == "rdf:type" || predicate == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" {
+            if predicate == "rdf:type"
+                || predicate == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            {
                 if let RdfTerm::Iri(ref obj) = triple.object {
                     let obj_resolved = self.resolve_iri(obj);
                     match obj_resolved.as_str() {
-                        "owl:TransitiveProperty" | "http://www.w3.org/2002/07/owl#TransitiveProperty" => {
+                        "owl:TransitiveProperty"
+                        | "http://www.w3.org/2002/07/owl#TransitiveProperty" => {
                             transitive_props.push(subject.clone());
                             continue;
                         }
-                        "owl:SymmetricProperty" | "http://www.w3.org/2002/07/owl#SymmetricProperty" => {
+                        "owl:SymmetricProperty"
+                        | "http://www.w3.org/2002/07/owl#SymmetricProperty" => {
                             symmetric_props.push(subject.clone());
                             continue;
                         }
                         _ => {
-                            class_types.entry(subject.clone()).or_default().push(obj_resolved);
+                            class_types
+                                .entry(subject.clone())
+                                .or_default()
+                                .push(obj_resolved);
                         }
                     }
                 }
@@ -118,25 +125,37 @@ impl TurtleParser {
                 "rdfs:subClassOf" | "http://www.w3.org/2000/01/rdf-schema#subClassOf" => {
                     if let RdfTerm::Iri(ref obj) = triple.object {
                         let obj_resolved = self.resolve_iri(obj);
-                        sub_class_of.entry(subject.clone()).or_default().push(obj_resolved);
+                        sub_class_of
+                            .entry(subject.clone())
+                            .or_default()
+                            .push(obj_resolved);
                     }
                 }
                 "rdfs:subPropertyOf" | "http://www.w3.org/2000/01/rdf-schema#subPropertyOf" => {
                     if let RdfTerm::Iri(ref obj) = triple.object {
                         let obj_resolved = self.resolve_iri(obj);
-                        sub_prop_of.entry(subject.clone()).or_default().push(obj_resolved);
+                        sub_prop_of
+                            .entry(subject.clone())
+                            .or_default()
+                            .push(obj_resolved);
                     }
                 }
                 "owl:equivalentClass" | "http://www.w3.org/2002/07/owl#equivalentClass" => {
                     if let RdfTerm::Iri(ref obj) = triple.object {
                         let obj_resolved = self.resolve_iri(obj);
-                        equivalent_classes.entry(subject.clone()).or_default().push(obj_resolved);
+                        equivalent_classes
+                            .entry(subject.clone())
+                            .or_default()
+                            .push(obj_resolved);
                     }
                 }
                 "owl:disjointWith" | "http://www.w3.org/2002/07/owl#disjointWith" => {
                     if let RdfTerm::Iri(ref obj) = triple.object {
                         let obj_resolved = self.resolve_iri(obj);
-                        disjoint_with.entry(subject.clone()).or_default().push(obj_resolved);
+                        disjoint_with
+                            .entry(subject.clone())
+                            .or_default()
+                            .push(obj_resolved);
                     }
                 }
                 "owl:inverseOf" | "http://www.w3.org/2002/07/owl#inverseOf" => {
@@ -165,19 +184,35 @@ impl TurtleParser {
         for (subject, types) in &class_types {
             let class_name = Self::extract_local_name(subject);
             let is_class = types.iter().any(|t| {
-                t.ends_with("#Class") || t.ends_with(":Class")
+                t.ends_with("#Class")
+                    || t.ends_with(":Class")
                     || t == "http://www.w3.org/2002/07/owl#Class"
                     || t == "rdfs:Class"
             });
 
             if is_class || !types.is_empty() {
                 let mut class = Class::new(&class_name);
-                class.superclasses = sub_class_of.get(subject).cloned().unwrap_or_default()
-                    .iter().map(|s| Self::extract_local_name(s)).collect();
-                class.equivalent_classes = equivalent_classes.get(subject).cloned().unwrap_or_default()
-                    .iter().map(|s| Self::extract_local_name(s)).collect();
-                class.disjoint_with = disjoint_with.get(subject).cloned().unwrap_or_default()
-                    .iter().map(|s| Self::extract_local_name(s)).collect();
+                class.superclasses = sub_class_of
+                    .get(subject)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| Self::extract_local_name(s))
+                    .collect();
+                class.equivalent_classes = equivalent_classes
+                    .get(subject)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| Self::extract_local_name(s))
+                    .collect();
+                class.disjoint_with = disjoint_with
+                    .get(subject)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| Self::extract_local_name(s))
+                    .collect();
                 ontology.add_class(class);
             }
         }
@@ -186,22 +221,31 @@ impl TurtleParser {
         for (subject, types) in &class_types {
             let prop_name = Self::extract_local_name(subject);
             let is_property = types.iter().any(|t| {
-                t.ends_with("#Property") || t.ends_with(":Property")
+                t.ends_with("#Property")
+                    || t.ends_with(":Property")
                     || t == "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
-                    || t == "owl:ObjectProperty" || t == "owl:DatatypeProperty"
+                    || t == "owl:ObjectProperty"
+                    || t == "owl:DatatypeProperty"
             });
 
             if is_property {
-                let domain = domains.get(subject)
+                let domain = domains
+                    .get(subject)
                     .map(|d| Self::extract_local_name(d))
                     .unwrap_or_default();
-                let range = ranges.get(subject)
+                let range = ranges
+                    .get(subject)
                     .map(|r| Self::iri_to_datatype(r))
                     .unwrap_or(DataType::String);
 
                 let mut prop = Property::new(&prop_name, &domain, range);
-                prop.subproperty_of = sub_prop_of.get(subject).cloned().unwrap_or_default()
-                    .iter().map(|s| Self::extract_local_name(s)).collect();
+                prop.subproperty_of = sub_prop_of
+                    .get(subject)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| Self::extract_local_name(s))
+                    .collect();
                 prop.inverse_of = inverse_of.get(subject).map(|s| Self::extract_local_name(s));
                 prop.is_transitive = transitive_props.contains(subject);
                 prop.is_symmetric = symmetric_props.contains(subject);
@@ -257,7 +301,9 @@ impl TurtleParser {
             // Parse subject predicate object . triples
             // Subject is the first token
             let without_dot = line.trim_end_matches('.').trim();
-            let first_space = without_dot.find(|c: char| c.is_whitespace()).unwrap_or(without_dot.len());
+            let first_space = without_dot
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(without_dot.len());
             let subject = without_dot[..first_space].to_string();
             let rest = without_dot[first_space..].trim();
 
@@ -269,7 +315,9 @@ impl TurtleParser {
                 }
 
                 // Split by whitespace to get predicate and object(s)
-                let first_space = po_pair.find(|c: char| c.is_whitespace()).unwrap_or(po_pair.len());
+                let first_space = po_pair
+                    .find(|c: char| c.is_whitespace())
+                    .unwrap_or(po_pair.len());
                 let predicate = po_pair[..first_space].trim().to_string();
                 let object_str = po_pair[first_space..].trim();
 
@@ -281,7 +329,7 @@ impl TurtleParser {
                     }
 
                     let object = if obj.starts_with('<') && obj.ends_with('>') {
-                        RdfTerm::Iri(obj[1..obj.len()-1].to_string())
+                        RdfTerm::Iri(obj[1..obj.len() - 1].to_string())
                     } else if obj.starts_with('"') {
                         // Find the closing quote, handling escaped quotes (\")
                         let mut end_quote = obj.len();
@@ -301,15 +349,32 @@ impl TurtleParser {
                         let raw_value = &obj[1..end_quote];
                         let value = unescape_turtle_string(raw_value);
                         // Safe: end_quote found by loop searching for closing quote
-                        let rest = if end_quote + 1 < obj.len() { &obj[end_quote+1..] } else { "" }.trim();
+                        let rest = if end_quote + 1 < obj.len() {
+                            &obj[end_quote + 1..]
+                        } else {
+                            ""
+                        }
+                        .trim();
                         let (language, datatype) = if rest.starts_with('@') {
                             (Some(rest[1..].to_string()), None)
                         } else if rest.starts_with("^^") {
-                            (None, Some(rest[2..].trim_start_matches('<').trim_end_matches('>').to_string()))
+                            (
+                                None,
+                                Some(
+                                    rest[2..]
+                                        .trim_start_matches('<')
+                                        .trim_end_matches('>')
+                                        .to_string(),
+                                ),
+                            )
                         } else {
                             (None, None)
                         };
-                        RdfTerm::Literal { value, language, datatype }
+                        RdfTerm::Literal {
+                            value,
+                            language,
+                            datatype,
+                        }
                     } else if obj.contains(':') {
                         RdfTerm::Iri(self.expand_prefixed_name(obj))
                     } else {
@@ -532,30 +597,60 @@ pub fn to_jsonld(ontology: &Ontology) -> serde_json::Value {
     let base = format!("http://ontodb.io/ontology/{}", ontology.name);
     let mut context = serde_json::Map::new();
     context.insert("@base".to_string(), serde_json::json!(base));
-    context.insert("rdf".to_string(), serde_json::json!("http://www.w3.org/1999/02/22-rdf-syntax-ns#"));
-    context.insert("rdfs".to_string(), serde_json::json!("http://www.w3.org/2000/01/rdf-schema#"));
-    context.insert("owl".to_string(), serde_json::json!("http://www.w3.org/2002/07/owl#"));
+    context.insert(
+        "rdf".to_string(),
+        serde_json::json!("http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+    );
+    context.insert(
+        "rdfs".to_string(),
+        serde_json::json!("http://www.w3.org/2000/01/rdf-schema#"),
+    );
+    context.insert(
+        "owl".to_string(),
+        serde_json::json!("http://www.w3.org/2002/07/owl#"),
+    );
 
     let mut graph = Vec::new();
 
     // Export classes
     for (name, class) in &ontology.classes {
         let mut class_json = serde_json::Map::new();
-        class_json.insert("@id".to_string(), serde_json::json!(format!("class/{}", name)));
+        class_json.insert(
+            "@id".to_string(),
+            serde_json::json!(format!("class/{}", name)),
+        );
         class_json.insert("@type".to_string(), serde_json::json!(["rdfs:Class"]));
         class_json.insert("rdfs:label".to_string(), serde_json::json!(name));
 
         if !class.superclasses.is_empty() {
-            class_json.insert("rdfs:subClassOf".to_string(),
-                serde_json::json!(class.superclasses.iter().map(|s| format!("class/{}", s)).collect::<Vec<_>>()));
+            class_json.insert(
+                "rdfs:subClassOf".to_string(),
+                serde_json::json!(class
+                    .superclasses
+                    .iter()
+                    .map(|s| format!("class/{}", s))
+                    .collect::<Vec<_>>()),
+            );
         }
         if !class.equivalent_classes.is_empty() {
-            class_json.insert("owl:equivalentClass".to_string(),
-                serde_json::json!(class.equivalent_classes.iter().map(|s| format!("class/{}", s)).collect::<Vec<_>>()));
+            class_json.insert(
+                "owl:equivalentClass".to_string(),
+                serde_json::json!(class
+                    .equivalent_classes
+                    .iter()
+                    .map(|s| format!("class/{}", s))
+                    .collect::<Vec<_>>()),
+            );
         }
         if !class.disjoint_with.is_empty() {
-            class_json.insert("owl:disjointWith".to_string(),
-                serde_json::json!(class.disjoint_with.iter().map(|s| format!("class/{}", s)).collect::<Vec<_>>()));
+            class_json.insert(
+                "owl:disjointWith".to_string(),
+                serde_json::json!(class
+                    .disjoint_with
+                    .iter()
+                    .map(|s| format!("class/{}", s))
+                    .collect::<Vec<_>>()),
+            );
         }
 
         graph.push(serde_json::Value::Object(class_json));
@@ -564,26 +659,45 @@ pub fn to_jsonld(ontology: &Ontology) -> serde_json::Value {
     // Export properties
     for (name, prop) in &ontology.properties {
         let mut prop_json = serde_json::Map::new();
-        prop_json.insert("@id".to_string(), serde_json::json!(format!("property/{}", name)));
+        prop_json.insert(
+            "@id".to_string(),
+            serde_json::json!(format!("property/{}", name)),
+        );
         prop_json.insert("@type".to_string(), serde_json::json!(["rdf:Property"]));
         prop_json.insert("rdfs:label".to_string(), serde_json::json!(name));
-        prop_json.insert("rdfs:domain".to_string(), serde_json::json!({"@id": format!("class/{}", prop.domain)}));
+        prop_json.insert(
+            "rdfs:domain".to_string(),
+            serde_json::json!({"@id": format!("class/{}", prop.domain)}),
+        );
         prop_json.insert("rdfs:range".to_string(), serde_json::json!({"@id": format!("http://www.w3.org/2001/XMLSchema#{}", datatype_to_xsd(&prop.range))}));
 
         if !prop.subproperty_of.is_empty() {
-            prop_json.insert("rdfs:subPropertyOf".to_string(),
-                serde_json::json!(prop.subproperty_of.iter().map(|s| format!("property/{}", s)).collect::<Vec<_>>()));
+            prop_json.insert(
+                "rdfs:subPropertyOf".to_string(),
+                serde_json::json!(prop
+                    .subproperty_of
+                    .iter()
+                    .map(|s| format!("property/{}", s))
+                    .collect::<Vec<_>>()),
+            );
         }
         if let Some(ref inverse) = prop.inverse_of {
-            prop_json.insert("owl:inverseOf".to_string(), serde_json::json!({"@id": format!("property/{}", inverse)}));
+            prop_json.insert(
+                "owl:inverseOf".to_string(),
+                serde_json::json!({"@id": format!("property/{}", inverse)}),
+            );
         }
         if prop.is_transitive {
-            prop_json.insert("@type".to_string(),
-                serde_json::json!(["rdf:Property", "owl:TransitiveProperty"]));
+            prop_json.insert(
+                "@type".to_string(),
+                serde_json::json!(["rdf:Property", "owl:TransitiveProperty"]),
+            );
         }
         if prop.is_symmetric {
-            prop_json.insert("@type".to_string(),
-                serde_json::json!(["rdf:Property", "owl:SymmetricProperty"]));
+            prop_json.insert(
+                "@type".to_string(),
+                serde_json::json!(["rdf:Property", "owl:SymmetricProperty"]),
+            );
         }
 
         graph.push(serde_json::Value::Object(prop_json));
@@ -631,9 +745,18 @@ ex:name rdf:type rdf:Property ;
 "#;
 
         let ontology = parser.parse(input, "test").unwrap();
-        assert!(ontology.classes.contains_key("Person"), "Should have Person class");
-        assert!(ontology.classes.contains_key("Employee"), "Should have Employee class");
-        assert!(ontology.properties.contains_key("name"), "Should have name property");
+        assert!(
+            ontology.classes.contains_key("Person"),
+            "Should have Person class"
+        );
+        assert!(
+            ontology.classes.contains_key("Employee"),
+            "Should have Employee class"
+        );
+        assert!(
+            ontology.properties.contains_key("name"),
+            "Should have name property"
+        );
     }
 
     #[test]

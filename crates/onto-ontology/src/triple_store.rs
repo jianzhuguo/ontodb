@@ -33,7 +33,11 @@ pub struct Triple {
 }
 
 impl Triple {
-    pub fn new(subject: impl Into<String>, predicate: impl Into<String>, object: impl Into<String>) -> Self {
+    pub fn new(
+        subject: impl Into<String>,
+        predicate: impl Into<String>,
+        object: impl Into<String>,
+    ) -> Self {
         Self {
             subject: subject.into(),
             predicate: predicate.into(),
@@ -54,21 +58,32 @@ impl TripleStore {
     pub fn add_triple(&self, subject: &str, predicate: &str, object: &str) -> Result<(), String> {
         // SPO index (primary)
         let spo_key = Self::make_spo_key(subject, predicate, object);
-        self.engine.put(spo_key, vec![]).map_err(|e| e.to_string())?;
+        self.engine
+            .put(spo_key, vec![])
+            .map_err(|e| e.to_string())?;
 
         // POS index
         let pos_key = Self::make_pos_key(predicate, object, subject);
-        self.engine.put(pos_key, vec![]).map_err(|e| e.to_string())?;
+        self.engine
+            .put(pos_key, vec![])
+            .map_err(|e| e.to_string())?;
 
         // OSP index
         let osp_key = Self::make_osp_key(object, subject, predicate);
-        self.engine.put(osp_key, vec![]).map_err(|e| e.to_string())?;
+        self.engine
+            .put(osp_key, vec![])
+            .map_err(|e| e.to_string())?;
 
         Ok(())
     }
 
     /// Remove a triple from all three indexes.
-    pub fn remove_triple(&self, subject: &str, predicate: &str, object: &str) -> Result<(), String> {
+    pub fn remove_triple(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> Result<(), String> {
         let spo_key = Self::make_spo_key(subject, predicate, object);
         self.engine.delete(spo_key).map_err(|e| e.to_string())?;
 
@@ -83,68 +98,116 @@ impl TripleStore {
 
     /// SPO query: given subject and predicate, find all objects.
     pub fn lookup_spo(&self, subject: &str, predicate: &str) -> Result<Vec<String>, String> {
-        let prefix = format!("__triple__{}__{}__", Self::escape(subject), Self::escape(predicate));
-        let results = self.engine.scan_prefix(prefix.as_bytes()).map_err(|e| e.to_string())?;
+        let prefix = format!(
+            "__triple__{}__{}__",
+            Self::escape(subject),
+            Self::escape(predicate)
+        );
+        let results = self
+            .engine
+            .scan_prefix(prefix.as_bytes())
+            .map_err(|e| e.to_string())?;
 
-        Ok(results.into_iter().filter_map(|(key, _)| {
-            let s = std::str::from_utf8(&key).ok()?;
-            Self::extract_third_component(s)
-        }).collect())
+        Ok(results
+            .into_iter()
+            .filter_map(|(key, _)| {
+                let s = std::str::from_utf8(&key).ok()?;
+                Self::extract_third_component(s)
+            })
+            .collect())
     }
 
     /// SPO query: given subject, find all predicate-object pairs.
     pub fn lookup_s(&self, subject: &str) -> Result<Vec<(String, String)>, String> {
         let prefix = format!("__triple__{}__", Self::escape(subject));
-        let results = self.engine.scan_prefix(prefix.as_bytes()).map_err(|e| e.to_string())?;
+        let results = self
+            .engine
+            .scan_prefix(prefix.as_bytes())
+            .map_err(|e| e.to_string())?;
 
-        Ok(results.into_iter().filter_map(|(key, _)| {
-            let s = std::str::from_utf8(&key).ok()?;
-            Self::extract_last_two_components(s)
-        }).collect())
+        Ok(results
+            .into_iter()
+            .filter_map(|(key, _)| {
+                let s = std::str::from_utf8(&key).ok()?;
+                Self::extract_last_two_components(s)
+            })
+            .collect())
     }
 
     /// POS query: given predicate and object, find all subjects.
     pub fn lookup_pos(&self, predicate: &str, object: &str) -> Result<Vec<String>, String> {
-        let prefix = format!("__triple_pos__{}__{}__", Self::escape(predicate), Self::escape(object));
-        let results = self.engine.scan_prefix(prefix.as_bytes()).map_err(|e| e.to_string())?;
+        let prefix = format!(
+            "__triple_pos__{}__{}__",
+            Self::escape(predicate),
+            Self::escape(object)
+        );
+        let results = self
+            .engine
+            .scan_prefix(prefix.as_bytes())
+            .map_err(|e| e.to_string())?;
 
-        Ok(results.into_iter().filter_map(|(key, _)| {
-            let s = std::str::from_utf8(&key).ok()?;
-            Self::extract_third_component(s)
-        }).collect())
+        Ok(results
+            .into_iter()
+            .filter_map(|(key, _)| {
+                let s = std::str::from_utf8(&key).ok()?;
+                Self::extract_third_component(s)
+            })
+            .collect())
     }
 
     /// POS query: given predicate, find all subject-object pairs.
     pub fn lookup_p(&self, predicate: &str) -> Result<Vec<(String, String)>, String> {
         let prefix = format!("__triple_pos__{}__", Self::escape(predicate));
-        let results = self.engine.scan_prefix(prefix.as_bytes()).map_err(|e| e.to_string())?;
+        let results = self
+            .engine
+            .scan_prefix(prefix.as_bytes())
+            .map_err(|e| e.to_string())?;
 
-        Ok(results.into_iter().filter_map(|(key, _)| {
-            let s = std::str::from_utf8(&key).ok()?;
-            Self::extract_last_two_components(s)
-        }).collect())
+        Ok(results
+            .into_iter()
+            .filter_map(|(key, _)| {
+                let s = std::str::from_utf8(&key).ok()?;
+                Self::extract_last_two_components(s)
+            })
+            .collect())
     }
 
     /// OSP query: given object and subject, find all predicates.
     pub fn lookup_osp(&self, object: &str, subject: &str) -> Result<Vec<String>, String> {
-        let prefix = format!("__triple_osp__{}__{}__", Self::escape(object), Self::escape(subject));
-        let results = self.engine.scan_prefix(prefix.as_bytes()).map_err(|e| e.to_string())?;
+        let prefix = format!(
+            "__triple_osp__{}__{}__",
+            Self::escape(object),
+            Self::escape(subject)
+        );
+        let results = self
+            .engine
+            .scan_prefix(prefix.as_bytes())
+            .map_err(|e| e.to_string())?;
 
-        Ok(results.into_iter().filter_map(|(key, _)| {
-            let s = std::str::from_utf8(&key).ok()?;
-            Self::extract_third_component(s)
-        }).collect())
+        Ok(results
+            .into_iter()
+            .filter_map(|(key, _)| {
+                let s = std::str::from_utf8(&key).ok()?;
+                Self::extract_third_component(s)
+            })
+            .collect())
     }
 
     /// OSP query: given object, find all subject-predicate pairs.
     pub fn lookup_o(&self, object: &str) -> Result<Vec<(String, String)>, String> {
         let prefix = format!("__triple_osp__{}__", Self::escape(object));
-        let results = self.engine.scan_prefix(prefix.as_bytes()).map_err(|e| e.to_string())?;
+        let results = self
+            .engine
+            .scan_prefix(prefix.as_bytes())
+            .map_err(|e| e.to_string())?;
 
-        Ok(results.into_iter().filter_map(|(key, _)| {
-            let s = std::str::from_utf8(&key).ok()?;
-            Self::extract_last_two_components(s)
-        }).collect())
+        Ok(results
+            .into_iter()
+            .filter_map(|(key, _)| {
+                let s = std::str::from_utf8(&key).ok()?;
+                Self::extract_last_two_components(s)
+            })
+            .collect())
     }
 
     /// Check if a triple exists.
@@ -156,19 +219,28 @@ impl TripleStore {
 
     /// Get all triples (SPO scan).
     pub fn get_all_triples(&self) -> Result<Vec<Triple>, String> {
-        let results = self.engine.scan_prefix(PREFIX_SPO).map_err(|e| e.to_string())?;
+        let results = self
+            .engine
+            .scan_prefix(PREFIX_SPO)
+            .map_err(|e| e.to_string())?;
 
-        Ok(results.into_iter().filter_map(|(key, _)| {
-            let s = std::str::from_utf8(&key).ok()?;
-            let parts = Self::parse_spo_key(s)?;
-            Some(Triple::new(parts.0, parts.1, parts.2))
-        }).collect())
+        Ok(results
+            .into_iter()
+            .filter_map(|(key, _)| {
+                let s = std::str::from_utf8(&key).ok()?;
+                let parts = Self::parse_spo_key(s)?;
+                Some(Triple::new(parts.0, parts.1, parts.2))
+            })
+            .collect())
     }
 
     /// Get all triples for a given subject.
     pub fn get_triples_by_subject(&self, subject: &str) -> Result<Vec<Triple>, String> {
         let pairs = self.lookup_s(subject)?;
-        Ok(pairs.into_iter().map(|(p, o)| Triple::new(subject, p, o)).collect())
+        Ok(pairs
+            .into_iter()
+            .map(|(p, o)| Triple::new(subject, p, o))
+            .collect())
     }
 
     /// Batch add multiple triples.
@@ -186,18 +258,33 @@ impl TripleStore {
     // ── Key construction ──
 
     fn make_spo_key(subject: &str, predicate: &str, object: &str) -> Vec<u8> {
-        format!("__triple__{}__{}__{}", Self::escape(subject), Self::escape(predicate), Self::escape(object))
-            .into_bytes()
+        format!(
+            "__triple__{}__{}__{}",
+            Self::escape(subject),
+            Self::escape(predicate),
+            Self::escape(object)
+        )
+        .into_bytes()
     }
 
     fn make_pos_key(predicate: &str, object: &str, subject: &str) -> Vec<u8> {
-        format!("__triple_pos__{}__{}__{}", Self::escape(predicate), Self::escape(object), Self::escape(subject))
-            .into_bytes()
+        format!(
+            "__triple_pos__{}__{}__{}",
+            Self::escape(predicate),
+            Self::escape(object),
+            Self::escape(subject)
+        )
+        .into_bytes()
     }
 
     fn make_osp_key(object: &str, subject: &str, predicate: &str) -> Vec<u8> {
-        format!("__triple_osp__{}__{}__{}", Self::escape(object), Self::escape(subject), Self::escape(predicate))
-            .into_bytes()
+        format!(
+            "__triple_osp__{}__{}__{}",
+            Self::escape(object),
+            Self::escape(subject),
+            Self::escape(predicate)
+        )
+        .into_bytes()
     }
 
     /// Escape special characters in triple components to avoid key collisions.
@@ -466,13 +553,19 @@ mod tests {
     fn test_special_characters() {
         let (store, _dir) = create_test_store();
 
-        store.add_triple("Product::001", "rdf:type", "Product").unwrap();
-        store.add_triple("http://example.org/Person", "name", "Alice").unwrap();
+        store
+            .add_triple("Product::001", "rdf:type", "Product")
+            .unwrap();
+        store
+            .add_triple("http://example.org/Person", "name", "Alice")
+            .unwrap();
 
         let types = store.lookup_spo("Product::001", "rdf:type").unwrap();
         assert_eq!(types, vec!["Product"]);
 
-        let names = store.lookup_spo("http://example.org/Person", "name").unwrap();
+        let names = store
+            .lookup_spo("http://example.org/Person", "name")
+            .unwrap();
         assert_eq!(names, vec!["Alice"]);
     }
 }

@@ -35,8 +35,8 @@ pub use model::{
     PropertyAssertion, Restriction, Triple,
 };
 pub use parser::OntologyParser;
-pub use rdf::{RdfError, RdfTerm, RdfTriple, TurtleParser, to_jsonld, to_ntriples};
+pub use rdf::{to_jsonld, to_ntriples, RdfError, RdfTerm, RdfTriple, TurtleParser};
 pub use reasoner::{DerivationStep, InferenceError, Reasoner, ReasoningResult};
-pub use rules::{Rule, RuleId, default_rules};
+pub use rules::{default_rules, Rule, RuleId};
 pub use store::{OntologyStore, DEFAULT_NAMESPACE};
 pub use triple_store::TripleStore;

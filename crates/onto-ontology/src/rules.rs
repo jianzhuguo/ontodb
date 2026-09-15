@@ -150,7 +150,10 @@ impl Rule for PrpSpo {
         let source: Vec<&Triple> = if new_facts.is_empty() {
             facts.iter().collect()
         } else {
-            new_facts.iter().filter(|t| t.predicate != "rdf:type").collect()
+            new_facts
+                .iter()
+                .filter(|t| t.predicate != "rdf:type")
+                .collect()
         };
         for fact in source {
             if fact.predicate == "rdf:type" {
@@ -210,7 +213,10 @@ impl Rule for PrpEqp {
         let source: Vec<&Triple> = if new_facts.is_empty() {
             facts.iter().collect()
         } else {
-            new_facts.iter().filter(|t| t.predicate != "rdf:type").collect()
+            new_facts
+                .iter()
+                .filter(|t| t.predicate != "rdf:type")
+                .collect()
         };
         for fact in source {
             if fact.predicate == "rdf:type" {
@@ -250,7 +256,10 @@ impl Rule for PrpInv {
         let mut reverse_index: HashMap<&str, Vec<&str>> = HashMap::new();
         for (name, prop_def) in &ontology.properties {
             if let Some(ref inverse) = prop_def.inverse_of {
-                reverse_index.entry(inverse.as_str()).or_default().push(name);
+                reverse_index
+                    .entry(inverse.as_str())
+                    .or_default()
+                    .push(name);
             }
         }
 
@@ -258,7 +267,10 @@ impl Rule for PrpInv {
         let source: Vec<&Triple> = if new_facts.is_empty() {
             facts.iter().collect()
         } else {
-            new_facts.iter().filter(|t| t.predicate != "rdf:type").collect()
+            new_facts
+                .iter()
+                .filter(|t| t.predicate != "rdf:type")
+                .collect()
         };
         for fact in source {
             if fact.predicate == "rdf:type" {
@@ -310,7 +322,9 @@ impl Rule for PrpTrp {
         let mut inferred = Vec::new();
 
         // Identify transitive predicates once
-        let transitive_preds: Vec<&str> = ontology.properties.iter()
+        let transitive_preds: Vec<&str> = ontology
+            .properties
+            .iter()
             .filter(|(_, p)| p.is_transitive)
             .map(|(name, _)| name.as_str())
             .collect();
@@ -325,7 +339,10 @@ impl Rule for PrpTrp {
                 std::collections::HashMap::new();
             for fact in facts {
                 if transitive_preds.contains(&fact.predicate.as_str()) {
-                    obj_map.entry(fact.subject.as_str()).or_default().push(fact.object.as_str());
+                    obj_map
+                        .entry(fact.subject.as_str())
+                        .or_default()
+                        .push(fact.object.as_str());
                 }
             }
             // Iterate facts directly for first iteration
@@ -359,8 +376,14 @@ impl Rule for PrpTrp {
                 std::collections::HashMap::new();
             for fact in facts.iter() {
                 if transitive_preds.contains(&fact.predicate.as_str()) {
-                    obj_map.entry(fact.subject.as_str()).or_default().push(fact.object.as_str());
-                    subj_map.entry(fact.object.as_str()).or_default().push(fact.subject.as_str());
+                    obj_map
+                        .entry(fact.subject.as_str())
+                        .or_default()
+                        .push(fact.object.as_str());
+                    subj_map
+                        .entry(fact.object.as_str())
+                        .or_default()
+                        .push(fact.subject.as_str());
                 }
             }
 
@@ -420,7 +443,10 @@ impl Rule for PrpSymp {
         let source: Vec<&Triple> = if new_facts.is_empty() {
             facts.iter().collect()
         } else {
-            new_facts.iter().filter(|t| t.predicate != "rdf:type").collect()
+            new_facts
+                .iter()
+                .filter(|t| t.predicate != "rdf:type")
+                .collect()
         };
         for fact in source {
             if fact.predicate == "rdf:type" {

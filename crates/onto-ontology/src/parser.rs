@@ -32,9 +32,9 @@ impl OntologyParser {
         let rest = input[15..].trim(); // Skip "CREATE ONTOLOGY"
 
         // Extract ontology name
-        let paren_pos = rest
-            .find('(')
-            .ok_or_else(|| CoreError::InvalidArgument("expected '(' after ontology name".to_string()))?;
+        let paren_pos = rest.find('(').ok_or_else(|| {
+            CoreError::InvalidArgument("expected '(' after ontology name".to_string())
+        })?;
 
         let name = rest[..paren_pos].trim();
         if name.is_empty() {
@@ -44,7 +44,12 @@ impl OntologyParser {
         }
 
         // Safe: paren_pos found by find('('), so paren_pos + 1 <= rest.len()
-        let body = if paren_pos + 1 < rest.len() { &rest[paren_pos + 1..] } else { "" }.trim();
+        let body = if paren_pos + 1 < rest.len() {
+            &rest[paren_pos + 1..]
+        } else {
+            ""
+        }
+        .trim();
         let body = body
             .strip_suffix(';')
             .unwrap_or(body)
@@ -118,7 +123,9 @@ impl OntologyParser {
     }
 
     fn parse_class(input: &str) -> Result<Class> {
-        let rest = input.strip_prefix("CLASS").or_else(|| input.strip_prefix("class"))
+        let rest = input
+            .strip_prefix("CLASS")
+            .or_else(|| input.strip_prefix("class"))
             .ok_or_else(|| CoreError::InvalidArgument("expected 'CLASS'".to_string()))?
             .trim();
 
@@ -136,7 +143,12 @@ impl OntologyParser {
         if let Some((pos, kw_len)) = result {
             let class_name = rest[..pos].trim();
             // Safe: pos found by find(), kw_len is correct
-            let parent = if pos + kw_len < rest.len() { &rest[pos + kw_len..] } else { "" }.trim();
+            let parent = if pos + kw_len < rest.len() {
+                &rest[pos + kw_len..]
+            } else {
+                ""
+            }
+            .trim();
 
             if class_name.is_empty() {
                 return Err(CoreError::InvalidArgument(
@@ -170,13 +182,17 @@ impl OntologyParser {
             .trim();
 
         // Find the opening parenthesis
-        let paren_pos = rest
-            .find('(')
-            .ok_or_else(|| CoreError::InvalidArgument("expected '(' in UNIQUE constraint".to_string()))?;
+        let paren_pos = rest.find('(').ok_or_else(|| {
+            CoreError::InvalidArgument("expected '(' in UNIQUE constraint".to_string())
+        })?;
 
         // Extract class name (if present) and columns
         let class_name = rest[..paren_pos].trim();
-        let after_paren = if paren_pos + 1 < rest.len() { &rest[paren_pos + 1..] } else { "" };
+        let after_paren = if paren_pos + 1 < rest.len() {
+            &rest[paren_pos + 1..]
+        } else {
+            ""
+        };
         let columns_str = after_paren
             .trim_end_matches(')')
             .trim_end_matches(';')
@@ -202,7 +218,8 @@ impl OntologyParser {
 
         if class_name.is_empty() {
             return Err(CoreError::InvalidArgument(
-                "UNIQUE constraint must specify a class name (e.g., UNIQUE ClassName(col))".to_string(),
+                "UNIQUE constraint must specify a class name (e.g., UNIQUE ClassName(col))"
+                    .to_string(),
             ));
         }
 
@@ -219,12 +236,12 @@ impl OntologyParser {
         let upper = rest.to_uppercase();
 
         // Find DOMAIN and RANGE keywords
-        let domain_pos = upper
-            .find("DOMAIN")
-            .ok_or_else(|| CoreError::InvalidArgument("expected 'DOMAIN' in property".to_string()))?;
-        let range_pos = upper
-            .find("RANGE")
-            .ok_or_else(|| CoreError::InvalidArgument("expected 'RANGE' in property".to_string()))?;
+        let domain_pos = upper.find("DOMAIN").ok_or_else(|| {
+            CoreError::InvalidArgument("expected 'DOMAIN' in property".to_string())
+        })?;
+        let range_pos = upper.find("RANGE").ok_or_else(|| {
+            CoreError::InvalidArgument("expected 'RANGE' in property".to_string())
+        })?;
 
         if domain_pos >= range_pos {
             return Err(CoreError::InvalidArgument(
@@ -233,9 +250,19 @@ impl OntologyParser {
         }
 
         let prop_name = rest[..domain_pos].trim();
-        let domain = if domain_pos + 6 < rest.len() { &rest[domain_pos + 6..range_pos] } else { "" }.trim();
+        let domain = if domain_pos + 6 < rest.len() {
+            &rest[domain_pos + 6..range_pos]
+        } else {
+            ""
+        }
+        .trim();
         // Safe: range_pos found by find(), "RANGE" is 5 chars
-        let after_range = if range_pos + 5 < rest.len() { &rest[range_pos + 5..] } else { "" }.trim();
+        let after_range = if range_pos + 5 < rest.len() {
+            &rest[range_pos + 5..]
+        } else {
+            ""
+        }
+        .trim();
 
         if prop_name.is_empty() {
             return Err(CoreError::InvalidArgument(

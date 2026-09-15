@@ -15,9 +15,9 @@ onto-storage = { workspace = true }
 onto-query = { workspace = true }
 onto-graph = { workspace = true }
 onto-ontology = { workspace = true }
-onto-raft = { workspace = true }
-onto-enterprise = { workspace = true }
-onto-sharding = { workspace = true }
+onto-raft = { workspace = true, optional = true }
+onto-enterprise = { workspace = true, optional = true }
+onto-sharding = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -53,21 +53,16 @@ rand = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-default = ["ontology"]
+default = []
 
 # === Feature flags control RUNTIME behavior, not compilation ===
-# All code is compiled, but features are only activated when enabled.
-# Community edition: only ontology feature enabled
-# Enterprise editions: additional features enabled via build script
+# onto-ontology (basic reasoning) is always included
+# Enterprise features are optional
 
-ontology = []
-raft = []
-sharding = []
-enterprise = []
+raft = ["dep:onto-raft"]
+sharding = ["dep:onto-sharding"]
+enterprise = ["dep:onto-enterprise"]
 
 # === Enterprise Bundles ===
-# Enterprise Standard: clustering + sharding + basic backup
-enterprise-standard = ["enterprise", "raft", "sharding", "onto-enterprise/enterprise-standard"]
-
-# Enterprise Gov/Finance: all enterprise features + compliance
-enterprise-gov = ["enterprise", "raft", "sharding", "onto-enterprise/enterprise-gov"]
+enterprise-standard = ["enterprise", "raft", "sharding"]
+enterprise-gov = ["enterprise", "raft", "sharding"]

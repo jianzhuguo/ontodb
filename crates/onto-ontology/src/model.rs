@@ -47,8 +47,7 @@ pub struct Ontology {
 }
 
 /// OWL-lite class type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ClassType {
     /// Normal class.
     #[default]
@@ -120,7 +119,6 @@ mod ordered_f64 {
 }
 
 impl Eq for Literal {}
-
 
 /// A class in the ontology (like a type or category).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,9 +330,10 @@ impl Ontology {
                     return true;
                 }
                 if visited.insert(superclass.clone())
-                    && self.is_subclass_of_inner(superclass, parent, visited) {
-                        return true;
-                    }
+                    && self.is_subclass_of_inner(superclass, parent, visited)
+                {
+                    return true;
+                }
             }
         }
         false
@@ -597,7 +596,8 @@ impl Ontology {
                     let cycle_path: Vec<String> = path[cycle_start..].to_vec();
                     errors.push(format!(
                         "Circular inheritance detected: {} -> {}",
-                        cycle_path.join(" -> "), superclass
+                        cycle_path.join(" -> "),
+                        superclass
                     ));
                 } else if !black.contains(superclass.as_str()) {
                     self.dfs_cycle_check(superclass, white, gray, black, path, errors);
@@ -642,7 +642,8 @@ impl Ontology {
                     let cycle: Vec<String> = chain[start..].to_vec();
                     errors.push(format!(
                         "Circular equivalence detected: {} -> {}",
-                        cycle.join(" <=> "), current
+                        cycle.join(" <=> "),
+                        current
                     ));
                 }
             }
@@ -749,11 +750,7 @@ impl Class {
 }
 
 impl Property {
-    pub fn new(
-        name: impl Into<String>,
-        domain: impl Into<String>,
-        range: DataType,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, domain: impl Into<String>, range: DataType) -> Self {
         Self {
             name: name.into(),
             description: None,
@@ -1010,8 +1007,16 @@ mod tests {
         assert!(onto.validate_disjoint_constraints().is_empty());
 
         // Add disjoint constraint
-        onto.classes.get_mut("Dog").unwrap().disjoint_with.push("Cat".to_string());
-        onto.classes.get_mut("Cat").unwrap().disjoint_with.push("Dog".to_string());
+        onto.classes
+            .get_mut("Dog")
+            .unwrap()
+            .disjoint_with
+            .push("Cat".to_string());
+        onto.classes
+            .get_mut("Cat")
+            .unwrap()
+            .disjoint_with
+            .push("Dog".to_string());
 
         // Still valid because Dog and Cat don't share subclasses
         assert!(onto.validate_disjoint_constraints().is_empty());
@@ -1039,8 +1044,8 @@ mod tests {
 
     #[test]
     fn test_inverse_property() {
-        let prop = Property::new("worksFor", "Employee", DataType::String)
-            .with_inverse_of("employs");
+        let prop =
+            Property::new("worksFor", "Employee", DataType::String).with_inverse_of("employs");
         assert_eq!(prop.inverse_of, Some("employs".to_string()));
     }
 
@@ -1048,11 +1053,10 @@ mod tests {
     fn test_intersection_class_type() {
         let mut onto = Ontology::new("test");
         onto.add_class(
-            Class::new("WorkingStudent")
-                .with_class_type(ClassType::Intersection(vec![
-                    "Employee".to_string(),
-                    "Student".to_string(),
-                ])),
+            Class::new("WorkingStudent").with_class_type(ClassType::Intersection(vec![
+                "Employee".to_string(),
+                "Student".to_string(),
+            ])),
         );
         match &onto.classes["WorkingStudent"].class_type {
             ClassType::Intersection(parents) => {
@@ -1098,7 +1102,10 @@ mod tests {
     #[test]
     fn test_individual() {
         let alice = Individual::new("alice", "Person")
-            .with_assertion("name", AssertionValue::Literal(Literal::String("Alice".into())))
+            .with_assertion(
+                "name",
+                AssertionValue::Literal(Literal::String("Alice".into())),
+            )
             .with_assertion("age", AssertionValue::Literal(Literal::Int(30)))
             .with_assertion("friendOf", AssertionValue::Individual("bob".into()));
 
@@ -1124,14 +1131,18 @@ mod tests {
         let mut onto = Ontology::new("family");
 
         onto.add_class(Class::new("Person"));
-        onto.add_class(Class::new("Parent").with_restriction(Restriction::MinCardinality {
-            property: "hasChild".to_string(),
-            min: 1,
-        }));
-        onto.add_class(Class::new("Child").with_restriction(Restriction::AllValuesFrom {
-            property: "hasParent".to_string(),
-            class: "Parent".to_string(),
-        }));
+        onto.add_class(
+            Class::new("Parent").with_restriction(Restriction::MinCardinality {
+                property: "hasChild".to_string(),
+                min: 1,
+            }),
+        );
+        onto.add_class(
+            Class::new("Child").with_restriction(Restriction::AllValuesFrom {
+                property: "hasParent".to_string(),
+                class: "Parent".to_string(),
+            }),
+        );
 
         // Verify serialize/deserialize roundtrip
         let json = serde_json::to_string(&onto).unwrap();

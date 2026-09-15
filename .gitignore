@@ -52,6 +52,11 @@ scripts/generate_patent_diagrams.py
 scripts/generate_patent_svg.py
 scripts/generate_ontoql_patent_docx.py
 
+# Enterprise edition (commercial, not open source)
+crates/onto-enterprise/
+crates/onto-raft/
+crates/onto-sharding/
+
 # Temporary debug/log output
 *.log
 check_output.txt

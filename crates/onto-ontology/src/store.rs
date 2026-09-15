@@ -54,7 +54,12 @@ impl OntologyStore {
     }
 
     /// Loads an ontology using an already-acquired engine reference.
-    pub fn load_with_engine(&self, engine: &LsmEngine, namespace: Option<&str>, name: &str) -> Result<Option<Ontology>> {
+    pub fn load_with_engine(
+        &self,
+        engine: &LsmEngine,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Ontology>> {
         let key = Self::make_ontology_key(namespace, name);
         match engine.get(&key)? {
             Some(bytes) => {
@@ -161,9 +166,13 @@ impl OntologyStore {
     }
 
     /// Merges all ontologies in a namespace into a single ontology for inheritance resolution.
-    pub fn merge_namespace_ontologies(&self, engine: &LsmEngine, namespace: &str) -> Result<Ontology> {
-        let mut merged = Ontology::new(format!("__merged_{}__", namespace))
-            .with_namespace(namespace);
+    pub fn merge_namespace_ontologies(
+        &self,
+        engine: &LsmEngine,
+        namespace: &str,
+    ) -> Result<Ontology> {
+        let mut merged =
+            Ontology::new(format!("__merged_{}__", namespace)).with_namespace(namespace);
         let prefix = Self::make_ontology_prefix(Some(namespace));
         let entries = engine.scan_prefix(&prefix)?;
         for (_key, val_bytes) in entries {

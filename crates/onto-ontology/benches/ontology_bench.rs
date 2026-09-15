@@ -141,8 +141,7 @@ fn build_realistic_ontology() -> Ontology {
     onto.add_property(Property::new("ancestor", "Person", DataType::String).transitive());
     onto.add_property(Property::new("friendOf", "Person", DataType::String).symmetric());
     onto.add_property(
-        Property::new("worksUnder", "Employee", DataType::String)
-            .with_subproperty_of("reportsTo"),
+        Property::new("worksUnder", "Employee", DataType::String).with_subproperty_of("reportsTo"),
     );
     onto.add_property(Property::new("discount", "VIPCustomer", DataType::Float64));
 
@@ -186,7 +185,10 @@ fn main() {
     for _ in 0..iters {
         let _ = OntologyParser::parse(sql_small).unwrap();
     }
-    println!("  Small (4 classes, 4 props): {:?}/parse", start.elapsed() / iters);
+    println!(
+        "  Small (4 classes, 4 props): {:?}/parse",
+        start.elapsed() / iters
+    );
 
     let mut big_sql = String::from("CREATE ONTOLOGY big (\n");
     for i in 0..100 {
@@ -206,7 +208,10 @@ fn main() {
     for _ in 0..iters {
         let _ = OntologyParser::parse(&big_sql).unwrap();
     }
-    println!("  Big (100 classes, 200 props): {:?}/parse", start.elapsed() / iters);
+    println!(
+        "  Big (100 classes, 200 props): {:?}/parse",
+        start.elapsed() / iters
+    );
 
     let mut huge_sql = String::from("CREATE ONTOLOGY huge (\n");
     for i in 0..500 {
@@ -226,7 +231,10 @@ fn main() {
     for _ in 0..iters {
         let _ = OntologyParser::parse(&huge_sql).unwrap();
     }
-    println!("  Huge (500 classes, 1000 props): {:?}/parse", start.elapsed() / iters);
+    println!(
+        "  Huge (500 classes, 1000 props): {:?}/parse",
+        start.elapsed() / iters
+    );
 
     let mut mega_sql = String::from("CREATE ONTOLOGY mega (\n");
     for i in 0..2000 {
@@ -246,7 +254,10 @@ fn main() {
     for _ in 0..iters {
         let _ = OntologyParser::parse(&mega_sql).unwrap();
     }
-    println!("  Mega (2000 classes, 5000 props): {:?}/parse", start.elapsed() / iters);
+    println!(
+        "  Mega (2000 classes, 5000 props): {:?}/parse",
+        start.elapsed() / iters
+    );
     println!();
 
     // ═══════════════════════════════════════════════════════════════
@@ -270,7 +281,11 @@ fn main() {
         let result = reasoner.reason(&facts);
         println!(
             "  Tree depth={}, width={}: {} inferred, {} iters, {:?}/reason",
-            depth, width, result.inferred.len(), result.iterations, start.elapsed() / iters
+            depth,
+            width,
+            result.inferred.len(),
+            result.iterations,
+            start.elapsed() / iters
         );
     }
 
@@ -286,7 +301,10 @@ fn main() {
         let result = reasoner.reason(&facts);
         println!(
             "  Wide {} classes: {} inferred, {} iters, {:?}/reason",
-            n, result.inferred.len(), result.iterations, start.elapsed() / iters
+            n,
+            result.inferred.len(),
+            result.iterations,
+            start.elapsed() / iters
         );
     }
     println!();
@@ -379,7 +397,10 @@ fn main() {
         let subs = onto.get_all_subclasses("Thing");
         println!(
             "  get_all_subclasses (depth={}, {} classes, {} subs): {:?}/query",
-            depth, total, subs.len(), start.elapsed() / iters
+            depth,
+            total,
+            subs.len(),
+            start.elapsed() / iters
         );
 
         let start = Instant::now();
@@ -388,7 +409,8 @@ fn main() {
         }
         println!(
             "  is_subclass_of (depth={}): {:?}/query",
-            depth, start.elapsed() / iters
+            depth,
+            start.elapsed() / iters
         );
 
         let start = Instant::now();
@@ -397,7 +419,8 @@ fn main() {
         }
         println!(
             "  get_class_properties (depth={}): {:?}/query",
-            depth, start.elapsed() / iters
+            depth,
+            start.elapsed() / iters
         );
         println!();
     }
@@ -414,7 +437,11 @@ fn main() {
         let subs = onto.get_all_subclasses("Thing");
         println!(
             "  get_all_subclasses ({} diamonds×depth{}, {} classes, {} subs): {:?}/query",
-            diamonds, depth, total, subs.len(), start.elapsed() / iters
+            diamonds,
+            depth,
+            total,
+            subs.len(),
+            start.elapsed() / iters
         );
     }
 
@@ -429,7 +456,12 @@ fn main() {
         let subs = onto.get_all_subclasses("Thing");
         println!(
             "  get_all_subclasses (mesh {}×{}×fan{}, {} classes, {} subs): {:?}/query",
-            layers, width, fan_in, total, subs.len(), start.elapsed() / iters
+            layers,
+            width,
+            fan_in,
+            total,
+            subs.len(),
+            start.elapsed() / iters
         );
     }
     println!();

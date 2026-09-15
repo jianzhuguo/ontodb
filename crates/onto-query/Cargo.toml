@@ -10,7 +10,7 @@ onto-core = { workspace = true }
 onto-graph = { workspace = true }
 onto-storage = { workspace = true }
 onto-ontology = { workspace = true }
-onto-sharding = { workspace = true }
+onto-sharding = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
@@ -20,6 +20,10 @@ tracing = { workspace = true }
 parking_lot = "0.12"
 csv = "1"
 hex = "0.4"
+
+[features]
+default = []
+sharding = ["dep:onto-sharding"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

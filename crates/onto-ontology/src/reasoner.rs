@@ -20,7 +20,9 @@ pub enum InferenceError {
 impl std::fmt::Display for InferenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InferenceError::ConsistencyViolation(msg) => write!(f, "consistency violation: {}", msg),
+            InferenceError::ConsistencyViolation(msg) => {
+                write!(f, "consistency violation: {}", msg)
+            }
             InferenceError::MaxIterationsExceeded(n) => {
                 write!(f, "reasoning did not converge after {} iterations", n)
             }
@@ -118,20 +120,22 @@ impl Reasoner {
             if !prop_def.is_transitive {
                 continue;
             }
-            
+
             // Check fact budget before processing transitive property
             if all_facts.len() >= self.max_facts {
                 budget_exceeded = true;
                 break;
             }
-            
+
             transitive_handled.insert(prop_name.clone());
 
             // Build adjacency list
             let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
             for fact in &all_facts {
                 if fact.predicate == *prop_name {
-                    adj.entry(fact.subject.as_str()).or_default().push(fact.object.as_str());
+                    adj.entry(fact.subject.as_str())
+                        .or_default()
+                        .push(fact.object.as_str());
                 }
             }
             if adj.is_empty() {
@@ -146,7 +150,7 @@ impl Reasoner {
                     budget_exceeded = true;
                     break;
                 }
-                
+
                 let mut visited: HashSet<&str> = HashSet::new();
                 let mut queue: VecDeque<&str> = VecDeque::new();
                 for t in targets {
@@ -159,7 +163,7 @@ impl Reasoner {
                         budget_exceeded = true;
                         break;
                     }
-                    
+
                     let t = Triple::new(*start, prop_name.as_str(), node);
                     if !all_facts.contains(&t) {
                         new_transitive.push(t);
@@ -172,7 +176,7 @@ impl Reasoner {
                         }
                     }
                 }
-                
+
                 if budget_exceeded {
                     break;
                 }
@@ -199,7 +203,10 @@ impl Reasoner {
             let mut class_subjects: HashMap<String, Vec<String>> = HashMap::new();
             for fact in &all_facts {
                 if fact.predicate == "rdf:type" {
-                    class_subjects.entry(fact.object.clone()).or_default().push(fact.subject.clone());
+                    class_subjects
+                        .entry(fact.object.clone())
+                        .or_default()
+                        .push(fact.subject.clone());
                 }
             }
 
@@ -238,7 +245,8 @@ impl Reasoner {
         // For the iterative loop, seed new_facts with original property facts
         // (non-rdf:type) so PrpInv/PrpSymp/PrpSpo/PrpEqp can process them.
         // The fast paths already handled rdf:type and transitive properties.
-        new_facts = facts.iter()
+        new_facts = facts
+            .iter()
             .filter(|t| t.predicate != "rdf:type")
             .cloned()
             .collect();
@@ -249,12 +257,16 @@ impl Reasoner {
 
             if parallel && self.rules.len() > 1 {
                 let rule_results: Vec<(RuleId, Vec<Triple>)> = std::thread::scope(|s| {
-                    let handles: Vec<_> = self.rules.iter().map(|rule| {
-                        s.spawn(|| {
-                            let inferred = rule.apply(&self.ontology, &all_facts, &new_facts);
-                            (rule.id(), inferred)
+                    let handles: Vec<_> = self
+                        .rules
+                        .iter()
+                        .map(|rule| {
+                            s.spawn(|| {
+                                let inferred = rule.apply(&self.ontology, &all_facts, &new_facts);
+                                (rule.id(), inferred)
+                            })
                         })
-                    }).collect();
+                        .collect();
                     handles.into_iter().filter_map(|h| h.join().ok()).collect()
                 });
                 for (rule_id, inferred) in rule_results {
@@ -744,10 +756,18 @@ mod tests {
         let facts = vec![Triple::type_of("alice", "Manager")];
         let result = reasoner.reason(&facts);
 
-        assert!(result.all_facts.contains(&Triple::type_of("alice", "Manager")));
-        assert!(result.all_facts.contains(&Triple::type_of("alice", "Employee")));
-        assert!(result.all_facts.contains(&Triple::type_of("alice", "Person")));
-        assert!(result.all_facts.contains(&Triple::type_of("alice", "Thing")));
+        assert!(result
+            .all_facts
+            .contains(&Triple::type_of("alice", "Manager")));
+        assert!(result
+            .all_facts
+            .contains(&Triple::type_of("alice", "Employee")));
+        assert!(result
+            .all_facts
+            .contains(&Triple::type_of("alice", "Person")));
+        assert!(result
+            .all_facts
+            .contains(&Triple::type_of("alice", "Thing")));
         assert!(result.iterations >= 1);
     }
 
@@ -759,8 +779,12 @@ mod tests {
         let facts = vec![Triple::type_of("alice", "Employee")];
         let result = reasoner.reason(&facts);
 
-        assert!(result.all_facts.contains(&Triple::type_of("alice", "Worker")));
-        assert!(result.all_facts.contains(&Triple::type_of("alice", "Person")));
+        assert!(result
+            .all_facts
+            .contains(&Triple::type_of("alice", "Worker")));
+        assert!(result
+            .all_facts
+            .contains(&Triple::type_of("alice", "Person")));
     }
 
     #[test]
@@ -860,12 +884,16 @@ mod tests {
         let onto = family_ontology();
         let reasoner = Reasoner::new(onto);
 
-        let alice = Individual::new("alice", "Manager")
-            .with_assertion("reportsTo", crate::model::AssertionValue::Individual("bob".into()));
+        let alice = Individual::new("alice", "Manager").with_assertion(
+            "reportsTo",
+            crate::model::AssertionValue::Individual("bob".into()),
+        );
 
         let result = reasoner.reason_individuals(&[alice]);
 
-        assert!(result.all_facts.contains(&Triple::type_of("alice", "Person")));
+        assert!(result
+            .all_facts
+            .contains(&Triple::type_of("alice", "Person")));
         assert!(result
             .all_facts
             .contains(&Triple::new("bob", "manages", "alice")));
@@ -889,7 +917,9 @@ mod tests {
         assert!(result.iterations <= 100);
 
         // Should have all expected inferences
-        assert!(result.all_facts.contains(&Triple::type_of("alice", "Thing")));
+        assert!(result
+            .all_facts
+            .contains(&Triple::type_of("alice", "Thing")));
         assert!(result
             .all_facts
             .contains(&Triple::new("bob", "manages", "alice")));

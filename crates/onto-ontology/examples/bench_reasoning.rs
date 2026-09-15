@@ -106,13 +106,31 @@ fn main() {
     let reasoner = Reasoner::new(onto);
 
     let chain_5: Vec<_> = (0..5)
-        .map(|i| onto_ontology::model::Triple::new(&format!("n{}", i), "ancestor", &format!("n{}", i + 1)))
+        .map(|i| {
+            onto_ontology::model::Triple::new(
+                &format!("n{}", i),
+                "ancestor",
+                &format!("n{}", i + 1),
+            )
+        })
         .collect();
     let chain_10: Vec<_> = (0..10)
-        .map(|i| onto_ontology::model::Triple::new(&format!("n{}", i), "ancestor", &format!("n{}", i + 1)))
+        .map(|i| {
+            onto_ontology::model::Triple::new(
+                &format!("n{}", i),
+                "ancestor",
+                &format!("n{}", i + 1),
+            )
+        })
         .collect();
     let chain_20: Vec<_> = (0..20)
-        .map(|i| onto_ontology::model::Triple::new(&format!("n{}", i), "ancestor", &format!("n{}", i + 1)))
+        .map(|i| {
+            onto_ontology::model::Triple::new(
+                &format!("n{}", i),
+                "ancestor",
+                &format!("n{}", i + 1),
+            )
+        })
         .collect();
 
     bench("Chain of 5", 5000, || {
@@ -131,10 +149,22 @@ fn main() {
     let reasoner = Reasoner::new(onto);
 
     let inv_10: Vec<_> = (0..10)
-        .map(|i| onto_ontology::model::Triple::new(&format!("emp{}", i), "manages", &format!("mgr{}", i % 3)))
+        .map(|i| {
+            onto_ontology::model::Triple::new(
+                &format!("emp{}", i),
+                "manages",
+                &format!("mgr{}", i % 3),
+            )
+        })
         .collect();
     let inv_50: Vec<_> = (0..50)
-        .map(|i| onto_ontology::model::Triple::new(&format!("emp{}", i), "manages", &format!("mgr{}", i % 5)))
+        .map(|i| {
+            onto_ontology::model::Triple::new(
+                &format!("emp{}", i),
+                "manages",
+                &format!("mgr{}", i % 5),
+            )
+        })
         .collect();
 
     bench("10 facts", 5000, || {
@@ -150,7 +180,13 @@ fn main() {
     let reasoner = Reasoner::new(onto);
 
     let symp_10: Vec<_> = (0..10)
-        .map(|i| onto_ontology::model::Triple::new(&format!("p{}", i), "colleague", &format!("p{}", (i + 1) % 10)))
+        .map(|i| {
+            onto_ontology::model::Triple::new(
+                &format!("p{}", i),
+                "colleague",
+                &format!("p{}", (i + 1) % 10),
+            )
+        })
         .collect();
 
     bench("10 facts", 5000, || {
