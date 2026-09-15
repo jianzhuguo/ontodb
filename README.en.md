@@ -224,7 +224,7 @@ One OntoDB instance serves N tenants/projects with low ops cost and data securit
 
 ## Performance Benchmarks
 
-> **1M+ throughput, microsecond reasoning, 100% vector recall. One database does the job of six — faster than all six combined.**
+> **1M+ throughput, microsecond reasoning, 100% vector recall. One system unifies 12 data types, replacing 6 independent databases.**
 
 ### Storage Engine
 
@@ -256,15 +256,16 @@ One OntoDB instance serves N tenants/projects with low ops cost and data securit
 | 10 rules | **34.5µs** |
 | 1000 rules | **1.79ms** |
 
-### One vs Six
+### Unified Replacement Comparison
 
-| Function | Traditional | OntoDB | Speedup |
-|----------|------------|--------|---------|
-| Relational | PG 100K | **1,126K** | **11x** |
-| Vector search | Milvus ~1ms | **403µs** | **2.5x** |
-| Graph query | Neo4j ~10ms | **<1ms** | **10x** |
-| OWL reasoning | Jena ~100ms | **50.8µs** | **2000x** |
-| Time series | InfluxDB ~200K | **1,126K** | **5.6x** |
+| Function | Standalone System | OntoDB | Note |
+|----------|------------------|--------|------|
+| Relational | PostgreSQL | **1,126K ops/s** | Write throughput |
+| Vector search | Milvus | **403µs / 100% recall** | 10K scale |
+| Graph query | Neo4j | **<1ms** | BFS/DFS |
+| OWL reasoning | Jena | **50.8µs** | Incremental fixpoint |
+| Time series | InfluxDB | **1,126K ops/s** | TSM columnar |
+| Rule engine | Drools | **34.5µs/10 rules** | DSL syntax |
 
 > See [benchmark-report.md](docs/benchmark-report.md) for full details
 
