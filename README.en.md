@@ -224,18 +224,52 @@ One OntoDB instance serves N tenants/projects with low ops cost and data securit
 
 ## Performance Benchmarks
 
-| Metric | Value | Note |
-|--------|-------|------|
-| Write throughput | **863,618 ops/s** | — |
-| Read throughput | **1,256,518 ops/s** | — |
-| Batch write | **1,082,230 ops/s** | — |
-| HNSW vector recall | **100%** (ef_search=200) | 341µs latency |
-| 8-thread speedup | **1.82x** | Near-linear |
-| OWL reasoning (100K triples) | **5ms** | Incremental fixpoint |
-| GIS spatial predicate | **<=1µs** | DE-9IM |
-| TSM compression | **60%+** | Delta+Gorilla |
-| Binary row filtering | **2x** | Zero-copy |
-| Incremental vs full reasoning | **10-100x** | Fixpoint algorithm |
+> Environment: Windows x86_64, Rust 1.77+, Release mode (opt-level=3, LTO)
+> See [benchmark-report.md](docs/benchmark-report.md) for full details
+
+### Storage Engine
+
+| Metric | Value |
+|--------|-------|
+| Write throughput | **1,126,486 ops/s** |
+| Read throughput | **1,306,438 ops/s** |
+| Group commit (1 thread) | **918,527 ops/s** |
+
+### HNSW Vector Search
+
+| Scale | Recall | Latency |
+|-------|--------|---------|
+| 10K vectors | **100%** | **403µs** |
+| 50K vectors | **100%** | **1.03ms** |
+| 200K vectors | **99.7%** | **4.06ms** |
+
+### OWL Reasoning
+
+| Scenario | Value |
+|----------|-------|
+| Single fact reasoning | **50.8µs** |
+| Batch reasoning (24 facts) | **106µs** -> 46 derived |
+| Batch reasoning (10K entities) | **22ms** -> 10K derived |
+| is_subclass_of | **390ns** |
+| Transitive chain (200 nodes) | **16ms** -> 19,900 derived |
+| Incremental vs full | **10-100x** |
+
+### Rule Engine
+
+| Scale | Latency |
+|-------|---------|
+| 10 rules | **34.5µs** |
+| 100 rules | **217.6µs** |
+| 1000 rules | **1.79ms** |
+| Distributed (4 workers, 1000 rules) | **4ms** |
+
+### Raft Consensus
+
+| Operation | Throughput |
+|-----------|-----------|
+| Log append | **37K ops/s** |
+| State machine apply | **1.48M ops/s** |
+| Restart recovery (50K entries) | **9.1µs** |
 
 ---
 
