@@ -81,7 +81,9 @@ impl SemanticCache {
             let mut best_sim = 0.0f32;
 
             for (key, entry) in &self.entries {
-                if now_ms >= entry.created_at + entry.ttl_ms { continue; }
+                if now_ms >= entry.created_at + entry.ttl_ms {
+                    continue;
+                }
                 let sim = cosine_similarity(fingerprint, &entry.fingerprint);
                 if sim >= self.config.similarity_threshold && sim > best_sim {
                     best_sim = sim;
@@ -104,10 +106,18 @@ impl SemanticCache {
     }
 
     /// Insert a cache entry.
-    pub fn insert(&mut self, query_text: &str, fingerprint: Vec<f32>, result_summary: &str, now_ms: u64) {
+    pub fn insert(
+        &mut self,
+        query_text: &str,
+        fingerprint: Vec<f32>,
+        result_summary: &str,
+        now_ms: u64,
+    ) {
         // Evict oldest if at capacity
         if self.entries.len() >= self.config.max_entries {
-            if let Some(oldest_key) = self.entries.iter()
+            if let Some(oldest_key) = self
+                .entries
+                .iter()
                 .min_by_key(|(_, e)| e.last_hit_at)
                 .map(|(k, _)| k.clone())
             {
@@ -115,15 +125,18 @@ impl SemanticCache {
             }
         }
 
-        self.entries.insert(query_text.to_string(), SemanticCacheEntry {
-            query_text: query_text.to_string(),
-            fingerprint,
-            result_summary: result_summary.to_string(),
-            hit_count: 0,
-            created_at: now_ms,
-            last_hit_at: now_ms,
-            ttl_ms: self.config.default_ttl_ms,
-        });
+        self.entries.insert(
+            query_text.to_string(),
+            SemanticCacheEntry {
+                query_text: query_text.to_string(),
+                fingerprint,
+                result_summary: result_summary.to_string(),
+                hit_count: 0,
+                created_at: now_ms,
+                last_hit_at: now_ms,
+                ttl_ms: self.config.default_ttl_ms,
+            },
+        );
     }
 
     /// Invalidate cache entries matching a pattern (e.g., when data changes).
@@ -141,11 +154,17 @@ impl SemanticCache {
             entries: self.entries.len(),
             hits: self.hits,
             misses: self.misses,
-            hit_rate: if self.hits + self.misses == 0 { 0.0 } else { self.hits as f64 / (self.hits + self.misses) as f64 },
+            hit_rate: if self.hits + self.misses == 0 {
+                0.0
+            } else {
+                self.hits as f64 / (self.hits + self.misses) as f64
+            },
         }
     }
 
-    pub fn entry_count(&self) -> usize { self.entries.len() }
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 #[derive(Debug)]
@@ -158,11 +177,17 @@ pub struct CacheStats {
 
 /// Cosine similarity between two vectors.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() { return 0.0; }
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot / (norm_a * norm_b) }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot / (norm_a * norm_b)
+    }
 }
 
 /// Simple text fingerprint (bag-of-words hash vector).
@@ -174,7 +199,9 @@ pub fn text_fingerprint(text: &str) -> Vec<f32> {
     }
     // L2 normalize
     let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 { vec.iter_mut().for_each(|x| *x /= norm); }
+    if norm > 0.0 {
+        vec.iter_mut().for_each(|x| *x /= norm);
+    }
     vec
 }
 
@@ -222,7 +249,12 @@ mod tests {
         };
         let mut cache = SemanticCache::new(config);
         let fp1 = text_fingerprint("find all sensors in building A");
-        cache.insert("find all sensors in building A", fp1.clone(), "5 rows", 1000);
+        cache.insert(
+            "find all sensors in building A",
+            fp1.clone(),
+            "5 rows",
+            1000,
+        );
 
         // Similar query
         let fp2 = text_fingerprint("list all sensors in building A");
@@ -233,7 +265,10 @@ mod tests {
 
     #[test]
     fn test_cache_ttl_expiry() {
-        let config = SemanticCacheConfig { default_ttl_ms: 1000, ..Default::default() };
+        let config = SemanticCacheConfig {
+            default_ttl_ms: 1000,
+            ..Default::default()
+        };
         let mut cache = SemanticCache::new(config);
         let fp = text_fingerprint("test");
         cache.insert("test", fp.clone(), "result", 1000);
@@ -244,7 +279,10 @@ mod tests {
 
     #[test]
     fn test_cache_eviction() {
-        let config = SemanticCacheConfig { max_entries: 3, ..Default::default() };
+        let config = SemanticCacheConfig {
+            max_entries: 3,
+            ..Default::default()
+        };
         let mut cache = SemanticCache::new(config);
         for i in 0..5 {
             let q = format!("query {}", i);

@@ -486,12 +486,8 @@ impl BPlusTree {
 
     /// Redistributes keys from left sibling to the underflowing leaf.
     fn redistribute_leaf_from_left(&mut self, parent_id: u64, child_idx: usize) {
-        
-        
         let (left_sibling_id, leaf_id) = match self.node(parent_id).expect("node should exist") {
-            Node::Internal(n) => {
-                (n.children[child_idx - 1], n.children[child_idx])
-            }
+            Node::Internal(n) => (n.children[child_idx - 1], n.children[child_idx]),
             _ => return,
         };
 
@@ -517,12 +513,8 @@ impl BPlusTree {
 
     /// Redistributes keys from right sibling to the underflowing leaf.
     fn redistribute_leaf_from_right(&mut self, parent_id: u64, child_idx: usize) {
-        
-        
         let (leaf_id, right_sibling_id) = match self.node(parent_id).expect("node should exist") {
-            Node::Internal(n) => {
-                (n.children[child_idx], n.children[child_idx + 1])
-            }
+            Node::Internal(n) => (n.children[child_idx], n.children[child_idx + 1]),
             _ => return,
         };
 
@@ -548,12 +540,8 @@ impl BPlusTree {
 
     /// Merges two adjacent leaf nodes. The left leaf absorbs the right leaf.
     fn merge_leaves(&mut self, parent_id: u64, left_idx: usize, right_idx: usize) {
-        
-        
         let (left_id, right_id) = match self.node(parent_id).expect("node should exist") {
-            Node::Internal(n) => {
-                (n.children[left_idx], n.children[right_idx])
-            }
+            Node::Internal(n) => (n.children[left_idx], n.children[right_idx]),
             _ => return,
         };
 
@@ -647,12 +635,8 @@ impl BPlusTree {
 
     /// Redistributes keys from left internal sibling.
     fn redistribute_internal_from_left(&mut self, parent_id: u64, child_idx: usize) {
-        
-        
         let (left_id, node_id) = match self.node(parent_id).expect("node should exist") {
-            Node::Internal(n) => {
-                (n.children[child_idx - 1], n.children[child_idx])
-            }
+            Node::Internal(n) => (n.children[child_idx - 1], n.children[child_idx]),
             _ => return,
         };
 
@@ -686,12 +670,8 @@ impl BPlusTree {
 
     /// Redistributes keys from right internal sibling.
     fn redistribute_internal_from_right(&mut self, parent_id: u64, child_idx: usize) {
-        
-        
         let (node_id, right_id) = match self.node(parent_id).expect("node should exist") {
-            Node::Internal(n) => {
-                (n.children[child_idx], n.children[child_idx + 1])
-            }
+            Node::Internal(n) => (n.children[child_idx], n.children[child_idx + 1]),
             _ => return,
         };
 
@@ -725,12 +705,8 @@ impl BPlusTree {
 
     /// Merges two adjacent internal nodes. The left node absorbs the right node.
     fn merge_internals(&mut self, parent_id: u64, left_idx: usize, right_idx: usize) {
-        
-        
         let (left_id, right_id) = match self.node(parent_id).expect("node should exist") {
-            Node::Internal(n) => {
-                (n.children[left_idx], n.children[right_idx])
-            }
+            Node::Internal(n) => (n.children[left_idx], n.children[right_idx]),
             _ => return,
         };
 

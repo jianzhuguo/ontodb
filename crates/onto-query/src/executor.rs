@@ -6,12 +6,15 @@
 
 use crate::cache::{PlanCache, QueryCache};
 use crate::optimizer::QueryPlanner;
-use crate::parser::{AggregateFunc, ArithmeticOp, FilterExpr, LiteralValue, QueryAst, SelectColumns, SelectItem, ValueExpr, WindowExpr, WindowFunc};
 use crate::optimizer::{ExecutionPlan, PlanNode};
-use onto_core::{CoreError, Result};
+use crate::parser::{
+    AggregateFunc, ArithmeticOp, FilterExpr, LiteralValue, QueryAst, SelectColumns, SelectItem,
+    ValueExpr, WindowExpr, WindowFunc,
+};
 use onto_core::binary_row::BinaryRow;
+use onto_core::{CoreError, Result};
 use onto_ontology::{DataType, OntologyStore, Reasoner};
-use onto_sharding::{ShardRouter, ShardManager, ShardMap};
+use onto_sharding::{ShardManager, ShardMap, ShardRouter};
 use onto_storage::LsmEngine;
 use serde_json::{json, Map, Value};
 
@@ -129,12 +132,16 @@ fn eval_binary_filter(row: &BinaryRow, expr: &FilterExpr) -> Option<bool> {
         }
         FilterExpr::And(l, r) => {
             let lv = eval_binary_filter(row, l)?;
-            if !lv { return Some(false); }
+            if !lv {
+                return Some(false);
+            }
             eval_binary_filter(row, r)
         }
         FilterExpr::Or(l, r) => {
             let lv = eval_binary_filter(row, l)?;
-            if lv { return Some(true); }
+            if lv {
+                return Some(true);
+            }
             eval_binary_filter(row, r)
         }
         FilterExpr::Not(e) => {
@@ -153,7 +160,9 @@ fn eval_binary_filter(row: &BinaryRow, expr: &FilterExpr) -> Option<bool> {
 
 /// Compare binary field value with a LiteralValue for equality.
 fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
-    use onto_core::binary_row::{TAG_NULL, TAG_BOOL, TAG_INT, TAG_FLOAT, TAG_STRING, parse_string_value};
+    use onto_core::binary_row::{
+        parse_string_value, TAG_BOOL, TAG_FLOAT, TAG_INT, TAG_NULL, TAG_STRING,
+    };
     match (tag, lit) {
         (TAG_NULL, LiteralValue::Null) => true,
         (TAG_NULL, _) => false,
@@ -162,33 +171,39 @@ fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
         (TAG_INT, LiteralValue::Int(n)) => {
             if let Ok(arr) = <[u8; 8]>::try_from(raw) {
                 i64::from_be_bytes(arr) == *n
-            } else { false }
+            } else {
+                false
+            }
         }
         (TAG_INT, LiteralValue::Float(n)) => {
             if let Ok(arr) = <[u8; 8]>::try_from(raw) {
                 (i64::from_be_bytes(arr) as f64) == *n
-            } else { false }
+            } else {
+                false
+            }
         }
         (TAG_FLOAT, LiteralValue::Float(n)) => {
             if let Ok(arr) = <[u8; 8]>::try_from(raw) {
                 f64::from_be_bytes(arr) == *n
-            } else { false }
+            } else {
+                false
+            }
         }
         (TAG_FLOAT, LiteralValue::Int(n)) => {
             if let Ok(arr) = <[u8; 8]>::try_from(raw) {
                 f64::from_be_bytes(arr) == (*n as f64)
-            } else { false }
+            } else {
+                false
+            }
         }
-        (TAG_STRING, LiteralValue::String(s)) => {
-            parse_string_value(raw) == Some(s.as_str())
-        }
+        (TAG_STRING, LiteralValue::String(s)) => parse_string_value(raw) == Some(s.as_str()),
         _ => false,
     }
 }
 
 /// Compare binary field value with a LiteralValue for ordering.
 fn binary_lit_ord(tag: u8, raw: &[u8], lit: &LiteralValue) -> Option<std::cmp::Ordering> {
-    use onto_core::binary_row::{TAG_INT, TAG_FLOAT, TAG_STRING, parse_string_value};
+    use onto_core::binary_row::{parse_string_value, TAG_FLOAT, TAG_INT, TAG_STRING};
     match (tag, lit) {
         (TAG_INT, LiteralValue::Int(n)) => {
             let arr: [u8; 8] = raw.try_into().ok()?;
@@ -206,9 +221,7 @@ fn binary_lit_ord(tag: u8, raw: &[u8], lit: &LiteralValue) -> Option<std::cmp::O
             let arr: [u8; 8] = raw.try_into().ok()?;
             f64::from_be_bytes(arr).partial_cmp(&(*n as f64))
         }
-        (TAG_STRING, LiteralValue::String(s)) => {
-            parse_string_value(raw).map(|v| v.cmp(s.as_str()))
-        }
+        (TAG_STRING, LiteralValue::String(s)) => parse_string_value(raw).map(|v| v.cmp(s.as_str())),
         _ => None,
     }
 }
@@ -405,15 +418,15 @@ impl InferenceCache {
         for class in affected_classes {
             self.class_hierarchy.remove(class);
         }
-        
+
         // Clear property cache for affected classes
         for class in affected_classes {
             self.class_properties.remove(class);
         }
-        
+
         // Clear merged ontology (needs rebuild when any class changes)
         self.merged_ontology = None;
-        
+
         // Note: inverse_property and transitive_closure are not class-specific,
         // so they don't need to be cleared for class-level changes
     }
@@ -424,7 +437,11 @@ impl QueryExecutor {
         Self::with_config(engine, ontology_store, QueryConfig::default())
     }
 
-    pub fn with_config(engine: Arc<LsmEngine>, ontology_store: OntologyStore, config: QueryConfig) -> Self {
+    pub fn with_config(
+        engine: Arc<LsmEngine>,
+        ontology_store: OntologyStore,
+        config: QueryConfig,
+    ) -> Self {
         Self {
             engine,
             ontology_store,
@@ -488,16 +505,21 @@ impl QueryExecutor {
     }
 
     /// Set the shard router for data sharding support.
-    pub fn with_shard_router(self, shard_map: ShardMap, local_shards: Vec<onto_sharding::ShardId>) -> Self {
+    pub fn with_shard_router(
+        self,
+        shard_map: ShardMap,
+        local_shards: Vec<onto_sharding::ShardId>,
+    ) -> Self {
         {
             let mut router = self.shard_router.write().unwrap_or_else(|e| e.into_inner());
             *router = Some(ShardRouter::new(shard_map.clone(), local_shards));
         }
         {
             let mut mgr = self.shard_manager.lock().unwrap_or_else(|e| e.into_inner());
-            *mgr = Some(ShardManager::from_json(
-                &serde_json::to_string(&shard_map).unwrap_or_default()
-            ).unwrap_or_else(|_| ShardManager::new(0)));
+            *mgr = Some(
+                ShardManager::from_json(&serde_json::to_string(&shard_map).unwrap_or_default())
+                    .unwrap_or_else(|_| ShardManager::new(0)),
+            );
         }
         self
     }
@@ -505,10 +527,9 @@ impl QueryExecutor {
     /// Get a snapshot of the shard router (cloned).
     pub fn shard_router_snapshot(&self) -> Option<ShardRouter> {
         let router = self.shard_router.read().unwrap_or_else(|e| e.into_inner());
-        router.as_ref().map(|r| ShardRouter::new(
-            r.shard_map().clone(),
-            r.local_shards().to_vec(),
-        ))
+        router
+            .as_ref()
+            .map(|r| ShardRouter::new(r.shard_map().clone(), r.local_shards().to_vec()))
     }
 
     /// Get the shard manager reference (if configured).
@@ -517,16 +538,21 @@ impl QueryExecutor {
     }
 
     /// Update the shard configuration at runtime.
-    pub fn update_shard_config(&self, shard_map: ShardMap, local_shards: Vec<onto_sharding::ShardId>) {
+    pub fn update_shard_config(
+        &self,
+        shard_map: ShardMap,
+        local_shards: Vec<onto_sharding::ShardId>,
+    ) {
         {
             let mut router = self.shard_router.write().unwrap_or_else(|e| e.into_inner());
             *router = Some(ShardRouter::new(shard_map.clone(), local_shards));
         }
         {
             let mut mgr = self.shard_manager.lock().unwrap_or_else(|e| e.into_inner());
-            *mgr = Some(ShardManager::from_json(
-                &serde_json::to_string(&shard_map).unwrap_or_default()
-            ).unwrap_or_else(|_| ShardManager::new(0)));
+            *mgr = Some(
+                ShardManager::from_json(&serde_json::to_string(&shard_map).unwrap_or_default())
+                    .unwrap_or_else(|_| ShardManager::new(0)),
+            );
         }
     }
 
@@ -593,11 +619,7 @@ impl QueryExecutor {
     }
 
     /// Gets a value by key, using transaction snapshot if a transaction is active.
-    pub fn txn_aware_get(
-        &self,
-        engine: &LsmEngine,
-        key: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
+    pub fn txn_aware_get(&self, engine: &LsmEngine, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let active_txn = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(txn_id) = active_txn {
             engine.txn_get(txn_id, key)
@@ -631,7 +653,8 @@ impl QueryExecutor {
         edge_label: Option<&str>,
         _max_depth: usize,
     ) -> Result<Vec<Map<String, Value>>> {
-        let results = self.plan_vector_search(&self.engine, class, column, query_vector, top_k, &None)?;
+        let results =
+            self.plan_vector_search(&self.engine, class, column, query_vector, top_k, &None)?;
 
         let Some(ref graph) = self.graph else {
             return Ok(results);
@@ -644,7 +667,8 @@ impl QueryExecutor {
         for (i, row) in results.iter().enumerate() {
             if let Some(pk) = row.get("__pk__").and_then(|v| v.as_str()) {
                 let entity_id = self.make_entity_id(class, pk);
-                let neighbors = graph.get_entity_neighbors(&entity_id, onto_graph::Direction::Out, edge_label);
+                let neighbors =
+                    graph.get_entity_neighbors(&entity_id, onto_graph::Direction::Out, edge_label);
                 for nid in &neighbors {
                     all_neighbor_keys.push((nid.clone(), nid.to_lsm_key()));
                 }
@@ -653,7 +677,8 @@ impl QueryExecutor {
         }
 
         // Phase 2: Batch fetch all neighbor properties (single scan pass)
-        let mut neighbor_docs: std::collections::HashMap<String, Map<String, Value>> = std::collections::HashMap::new();
+        let mut neighbor_docs: std::collections::HashMap<String, Map<String, Value>> =
+            std::collections::HashMap::new();
         for (nid, lsm_key) in &all_neighbor_keys {
             if neighbor_docs.contains_key(&nid.to_string()) {
                 continue;
@@ -670,17 +695,23 @@ impl QueryExecutor {
         for (row_idx, row) in results.into_iter().enumerate() {
             let mut row = row;
             if let Some((_, neighbors)) = row_neighbors.iter().find(|(i, _)| *i == row_idx) {
-                let neighbor_data: Vec<serde_json::Value> = neighbors.iter().filter_map(|nid| {
-                    neighbor_docs.get(&nid.to_string()).map(|doc| {
-                        serde_json::json!({
-                            "entity": nid.to_string(),
-                            "class": nid.class(),
-                            "properties": doc,
+                let neighbor_data: Vec<serde_json::Value> = neighbors
+                    .iter()
+                    .filter_map(|nid| {
+                        neighbor_docs.get(&nid.to_string()).map(|doc| {
+                            serde_json::json!({
+                                "entity": nid.to_string(),
+                                "class": nid.class(),
+                                "properties": doc,
+                            })
                         })
                     })
-                }).collect();
+                    .collect();
                 row.insert("_neighbors".to_string(), serde_json::json!(neighbor_data));
-                row.insert("_neighbor_count".to_string(), serde_json::json!(neighbors.len()));
+                row.insert(
+                    "_neighbor_count".to_string(),
+                    serde_json::json!(neighbors.len()),
+                );
             }
             enriched.push(row);
         }
@@ -713,7 +744,10 @@ impl QueryExecutor {
         if let Ok(Some(val_bytes)) = self.engine.get(&start_id.to_lsm_key()) {
             if let Some(mut doc) = storage_bytes_to_doc(&val_bytes) {
                 doc.insert("_depth".to_string(), serde_json::json!(0));
-                doc.insert("_entity".to_string(), serde_json::json!(start_id.to_string()));
+                doc.insert(
+                    "_entity".to_string(),
+                    serde_json::json!(start_id.to_string()),
+                );
                 results.push(doc);
             }
         }
@@ -723,7 +757,10 @@ impl QueryExecutor {
             if let Ok(Some(val_bytes)) = self.engine.get(&neighbor_id.to_lsm_key()) {
                 if let Some(mut doc) = storage_bytes_to_doc(&val_bytes) {
                     doc.insert("_depth".to_string(), serde_json::json!(1));
-                    doc.insert("_entity".to_string(), serde_json::json!(neighbor_id.to_string()));
+                    doc.insert(
+                        "_entity".to_string(),
+                        serde_json::json!(neighbor_id.to_string()),
+                    );
                     results.push(doc);
                 }
             }
@@ -750,7 +787,12 @@ impl QueryExecutor {
     ) -> Result<Vec<Map<String, Value>>> {
         // Step 1: Vector search
         let vector_results = self.plan_vector_search(
-            &self.engine, class, vector_column, query_vector, top_k, &None,
+            &self.engine,
+            class,
+            vector_column,
+            query_vector,
+            top_k,
+            &None,
         )?;
 
         let Some(ref graph) = self.graph else {
@@ -775,8 +817,14 @@ impl QueryExecutor {
                     for neighbor_id in &neighbors {
                         if let Ok(Some(val_bytes)) = self.engine.get(&neighbor_id.to_lsm_key()) {
                             if let Some(mut doc) = storage_bytes_to_doc(&val_bytes) {
-                                doc.insert("_source_entity".to_string(), serde_json::json!(entity_id.to_string()));
-                                doc.insert("_relation".to_string(), serde_json::json!(graph_edge_label.unwrap_or("related")));
+                                doc.insert(
+                                    "_source_entity".to_string(),
+                                    serde_json::json!(entity_id.to_string()),
+                                );
+                                doc.insert(
+                                    "_relation".to_string(),
+                                    serde_json::json!(graph_edge_label.unwrap_or("related")),
+                                );
                                 all_entities.push((neighbor_id.to_string(), doc));
                             }
                         }
@@ -787,7 +835,8 @@ impl QueryExecutor {
 
         // Step 3: Apply relational filter if provided
         let filtered: Vec<Map<String, Value>> = if let Some(filter) = relational_filter {
-            all_entities.into_iter()
+            all_entities
+                .into_iter()
                 .filter(|(_, doc)| self.eval_filter(&self.engine, doc, filter))
                 .map(|(_, doc)| doc)
                 .collect()
@@ -823,27 +872,42 @@ impl QueryExecutor {
             (Some(s), Some(p), None) => {
                 // SPO query
                 let objects = triple_store.lookup_spo(s, p).unwrap_or_default();
-                objects.into_iter().map(|o| onto_ontology::triple_store::Triple::new(s, p, o)).collect()
+                objects
+                    .into_iter()
+                    .map(|o| onto_ontology::triple_store::Triple::new(s, p, o))
+                    .collect()
             }
             (Some(s), None, None) => {
                 // S query
                 let pairs = triple_store.lookup_s(s).unwrap_or_default();
-                pairs.into_iter().map(|(p, o)| onto_ontology::triple_store::Triple::new(s, p, o)).collect()
+                pairs
+                    .into_iter()
+                    .map(|(p, o)| onto_ontology::triple_store::Triple::new(s, p, o))
+                    .collect()
             }
             (None, Some(p), Some(o)) => {
                 // POS query
                 let subjects = triple_store.lookup_pos(p, o).unwrap_or_default();
-                subjects.into_iter().map(|s| onto_ontology::triple_store::Triple::new(s, p, o)).collect()
+                subjects
+                    .into_iter()
+                    .map(|s| onto_ontology::triple_store::Triple::new(s, p, o))
+                    .collect()
             }
             (None, Some(p), None) => {
                 // P query
                 let pairs = triple_store.lookup_p(p).unwrap_or_default();
-                pairs.into_iter().map(|(s, o)| onto_ontology::triple_store::Triple::new(s, p, o)).collect()
+                pairs
+                    .into_iter()
+                    .map(|(s, o)| onto_ontology::triple_store::Triple::new(s, p, o))
+                    .collect()
             }
             (None, None, Some(o)) => {
                 // O query
                 let pairs = triple_store.lookup_o(o).unwrap_or_default();
-                pairs.into_iter().map(|(s, p)| onto_ontology::triple_store::Triple::new(s, p, o)).collect()
+                pairs
+                    .into_iter()
+                    .map(|(s, p)| onto_ontology::triple_store::Triple::new(s, p, o))
+                    .collect()
             }
             _ => {
                 // Get all triples
@@ -852,20 +916,26 @@ impl QueryExecutor {
         };
 
         // Convert to rows
-        let rows: Vec<Map<String, Value>> = triples.into_iter().map(|t| {
-            let mut row = Map::new();
-            row.insert("subject".to_string(), serde_json::json!(t.subject));
-            row.insert("predicate".to_string(), serde_json::json!(t.predicate));
-            row.insert("object".to_string(), serde_json::json!(t.object));
-            row
-        }).collect();
+        let rows: Vec<Map<String, Value>> = triples
+            .into_iter()
+            .map(|t| {
+                let mut row = Map::new();
+                row.insert("subject".to_string(), serde_json::json!(t.subject));
+                row.insert("predicate".to_string(), serde_json::json!(t.predicate));
+                row.insert("object".to_string(), serde_json::json!(t.object));
+                row
+            })
+            .collect();
 
         Ok(rows)
     }
 
     /// Get runtime execution statistics.
     pub fn runtime_stats(&self) -> RuntimeStats {
-        self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.runtime_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Get engine storage statistics (SSTable count, total entries, etc.).
@@ -928,18 +998,32 @@ impl QueryExecutor {
 
     /// Get query cache statistics.
     pub fn query_cache_stats(&self) -> crate::cache::CacheStats {
-        self.query_cache.lock().unwrap_or_else(|e| e.into_inner()).stats().clone()
+        self.query_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stats()
+            .clone()
     }
 
     /// Get plan cache statistics.
     pub fn plan_cache_stats(&self) -> crate::cache::CacheStats {
-        self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).stats().clone()
+        self.plan_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stats()
+            .clone()
     }
 
     /// Clear all caches.
     pub fn clear_caches(&self) {
-        self.query_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.query_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.plan_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Returns schema introspection data: all ontologies, classes, properties, and indexes.
@@ -953,11 +1037,26 @@ impl QueryExecutor {
                 let mut classes = serde_json::Map::new();
                 for (name, class) in &ontology.classes {
                     let mut class_info = serde_json::Map::new();
-                    class_info.insert("type".to_string(), serde_json::json!(format!("{:?}", class.class_type)));
-                    class_info.insert("superclasses".to_string(), serde_json::json!(class.superclasses));
-                    class_info.insert("equivalent_classes".to_string(), serde_json::json!(class.equivalent_classes));
-                    class_info.insert("disjoint_with".to_string(), serde_json::json!(class.disjoint_with));
-                    class_info.insert("properties".to_string(), serde_json::json!(class.properties));
+                    class_info.insert(
+                        "type".to_string(),
+                        serde_json::json!(format!("{:?}", class.class_type)),
+                    );
+                    class_info.insert(
+                        "superclasses".to_string(),
+                        serde_json::json!(class.superclasses),
+                    );
+                    class_info.insert(
+                        "equivalent_classes".to_string(),
+                        serde_json::json!(class.equivalent_classes),
+                    );
+                    class_info.insert(
+                        "disjoint_with".to_string(),
+                        serde_json::json!(class.disjoint_with),
+                    );
+                    class_info.insert(
+                        "properties".to_string(),
+                        serde_json::json!(class.properties),
+                    );
                     classes.insert(name.clone(), serde_json::Value::Object(class_info));
                 }
 
@@ -967,18 +1066,36 @@ impl QueryExecutor {
                     prop_info.insert("domain".to_string(), serde_json::json!(prop.domain));
                     prop_info.insert("range".to_string(), serde_json::json!(prop.range.as_str()));
                     prop_info.insert("required".to_string(), serde_json::json!(prop.required));
-                    prop_info.insert("multi_valued".to_string(), serde_json::json!(prop.multi_valued));
+                    prop_info.insert(
+                        "multi_valued".to_string(),
+                        serde_json::json!(prop.multi_valued),
+                    );
                     if let Some(ref inverse) = prop.inverse_of {
                         prop_info.insert("inverse_of".to_string(), serde_json::json!(inverse));
                     }
-                    prop_info.insert("is_transitive".to_string(), serde_json::json!(prop.is_transitive));
-                    prop_info.insert("is_symmetric".to_string(), serde_json::json!(prop.is_symmetric));
-                    prop_info.insert("is_functional".to_string(), serde_json::json!(prop.is_functional));
+                    prop_info.insert(
+                        "is_transitive".to_string(),
+                        serde_json::json!(prop.is_transitive),
+                    );
+                    prop_info.insert(
+                        "is_symmetric".to_string(),
+                        serde_json::json!(prop.is_symmetric),
+                    );
+                    prop_info.insert(
+                        "is_functional".to_string(),
+                        serde_json::json!(prop.is_functional),
+                    );
                     if !prop.subproperty_of.is_empty() {
-                        prop_info.insert("subproperty_of".to_string(), serde_json::json!(prop.subproperty_of));
+                        prop_info.insert(
+                            "subproperty_of".to_string(),
+                            serde_json::json!(prop.subproperty_of),
+                        );
                     }
                     if !prop.equivalent_properties.is_empty() {
-                        prop_info.insert("equivalent_properties".to_string(), serde_json::json!(prop.equivalent_properties));
+                        prop_info.insert(
+                            "equivalent_properties".to_string(),
+                            serde_json::json!(prop.equivalent_properties),
+                        );
                     }
                     properties.insert(name.clone(), serde_json::Value::Object(prop_info));
                 }
@@ -989,7 +1106,10 @@ impl QueryExecutor {
                     onto_info.insert("namespace".to_string(), serde_json::json!(ns));
                 }
                 onto_info.insert("classes".to_string(), serde_json::Value::Object(classes));
-                onto_info.insert("properties".to_string(), serde_json::Value::Object(properties));
+                onto_info.insert(
+                    "properties".to_string(),
+                    serde_json::Value::Object(properties),
+                );
                 ontologies.push(serde_json::Value::Object(onto_info));
             }
         }
@@ -1041,14 +1161,15 @@ impl QueryExecutor {
         // Check existence via scan_prefix (more reliable than get with tombstones)
         let prefix = b"__ontology__";
         let entries = engine.scan_prefix(prefix).unwrap_or_default();
-        
+
         // Try to find the ontology with various key formats
         let mut found_key: Option<Vec<u8>> = None;
         for (k, _) in &entries {
             let key_str = String::from_utf8_lossy(k);
             // Match exact name or namespaced name (e.g., "__ontology___default::ValueHub")
-            if key_str == format!("__ontology__{}", name) || 
-               key_str.ends_with(&format!("::{}", name)) {
+            if key_str == format!("__ontology__{}", name)
+                || key_str.ends_with(&format!("::{}", name))
+            {
                 found_key = Some(k.clone());
                 break;
             }
@@ -1059,7 +1180,10 @@ impl QueryExecutor {
             tracing::info!("Dropped ontology '{}'", name);
             Ok(())
         } else {
-            Err(onto_core::CoreError::InvalidArgument(format!("Ontology '{}' not found", name)))
+            Err(onto_core::CoreError::InvalidArgument(format!(
+                "Ontology '{}' not found",
+                name
+            )))
         }
     }
 
@@ -1070,7 +1194,10 @@ impl QueryExecutor {
 
     /// Returns true if a multi-statement transaction is active.
     pub fn in_transaction(&self) -> bool {
-        self.active_txn.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        self.active_txn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// Classifies whether a query is read-only (can use a read lock).
@@ -1090,15 +1217,16 @@ impl QueryExecutor {
         // use a short write lock that's only held during the commit phase.
         // This allows concurrent reads to proceed during query planning and execution.
         let active_txn = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
-        let is_simple_dml = active_txn.is_none() && matches!(
-            ast,
-            QueryAst::Insert { .. }
-                | QueryAst::BatchInsert { .. }
-                | QueryAst::BatchUpsert { .. }
-                | QueryAst::Update { .. }
-                | QueryAst::Delete { .. }
-                | QueryAst::Upsert { .. }
-        );
+        let is_simple_dml = active_txn.is_none()
+            && matches!(
+                ast,
+                QueryAst::Insert { .. }
+                    | QueryAst::BatchInsert { .. }
+                    | QueryAst::BatchUpsert { .. }
+                    | QueryAst::Update { .. }
+                    | QueryAst::Delete { .. }
+                    | QueryAst::Upsert { .. }
+            );
 
         if is_simple_dml {
             return self.execute_dml_short_lock(ast);
@@ -1123,7 +1251,11 @@ impl QueryExecutor {
     /// let ast = QueryParser::parse("SELECT * FROM User WHERE age > $1")?;
     /// let result = executor.execute_prepared(&ast, &[LiteralValue::Int(18)])?;
     /// ```
-    pub fn execute_prepared(&self, ast: &QueryAst, params: &[crate::parser::LiteralValue]) -> Result<QueryResult> {
+    pub fn execute_prepared(
+        &self,
+        ast: &QueryAst,
+        params: &[crate::parser::LiteralValue],
+    ) -> Result<QueryResult> {
         let substituted = ast.substitute_params(params)?;
         self.execute(&substituted)
     }
@@ -1142,8 +1274,12 @@ impl QueryExecutor {
 
         // Phase 3: Commit or abort
         match &result {
-            Ok(_) => { engine.commit_txn(txn_id)?; }
-            Err(_) => { let _ = engine.abort_txn(txn_id); }
+            Ok(_) => {
+                engine.commit_txn(txn_id)?;
+            }
+            Err(_) => {
+                let _ = engine.abort_txn(txn_id);
+            }
         }
 
         let elapsed = start_time.elapsed();
@@ -1231,16 +1367,33 @@ impl QueryExecutor {
                 // Check plan cache first
                 let cached_plan = {
                     let ast_hash = Self::hash_ast(ast);
-                    let cached = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).get(ast_hash);
+                    let cached = self
+                        .plan_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(ast_hash);
                     if cached.is_some() {
-                        self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner()).plan_cache_hits += 1;
+                        self.runtime_stats
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .plan_cache_hits += 1;
                         cached
                     } else {
-                        let plan = self.planner.read().unwrap_or_else(|e| e.into_inner()).plan(ast);
+                        let plan = self
+                            .planner
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .plan(ast);
                         if let Ok(ref p) = plan {
-                            self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(ast_hash, p.clone());
+                            self.plan_cache
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(ast_hash, p.clone());
                         }
-                        self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner()).plan_cache_misses += 1;
+                        self.runtime_stats
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .plan_cache_misses += 1;
                         plan.ok()
                     }
                 };
@@ -1254,13 +1407,22 @@ impl QueryExecutor {
 
                     // Post-processing
                     if let QueryAst::Select {
-                        distinct, columns, group_by, having, order_by, limit, offset, ..
-                    } = ast {
+                        distinct,
+                        columns,
+                        group_by,
+                        having,
+                        order_by,
+                        limit,
+                        offset,
+                        ..
+                    } = ast
+                    {
                         let has_aggregates = Self::columns_have_aggregates(columns);
 
                         // Fast path: COUNT(*) was already computed by plan_seq_scan_count_only.
                         // Skip re-aggregation — just apply ORDER BY / LIMIT if present.
-                        if has_aggregates && group_by.is_none()
+                        if has_aggregates
+                            && group_by.is_none()
                             && rows.len() == 1
                             && Self::is_pure_count_star(columns)
                         {
@@ -1271,24 +1433,43 @@ impl QueryExecutor {
                         }
 
                         if group_by.is_some() || has_aggregates {
-                            let result = self.execute_aggregation_read(engine, columns, &rows, group_by.as_ref(), having, order_by, *limit)?;
+                            let result = self.execute_aggregation_read(
+                                engine,
+                                columns,
+                                &rows,
+                                group_by.as_ref(),
+                                having,
+                                order_by,
+                                *limit,
+                            )?;
                             if let QueryResult::Rows(mut agg_rows) = result {
-                                if *distinct { Self::dedup_rows(&mut agg_rows); }
+                                if *distinct {
+                                    Self::dedup_rows(&mut agg_rows);
+                                }
                                 return Ok(QueryResult::Rows(agg_rows));
                             }
                             return Ok(result);
                         }
 
                         if let SelectColumns::Columns(items) = columns {
-                            let window_exprs: Vec<&WindowExpr> = items.iter().filter_map(|item| {
-                                if let SelectItem::WindowFunction(w) = item { Some(w) } else { None }
-                            }).collect();
+                            let window_exprs: Vec<&WindowExpr> = items
+                                .iter()
+                                .filter_map(|item| {
+                                    if let SelectItem::WindowFunction(w) = item {
+                                        Some(w)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
                             if !window_exprs.is_empty() {
                                 Self::execute_window_functions(&mut rows, &window_exprs);
                             }
                         }
 
-                        if *distinct { Self::dedup_rows(&mut rows); }
+                        if *distinct {
+                            Self::dedup_rows(&mut rows);
+                        }
 
                         if let Some(off) = offset {
                             if *off < rows.len() {
@@ -1305,34 +1486,55 @@ impl QueryExecutor {
                     Ok(QueryResult::Rows(rows))
                 } else {
                     // Plan generation failed, return error
-                    Err(CoreError::Custom("failed to generate execution plan".to_string()))
+                    Err(CoreError::Custom(
+                        "failed to generate execution plan".to_string(),
+                    ))
                 }
             }
-            QueryAst::Explain { query } => {
-                self.execute_explain_read(query, engine)
-            }
-            QueryAst::ExplainReasoning { query } => {
-                self.execute_explain_reasoning(query, engine)
-            }
-            QueryAst::Analyze { table } => {
-                self.execute_analyze_read(table, engine)
-            }
-            QueryAst::Match { variable, class, filter, returns } => {
-                self.execute_match_read(engine, variable, class, filter, returns)
-            }
-            QueryAst::VectorSearch { class, column, query_vector, top_k, filter } => {
+            QueryAst::Explain { query } => self.execute_explain_read(query, engine),
+            QueryAst::ExplainReasoning { query } => self.execute_explain_reasoning(query, engine),
+            QueryAst::Analyze { table } => self.execute_analyze_read(table, engine),
+            QueryAst::Match {
+                variable,
+                class,
+                filter,
+                returns,
+            } => self.execute_match_read(engine, variable, class, filter, returns),
+            QueryAst::VectorSearch {
+                class,
+                column,
+                query_vector,
+                top_k,
+                filter,
+            } => {
                 self.execute_vector_search_read(engine, class, column, query_vector, *top_k, filter)
             }
-            QueryAst::GraphMatch { pattern, filter, returns } => {
-                self.execute_graph_match_read(engine, pattern, filter, returns)
-            }
-            QueryAst::GraphShortestPath { from_id, to_id, max_depth } => {
-                self.execute_graph_shortest_path_read(from_id, to_id, *max_depth)
-            }
-            QueryAst::GraphTraverse { start_id, direction, edge_label, max_depth, filter } => {
-                self.execute_graph_traverse_read(start_id, *direction, edge_label.as_deref(), *max_depth, filter)
-            }
-            _ => Err(CoreError::Custom("unexpected query type in read path".to_string())),
+            QueryAst::GraphMatch {
+                pattern,
+                filter,
+                returns,
+            } => self.execute_graph_match_read(engine, pattern, filter, returns),
+            QueryAst::GraphShortestPath {
+                from_id,
+                to_id,
+                max_depth,
+            } => self.execute_graph_shortest_path_read(from_id, to_id, *max_depth),
+            QueryAst::GraphTraverse {
+                start_id,
+                direction,
+                edge_label,
+                max_depth,
+                filter,
+            } => self.execute_graph_traverse_read(
+                start_id,
+                *direction,
+                edge_label.as_deref(),
+                *max_depth,
+                filter,
+            ),
+            _ => Err(CoreError::Custom(
+                "unexpected query type in read path".to_string(),
+            )),
         };
 
         let elapsed = start_time.elapsed();
@@ -1367,36 +1569,46 @@ impl QueryExecutor {
                 // EXPLAIN: generate and return the execution plan
                 self.execute_explain(query, engine)
             }
-            QueryAst::ExplainReasoning { query } => {
-                self.execute_explain_reasoning(query, engine)
-            }
+            QueryAst::ExplainReasoning { query } => self.execute_explain_reasoning(query, engine),
             QueryAst::Analyze { table } => {
                 // ANALYZE: collect table statistics
                 self.execute_analyze(table, engine)
             }
-            QueryAst::With { ctes, query, recursive } => {
+            QueryAst::With {
+                ctes,
+                query,
+                recursive,
+            } => {
                 // WITH clause: execute CTEs and substitute into main query
                 self.execute_with_ctes(ctes, query, engine, *recursive)
             }
             QueryAst::CreateOntology { sql } => {
                 // DDL doesn't need MVCC transaction
                 let ontology = onto_ontology::OntologyParser::parse(sql)?;
-                
+
                 // Fix inheritance: merge with existing ontologies in the same namespace
                 // This allows cross-ontology inheritance within a namespace
-                let namespace = ontology.namespace.as_deref().unwrap_or(onto_ontology::DEFAULT_NAMESPACE);
-                let merged_for_validation = self.ontology_store.merge_namespace_ontologies(engine, namespace)?;
-                
+                let namespace = ontology
+                    .namespace
+                    .as_deref()
+                    .unwrap_or(onto_ontology::DEFAULT_NAMESPACE);
+                let merged_for_validation = self
+                    .ontology_store
+                    .merge_namespace_ontologies(engine, namespace)?;
+
                 // Add classes from new ontology to merged for validation
                 for (name, class) in &ontology.classes {
                     if !merged_for_validation.classes.contains_key(name) {
                         // We need to add to a mutable copy
                         let mut validation_ontology = merged_for_validation.clone();
-                        validation_ontology.classes.insert(name.clone(), class.clone());
+                        validation_ontology
+                            .classes
+                            .insert(name.clone(), class.clone());
                         validation_ontology.rebuild_indexes();
-                        
+
                         // Validate only the new ontology against the merged context
-                        let validation_errors = self.validate_ontology_with_context(&ontology, &validation_ontology);
+                        let validation_errors =
+                            self.validate_ontology_with_context(&ontology, &validation_ontology);
                         if !validation_errors.is_empty() {
                             return Err(CoreError::InvalidArgument(format!(
                                 "Ontology validation failed:\n  - {}",
@@ -1405,10 +1617,12 @@ impl QueryExecutor {
                         }
                     }
                 }
-                
+
                 self.ontology_store.save_with_engine(engine, &ontology)?;
                 // Selective invalidation: only clear caches related to this ontology
-                self.inference_cache.lock().unwrap_or_else(|e| e.into_inner())
+                self.inference_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
                     .invalidate_ontology(&ontology.name);
                 Ok(QueryResult::Success(format!(
                     "Ontology '{}' created with {} classes and {} properties",
@@ -1425,7 +1639,8 @@ impl QueryExecutor {
                 engine.create_index(class, column)?;
                 self.refresh_index_stats(engine, class);
                 Ok(QueryResult::Success(format!(
-                    "Index created on {}.{}", class, column
+                    "Index created on {}.{}",
+                    class, column
                 )))
             }
             QueryAst::CreateCompositeIndex { class, columns } => {
@@ -1436,17 +1651,21 @@ impl QueryExecutor {
                 }
                 self.refresh_index_stats(engine, class);
                 Ok(QueryResult::Success(format!(
-                    "Composite index created on {} ({})", class, columns.join(", ")
+                    "Composite index created on {} ({})",
+                    class,
+                    columns.join(", ")
                 )))
             }
             QueryAst::DropIndex { class, column } => {
                 if engine.drop_index(class, column) {
                     Ok(QueryResult::Success(format!(
-                        "Index dropped on {}.{}", class, column
+                        "Index dropped on {}.{}",
+                        class, column
                     )))
                 } else {
                     Ok(QueryResult::Success(format!(
-                        "No index found on {}.{}", class, column
+                        "No index found on {}.{}",
+                        class, column
                     )))
                 }
             }
@@ -1462,11 +1681,19 @@ impl QueryExecutor {
                 let distance_metric = match metric.to_lowercase().as_str() {
                     "l2" | "euclidean" => onto_storage::DistanceMetric::L2,
                     "cosine" => onto_storage::DistanceMetric::Cosine,
-                    "innerproduct" | "inner_product" | "dot" => onto_storage::DistanceMetric::InnerProduct,
+                    "innerproduct" | "inner_product" | "dot" => {
+                        onto_storage::DistanceMetric::InnerProduct
+                    }
                     _ => onto_storage::DistanceMetric::Cosine,
                 };
                 engine.create_vector_index(
-                    class, column, *dimension, distance_metric, *m, *ef_construction, *ef_search,
+                    class,
+                    column,
+                    *dimension,
+                    distance_metric,
+                    *m,
+                    *ef_construction,
+                    *ef_search,
                 )?;
                 Ok(QueryResult::Success(format!(
                     "Vector index created on {}.{} (dim={}, metric={:?})",
@@ -1476,11 +1703,13 @@ impl QueryExecutor {
             QueryAst::DropVectorIndex { class, column } => {
                 if engine.drop_vector_index(class, column) {
                     Ok(QueryResult::Success(format!(
-                        "Vector index dropped on {}.{}", class, column
+                        "Vector index dropped on {}.{}",
+                        class, column
                     )))
                 } else {
                     Ok(QueryResult::Success(format!(
-                        "No vector index found on {}.{}", class, column
+                        "No vector index found on {}.{}",
+                        class, column
                     )))
                 }
             }
@@ -1501,11 +1730,13 @@ impl QueryExecutor {
                         .map_err(|e| CoreError::Serialization(e.to_string()))?;
                     engine.put(meta_key.as_bytes().to_vec(), query_json.as_bytes().to_vec())?;
                     Ok(QueryResult::Success(format!(
-                        "Materialized view '{}' created with {} rows", name, row_count
+                        "Materialized view '{}' created with {} rows",
+                        name, row_count
                     )))
                 } else {
                     Ok(QueryResult::Success(format!(
-                        "Materialized view '{}' created (no rows)", name
+                        "Materialized view '{}' created (no rows)",
+                        name
                     )))
                 }
             }
@@ -1521,11 +1752,13 @@ impl QueryExecutor {
                 engine.delete(meta_key.as_bytes().to_vec())?;
                 if count > 0 {
                     Ok(QueryResult::Success(format!(
-                        "Materialized view '{}' dropped ({} rows removed)", name, count
+                        "Materialized view '{}' dropped ({} rows removed)",
+                        name, count
                     )))
                 } else {
                     Ok(QueryResult::Success(format!(
-                        "No materialized view '{}' found", name
+                        "No materialized view '{}' found",
+                        name
                     )))
                 }
             }
@@ -1537,16 +1770,21 @@ impl QueryExecutor {
                 // Get the original query from metadata
                 let query_bytes = engine.get(meta_key.as_bytes())?;
                 let query_json = match query_bytes {
-                    Some(bytes) => String::from_utf8(bytes)
-                        .map_err(|_| CoreError::InvalidArgument("invalid query metadata".to_string()))?,
-                    None => return Ok(QueryResult::Success(format!(
-                        "No materialized view '{}' found (use CREATE MATERIALIZED VIEW first)", name
-                    ))),
+                    Some(bytes) => String::from_utf8(bytes).map_err(|_| {
+                        CoreError::InvalidArgument("invalid query metadata".to_string())
+                    })?,
+                    None => {
+                        return Ok(QueryResult::Success(format!(
+                            "No materialized view '{}' found (use CREATE MATERIALIZED VIEW first)",
+                            name
+                        )))
+                    }
                 };
 
                 // Deserialize the query AST from JSON
-                let query_ast: QueryAst = serde_json::from_str(&query_json)
-                    .map_err(|e| CoreError::Serialization(format!("failed to deserialize query: {}", e)))?;
+                let query_ast: QueryAst = serde_json::from_str(&query_json).map_err(|e| {
+                    CoreError::Serialization(format!("failed to deserialize query: {}", e))
+                })?;
                 let result = self.execute_with_engine_inner(&query_ast, engine)?;
 
                 if let QueryResult::Rows(new_rows) = result {
@@ -1557,11 +1795,14 @@ impl QueryExecutor {
                     // Build a set of old row JSON strings for comparison.
                     // Strip internal fields (__pk__, __class__) before comparison
                     // because __pk__ contains a sequence number that changes between queries.
-                    let mut old_row_set: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+                    let mut old_row_set: std::collections::HashMap<String, Vec<u8>> =
+                        std::collections::HashMap::new();
                     for (key, val_bytes) in existing {
                         if let Some(mut obj) = storage_bytes_to_doc(&val_bytes) {
                             Self::strip_internal_fields(&mut obj);
-                            if let Ok(stripped_json) = serde_json::to_string(&serde_json::Value::Object(obj)) {
+                            if let Ok(stripped_json) =
+                                serde_json::to_string(&serde_json::Value::Object(obj))
+                            {
                                 old_row_set.insert(stripped_json, key);
                             }
                         }
@@ -1571,7 +1812,8 @@ impl QueryExecutor {
                     let mut unchanged = 0;
 
                     // Track which old rows are still present
-                    let mut seen_old_jsons: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    let mut seen_old_jsons: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
 
                     for (i, row) in new_rows.iter().enumerate() {
                         let key = format!("{}{:010}", prefix, i);
@@ -1579,8 +1821,9 @@ impl QueryExecutor {
                         // Strip internal fields for comparison (same as old rows)
                         let mut stripped_row = row.clone();
                         Self::strip_internal_fields(&mut stripped_row);
-                        let json_str = serde_json::to_string(&serde_json::Value::Object(stripped_row))
-                            .map_err(|e| CoreError::Serialization(e.to_string()))?;
+                        let json_str =
+                            serde_json::to_string(&serde_json::Value::Object(stripped_row))
+                                .map_err(|e| CoreError::Serialization(e.to_string()))?;
 
                         if old_row_set.contains_key(&json_str) {
                             seen_old_jsons.insert(json_str);
@@ -1606,7 +1849,8 @@ impl QueryExecutor {
                     )))
                 } else {
                     Ok(QueryResult::Success(format!(
-                        "Materialized view '{}' refreshed (query returned no rows)", name
+                        "Materialized view '{}' refreshed (query returned no rows)",
+                        name
                     )))
                 }
             }
@@ -1614,12 +1858,15 @@ impl QueryExecutor {
                 let mut txn = self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
                 if txn.is_some() {
                     return Err(CoreError::InvalidArgument(
-                        "transaction already active (use COMMIT or ROLLBACK first)".to_string()
+                        "transaction already active (use COMMIT or ROLLBACK first)".to_string(),
                     ));
                 }
                 let txn_id = engine.begin_txn();
                 *txn = Some(txn_id);
-                Ok(QueryResult::Success(format!("Transaction started (txn_id={})", txn_id)))
+                Ok(QueryResult::Success(format!(
+                    "Transaction started (txn_id={})",
+                    txn_id
+                )))
             }
             QueryAst::Commit => {
                 let mut txn = self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
@@ -1629,7 +1876,7 @@ impl QueryExecutor {
                         Ok(QueryResult::Success("Transaction committed".to_string()))
                     }
                     None => Err(CoreError::InvalidArgument(
-                        "no active transaction to commit".to_string()
+                        "no active transaction to commit".to_string(),
                     )),
                 }
             }
@@ -1641,7 +1888,7 @@ impl QueryExecutor {
                         Ok(QueryResult::Success("Transaction rolled back".to_string()))
                     }
                     None => Err(CoreError::InvalidArgument(
-                        "no active transaction to roll back".to_string()
+                        "no active transaction to roll back".to_string(),
                     )),
                 }
             }
@@ -1674,39 +1921,57 @@ impl QueryExecutor {
             }
             QueryAst::Flush => {
                 engine.flush()?;
-                Ok(QueryResult::Success("MemTable flushed to SSTable".to_string()))
+                Ok(QueryResult::Success(
+                    "MemTable flushed to SSTable".to_string(),
+                ))
             }
             QueryAst::SystemActivate { entity, reason } => {
                 // Parse entity: "Class::pk" format
                 let (class, pk) = match entity.split_once("::") {
                     Some((c, p)) => (c, p),
-                    None => return Err(CoreError::InvalidArgument(
-                        format!("expected 'Class::pk' format, got '{}'", entity)
-                    )),
+                    None => {
+                        return Err(CoreError::InvalidArgument(format!(
+                            "expected 'Class::pk' format, got '{}'",
+                            entity
+                        )))
+                    }
                 };
                 engine.activate(class, pk, 0.5, reason)?;
                 Ok(QueryResult::Success(format!(
-                    "Activated {} (reason: {}, delta: +0.5)", entity, reason
+                    "Activated {} (reason: {}, delta: +0.5)",
+                    entity, reason
                 )))
             }
             QueryAst::CreateNamespace { name } => {
                 let namespace = onto_ontology::Namespace::new(name);
                 self.ontology_store.save_namespace(&namespace)?;
-                Ok(QueryResult::Success(format!("Namespace '{}' created", name)))
+                Ok(QueryResult::Success(format!(
+                    "Namespace '{}' created",
+                    name
+                )))
             }
             QueryAst::DropNamespace { name } => {
                 self.ontology_store.delete_namespace(name)?;
-                Ok(QueryResult::Success(format!("Namespace '{}' dropped", name)))
+                Ok(QueryResult::Success(format!(
+                    "Namespace '{}' dropped",
+                    name
+                )))
             }
             QueryAst::UseNamespace { name } => {
                 // Verify namespace exists
                 let ns = self.ontology_store.load_namespace(name)?;
                 if ns.is_none() {
-                    return Err(CoreError::InvalidArgument(format!("Namespace '{}' not found", name)));
+                    return Err(CoreError::InvalidArgument(format!(
+                        "Namespace '{}' not found",
+                        name
+                    )));
                 }
                 // Store current namespace — all subsequent EntityId will use this
                 *self.current_namespace.lock().unwrap() = name.to_string();
-                Ok(QueryResult::Success(format!("Now using namespace '{}'", name)))
+                Ok(QueryResult::Success(format!(
+                    "Now using namespace '{}'",
+                    name
+                )))
             }
             QueryAst::DropOntology { name } => {
                 // Search for the ontology across all namespaces
@@ -1717,7 +1982,9 @@ impl QueryExecutor {
                         if ontology.name == *name {
                             engine.delete(key.clone())?;
                             // Invalidate cache
-                            self.inference_cache.lock().unwrap_or_else(|e| e.into_inner())
+                            self.inference_cache
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
                                 .invalidate_ontology(&ontology.name);
                             found = true;
                             break;
@@ -1727,37 +1994,75 @@ impl QueryExecutor {
                 if found {
                     Ok(QueryResult::Success(format!("Ontology '{}' dropped", name)))
                 } else {
-                    Err(CoreError::InvalidArgument(format!("Ontology '{}' not found", name)))
+                    Err(CoreError::InvalidArgument(format!(
+                        "Ontology '{}' not found",
+                        name
+                    )))
                 }
             }
-            QueryAst::Copy { class, file_path, format } => {
+            QueryAst::Copy {
+                class,
+                file_path,
+                format,
+            } => {
                 // COPY uses direct bulk load without transaction for maximum speed
                 self.execute_copy(engine, class, file_path, *format)
             }
-            QueryAst::GraphMatch { pattern, filter, returns } => {
-                self.execute_graph_match_read(engine, pattern, filter, returns)
-            }
-            QueryAst::GraphShortestPath { from_id, to_id, max_depth } => {
-                self.execute_graph_shortest_path_read(from_id, to_id, *max_depth)
-            }
-            QueryAst::GraphTraverse { start_id, direction, edge_label, max_depth, filter } => {
-                self.execute_graph_traverse_read(start_id, *direction, edge_label.as_deref(), *max_depth, filter)
-            }
+            QueryAst::GraphMatch {
+                pattern,
+                filter,
+                returns,
+            } => self.execute_graph_match_read(engine, pattern, filter, returns),
+            QueryAst::GraphShortestPath {
+                from_id,
+                to_id,
+                max_depth,
+            } => self.execute_graph_shortest_path_read(from_id, to_id, *max_depth),
+            QueryAst::GraphTraverse {
+                start_id,
+                direction,
+                edge_label,
+                max_depth,
+                filter,
+            } => self.execute_graph_traverse_read(
+                start_id,
+                *direction,
+                edge_label.as_deref(),
+                *max_depth,
+                filter,
+            ),
             _ => {
                 // For SELECT queries, check plan cache first
                 let cached_plan = if matches!(ast, QueryAst::Select { .. }) {
                     let ast_hash = Self::hash_ast(ast);
-                    let cached = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).get(ast_hash);
+                    let cached = self
+                        .plan_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(ast_hash);
                     if cached.is_some() {
-                        self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner()).plan_cache_hits += 1;
+                        self.runtime_stats
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .plan_cache_hits += 1;
                         cached
                     } else {
                         // Plan cache miss - generate and cache plan
-                        let plan = self.planner.read().unwrap_or_else(|e| e.into_inner()).plan(ast);
+                        let plan = self
+                            .planner
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .plan(ast);
                         if let Ok(ref p) = plan {
-                            self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).insert(ast_hash, p.clone());
+                            self.plan_cache
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(ast_hash, p.clone());
                         }
-                        self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner()).plan_cache_misses += 1;
+                        self.runtime_stats
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .plan_cache_misses += 1;
                         plan.ok()
                     }
                 } else {
@@ -1772,11 +2077,16 @@ impl QueryExecutor {
                 } else {
                     // Auto-commit mode: each statement runs in its own transaction
                     let txn_id = engine.begin_txn();
-                    let result = self.execute_in_txn_with_plan(ast, engine, txn_id, cached_plan.as_ref());
+                    let result =
+                        self.execute_in_txn_with_plan(ast, engine, txn_id, cached_plan.as_ref());
                     // Commit on success, abort on error
                     match &result {
-                        Ok(_) => { engine.commit_txn(txn_id)?; }
-                        Err(_) => { let _ = engine.abort_txn(txn_id); }
+                        Ok(_) => {
+                            engine.commit_txn(txn_id)?;
+                        }
+                        Err(_) => {
+                            let _ = engine.abort_txn(txn_id);
+                        }
                     }
                     result
                 }
@@ -1803,7 +2113,10 @@ impl QueryExecutor {
                 estimated_rows: 500,
             };
         }
-        Ok(ExecutionPlan::new(node, crate::optimizer::CostEstimate::zero()))
+        Ok(ExecutionPlan::new(
+            node,
+            crate::optimizer::CostEstimate::zero(),
+        ))
     }
 
     /// Executes a query using the plan-driven execution engine.
@@ -1864,21 +2177,43 @@ impl QueryExecutor {
     }
 
     /// Recursively executes a PlanNode and returns the result rows.
-    fn execute_plan_node(&self, node: &PlanNode, engine: &LsmEngine) -> Result<Vec<Map<String, Value>>> {
+    fn execute_plan_node(
+        &self,
+        node: &PlanNode,
+        engine: &LsmEngine,
+    ) -> Result<Vec<Map<String, Value>>> {
         match node {
-            PlanNode::SeqScan { table, alias, filter, .. } => {
-                self.plan_seq_scan(engine, table, alias.as_deref(), filter, None)
-            }
-            PlanNode::IndexScan { table, alias, index_column, filter, .. } => {
-                self.plan_index_scan(engine, table, alias.as_deref(), index_column, filter)
-            }
-            PlanNode::IndexLookup { table, alias, index_column, key, .. } => {
-                self.plan_index_lookup(engine, table, alias.as_deref(), index_column, key)
-            }
-            PlanNode::VectorSearch { table, column, query_vector, top_k, filter, .. } => {
-                self.plan_vector_search(engine, table, column, query_vector, *top_k, filter)
-            }
-            PlanNode::Filter { input, predicate, .. } => {
+            PlanNode::SeqScan {
+                table,
+                alias,
+                filter,
+                ..
+            } => self.plan_seq_scan(engine, table, alias.as_deref(), filter, None),
+            PlanNode::IndexScan {
+                table,
+                alias,
+                index_column,
+                filter,
+                ..
+            } => self.plan_index_scan(engine, table, alias.as_deref(), index_column, filter),
+            PlanNode::IndexLookup {
+                table,
+                alias,
+                index_column,
+                key,
+                ..
+            } => self.plan_index_lookup(engine, table, alias.as_deref(), index_column, key),
+            PlanNode::VectorSearch {
+                table,
+                column,
+                query_vector,
+                top_k,
+                filter,
+                ..
+            } => self.plan_vector_search(engine, table, column, query_vector, *top_k, filter),
+            PlanNode::Filter {
+                input, predicate, ..
+            } => {
                 let mut rows = self.execute_plan_node(input, engine)?;
                 let filter_expr = Some(predicate.clone());
                 rows.retain(|row| self.matches_filter(engine, row, &filter_expr));
@@ -1888,7 +2223,9 @@ impl QueryExecutor {
                 // Check if there are aggregates or expressions that need all columns
                 let has_aggregates = Self::columns_have_aggregates(columns);
                 let has_expr = match columns {
-                    SelectColumns::Columns(items) => items.iter().any(|item| matches!(item, SelectItem::Expression(_))),
+                    SelectColumns::Columns(items) => items
+                        .iter()
+                        .any(|item| matches!(item, SelectItem::Expression(_))),
                     _ => false,
                 };
 
@@ -1902,7 +2239,13 @@ impl QueryExecutor {
                 // Only push column projection down when there are no aggregates/expressions
                 // (aggregates and expressions may reference columns not in the SELECT list)
                 let raw_rows = if !has_aggregates && !has_expr {
-                    if let PlanNode::SeqScan { table, alias, filter, .. } = input.as_ref() {
+                    if let PlanNode::SeqScan {
+                        table,
+                        alias,
+                        filter,
+                        ..
+                    } = input.as_ref()
+                    {
                         self.plan_seq_scan(engine, table, alias.as_deref(), filter, Some(columns))?
                     } else {
                         self.execute_plan_node(input, engine)?
@@ -1922,11 +2265,12 @@ impl QueryExecutor {
                             for item in items {
                                 match item {
                                     SelectItem::Column(col) => {
-                                        let (real_col, alias_part) = if let Some(as_pos) = col.find(" as ") {
-                                            (&col[..as_pos], Some(col[as_pos + 4..].trim()))
-                                        } else {
-                                            (col.as_str(), None)
-                                        };
+                                        let (real_col, alias_part) =
+                                            if let Some(as_pos) = col.find(" as ") {
+                                                (&col[..as_pos], Some(col[as_pos + 4..].trim()))
+                                            } else {
+                                                (col.as_str(), None)
+                                            };
                                         if let Some(val) = raw_row.get(real_col) {
                                             let name = alias_part.unwrap_or(real_col);
                                             let name = name.split('.').next_back().unwrap_or(name);
@@ -1934,7 +2278,8 @@ impl QueryExecutor {
                                         }
                                     }
                                     SelectItem::Expression(expr) => {
-                                        let val = self.evaluate_value_expr(expr, raw_row, engine)?;
+                                        let val =
+                                            self.evaluate_value_expr(expr, raw_row, engine)?;
                                         let name = Self::value_expr_default_name(expr);
                                         projected.insert(name, val);
                                     }
@@ -1946,28 +2291,46 @@ impl QueryExecutor {
                     }
                     Ok(result)
                 } else {
-                    let projected: Vec<Map<String, Value>> = raw_rows.iter()
+                    let projected: Vec<Map<String, Value>> = raw_rows
+                        .iter()
                         .map(|row| self.project_columns(row, columns))
                         .collect();
                     Ok(projected)
                 }
             }
-            PlanNode::NestedLoopJoin { left, right, join_clause, .. } => {
+            PlanNode::NestedLoopJoin {
+                left,
+                right,
+                join_clause,
+                ..
+            } => {
                 let left_rows = self.execute_plan_node(left, engine)?;
                 let right_rows = self.execute_plan_node(right, engine)?;
                 Self::execute_nested_loop_join(left_rows, right_rows, join_clause)
             }
-            PlanNode::HashJoin { left, right, join_clause, .. } => {
+            PlanNode::HashJoin {
+                left,
+                right,
+                join_clause,
+                ..
+            } => {
                 let left_rows = self.execute_plan_node(left, engine)?;
                 let right_rows = self.execute_plan_node(right, engine)?;
                 Self::execute_hash_join_rows(left_rows, right_rows, join_clause)
             }
-            PlanNode::SortMergeJoin { left, right, join_clause, .. } => {
+            PlanNode::SortMergeJoin {
+                left,
+                right,
+                join_clause,
+                ..
+            } => {
                 let left_rows = self.execute_plan_node(left, engine)?;
                 let right_rows = self.execute_plan_node(right, engine)?;
                 Self::execute_sort_merge_join_rows(left_rows, right_rows, join_clause)
             }
-            PlanNode::Sort { input, order_by, .. } => {
+            PlanNode::Sort {
+                input, order_by, ..
+            } => {
                 let mut rows = self.execute_plan_node(input, engine)?;
                 // Apply each ORDER BY column in reverse (last key has highest priority)
                 for ob in order_by.iter().rev() {
@@ -1986,7 +2349,9 @@ impl QueryExecutor {
                 // (OFFSET must be applied before LIMIT)
                 self.execute_plan_node(input, engine)
             }
-            PlanNode::Union { left, right, all, .. } => {
+            PlanNode::Union {
+                left, right, all, ..
+            } => {
                 let mut left_rows = self.execute_plan_node(left, engine)?;
                 let right_rows = self.execute_plan_node(right, engine)?;
                 left_rows.extend(right_rows);
@@ -1998,14 +2363,15 @@ impl QueryExecutor {
             PlanNode::WindowFunction { input, windows, .. } => {
                 let mut rows = self.execute_plan_node(input, engine)?;
                 // Convert PlanWindowExpr to parser::WindowExpr for execution
-                let parser_windows: Vec<crate::parser::WindowExpr> = windows.iter().map(|w| {
-                    crate::parser::WindowExpr {
+                let parser_windows: Vec<crate::parser::WindowExpr> = windows
+                    .iter()
+                    .map(|w| crate::parser::WindowExpr {
                         func: w.func.clone(),
                         arg: w.arg.clone(),
                         over: w.over.clone(),
                         alias: w.alias.clone(),
-                    }
-                }).collect();
+                    })
+                    .collect();
                 let window_refs: Vec<&crate::parser::WindowExpr> = parser_windows.iter().collect();
                 Self::execute_window_functions(&mut rows, &window_refs);
                 Ok(rows)
@@ -2037,12 +2403,17 @@ impl QueryExecutor {
                 match target {
                     ShardTarget::Single(shard) => {
                         if !router.is_local(shard) {
-                            tracing::debug!(table = table, shard = shard, "shard not local, skipping scan");
+                            tracing::debug!(
+                                table = table,
+                                shard = shard,
+                                "shard not local, skipping scan"
+                            );
                             return Ok(Vec::new());
                         }
                     }
                     ShardTarget::Multi(shards) => {
-                        let local_shards: Vec<_> = shards.into_iter().filter(|s| router.is_local(*s)).collect();
+                        let local_shards: Vec<_> =
+                            shards.into_iter().filter(|s| router.is_local(*s)).collect();
                         if local_shards.is_empty() {
                             tracing::debug!(table = table, "no local shards for multi-shard scan");
                             return Ok(Vec::new());
@@ -2058,11 +2429,15 @@ impl QueryExecutor {
 
         // Check CTE tables first
         let cte_prefix = format!("__cte_{}::", table.to_lowercase());
-        let cte_entries = engine.scan_prefix(cte_prefix.as_bytes()).unwrap_or_default();
+        let cte_entries = engine
+            .scan_prefix(cte_prefix.as_bytes())
+            .unwrap_or_default();
         if !cte_entries.is_empty() {
             let mut rows = Vec::new();
             for (_key, val_bytes) in &cte_entries {
-                if val_bytes == b"__deleted__" { continue; }
+                if val_bytes == b"__deleted__" {
+                    continue;
+                }
                 if let Some(doc) = storage_bytes_to_doc(val_bytes) {
                     rows.push(doc);
                 }
@@ -2078,7 +2453,9 @@ impl QueryExecutor {
         if !mv_entries.is_empty() {
             let mut rows = Vec::new();
             for (_key, val_bytes) in &mv_entries {
-                if val_bytes == b"__deleted__" { continue; }
+                if val_bytes == b"__deleted__" {
+                    continue;
+                }
                 if let Some(doc) = storage_bytes_to_doc(val_bytes) {
                     rows.push(doc);
                 }
@@ -2090,7 +2467,11 @@ impl QueryExecutor {
 
         // Regular table scan — expand class hierarchy via ontology reasoning
         let class_hierarchy = self.get_class_hierarchy(engine, table);
-        tracing::debug!("plan_seq_scan: table='{}', class_hierarchy={:?}", table, class_hierarchy);
+        tracing::debug!(
+            "plan_seq_scan: table='{}', class_hierarchy={:?}",
+            table,
+            class_hierarchy
+        );
 
         // Semantic optimization: narrow scan scope using __class__ filter and disjoint constraints
         let scan_classes = self.narrow_scan_scope(engine, table, filter, &class_hierarchy);
@@ -2106,13 +2487,21 @@ impl QueryExecutor {
                 for item in items {
                     match item {
                         SelectItem::Column(col) => {
-                            let real = if let Some(pos) = col.find(" as ") { &col[..pos] } else { col.as_str() };
+                            let real = if let Some(pos) = col.find(" as ") {
+                                &col[..pos]
+                            } else {
+                                col.as_str()
+                            };
                             let name = real.split('.').next_back().unwrap_or(real).to_string();
-                            if !cols.contains(&name) { cols.push(name); }
+                            if !cols.contains(&name) {
+                                cols.push(name);
+                            }
                         }
                         SelectItem::Aggregate(a) => {
                             if let Some(ref alias) = a.alias {
-                                if !cols.contains(alias) { cols.push(alias.clone()); }
+                                if !cols.contains(alias) {
+                                    cols.push(alias.clone());
+                                }
                             }
                         }
                         _ => {}
@@ -2146,9 +2535,10 @@ impl QueryExecutor {
                 }
                 // Tier 1: fast byte-level rejection (definitely doesn't match → skip)
                 if !fast_filter_cols.is_empty()
-                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
-                        continue;
-                    }
+                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols)
+                {
+                    continue;
+                }
                 // Tier 2: BinaryRow path (for binary-stored data) — no JSON parsing
                 if let Some(brow) = BinaryRow::parse(val_bytes) {
                     if !brow.class_in_hierarchy(&scan_classes) {
@@ -2160,13 +2550,26 @@ impl QueryExecutor {
                             Some(false) => continue,
                             None => {
                                 if let Some(mut doc) = brow.to_map() {
-                                    if !self.eval_filter(engine, &doc, f) { continue; }
-                                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                                    if !self.eval_filter(engine, &doc, f) {
+                                        continue;
+                                    }
+                                    doc.insert(
+                                        "__pk__".to_string(),
+                                        Value::String(String::from_utf8_lossy(key).to_string()),
+                                    );
                                     // Add shard routing info for debugging
-                                    if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                                    if let Some(router) = self
+                                        .shard_router
+                                        .read()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .as_ref()
+                                    {
                                         let pk = String::from_utf8_lossy(key);
                                         let target = router.route_key(table, pk.as_bytes());
-                                        doc.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                                        doc.insert(
+                                            "__shard__".to_string(),
+                                            Value::String(format!("{:?}", target)),
+                                        );
                                     }
                                     rows.push(doc);
                                 }
@@ -2175,31 +2578,59 @@ impl QueryExecutor {
                         }
                     }
                     if let Some(mut doc) = brow.to_map_projected(&proj_cols) {
-                        doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                        doc.insert(
+                            "__pk__".to_string(),
+                            Value::String(String::from_utf8_lossy(key).to_string()),
+                        );
                         // Add shard routing info for debugging
-                        if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                        if let Some(router) = self
+                            .shard_router
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                        {
                             let pk = String::from_utf8_lossy(key);
                             let target = router.route_key(table, pk.as_bytes());
-                            doc.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                            doc.insert(
+                                "__shard__".to_string(),
+                                Value::String(format!("{:?}", target)),
+                            );
                         }
                         rows.push(doc);
                     }
                     continue;
                 }
                 // Tier 3: JSON fallback (legacy data stored as JSON)
-                if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
-                    if !scan_classes.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                if let Ok(serde_json::Value::Object(mut doc)) =
+                    serde_json::from_slice::<serde_json::Value>(val_bytes)
+                {
+                    if !scan_classes
+                        .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                    {
                         continue;
                     }
                     if let Some(f) = filter {
-                        if !self.eval_filter(engine, &doc, f) { continue; }
+                        if !self.eval_filter(engine, &doc, f) {
+                            continue;
+                        }
                     }
-                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                    doc.insert(
+                        "__pk__".to_string(),
+                        Value::String(String::from_utf8_lossy(key).to_string()),
+                    );
                     // Add shard routing info for debugging
-                    if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    if let Some(router) = self
+                        .shard_router
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
                         let pk = String::from_utf8_lossy(key);
                         let target = router.route_key(table, pk.as_bytes());
-                        doc.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                        doc.insert(
+                            "__shard__".to_string(),
+                            Value::String(format!("{:?}", target)),
+                        );
                     }
                     rows.push(doc);
                 }
@@ -2258,7 +2689,10 @@ impl QueryExecutor {
                             // BinaryRow filter evaluation
                             if let Some(true) = eval_binary_filter(&brow, f) {
                                 if let Some(mut doc) = brow.to_map() {
-                                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(pk).to_string()));
+                                    doc.insert(
+                                        "__pk__".to_string(),
+                                        Value::String(String::from_utf8_lossy(pk).to_string()),
+                                    );
                                     rows.push(doc);
                                 }
                                 continue;
@@ -2266,12 +2700,16 @@ impl QueryExecutor {
                         }
                         // Fallback: full Map parsing
                         if let Some(mut doc) = simd_parse_row(&val_bytes) {
-                            if doc.get("__class__")
+                            if doc
+                                .get("__class__")
                                 .and_then(|v| v.as_str())
                                 .map(|c| class_hierarchy.contains(c))
                                 .unwrap_or(false)
                             {
-                                doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(pk).to_string()));
+                                doc.insert(
+                                    "__pk__".to_string(),
+                                    Value::String(String::from_utf8_lossy(pk).to_string()),
+                                );
                                 rows.push(doc);
                             }
                         }
@@ -2300,8 +2738,13 @@ impl QueryExecutor {
         if engine.has_index(table, index_column) {
             let json_val = Self::literal_to_json_static(key);
             let pkeys = {
-                let index_mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
-                index_mgr.lookup_eq_read(table, index_column, &json_val).unwrap_or_default()
+                let index_mgr = engine
+                    .index_manager()
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                index_mgr
+                    .lookup_eq_read(table, index_column, &json_val)
+                    .unwrap_or_default()
             };
             let mut rows = Self::fetch_rows_by_pks(engine, &pkeys)?;
             if let Some(a) = alias {
@@ -2330,16 +2773,16 @@ impl QueryExecutor {
             // Adaptive filtering: choose between pre-filter and post-filter
             // based on estimated selectivity
             let class_hierarchy = self.get_class_hierarchy(engine, table);
-            
+
             // Estimate filter selectivity from statistics
             let stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
             let row_count = stats.table_row_counts.get(table).copied().unwrap_or(1000);
             drop(stats);
-            
+
             // Heuristic: if we expect few matches (< 10% of rows), use pre-filter
             // Otherwise, use post-filter (vector search first, then filter)
             let use_prefilter = self.should_use_prefilter(engine, table, f, row_count);
-            
+
             if use_prefilter {
                 // Pre-filter: scan documents first, then search with allowed IDs
                 let mut allowed_ids = HashSet::new();
@@ -2348,42 +2791,55 @@ impl QueryExecutor {
                     let entries = engine.scan_prefix(prefix.as_bytes())?;
                     for (key, val_bytes) in &entries {
                         if let Some(ref doc) = storage_bytes_to_doc(val_bytes) {
-                            if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
-                                && self.eval_filter(engine, doc, f) {
-                                    allowed_ids.insert(key.clone());
-                                }
+                            if class_hierarchy.contains(
+                                doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""),
+                            ) && self.eval_filter(engine, doc, f)
+                            {
+                                allowed_ids.insert(key.clone());
+                            }
                         }
                     }
                 }
-                engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner())
+                engine
+                    .vector_index_manager()
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
                     .search_filtered(table, column, query_vector, top_k, &allowed_ids)?
             } else {
                 // Post-filter: vector search first, then filter results
                 // Search for more candidates to account for filtering
                 let expanded_top_k = top_k * 3; // Get 3x more candidates
-                let candidates = engine.vector_index_manager().read()
+                let candidates = engine
+                    .vector_index_manager()
+                    .read()
                     .unwrap_or_else(|e| e.into_inner())
                     .search(table, column, query_vector, expanded_top_k)?;
-                
+
                 // Filter candidates
                 let mut filtered = Vec::new();
                 for result in candidates {
                     if let Ok(Some(val_bytes)) = engine.get(&result.entry.id) {
                         if let Some(ref doc) = storage_bytes_to_doc(&val_bytes) {
-                            if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
-                                && self.eval_filter(engine, doc, f) {
-                                    filtered.push(result);
-                                    if filtered.len() >= top_k {
-                                        break;
-                                    }
+                            if class_hierarchy.contains(
+                                doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""),
+                            ) && self.eval_filter(engine, doc, f)
+                            {
+                                filtered.push(result);
+                                if filtered.len() >= top_k {
+                                    break;
                                 }
+                            }
                         }
                     }
                 }
                 filtered
             }
         } else {
-            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search(table, column, query_vector, top_k)?
+            engine
+                .vector_index_manager()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .search(table, column, query_vector, top_k)?
         };
 
         let mut rows = Vec::new();
@@ -2557,7 +3013,9 @@ impl QueryExecutor {
                     for right_row in matching_rights {
                         matched = true;
                         // Track matched right row index
-                        if let Some(idx) = right_rows.iter().position(|r| std::ptr::eq(r, *right_row)) {
+                        if let Some(idx) =
+                            right_rows.iter().position(|r| std::ptr::eq(r, *right_row))
+                        {
                             matched_right.insert(idx);
                         }
                         let mut merged = Map::new();
@@ -2659,20 +3117,30 @@ impl QueryExecutor {
                 std::cmp::Ordering::Equal => {
                     // Handle duplicate keys
                     while ri < right_rows.len() {
-                        let rv2 = Self::resolve_column_value(&right_rows[ri], &right_col).unwrap_or_default();
-                        if Self::compare_values(&rv2, &rv) != std::cmp::Ordering::Equal { break; }
+                        let rv2 = Self::resolve_column_value(&right_rows[ri], &right_col)
+                            .unwrap_or_default();
+                        if Self::compare_values(&rv2, &rv) != std::cmp::Ordering::Equal {
+                            break;
+                        }
                         let mut li2 = li;
                         while li2 < left_rows.len() {
-                            let lv2 = Self::resolve_column_value(&left_rows[li2], &left_col).unwrap_or_default();
-                            if Self::compare_values(&lv2, &lv) != std::cmp::Ordering::Equal { break; }
+                            let lv2 = Self::resolve_column_value(&left_rows[li2], &left_col)
+                                .unwrap_or_default();
+                            if Self::compare_values(&lv2, &lv) != std::cmp::Ordering::Equal {
+                                break;
+                            }
                             matched_left.insert(li2);
                             matched_right.insert(ri);
                             let mut merged = Map::new();
-                            for (k, v) in &left_rows[li2] { merged.insert(k.clone(), v.clone()); }
+                            for (k, v) in &left_rows[li2] {
+                                merged.insert(k.clone(), v.clone());
+                            }
                             for (k, v) in &right_rows[ri] {
                                 let key = format!("{}.{}", right_alias, k);
                                 merged.insert(key, v.clone());
-                                if !merged.contains_key(k) { merged.insert(k.clone(), v.clone()); }
+                                if !merged.contains_key(k) {
+                                    merged.insert(k.clone(), v.clone());
+                                }
                             }
                             result.push(merged);
                             li2 += 1;
@@ -2680,8 +3148,11 @@ impl QueryExecutor {
                         ri += 1;
                     }
                     while li < left_rows.len() {
-                        let lv2 = Self::resolve_column_value(&left_rows[li], &left_col).unwrap_or_default();
-                        if Self::compare_values(&lv2, &lv) != std::cmp::Ordering::Equal { break; }
+                        let lv2 = Self::resolve_column_value(&left_rows[li], &left_col)
+                            .unwrap_or_default();
+                        if Self::compare_values(&lv2, &lv) != std::cmp::Ordering::Equal {
+                            break;
+                        }
                         li += 1;
                     }
                 }
@@ -2746,7 +3217,10 @@ impl QueryExecutor {
     fn get_class_hierarchy(&self, engine: &LsmEngine, table: &str) -> HashSet<String> {
         // Check cache first
         {
-            let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .inference_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.class_hierarchy.get(table) {
                 return cached.clone();
             }
@@ -2774,8 +3248,13 @@ impl QueryExecutor {
 
         // Cache the result
         {
-            let mut cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
-            cache.class_hierarchy.insert(table.to_string(), classes.clone());
+            let mut cache = self
+                .inference_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            cache
+                .class_hierarchy
+                .insert(table.to_string(), classes.clone());
         }
 
         classes
@@ -2803,7 +3282,9 @@ impl QueryExecutor {
             let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
             for (_key, val_bytes) in &entries {
                 if let Some(doc) = simd_parse_row(val_bytes) {
-                    if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                    if class_hierarchy
+                        .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                    {
                         row_count += 1;
                     }
                 }
@@ -2826,7 +3307,10 @@ impl QueryExecutor {
             vector_indexes: Vec::new(),
             histograms: Vec::new(),
         };
-        self.planner.write().unwrap_or_else(|e| e.into_inner()).update_stats(table.to_string(), planner_stats);
+        self.planner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .update_stats(table.to_string(), planner_stats);
     }
 
     /// Returns the cached merged ontology, or builds and caches it.
@@ -2834,7 +3318,10 @@ impl QueryExecutor {
     fn get_merged_ontology(&self, engine: &LsmEngine) -> onto_ontology::Ontology {
         // Check cache first
         {
-            let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .inference_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(ref cached) = cache.merged_ontology {
                 return cached.clone();
             }
@@ -2861,17 +3348,25 @@ impl QueryExecutor {
 
         // Cache inverse property mappings
         {
-            let mut cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self
+                .inference_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for (name, prop) in &merged.properties {
                 if !cache.inverse_property.contains_key(name) {
-                    cache.inverse_property.insert(name.clone(), prop.inverse_of.clone());
+                    cache
+                        .inverse_property
+                        .insert(name.clone(), prop.inverse_of.clone());
                 }
             }
             // Cache class properties for fast lookup
             for class_name in merged.classes.keys() {
                 if !cache.class_properties.contains_key(class_name) {
-                    let props: Vec<String> = merged.get_class_properties(class_name)
-                        .iter().map(|p| p.name.clone()).collect();
+                    let props: Vec<String> = merged
+                        .get_class_properties(class_name)
+                        .iter()
+                        .map(|p| p.name.clone())
+                        .collect();
                     cache.class_properties.insert(class_name.clone(), props);
                 }
             }
@@ -2930,7 +3425,10 @@ impl QueryExecutor {
         }
 
         // Intersect with the original hierarchy (only scan classes that are in scope)
-        let in_scope: HashSet<String> = scan_classes.intersection(class_hierarchy).cloned().collect();
+        let in_scope: HashSet<String> = scan_classes
+            .intersection(class_hierarchy)
+            .cloned()
+            .collect();
 
         // Exclude disjoint classes for each targeted class
         let mut excluded = HashSet::new();
@@ -2990,7 +3488,11 @@ impl QueryExecutor {
     /// Only executes the query for read-only queries (SELECT, etc.).
     /// DML queries (INSERT/UPDATE/DELETE) return the plan without execution.
     fn execute_explain(&self, query: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
-        let plan = self.planner.read().unwrap_or_else(|e| e.into_inner()).plan(query)?;
+        let plan = self
+            .planner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .plan(query)?;
         let description = plan.describe();
 
         // Only execute for read-only queries; DML should not be executed in EXPLAIN
@@ -3022,16 +3524,21 @@ impl QueryExecutor {
             "description": description,
         });
 
-        Ok(QueryResult::Rows(vec![Map::from_iter(vec![
-            ("plan".to_string(), plan_json),
-        ])]))
+        Ok(QueryResult::Rows(vec![Map::from_iter(vec![(
+            "plan".to_string(),
+            plan_json,
+        )])]))
     }
 
     /// Executes EXPLAIN REASONING: shows ontology reasoning derivation chain.
     ///
     /// For a MATCH or SELECT query, shows which inference rules were applied
     /// and what facts were derived.
-    fn execute_explain_reasoning(&self, query: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
+    fn execute_explain_reasoning(
+        &self,
+        query: &QueryAst,
+        engine: &LsmEngine,
+    ) -> Result<QueryResult> {
         // First, collect all facts from the relevant classes
         let facts = self.collect_facts_for_reasoning(query, engine)?;
 
@@ -3044,15 +3551,21 @@ impl QueryExecutor {
 
         let Some(class) = class_name else {
             return Err(CoreError::InvalidArgument(
-                "EXPLAIN REASONING requires a MATCH or SELECT query".to_string()
+                "EXPLAIN REASONING requires a MATCH or SELECT query".to_string(),
             ));
         };
 
-        let ontology = match self.ontology_store.find_ontology_for_class_global(engine, class)? {
+        let ontology = match self
+            .ontology_store
+            .find_ontology_for_class_global(engine, class)?
+        {
             Some(o) => o,
-            None => return Ok(QueryResult::Rows(vec![Map::from_iter(vec![
-                ("info".to_string(), Value::String("No ontology found for this class".to_string())),
-            ])])),
+            None => {
+                return Ok(QueryResult::Rows(vec![Map::from_iter(vec![(
+                    "info".to_string(),
+                    Value::String("No ontology found for this class".to_string()),
+                )])]))
+            }
         };
 
         // Run reasoning
@@ -3066,15 +3579,34 @@ impl QueryExecutor {
         let mut summary = Map::new();
         summary.insert("type".to_string(), Value::String("summary".to_string()));
         summary.insert("ontology".to_string(), Value::String(ontology.name.clone()));
-        summary.insert("original_facts".to_string(), Value::Number(serde_json::Number::from(facts.len())));
-        summary.insert("inferred_facts".to_string(), Value::Number(serde_json::Number::from(result.inferred.len())));
-        summary.insert("total_facts".to_string(), Value::Number(serde_json::Number::from(result.all_facts.len())));
-        summary.insert("iterations".to_string(), Value::Number(serde_json::Number::from(result.iterations)));
+        summary.insert(
+            "original_facts".to_string(),
+            Value::Number(serde_json::Number::from(facts.len())),
+        );
+        summary.insert(
+            "inferred_facts".to_string(),
+            Value::Number(serde_json::Number::from(result.inferred.len())),
+        );
+        summary.insert(
+            "total_facts".to_string(),
+            Value::Number(serde_json::Number::from(result.all_facts.len())),
+        );
+        summary.insert(
+            "iterations".to_string(),
+            Value::Number(serde_json::Number::from(result.iterations)),
+        );
 
         // Rule counts
-        let rule_counts: Map<String, Value> = result.rule_counts.iter().map(|(rule, count)| {
-            (format!("{:?}", rule), Value::Number(serde_json::Number::from(*count)))
-        }).collect();
+        let rule_counts: Map<String, Value> = result
+            .rule_counts
+            .iter()
+            .map(|(rule, count)| {
+                (
+                    format!("{:?}", rule),
+                    Value::Number(serde_json::Number::from(*count)),
+                )
+            })
+            .collect();
         summary.insert("rule_counts".to_string(), Value::Object(rule_counts));
         rows.push(summary);
 
@@ -3083,16 +3615,26 @@ impl QueryExecutor {
             let mut row = Map::new();
             row.insert("type".to_string(), Value::String("inferred".to_string()));
             row.insert("subject".to_string(), Value::String(fact.subject.clone()));
-            row.insert("predicate".to_string(), Value::String(fact.predicate.clone()));
+            row.insert(
+                "predicate".to_string(),
+                Value::String(fact.predicate.clone()),
+            );
             row.insert("object".to_string(), Value::String(fact.object.clone()));
 
             // Find which rule produced this fact
             let steps = reasoner.explain(&facts, fact);
             if let Some(step) = steps.first() {
-                row.insert("rule".to_string(), Value::String(format!("{:?}", step.rule)));
-                let premises: Vec<Value> = step.premises.iter().map(|p| {
-                    Value::String(format!("({}, {}, {})", p.subject, p.predicate, p.object))
-                }).collect();
+                row.insert(
+                    "rule".to_string(),
+                    Value::String(format!("{:?}", step.rule)),
+                );
+                let premises: Vec<Value> = step
+                    .premises
+                    .iter()
+                    .map(|p| {
+                        Value::String(format!("({}, {}, {})", p.subject, p.predicate, p.object))
+                    })
+                    .collect();
                 row.insert("premises".to_string(), Value::Array(premises));
             }
             rows.push(row);
@@ -3110,7 +3652,11 @@ impl QueryExecutor {
     }
 
     /// Collects all relevant facts (triples) for reasoning from the database.
-    fn collect_facts_for_reasoning(&self, query: &QueryAst, engine: &LsmEngine) -> Result<Vec<onto_ontology::Triple>> {
+    fn collect_facts_for_reasoning(
+        &self,
+        query: &QueryAst,
+        engine: &LsmEngine,
+    ) -> Result<Vec<onto_ontology::Triple>> {
         let class_name = match query {
             QueryAst::Match { class, .. } => class.as_str(),
             QueryAst::Select { from, .. } => from.as_str(),
@@ -3131,7 +3677,9 @@ impl QueryExecutor {
         }
 
         // Collect property facts
-        let ontology = self.ontology_store.find_ontology_for_class_global(engine, class_name)?;
+        let ontology = self
+            .ontology_store
+            .find_ontology_for_class_global(engine, class_name)?;
         if let Some(onto) = ontology {
             for scan_class in &class_hierarchy {
                 let prefix = format!("{}::", scan_class);
@@ -3141,13 +3689,17 @@ impl QueryExecutor {
                     if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
                         if let Some(obj) = doc.as_object() {
                             for (prop_name, prop_def) in &onto.properties {
-                                if prop_def.domain == *scan_class || class_hierarchy.contains(&prop_def.domain) {
+                                if prop_def.domain == *scan_class
+                                    || class_hierarchy.contains(&prop_def.domain)
+                                {
                                     if let Some(val) = obj.get(prop_name) {
                                         let val_str = match val {
                                             serde_json::Value::String(s) => s.clone(),
                                             other => other.to_string(),
                                         };
-                                        facts.push(onto_ontology::Triple::new(&pk, prop_name, &val_str));
+                                        facts.push(onto_ontology::Triple::new(
+                                            &pk, prop_name, &val_str,
+                                        ));
                                     }
                                 }
                             }
@@ -3166,7 +3718,8 @@ impl QueryExecutor {
     fn execute_analyze(&self, table: &str, engine: &LsmEngine) -> Result<QueryResult> {
         let class_hierarchy = self.get_class_hierarchy(engine, table);
         let mut row_count = 0u64;
-        let mut column_stats: std::collections::HashMap<String, ColumnStats> = std::collections::HashMap::new();
+        let mut column_stats: std::collections::HashMap<String, ColumnStats> =
+            std::collections::HashMap::new();
 
         for scan_class in &class_hierarchy {
             let prefix = format!("{}::", scan_class);
@@ -3174,10 +3727,14 @@ impl QueryExecutor {
 
             for (_key, val_bytes) in &entries {
                 if let Some(doc) = simd_parse_row(val_bytes) {
-                    if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                    if class_hierarchy
+                        .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                    {
                         row_count += 1;
                         for (col_name, col_value) in &doc {
-                            if col_name == "__class__" { continue; }
+                            if col_name == "__class__" {
+                                continue;
+                            }
                             let stats = column_stats.entry(col_name.clone()).or_default();
                             stats.non_null_count += 1;
                             // Track distinct values (sample up to 1000)
@@ -3210,12 +3767,14 @@ impl QueryExecutor {
         // Build secondary index stats for columns with indexes
         for (col_name, col_stats) in &column_stats {
             if engine.has_index(table, col_name) {
-                planner_stats.secondary_indexes.push(crate::optimizer::cost::IndexStats {
-                    column: col_name.clone(),
-                    cardinality: col_stats.distinct_values.len() as u64,
-                    is_sorted: true,
-                    tree_height: 3,
-                });
+                planner_stats
+                    .secondary_indexes
+                    .push(crate::optimizer::cost::IndexStats {
+                        column: col_name.clone(),
+                        cardinality: col_stats.distinct_values.len() as u64,
+                        is_sorted: true,
+                        tree_height: 3,
+                    });
             }
         }
 
@@ -3226,27 +3785,45 @@ impl QueryExecutor {
         }
 
         // Update planner statistics for future query optimization
-        self.planner.write().unwrap_or_else(|e| e.into_inner()).update_stats(table.to_string(), planner_stats.clone());
+        self.planner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .update_stats(table.to_string(), planner_stats.clone());
 
         let mut result_rows = Vec::new();
         let mut summary = Map::new();
         summary.insert("table".to_string(), Value::String(table.to_string()));
-        summary.insert("row_count".to_string(), Value::Number(serde_json::Number::from(row_count)));
+        summary.insert(
+            "row_count".to_string(),
+            Value::Number(serde_json::Number::from(row_count)),
+        );
         result_rows.push(summary);
 
         for (col_name, col_stats) in &column_stats {
             let mut col_row = Map::new();
             col_row.insert("column".to_string(), Value::String(col_name.clone()));
-            col_row.insert("non_null_count".to_string(), Value::Number(serde_json::Number::from(col_stats.non_null_count)));
-            col_row.insert("distinct_count".to_string(), Value::Number(serde_json::Number::from(col_stats.distinct_values.len() as u64)));
+            col_row.insert(
+                "non_null_count".to_string(),
+                Value::Number(serde_json::Number::from(col_stats.non_null_count)),
+            );
+            col_row.insert(
+                "distinct_count".to_string(),
+                Value::Number(serde_json::Number::from(
+                    col_stats.distinct_values.len() as u64
+                )),
+            );
             let selectivity = if col_stats.non_null_count > 0 {
                 col_stats.distinct_values.len() as f64 / col_stats.non_null_count as f64
             } else {
                 0.0
             };
-            col_row.insert("selectivity".to_string(), Value::Number(
-                serde_json::Number::from_f64(selectivity).unwrap_or(serde_json::Number::from(0))
-            ));
+            col_row.insert(
+                "selectivity".to_string(),
+                Value::Number(
+                    serde_json::Number::from_f64(selectivity)
+                        .unwrap_or(serde_json::Number::from(0)),
+                ),
+            );
             result_rows.push(col_row);
         }
 
@@ -3257,7 +3834,11 @@ impl QueryExecutor {
 
     /// Read-only EXPLAIN: generates execution plan, runs inner query via read path.
     fn execute_explain_read(&self, query: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
-        let plan = self.planner.read().unwrap_or_else(|e| e.into_inner()).plan(query)?;
+        let plan = self
+            .planner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .plan(query)?;
         let description = plan.describe();
 
         let start = std::time::Instant::now();
@@ -3285,9 +3866,10 @@ impl QueryExecutor {
             "description": description,
         });
 
-        Ok(QueryResult::Rows(vec![Map::from_iter(vec![
-            ("plan".to_string(), plan_json),
-        ])]))
+        Ok(QueryResult::Rows(vec![Map::from_iter(vec![(
+            "plan".to_string(),
+            plan_json,
+        )])]))
     }
 
     /// Executes system.* virtual table queries (DBA views for live data).
@@ -3296,7 +3878,10 @@ impl QueryExecutor {
             "system.data_temperature" => self.view_data_temperature(engine),
             "system.value_events" => self.view_value_events(engine),
             "system.value_decay_prediction" => self.view_value_decay_prediction(engine),
-            _ => Err(CoreError::InvalidArgument(format!("unknown system view: {}", view))),
+            _ => Err(CoreError::InvalidArgument(format!(
+                "unknown system view: {}",
+                view
+            ))),
         }
     }
 
@@ -3329,20 +3914,47 @@ impl QueryExecutor {
         let mut rows = Vec::new();
         let mut row = Map::new();
         row.insert("tier".to_string(), Value::String("hot (>0.8)".to_string()));
-        row.insert("row_count".to_string(), Value::Number(serde_json::Number::from(hot)));
-        if hot > 0 { row.insert("avg_score".to_string(), Value::Number(serde_json::Number::from_f64(hot_sum / hot as f64).unwrap())); }
+        row.insert(
+            "row_count".to_string(),
+            Value::Number(serde_json::Number::from(hot)),
+        );
+        if hot > 0 {
+            row.insert(
+                "avg_score".to_string(),
+                Value::Number(serde_json::Number::from_f64(hot_sum / hot as f64).unwrap()),
+            );
+        }
         rows.push(row);
 
         let mut row = Map::new();
-        row.insert("tier".to_string(), Value::String("warm (0.4-0.8)".to_string()));
-        row.insert("row_count".to_string(), Value::Number(serde_json::Number::from(warm)));
-        if warm > 0 { row.insert("avg_score".to_string(), Value::Number(serde_json::Number::from_f64(warm_sum / warm as f64).unwrap())); }
+        row.insert(
+            "tier".to_string(),
+            Value::String("warm (0.4-0.8)".to_string()),
+        );
+        row.insert(
+            "row_count".to_string(),
+            Value::Number(serde_json::Number::from(warm)),
+        );
+        if warm > 0 {
+            row.insert(
+                "avg_score".to_string(),
+                Value::Number(serde_json::Number::from_f64(warm_sum / warm as f64).unwrap()),
+            );
+        }
         rows.push(row);
 
         let mut row = Map::new();
         row.insert("tier".to_string(), Value::String("cold (<0.4)".to_string()));
-        row.insert("row_count".to_string(), Value::Number(serde_json::Number::from(cold)));
-        if cold > 0 { row.insert("avg_score".to_string(), Value::Number(serde_json::Number::from_f64(cold_sum / cold as f64).unwrap())); }
+        row.insert(
+            "row_count".to_string(),
+            Value::Number(serde_json::Number::from(cold)),
+        );
+        if cold > 0 {
+            row.insert(
+                "avg_score".to_string(),
+                Value::Number(serde_json::Number::from_f64(cold_sum / cold as f64).unwrap()),
+            );
+        }
         rows.push(row);
 
         Ok(QueryResult::Rows(rows))
@@ -3390,10 +4002,25 @@ impl QueryExecutor {
                     };
 
                     let mut row = Map::new();
-                    row.insert("entity".to_string(), Value::String(format!("{}::{}", class, pk)));
-                    row.insert("cur_score".to_string(), Value::Number(serde_json::Number::from_f64((cur_score * 1000.0).round() / 1000.0).unwrap()));
-                    row.insert("lambda".to_string(), Value::Number(serde_json::Number::from_f64(meta.lambda).unwrap()));
-                    row.insert("predicted_cold_at".to_string(), Value::Number(serde_json::Number::from(predicted_cold_at)));
+                    row.insert(
+                        "entity".to_string(),
+                        Value::String(format!("{}::{}", class, pk)),
+                    );
+                    row.insert(
+                        "cur_score".to_string(),
+                        Value::Number(
+                            serde_json::Number::from_f64((cur_score * 1000.0).round() / 1000.0)
+                                .unwrap(),
+                        ),
+                    );
+                    row.insert(
+                        "lambda".to_string(),
+                        Value::Number(serde_json::Number::from_f64(meta.lambda).unwrap()),
+                    );
+                    row.insert(
+                        "predicted_cold_at".to_string(),
+                        Value::Number(serde_json::Number::from(predicted_cold_at)),
+                    );
                     rows.push(row);
                 }
             }
@@ -3406,17 +4033,22 @@ impl QueryExecutor {
     fn execute_analyze_read(&self, table: &str, engine: &LsmEngine) -> Result<QueryResult> {
         let class_hierarchy = self.get_class_hierarchy_read(engine, table);
         let mut row_count = 0u64;
-        let mut column_stats: std::collections::HashMap<String, ColumnStats> = std::collections::HashMap::new();
+        let mut column_stats: std::collections::HashMap<String, ColumnStats> =
+            std::collections::HashMap::new();
 
         for scan_class in &class_hierarchy {
             let prefix = format!("{}::", scan_class);
             let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
             for (_key, val_bytes) in &entries {
                 if let Some(doc) = simd_parse_row(val_bytes) {
-                    if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                    if class_hierarchy
+                        .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                    {
                         row_count += 1;
                         for (col_name, col_value) in &doc {
-                            if col_name == "__class__" { continue; }
+                            if col_name == "__class__" {
+                                continue;
+                            }
                             let stats = column_stats.entry(col_name.clone()).or_default();
                             stats.non_null_count += 1;
                             if stats.distinct_values.len() < 1000 {
@@ -3446,12 +4078,14 @@ impl QueryExecutor {
 
         for (col_name, col_stats) in &column_stats {
             if engine.has_index(table, col_name) {
-                planner_stats.secondary_indexes.push(crate::optimizer::cost::IndexStats {
-                    column: col_name.clone(),
-                    cardinality: col_stats.distinct_values.len() as u64,
-                    is_sorted: true,
-                    tree_height: 3,
-                });
+                planner_stats
+                    .secondary_indexes
+                    .push(crate::optimizer::cost::IndexStats {
+                        column: col_name.clone(),
+                        cardinality: col_stats.distinct_values.len() as u64,
+                        is_sorted: true,
+                        tree_height: 3,
+                    });
             }
         }
 
@@ -3459,27 +4093,45 @@ impl QueryExecutor {
             let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
             stats.table_row_counts.insert(table.to_string(), row_count);
         }
-        self.planner.write().unwrap_or_else(|e| e.into_inner()).update_stats(table.to_string(), planner_stats.clone());
+        self.planner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .update_stats(table.to_string(), planner_stats.clone());
 
         let mut result_rows = Vec::new();
         let mut summary = Map::new();
         summary.insert("table".to_string(), Value::String(table.to_string()));
-        summary.insert("row_count".to_string(), Value::Number(serde_json::Number::from(row_count)));
+        summary.insert(
+            "row_count".to_string(),
+            Value::Number(serde_json::Number::from(row_count)),
+        );
         result_rows.push(summary);
 
         for (col_name, col_stats) in &column_stats {
             let mut col_row = Map::new();
             col_row.insert("column".to_string(), Value::String(col_name.clone()));
-            col_row.insert("non_null_count".to_string(), Value::Number(serde_json::Number::from(col_stats.non_null_count)));
-            col_row.insert("distinct_count".to_string(), Value::Number(serde_json::Number::from(col_stats.distinct_values.len() as u64)));
+            col_row.insert(
+                "non_null_count".to_string(),
+                Value::Number(serde_json::Number::from(col_stats.non_null_count)),
+            );
+            col_row.insert(
+                "distinct_count".to_string(),
+                Value::Number(serde_json::Number::from(
+                    col_stats.distinct_values.len() as u64
+                )),
+            );
             let selectivity = if col_stats.non_null_count > 0 {
                 col_stats.distinct_values.len() as f64 / col_stats.non_null_count as f64
             } else {
                 0.0
             };
-            col_row.insert("selectivity".to_string(), Value::Number(
-                serde_json::Number::from_f64(selectivity).unwrap_or(serde_json::Number::from(0))
-            ));
+            col_row.insert(
+                "selectivity".to_string(),
+                Value::Number(
+                    serde_json::Number::from_f64(selectivity)
+                        .unwrap_or(serde_json::Number::from(0)),
+                ),
+            );
             result_rows.push(col_row);
         }
 
@@ -3500,10 +4152,14 @@ impl QueryExecutor {
                     row_count += 1;
                     if let Some(doc) = simd_parse_row(val_bytes) {
                         for (col_name, col_val) in &doc {
-                            if col_name.starts_with("__") { continue; }
-                            let stats = column_stats.entry(col_name.clone()).or_insert_with(|| ColumnStats {
-                                non_null_count: 0,
-                                distinct_values: HashSet::new(),
+                            if col_name.starts_with("__") {
+                                continue;
+                            }
+                            let stats = column_stats.entry(col_name.clone()).or_insert_with(|| {
+                                ColumnStats {
+                                    non_null_count: 0,
+                                    distinct_values: HashSet::new(),
+                                }
                             });
                             stats.non_null_count += 1;
                             let val_str = match col_val {
@@ -3529,16 +4185,21 @@ impl QueryExecutor {
 
         for (col_name, col_stats) in &column_stats {
             if engine.has_index(table, col_name) {
-                planner_stats.secondary_indexes.push(crate::optimizer::cost::IndexStats {
-                    column: col_name.clone(),
-                    cardinality: col_stats.distinct_values.len() as u64,
-                    is_sorted: true,
-                    tree_height: 3,
-                });
+                planner_stats
+                    .secondary_indexes
+                    .push(crate::optimizer::cost::IndexStats {
+                        column: col_name.clone(),
+                        cardinality: col_stats.distinct_values.len() as u64,
+                        is_sorted: true,
+                        tree_height: 3,
+                    });
             }
         }
 
-        self.planner.write().unwrap_or_else(|e| e.into_inner()).update_stats(table.to_string(), planner_stats);
+        self.planner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .update_stats(table.to_string(), planner_stats);
     }
 
     /// Read-only plan execution with &LsmEngine.
@@ -3549,21 +4210,43 @@ impl QueryExecutor {
     }
 
     /// Read-only plan node execution with &LsmEngine.
-    fn execute_plan_node_read(&self, node: &PlanNode, engine: &LsmEngine) -> Result<Vec<Map<String, Value>>> {
+    fn execute_plan_node_read(
+        &self,
+        node: &PlanNode,
+        engine: &LsmEngine,
+    ) -> Result<Vec<Map<String, Value>>> {
         match node {
-            PlanNode::SeqScan { table, alias, filter, .. } => {
-                self.plan_seq_scan_read(engine, table, alias.as_deref(), filter, None)
-            }
-            PlanNode::IndexScan { table, alias, index_column, filter, .. } => {
-                self.plan_index_scan_read(engine, table, alias.as_deref(), index_column, filter)
-            }
-            PlanNode::IndexLookup { table, alias, index_column, key, .. } => {
-                self.plan_index_lookup_read(engine, table, alias.as_deref(), index_column, key)
-            }
-            PlanNode::VectorSearch { table, column, query_vector, top_k, filter, .. } => {
-                self.plan_vector_search_read(engine, table, column, query_vector, *top_k, filter)
-            }
-            PlanNode::Filter { input, predicate, .. } => {
+            PlanNode::SeqScan {
+                table,
+                alias,
+                filter,
+                ..
+            } => self.plan_seq_scan_read(engine, table, alias.as_deref(), filter, None),
+            PlanNode::IndexScan {
+                table,
+                alias,
+                index_column,
+                filter,
+                ..
+            } => self.plan_index_scan_read(engine, table, alias.as_deref(), index_column, filter),
+            PlanNode::IndexLookup {
+                table,
+                alias,
+                index_column,
+                key,
+                ..
+            } => self.plan_index_lookup_read(engine, table, alias.as_deref(), index_column, key),
+            PlanNode::VectorSearch {
+                table,
+                column,
+                query_vector,
+                top_k,
+                filter,
+                ..
+            } => self.plan_vector_search_read(engine, table, column, query_vector, *top_k, filter),
+            PlanNode::Filter {
+                input, predicate, ..
+            } => {
                 let mut rows = self.execute_plan_node_read(input, engine)?;
                 rows.retain(|row| self.eval_filter_read(engine, row, predicate));
                 Ok(rows)
@@ -3571,7 +4254,9 @@ impl QueryExecutor {
             PlanNode::Projection { input, columns, .. } => {
                 let has_aggregates = Self::columns_have_aggregates(columns);
                 let has_expr = match columns {
-                    SelectColumns::Columns(items) => items.iter().any(|item| matches!(item, SelectItem::Expression(_))),
+                    SelectColumns::Columns(items) => items
+                        .iter()
+                        .any(|item| matches!(item, SelectItem::Expression(_))),
                     _ => false,
                 };
 
@@ -3584,8 +4269,20 @@ impl QueryExecutor {
 
                 // Only push column projection down when there are no aggregates/expressions
                 let raw_rows = if !has_aggregates && !has_expr {
-                    if let PlanNode::SeqScan { table, alias, filter, .. } = input.as_ref() {
-                        self.plan_seq_scan_read(engine, table, alias.as_deref(), filter, Some(columns))?
+                    if let PlanNode::SeqScan {
+                        table,
+                        alias,
+                        filter,
+                        ..
+                    } = input.as_ref()
+                    {
+                        self.plan_seq_scan_read(
+                            engine,
+                            table,
+                            alias.as_deref(),
+                            filter,
+                            Some(columns),
+                        )?
                     } else {
                         self.execute_plan_node_read(input, engine)?
                     }
@@ -3602,11 +4299,12 @@ impl QueryExecutor {
                         if let SelectColumns::Columns(items) = columns {
                             for item in items {
                                 if let SelectItem::Column(col) = item {
-                                    let (real_col, alias_part) = if let Some(as_pos) = col.find(" as ") {
-                                        (&col[..as_pos], Some(col[as_pos + 4..].trim()))
-                                    } else {
-                                        (col.as_str(), None)
-                                    };
+                                    let (real_col, alias_part) =
+                                        if let Some(as_pos) = col.find(" as ") {
+                                            (&col[..as_pos], Some(col[as_pos + 4..].trim()))
+                                        } else {
+                                            (col.as_str(), None)
+                                        };
                                     if let Some(val) = raw_row.get(real_col) {
                                         let name = alias_part.unwrap_or(real_col);
                                         let name = name.split('.').next_back().unwrap_or(name);
@@ -3619,41 +4317,57 @@ impl QueryExecutor {
                     }
                     Ok(result)
                 } else {
-                    let projected: Vec<Map<String, Value>> = raw_rows.iter()
+                    let projected: Vec<Map<String, Value>> = raw_rows
+                        .iter()
                         .map(|row| self.project_columns(row, columns))
                         .collect();
                     Ok(projected)
                 }
             }
-            PlanNode::NestedLoopJoin { left, right, join_clause, .. } => {
+            PlanNode::NestedLoopJoin {
+                left,
+                right,
+                join_clause,
+                ..
+            } => {
                 let left_rows = self.execute_plan_node_read(left, engine)?;
                 let right_rows = self.execute_plan_node_read(right, engine)?;
                 Self::execute_nested_loop_join(left_rows, right_rows, join_clause)
             }
-            PlanNode::HashJoin { left, right, join_clause, .. } => {
+            PlanNode::HashJoin {
+                left,
+                right,
+                join_clause,
+                ..
+            } => {
                 let left_rows = self.execute_plan_node_read(left, engine)?;
                 let right_rows = self.execute_plan_node_read(right, engine)?;
                 Self::execute_hash_join_rows(left_rows, right_rows, join_clause)
             }
-            PlanNode::SortMergeJoin { left, right, join_clause, .. } => {
+            PlanNode::SortMergeJoin {
+                left,
+                right,
+                join_clause,
+                ..
+            } => {
                 let left_rows = self.execute_plan_node_read(left, engine)?;
                 let right_rows = self.execute_plan_node_read(right, engine)?;
                 Self::execute_sort_merge_join_rows(left_rows, right_rows, join_clause)
             }
-            PlanNode::Sort { input, order_by, .. } => {
+            PlanNode::Sort {
+                input, order_by, ..
+            } => {
                 let mut rows = self.execute_plan_node_read(input, engine)?;
                 for ob in order_by.iter().rev() {
                     Self::sort_rows(&mut rows, &ob.column, ob.ascending);
                 }
                 Ok(rows)
             }
-            PlanNode::Aggregation { input, .. } => {
-                self.execute_plan_node_read(input, engine)
-            }
-            PlanNode::Limit { input, .. } => {
-                self.execute_plan_node_read(input, engine)
-            }
-            PlanNode::Union { left, right, all, .. } => {
+            PlanNode::Aggregation { input, .. } => self.execute_plan_node_read(input, engine),
+            PlanNode::Limit { input, .. } => self.execute_plan_node_read(input, engine),
+            PlanNode::Union {
+                left, right, all, ..
+            } => {
                 let mut left_rows = self.execute_plan_node_read(left, engine)?;
                 let right_rows = self.execute_plan_node_read(right, engine)?;
                 left_rows.extend(right_rows);
@@ -3664,14 +4378,15 @@ impl QueryExecutor {
             }
             PlanNode::WindowFunction { input, windows, .. } => {
                 let mut rows = self.execute_plan_node_read(input, engine)?;
-                let parser_windows: Vec<crate::parser::WindowExpr> = windows.iter().map(|w| {
-                    crate::parser::WindowExpr {
+                let parser_windows: Vec<crate::parser::WindowExpr> = windows
+                    .iter()
+                    .map(|w| crate::parser::WindowExpr {
                         func: w.func.clone(),
                         arg: w.arg.clone(),
                         over: w.over.clone(),
                         alias: w.alias.clone(),
-                    }
-                }).collect();
+                    })
+                    .collect();
                 let window_refs: Vec<&crate::parser::WindowExpr> = parser_windows.iter().collect();
                 Self::execute_window_functions(&mut rows, &window_refs);
                 Ok(rows)
@@ -3702,12 +4417,17 @@ impl QueryExecutor {
                 match target {
                     ShardTarget::Single(shard) => {
                         if !router.is_local(shard) {
-                            tracing::debug!(table = table, shard = shard, "shard not local, skipping scan");
+                            tracing::debug!(
+                                table = table,
+                                shard = shard,
+                                "shard not local, skipping scan"
+                            );
                             return Ok(Vec::new());
                         }
                     }
                     ShardTarget::Multi(shards) => {
-                        let local_shards: Vec<_> = shards.into_iter().filter(|s| router.is_local(*s)).collect();
+                        let local_shards: Vec<_> =
+                            shards.into_iter().filter(|s| router.is_local(*s)).collect();
                         if local_shards.is_empty() {
                             tracing::debug!(table = table, "no local shards for multi-shard scan");
                             return Ok(Vec::new());
@@ -3735,14 +4455,22 @@ impl QueryExecutor {
                     match item {
                         SelectItem::Column(col) => {
                             // Strip " as alias" suffix
-                            let real = if let Some(pos) = col.find(" as ") { &col[..pos] } else { col.as_str() };
+                            let real = if let Some(pos) = col.find(" as ") {
+                                &col[..pos]
+                            } else {
+                                col.as_str()
+                            };
                             // Strip "table." prefix
                             let name = real.split('.').next_back().unwrap_or(real).to_string();
-                            if !cols.contains(&name) { cols.push(name); }
+                            if !cols.contains(&name) {
+                                cols.push(name);
+                            }
                         }
                         SelectItem::Aggregate(a) => {
                             if let Some(ref alias) = a.alias {
-                                if !cols.contains(alias) { cols.push(alias.clone()); }
+                                if !cols.contains(alias) {
+                                    cols.push(alias.clone());
+                                }
                             }
                         }
                         _ => {}
@@ -3771,19 +4499,27 @@ impl QueryExecutor {
                 }
                 // Tier 1: fast byte-level rejection
                 if !fast_filter_cols.is_empty()
-                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
-                        tracing::debug!("fast_filter_reject: rejected row");
-                        continue;
-                    }
+                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols)
+                {
+                    tracing::debug!("fast_filter_reject: rejected row");
+                    continue;
+                }
                 // Tier 2: BinaryRow path (for binary-stored data) — no JSON parsing
                 if let Some(brow) = BinaryRow::parse(val_bytes) {
                     if !brow.class_in_hierarchy(&class_hierarchy) {
-                        tracing::debug!("class_in_hierarchy: rejected row, class={:?}", brow.class_value());
+                        tracing::debug!(
+                            "class_in_hierarchy: rejected row, class={:?}",
+                            brow.class_value()
+                        );
                         continue;
                     }
                     if let Some(f) = filter {
                         let filter_result = eval_binary_filter(&brow, f);
-                        tracing::debug!("eval_binary_filter: result={:?}, filter={:?}", filter_result, f);
+                        tracing::debug!(
+                            "eval_binary_filter: result={:?}, filter={:?}",
+                            filter_result,
+                            f
+                        );
                         match filter_result {
                             Some(true) => {}
                             Some(false) => continue,
@@ -3792,13 +4528,26 @@ impl QueryExecutor {
                                 if let Some(mut doc) = brow.to_map() {
                                     let filter_pass = self.eval_filter_read(engine, &doc, f);
                                     tracing::debug!("eval_filter_read: result={}", filter_pass);
-                                    if !filter_pass { continue; }
-                                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                                    if !filter_pass {
+                                        continue;
+                                    }
+                                    doc.insert(
+                                        "__pk__".to_string(),
+                                        Value::String(String::from_utf8_lossy(key).to_string()),
+                                    );
                                     // Add shard routing info
-                                    if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                                    if let Some(router) = self
+                                        .shard_router
+                                        .read()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .as_ref()
+                                    {
                                         let pk = String::from_utf8_lossy(key);
                                         let target = router.route_key(table, pk.as_bytes());
-                                        doc.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                                        doc.insert(
+                                            "__shard__".to_string(),
+                                            Value::String(format!("{:?}", target)),
+                                        );
                                     }
                                     rows.push(doc);
                                 }
@@ -3808,31 +4557,59 @@ impl QueryExecutor {
                     }
                     // Use projected conversion when column list is available
                     if let Some(mut doc) = brow.to_map_projected(&proj_cols) {
-                        doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                        doc.insert(
+                            "__pk__".to_string(),
+                            Value::String(String::from_utf8_lossy(key).to_string()),
+                        );
                         // Add shard routing info
-                        if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                        if let Some(router) = self
+                            .shard_router
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                        {
                             let pk = String::from_utf8_lossy(key);
                             let target = router.route_key(table, pk.as_bytes());
-                            doc.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                            doc.insert(
+                                "__shard__".to_string(),
+                                Value::String(format!("{:?}", target)),
+                            );
                         }
                         rows.push(doc);
                     }
                     continue;
                 }
                 // Tier 3: JSON fallback (legacy data stored as JSON)
-                if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
-                    if !class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                if let Ok(serde_json::Value::Object(mut doc)) =
+                    serde_json::from_slice::<serde_json::Value>(val_bytes)
+                {
+                    if !class_hierarchy
+                        .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                    {
                         continue;
                     }
                     if let Some(f) = filter {
-                        if !self.eval_filter_read(engine, &doc, f) { continue; }
+                        if !self.eval_filter_read(engine, &doc, f) {
+                            continue;
+                        }
                     }
-                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                    doc.insert(
+                        "__pk__".to_string(),
+                        Value::String(String::from_utf8_lossy(key).to_string()),
+                    );
                     // Add shard routing info
-                    if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    if let Some(router) = self
+                        .shard_router
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
                         let pk = String::from_utf8_lossy(key);
                         let target = router.route_key(table, pk.as_bytes());
-                        doc.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                        doc.insert(
+                            "__shard__".to_string(),
+                            Value::String(format!("{:?}", target)),
+                        );
                     }
                     rows.push(doc);
                 }
@@ -3891,9 +4668,10 @@ impl QueryExecutor {
             for (_key, val_bytes) in &entries {
                 // Tier 1: fast byte-level rejection
                 if !fast_filter_cols.is_empty()
-                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols) {
-                        continue;
-                    }
+                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols)
+                {
+                    continue;
+                }
                 // Tier 2: BinaryRow path — filter without full deserialization
                 if let Some(brow) = BinaryRow::parse(val_bytes) {
                     if !brow.class_in_hierarchy(&class_hierarchy) {
@@ -3901,7 +4679,9 @@ impl QueryExecutor {
                     }
                     if let Some(f) = filter {
                         match eval_binary_filter(&brow, f) {
-                            Some(true) => { count += 1; }
+                            Some(true) => {
+                                count += 1;
+                            }
                             Some(false) => continue,
                             None => {
                                 // Filter needs full deserialization — rare case
@@ -3918,12 +4698,18 @@ impl QueryExecutor {
                     continue;
                 }
                 // Tier 3: JSON fallback
-                if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
-                    if !class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
+                if let Ok(serde_json::Value::Object(doc)) =
+                    serde_json::from_slice::<serde_json::Value>(val_bytes)
+                {
+                    if !class_hierarchy
+                        .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                    {
                         continue;
                     }
                     if let Some(f) = filter {
-                        if !self.eval_filter_read(engine, &doc, f) { continue; }
+                        if !self.eval_filter_read(engine, &doc, f) {
+                            continue;
+                        }
                     }
                     count += 1;
                 }
@@ -4098,7 +4884,11 @@ impl QueryExecutor {
                         }
                         LiteralValue::Bool(b) => {
                             let trimmed = raw.trim_ascii();
-                            return if *b { trimmed == b"true" } else { trimmed == b"false" };
+                            return if *b {
+                                trimmed == b"true"
+                            } else {
+                                trimmed == b"false"
+                            };
                         }
                         _ => {}
                     }
@@ -4123,10 +4913,12 @@ impl QueryExecutor {
         let start = json_str.find(&pattern)?;
         let value_start = start + pattern.len();
         // Skip whitespace
-        let value_start = value_start + json_str[value_start..].chars()
-            .take_while(|c| c.is_whitespace())
-            .map(|c| c.len_utf8())
-            .sum::<usize>();
+        let value_start = value_start
+            + json_str[value_start..]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .map(|c| c.len_utf8())
+                .sum::<usize>();
         if value_start >= json_str.len() {
             return None;
         }
@@ -4153,7 +4945,13 @@ impl QueryExecutor {
             for b in rest.bytes() {
                 match b {
                     b'[' => depth += 1,
-                    b']' => { depth -= 1; if depth == 0 { end += 1; break; } }
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end += 1;
+                            break;
+                        }
+                    }
                     _ => {}
                 }
                 end += 1;
@@ -4166,7 +4964,13 @@ impl QueryExecutor {
             for b in rest.bytes() {
                 match b {
                     b'{' => depth += 1,
-                    b'}' => { depth -= 1; if depth == 0 { end += 1; break; } }
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end += 1;
+                            break;
+                        }
+                    }
                     _ => {}
                 }
                 end += 1;
@@ -4192,7 +4996,7 @@ impl QueryExecutor {
         if !s.starts_with('"') || !s.ends_with('"') || s.len() < 2 {
             return None;
         }
-        let inner = &s[1..s.len()-1];
+        let inner = &s[1..s.len() - 1];
         // Handle JSON escape sequences
         let mut result = String::with_capacity(inner.len());
         let mut chars = inner.chars();
@@ -4260,11 +5064,19 @@ impl QueryExecutor {
                         .unwrap_or(false)
                 });
                 // Add shard routing info
-                if let Some(router) = self.shard_router.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                if let Some(router) = self
+                    .shard_router
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                {
                     for row in &mut rows {
                         if let Some(pk) = row.get("__pk__").and_then(|v| v.as_str()) {
                             let target = router.route_key(table, pk.as_bytes());
-                            row.insert("__shard__".to_string(), Value::String(format!("{:?}", target)));
+                            row.insert(
+                                "__shard__".to_string(),
+                                Value::String(format!("{:?}", target)),
+                            );
                         }
                     }
                 }
@@ -4288,9 +5100,14 @@ impl QueryExecutor {
         key: &LiteralValue,
     ) -> Result<Vec<Map<String, Value>>> {
         if engine.has_index(table, index_column) {
-            let index_mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+            let index_mgr = engine
+                .index_manager()
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             let json_val = Self::literal_to_json_static(key);
-            let pkeys = index_mgr.lookup_eq_read(table, index_column, &json_val).unwrap_or_default();
+            let pkeys = index_mgr
+                .lookup_eq_read(table, index_column, &json_val)
+                .unwrap_or_default();
             let mut rows = Self::fetch_rows_by_pks_read(engine, &pkeys)?;
             if let Some(a) = alias {
                 Self::apply_alias(&mut rows, a);
@@ -4324,20 +5141,29 @@ impl QueryExecutor {
             return None;
         }
 
-        let index_mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+        let index_mgr = engine
+            .index_manager()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
 
         let pkeys: Vec<Vec<u8>> = match filter {
             FilterExpr::Eq(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                index_mgr.lookup_eq_read(class, &col, &json_val).unwrap_or_default()
+                index_mgr
+                    .lookup_eq_read(class, &col, &json_val)
+                    .unwrap_or_default()
             }
             FilterExpr::Gt(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                index_mgr.lookup_gt_read(class, &col, &json_val).unwrap_or_default()
+                index_mgr
+                    .lookup_gt_read(class, &col, &json_val)
+                    .unwrap_or_default()
             }
             FilterExpr::Lt(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                index_mgr.lookup_lt_read(class, &col, &json_val).unwrap_or_default()
+                index_mgr
+                    .lookup_lt_read(class, &col, &json_val)
+                    .unwrap_or_default()
             }
             FilterExpr::Gte(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
@@ -4354,7 +5180,9 @@ impl QueryExecutor {
             FilterExpr::Between(_, low, high) => {
                 let low_json = Self::literal_to_json_static(low);
                 let high_json = Self::literal_to_json_static(high);
-                index_mgr.lookup_range_read(class, &col, Some(&low_json), Some(&high_json)).unwrap_or_default()
+                index_mgr
+                    .lookup_range_read(class, &col, Some(&low_json), Some(&high_json))
+                    .unwrap_or_default()
             }
             FilterExpr::In(_, values) => {
                 let mut all_pkeys = Vec::new();
@@ -4410,16 +5238,26 @@ impl QueryExecutor {
                 let entries = engine.scan_prefix(prefix.as_bytes())?;
                 for (key, val_bytes) in &entries {
                     if let Some(ref doc) = storage_bytes_to_doc(val_bytes) {
-                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
-                            && self.eval_filter_read(engine, doc, f) {
-                                allowed_ids.insert(key.clone());
-                            }
+                        if class_hierarchy
+                            .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                            && self.eval_filter_read(engine, doc, f)
+                        {
+                            allowed_ids.insert(key.clone());
+                        }
                     }
                 }
             }
-            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search_filtered(table, column, query_vector, top_k, &allowed_ids)?
+            engine
+                .vector_index_manager()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .search_filtered(table, column, query_vector, top_k, &allowed_ids)?
         } else {
-            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search(table, column, query_vector, top_k)?
+            engine
+                .vector_index_manager()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .search(table, column, query_vector, top_k)?
         };
 
         let mut rows = Vec::new();
@@ -4455,15 +5293,25 @@ impl QueryExecutor {
                         continue;
                     }
                     if let Some(mut doc) = brow.to_map() {
-                        doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                        doc.insert(
+                            "__pk__".to_string(),
+                            Value::String(String::from_utf8_lossy(key).to_string()),
+                        );
                         rows.push(doc);
                     }
                     continue;
                 }
                 // Tier 2: JSON fallback (legacy data stored as JSON)
-                if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
-                    if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("")) {
-                        doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(key).to_string()));
+                if let Ok(serde_json::Value::Object(mut doc)) =
+                    serde_json::from_slice::<serde_json::Value>(val_bytes)
+                {
+                    if class_hierarchy
+                        .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                    {
+                        doc.insert(
+                            "__pk__".to_string(),
+                            Value::String(String::from_utf8_lossy(key).to_string()),
+                        );
                         rows.push(doc);
                     }
                 }
@@ -4475,21 +5323,27 @@ impl QueryExecutor {
         }
 
         if returns.is_empty() {
-            let cleaned: Vec<Map<String, Value>> = rows.into_iter().map(|mut r| {
-                r.remove("__pk__");
-                r
-            }).collect();
+            let cleaned: Vec<Map<String, Value>> = rows
+                .into_iter()
+                .map(|mut r| {
+                    r.remove("__pk__");
+                    r
+                })
+                .collect();
             Ok(QueryResult::Rows(cleaned))
         } else {
-            let projected: Vec<Map<String, Value>> = rows.iter().map(|row| {
-                let mut result = Map::new();
-                for col in returns {
-                    if let Some(val) = Self::resolve_column_value(row, col) {
-                        result.insert(col.clone(), Value::String(val));
+            let projected: Vec<Map<String, Value>> = rows
+                .iter()
+                .map(|row| {
+                    let mut result = Map::new();
+                    for col in returns {
+                        if let Some(val) = Self::resolve_column_value(row, col) {
+                            result.insert(col.clone(), Value::String(val));
+                        }
                     }
-                }
-                result
-            }).collect();
+                    result
+                })
+                .collect();
             Ok(QueryResult::Rows(projected))
         }
     }
@@ -4509,7 +5363,7 @@ impl QueryExecutor {
 
         let Some(ref graph) = self.graph else {
             return Err(CoreError::InvalidArgument(
-                "GRAPH MATCH requires graph store (start server with graph enabled)".to_string()
+                "GRAPH MATCH requires graph store (start server with graph enabled)".to_string(),
             ));
         };
 
@@ -4522,7 +5376,9 @@ impl QueryExecutor {
 
         // Load ontology for reasoning (subclass expansion, inverse property derivation)
         let ontology = if let Some(first_label) = nodes[0].label.as_ref() {
-            self.ontology_store.find_ontology_for_class_global(engine, first_label).unwrap_or(None)
+            self.ontology_store
+                .find_ontology_for_class_global(engine, first_label)
+                .unwrap_or(None)
         } else {
             None
         };
@@ -4559,9 +5415,15 @@ impl QueryExecutor {
                 if !first_node.variable.is_empty() {
                     // Prefix all vertex properties with variable name
                     for (k, v) in &vertex.properties {
-                        row.insert(format!("{}.{}", first_node.variable, k), Self::prop_value_to_json(v));
+                        row.insert(
+                            format!("{}.{}", first_node.variable, k),
+                            Self::prop_value_to_json(v),
+                        );
                     }
-                    row.insert(format!("{}.id", first_node.variable), Value::String(vertex.id.clone()));
+                    row.insert(
+                        format!("{}.id", first_node.variable),
+                        Value::String(vertex.id.clone()),
+                    );
                 } else {
                     for (k, v) in &vertex.properties {
                         row.insert(k.clone(), Self::prop_value_to_json(v));
@@ -4576,9 +5438,15 @@ impl QueryExecutor {
                 let mut current_bindings: Vec<Map<String, Value>> = Vec::new();
                 let mut init_row = Map::new();
                 if !first_node.variable.is_empty() {
-                    init_row.insert(format!("{}.id", first_node.variable), Value::String(start_vertex.id.clone()));
+                    init_row.insert(
+                        format!("{}.id", first_node.variable),
+                        Value::String(start_vertex.id.clone()),
+                    );
                     for (k, v) in &start_vertex.properties {
-                        init_row.insert(format!("{}.{}", first_node.variable, k), Self::prop_value_to_json(v));
+                        init_row.insert(
+                            format!("{}.{}", first_node.variable, k),
+                            Self::prop_value_to_json(v),
+                        );
                     }
                 }
                 current_bindings.push(init_row);
@@ -4600,7 +5468,8 @@ impl QueryExecutor {
                             }
                         };
 
-                        let source_id = binding.get(&format!("{}.id", source_var))
+                        let source_id = binding
+                            .get(&format!("{}.id", source_var))
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
@@ -4666,29 +5535,43 @@ impl QueryExecutor {
                         // Traverse all effective labels
                         let mut all_neighbors = Vec::new();
                         for (lbl, dir) in effective_labels.iter().zip(effective_directions.iter()) {
-                            let neighbors = traversal.hop(&source_id, *dir, Some(lbl.as_str()), None, None)
+                            let neighbors = traversal
+                                .hop(&source_id, *dir, Some(lbl.as_str()), None, None)
                                 .unwrap_or_default();
                             for n in neighbors {
-                                if !all_neighbors.iter().any(|existing: &onto_graph::model::Vertex| existing.id == n.id) {
+                                if !all_neighbors
+                                    .iter()
+                                    .any(|existing: &onto_graph::model::Vertex| existing.id == n.id)
+                                {
                                     all_neighbors.push(n);
                                 }
                             }
                         }
 
                         // Ontology reasoning: expand target node subclasses
-                        let expanded_target_labels = if let (Some(ref target_label), Some(ref onto)) = (&next_node.label, &ontology) {
-                            let mut labels = vec![target_label.clone()];
-                            let subclasses = onto.get_all_subclasses(target_label);
-                            labels.extend(subclasses);
-                            labels
-                        } else {
-                            next_node.label.as_ref().map(|l| vec![l.clone()]).unwrap_or_default()
-                        };
+                        let expanded_target_labels =
+                            if let (Some(ref target_label), Some(ref onto)) =
+                                (&next_node.label, &ontology)
+                            {
+                                let mut labels = vec![target_label.clone()];
+                                let subclasses = onto.get_all_subclasses(target_label);
+                                labels.extend(subclasses);
+                                labels
+                            } else {
+                                next_node
+                                    .label
+                                    .as_ref()
+                                    .map(|l| vec![l.clone()])
+                                    .unwrap_or_default()
+                            };
 
                         for neighbor in &all_neighbors {
                             // Check label filter on target node (with subclass expansion)
                             if !expanded_target_labels.is_empty() {
-                                let matches = neighbor.labels.iter().any(|l| expanded_target_labels.contains(l));
+                                let matches = neighbor
+                                    .labels
+                                    .iter()
+                                    .any(|l| expanded_target_labels.contains(l));
                                 if !matches {
                                     continue;
                                 }
@@ -4696,9 +5579,15 @@ impl QueryExecutor {
 
                             let mut new_row = binding.clone();
                             if !next_node.variable.is_empty() {
-                                new_row.insert(format!("{}.id", next_node.variable), Value::String(neighbor.id.clone()));
+                                new_row.insert(
+                                    format!("{}.id", next_node.variable),
+                                    Value::String(neighbor.id.clone()),
+                                );
                                 for (k, v) in &neighbor.properties {
-                                    new_row.insert(format!("{}.{}", next_node.variable, k), Self::prop_value_to_json(v));
+                                    new_row.insert(
+                                        format!("{}.{}", next_node.variable, k),
+                                        Self::prop_value_to_json(v),
+                                    );
                                 }
                             }
                             new_bindings.push(new_row);
@@ -4719,21 +5608,24 @@ impl QueryExecutor {
 
         // Apply RETURN projection
         if !returns.is_empty() {
-            let projected: Vec<Map<String, Value>> = result_rows.iter().map(|row| {
-                let mut result = Map::new();
-                for col in returns {
-                    let col_trimmed = col.trim();
-                    // Try direct match, then with .name suffix
-                    if let Some(val) = row.get(col_trimmed) {
-                        result.insert(col_trimmed.to_string(), val.clone());
-                    } else if let Some(val) = row.get(&format!("{}.name", col_trimmed)) {
-                        result.insert(col_trimmed.to_string(), val.clone());
-                    } else if let Some(val) = row.get(&format!("{}.id", col_trimmed)) {
-                        result.insert(col_trimmed.to_string(), val.clone());
+            let projected: Vec<Map<String, Value>> = result_rows
+                .iter()
+                .map(|row| {
+                    let mut result = Map::new();
+                    for col in returns {
+                        let col_trimmed = col.trim();
+                        // Try direct match, then with .name suffix
+                        if let Some(val) = row.get(col_trimmed) {
+                            result.insert(col_trimmed.to_string(), val.clone());
+                        } else if let Some(val) = row.get(&format!("{}.name", col_trimmed)) {
+                            result.insert(col_trimmed.to_string(), val.clone());
+                        } else if let Some(val) = row.get(&format!("{}.id", col_trimmed)) {
+                            result.insert(col_trimmed.to_string(), val.clone());
+                        }
                     }
-                }
-                result
-            }).collect();
+                    result
+                })
+                .collect();
             Ok(QueryResult::Rows(projected))
         } else {
             Ok(QueryResult::Rows(result_rows))
@@ -4751,7 +5643,7 @@ impl QueryExecutor {
 
         let Some(ref graph) = self.graph else {
             return Err(CoreError::InvalidArgument(
-                "GRAPH SHORTEST PATH requires graph store".to_string()
+                "GRAPH SHORTEST PATH requires graph store".to_string(),
             ));
         };
 
@@ -4759,18 +5651,28 @@ impl QueryExecutor {
         match traversal.shortest_path(from_id, to_id, max_depth) {
             Ok(Some(path)) => {
                 let mut row = Map::new();
-                row.insert("path".to_string(), Value::Array(
-                    path.vertex_ids.iter().map(|id| Value::String(id.clone())).collect()
-                ));
-                row.insert("length".to_string(), Value::Number(serde_json::Number::from(path.length)));
+                row.insert(
+                    "path".to_string(),
+                    Value::Array(
+                        path.vertex_ids
+                            .iter()
+                            .map(|id| Value::String(id.clone()))
+                            .collect(),
+                    ),
+                );
+                row.insert(
+                    "length".to_string(),
+                    Value::Number(serde_json::Number::from(path.length)),
+                );
                 row.insert("from".to_string(), Value::String(from_id.to_string()));
                 row.insert("to".to_string(), Value::String(to_id.to_string()));
                 Ok(QueryResult::Rows(vec![row]))
             }
-            Ok(None) => {
-                Ok(QueryResult::Rows(Vec::new()))
-            }
-            Err(e) => Err(CoreError::Custom(format!("graph shortest path error: {}", e))),
+            Ok(None) => Ok(QueryResult::Rows(Vec::new())),
+            Err(e) => Err(CoreError::Custom(format!(
+                "graph shortest path error: {}",
+                e
+            ))),
         }
     }
 
@@ -4787,7 +5689,7 @@ impl QueryExecutor {
 
         let Some(ref graph) = self.graph else {
             return Err(CoreError::InvalidArgument(
-                "GRAPH TRAVERSE requires graph store".to_string()
+                "GRAPH TRAVERSE requires graph store".to_string(),
             ));
         };
 
@@ -4798,16 +5700,24 @@ impl QueryExecutor {
         };
 
         let traversal = TraversalEngine::new(graph.as_ref());
-        let result = traversal.traverse_bfs(start_id, max_depth, dir, edge_label, None)
+        let result = traversal
+            .traverse_bfs(start_id, max_depth, dir, edge_label, None)
             .map_err(|e| CoreError::Custom(format!("graph traversal error: {}", e)))?;
 
         let mut rows: Vec<Map<String, Value>> = Vec::new();
         for vertex in &result.vertices {
             let mut row = Map::new();
             row.insert("id".to_string(), Value::String(vertex.id.clone()));
-            row.insert("labels".to_string(), Value::Array(
-                vertex.labels.iter().map(|l| Value::String(l.clone())).collect()
-            ));
+            row.insert(
+                "labels".to_string(),
+                Value::Array(
+                    vertex
+                        .labels
+                        .iter()
+                        .map(|l| Value::String(l.clone()))
+                        .collect(),
+                ),
+            );
             for (k, v) in &vertex.properties {
                 row.insert(k.clone(), Self::prop_value_to_json(v));
             }
@@ -4824,33 +5734,31 @@ impl QueryExecutor {
     /// Evaluate a filter expression against a graph match result row.
     fn eval_graph_filter(row: &Map<String, Value>, filter: &FilterExpr) -> bool {
         match filter {
-            FilterExpr::Eq(col, val) => {
-                row.get(col).is_some_and(|v| Self::value_matches_literal(v, val))
-            }
-            FilterExpr::Ne(col, val) => {
-                row.get(col).is_none_or(|v| !Self::value_matches_literal(v, val))
-            }
+            FilterExpr::Eq(col, val) => row
+                .get(col)
+                .is_some_and(|v| Self::value_matches_literal(v, val)),
+            FilterExpr::Ne(col, val) => row
+                .get(col)
+                .is_none_or(|v| !Self::value_matches_literal(v, val)),
             FilterExpr::Gt(col, val) => {
                 row.get(col).is_some_and(|v| Self::value_gt_literal(v, val))
             }
             FilterExpr::Lt(col, val) => {
                 row.get(col).is_some_and(|v| Self::value_lt_literal(v, val))
             }
-            FilterExpr::Gte(col, val) => {
-                row.get(col).is_some_and(|v| Self::value_gt_literal(v, val) || Self::value_matches_literal(v, val))
-            }
-            FilterExpr::Lte(col, val) => {
-                row.get(col).is_some_and(|v| Self::value_lt_literal(v, val) || Self::value_matches_literal(v, val))
-            }
+            FilterExpr::Gte(col, val) => row.get(col).is_some_and(|v| {
+                Self::value_gt_literal(v, val) || Self::value_matches_literal(v, val)
+            }),
+            FilterExpr::Lte(col, val) => row.get(col).is_some_and(|v| {
+                Self::value_lt_literal(v, val) || Self::value_matches_literal(v, val)
+            }),
             FilterExpr::And(left, right) => {
                 Self::eval_graph_filter(row, left) && Self::eval_graph_filter(row, right)
             }
             FilterExpr::Or(left, right) => {
                 Self::eval_graph_filter(row, left) || Self::eval_graph_filter(row, right)
             }
-            FilterExpr::Not(inner) => {
-                !Self::eval_graph_filter(row, inner)
-            }
+            FilterExpr::Not(inner) => !Self::eval_graph_filter(row, inner),
             _ => true, // Unsupported filters pass through
         }
     }
@@ -4867,8 +5775,12 @@ impl QueryExecutor {
 
     fn value_gt_literal(value: &Value, literal: &crate::parser::LiteralValue) -> bool {
         match (value, literal) {
-            (Value::Number(n), crate::parser::LiteralValue::Int(l)) => n.as_i64().is_some_and(|v| v > *l),
-            (Value::Number(n), crate::parser::LiteralValue::Float(l)) => n.as_f64().is_some_and(|v| v > *l),
+            (Value::Number(n), crate::parser::LiteralValue::Int(l)) => {
+                n.as_i64().is_some_and(|v| v > *l)
+            }
+            (Value::Number(n), crate::parser::LiteralValue::Float(l)) => {
+                n.as_f64().is_some_and(|v| v > *l)
+            }
             (Value::String(s), crate::parser::LiteralValue::String(l)) => s > l,
             _ => false,
         }
@@ -4876,8 +5788,12 @@ impl QueryExecutor {
 
     fn value_lt_literal(value: &Value, literal: &crate::parser::LiteralValue) -> bool {
         match (value, literal) {
-            (Value::Number(n), crate::parser::LiteralValue::Int(l)) => n.as_i64().is_some_and(|v| v < *l),
-            (Value::Number(n), crate::parser::LiteralValue::Float(l)) => n.as_f64().is_some_and(|v| v < *l),
+            (Value::Number(n), crate::parser::LiteralValue::Int(l)) => {
+                n.as_i64().is_some_and(|v| v < *l)
+            }
+            (Value::Number(n), crate::parser::LiteralValue::Float(l)) => {
+                n.as_f64().is_some_and(|v| v < *l)
+            }
             (Value::String(s), crate::parser::LiteralValue::String(l)) => s < l,
             _ => false,
         }
@@ -4888,9 +5804,9 @@ impl QueryExecutor {
             onto_graph::model::PropValue::Null => Value::Null,
             onto_graph::model::PropValue::Bool(b) => Value::Bool(*b),
             onto_graph::model::PropValue::Int(i) => Value::Number(serde_json::Number::from(*i)),
-            onto_graph::model::PropValue::Float(f) => {
-                serde_json::Number::from_f64(*f).map(Value::Number).unwrap_or(Value::Null)
-            }
+            onto_graph::model::PropValue::Float(f) => serde_json::Number::from_f64(*f)
+                .map(Value::Number)
+                .unwrap_or(Value::Null),
             onto_graph::model::PropValue::String(s) => Value::String(s.clone()),
             onto_graph::model::PropValue::List(l) => {
                 Value::Array(l.iter().map(Self::prop_value_to_json).collect())
@@ -4910,7 +5826,8 @@ impl QueryExecutor {
     ) -> Result<QueryResult> {
         if !engine.has_vector_index(class, column) {
             return Err(CoreError::InvalidArgument(format!(
-                "no vector index on {}.{}", class, column
+                "no vector index on {}.{}",
+                class, column
             )));
         }
 
@@ -4922,16 +5839,30 @@ impl QueryExecutor {
                 let entries = engine.scan_prefix(prefix.as_bytes())?;
                 for (key, val_bytes) in &entries {
                     if let Some(ref doc) = storage_bytes_to_doc(val_bytes) {
-                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
-                            && Self::eval_filter_static_with_hierarchy(doc, filter_expr, &class_hierarchy) {
-                                allowed_ids.insert(key.clone());
-                            }
+                        if class_hierarchy
+                            .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                            && Self::eval_filter_static_with_hierarchy(
+                                doc,
+                                filter_expr,
+                                &class_hierarchy,
+                            )
+                        {
+                            allowed_ids.insert(key.clone());
+                        }
                     }
                 }
             }
-            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search_filtered(class, column, query_vector, top_k, &allowed_ids)?
+            engine
+                .vector_index_manager()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .search_filtered(class, column, query_vector, top_k, &allowed_ids)?
         } else {
-            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search(class, column, query_vector, top_k)?
+            engine
+                .vector_index_manager()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .search(class, column, query_vector, top_k)?
         };
 
         let mut rows = Vec::new();
@@ -4961,8 +5892,12 @@ impl QueryExecutor {
             let mut group_map: std::collections::BTreeMap<String, Vec<&Map<String, Value>>> =
                 std::collections::BTreeMap::new();
             for row in rows {
-                let key = gb.columns.iter()
-                    .map(|col| Self::resolve_column_value(row, col).unwrap_or_else(|| "NULL".to_string()))
+                let key = gb
+                    .columns
+                    .iter()
+                    .map(|col| {
+                        Self::resolve_column_value(row, col).unwrap_or_else(|| "NULL".to_string())
+                    })
                     .collect::<Vec<_>>()
                     .join("\x00");
                 group_map.entry(key).or_default().push(row);
@@ -4990,7 +5925,10 @@ impl QueryExecutor {
                     match item {
                         SelectItem::Aggregate(agg) => {
                             let val = Self::compute_aggregate(agg, group_rows);
-                            let name = agg.alias.clone().unwrap_or_else(|| Self::default_agg_name(agg));
+                            let name = agg
+                                .alias
+                                .clone()
+                                .unwrap_or_else(|| Self::default_agg_name(agg));
                             result_row.insert(name, val);
                         }
                         SelectItem::Column(col) => {
@@ -5008,7 +5946,10 @@ impl QueryExecutor {
             }
 
             // Use read-path filter for HAVING with ontology reasoning
-            if having.as_ref().is_none_or(|h| self.eval_filter_read(engine, &result_row, h)) {
+            if having
+                .as_ref()
+                .is_none_or(|h| self.eval_filter_read(engine, &result_row, h))
+            {
                 result_rows.push(result_row);
             }
         }
@@ -5027,7 +5968,10 @@ impl QueryExecutor {
     /// Read-only class hierarchy lookup (no mutation needed).
     fn get_class_hierarchy_read(&self, engine: &LsmEngine, table: &str) -> HashSet<String> {
         {
-            let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .inference_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.class_hierarchy.get(table) {
                 return cached.clone();
             }
@@ -5067,8 +6011,13 @@ impl QueryExecutor {
         }
 
         {
-            let mut cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
-            cache.class_hierarchy.insert(table.to_string(), classes.clone());
+            let mut cache = self
+                .inference_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            cache
+                .class_hierarchy
+                .insert(table.to_string(), classes.clone());
         }
 
         classes
@@ -5077,17 +6026,20 @@ impl QueryExecutor {
     /// Read-only filter evaluation with ontology reasoning (no subquery support).
     /// Supports: Eq, Ne, Gt, Lt, Gte, Lte, Like, Between, In, IsNull, IsNotNull, Not, And, Or.
     /// Class hierarchy and property inference are applied via read-only engine access.
-    fn eval_filter_read(&self, engine: &LsmEngine, doc: &Map<String, Value>, expr: &FilterExpr) -> bool {
+    fn eval_filter_read(
+        &self,
+        engine: &LsmEngine,
+        doc: &Map<String, Value>,
+        expr: &FilterExpr,
+    ) -> bool {
         match expr {
-            FilterExpr::Eq(col, val) => {
-                doc.get(col).is_some_and(|v| {
-                    if col == "__class__" {
-                        self.class_value_matches_read(engine, v, val)
-                    } else {
-                        self.property_value_matches_read(engine, doc, col, val)
-                    }
-                })
-            }
+            FilterExpr::Eq(col, val) => doc.get(col).is_some_and(|v| {
+                if col == "__class__" {
+                    self.class_value_matches_read(engine, v, val)
+                } else {
+                    self.property_value_matches_read(engine, doc, col, val)
+                }
+            }),
             FilterExpr::Ne(col, val) => {
                 // SQL semantics: NULL != anything is NULL (falsy)
                 match doc.get(col) {
@@ -5102,55 +6054,45 @@ impl QueryExecutor {
                     None => false,
                 }
             }
-            FilterExpr::Gt(col, val) => {
-                doc.get(col).is_some_and(|v| self.value_gt(v, val))
-            }
-            FilterExpr::Lt(col, val) => {
-                doc.get(col).is_some_and(|v| self.value_lt(v, val))
-            }
-            FilterExpr::Gte(col, val) => {
-                doc.get(col).is_some_and(|v| self.value_gt(v, val) || self.value_matches(v, val))
-            }
-            FilterExpr::Lte(col, val) => {
-                doc.get(col).is_some_and(|v| self.value_lt(v, val) || self.value_matches(v, val))
-            }
-            FilterExpr::Like(col, pattern) => {
-                doc.get(col).is_some_and(|v| {
-                    let s = match v {
-                        Value::String(s) => s.clone(),
-                        _ => v.to_string(),
-                    };
-                    Self::like_match(&s, pattern)
-                })
-            }
-            FilterExpr::Between(col, low, high) => {
-                doc.get(col).is_some_and(|v| {
-                    self.value_gte(v, low) && self.value_lte(v, high)
-                })
-            }
-            FilterExpr::In(col, values) => {
-                doc.get(col).is_some_and(|v| {
-                    if col == "__class__" {
-                        values.iter().any(|val| self.class_value_matches_read(engine, v, val))
-                    } else {
-                        values.iter().any(|val| self.property_value_matches_read(engine, doc, col, val))
-                    }
-                })
-            }
-            FilterExpr::IsNull(col) => {
-                doc.get(col).is_none_or(|v| matches!(v, Value::Null))
-            }
-            FilterExpr::IsNotNull(col) => {
-                doc.get(col).is_some_and(|v| !matches!(v, Value::Null))
-            }
-            FilterExpr::Not(expr) => {
-                !self.eval_filter_read(engine, doc, expr)
-            }
+            FilterExpr::Gt(col, val) => doc.get(col).is_some_and(|v| self.value_gt(v, val)),
+            FilterExpr::Lt(col, val) => doc.get(col).is_some_and(|v| self.value_lt(v, val)),
+            FilterExpr::Gte(col, val) => doc
+                .get(col)
+                .is_some_and(|v| self.value_gt(v, val) || self.value_matches(v, val)),
+            FilterExpr::Lte(col, val) => doc
+                .get(col)
+                .is_some_and(|v| self.value_lt(v, val) || self.value_matches(v, val)),
+            FilterExpr::Like(col, pattern) => doc.get(col).is_some_and(|v| {
+                let s = match v {
+                    Value::String(s) => s.clone(),
+                    _ => v.to_string(),
+                };
+                Self::like_match(&s, pattern)
+            }),
+            FilterExpr::Between(col, low, high) => doc
+                .get(col)
+                .is_some_and(|v| self.value_gte(v, low) && self.value_lte(v, high)),
+            FilterExpr::In(col, values) => doc.get(col).is_some_and(|v| {
+                if col == "__class__" {
+                    values
+                        .iter()
+                        .any(|val| self.class_value_matches_read(engine, v, val))
+                } else {
+                    values
+                        .iter()
+                        .any(|val| self.property_value_matches_read(engine, doc, col, val))
+                }
+            }),
+            FilterExpr::IsNull(col) => doc.get(col).is_none_or(|v| matches!(v, Value::Null)),
+            FilterExpr::IsNotNull(col) => doc.get(col).is_some_and(|v| !matches!(v, Value::Null)),
+            FilterExpr::Not(expr) => !self.eval_filter_read(engine, doc, expr),
             FilterExpr::And(left, right) => {
-                self.eval_filter_read(engine, doc, left) && self.eval_filter_read(engine, doc, right)
+                self.eval_filter_read(engine, doc, left)
+                    && self.eval_filter_read(engine, doc, right)
             }
             FilterExpr::Or(left, right) => {
-                self.eval_filter_read(engine, doc, left) || self.eval_filter_read(engine, doc, right)
+                self.eval_filter_read(engine, doc, left)
+                    || self.eval_filter_read(engine, doc, right)
             }
             _ => true, // Subquery filters (EXISTS, IN subquery) pass through in read path
         }
@@ -5203,7 +6145,10 @@ impl QueryExecutor {
     /// Read-only property aliases lookup (subproperty/equivalent property).
     fn get_property_aliases_read(&self, engine: &LsmEngine, property: &str) -> HashSet<String> {
         {
-            let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .inference_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.property_aliases.get(property) {
                 return cached.clone();
             }
@@ -5239,8 +6184,13 @@ impl QueryExecutor {
         }
 
         {
-            let mut cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
-            cache.property_aliases.insert(property.to_string(), aliases.clone());
+            let mut cache = self
+                .inference_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            cache
+                .property_aliases
+                .insert(property.to_string(), aliases.clone());
         }
 
         aliases
@@ -5289,9 +6239,14 @@ impl QueryExecutor {
                                 .collect();
                             let truly_new: Vec<Map<String, Value>> = new_rows
                                 .into_iter()
-                                .filter(|r| !existing_set.contains(&serde_json::to_string(r).unwrap_or_default()))
+                                .filter(|r| {
+                                    !existing_set
+                                        .contains(&serde_json::to_string(r).unwrap_or_default())
+                                })
                                 .collect();
-                            if truly_new.is_empty() { break; }
+                            if truly_new.is_empty() {
+                                break;
+                            }
                             all_rows.extend(truly_new);
                         } else {
                             all_rows.extend(new_rows);
@@ -5323,7 +6278,11 @@ impl QueryExecutor {
         result
     }
 
-    fn materialize_cte(engine: &LsmEngine, prefix: &str, rows: &[Map<String, Value>]) -> Result<()> {
+    fn materialize_cte(
+        engine: &LsmEngine,
+        prefix: &str,
+        rows: &[Map<String, Value>],
+    ) -> Result<()> {
         for (i, row) in rows.iter().enumerate() {
             let key = format!("{}{:010}", prefix, i);
             let value = doc_to_storage_bytes(row);
@@ -5359,12 +6318,21 @@ impl QueryExecutor {
 
             // Post-processing: aggregation, window functions, DISTINCT, OFFSET/LIMIT
             if let QueryAst::Select {
-                distinct, columns, group_by, having, order_by, limit, offset, ..
-            } = ast {
+                distinct,
+                columns,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+                ..
+            } = ast
+            {
                 let has_aggregates = Self::columns_have_aggregates(columns);
 
                 // Fast path: COUNT(*) was already computed by plan_seq_scan_count_only.
-                if has_aggregates && group_by.is_none()
+                if has_aggregates
+                    && group_by.is_none()
                     && rows.len() == 1
                     && Self::is_pure_count_star(columns)
                 {
@@ -5375,24 +6343,43 @@ impl QueryExecutor {
                 }
 
                 if group_by.is_some() || has_aggregates {
-                    let result = self.execute_aggregation(engine, columns, &rows, group_by.as_ref(), having, order_by, *limit)?;
+                    let result = self.execute_aggregation(
+                        engine,
+                        columns,
+                        &rows,
+                        group_by.as_ref(),
+                        having,
+                        order_by,
+                        *limit,
+                    )?;
                     if let QueryResult::Rows(mut agg_rows) = result {
-                        if *distinct { Self::dedup_rows(&mut agg_rows); }
+                        if *distinct {
+                            Self::dedup_rows(&mut agg_rows);
+                        }
                         return Ok(QueryResult::Rows(agg_rows));
                     }
                     return Ok(result);
                 }
 
                 if let SelectColumns::Columns(items) = columns {
-                    let window_exprs: Vec<&WindowExpr> = items.iter().filter_map(|item| {
-                        if let SelectItem::WindowFunction(w) = item { Some(w) } else { None }
-                    }).collect();
+                    let window_exprs: Vec<&WindowExpr> = items
+                        .iter()
+                        .filter_map(|item| {
+                            if let SelectItem::WindowFunction(w) = item {
+                                Some(w)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     if !window_exprs.is_empty() {
                         Self::execute_window_functions(&mut rows, &window_exprs);
                     }
                 }
 
-                if *distinct { Self::dedup_rows(&mut rows); }
+                if *distinct {
+                    Self::dedup_rows(&mut rows);
+                }
 
                 if let Some(off) = offset {
                     if *off < rows.len() {
@@ -5414,7 +6401,12 @@ impl QueryExecutor {
     }
 
     /// Executes a statement within an existing transaction.
-    fn execute_in_txn(&self, ast: &QueryAst, engine: &LsmEngine, txn_id: u64) -> Result<QueryResult> {
+    fn execute_in_txn(
+        &self,
+        ast: &QueryAst,
+        engine: &LsmEngine,
+        txn_id: u64,
+    ) -> Result<QueryResult> {
         match ast {
             QueryAst::Insert {
                 class,
@@ -5443,23 +6435,33 @@ impl QueryExecutor {
                 if let QueryResult::Rows(rows) = select_result {
                     let count = rows.len();
                     for row in &rows {
-                        let values: Vec<crate::parser::LiteralValue> = columns.iter().map(|col| {
-                            match row.get(col) {
-                                Some(serde_json::Value::String(s)) => crate::parser::LiteralValue::String(s.clone()),
+                        let values: Vec<crate::parser::LiteralValue> = columns
+                            .iter()
+                            .map(|col| match row.get(col) {
+                                Some(serde_json::Value::String(s)) => {
+                                    crate::parser::LiteralValue::String(s.clone())
+                                }
                                 Some(serde_json::Value::Number(n)) => {
                                     if let Some(i) = n.as_i64() {
                                         crate::parser::LiteralValue::Int(i)
                                     } else {
-                                        crate::parser::LiteralValue::Float(n.as_f64().unwrap_or(0.0))
+                                        crate::parser::LiteralValue::Float(
+                                            n.as_f64().unwrap_or(0.0),
+                                        )
                                     }
                                 }
-                                Some(serde_json::Value::Bool(b)) => crate::parser::LiteralValue::Bool(*b),
+                                Some(serde_json::Value::Bool(b)) => {
+                                    crate::parser::LiteralValue::Bool(*b)
+                                }
                                 _ => crate::parser::LiteralValue::Null,
-                            }
-                        }).collect();
+                            })
+                            .collect();
                         self.execute_insert_txn(engine, txn_id, class, columns, &values)?;
                     }
-                    Ok(QueryResult::Success(format!("{} row(s) inserted from SELECT", count)))
+                    Ok(QueryResult::Success(format!(
+                        "{} row(s) inserted from SELECT",
+                        count
+                    )))
                 } else {
                     Ok(QueryResult::Success("0 rows inserted".to_string()))
                 }
@@ -5472,7 +6474,9 @@ impl QueryExecutor {
                 assignments,
             } => {
                 // Check if a row with the conflict column value already exists
-                let conflict_val = columns.iter().position(|c| c == conflict_column)
+                let conflict_val = columns
+                    .iter()
+                    .position(|c| c == conflict_column)
                     .and_then(|pos| values.get(pos));
                 if let Some(val) = conflict_val {
                     // Search for existing row
@@ -5480,12 +6484,20 @@ impl QueryExecutor {
                     let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
                     let mut existing_key: Option<Vec<u8>> = None;
                     for (key, val_bytes) in &entries {
-                        if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                        if let Ok(serde_json::Value::Object(doc)) =
+                            serde_json::from_slice::<serde_json::Value>(val_bytes)
+                        {
                             if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
                                 if let Some(existing_val) = doc.get(conflict_column) {
                                     let matches = match (existing_val, val) {
-                                        (serde_json::Value::String(s), crate::parser::LiteralValue::String(l)) => s == l,
-                                        (serde_json::Value::Number(n), crate::parser::LiteralValue::Int(l)) => n.as_i64() == Some(*l),
+                                        (
+                                            serde_json::Value::String(s),
+                                            crate::parser::LiteralValue::String(l),
+                                        ) => s == l,
+                                        (
+                                            serde_json::Value::Number(n),
+                                            crate::parser::LiteralValue::Int(l),
+                                        ) => n.as_i64() == Some(*l),
                                         _ => false,
                                     };
                                     if matches {
@@ -5499,13 +6511,17 @@ impl QueryExecutor {
                     if let Some(key) = existing_key {
                         // Update existing row
                         if let Ok(Some(val_bytes)) = engine.txn_get(txn_id, &key) {
-                            if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(&val_bytes) {
+                            if let Ok(serde_json::Value::Object(mut doc)) =
+                                serde_json::from_slice::<serde_json::Value>(&val_bytes)
+                            {
                                 for (col, assign_val) in assignments {
                                     doc.insert(col.clone(), self.literal_to_json(assign_val));
                                 }
                                 let new_value = doc_to_storage_bytes(&doc);
                                 engine.txn_put(txn_id, key, new_value)?;
-                                return Ok(QueryResult::Success("1 row updated (upsert)".to_string()));
+                                return Ok(QueryResult::Success(
+                                    "1 row updated (upsert)".to_string(),
+                                ));
                             }
                         }
                     }
@@ -5523,19 +6539,29 @@ impl QueryExecutor {
                 let mut total = 0;
                 for row in rows {
                     // Check if a row with the conflict column value already exists
-                    let conflict_val = columns.iter().position(|c| c == conflict_column)
+                    let conflict_val = columns
+                        .iter()
+                        .position(|c| c == conflict_column)
                         .and_then(|pos| row.get(pos));
                     if let Some(val) = conflict_val {
                         let prefix = format!("{}::", class);
                         let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
                         let mut existing_key: Option<Vec<u8>> = None;
                         for (key, val_bytes) in &entries {
-                            if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                            if let Ok(serde_json::Value::Object(doc)) =
+                                serde_json::from_slice::<serde_json::Value>(val_bytes)
+                            {
                                 if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
                                     if let Some(existing_val) = doc.get(conflict_column) {
                                         let matches = match (existing_val, val) {
-                                            (serde_json::Value::String(s), crate::parser::LiteralValue::String(l)) => s == l,
-                                            (serde_json::Value::Number(n), crate::parser::LiteralValue::Int(l)) => n.as_i64() == Some(*l),
+                                            (
+                                                serde_json::Value::String(s),
+                                                crate::parser::LiteralValue::String(l),
+                                            ) => s == l,
+                                            (
+                                                serde_json::Value::Number(n),
+                                                crate::parser::LiteralValue::Int(l),
+                                            ) => n.as_i64() == Some(*l),
                                             _ => false,
                                         };
                                         if matches {
@@ -5549,7 +6575,9 @@ impl QueryExecutor {
                         if let Some(key) = existing_key {
                             // Update existing row
                             if let Ok(Some(val_bytes)) = engine.txn_get(txn_id, &key) {
-                                if let Ok(serde_json::Value::Object(mut doc)) = serde_json::from_slice::<serde_json::Value>(&val_bytes) {
+                                if let Ok(serde_json::Value::Object(mut doc)) =
+                                    serde_json::from_slice::<serde_json::Value>(&val_bytes)
+                                {
                                     for (col, assign_val) in assignments {
                                         doc.insert(col.clone(), self.literal_to_json(assign_val));
                                     }
@@ -5565,14 +6593,21 @@ impl QueryExecutor {
                     self.execute_insert_txn(engine, txn_id, class, columns, row)?;
                     total += 1;
                 }
-                Ok(QueryResult::Success(format!("{} row(s) inserted/updated (batch upsert)", total)))
+                Ok(QueryResult::Success(format!(
+                    "{} row(s) inserted/updated (batch upsert)",
+                    total
+                )))
             }
-            QueryAst::Import { class, file_path, format } => {
-                self.execute_import(engine, txn_id, class, file_path, *format)
-            }
-            QueryAst::Copy { class, file_path, format } => {
-                self.execute_copy(engine, class, file_path, *format)
-            }
+            QueryAst::Import {
+                class,
+                file_path,
+                format,
+            } => self.execute_import(engine, txn_id, class, file_path, *format),
+            QueryAst::Copy {
+                class,
+                file_path,
+                format,
+            } => self.execute_copy(engine, class, file_path, *format),
             QueryAst::Select {
                 distinct,
                 columns,
@@ -5589,7 +6624,11 @@ impl QueryExecutor {
             } => {
                 // Phase 24: Use plan-driven execution
                 // Generate execution plan, then execute it
-                let plan = self.planner.read().unwrap_or_else(|e| e.into_inner()).plan(ast)?;
+                let plan = self
+                    .planner
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .plan(ast)?;
 
                 // Execute the plan to get core result rows
                 let plan_result = self.execute_plan(&plan, engine)?;
@@ -5603,7 +6642,8 @@ impl QueryExecutor {
                 let has_aggregates = Self::columns_have_aggregates(columns);
 
                 // Fast path: COUNT(*) was already computed by plan_seq_scan_count_only.
-                if has_aggregates && group_by.is_none()
+                if has_aggregates
+                    && group_by.is_none()
                     && rows.len() == 1
                     && Self::is_pure_count_star(columns)
                 {
@@ -5614,9 +6654,19 @@ impl QueryExecutor {
                 }
 
                 if group_by.is_some() || has_aggregates {
-                    let result = self.execute_aggregation(engine, columns, &rows, group_by.as_ref(), having, order_by, *limit)?;
+                    let result = self.execute_aggregation(
+                        engine,
+                        columns,
+                        &rows,
+                        group_by.as_ref(),
+                        having,
+                        order_by,
+                        *limit,
+                    )?;
                     if let QueryResult::Rows(mut agg_rows) = result {
-                        if *distinct { Self::dedup_rows(&mut agg_rows); }
+                        if *distinct {
+                            Self::dedup_rows(&mut agg_rows);
+                        }
                         return Ok(QueryResult::Rows(agg_rows));
                     }
                     return Ok(result);
@@ -5624,16 +6674,25 @@ impl QueryExecutor {
 
                 // 2. Window functions (ValueExpr expressions are handled by Projection)
                 if let SelectColumns::Columns(items) = columns {
-                    let window_exprs: Vec<&WindowExpr> = items.iter().filter_map(|item| {
-                        if let SelectItem::WindowFunction(w) = item { Some(w) } else { None }
-                    }).collect();
+                    let window_exprs: Vec<&WindowExpr> = items
+                        .iter()
+                        .filter_map(|item| {
+                            if let SelectItem::WindowFunction(w) = item {
+                                Some(w)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     if !window_exprs.is_empty() {
                         Self::execute_window_functions(&mut rows, &window_exprs);
                     }
                 }
 
                 // 4. DISTINCT
-                if *distinct { Self::dedup_rows(&mut rows); }
+                if *distinct {
+                    Self::dedup_rows(&mut rows);
+                }
 
                 // 5. OFFSET then LIMIT (correct pagination order)
                 if let Some(off) = offset {
@@ -5713,7 +6772,15 @@ impl QueryExecutor {
                 query_vector,
                 top_k,
                 filter,
-            } => self.execute_vector_search_txn(engine, txn_id, class, column, query_vector, *top_k, filter),
+            } => self.execute_vector_search_txn(
+                engine,
+                txn_id,
+                class,
+                column,
+                query_vector,
+                *top_k,
+                filter,
+            ),
             _ => Err(onto_core::CoreError::InvalidArgument(
                 "unsupported statement type in transaction".to_string(),
             )),
@@ -5721,7 +6788,13 @@ impl QueryExecutor {
     }
 
     /// Executes UNION [ALL] by running both queries and merging results.
-    fn execute_union(&self, engine: &LsmEngine, left: &QueryAst, right: &QueryAst, all: bool) -> Result<QueryResult> {
+    fn execute_union(
+        &self,
+        engine: &LsmEngine,
+        left: &QueryAst,
+        right: &QueryAst,
+        all: bool,
+    ) -> Result<QueryResult> {
         let left_result = self.execute_with_engine_inner(left, engine)?;
         let right_result = self.execute_with_engine_inner(right, engine)?;
 
@@ -5756,10 +6829,7 @@ impl QueryExecutor {
     fn dedup_rows(rows: &mut Vec<Map<String, Value>>) {
         let mut seen = std::collections::HashSet::new();
         rows.retain(|row| {
-            let key: Vec<String> = row
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect();
+            let key: Vec<String> = row.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
             seen.insert(key.join("\x00"))
         });
     }
@@ -5770,7 +6840,11 @@ impl QueryExecutor {
             let a_val = a.get(col);
             let b_val = b.get(col);
             let ord = Self::compare_values_direct(a_val, b_val);
-            if ascending { ord } else { ord.reverse() }
+            if ascending {
+                ord
+            } else {
+                ord.reverse()
+            }
         });
     }
 
@@ -5778,7 +6852,9 @@ impl QueryExecutor {
     fn columns_have_aggregates(columns: &SelectColumns) -> bool {
         match columns {
             SelectColumns::All => false,
-            SelectColumns::Columns(items) => items.iter().any(|item| matches!(item, SelectItem::Aggregate(_))),
+            SelectColumns::Columns(items) => items
+                .iter()
+                .any(|item| matches!(item, SelectItem::Aggregate(_))),
         }
     }
 
@@ -5883,7 +6959,10 @@ impl QueryExecutor {
     }
 
     /// Computes a single aggregate value for a group of rows.
-    fn compute_aggregate(agg: &crate::parser::AggregateExpr, rows: &[&Map<String, Value>]) -> Value {
+    fn compute_aggregate(
+        agg: &crate::parser::AggregateExpr,
+        rows: &[&Map<String, Value>],
+    ) -> Value {
         match agg.func {
             AggregateFunc::Count => {
                 if agg.arg == "*" {
@@ -5903,7 +6982,9 @@ impl QueryExecutor {
                     .filter_map(|v| v.parse::<f64>().ok())
                     .sum();
                 if sum.fract() == 0.0 {
-                    Value::Number(serde_json::Number::from(sum.clamp(i64::MIN as f64, i64::MAX as f64) as i64))
+                    Value::Number(serde_json::Number::from(
+                        sum.clamp(i64::MIN as f64, i64::MAX as f64) as i64,
+                    ))
                 } else {
                     Value::Number(
                         serde_json::Number::from_f64(sum).unwrap_or(serde_json::Number::from(0)),
@@ -5955,9 +7036,10 @@ impl QueryExecutor {
     /// 3. Compute the window function value for each row
     fn execute_window_functions(rows: &mut Vec<Map<String, Value>>, windows: &[&WindowExpr]) {
         for window in windows {
-            let alias = window.alias.clone().unwrap_or_else(|| {
-                format!("{:?}()", window.func).to_lowercase()
-            });
+            let alias = window
+                .alias
+                .clone()
+                .unwrap_or_else(|| format!("{:?}()", window.func).to_lowercase());
 
             // Partition the rows
             let partitions = Self::partition_rows(rows, &window.over.partition_by);
@@ -5974,16 +7056,28 @@ impl QueryExecutor {
                 if !window.over.order_by.is_empty() {
                     for ob in window.over.order_by.iter().rev() {
                         partition_rows.sort_by(|a, b| {
-                            let a_val = Self::resolve_column_value(&a.1, &ob.column).unwrap_or_default();
-                            let b_val = Self::resolve_column_value(&b.1, &ob.column).unwrap_or_default();
+                            let a_val =
+                                Self::resolve_column_value(&a.1, &ob.column).unwrap_or_default();
+                            let b_val =
+                                Self::resolve_column_value(&b.1, &ob.column).unwrap_or_default();
                             let ord = Self::compare_values(&a_val, &b_val);
-                            if ob.ascending { ord } else { ord.reverse() }
+                            if ob.ascending {
+                                ord
+                            } else {
+                                ord.reverse()
+                            }
                         });
                     }
                 }
 
                 // Compute window function values
-                let values = Self::compute_window_values(&window.func, window.arg.as_deref(), &partition_rows, &window.over.frame, &window.over.order_by);
+                let values = Self::compute_window_values(
+                    &window.func,
+                    window.arg.as_deref(),
+                    &partition_rows,
+                    &window.over.frame,
+                    &window.over.order_by,
+                );
 
                 // Write values back to rows
                 for (i, val) in partition_indices.iter().zip(values.iter()) {
@@ -5999,11 +7093,14 @@ impl QueryExecutor {
             return vec![(0..rows.len()).collect()];
         }
 
-        let mut partitions: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+        let mut partitions: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
         for (i, row) in rows.iter().enumerate() {
             let key: String = partition_by
                 .iter()
-                .map(|col| Self::resolve_column_value(row, col).unwrap_or_else(|| "NULL".to_string()))
+                .map(|col| {
+                    Self::resolve_column_value(row, col).unwrap_or_else(|| "NULL".to_string())
+                })
                 .collect::<Vec<_>>()
                 .join("\x00");
             partitions.entry(key).or_default().push(i);
@@ -6031,8 +7128,10 @@ impl QueryExecutor {
                         Value::Number(serde_json::Number::from(idx + 1))
                     } else {
                         let same_as_prev = order_by.iter().all(|ob| {
-                            let a = Self::resolve_column_value(&partition[idx - 1].1, &ob.column).unwrap_or_default();
-                            let b = Self::resolve_column_value(&partition[idx].1, &ob.column).unwrap_or_default();
+                            let a = Self::resolve_column_value(&partition[idx - 1].1, &ob.column)
+                                .unwrap_or_default();
+                            let b = Self::resolve_column_value(&partition[idx].1, &ob.column)
+                                .unwrap_or_default();
                             a == b
                         });
                         if same_as_prev {
@@ -6048,8 +7147,10 @@ impl QueryExecutor {
                         Value::Number(serde_json::Number::from(1))
                     } else {
                         let same_as_prev = order_by.iter().all(|ob| {
-                            let a = Self::resolve_column_value(&partition[idx - 1].1, &ob.column).unwrap_or_default();
-                            let b = Self::resolve_column_value(&partition[idx].1, &ob.column).unwrap_or_default();
+                            let a = Self::resolve_column_value(&partition[idx - 1].1, &ob.column)
+                                .unwrap_or_default();
+                            let b = Self::resolve_column_value(&partition[idx].1, &ob.column)
+                                .unwrap_or_default();
                             a == b
                         });
                         if same_as_prev {
@@ -6103,21 +7204,11 @@ impl QueryExecutor {
                         .map(Value::String)
                         .unwrap_or(Value::Null)
                 }
-                WindowFunc::Sum => {
-                    Self::compute_running_sum(arg.unwrap_or(""), partition, idx)
-                }
-                WindowFunc::Avg => {
-                    Self::compute_running_avg(arg.unwrap_or(""), partition, idx)
-                }
-                WindowFunc::Min => {
-                    Self::compute_running_min(arg.unwrap_or(""), partition, idx)
-                }
-                WindowFunc::Max => {
-                    Self::compute_running_max(arg.unwrap_or(""), partition, idx)
-                }
-                WindowFunc::Count => {
-                    Value::Number(serde_json::Number::from(idx + 1))
-                }
+                WindowFunc::Sum => Self::compute_running_sum(arg.unwrap_or(""), partition, idx),
+                WindowFunc::Avg => Self::compute_running_avg(arg.unwrap_or(""), partition, idx),
+                WindowFunc::Min => Self::compute_running_min(arg.unwrap_or(""), partition, idx),
+                WindowFunc::Max => Self::compute_running_max(arg.unwrap_or(""), partition, idx),
+                WindowFunc::Count => Value::Number(serde_json::Number::from(idx + 1)),
             };
             values.push(val);
         }
@@ -6125,21 +7216,31 @@ impl QueryExecutor {
     }
 
     /// Computes running sum up to and including the current row.
-    fn compute_running_sum(col: &str, partition: &[(usize, Map<String, Value>)], end: usize) -> Value {
+    fn compute_running_sum(
+        col: &str,
+        partition: &[(usize, Map<String, Value>)],
+        end: usize,
+    ) -> Value {
         let sum: f64 = partition[..=end]
             .iter()
             .filter_map(|(_, row)| Self::resolve_column_value(row, col))
             .filter_map(|v| v.parse::<f64>().ok())
             .sum();
         if sum.fract() == 0.0 {
-            Value::Number(serde_json::Number::from(sum.clamp(i64::MIN as f64, i64::MAX as f64) as i64))
+            Value::Number(serde_json::Number::from(
+                sum.clamp(i64::MIN as f64, i64::MAX as f64) as i64,
+            ))
         } else {
             Value::Number(serde_json::Number::from_f64(sum).unwrap_or(serde_json::Number::from(0)))
         }
     }
 
     /// Computes running average up to and including the current row.
-    fn compute_running_avg(col: &str, partition: &[(usize, Map<String, Value>)], end: usize) -> Value {
+    fn compute_running_avg(
+        col: &str,
+        partition: &[(usize, Map<String, Value>)],
+        end: usize,
+    ) -> Value {
         let values: Vec<f64> = partition[..=end]
             .iter()
             .filter_map(|(_, row)| Self::resolve_column_value(row, col))
@@ -6154,7 +7255,11 @@ impl QueryExecutor {
     }
 
     /// Computes running minimum up to and including the current row.
-    fn compute_running_min(col: &str, partition: &[(usize, Map<String, Value>)], end: usize) -> Value {
+    fn compute_running_min(
+        col: &str,
+        partition: &[(usize, Map<String, Value>)],
+        end: usize,
+    ) -> Value {
         let min = partition[..=end]
             .iter()
             .filter_map(|(_, row)| Self::resolve_column_value(row, col))
@@ -6166,7 +7271,11 @@ impl QueryExecutor {
     }
 
     /// Computes running maximum up to and including the current row.
-    fn compute_running_max(col: &str, partition: &[(usize, Map<String, Value>)], end: usize) -> Value {
+    fn compute_running_max(
+        col: &str,
+        partition: &[(usize, Map<String, Value>)],
+        end: usize,
+    ) -> Value {
         let max = partition[..=end]
             .iter()
             .filter_map(|(_, row)| Self::resolve_column_value(row, col))
@@ -6203,8 +7312,18 @@ impl QueryExecutor {
     /// Resolves join column references from the ON condition.
     /// Returns (left_column_name, right_column_name) without alias prefixes.
     fn resolve_join_columns(on: &crate::parser::JoinOn) -> Result<(String, String)> {
-        let left = on.left.split('.').next_back().unwrap_or(&on.left).to_string();
-        let right = on.right.split('.').next_back().unwrap_or(&on.right).to_string();
+        let left = on
+            .left
+            .split('.')
+            .next_back()
+            .unwrap_or(&on.left)
+            .to_string();
+        let right = on
+            .right
+            .split('.')
+            .next_back()
+            .unwrap_or(&on.right)
+            .to_string();
         Ok((left, right))
     }
 
@@ -6238,7 +7357,9 @@ impl QueryExecutor {
     fn compare_values(a: &str, b: &str) -> std::cmp::Ordering {
         // Try numeric comparison
         if let (Ok(a_num), Ok(b_num)) = (a.parse::<f64>(), b.parse::<f64>()) {
-            return a_num.partial_cmp(&b_num).unwrap_or(std::cmp::Ordering::Equal);
+            return a_num
+                .partial_cmp(&b_num)
+                .unwrap_or(std::cmp::Ordering::Equal);
         }
         // Fall back to string comparison
         a.cmp(b)
@@ -6398,9 +7519,8 @@ impl QueryExecutor {
         use crate::parser::ImportFormat;
         Self::validate_file_path(file_path)?;
 
-        let content = std::fs::read_to_string(file_path).map_err(|_| {
-            CoreError::InvalidArgument("file not found or unreadable".to_string())
-        })?;
+        let content = std::fs::read_to_string(file_path)
+            .map_err(|_| CoreError::InvalidArgument("file not found or unreadable".to_string()))?;
 
         match format {
             ImportFormat::Csv => self.execute_import_csv(engine, txn_id, class, &content),
@@ -6427,9 +7547,8 @@ impl QueryExecutor {
         Self::validate_file_path(file_path)?;
 
         let start = std::time::Instant::now();
-        let content = std::fs::read_to_string(file_path).map_err(|_| {
-            CoreError::InvalidArgument("file not found or unreadable".to_string())
-        })?;
+        let content = std::fs::read_to_string(file_path)
+            .map_err(|_| CoreError::InvalidArgument("file not found or unreadable".to_string()))?;
 
         let entries = match format {
             ImportFormat::Csv => self.parse_csv_to_entries(class, &content)?,
@@ -6449,7 +7568,8 @@ impl QueryExecutor {
                 if let Some(ref graph) = self.graph {
                     for (key, _) in &entries {
                         if let Some(entity_id) = onto_core::EntityId::from_lsm_key(key) {
-                            let _ = graph.upsert_vertex_from_entity(&entity_id, &[class.to_string()]);
+                            let _ =
+                                graph.upsert_vertex_from_entity(&entity_id, &[class.to_string()]);
                         }
                     }
                 }
@@ -6458,7 +7578,9 @@ impl QueryExecutor {
                 let rate = entries.len() as f64 / elapsed.as_secs_f64();
                 Ok(QueryResult::Success(format!(
                     "{} row(s) copied in {:.2}s ({:.0} rows/sec)",
-                    entries.len(), elapsed.as_secs_f64(), rate
+                    entries.len(),
+                    elapsed.as_secs_f64(),
+                    rate
                 )))
             }
             Err(e) => {
@@ -6475,22 +7597,24 @@ impl QueryExecutor {
             .has_headers(true)
             .from_reader(content.as_bytes());
 
-        let headers: Vec<String> = reader.headers()
+        let headers: Vec<String> = reader
+            .headers()
             .map_err(|e| CoreError::InvalidArgument(format!("CSV header error: {}", e)))?
             .iter()
             .map(|h| h.trim().to_string())
             .collect();
 
         if headers.is_empty() {
-            return Err(CoreError::InvalidArgument("CSV file has no headers".to_string()));
+            return Err(CoreError::InvalidArgument(
+                "CSV file has no headers".to_string(),
+            ));
         }
 
         let mut entries = Vec::new();
 
         for result in reader.records() {
-            let record = result.map_err(|e| {
-                CoreError::InvalidArgument(format!("CSV parse error: {}", e))
-            })?;
+            let record = result
+                .map_err(|e| CoreError::InvalidArgument(format!("CSV parse error: {}", e)))?;
 
             let mut doc = serde_json::Map::new();
             doc.insert("__class__".to_string(), json!(class));
@@ -6540,8 +7664,10 @@ impl QueryExecutor {
                 if line.is_empty() {
                     continue;
                 }
-                if let serde_json::Value::Object(map) = serde_json::from_str::<serde_json::Value>(line)
-                    .map_err(|e| CoreError::InvalidArgument(format!("JSON parse error: {}", e)))?
+                if let serde_json::Value::Object(map) =
+                    serde_json::from_str::<serde_json::Value>(line).map_err(|e| {
+                        CoreError::InvalidArgument(format!("JSON parse error: {}", e))
+                    })?
                 {
                     let mut doc = serde_json::Map::new();
                     doc.insert("__class__".to_string(), json!(class));
@@ -6572,14 +7698,17 @@ impl QueryExecutor {
             .has_headers(true)
             .from_reader(content.as_bytes());
 
-        let headers: Vec<String> = reader.headers()
+        let headers: Vec<String> = reader
+            .headers()
             .map_err(|e| CoreError::InvalidArgument(format!("CSV header error: {}", e)))?
             .iter()
             .map(|h| h.trim().to_string())
             .collect();
 
         if headers.is_empty() {
-            return Err(CoreError::InvalidArgument("CSV file has no headers".to_string()));
+            return Err(CoreError::InvalidArgument(
+                "CSV file has no headers".to_string(),
+            ));
         }
 
         // Collect all valid rows first, then batch insert
@@ -6616,11 +7745,16 @@ impl QueryExecutor {
         }
 
         // Batch insert into transaction buffer
-        let imported = engine.txn_put_batch(txn_id, batch)
-            .map_err(|e| CoreError::InvalidArgument(format!("batch insert error: {}", e)))? as u64;
+        let imported = engine
+            .txn_put_batch(txn_id, batch)
+            .map_err(|e| CoreError::InvalidArgument(format!("batch insert error: {}", e)))?
+            as u64;
 
         if errors.is_empty() {
-            Ok(QueryResult::Success(format!("{} row(s) imported from CSV", imported)))
+            Ok(QueryResult::Success(format!(
+                "{} row(s) imported from CSV",
+                imported
+            )))
         } else {
             let msg = format!(
                 "{} row(s) imported, {} error(s): {}",
@@ -6689,9 +7823,8 @@ impl QueryExecutor {
         class: &str,
         content: &str,
     ) -> Result<QueryResult> {
-        let arr: Vec<serde_json::Value> = serde_json::from_str(content).map_err(|e| {
-            CoreError::InvalidArgument(format!("JSON parse error: {}", e))
-        })?;
+        let arr: Vec<serde_json::Value> = serde_json::from_str(content)
+            .map_err(|e| CoreError::InvalidArgument(format!("JSON parse error: {}", e)))?;
 
         let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(arr.len());
         let mut errors = Vec::new();
@@ -6714,8 +7847,10 @@ impl QueryExecutor {
             }
         }
 
-        let imported = engine.txn_put_batch(txn_id, batch)
-            .map_err(|e| CoreError::InvalidArgument(format!("batch insert error: {}", e)))? as u64;
+        let imported = engine
+            .txn_put_batch(txn_id, batch)
+            .map_err(|e| CoreError::InvalidArgument(format!("batch insert error: {}", e)))?
+            as u64;
 
         Self::build_import_result(imported, errors)
     }
@@ -6763,8 +7898,10 @@ impl QueryExecutor {
             }
         }
 
-        let imported = engine.txn_put_batch(txn_id, batch)
-            .map_err(|e| CoreError::InvalidArgument(format!("batch insert error: {}", e)))? as u64;
+        let imported = engine
+            .txn_put_batch(txn_id, batch)
+            .map_err(|e| CoreError::InvalidArgument(format!("batch insert error: {}", e)))?
+            as u64;
 
         Self::build_import_result(imported, errors)
     }
@@ -6781,9 +7918,13 @@ impl QueryExecutor {
     ) -> Result<()> {
         let map = match obj {
             serde_json::Value::Object(m) => m,
-            _ => return Err(CoreError::InvalidArgument(
-                format!("row {}: expected JSON object, got {}", row_num, obj_type_name(obj))
-            )),
+            _ => {
+                return Err(CoreError::InvalidArgument(format!(
+                    "row {}: expected JSON object, got {}",
+                    row_num,
+                    obj_type_name(obj)
+                )))
+            }
         };
 
         let mut columns = Vec::new();
@@ -6801,7 +7942,10 @@ impl QueryExecutor {
     /// Builds the import result message, returning an error if all rows failed.
     fn build_import_result(imported: u64, errors: Vec<String>) -> Result<QueryResult> {
         if errors.is_empty() {
-            Ok(QueryResult::Success(format!("{} row(s) imported from JSON", imported)))
+            Ok(QueryResult::Success(format!(
+                "{} row(s) imported from JSON",
+                imported
+            )))
         } else {
             let msg = format!(
                 "{} row(s) imported, {} error(s): {}",
@@ -6841,21 +7985,27 @@ impl QueryExecutor {
         // Project requested columns
         if returns.is_empty() {
             // Remove __pk__ from results
-            let cleaned: Vec<Map<String, Value>> = rows.into_iter().map(|mut r| {
-                r.remove("__pk__");
-                r
-            }).collect();
+            let cleaned: Vec<Map<String, Value>> = rows
+                .into_iter()
+                .map(|mut r| {
+                    r.remove("__pk__");
+                    r
+                })
+                .collect();
             Ok(QueryResult::Rows(cleaned))
         } else {
-            let projected: Vec<Map<String, Value>> = rows.iter().map(|row| {
-                let mut result = Map::new();
-                for col in returns {
-                    if let Some(val) = Self::resolve_column_value(row, col) {
-                        result.insert(col.clone(), Value::String(val));
+            let projected: Vec<Map<String, Value>> = rows
+                .iter()
+                .map(|row| {
+                    let mut result = Map::new();
+                    for col in returns {
+                        if let Some(val) = Self::resolve_column_value(row, col) {
+                            result.insert(col.clone(), Value::String(val));
+                        }
                     }
-                }
-                result
-            }).collect();
+                    result
+                })
+                .collect();
             Ok(QueryResult::Rows(projected))
         }
     }
@@ -6896,11 +8046,14 @@ impl QueryExecutor {
                             continue;
                         }
                         match eval_binary_filter(&brow, filter_expr) {
-                            Some(true) => { allowed_ids.insert(key.clone()); }
+                            Some(true) => {
+                                allowed_ids.insert(key.clone());
+                            }
                             Some(false) => {}
                             None => {
                                 if let Some(ref doc) = brow.to_map() {
-                                    if self.matches_filter(engine, doc, &Some(filter_expr.clone())) {
+                                    if self.matches_filter(engine, doc, &Some(filter_expr.clone()))
+                                    {
                                         allowed_ids.insert(key.clone());
                                     }
                                 }
@@ -6912,21 +8065,27 @@ impl QueryExecutor {
                     if let Ok(serde_json::Value::Object(ref doc)) =
                         serde_json::from_slice::<serde_json::Value>(val_bytes)
                     {
-                        if class_hierarchy.contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
-                            && self.matches_filter(engine, doc, &Some(filter_expr.clone())) {
-                                allowed_ids.insert(key.clone());
-                            }
+                        if class_hierarchy
+                            .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                            && self.matches_filter(engine, doc, &Some(filter_expr.clone()))
+                        {
+                            allowed_ids.insert(key.clone());
+                        }
                     }
                 }
             }
 
-            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search_filtered(
-                class, column, query_vector, top_k, &allowed_ids,
-            )?
+            engine
+                .vector_index_manager()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .search_filtered(class, column, query_vector, top_k, &allowed_ids)?
         } else {
-            engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search(
-                class, column, query_vector, top_k,
-            )?
+            engine
+                .vector_index_manager()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .search(class, column, query_vector, top_k)?
         };
 
         // Fetch full documents for the search results
@@ -6944,10 +8103,7 @@ impl QueryExecutor {
                 };
                 if let Some(mut d) = doc {
                     // Add the distance as a virtual column
-                    d.insert(
-                        "_distance".to_string(),
-                        serde_json::json!(result.distance),
-                    );
+                    d.insert("_distance".to_string(), serde_json::json!(result.distance));
                     rows.push(d);
                 }
             }
@@ -7012,20 +8168,29 @@ impl QueryExecutor {
             return Ok(None);
         }
 
-        let index_mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+        let index_mgr = engine
+            .index_manager()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
 
         let pkeys: Vec<Vec<u8>> = match filter {
             FilterExpr::Eq(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                index_mgr.lookup_eq_read(class, &col, &json_val).unwrap_or_default()
+                index_mgr
+                    .lookup_eq_read(class, &col, &json_val)
+                    .unwrap_or_default()
             }
             FilterExpr::Gt(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                index_mgr.lookup_gt_read(class, &col, &json_val).unwrap_or_default()
+                index_mgr
+                    .lookup_gt_read(class, &col, &json_val)
+                    .unwrap_or_default()
             }
             FilterExpr::Lt(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                index_mgr.lookup_lt_read(class, &col, &json_val).unwrap_or_default()
+                index_mgr
+                    .lookup_lt_read(class, &col, &json_val)
+                    .unwrap_or_default()
             }
             FilterExpr::Gte(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
@@ -7080,7 +8245,11 @@ impl QueryExecutor {
     /// subclass-aware matching: a document with `__class__ = "Employee"` matches a filter
     /// on `__class__ = "Person"` if Employee is a subclass of Person.
     #[allow(dead_code)]
-    fn eval_filter_static_with_hierarchy(doc: &Map<String, Value>, filter: &FilterExpr, class_hierarchy: &HashSet<String>) -> bool {
+    fn eval_filter_static_with_hierarchy(
+        doc: &Map<String, Value>,
+        filter: &FilterExpr,
+        class_hierarchy: &HashSet<String>,
+    ) -> bool {
         // Helper to resolve column value (preserving original type) with alias support
         let resolve_val = |col: &str| -> Option<&Value> {
             // Try exact match first
@@ -7096,24 +8265,20 @@ impl QueryExecutor {
             None
         };
         match filter {
-            FilterExpr::Eq(col, val) => {
-                resolve_val(col).is_some_and(|v| {
-                    if col == "__class__" && !class_hierarchy.is_empty() {
-                        Self::class_value_matches_hierarchy(v, val, class_hierarchy)
-                    } else {
-                        Self::value_matches_static(v, val)
-                    }
-                })
-            }
-            FilterExpr::Ne(col, val) => {
-                !resolve_val(col).is_some_and(|v| {
-                    if col == "__class__" && !class_hierarchy.is_empty() {
-                        Self::class_value_matches_hierarchy(v, val, class_hierarchy)
-                    } else {
-                        Self::value_matches_static(v, val)
-                    }
-                })
-            }
+            FilterExpr::Eq(col, val) => resolve_val(col).is_some_and(|v| {
+                if col == "__class__" && !class_hierarchy.is_empty() {
+                    Self::class_value_matches_hierarchy(v, val, class_hierarchy)
+                } else {
+                    Self::value_matches_static(v, val)
+                }
+            }),
+            FilterExpr::Ne(col, val) => !resolve_val(col).is_some_and(|v| {
+                if col == "__class__" && !class_hierarchy.is_empty() {
+                    Self::class_value_matches_hierarchy(v, val, class_hierarchy)
+                } else {
+                    Self::value_matches_static(v, val)
+                }
+            }),
             FilterExpr::Gt(col, val) => {
                 resolve_val(col).is_some_and(|v| Self::value_gt_static(v, val))
             }
@@ -7126,32 +8291,25 @@ impl QueryExecutor {
             FilterExpr::Lte(col, val) => {
                 resolve_val(col).is_some_and(|v| Self::value_lte_static(v, val))
             }
-            FilterExpr::Like(col, pattern) => {
-                resolve_val(col).is_some_and(|v| {
-                    let s = match v {
-                        Value::String(s) => s.clone(),
-                        _ => v.to_string(),
-                    };
-                    Self::like_match(&s, pattern)
-                })
-            }
-            FilterExpr::Between(col, low, high) => {
-                resolve_val(col).is_some_and(|v| {
-                    Self::value_gte_static(v, low) && Self::value_lte_static(v, high)
-                })
-            }
-            FilterExpr::In(col, values) => {
-                resolve_val(col).is_some_and(|v| {
-                    if col == "__class__" && !class_hierarchy.is_empty() {
-                        values.iter().any(|lv| Self::class_value_matches_hierarchy(v, lv, class_hierarchy))
-                    } else {
-                        values.iter().any(|lv| Self::value_matches_static(v, lv))
-                    }
-                })
-            }
-            FilterExpr::IsNull(col) => {
-                resolve_val(col).is_none_or(|v| matches!(v, Value::Null))
-            }
+            FilterExpr::Like(col, pattern) => resolve_val(col).is_some_and(|v| {
+                let s = match v {
+                    Value::String(s) => s.clone(),
+                    _ => v.to_string(),
+                };
+                Self::like_match(&s, pattern)
+            }),
+            FilterExpr::Between(col, low, high) => resolve_val(col)
+                .is_some_and(|v| Self::value_gte_static(v, low) && Self::value_lte_static(v, high)),
+            FilterExpr::In(col, values) => resolve_val(col).is_some_and(|v| {
+                if col == "__class__" && !class_hierarchy.is_empty() {
+                    values
+                        .iter()
+                        .any(|lv| Self::class_value_matches_hierarchy(v, lv, class_hierarchy))
+                } else {
+                    values.iter().any(|lv| Self::value_matches_static(v, lv))
+                }
+            }),
+            FilterExpr::IsNull(col) => resolve_val(col).is_none_or(|v| matches!(v, Value::Null)),
             FilterExpr::IsNotNull(col) => {
                 resolve_val(col).is_some_and(|v| !matches!(v, Value::Null))
             }
@@ -7173,7 +8331,11 @@ impl QueryExecutor {
     /// Checks if a document's __class__ value matches a target class via the hierarchy.
     /// Returns true if the document's class equals the target or is a subclass of it.
     #[allow(dead_code)]
-    fn class_value_matches_hierarchy(doc_val: &Value, target: &LiteralValue, class_hierarchy: &HashSet<String>) -> bool {
+    fn class_value_matches_hierarchy(
+        doc_val: &Value,
+        target: &LiteralValue,
+        class_hierarchy: &HashSet<String>,
+    ) -> bool {
         match (doc_val, target) {
             (Value::String(doc_class), LiteralValue::String(target_class)) => {
                 // Direct match or document's class is in the hierarchy (i.e. a subclass of target)
@@ -7226,10 +8388,7 @@ impl QueryExecutor {
     }
 
     /// Fetches rows by their primary keys (plan-driven path, no txn).
-    fn fetch_rows_by_pks(
-        engine: &LsmEngine,
-        pkeys: &[Vec<u8>],
-    ) -> Result<Vec<Map<String, Value>>> {
+    fn fetch_rows_by_pks(engine: &LsmEngine, pkeys: &[Vec<u8>]) -> Result<Vec<Map<String, Value>>> {
         let mut rows = Vec::new();
         for pk in pkeys {
             if let Ok(Some(val_bytes)) = engine.get(pk) {
@@ -7259,16 +8418,19 @@ impl QueryExecutor {
                 serde_json::Value::Null
             }
             LiteralValue::Array(arr) => {
-                let json_arr: Vec<serde_json::Value> = arr
-                    .iter()
-                    .map(Self::literal_to_json_static)
-                    .collect();
+                let json_arr: Vec<serde_json::Value> =
+                    arr.iter().map(Self::literal_to_json_static).collect();
                 serde_json::Value::Array(json_arr)
             }
         }
     }
 
-    fn matches_filter(&self, engine: &LsmEngine, doc: &Map<String, Value>, filter: &Option<FilterExpr>) -> bool {
+    fn matches_filter(
+        &self,
+        engine: &LsmEngine,
+        doc: &Map<String, Value>,
+        filter: &Option<FilterExpr>,
+    ) -> bool {
         match filter {
             None => true,
             Some(expr) => self.eval_filter(engine, doc, expr),
@@ -7277,15 +8439,13 @@ impl QueryExecutor {
 
     fn eval_filter(&self, engine: &LsmEngine, doc: &Map<String, Value>, expr: &FilterExpr) -> bool {
         match expr {
-            FilterExpr::Eq(col, val) => {
-                doc.get(col).is_some_and(|v| {
-                    if col == "__class__" {
-                        self.class_value_matches(engine, v, val)
-                    } else {
-                        self.property_value_matches(engine, doc, col, val)
-                    }
-                })
-            }
+            FilterExpr::Eq(col, val) => doc.get(col).is_some_and(|v| {
+                if col == "__class__" {
+                    self.class_value_matches(engine, v, val)
+                } else {
+                    self.property_value_matches(engine, doc, col, val)
+                }
+            }),
             FilterExpr::Ne(col, val) => {
                 // SQL semantics: NULL != anything is NULL (falsy)
                 match doc.get(col) {
@@ -7300,61 +8460,47 @@ impl QueryExecutor {
                     None => false, // missing column → NULL → Ne is false
                 }
             }
-            FilterExpr::Gt(col, val) => {
-                doc.get(col)
-                    .is_some_and(|v| self.value_gt(v, val))
-            }
-            FilterExpr::Lt(col, val) => {
-                doc.get(col)
-                    .is_some_and(|v| self.value_lt(v, val))
-            }
-            FilterExpr::Gte(col, val) => {
-                doc.get(col)
-                    .is_some_and(|v| self.value_gt(v, val) || self.value_matches(v, val))
-            }
-            FilterExpr::Lte(col, val) => {
-                doc.get(col)
-                    .is_some_and(|v| self.value_lt(v, val) || self.value_matches(v, val))
-            }
-            FilterExpr::Like(col, pattern) => {
-                doc.get(col).is_some_and(|v| {
-                    let s = match v {
-                        Value::String(s) => s.clone(),
-                        _ => v.to_string(),
-                    };
-                    Self::like_match(&s, pattern)
-                })
-            }
-            FilterExpr::Between(col, low, high) => {
-                doc.get(col).is_some_and(|v| {
-                    self.value_gte(v, low) && self.value_lte(v, high)
-                })
-            }
-            FilterExpr::In(col, values) => {
-                doc.get(col).is_some_and(|v| {
-                    if col == "__class__" {
-                        values.iter().any(|val| self.class_value_matches(engine, v, val))
-                    } else {
-                        values.iter().any(|val| self.property_value_matches(engine, doc, col, val))
-                    }
-                })
-            }
+            FilterExpr::Gt(col, val) => doc.get(col).is_some_and(|v| self.value_gt(v, val)),
+            FilterExpr::Lt(col, val) => doc.get(col).is_some_and(|v| self.value_lt(v, val)),
+            FilterExpr::Gte(col, val) => doc
+                .get(col)
+                .is_some_and(|v| self.value_gt(v, val) || self.value_matches(v, val)),
+            FilterExpr::Lte(col, val) => doc
+                .get(col)
+                .is_some_and(|v| self.value_lt(v, val) || self.value_matches(v, val)),
+            FilterExpr::Like(col, pattern) => doc.get(col).is_some_and(|v| {
+                let s = match v {
+                    Value::String(s) => s.clone(),
+                    _ => v.to_string(),
+                };
+                Self::like_match(&s, pattern)
+            }),
+            FilterExpr::Between(col, low, high) => doc
+                .get(col)
+                .is_some_and(|v| self.value_gte(v, low) && self.value_lte(v, high)),
+            FilterExpr::In(col, values) => doc.get(col).is_some_and(|v| {
+                if col == "__class__" {
+                    values
+                        .iter()
+                        .any(|val| self.class_value_matches(engine, v, val))
+                } else {
+                    values
+                        .iter()
+                        .any(|val| self.property_value_matches(engine, doc, col, val))
+                }
+            }),
             FilterExpr::InSubquery(col, subquery) => {
                 let sub_result = self.execute_with_engine_inner(subquery, engine);
                 match sub_result {
-                    Ok(QueryResult::Rows(rows)) => {
-                        doc.get(col).is_some_and(|v| {
-                            rows.iter().any(|row| {
-                                row.values().any(|sv| {
-                                    match (v, sv) {
-                                        (Value::String(a), Value::String(b)) => a == b,
-                                        (Value::Number(a), Value::Number(b)) => a == b,
-                                        _ => *v == *sv,
-                                    }
-                                })
+                    Ok(QueryResult::Rows(rows)) => doc.get(col).is_some_and(|v| {
+                        rows.iter().any(|row| {
+                            row.values().any(|sv| match (v, sv) {
+                                (Value::String(a), Value::String(b)) => a == b,
+                                (Value::Number(a), Value::Number(b)) => a == b,
+                                _ => *v == *sv,
                             })
                         })
-                    }
+                    }),
                     _ => false,
                 }
             }
@@ -7372,15 +8518,9 @@ impl QueryExecutor {
                     _ => false,
                 }
             }
-            FilterExpr::IsNull(col) => {
-                doc.get(col).is_none_or(|v| matches!(v, Value::Null))
-            }
-            FilterExpr::IsNotNull(col) => {
-                doc.get(col).is_some_and(|v| !matches!(v, Value::Null))
-            }
-            FilterExpr::Not(expr) => {
-                !self.eval_filter(engine, doc, expr)
-            }
+            FilterExpr::IsNull(col) => doc.get(col).is_none_or(|v| matches!(v, Value::Null)),
+            FilterExpr::IsNotNull(col) => doc.get(col).is_some_and(|v| !matches!(v, Value::Null)),
+            FilterExpr::Not(expr) => !self.eval_filter(engine, doc, expr),
             FilterExpr::And(left, right) => {
                 self.eval_filter(engine, doc, left) && self.eval_filter(engine, doc, right)
             }
@@ -7426,7 +8566,10 @@ impl QueryExecutor {
     fn get_property_aliases(&self, engine: &LsmEngine, property: &str) -> HashSet<String> {
         // Check cache first
         {
-            let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .inference_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.property_aliases.get(property) {
                 return cached.clone();
             }
@@ -7463,8 +8606,13 @@ impl QueryExecutor {
 
         // Store in cache
         {
-            let mut cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
-            cache.property_aliases.insert(property.to_string(), aliases.clone());
+            let mut cache = self
+                .inference_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            cache
+                .property_aliases
+                .insert(property.to_string(), aliases.clone());
         }
 
         aliases
@@ -7477,7 +8625,10 @@ impl QueryExecutor {
     fn get_inverse_property(&self, engine: &LsmEngine, property: &str) -> Option<String> {
         // Check cache first
         {
-            let cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self
+                .inference_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.inverse_property.get(property) {
                 return cached.clone();
             }
@@ -7504,8 +8655,13 @@ impl QueryExecutor {
 
         // Store in cache
         {
-            let mut cache = self.inference_cache.lock().unwrap_or_else(|e| e.into_inner());
-            cache.inverse_property.insert(property.to_string(), result.clone());
+            let mut cache = self
+                .inference_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            cache
+                .inverse_property
+                .insert(property.to_string(), result.clone());
         }
 
         result
@@ -7566,7 +8722,9 @@ impl QueryExecutor {
                     for class_name in ontology.classes.keys() {
                         let doc_key = format!("{}::{}", class_name, current);
                         if let Ok(Some(doc_bytes)) = engine.get(doc_key.as_bytes()) {
-                            if let Ok(serde_json::Value::Object(doc)) = serde_json::from_slice::<serde_json::Value>(&doc_bytes) {
+                            if let Ok(serde_json::Value::Object(doc)) =
+                                serde_json::from_slice::<serde_json::Value>(&doc_bytes)
+                            {
                                 for alias in &property_aliases {
                                     if let Some(serde_json::Value::String(val)) = doc.get(alias) {
                                         if !visited.contains(val) {
@@ -7624,12 +8782,10 @@ impl QueryExecutor {
         // and check if that document has `col` pointing back to this document's ID.
         if self.is_symmetric_property(engine, col) {
             if let LiteralValue::String(target_id) = val {
-                let doc_id = doc.get("__pk__")
-                    .and_then(|v| v.as_str())
-                    .map(|pk| {
-                        // Extract the ID part from "Class::id"
-                        pk.rsplit("::").next().unwrap_or(pk).to_string()
-                    });
+                let doc_id = doc.get("__pk__").and_then(|v| v.as_str()).map(|pk| {
+                    // Extract the ID part from "Class::id"
+                    pk.rsplit("::").next().unwrap_or(pk).to_string()
+                });
                 if let Some(ref id) = doc_id {
                     if id == target_id {
                         // The filter is asking for documents where col = self, which always matches for symmetric
@@ -7646,20 +8802,27 @@ impl QueryExecutor {
         if let Some(inverse) = self.get_inverse_property(engine, col) {
             if let LiteralValue::String(target_id) = val {
                 // Look up the target document to see if it has the inverse property pointing to us
-                let doc_id = doc.get("__pk__")
+                let doc_id = doc
+                    .get("__pk__")
                     .and_then(|v| v.as_str())
                     .map(|pk| pk.rsplit("::").next().unwrap_or(pk).to_string());
                 if let Some(ref id) = doc_id {
                     // Check all classes for the target document
                     let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
                     for (_key, val_bytes) in &entries {
-                        if let Ok(ontology) = serde_json::from_slice::<onto_ontology::Ontology>(val_bytes) {
+                        if let Ok(ontology) =
+                            serde_json::from_slice::<onto_ontology::Ontology>(val_bytes)
+                        {
                             for class_name in ontology.classes.keys() {
                                 let target_key = format!("{}::{}", class_name, target_id);
                                 if let Ok(Some(target_bytes)) = engine.get(target_key.as_bytes()) {
-                                    if let Ok(serde_json::Value::Object(target_doc)) = serde_json::from_slice::<serde_json::Value>(&target_bytes) {
+                                    if let Ok(serde_json::Value::Object(target_doc)) =
+                                        serde_json::from_slice::<serde_json::Value>(&target_bytes)
+                                    {
                                         // Check if target has inverse property pointing to our doc
-                                        if let Some(serde_json::Value::String(inverse_val)) = target_doc.get(&inverse) {
+                                        if let Some(serde_json::Value::String(inverse_val)) =
+                                            target_doc.get(&inverse)
+                                        {
                                             if inverse_val == id {
                                                 return true;
                                             }
@@ -7798,7 +8961,8 @@ impl QueryExecutor {
                 Self::eval_arithmetic(op, &left_val, &right_val)
             }
             ValueExpr::Function { name, args } => {
-                let arg_values: Vec<Value> = args.iter()
+                let arg_values: Vec<Value> = args
+                    .iter()
                     .map(|a| self.evaluate_value_expr(a, row, engine))
                     .collect::<Result<Vec<_>>>()?;
                 Self::eval_builtin_function(name, &arg_values)
@@ -7839,9 +9003,14 @@ impl QueryExecutor {
             }
             "SUBSTRING" => {
                 if let Some(Value::String(s)) = args.first() {
-                    let start = args.get(1).and_then(|v| v.as_i64()).unwrap_or(1).max(1) as usize - 1;
-                    let len = args.get(2).and_then(|v| v.as_i64()).map(|l| l.max(0) as usize);
-                    let substr: String = s.chars().skip(start).take(len.unwrap_or(s.len())).collect();
+                    let start =
+                        args.get(1).and_then(|v| v.as_i64()).unwrap_or(1).max(1) as usize - 1;
+                    let len = args
+                        .get(2)
+                        .and_then(|v| v.as_i64())
+                        .map(|l| l.max(0) as usize);
+                    let substr: String =
+                        s.chars().skip(start).take(len.unwrap_or(s.len())).collect();
                     Ok(Value::String(substr))
                 } else {
                     Ok(Value::Null)
@@ -7887,7 +9056,10 @@ impl QueryExecutor {
                     match val {
                         Value::Number(n) => {
                             if let Some(f) = n.as_f64() {
-                                Ok(Value::Number(serde_json::Number::from_f64(f.abs()).unwrap_or(serde_json::Number::from(0))))
+                                Ok(Value::Number(
+                                    serde_json::Number::from_f64(f.abs())
+                                        .unwrap_or(serde_json::Number::from(0)),
+                                ))
                             } else {
                                 Ok(val.clone())
                             }
@@ -7906,7 +9078,10 @@ impl QueryExecutor {
                             if let Some(f) = n.as_f64() {
                                 let factor = 10f64.powi(decimals as i32);
                                 let rounded = (f * factor).round() / factor;
-                                Ok(Value::Number(serde_json::Number::from_f64(rounded).unwrap_or(serde_json::Number::from(0))))
+                                Ok(Value::Number(
+                                    serde_json::Number::from_f64(rounded)
+                                        .unwrap_or(serde_json::Number::from(0)),
+                                ))
                             } else {
                                 Ok(val.clone())
                             }
@@ -7923,7 +9098,8 @@ impl QueryExecutor {
                 if args.len() >= 2 {
                     let lon = args[0].as_f64().unwrap_or(0.0);
                     let lat = args[1].as_f64().unwrap_or(0.0);
-                    let point = onto_core::geo::Geometry::Point(onto_core::geo::Coord::new(lon, lat));
+                    let point =
+                        onto_core::geo::Geometry::Point(onto_core::geo::Coord::new(lon, lat));
                     let wkb = point.to_wkb();
                     Ok(Value::String(hex::encode(&wkb)))
                 } else {
@@ -8093,7 +9269,9 @@ impl QueryExecutor {
                     let lat = args[0].as_f64().unwrap_or(0.0);
                     let lon = args[1].as_f64().unwrap_or(0.0);
                     let precision = args.get(2).and_then(|v| v.as_i64()).unwrap_or(8) as usize;
-                    Ok(Value::String(onto_core::geo::geohash_encode(lat, lon, precision)))
+                    Ok(Value::String(onto_core::geo::geohash_encode(
+                        lat, lon, precision,
+                    )))
                 } else {
                     Ok(Value::Null)
                 }
@@ -8153,7 +9331,8 @@ impl QueryExecutor {
                         Ok(Value::Null)
                     } else {
                         let mean = values.iter().sum::<f64>() / values.len() as f64;
-                        let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+                        let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+                            / values.len() as f64;
                         Ok(json!(var.sqrt()))
                     }
                 } else {
@@ -8163,8 +9342,15 @@ impl QueryExecutor {
             "TS_MIN" => {
                 // TS_MIN(array) → minimum value
                 if let Some(Value::Array(arr)) = args.first() {
-                    let min = arr.iter().filter_map(|v| v.as_f64()).fold(f64::INFINITY, f64::min);
-                    if min == f64::INFINITY { Ok(Value::Null) } else { Ok(json!(min)) }
+                    let min = arr
+                        .iter()
+                        .filter_map(|v| v.as_f64())
+                        .fold(f64::INFINITY, f64::min);
+                    if min == f64::INFINITY {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(json!(min))
+                    }
                 } else {
                     Ok(Value::Null)
                 }
@@ -8172,8 +9358,15 @@ impl QueryExecutor {
             "TS_MAX" => {
                 // TS_MAX(array) → maximum value
                 if let Some(Value::Array(arr)) = args.first() {
-                    let max = arr.iter().filter_map(|v| v.as_f64()).fold(f64::NEG_INFINITY, f64::max);
-                    if max == f64::NEG_INFINITY { Ok(Value::Null) } else { Ok(json!(max)) }
+                    let max = arr
+                        .iter()
+                        .filter_map(|v| v.as_f64())
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    if max == f64::NEG_INFINITY {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(json!(max))
+                    }
                 } else {
                     Ok(Value::Null)
                 }
@@ -8202,7 +9395,9 @@ impl QueryExecutor {
                     let values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                     let threshold = args.get(1).and_then(|v| v.as_f64()).unwrap_or(2.0);
                     let anomalies = onto_core::time_series::detect_anomalies(&values, threshold);
-                    Ok(Value::Array(anomalies.into_iter().map(|i| json!(i)).collect()))
+                    Ok(Value::Array(
+                        anomalies.into_iter().map(|i| json!(i)).collect(),
+                    ))
                 } else {
                     Ok(Value::Null)
                 }
@@ -8231,7 +9426,8 @@ impl QueryExecutor {
                     if values.is_empty() {
                         Ok(Value::Null)
                     } else {
-                        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        values
+                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                         let idx = (percentile * (values.len() - 1) as f64).round() as usize;
                         Ok(json!(values[idx.min(values.len() - 1)]))
                     }
@@ -8246,7 +9442,8 @@ impl QueryExecutor {
                     if values.is_empty() {
                         Ok(Value::Null)
                     } else {
-                        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        values
+                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                         let mid = values.len() / 2;
                         if values.len().is_multiple_of(2) {
                             Ok(json!((values[mid - 1] + values[mid]) / 2.0))
@@ -8258,7 +9455,10 @@ impl QueryExecutor {
                     Ok(Value::Null)
                 }
             }
-            _ => Err(CoreError::InvalidArgument(format!("unknown function: {}", name))),
+            _ => Err(CoreError::InvalidArgument(format!(
+                "unknown function: {}",
+                name
+            ))),
         }
     }
 
@@ -8288,7 +9488,11 @@ impl QueryExecutor {
         Ok(json!(result))
     }
 
-    fn project_columns(&self, doc: &Map<String, Value>, columns: &SelectColumns) -> Map<String, Value> {
+    fn project_columns(
+        &self,
+        doc: &Map<String, Value>,
+        columns: &SelectColumns,
+    ) -> Map<String, Value> {
         match columns {
             SelectColumns::All => doc.clone(),
             SelectColumns::Columns(items) => {
@@ -8352,7 +9556,10 @@ impl QueryExecutor {
         doc: &Map<String, Value>,
     ) -> Result<()> {
         // Find the ontology containing this class
-        let ontology = match self.ontology_store.find_ontology_for_class_global(engine, class)? {
+        let ontology = match self
+            .ontology_store
+            .find_ontology_for_class_global(engine, class)?
+        {
             Some(o) => o,
             None => return Ok(()), // No ontology defined — skip validation
         };
@@ -8408,7 +9615,10 @@ impl QueryExecutor {
         doc: &Map<String, Value>,
     ) -> Result<()> {
         // Find the ontology containing this class
-        let ontology = match self.ontology_store.find_ontology_for_class_global(engine, class)? {
+        let ontology = match self
+            .ontology_store
+            .find_ontology_for_class_global(engine, class)?
+        {
             Some(o) => o,
             None => return Ok(()), // No ontology — no constraints
         };
@@ -8453,13 +9663,14 @@ impl QueryExecutor {
                     .collect();
 
                 // Check if all unique column values match
-                let all_match = new_values
-                    .iter()
-                    .zip(existing_values.iter())
-                    .all(|(new, existing)| match (new, existing) {
-                        (Some(n), Some(e)) => n == e,
-                        _ => false,
-                    });
+                let all_match =
+                    new_values
+                        .iter()
+                        .zip(existing_values.iter())
+                        .all(|(new, existing)| match (new, existing) {
+                            (Some(n), Some(e)) => n == e,
+                            _ => false,
+                        });
 
                 if all_match {
                     let constraint_desc = unique_cols.join(", ");
@@ -8507,7 +9718,12 @@ impl QueryExecutor {
     ) -> Result<()> {
         // Collect restrictions from this class and all superclasses
         let mut all_restrictions = Vec::new();
-        Self::collect_restrictions(ontology, &class_def.name, &mut all_restrictions, &mut std::collections::HashSet::new());
+        Self::collect_restrictions(
+            ontology,
+            &class_def.name,
+            &mut all_restrictions,
+            &mut std::collections::HashSet::new(),
+        );
 
         for restriction in &all_restrictions {
             match restriction {
@@ -8542,7 +9758,10 @@ impl QueryExecutor {
                         )));
                     }
                 }
-                onto_ontology::Restriction::ExactCardinality { property, count: expected } => {
+                onto_ontology::Restriction::ExactCardinality {
+                    property,
+                    count: expected,
+                } => {
                     let count = Self::count_property_values(doc, property);
                     if count != *expected {
                         return Err(CoreError::InvalidArgument(format!(
@@ -8551,7 +9770,10 @@ impl QueryExecutor {
                         )));
                     }
                 }
-                onto_ontology::Restriction::SomeValuesFrom { property, class: required_class } => {
+                onto_ontology::Restriction::SomeValuesFrom {
+                    property,
+                    class: required_class,
+                } => {
                     // At least one value of the property must be an instance of the required class
                     if let Some(val) = doc.get(property) {
                         if let Value::String(ref_id) = val {
@@ -8564,7 +9786,10 @@ impl QueryExecutor {
                         }
                     }
                 }
-                onto_ontology::Restriction::AllValuesFrom { property, class: required_class } => {
+                onto_ontology::Restriction::AllValuesFrom {
+                    property,
+                    class: required_class,
+                } => {
                     // All values of the property must be instances of the required class
                     if let Some(val) = doc.get(property) {
                         match val {
@@ -8579,7 +9804,11 @@ impl QueryExecutor {
                             Value::Array(items) => {
                                 for item in items {
                                     if let Value::String(ref_id) = item {
-                                        if !self.is_instance_of_class(engine, ref_id, required_class)? {
+                                        if !self.is_instance_of_class(
+                                            engine,
+                                            ref_id,
+                                            required_class,
+                                        )? {
                                             return Err(CoreError::InvalidArgument(format!(
                                                 "restriction violation: all values of property '{}' must be instances of class '{}'",
                                                 property, required_class
@@ -8641,7 +9870,9 @@ impl QueryExecutor {
         for class_name in &hierarchy {
             let key = format!("{}::{}", class_name, doc_id);
             if let Ok(Some(val_bytes)) = engine.get(key.as_bytes()) {
-                if let Ok(serde_json::Value::Object(ref doc)) = serde_json::from_slice::<serde_json::Value>(&val_bytes) {
+                if let Ok(serde_json::Value::Object(ref doc)) =
+                    serde_json::from_slice::<serde_json::Value>(&val_bytes)
+                {
                     if let Some(Value::String(doc_class)) = doc.get("__class__") {
                         if hierarchy.contains(doc_class.as_str()) {
                             return Ok(true);
@@ -8749,10 +9980,7 @@ impl QueryExecutor {
                 Value::Null
             }
             LiteralValue::Array(arr) => {
-                let json_arr: Vec<Value> = arr
-                    .iter()
-                    .map(|v| self.literal_to_json(v))
-                    .collect();
+                let json_arr: Vec<Value> = arr.iter().map(|v| self.literal_to_json(v)).collect();
                 Value::Array(json_arr)
             }
         }
@@ -8829,9 +10057,17 @@ impl QueryResult {
                 // Header
                 if let Some(first) = rows.first() {
                     let cols: Vec<&String> = first.keys().collect();
-                    output.push_str(&cols.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(" | "));
+                    output.push_str(
+                        &cols
+                            .iter()
+                            .map(|c| c.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                    );
                     output.push('\n');
-                    output.push_str(&"-".repeat(cols.iter().map(|c| c.len()).sum::<usize>() + cols.len() * 3));
+                    output.push_str(
+                        &"-".repeat(cols.iter().map(|c| c.len()).sum::<usize>() + cols.len() * 3),
+                    );
                     output.push('\n');
                 }
 
@@ -8863,7 +10099,12 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
     use crate::optimizer::PlanNode;
 
     match node {
-        PlanNode::SeqScan { table, alias, estimated_rows, .. } => {
+        PlanNode::SeqScan {
+            table,
+            alias,
+            estimated_rows,
+            ..
+        } => {
             json!({
                 "type": "SeqScan",
                 "table": table,
@@ -8871,7 +10112,12 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
-        PlanNode::IndexScan { table, index_column, estimated_rows, .. } => {
+        PlanNode::IndexScan {
+            table,
+            index_column,
+            estimated_rows,
+            ..
+        } => {
             json!({
                 "type": "IndexScan",
                 "table": table,
@@ -8879,7 +10125,12 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
-        PlanNode::IndexLookup { table, index_column, estimated_rows, .. } => {
+        PlanNode::IndexLookup {
+            table,
+            index_column,
+            estimated_rows,
+            ..
+        } => {
             json!({
                 "type": "IndexLookup",
                 "table": table,
@@ -8887,7 +10138,13 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
-        PlanNode::VectorSearch { table, column, top_k, estimated_rows, .. } => {
+        PlanNode::VectorSearch {
+            table,
+            column,
+            top_k,
+            estimated_rows,
+            ..
+        } => {
             json!({
                 "type": "VectorSearch",
                 "table": table,
@@ -8896,21 +10153,34 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
-        PlanNode::Filter { input, estimated_rows, .. } => {
+        PlanNode::Filter {
+            input,
+            estimated_rows,
+            ..
+        } => {
             json!({
                 "type": "Filter",
                 "input": format_plan_node(input),
                 "rows": estimated_rows,
             })
         }
-        PlanNode::Projection { input, estimated_rows, .. } => {
+        PlanNode::Projection {
+            input,
+            estimated_rows,
+            ..
+        } => {
             json!({
                 "type": "Projection",
                 "input": format_plan_node(input),
                 "rows": estimated_rows,
             })
         }
-        PlanNode::NestedLoopJoin { left, right, estimated_rows, .. } => {
+        PlanNode::NestedLoopJoin {
+            left,
+            right,
+            estimated_rows,
+            ..
+        } => {
             json!({
                 "type": "NestedLoopJoin",
                 "left": format_plan_node(left),
@@ -8918,7 +10188,12 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
-        PlanNode::HashJoin { left, right, estimated_rows, .. } => {
+        PlanNode::HashJoin {
+            left,
+            right,
+            estimated_rows,
+            ..
+        } => {
             json!({
                 "type": "HashJoin",
                 "left": format_plan_node(left),
@@ -8926,7 +10201,12 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
-        PlanNode::SortMergeJoin { left, right, estimated_rows, .. } => {
+        PlanNode::SortMergeJoin {
+            left,
+            right,
+            estimated_rows,
+            ..
+        } => {
             json!({
                 "type": "SortMergeJoin",
                 "left": format_plan_node(left),
@@ -8934,10 +10214,16 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
-        PlanNode::Sort { input, order_by, estimated_rows, .. } => {
-            let ob_json: Vec<Value> = order_by.iter().map(|ob| {
-                json!({"column": ob.column, "ascending": ob.ascending})
-            }).collect();
+        PlanNode::Sort {
+            input,
+            order_by,
+            estimated_rows,
+            ..
+        } => {
+            let ob_json: Vec<Value> = order_by
+                .iter()
+                .map(|ob| json!({"column": ob.column, "ascending": ob.ascending}))
+                .collect();
             json!({
                 "type": "Sort",
                 "input": format_plan_node(input),
@@ -8945,7 +10231,12 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
-        PlanNode::Aggregation { input, group_by, estimated_rows, .. } => {
+        PlanNode::Aggregation {
+            input,
+            group_by,
+            estimated_rows,
+            ..
+        } => {
             json!({
                 "type": "Aggregation",
                 "input": format_plan_node(input),
@@ -8953,7 +10244,12 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
-        PlanNode::Limit { input, count, estimated_rows, .. } => {
+        PlanNode::Limit {
+            input,
+            count,
+            estimated_rows,
+            ..
+        } => {
             json!({
                 "type": "Limit",
                 "input": format_plan_node(input),
@@ -8961,7 +10257,13 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
-        PlanNode::Union { left, right, all, estimated_rows, .. } => {
+        PlanNode::Union {
+            left,
+            right,
+            all,
+            estimated_rows,
+            ..
+        } => {
             json!({
                 "type": "Union",
                 "all": all,
@@ -8970,15 +10272,23 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
-        PlanNode::WindowFunction { input, windows, estimated_rows, .. } => {
-            let win_json: Vec<Value> = windows.iter().map(|w| {
-                json!({
-                    "function": format!("{:?}", w.func),
-                    "argument": w.arg,
-                    "alias": w.alias,
-                    "partition_by": w.over.partition_by,
+        PlanNode::WindowFunction {
+            input,
+            windows,
+            estimated_rows,
+            ..
+        } => {
+            let win_json: Vec<Value> = windows
+                .iter()
+                .map(|w| {
+                    json!({
+                        "function": format!("{:?}", w.func),
+                        "argument": w.arg,
+                        "alias": w.alias,
+                        "partition_by": w.over.partition_by,
+                    })
                 })
-            }).collect();
+                .collect();
             json!({
                 "type": "WindowFunction",
                 "input": format_plan_node(input),
@@ -9026,7 +10336,9 @@ fn parse_geojson(map: &serde_json::Map<String, Value>) -> Option<onto_core::geo:
             if arr.len() >= 2 {
                 let lon = arr[0].as_f64()?;
                 let lat = arr[1].as_f64()?;
-                Some(onto_core::geo::Geometry::Point(onto_core::geo::Coord::new(lon, lat)))
+                Some(onto_core::geo::Geometry::Point(onto_core::geo::Coord::new(
+                    lon, lat,
+                )))
             } else {
                 None
             }
@@ -9194,7 +10506,8 @@ mod tests {
 
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'iPhone'").unwrap();
+        let ast =
+            QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'iPhone'").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Success(msg) => assert!(msg.contains("1 row(s) updated")),
@@ -9250,7 +10563,8 @@ mod tests {
 
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse("MATCH (p: Product) WHERE price > 900 RETURN name, price").unwrap();
+        let ast =
+            QueryParser::parse("MATCH (p: Product) WHERE price > 900 RETURN name, price").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -9269,7 +10583,8 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'Galaxy'").unwrap();
+        let ast =
+            QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'Galaxy'").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Success(msg) => assert!(msg.contains("0 row(s) updated")),
@@ -9308,7 +10623,10 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse("UPDATE Product SET name = 'iPhone 15', price = 1099 WHERE name = 'iPhone'").unwrap();
+        let ast = QueryParser::parse(
+            "UPDATE Product SET name = 'iPhone 15', price = 1099 WHERE name = 'iPhone'",
+        )
+        .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Success(msg) => assert!(msg.contains("1 row(s) updated")),
@@ -9418,10 +10736,17 @@ mod tests {
         }
 
         // 2. INSERT
-        for (name, price) in [("iPhone", 999), ("iPad", 799), ("MacBook", 1999), ("AirPods", 249)] {
+        for (name, price) in [
+            ("iPhone", 999),
+            ("iPad", 799),
+            ("MacBook", 1999),
+            ("AirPods", 249),
+        ] {
             let ast = QueryParser::parse(&format!(
-                "INSERT INTO Product (name, price) VALUES ('{}', {})", name, price
-            )).unwrap();
+                "INSERT INTO Product (name, price) VALUES ('{}', {})",
+                name, price
+            ))
+            .unwrap();
             executor.execute(&ast).unwrap();
         }
 
@@ -9442,7 +10767,8 @@ mod tests {
         }
 
         // 5. UPDATE
-        let ast = QueryParser::parse("UPDATE Product SET price = 1099 WHERE name = 'iPhone'").unwrap();
+        let ast =
+            QueryParser::parse("UPDATE Product SET price = 1099 WHERE name = 'iPhone'").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Success(msg) => assert!(msg.contains("1 row(s) updated")),
@@ -9515,7 +10841,8 @@ mod tests {
         executor.engine().flush().unwrap();
 
         // Update
-        let ast = QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'iPhone'").unwrap();
+        let ast =
+            QueryParser::parse("UPDATE Product SET price = 899 WHERE name = 'iPhone'").unwrap();
         executor.execute(&ast).unwrap();
         executor.engine().flush().unwrap();
 
@@ -9562,8 +10889,9 @@ mod tests {
 
         // JOIN: Product p JOIN Order o ON p.name = o.product_id
         let ast = QueryParser::parse(
-            "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id"
-        ).unwrap();
+            "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id",
+        )
+        .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -9636,8 +10964,9 @@ mod tests {
         executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse(
-            "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id"
-        ).unwrap();
+            "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id",
+        )
+        .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -9657,9 +10986,9 @@ mod tests {
         executor.engine().flush().unwrap();
 
         // SELECT * with JOIN should return all columns from both tables
-        let ast = QueryParser::parse(
-            "SELECT * FROM Product p JOIN Order o ON p.name = o.product_id"
-        ).unwrap();
+        let ast =
+            QueryParser::parse("SELECT * FROM Product p JOIN Order o ON p.name = o.product_id")
+                .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -9701,14 +11030,20 @@ mod tests {
         insert_row(&executor, "Product", "MacBook", 1999);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse("SELECT SUM(price) as total, AVG(price) as avg_price FROM Product").unwrap();
+        let ast =
+            QueryParser::parse("SELECT SUM(price) as total, AVG(price) as avg_price FROM Product")
+                .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].get("total").unwrap().as_i64().unwrap(), 3797);
                 let avg = rows[0].get("avg_price").unwrap().as_f64().unwrap();
-                assert!((avg - 1265.666).abs() < 1.0, "avg should be ~1265.67, got {}", avg);
+                assert!(
+                    (avg - 1265.666).abs() < 1.0,
+                    "avg should be ~1265.67, got {}",
+                    avg
+                );
             }
             _ => panic!("expected 1 row with sum and avg"),
         }
@@ -9722,7 +11057,9 @@ mod tests {
         insert_row(&executor, "Product", "MacBook", 1999);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse("SELECT MIN(price) as min_p, MAX(price) as max_p FROM Product").unwrap();
+        let ast =
+            QueryParser::parse("SELECT MIN(price) as min_p, MAX(price) as max_p FROM Product")
+                .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -9741,7 +11078,11 @@ mod tests {
         // Use a simple schema with a "category" field
         let ast = QueryAst::Insert {
             class: "Item".to_string(),
-            columns: vec!["name".to_string(), "category".to_string(), "price".to_string()],
+            columns: vec![
+                "name".to_string(),
+                "category".to_string(),
+                "price".to_string(),
+            ],
             values: vec![
                 LiteralValue::String("iPhone".to_string()),
                 LiteralValue::String("phone".to_string()),
@@ -9752,7 +11093,11 @@ mod tests {
 
         let ast = QueryAst::Insert {
             class: "Item".to_string(),
-            columns: vec!["name".to_string(), "category".to_string(), "price".to_string()],
+            columns: vec![
+                "name".to_string(),
+                "category".to_string(),
+                "price".to_string(),
+            ],
             values: vec![
                 LiteralValue::String("iPad".to_string()),
                 LiteralValue::String("tablet".to_string()),
@@ -9763,7 +11108,11 @@ mod tests {
 
         let ast = QueryAst::Insert {
             class: "Item".to_string(),
-            columns: vec!["name".to_string(), "category".to_string(), "price".to_string()],
+            columns: vec![
+                "name".to_string(),
+                "category".to_string(),
+                "price".to_string(),
+            ],
             values: vec![
                 LiteralValue::String("Galaxy".to_string()),
                 LiteralValue::String("phone".to_string()),
@@ -9774,7 +11123,11 @@ mod tests {
 
         let ast = QueryAst::Insert {
             class: "Item".to_string(),
-            columns: vec!["name".to_string(), "category".to_string(), "price".to_string()],
+            columns: vec![
+                "name".to_string(),
+                "category".to_string(),
+                "price".to_string(),
+            ],
             values: vec![
                 LiteralValue::String("Pixel".to_string()),
                 LiteralValue::String("phone".to_string()),
@@ -9787,24 +11140,27 @@ mod tests {
 
         // GROUP BY category with COUNT and SUM
         let ast = QueryParser::parse(
-            "SELECT category, COUNT(*) as cnt, SUM(price) as total FROM Item GROUP BY category"
-        ).unwrap();
+            "SELECT category, COUNT(*) as cnt, SUM(price) as total FROM Item GROUP BY category",
+        )
+        .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 2); // phone, tablet
 
                 // Find phone group
-                let phone_row = rows.iter().find(|r| {
-                    r.get("category").and_then(|v| v.as_str()) == Some("phone")
-                }).unwrap();
+                let phone_row = rows
+                    .iter()
+                    .find(|r| r.get("category").and_then(|v| v.as_str()) == Some("phone"))
+                    .unwrap();
                 assert_eq!(phone_row.get("cnt").unwrap().as_i64().unwrap(), 3);
                 assert_eq!(phone_row.get("total").unwrap().as_i64().unwrap(), 2597);
 
                 // Find tablet group
-                let tablet_row = rows.iter().find(|r| {
-                    r.get("category").and_then(|v| v.as_str()) == Some("tablet")
-                }).unwrap();
+                let tablet_row = rows
+                    .iter()
+                    .find(|r| r.get("category").and_then(|v| v.as_str()) == Some("tablet"))
+                    .unwrap();
                 assert_eq!(tablet_row.get("cnt").unwrap().as_i64().unwrap(), 1);
                 assert_eq!(tablet_row.get("total").unwrap().as_i64().unwrap(), 799);
             }
@@ -9824,7 +11180,11 @@ mod tests {
         ] {
             let ast = QueryAst::Insert {
                 class: "Item".to_string(),
-                columns: vec!["name".to_string(), "category".to_string(), "price".to_string()],
+                columns: vec![
+                    "name".to_string(),
+                    "category".to_string(),
+                    "price".to_string(),
+                ],
                 values: vec![
                     LiteralValue::String(name.to_string()),
                     LiteralValue::String(cat.to_string()),
@@ -9837,8 +11197,9 @@ mod tests {
 
         // GROUP BY category HAVING COUNT(*) > 1
         let ast = QueryParser::parse(
-            "SELECT category, COUNT(*) as cnt FROM Item GROUP BY category HAVING cnt > 1"
-        ).unwrap();
+            "SELECT category, COUNT(*) as cnt FROM Item GROUP BY category HAVING cnt > 1",
+        )
+        .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -9862,7 +11223,11 @@ mod tests {
         ] {
             let ast = QueryAst::Insert {
                 class: "Item".to_string(),
-                columns: vec!["name".to_string(), "category".to_string(), "price".to_string()],
+                columns: vec![
+                    "name".to_string(),
+                    "category".to_string(),
+                    "price".to_string(),
+                ],
                 values: vec![
                     LiteralValue::String(name.to_string()),
                     LiteralValue::String(cat.to_string()),
@@ -9874,8 +11239,9 @@ mod tests {
         executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse(
-            "SELECT category, COUNT(*) as cnt FROM Item GROUP BY category LIMIT 2"
-        ).unwrap();
+            "SELECT category, COUNT(*) as cnt FROM Item GROUP BY category LIMIT 2",
+        )
+        .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -9916,7 +11282,8 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse("SELECT name, price FROM Product ORDER BY price DESC").unwrap();
+        let ast =
+            QueryParser::parse("SELECT name, price FROM Product ORDER BY price DESC").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -9937,7 +11304,8 @@ mod tests {
         insert_row(&executor, "Product", "iPad", 799);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse("SELECT name FROM Product ORDER BY price DESC LIMIT 2").unwrap();
+        let ast =
+            QueryParser::parse("SELECT name FROM Product ORDER BY price DESC LIMIT 2").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -9961,7 +11329,11 @@ mod tests {
         ] {
             let ast = QueryAst::Insert {
                 class: "Item".to_string(),
-                columns: vec!["name".to_string(), "category".to_string(), "price".to_string()],
+                columns: vec![
+                    "name".to_string(),
+                    "category".to_string(),
+                    "price".to_string(),
+                ],
                 values: vec![
                     LiteralValue::String(name.to_string()),
                     LiteralValue::String(cat.to_string()),
@@ -9974,8 +11346,9 @@ mod tests {
 
         // GROUP BY + ORDER BY total DESC
         let ast = QueryParser::parse(
-            "SELECT category, SUM(price) as total FROM Item GROUP BY category ORDER BY total DESC"
-        ).unwrap();
+            "SELECT category, SUM(price) as total FROM Item GROUP BY category ORDER BY total DESC",
+        )
+        .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10043,7 +11416,10 @@ mod tests {
         match &result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "MacBook Pro");
+                assert_eq!(
+                    rows[0].get("name").unwrap().as_str().unwrap(),
+                    "MacBook Pro"
+                );
             }
             _ => panic!("expected 1 row with '%Pro' suffix"),
         }
@@ -10072,9 +11448,9 @@ mod tests {
     #[test]
     fn test_like_multibyte_underscore() {
         // _ should match one CHARACTER, not one byte
-        assert!(QueryExecutor::like_match("中文", "中_"));   // 2 chars, pattern matches
-        assert!(!QueryExecutor::like_match("中文", "中__"));  // 2 chars, pattern expects 3
-        assert!(QueryExecutor::like_match("a中b", "a_b"));   // mixed ASCII + CJK
+        assert!(QueryExecutor::like_match("中文", "中_")); // 2 chars, pattern matches
+        assert!(!QueryExecutor::like_match("中文", "中__")); // 2 chars, pattern expects 3
+        assert!(QueryExecutor::like_match("a中b", "a_b")); // mixed ASCII + CJK
         assert!(!QueryExecutor::like_match("a中b", "a__b")); // expects 4 chars
     }
 
@@ -10096,7 +11472,9 @@ mod tests {
         insert_row(&executor, "Product", "AirPods", 249);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price BETWEEN 500 AND 1500").unwrap();
+        let ast =
+            QueryParser::parse("SELECT name, price FROM Product WHERE price BETWEEN 500 AND 1500")
+                .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10117,7 +11495,10 @@ mod tests {
         insert_row(&executor, "Product", "AirPods", 249);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse("SELECT name FROM Product WHERE name IN ('iPhone', 'MacBook', 'AirPods')").unwrap();
+        let ast = QueryParser::parse(
+            "SELECT name FROM Product WHERE name IN ('iPhone', 'MacBook', 'AirPods')",
+        )
+        .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10135,7 +11516,8 @@ mod tests {
         insert_row(&executor, "Product", "MacBook", 1999);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse("SELECT name FROM Product WHERE price IN (799, 1999)").unwrap();
+        let ast =
+            QueryParser::parse("SELECT name FROM Product WHERE price IN (799, 1999)").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10157,14 +11539,16 @@ mod tests {
         let ast = QueryAst::Insert {
             class: "Item".to_string(),
             columns: vec!["name".to_string(), "price".to_string()],
-            values: vec![LiteralValue::String("Widget".to_string()), LiteralValue::Int(49)],
+            values: vec![
+                LiteralValue::String("Widget".to_string()),
+                LiteralValue::Int(49),
+            ],
         };
         executor.execute(&ast).unwrap();
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse(
-            "SELECT name FROM Product UNION SELECT name FROM Item"
-        ).unwrap();
+        let ast =
+            QueryParser::parse("SELECT name FROM Product UNION SELECT name FROM Item").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10182,15 +11566,17 @@ mod tests {
         let ast = QueryAst::Insert {
             class: "Item".to_string(),
             columns: vec!["name".to_string(), "price".to_string()],
-            values: vec![LiteralValue::String("iPhone".to_string()), LiteralValue::Int(999)],
+            values: vec![
+                LiteralValue::String("iPhone".to_string()),
+                LiteralValue::Int(999),
+            ],
         };
         executor.execute(&ast).unwrap();
         executor.engine().flush().unwrap();
 
         // UNION ALL keeps duplicates
-        let ast = QueryParser::parse(
-            "SELECT name FROM Product UNION ALL SELECT name FROM Item"
-        ).unwrap();
+        let ast =
+            QueryParser::parse("SELECT name FROM Product UNION ALL SELECT name FROM Item").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10200,9 +11586,8 @@ mod tests {
         }
 
         // UNION (without ALL) removes duplicates
-        let ast = QueryParser::parse(
-            "SELECT name FROM Product UNION SELECT name FROM Item"
-        ).unwrap();
+        let ast =
+            QueryParser::parse("SELECT name FROM Product UNION SELECT name FROM Item").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10224,8 +11609,9 @@ mod tests {
 
         // Subquery: select names where price > 900
         let ast = QueryParser::parse(
-            "SELECT name FROM Product WHERE name IN (SELECT name FROM Product WHERE price > 900)"
-        ).unwrap();
+            "SELECT name FROM Product WHERE name IN (SELECT name FROM Product WHERE price > 900)",
+        )
+        .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10243,8 +11629,9 @@ mod tests {
 
         // Subquery returns empty set
         let ast = QueryParser::parse(
-            "SELECT name FROM Product WHERE name IN (SELECT name FROM Product WHERE price > 9999)"
-        ).unwrap();
+            "SELECT name FROM Product WHERE name IN (SELECT name FROM Product WHERE price > 9999)",
+        )
+        .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10317,7 +11704,9 @@ mod tests {
         insert_row(&executor, "Product", "AirPods", 249);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price BETWEEN 700 AND 1000").unwrap();
+        let ast =
+            QueryParser::parse("SELECT name, price FROM Product WHERE price BETWEEN 700 AND 1000")
+                .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10373,7 +11762,8 @@ mod tests {
         insert_row(&executor, "Product", "AirPods", 249);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse("SELECT name FROM Product WHERE price IN (249, 1999)").unwrap();
+        let ast =
+            QueryParser::parse("SELECT name FROM Product WHERE price IN (249, 1999)").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10404,14 +11794,17 @@ mod tests {
         }
 
         // Update the price
-        let ast = QueryParser::parse("UPDATE Product SET price = 1099 WHERE name = 'iPhone'").unwrap();
+        let ast =
+            QueryParser::parse("UPDATE Product SET price = 1099 WHERE name = 'iPhone'").unwrap();
         executor.execute(&ast).unwrap();
 
         // Old price should no longer be found via index
         let ast = QueryParser::parse("SELECT name FROM Product WHERE price = 999").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
-            QueryResult::Rows(rows) => assert_eq!(rows.len(), 0, "old price 999 should not be in index"),
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 0, "old price 999 should not be in index")
+            }
             _ => panic!("expected 0 rows"),
         }
 
@@ -10446,7 +11839,9 @@ mod tests {
         let ast = QueryParser::parse("SELECT name FROM Product WHERE price = 999").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
-            QueryResult::Rows(rows) => assert_eq!(rows.len(), 0, "deleted row should not be in index"),
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 0, "deleted row should not be in index")
+            }
             _ => panic!("expected 0 rows"),
         }
 
@@ -10471,7 +11866,8 @@ mod tests {
         executor.engine().flush().unwrap();
 
         // Move iPhone from 999 to 599
-        let ast = QueryParser::parse("UPDATE Product SET price = 599 WHERE name = 'iPhone'").unwrap();
+        let ast =
+            QueryParser::parse("UPDATE Product SET price = 599 WHERE name = 'iPhone'").unwrap();
         executor.execute(&ast).unwrap();
 
         // Range scan: price < 700 should now find iPhone(599) but not iPad(799)
@@ -10506,8 +11902,9 @@ mod tests {
 
         // Create vector index
         let ast = QueryParser::parse(
-            "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3"
-        ).unwrap();
+            "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3",
+        )
+        .unwrap();
         executor.execute(&ast).unwrap();
 
         // Insert documents with vectors
@@ -10544,9 +11941,9 @@ mod tests {
         executor.engine().flush().unwrap();
 
         // Vector search: find 2 nearest to [1.0, 0.0, 0.0]
-        let ast = QueryParser::parse(
-            "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 2"
-        ).unwrap();
+        let ast =
+            QueryParser::parse("VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0] TOP 2")
+                .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10564,9 +11961,9 @@ mod tests {
     fn test_vector_search_with_filter() {
         let (executor, _dir) = setup();
 
-        let ast = QueryParser::parse(
-            "CREATE VECTOR INDEX ON Product (embedding) METRIC l2 DIMENSION 3"
-        ).unwrap();
+        let ast =
+            QueryParser::parse("CREATE VECTOR INDEX ON Product (embedding) METRIC l2 DIMENSION 3")
+                .unwrap();
         executor.execute(&ast).unwrap();
 
         // Insert products with category
@@ -10626,9 +12023,7 @@ mod tests {
         assert!(executor.engine().has_vector_index("Product", "embedding"));
 
         // Drop
-        let ast = QueryParser::parse(
-            "DROP VECTOR INDEX ON Product (embedding)"
-        ).unwrap();
+        let ast = QueryParser::parse("DROP VECTOR INDEX ON Product (embedding)").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Success(msg) => assert!(msg.contains("Vector index dropped")),
@@ -10656,8 +12051,9 @@ mod tests {
             let executor = QueryExecutor::new(engine.clone(), ontology_store);
 
             let ast = QueryParser::parse(
-                "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3"
-            ).unwrap();
+                "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3",
+            )
+            .unwrap();
             executor.execute(&ast).unwrap();
 
             let ast = QueryAst::Insert {
@@ -10685,9 +12081,12 @@ mod tests {
             assert!(engine.has_vector_index("Product", "embedding"));
 
             // Search should work with rebuilt index
-            let results = engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner()).search(
-                "Product", "embedding", &[1.0, 0.0, 0.0], 1,
-            ).unwrap();
+            let results = engine
+                .vector_index_manager()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .search("Product", "embedding", &[1.0, 0.0, 0.0], 1)
+                .unwrap();
             assert_eq!(results.len(), 1);
         }
     }
@@ -10710,9 +12109,10 @@ mod tests {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 3);
                 // MacBook should be 'expensive'
-                let macbook = rows.iter().find(|r| {
-                    r.get("name").and_then(|v| v.as_str()) == Some("MacBook")
-                }).unwrap();
+                let macbook = rows
+                    .iter()
+                    .find(|r| r.get("name").and_then(|v| v.as_str()) == Some("MacBook"))
+                    .unwrap();
                 assert_eq!(macbook.get("case").unwrap().as_str().unwrap(), "expensive");
             }
             _ => panic!("expected Rows"),
@@ -10730,8 +12130,9 @@ mod tests {
         executor.engine().flush().unwrap();
 
         let ast = QueryParser::parse(
-            "WITH expensive AS (SELECT * FROM Product WHERE price > 900) SELECT * FROM expensive"
-        ).unwrap();
+            "WITH expensive AS (SELECT * FROM Product WHERE price > 900) SELECT * FROM expensive",
+        )
+        .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10751,16 +12152,20 @@ mod tests {
         insert_row(&executor, "Product", "MacBook", 1999);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse(
-            "SELECT name, ROW_NUMBER() OVER (ORDER BY price DESC) FROM Product"
-        ).unwrap();
+        let ast =
+            QueryParser::parse("SELECT name, ROW_NUMBER() OVER (ORDER BY price DESC) FROM Product")
+                .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 3);
                 // All rows should have the window function column
                 for row in rows {
-                    assert!(row.contains_key("rownumber()"), "missing rownumber() key, got: {:?}", row.keys().collect::<Vec<_>>());
+                    assert!(
+                        row.contains_key("rownumber()"),
+                        "missing rownumber() key, got: {:?}",
+                        row.keys().collect::<Vec<_>>()
+                    );
                 }
             }
             _ => panic!("expected Rows"),
@@ -10775,9 +12180,8 @@ mod tests {
         insert_row(&executor, "Product", "MacBook", 1999);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse(
-            "SELECT name, RANK() OVER (ORDER BY price DESC) FROM Product"
-        ).unwrap();
+        let ast = QueryParser::parse("SELECT name, RANK() OVER (ORDER BY price DESC) FROM Product")
+            .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -10808,7 +12212,11 @@ mod tests {
                 for row in rows {
                     // Check that at least some aggregate keys exist
                     let keys: Vec<&str> = row.keys().map(|s| s.as_str()).collect();
-                    assert!(keys.len() >= 2, "expected at least 2 columns, got: {:?}", keys);
+                    assert!(
+                        keys.len() >= 2,
+                        "expected at least 2 columns, got: {:?}",
+                        keys
+                    );
                 }
             }
             _ => panic!("expected Rows"),
@@ -10874,9 +12282,8 @@ mod tests {
         executor.engine().flush().unwrap();
 
         // Create
-        let ast = QueryParser::parse(
-            "CREATE MATERIALIZED VIEW mv_test AS SELECT * FROM Product"
-        ).unwrap();
+        let ast = QueryParser::parse("CREATE MATERIALIZED VIEW mv_test AS SELECT * FROM Product")
+            .unwrap();
         executor.execute(&ast).unwrap();
 
         // Drop
@@ -10892,7 +12299,11 @@ mod tests {
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
-                assert!(rows.is_empty(), "expected 0 rows after DROP MATERIALIZED VIEW, got {}", rows.len());
+                assert!(
+                    rows.is_empty(),
+                    "expected 0 rows after DROP MATERIALIZED VIEW, got {}",
+                    rows.len()
+                );
             }
             _ => panic!("expected Rows"),
         }
@@ -10907,8 +12318,9 @@ mod tests {
 
         // Create materialized view
         let ast = QueryParser::parse(
-            "CREATE MATERIALIZED VIEW expensive_mv AS SELECT * FROM Product WHERE price > 900"
-        ).unwrap();
+            "CREATE MATERIALIZED VIEW expensive_mv AS SELECT * FROM Product WHERE price > 900",
+        )
+        .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Success(msg) => {
@@ -11031,8 +12443,9 @@ mod tests {
         // AND condition: price > 800 AND price < 1500
         // Should use index for price > 800, then filter price < 1500
         let ast = QueryParser::parse(
-            "SELECT name, price FROM Product WHERE price > 800 AND price < 1500"
-        ).unwrap();
+            "SELECT name, price FROM Product WHERE price > 800 AND price < 1500",
+        )
+        .unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -11060,7 +12473,11 @@ mod tests {
         }
 
         let stats = executor.runtime_stats();
-        assert_eq!(stats.total_queries - before, 3, "should have 3 more queries");
+        assert_eq!(
+            stats.total_queries - before,
+            3,
+            "should have 3 more queries"
+        );
         assert!(stats.total_time_us > 0);
         assert!(stats.table_scan_counts.contains_key("Product"));
     }
@@ -11076,7 +12493,8 @@ mod tests {
         executor.engine().flush().unwrap();
 
         // LIMIT 2 OFFSET 2 should skip first 2, return next 2
-        let ast = QueryParser::parse("SELECT name FROM Product ORDER BY price LIMIT 2 OFFSET 2").unwrap();
+        let ast =
+            QueryParser::parse("SELECT name FROM Product ORDER BY price LIMIT 2 OFFSET 2").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -11134,9 +12552,7 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse(
-            "SELECT COALESCE(name, 'unknown') FROM Product"
-        ).unwrap();
+        let ast = QueryParser::parse("SELECT COALESCE(name, 'unknown') FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
@@ -11153,14 +12569,15 @@ mod tests {
         insert_row(&executor, "Product", "iPhone", 999);
         executor.engine().flush().unwrap();
 
-        let ast = QueryParser::parse(
-            "SELECT CONCAT(name, ' - ', 'Premium') FROM Product"
-        ).unwrap();
+        let ast = QueryParser::parse("SELECT CONCAT(name, ' - ', 'Premium') FROM Product").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].values().next().unwrap().as_str().unwrap(), "iPhone - Premium");
+                assert_eq!(
+                    rows[0].values().next().unwrap().as_str().unwrap(),
+                    "iPhone - Premium"
+                );
             }
             _ => panic!("expected Rows"),
         }
@@ -11245,24 +12662,34 @@ mod tests {
         ).unwrap()).unwrap();
 
         // BEGIN, INSERT, COMMIT - data should persist
-        executor.execute(&QueryParser::parse("BEGIN").unwrap()).unwrap();
+        executor
+            .execute(&QueryParser::parse("BEGIN").unwrap())
+            .unwrap();
         assert!(executor.in_transaction());
 
-        executor.execute(&QueryParser::parse(
-            "INSERT INTO Product (name, price) VALUES ('Widget', 100)"
-        ).unwrap()).unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Product (name, price) VALUES ('Widget', 100)")
+                    .unwrap(),
+            )
+            .unwrap();
 
-        executor.execute(&QueryParser::parse("COMMIT").unwrap()).unwrap();
+        executor
+            .execute(&QueryParser::parse("COMMIT").unwrap())
+            .unwrap();
         assert!(!executor.in_transaction());
 
         // Data should be visible after commit
-        let result = executor.execute(&QueryParser::parse(
-            "SELECT name, price FROM Product"
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(&QueryParser::parse("SELECT name, price FROM Product").unwrap())
+            .unwrap();
         match result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].get("name").unwrap(), &Value::String("Widget".to_string()));
+                assert_eq!(
+                    rows[0].get("name").unwrap(),
+                    &Value::String("Widget".to_string())
+                );
             }
             _ => panic!("expected Rows"),
         }
@@ -11278,17 +12705,24 @@ mod tests {
         ).unwrap()).unwrap();
 
         // BEGIN, INSERT, ROLLBACK - data should be discarded
-        executor.execute(&QueryParser::parse("BEGIN").unwrap()).unwrap();
-        executor.execute(&QueryParser::parse(
-            "INSERT INTO Product (name, price) VALUES ('Widget', 100)"
-        ).unwrap()).unwrap();
-        executor.execute(&QueryParser::parse("ROLLBACK").unwrap()).unwrap();
+        executor
+            .execute(&QueryParser::parse("BEGIN").unwrap())
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Product (name, price) VALUES ('Widget', 100)")
+                    .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("ROLLBACK").unwrap())
+            .unwrap();
         assert!(!executor.in_transaction());
 
         // Data should NOT be visible after rollback
-        let result = executor.execute(&QueryParser::parse(
-            "SELECT name, price FROM Product"
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(&QueryParser::parse("SELECT name, price FROM Product").unwrap())
+            .unwrap();
         match result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 0);
@@ -11306,22 +12740,32 @@ mod tests {
         ).unwrap()).unwrap();
 
         // BEGIN, multiple INSERTs, COMMIT
-        executor.execute(&QueryParser::parse("BEGIN").unwrap()).unwrap();
-        executor.execute(&QueryParser::parse(
-            "INSERT INTO Product (name, price) VALUES ('A', 10)"
-        ).unwrap()).unwrap();
-        executor.execute(&QueryParser::parse(
-            "INSERT INTO Product (name, price) VALUES ('B', 20)"
-        ).unwrap()).unwrap();
-        executor.execute(&QueryParser::parse(
-            "INSERT INTO Product (name, price) VALUES ('C', 30)"
-        ).unwrap()).unwrap();
-        executor.execute(&QueryParser::parse("COMMIT").unwrap()).unwrap();
+        executor
+            .execute(&QueryParser::parse("BEGIN").unwrap())
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Product (name, price) VALUES ('A', 10)").unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Product (name, price) VALUES ('B', 20)").unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Product (name, price) VALUES ('C', 30)").unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("COMMIT").unwrap())
+            .unwrap();
 
         // All three rows should be visible
-        let result = executor.execute(&QueryParser::parse(
-            "SELECT name FROM Product ORDER BY name"
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(&QueryParser::parse("SELECT name FROM Product ORDER BY name").unwrap())
+            .unwrap();
         match result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 3);
@@ -11339,21 +12783,33 @@ mod tests {
         ).unwrap()).unwrap();
 
         // Insert initial data (auto-commit)
-        executor.execute(&QueryParser::parse(
-            "INSERT INTO Product (name, price) VALUES ('Widget', 100)"
-        ).unwrap()).unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Product (name, price) VALUES ('Widget', 100)")
+                    .unwrap(),
+            )
+            .unwrap();
 
         // BEGIN, UPDATE, ROLLBACK - update should be discarded
-        executor.execute(&QueryParser::parse("BEGIN").unwrap()).unwrap();
-        executor.execute(&QueryParser::parse(
-            "UPDATE Product SET price = 999 WHERE name = 'Widget'"
-        ).unwrap()).unwrap();
-        executor.execute(&QueryParser::parse("ROLLBACK").unwrap()).unwrap();
+        executor
+            .execute(&QueryParser::parse("BEGIN").unwrap())
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("UPDATE Product SET price = 999 WHERE name = 'Widget'")
+                    .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("ROLLBACK").unwrap())
+            .unwrap();
 
         // Original price should be visible
-        let result = executor.execute(&QueryParser::parse(
-            "SELECT price FROM Product WHERE name = 'Widget'"
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(
+                &QueryParser::parse("SELECT price FROM Product WHERE name = 'Widget'").unwrap(),
+            )
+            .unwrap();
         match result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -11367,13 +12823,20 @@ mod tests {
     fn test_begin_while_in_txn_errors() {
         let (executor, _dir) = setup();
 
-        executor.execute(&QueryParser::parse("BEGIN").unwrap()).unwrap();
+        executor
+            .execute(&QueryParser::parse("BEGIN").unwrap())
+            .unwrap();
         let result = executor.execute(&QueryParser::parse("BEGIN").unwrap());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("transaction already active"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("transaction already active"));
 
         // Clean up
-        executor.execute(&QueryParser::parse("ROLLBACK").unwrap()).unwrap();
+        executor
+            .execute(&QueryParser::parse("ROLLBACK").unwrap())
+            .unwrap();
     }
 
     #[test]
@@ -11382,7 +12845,10 @@ mod tests {
 
         let result = executor.execute(&QueryParser::parse("COMMIT").unwrap());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no active transaction"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no active transaction"));
     }
 
     #[test]
@@ -11391,7 +12857,10 @@ mod tests {
 
         let result = executor.execute(&QueryParser::parse("ROLLBACK").unwrap());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("no active transaction"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no active transaction"));
     }
 
     #[test]
@@ -11403,14 +12872,12 @@ mod tests {
 
     #[test]
     fn test_memory_estimation() {
-        let rows = vec![
-            {
-                let mut row = Map::new();
-                row.insert("name".to_string(), Value::String("test".to_string()));
-                row.insert("price".to_string(), Value::Number(100.into()));
-                row
-            }
-        ];
+        let rows = vec![{
+            let mut row = Map::new();
+            row.insert("name".to_string(), Value::String("test".to_string()));
+            row.insert("price".to_string(), Value::Number(100.into()));
+            row
+        }];
         let estimated = QueryExecutor::estimate_rows_memory(&rows);
         assert!(estimated > 0);
         assert!(estimated < 1000); // Should be small for one row
@@ -11433,16 +12900,22 @@ mod tests {
         ).unwrap()).unwrap();
 
         // Insert should work (writes are buffered)
-        small_exec.execute(&QueryParser::parse(
-            "INSERT INTO Product (name) VALUES ('A long product name that exceeds budget')"
-        ).unwrap()).unwrap();
+        small_exec
+            .execute(
+                &QueryParser::parse(
+                    "INSERT INTO Product (name) VALUES ('A long product name that exceeds budget')",
+                )
+                .unwrap(),
+            )
+            .unwrap();
 
         // SELECT should fail due to memory budget
-        let result = small_exec.execute(&QueryParser::parse(
-            "SELECT name FROM Product"
-        ).unwrap());
+        let result = small_exec.execute(&QueryParser::parse("SELECT name FROM Product").unwrap());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("memory budget exceeded"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("memory budget exceeded"));
     }
 
     // P26-3: IS NULL, NOT, LEFT JOIN tests
@@ -11456,22 +12929,28 @@ mod tests {
         ).unwrap()).unwrap();
 
         // Insert with NULL price
-        executor.execute(&QueryParser::parse(
-            "INSERT INTO Product (name) VALUES ('NoPrice')"
-        ).unwrap()).unwrap();
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Product (name) VALUES ('NoPrice')").unwrap())
+            .unwrap();
         // Insert with price
-        executor.execute(&QueryParser::parse(
-            "INSERT INTO Product (name, price) VALUES ('WithPrice', 100)"
-        ).unwrap()).unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Product (name, price) VALUES ('WithPrice', 100)")
+                    .unwrap(),
+            )
+            .unwrap();
 
         // IS NULL should find the row without price
-        let result = executor.execute(&QueryParser::parse(
-            "SELECT name FROM Product WHERE price IS NULL"
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(&QueryParser::parse("SELECT name FROM Product WHERE price IS NULL").unwrap())
+            .unwrap();
         match result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].get("name").unwrap(), &Value::String("NoPrice".to_string()));
+                assert_eq!(
+                    rows[0].get("name").unwrap(),
+                    &Value::String("NoPrice".to_string())
+                );
             }
             _ => panic!("expected Rows"),
         }
@@ -11485,21 +12964,29 @@ mod tests {
             "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
         ).unwrap()).unwrap();
 
-        executor.execute(&QueryParser::parse(
-            "INSERT INTO Product (name) VALUES ('NoPrice')"
-        ).unwrap()).unwrap();
-        executor.execute(&QueryParser::parse(
-            "INSERT INTO Product (name, price) VALUES ('WithPrice', 100)"
-        ).unwrap()).unwrap();
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Product (name) VALUES ('NoPrice')").unwrap())
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Product (name, price) VALUES ('WithPrice', 100)")
+                    .unwrap(),
+            )
+            .unwrap();
 
         // IS NOT NULL should find the row with price
-        let result = executor.execute(&QueryParser::parse(
-            "SELECT name FROM Product WHERE price IS NOT NULL"
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(
+                &QueryParser::parse("SELECT name FROM Product WHERE price IS NOT NULL").unwrap(),
+            )
+            .unwrap();
         match result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].get("name").unwrap(), &Value::String("WithPrice".to_string()));
+                assert_eq!(
+                    rows[0].get("name").unwrap(),
+                    &Value::String("WithPrice".to_string())
+                );
             }
             _ => panic!("expected Rows"),
         }
@@ -11513,21 +13000,30 @@ mod tests {
             "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
         ).unwrap()).unwrap();
 
-        executor.execute(&QueryParser::parse(
-            "INSERT INTO Product (name, price) VALUES ('A', 100)"
-        ).unwrap()).unwrap();
-        executor.execute(&QueryParser::parse(
-            "INSERT INTO Product (name, price) VALUES ('B', 200)"
-        ).unwrap()).unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Product (name, price) VALUES ('A', 100)").unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Product (name, price) VALUES ('B', 200)").unwrap(),
+            )
+            .unwrap();
 
         // NOT (price = 100) should find B
-        let result = executor.execute(&QueryParser::parse(
-            "SELECT name FROM Product WHERE NOT (price = 100)"
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(
+                &QueryParser::parse("SELECT name FROM Product WHERE NOT (price = 100)").unwrap(),
+            )
+            .unwrap();
         match result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].get("name").unwrap(), &Value::String("B".to_string()));
+                assert_eq!(
+                    rows[0].get("name").unwrap(),
+                    &Value::String("B".to_string())
+                );
             }
             _ => panic!("expected Rows"),
         }
@@ -11537,11 +13033,11 @@ mod tests {
     fn test_left_join_parse() {
         // Test that LEFT JOIN parses correctly
         let result = QueryParser::parse(
-            "SELECT name, value FROM TableA LEFT JOIN TableB ON TableA.id = TableB.a_id"
+            "SELECT name, value FROM TableA LEFT JOIN TableB ON TableA.id = TableB.a_id",
         );
         // Just verify it parses without error
         match &result {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => panic!("Parse error: {:?}", e),
         }
     }
@@ -11560,11 +13056,21 @@ mod tests {
         ).unwrap()).unwrap();
 
         // Write CSV file
-        std::fs::write(&csv_path, "name,price\nWidget,100\nGadget,200\nDoohickey,300\n").unwrap();
+        std::fs::write(
+            &csv_path,
+            "name,price\nWidget,100\nGadget,200\nDoohickey,300\n",
+        )
+        .unwrap();
 
-        let result = executor.execute(&QueryParser::parse(
-            &format!("IMPORT INTO Product FROM CSV '{}'", csv_path.display())
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(
+                &QueryParser::parse(&format!(
+                    "IMPORT INTO Product FROM CSV '{}'",
+                    csv_path.display()
+                ))
+                .unwrap(),
+            )
+            .unwrap();
 
         match result {
             QueryResult::Success(msg) => {
@@ -11574,9 +13080,9 @@ mod tests {
         }
 
         // Verify data was inserted
-        let select_result = executor.execute(&QueryParser::parse(
-            "SELECT name, price FROM Product"
-        ).unwrap()).unwrap();
+        let select_result = executor
+            .execute(&QueryParser::parse("SELECT name, price FROM Product").unwrap())
+            .unwrap();
         match select_result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows.len(), 3);
@@ -11596,9 +13102,15 @@ mod tests {
 
         std::fs::write(&csv_path, "name,qty,active\nA,42,true\nB,0,false\n").unwrap();
 
-        let result = executor.execute(&QueryParser::parse(
-            &format!("IMPORT INTO Item FROM CSV '{}'", csv_path.display())
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(
+                &QueryParser::parse(&format!(
+                    "IMPORT INTO Item FROM CSV '{}'",
+                    csv_path.display()
+                ))
+                .unwrap(),
+            )
+            .unwrap();
 
         match result {
             QueryResult::Success(msg) => assert!(msg.contains("2 row(s) imported")),
@@ -11615,14 +13127,24 @@ mod tests {
             "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
         ).unwrap()).unwrap();
 
-        std::fs::write(&json_path, r#"[
+        std::fs::write(
+            &json_path,
+            r#"[
             {"name": "Widget", "price": 100},
             {"name": "Gadget", "price": 200}
-        ]"#).unwrap();
+        ]"#,
+        )
+        .unwrap();
 
-        let result = executor.execute(&QueryParser::parse(
-            &format!("IMPORT INTO Product FROM JSON '{}'", json_path.display())
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(
+                &QueryParser::parse(&format!(
+                    "IMPORT INTO Product FROM JSON '{}'",
+                    json_path.display()
+                ))
+                .unwrap(),
+            )
+            .unwrap();
 
         match result {
             QueryResult::Success(msg) => {
@@ -11641,11 +13163,21 @@ mod tests {
             "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)"
         ).unwrap()).unwrap();
 
-        std::fs::write(&json_path, "{\"name\": \"Widget\", \"price\": 100}\n{\"name\": \"Gadget\", \"price\": 200}\n").unwrap();
+        std::fs::write(
+            &json_path,
+            "{\"name\": \"Widget\", \"price\": 100}\n{\"name\": \"Gadget\", \"price\": 200}\n",
+        )
+        .unwrap();
 
-        let result = executor.execute(&QueryParser::parse(
-            &format!("IMPORT INTO Product FROM JSON '{}'", json_path.display())
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(
+                &QueryParser::parse(&format!(
+                    "IMPORT INTO Product FROM JSON '{}'",
+                    json_path.display()
+                ))
+                .unwrap(),
+            )
+            .unwrap();
 
         match result {
             QueryResult::Success(msg) => {
@@ -11663,9 +13195,9 @@ mod tests {
             "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING)"
         ).unwrap()).unwrap();
 
-        let result = executor.execute(&QueryParser::parse(
-            "IMPORT INTO Product FROM CSV '/nonexistent/file.csv'"
-        ).unwrap());
+        let result = executor.execute(
+            &QueryParser::parse("IMPORT INTO Product FROM CSV '/nonexistent/file.csv'").unwrap(),
+        );
 
         assert!(result.is_err(), "should fail for nonexistent file");
     }
@@ -11681,9 +13213,15 @@ mod tests {
 
         std::fs::write(&csv_path, "name\n").unwrap();
 
-        let result = executor.execute(&QueryParser::parse(
-            &format!("IMPORT INTO Product FROM CSV '{}'", csv_path.display())
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(
+                &QueryParser::parse(&format!(
+                    "IMPORT INTO Product FROM CSV '{}'",
+                    csv_path.display()
+                ))
+                .unwrap(),
+            )
+            .unwrap();
 
         match result {
             QueryResult::Success(msg) => {
@@ -11702,15 +13240,25 @@ mod tests {
             "CREATE ONTOLOGY test (CLASS Item, PROPERTY name DOMAIN Item RANGE STRING, PROPERTY value DOMAIN Item RANGE INT64)"
         ).unwrap()).unwrap();
 
-        std::fs::write(&json_path, r#"[
+        std::fs::write(
+            &json_path,
+            r#"[
             {"name": "A", "value": 42},
             {"name": "B", "value": null},
             {"name": "C"}
-        ]"#).unwrap();
+        ]"#,
+        )
+        .unwrap();
 
-        let result = executor.execute(&QueryParser::parse(
-            &format!("IMPORT INTO Item FROM JSON '{}'", json_path.display())
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(
+                &QueryParser::parse(&format!(
+                    "IMPORT INTO Item FROM JSON '{}'",
+                    json_path.display()
+                ))
+                .unwrap(),
+            )
+            .unwrap();
 
         match result {
             QueryResult::Success(msg) => {
@@ -11731,9 +13279,15 @@ mod tests {
 
         std::fs::write(&csv_path, "name,score\n\"quoted name\",3.14\nnormal,NaN\n").unwrap();
 
-        let result = executor.execute(&QueryParser::parse(
-            &format!("IMPORT INTO Item FROM CSV '{}'", csv_path.display())
-        ).unwrap()).unwrap();
+        let result = executor
+            .execute(
+                &QueryParser::parse(&format!(
+                    "IMPORT INTO Item FROM CSV '{}'",
+                    csv_path.display()
+                ))
+                .unwrap(),
+            )
+            .unwrap();
 
         match result {
             QueryResult::Success(msg) => {
@@ -11806,14 +13360,17 @@ mod tests {
         let executor = QueryExecutor::new(engine.clone(), ontology_store);
 
         // Create ontology with unique constraint on email
-        let ast = QueryParser::parse(r#"
+        let ast = QueryParser::parse(
+            r#"
             CREATE ONTOLOGY shop (
                 CLASS User,
                 PROPERTY name DOMAIN User RANGE STRING,
                 PROPERTY email DOMAIN User RANGE STRING,
                 UNIQUE User(email)
             )
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         executor.execute(&ast).unwrap();
 
         // First insert should succeed
@@ -11872,14 +13429,17 @@ mod tests {
         let executor = QueryExecutor::new(engine.clone(), ontology_store);
 
         // Create ontology with composite unique constraint
-        let ast = QueryParser::parse(r#"
+        let ast = QueryParser::parse(
+            r#"
             CREATE ONTOLOGY school (
                 CLASS Enrollment,
                 PROPERTY student DOMAIN Enrollment RANGE STRING,
                 PROPERTY course DOMAIN Enrollment RANGE STRING,
                 UNIQUE Enrollment(student, course)
             )
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         executor.execute(&ast).unwrap();
 
         // First insert
@@ -11942,11 +13502,15 @@ mod tests {
         assert_eq!(executor.current_namespace(), "default");
 
         // 创建 namespace "tenant_a"
-        let ast = QueryAst::CreateNamespace { name: "tenant_a".to_string() };
+        let ast = QueryAst::CreateNamespace {
+            name: "tenant_a".to_string(),
+        };
         executor.execute(&ast).unwrap();
 
         // 切换到 tenant_a
-        let ast = QueryAst::UseNamespace { name: "tenant_a".to_string() };
+        let ast = QueryAst::UseNamespace {
+            name: "tenant_a".to_string(),
+        };
         executor.execute(&ast).unwrap();
         assert_eq!(executor.current_namespace(), "tenant_a");
 
@@ -11956,9 +13520,13 @@ mod tests {
         assert_eq!(eid.to_lsm_key(), b"tenant_a::Device::001");
 
         // 创建 namespace "tenant_b" 并切换
-        let ast = QueryAst::CreateNamespace { name: "tenant_b".to_string() };
+        let ast = QueryAst::CreateNamespace {
+            name: "tenant_b".to_string(),
+        };
         executor.execute(&ast).unwrap();
-        let ast = QueryAst::UseNamespace { name: "tenant_b".to_string() };
+        let ast = QueryAst::UseNamespace {
+            name: "tenant_b".to_string(),
+        };
         executor.execute(&ast).unwrap();
         assert_eq!(executor.current_namespace(), "tenant_b");
 
@@ -11971,7 +13539,9 @@ mod tests {
         assert_ne!(eid.to_lsm_key(), eid2.to_lsm_key());
 
         // 切换到不存在的 namespace 应报错
-        let ast = QueryAst::UseNamespace { name: "nonexistent".to_string() };
+        let ast = QueryAst::UseNamespace {
+            name: "nonexistent".to_string(),
+        };
         assert!(executor.execute(&ast).is_err());
 
         // namespace 不变

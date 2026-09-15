@@ -4074,8 +4074,7 @@ impl QueryParser {
         let entity = Self::extract_quoted_path(rest)?;
         let after_entity = &rest[rest.find(['\'', '"']).unwrap_or(0)..];
         let after_entity = &after_entity[1..]; // skip opening quote
-        let quote_char =
-            rest.as_bytes()[rest.find(['\'', '"']).unwrap_or(0)] as char;
+        let quote_char = rest.as_bytes()[rest.find(['\'', '"']).unwrap_or(0)] as char;
         let end = after_entity.find(quote_char).unwrap_or(after_entity.len());
         let after_entity = safe_slice_from(after_entity, end + 1).trim();
         let reason = if !after_entity.is_empty() {

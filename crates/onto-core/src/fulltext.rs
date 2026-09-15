@@ -80,7 +80,10 @@ impl FullTextIndex {
     }
 
     pub fn with_config(config: Bm25Config) -> Self {
-        Self { config, ..Self::new() }
+        Self {
+            config,
+            ..Self::new()
+        }
     }
 
     /// Add a document with named fields.
@@ -103,11 +106,14 @@ impl FullTextIndex {
                     term_freq: *freq,
                     field: field_name.clone(),
                 };
-                let list = self.inverted_index.entry(term.clone()).or_insert_with(|| PostingList {
-                    term: term.clone(),
-                    postings: Vec::new(),
-                    doc_freq: 0,
-                });
+                let list = self
+                    .inverted_index
+                    .entry(term.clone())
+                    .or_insert_with(|| PostingList {
+                        term: term.clone(),
+                        postings: Vec::new(),
+                        doc_freq: 0,
+                    });
                 list.postings.push(posting);
                 list.doc_freq = list.postings.len() as u32;
             }
@@ -146,9 +152,13 @@ impl FullTextIndex {
                         let avg_dl = self.avg_doc_length;
 
                         let score = idf * (tf * (self.config.k1 + 1.0))
-                            / (tf + self.config.k1 * (1.0 - self.config.b + self.config.b * dl / avg_dl));
+                            / (tf
+                                + self.config.k1
+                                    * (1.0 - self.config.b + self.config.b * dl / avg_dl));
 
-                        let entry = scores.entry(posting.doc_id.clone()).or_insert((0.0, Vec::new()));
+                        let entry = scores
+                            .entry(posting.doc_id.clone())
+                            .or_insert((0.0, Vec::new()));
                         entry.0 += score;
                         if !entry.1.contains(&posting.field) {
                             entry.1.push(posting.field.clone());
@@ -167,7 +177,11 @@ impl FullTextIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results
     }
 
@@ -180,7 +194,8 @@ impl FullTextIndex {
                 list.doc_freq = list.postings.len() as u32;
             }
             // Remove empty terms
-            self.inverted_index.retain(|_, list| !list.postings.is_empty());
+            self.inverted_index
+                .retain(|_, list| !list.postings.is_empty());
 
             self.total_docs -= 1;
             if self.total_docs > 0 {
@@ -192,9 +207,15 @@ impl FullTextIndex {
         }
     }
 
-    pub fn doc_count(&self) -> u32 { self.total_docs }
-    pub fn term_count(&self) -> usize { self.inverted_index.len() }
-    pub fn get_document(&self, doc_id: &str) -> Option<&IndexedDocument> { self.documents.get(doc_id) }
+    pub fn doc_count(&self) -> u32 {
+        self.total_docs
+    }
+    pub fn term_count(&self) -> usize {
+        self.inverted_index.len()
+    }
+    pub fn get_document(&self, doc_id: &str) -> Option<&IndexedDocument> {
+        self.documents.get(doc_id)
+    }
 }
 
 /// BM25 IDF calculation.
@@ -279,11 +300,17 @@ mod tests {
     fn test_fulltext_search_basic() {
         let mut idx = FullTextIndex::new();
         let mut fields = HashMap::new();
-        fields.insert("content".into(), "The temperature sensor shows 85 degrees".into());
+        fields.insert(
+            "content".into(),
+            "The temperature sensor shows 85 degrees".into(),
+        );
         idx.add_document("doc1", fields);
 
         let mut fields2 = HashMap::new();
-        fields2.insert("content".into(), "The humidity sensor shows 60 percent".into());
+        fields2.insert(
+            "content".into(),
+            "The humidity sensor shows 60 percent".into(),
+        );
         idx.add_document("doc2", fields2);
 
         let results = idx.search("temperature");
@@ -313,7 +340,10 @@ mod tests {
         let mut idx = FullTextIndex::new();
 
         let mut f1 = HashMap::new();
-        f1.insert("content".into(), "sensor temperature temperature temperature".into());
+        f1.insert(
+            "content".into(),
+            "sensor temperature temperature temperature".into(),
+        );
         idx.add_document("d1", f1);
 
         let mut f2 = HashMap::new();

@@ -48,13 +48,20 @@ pub struct LineageTracker {
 
 impl LineageTracker {
     pub fn new(max_records: usize) -> Self {
-        Self { records: Vec::new(), index: HashMap::new(), max_records }
+        Self {
+            records: Vec::new(),
+            index: HashMap::new(),
+            max_records,
+        }
     }
 
     /// Record a lineage event.
     pub fn record(&mut self, record: LineageRecord) {
         let idx = self.records.len();
-        self.index.entry(record.entity_id.clone()).or_default().push(idx);
+        self.index
+            .entry(record.entity_id.clone())
+            .or_default()
+            .push(idx);
         self.records.push(record);
 
         // Evict oldest if over limit
@@ -71,8 +78,14 @@ impl LineageTracker {
 
     /// Get lineage for an entity.
     pub fn get_lineage(&self, entity_id: &str) -> Vec<&LineageRecord> {
-        self.index.get(entity_id)
-            .map(|indices| indices.iter().filter_map(|&i| self.records.get(i)).collect())
+        self.index
+            .get(entity_id)
+            .map(|indices| {
+                indices
+                    .iter()
+                    .filter_map(|&i| self.records.get(i))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -113,7 +126,13 @@ impl LineageTracker {
         } else {
             for record in &records {
                 for parent_id in &record.parent_ids {
-                    self.trace_recursive(parent_id, current_path, all_paths, visited, remaining_depth - 1);
+                    self.trace_recursive(
+                        parent_id,
+                        current_path,
+                        all_paths,
+                        visited,
+                        remaining_depth - 1,
+                    );
                 }
                 if record.parent_ids.is_empty() {
                     all_paths.push(LineagePath {
@@ -130,10 +149,15 @@ impl LineageTracker {
 
     /// Get records by source type.
     pub fn get_by_source(&self, source: &LineageSource) -> Vec<&LineageRecord> {
-        self.records.iter().filter(|r| &r.source == source).collect()
+        self.records
+            .iter()
+            .filter(|r| &r.source == source)
+            .collect()
     }
 
-    pub fn record_count(&self) -> usize { self.records.len() }
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
 }
 
 /// A lineage path from leaf to root.
@@ -144,7 +168,12 @@ pub struct LineagePath {
 }
 
 /// Convenience: record a direct write.
-pub fn record_write(tracker: &mut LineageTracker, entity_id: &str, attribute: &str, timestamp_us: u64) {
+pub fn record_write(
+    tracker: &mut LineageTracker,
+    entity_id: &str,
+    attribute: &str,
+    timestamp_us: u64,
+) {
     tracker.record(LineageRecord {
         entity_id: entity_id.to_string(),
         attribute: attribute.to_string(),

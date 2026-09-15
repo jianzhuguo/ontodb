@@ -1342,10 +1342,16 @@ mod tests {
         let store = GraphStore::new();
 
         store
-            .upsert_vertex_from_entity(&EntityId::new("default", "Product", "001"), &["Product".to_string()])
+            .upsert_vertex_from_entity(
+                &EntityId::new("default", "Product", "001"),
+                &["Product".to_string()],
+            )
             .unwrap();
         store
-            .upsert_vertex_from_entity(&EntityId::new("default", "Product", "002"), &["Product".to_string()])
+            .upsert_vertex_from_entity(
+                &EntityId::new("default", "Product", "002"),
+                &["Product".to_string()],
+            )
             .unwrap();
         store
             .upsert_vertex_from_entity(

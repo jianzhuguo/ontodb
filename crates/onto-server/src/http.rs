@@ -2154,10 +2154,8 @@ async fn cursor_query(
                     };
 
                     // Convert Map<String, Value> rows to Value rows
-                    let value_rows: Vec<Value> = rows
-                        .into_iter()
-                        .map(serde_json::Value::Object)
-                        .collect();
+                    let value_rows: Vec<Value> =
+                        rows.into_iter().map(serde_json::Value::Object).collect();
 
                     let response = CursorResponse {
                         rows: value_rows,

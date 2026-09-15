@@ -16,8 +16,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 // ============================================================
 // 数据结构
@@ -104,7 +104,10 @@ async fn list_rules(State(state): State<Arc<RuleEngineState>>) -> impl IntoRespo
     let rules = state.rules.lock().unwrap();
     let rules_vec: Vec<RuleDto> = rules.values().cloned().collect();
     let total = rules_vec.len();
-    Json(RulesListResponse { rules: rules_vec, total })
+    Json(RulesListResponse {
+        rules: rules_vec,
+        total,
+    })
 }
 
 async fn create_rule(
@@ -130,11 +133,14 @@ async fn create_rule(
     state.rules.lock().unwrap().insert(rule_id, rule.clone());
     let _ = save_rule_file(&state.rules_dir, &rule);
 
-    (StatusCode::CREATED, Json(RuleResponse {
-        success: true,
-        rule: Some(rule),
-        message: "Rule created".to_string(),
-    }))
+    (
+        StatusCode::CREATED,
+        Json(RuleResponse {
+            success: true,
+            rule: Some(rule),
+            message: "Rule created".to_string(),
+        }),
+    )
 }
 
 async fn update_rule(
@@ -145,7 +151,9 @@ async fn update_rule(
     let mut rules = state.rules.lock().unwrap();
     match rules.get_mut(&rule_id) {
         Some(rule) => {
-            if let Some(name) = req.name { rule.name = name; }
+            if let Some(name) = req.name {
+                rule.name = name;
+            }
             if let Some(dsl) = req.dsl {
                 let (conditions, actions) = parse_dsl(&dsl);
                 rule.conditions = conditions;
@@ -153,13 +161,23 @@ async fn update_rule(
                 rule.priority = extract_priority(&dsl);
                 rule.dsl = dsl;
             }
-            if let Some(enabled) = req.enabled { rule.enabled = enabled; }
+            if let Some(enabled) = req.enabled {
+                rule.enabled = enabled;
+            }
             rule.updated_at = chrono::Utc::now().to_rfc3339();
             let updated = rule.clone();
             let _ = save_rule_file(&state.rules_dir, &updated);
-            (StatusCode::OK, Json(serde_json::json!({"success": true, "rule": updated}))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"success": true, "rule": updated})),
+            )
+                .into_response()
         }
-        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"success": false, "message": "Not found"}))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"success": false, "message": "Not found"})),
+        )
+            .into_response(),
     }
 }
 
@@ -171,7 +189,10 @@ async fn delete_rule(
     if rules.remove(&rule_id).is_some() {
         (StatusCode::OK, Json(serde_json::json!({"success": true})))
     } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"success": false})))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"success": false})),
+        )
     }
 }
 
@@ -183,7 +204,9 @@ async fn test_rules(
     let mut results = Vec::new();
 
     for rule in rules.values() {
-        if !rule.enabled { continue; }
+        if !rule.enabled {
+            continue;
+        }
         if evaluate(&rule.conditions, &req.facts) {
             results.push(serde_json::json!({
                 "rule": rule.name,
@@ -213,7 +236,9 @@ async fn reload_rules(State(state): State<Arc<RuleEngineState>>) -> impl IntoRes
 
     for entry in std::fs::read_dir(&dir).unwrap().flatten() {
         let path = entry.path();
-        if path.extension().is_none_or(|e| e != "dsl") { continue; }
+        if path.extension().is_none_or(|e| e != "dsl") {
+            continue;
+        }
         if let Ok(content) = std::fs::read_to_string(&path) {
             for rule in parse_dsl_file(&content) {
                 rules.insert(rule.rule_id.clone(), rule);
@@ -244,15 +269,35 @@ fn parse_dsl(dsl: &str) -> (Vec<ConditionDto>, Vec<ActionDto>) {
 
     for line in dsl.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
-        if line == "WHEN:" { in_when = true; in_then = false; continue; }
-        if line == "THEN:" { in_when = false; in_then = true; continue; }
-        if line.starts_with("RULE:") || line.starts_with("ID:") || line.starts_with("PRIORITY:") || line.starts_with("ENABLED:") { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "WHEN:" {
+            in_when = true;
+            in_then = false;
+            continue;
+        }
+        if line == "THEN:" {
+            in_when = false;
+            in_then = true;
+            continue;
+        }
+        if line.starts_with("RULE:")
+            || line.starts_with("ID:")
+            || line.starts_with("PRIORITY:")
+            || line.starts_with("ENABLED:")
+        {
+            continue;
+        }
 
         if in_when {
-            if let Some(c) = parse_condition(line) { conditions.push(c); }
+            if let Some(c) = parse_condition(line) {
+                conditions.push(c);
+            }
         } else if in_then {
-            if let Some(a) = parse_action(line) { actions.push(a); }
+            if let Some(a) = parse_action(line) {
+                actions.push(a);
+            }
         }
     }
     (conditions, actions)
@@ -260,11 +305,13 @@ fn parse_dsl(dsl: &str) -> (Vec<ConditionDto>, Vec<ActionDto>) {
 
 fn parse_condition(line: &str) -> Option<ConditionDto> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 3 { return None; }
+    if parts.len() < 3 {
+        return None;
+    }
     let dot = parts[0].find('.')?;
     Some(ConditionDto {
         entity: parts[0][..dot].to_string(),
-        attribute: parts[0][dot+1..].to_string(),
+        attribute: parts[0][dot + 1..].to_string(),
         operator: parts[1].to_string(),
         value: parts[2..].join(" ").trim_matches('"').to_string(),
     })
@@ -272,12 +319,14 @@ fn parse_condition(line: &str) -> Option<ConditionDto> {
 
 fn parse_action(line: &str) -> Option<ActionDto> {
     let parts: Vec<&str> = line.splitn(2, '=').collect();
-    if parts.len() < 2 { return None; }
+    if parts.len() < 2 {
+        return None;
+    }
     let dot = parts[0].trim().find('.')?;
     let attr = parts[0].trim();
     Some(ActionDto {
         entity: attr[..dot].to_string(),
-        attribute: attr[dot+1..].to_string(),
+        attribute: attr[dot + 1..].to_string(),
         value: parts[1].trim().trim_matches('"').to_string(),
     })
 }
@@ -293,7 +342,8 @@ fn extract_priority(dsl: &str) -> String {
 
 fn evaluate(conditions: &[ConditionDto], facts: &HashMap<String, HashMap<String, String>>) -> bool {
     conditions.iter().all(|c| {
-        facts.get(&c.entity)
+        facts
+            .get(&c.entity)
             .and_then(|m| m.get(&c.attribute))
             .is_some_and(|v| compare(&c.operator, v, &c.value))
     })
@@ -302,12 +352,21 @@ fn evaluate(conditions: &[ConditionDto], facts: &HashMap<String, HashMap<String,
 fn compare(op: &str, a: &str, b: &str) -> bool {
     if let (Ok(a), Ok(b)) = (a.parse::<f64>(), b.parse::<f64>()) {
         match op {
-            ">" => a > b, "<" => a < b, "=" | "==" => (a-b).abs() < f64::EPSILON,
-            "!=" => (a-b).abs() > f64::EPSILON, ">=" => a >= b, "<=" => a <= b,
+            ">" => a > b,
+            "<" => a < b,
+            "=" | "==" => (a - b).abs() < f64::EPSILON,
+            "!=" => (a - b).abs() > f64::EPSILON,
+            ">=" => a >= b,
+            "<=" => a <= b,
             _ => false,
         }
     } else {
-        match op { "=" | "==" => a == b, "!=" => a != b, "contains" => a.contains(b), _ => false }
+        match op {
+            "=" | "==" => a == b,
+            "!=" => a != b,
+            "contains" => a.contains(b),
+            _ => false,
+        }
     }
 }
 
@@ -417,7 +476,9 @@ async fn import_rules_from_file(
             }
         }
     }
-    Json(serde_json::json!({"success": true, "path": req.path, "imported": imported, "skipped": skipped}))
+    Json(
+        serde_json::json!({"success": true, "path": req.path, "imported": imported, "skipped": skipped}),
+    )
 }
 
 fn save_rule_file(dir: &str, rule: &RuleDto) -> Result<(), String> {
@@ -425,7 +486,8 @@ fn save_rule_file(dir: &str, rule: &RuleDto) -> Result<(), String> {
     std::fs::write(
         PathBuf::from(dir).join(format!("{}.dsl", rule.rule_id)),
         &rule.dsl,
-    ).map_err(|e| e.to_string())
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn parse_dsl_file(content: &str) -> Vec<RuleDto> {
@@ -442,10 +504,15 @@ fn parse_dsl_file(content: &str) -> Vec<RuleDto> {
                 let dsl = lines.join("\n");
                 let (c, a) = parse_dsl(&dsl);
                 rules.push(RuleDto {
-                    rule_id: id.clone(), name: name.clone(), dsl,
+                    rule_id: id.clone(),
+                    name: name.clone(),
+                    dsl,
                     priority: extract_priority(&lines.join("\n")),
-                    enabled: true, conditions: c, actions: a,
-                    created_at: String::new(), updated_at: String::new(),
+                    enabled: true,
+                    conditions: c,
+                    actions: a,
+                    created_at: String::new(),
+                    updated_at: String::new(),
                 });
             }
             name = t.strip_prefix("RULE:").unwrap_or(t).trim().to_string();
@@ -464,10 +531,15 @@ fn parse_dsl_file(content: &str) -> Vec<RuleDto> {
         let dsl = lines.join("\n");
         let (c, a) = parse_dsl(&dsl);
         rules.push(RuleDto {
-            rule_id: id, name, dsl,
+            rule_id: id,
+            name,
+            dsl,
             priority: extract_priority(&lines.join("\n")),
-            enabled: true, conditions: c, actions: a,
-            created_at: String::new(), updated_at: String::new(),
+            enabled: true,
+            conditions: c,
+            actions: a,
+            created_at: String::new(),
+            updated_at: String::new(),
         });
     }
     rules
@@ -480,7 +552,10 @@ fn parse_dsl_file(content: &str) -> Vec<RuleDto> {
 #[tokio::main]
 async fn main() {
     let rules_dir = std::env::var("RULES_DIR").unwrap_or_else(|_| "./rules".to_string());
-    let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "7912".to_string()).parse().unwrap_or(7912);
+    let port: u16 = std::env::var("PORT")
+        .unwrap_or_else(|_| "7912".to_string())
+        .parse()
+        .unwrap_or(7912);
 
     let state = Arc::new(RuleEngineState::new(rules_dir.clone()));
 
@@ -491,7 +566,9 @@ async fn main() {
             let mut rules = state.rules.lock().unwrap();
             for entry in std::fs::read_dir(&dir).unwrap().flatten() {
                 let path = entry.path();
-                if path.extension().is_none_or(|e| e != "dsl") { continue; }
+                if path.extension().is_none_or(|e| e != "dsl") {
+                    continue;
+                }
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     for rule in parse_dsl_file(&content) {
                         rules.insert(rule.rule_id.clone(), rule);
@@ -504,13 +581,25 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/rules", get(list_rules).post(create_rule))
-        .route("/api/rules/:id", get(|axum::extract::Path(id): axum::extract::Path<String>, State(state): State<Arc<RuleEngineState>>| async move {
-            let rules = state.rules.lock().unwrap();
-            match rules.get(&id) {
-                Some(r) => Json(serde_json::json!({"rule": r})).into_response(),
-                None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
-            }
-        }).put(update_rule).delete(delete_rule))
+        .route(
+            "/api/rules/:id",
+            get(
+                |axum::extract::Path(id): axum::extract::Path<String>,
+                 State(state): State<Arc<RuleEngineState>>| async move {
+                    let rules = state.rules.lock().unwrap();
+                    match rules.get(&id) {
+                        Some(r) => Json(serde_json::json!({"rule": r})).into_response(),
+                        None => (
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({"error": "not found"})),
+                        )
+                            .into_response(),
+                    }
+                },
+            )
+            .put(update_rule)
+            .delete(delete_rule),
+        )
         .route("/api/rules/test", post(test_rules))
         .route("/api/rules/reload", post(reload_rules))
         .route("/api/rules/stats", get(rule_stats))
@@ -531,6 +620,8 @@ async fn main() {
     println!("  POST   /api/rules/reload - Hot reload");
     println!("  GET    /api/rules/stats  - Statistics");
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+        .await
+        .unwrap();
     axum::serve(listener, app).await.unwrap();
 }

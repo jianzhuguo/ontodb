@@ -12,11 +12,26 @@ use std::collections::HashMap;
 /// External data source types.
 #[derive(Debug, Clone)]
 pub enum ExternalSource {
-    PostgreSQL { host: String, port: u16, database: String },
-    MySQL { host: String, port: u16, database: String },
-    RestApi { base_url: String, auth_header: Option<String> },
-    CsvFile { path: String },
-    JsonFile { path: String },
+    PostgreSQL {
+        host: String,
+        port: u16,
+        database: String,
+    },
+    MySQL {
+        host: String,
+        port: u16,
+        database: String,
+    },
+    RestApi {
+        base_url: String,
+        auth_header: Option<String>,
+    },
+    CsvFile {
+        path: String,
+    },
+    JsonFile {
+        path: String,
+    },
 }
 
 /// External table mapping.
@@ -44,7 +59,10 @@ pub struct FederatedEngine {
 
 impl FederatedEngine {
     pub fn new() -> Self {
-        Self { tables: HashMap::new(), sources: HashMap::new() }
+        Self {
+            tables: HashMap::new(),
+            sources: HashMap::new(),
+        }
     }
 
     /// Register an external data source as a namespace.
@@ -60,7 +78,8 @@ impl FederatedEngine {
 
     /// Check if a table is external (federated).
     pub fn is_external(&self, namespace: &str, table: &str) -> bool {
-        self.tables.contains_key(&format!("{}::{}", namespace, table))
+        self.tables
+            .contains_key(&format!("{}::{}", namespace, table))
     }
 
     /// Get external table metadata.
@@ -84,18 +103,25 @@ impl FederatedEngine {
             source_type: match &t.source {
                 ExternalSource::PostgreSQL { .. } => "PostgreSQL".into(),
                 ExternalSource::MySQL { .. } => "MySQL".into(),
-            ExternalSource::RestApi { .. } => "REST".into(),
+                ExternalSource::RestApi { .. } => "REST".into(),
                 ExternalSource::CsvFile { .. } => "CSV".into(),
                 ExternalSource::JsonFile { .. } => "JSON".into(),
             },
             columns: t.columns.iter().map(|c| c.name.clone()).collect(),
             cache_ttl_ms: t.cache_ttl_ms,
-            pushdown_supported: matches!(t.source, ExternalSource::PostgreSQL { .. } | ExternalSource::MySQL { .. }),
+            pushdown_supported: matches!(
+                t.source,
+                ExternalSource::PostgreSQL { .. } | ExternalSource::MySQL { .. }
+            ),
         })
     }
 
-    pub fn source_count(&self) -> usize { self.sources.len() }
-    pub fn table_count(&self) -> usize { self.tables.len() }
+    pub fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+    pub fn table_count(&self) -> usize {
+        self.tables.len()
+    }
 }
 
 #[derive(Debug)]
@@ -113,27 +139,45 @@ mod tests {
     #[test]
     fn test_register_source() {
         let mut engine = FederatedEngine::new();
-        engine.register_source("mysql_legacy", ExternalSource::MySQL {
-            host: "10.0.0.1".into(), port: 3306, database: "legacy".into(),
-        });
+        engine.register_source(
+            "mysql_legacy",
+            ExternalSource::MySQL {
+                host: "10.0.0.1".into(),
+                port: 3306,
+                database: "legacy".into(),
+            },
+        );
         assert_eq!(engine.source_count(), 1);
     }
 
     #[test]
     fn test_register_table() {
         let mut engine = FederatedEngine::new();
-        engine.register_source("pg", ExternalSource::PostgreSQL {
-            host: "localhost".into(), port: 5432, database: "app".into(),
-        });
+        engine.register_source(
+            "pg",
+            ExternalSource::PostgreSQL {
+                host: "localhost".into(),
+                port: 5432,
+                database: "app".into(),
+            },
+        );
         engine.register_table(ExternalTable {
             namespace: "pg".into(),
             table_name: "users".into(),
             source: ExternalSource::PostgreSQL {
-                host: "localhost".into(), port: 5432, database: "app".into(),
+                host: "localhost".into(),
+                port: 5432,
+                database: "app".into(),
             },
             columns: vec![
-                ColumnInfo { name: "id".into(), col_type: "int".into() },
-                ColumnInfo { name: "name".into(), col_type: "text".into() },
+                ColumnInfo {
+                    name: "id".into(),
+                    col_type: "int".into(),
+                },
+                ColumnInfo {
+                    name: "name".into(),
+                    col_type: "text".into(),
+                },
             ],
             cache_ttl_ms: 60000,
         });
@@ -146,10 +190,13 @@ mod tests {
     #[test]
     fn test_plan_hint() {
         let mut engine = FederatedEngine::new();
-        engine.register_source("api", ExternalSource::RestApi {
-            base_url: "https://api.example.com".into(),
-            auth_header: Some("Bearer token".into()),
-        });
+        engine.register_source(
+            "api",
+            ExternalSource::RestApi {
+                base_url: "https://api.example.com".into(),
+                auth_header: Some("Bearer token".into()),
+            },
+        );
         engine.register_table(ExternalTable {
             namespace: "api".into(),
             table_name: "products".into(),
@@ -157,7 +204,10 @@ mod tests {
                 base_url: "https://api.example.com".into(),
                 auth_header: None,
             },
-            columns: vec![ColumnInfo { name: "id".into(), col_type: "string".into() }],
+            columns: vec![ColumnInfo {
+                name: "id".into(),
+                col_type: "string".into(),
+            }],
             cache_ttl_ms: 300000,
         });
 
@@ -173,7 +223,9 @@ mod tests {
             namespace: "pg".into(),
             table_name: "orders".into(),
             source: ExternalSource::PostgreSQL {
-                host: "localhost".into(), port: 5432, database: "app".into(),
+                host: "localhost".into(),
+                port: 5432,
+                database: "app".into(),
             },
             columns: vec![],
             cache_ttl_ms: 60000,
@@ -187,14 +239,22 @@ mod tests {
     fn test_list_tables() {
         let mut engine = FederatedEngine::new();
         engine.register_table(ExternalTable {
-            namespace: "a".into(), table_name: "t1".into(),
-            source: ExternalSource::CsvFile { path: "/tmp/a.csv".into() },
-            columns: vec![], cache_ttl_ms: 0,
+            namespace: "a".into(),
+            table_name: "t1".into(),
+            source: ExternalSource::CsvFile {
+                path: "/tmp/a.csv".into(),
+            },
+            columns: vec![],
+            cache_ttl_ms: 0,
         });
         engine.register_table(ExternalTable {
-            namespace: "b".into(), table_name: "t2".into(),
-            source: ExternalSource::JsonFile { path: "/tmp/b.json".into() },
-            columns: vec![], cache_ttl_ms: 0,
+            namespace: "b".into(),
+            table_name: "t2".into(),
+            source: ExternalSource::JsonFile {
+                path: "/tmp/b.json".into(),
+            },
+            columns: vec![],
+            cache_ttl_ms: 0,
         });
 
         assert_eq!(engine.list_tables().len(), 2);

@@ -37,17 +37,31 @@ pub enum PlanNode {
     /// Single modality scan
     Scan(QueryOp),
     /// Filter operation
-    Filter { child: Box<PlanNode>, predicate: String, selectivity: f64 },
+    Filter {
+        child: Box<PlanNode>,
+        predicate: String,
+        selectivity: f64,
+    },
     /// Join two sub-plans
-    Join { left: Box<PlanNode>, right: Box<PlanNode>, join_type: JoinType },
+    Join {
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+        join_type: JoinType,
+    },
     /// Union of sub-plans
     Union { children: Vec<PlanNode> },
     /// Sort
-    Sort { child: Box<PlanNode>, keys: Vec<String> },
+    Sort {
+        child: Box<PlanNode>,
+        keys: Vec<String>,
+    },
     /// Limit
     Limit { child: Box<PlanNode>, count: u64 },
     /// Cross-modal fusion (unique to OntoDB)
-    Fusion { children: Vec<PlanNode>, fusion_type: FusionType },
+    Fusion {
+        children: Vec<PlanNode>,
+        fusion_type: FusionType,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +106,11 @@ impl Default for CostModel {
         scan_cost.insert(Modality::Spatial, 0.3);
         scan_cost.insert(Modality::Ontology, 2.0);
         scan_cost.insert(Modality::FullText, 0.3);
-        Self { scan_cost, join_multiplier: 1.5, fusion_overhead: 1.2 }
+        Self {
+            scan_cost,
+            join_multiplier: 1.5,
+            fusion_overhead: 1.2,
+        }
     }
 }
 
@@ -103,7 +121,9 @@ pub struct FusionOptimizer {
 
 impl FusionOptimizer {
     pub fn new() -> Self {
-        Self { cost_model: CostModel::default() }
+        Self {
+            cost_model: CostModel::default(),
+        }
     }
 
     pub fn with_cost_model(cost_model: CostModel) -> Self {
@@ -131,7 +151,9 @@ impl FusionOptimizer {
         sorted_ops.sort_by(|a, b| {
             let cost_a = self.estimate_cost(a);
             let cost_b = self.estimate_cost(b);
-            cost_a.partial_cmp(&cost_b).unwrap_or(std::cmp::Ordering::Equal)
+            cost_a
+                .partial_cmp(&cost_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // Detect fusion patterns
@@ -171,7 +193,10 @@ impl FusionOptimizer {
 
     fn build_fusion_plan(&self, ops: &[QueryOp], fusion_type: FusionType) -> PlanNode {
         let children: Vec<PlanNode> = ops.iter().map(|op| PlanNode::Scan(op.clone())).collect();
-        PlanNode::Fusion { children, fusion_type }
+        PlanNode::Fusion {
+            children,
+            fusion_type,
+        }
     }
 
     fn estimate_cost(&self, op: &QueryOp) -> f64 {
@@ -183,19 +208,18 @@ impl FusionOptimizer {
     pub fn estimate_plan_cost(&self, plan: &PlanNode) -> f64 {
         match plan {
             PlanNode::Scan(op) => self.estimate_cost(op),
-            PlanNode::Filter { child, selectivity, .. } => {
-                self.estimate_plan_cost(child) * selectivity
-            }
+            PlanNode::Filter {
+                child, selectivity, ..
+            } => self.estimate_plan_cost(child) * selectivity,
             PlanNode::Join { left, right, .. } => {
-                self.estimate_plan_cost(left) + self.estimate_plan_cost(right) * self.cost_model.join_multiplier
+                self.estimate_plan_cost(left)
+                    + self.estimate_plan_cost(right) * self.cost_model.join_multiplier
             }
             PlanNode::Union { children } => {
                 children.iter().map(|c| self.estimate_plan_cost(c)).sum()
             }
             PlanNode::Sort { child, .. } => self.estimate_plan_cost(child) * 1.1,
-            PlanNode::Limit { child, count } => {
-                self.estimate_plan_cost(child).min(*count as f64)
-            }
+            PlanNode::Limit { child, count } => self.estimate_plan_cost(child).min(*count as f64),
             PlanNode::Fusion { children, .. } => {
                 let base: f64 = children.iter().map(|c| self.estimate_plan_cost(c)).sum();
                 base * self.cost_model.fusion_overhead
@@ -208,20 +232,34 @@ impl FusionOptimizer {
 pub fn explain_plan(plan: &PlanNode, depth: usize) -> String {
     let indent = "  ".repeat(depth);
     match plan {
-        PlanNode::Scan(op) => format!("{}Scan({:?}) rows={} cost={}µs", indent, op.modality, op.estimated_rows, op.estimated_cost_us),
-        PlanNode::Filter { child, predicate, selectivity } => {
+        PlanNode::Scan(op) => format!(
+            "{}Scan({:?}) rows={} cost={}µs",
+            indent, op.modality, op.estimated_rows, op.estimated_cost_us
+        ),
+        PlanNode::Filter {
+            child,
+            predicate,
+            selectivity,
+        } => {
             let mut s = format!("{}Filter({}, sel={:.2})\n", indent, predicate, selectivity);
             s += &explain_plan(child, depth + 1);
             s
         }
-        PlanNode::Join { left, right, join_type } => {
+        PlanNode::Join {
+            left,
+            right,
+            join_type,
+        } => {
             let mut s = format!("{:?}Join({:?})\n", indent, join_type);
             s += &explain_plan(left, depth + 1);
             s += "\n";
             s += &explain_plan(right, depth + 1);
             s
         }
-        PlanNode::Fusion { children, fusion_type } => {
+        PlanNode::Fusion {
+            children,
+            fusion_type,
+        } => {
             let mut s = format!("{}Fusion({:?})\n", indent, fusion_type);
             for child in children {
                 s += &explain_plan(child, depth + 1);
@@ -283,7 +321,10 @@ mod tests {
         ];
         let plan = optimizer.optimize(ops);
         match plan {
-            PlanNode::Fusion { fusion_type: FusionType::VectorRelational, .. } => {}
+            PlanNode::Fusion {
+                fusion_type: FusionType::VectorRelational,
+                ..
+            } => {}
             _ => panic!("Expected VectorRelational Fusion, got {:?}", plan),
         }
     }
@@ -297,7 +338,10 @@ mod tests {
         ];
         let plan = optimizer.optimize(ops);
         match plan {
-            PlanNode::Fusion { fusion_type: FusionType::SpatialTemporal, .. } => {}
+            PlanNode::Fusion {
+                fusion_type: FusionType::SpatialTemporal,
+                ..
+            } => {}
             _ => panic!("Expected SpatialTemporal Fusion"),
         }
     }
@@ -311,7 +355,10 @@ mod tests {
         ];
         let plan = optimizer.optimize(ops);
         match plan {
-            PlanNode::Fusion { fusion_type: FusionType::OntologyInfer, .. } => {}
+            PlanNode::Fusion {
+                fusion_type: FusionType::OntologyInfer,
+                ..
+            } => {}
             _ => panic!("Expected OntologyInfer Fusion"),
         }
     }
@@ -325,7 +372,10 @@ mod tests {
         ];
         let plan = optimizer.optimize(ops);
         match plan {
-            PlanNode::Fusion { fusion_type: FusionType::TextVectorRerank, .. } => {}
+            PlanNode::Fusion {
+                fusion_type: FusionType::TextVectorRerank,
+                ..
+            } => {}
             _ => panic!("Expected TextVectorRerank Fusion"),
         }
     }

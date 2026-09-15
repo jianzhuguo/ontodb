@@ -17,7 +17,6 @@
 #![allow(clippy::unnecessary_unwrap)]
 #![allow(clippy::result_large_err)]
 #![allow(clippy::doc_lazy_continuation)]
-
 // Copyright (c) 2024-2026 OntoDB Team
 // Licensed under the Business Source License 1.1 (BUSL-1.1).
 // See LICENSE for details. Change Date: 2031-09-15.
@@ -529,13 +528,13 @@ fn build_enterprise_config(args: &Args, tier: ProductTier) -> onto_enterprise::E
         {
             config.encryption.storage_encryption = args.encryption_enabled;
             if let Some(ref key_file) = args.master_key_file {
-    #[cfg(feature = "enterprise")]
+                #[cfg(feature = "enterprise")]
                 config.encryption.master_key_source = onto_enterprise::encryption::KeySource::File(
                     key_file.to_string_lossy().to_string(),
                 );
             } else if let Some(ref env_var) = args.master_key_env {
                 config.encryption.master_key_source =
-            #[cfg(feature = "enterprise")]
+                    #[cfg(feature = "enterprise")]
                     onto_enterprise::encryption::KeySource::Env(env_var.clone());
             }
         }
@@ -552,7 +551,7 @@ fn build_enterprise_config(args: &Args, tier: ProductTier) -> onto_enterprise::E
     }
 
     // Load from config file if specified
-            #[cfg(feature = "enterprise")]
+    #[cfg(feature = "enterprise")]
     if let Some(ref config_path) = args.enterprise_config {
         match std::fs::read_to_string(config_path) {
             Ok(content) => {
