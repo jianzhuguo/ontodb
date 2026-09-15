@@ -277,7 +277,7 @@ OntoDB：  EntityId = {namespace}::{class}::{pk} → 键前缀路由 → 物理�
 | 时序存储 | InfluxDB | **1,126K ops/s** | TSM列式 |
 | 规则引擎 | Drools | **34.5µs/10条** | DSL语法 |
 
-> 详见 [benchmark-report.md](docs/benchmark-report.md)
+> 详见 [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md)
 
 ---
 

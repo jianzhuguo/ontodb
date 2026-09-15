@@ -267,7 +267,7 @@ One OntoDB instance serves N tenants/projects with low ops cost and data securit
 | Time series | InfluxDB | **1,126K ops/s** | TSM columnar |
 | Rule engine | Drools | **34.5µs/10 rules** | DSL syntax |
 
-> See [benchmark-report.md](docs/benchmark-report.md) for full details
+> See [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md) for full details
 
 ---
 
