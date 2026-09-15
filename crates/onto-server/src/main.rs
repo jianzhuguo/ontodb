@@ -281,7 +281,11 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    println!("============================================================");
     println!("OntoDB v{}", env!("CARGO_PKG_VERSION"));
+    println!("Copyright (c) 2024-2026 OntoDB Team. All rights reserved.");
+    println!("Licensed under BUSL-1.1 | https://ontovalue.com");
+    println!("============================================================");
     println!("Edition: {:?}", tier);
     if !features.is_empty() {
         println!("Enterprise features: {}", features.join(", "));

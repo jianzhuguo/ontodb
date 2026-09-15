@@ -609,6 +609,11 @@ async fn main() {
         .route("/api/rules/import/file", post(import_rules_from_file))
         .with_state(state);
 
+    println!("============================================================");
+    println!("OntoDB Rules API v0.1.0");
+    println!("Copyright (c) 2024-2026 OntoDB Team. All rights reserved.");
+    println!("Licensed under BUSL-1.1 | https://ontovalue.com");
+    println!("============================================================");
     println!("Rules API server listening on 0.0.0.0:{}", port);
     println!("Endpoints:");
     println!("  GET    /api/rules        - List all rules");

@@ -901,7 +901,7 @@ fn handle_meta_command(cmd: &str, stream: &TcpStream) {
 }
 
 fn print_banner(addr: &str) {
-    println!("OntoDB CLI v{}", env!("CARGO_PKG_VERSION"));
+    println!("OntoDB CLI v{} | Copyright (c) 2024-2026 OntoDB Team", env!("CARGO_PKG_VERSION"));
     println!("Connected to {}", addr);
     println!();
     println!("Type SQL queries ending with ';' to execute.");
