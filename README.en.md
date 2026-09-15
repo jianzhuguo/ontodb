@@ -258,14 +258,14 @@ One OntoDB instance serves N tenants/projects with low ops cost and data securit
 
 ### Performance vs Domain-Specific Databases
 
-| Function | Standalone System | OntoDB | Note |
-|----------|------------------|--------|------|
-| Relational | PostgreSQL | **1,126K ops/s** | Write throughput |
-| Vector search | Milvus | **403µs / 100% recall** | 10K scale |
-| Graph query | Neo4j | **<1ms** | BFS/DFS |
-| OWL reasoning | Jena | **50.8µs** | Incremental fixpoint |
-| Time series | InfluxDB | **1,126K ops/s** | TSM columnar |
-| Rule engine | Drools | **34.5µs/10 rules** | DSL syntax |
+| Function | Specialist DB | Specialist Perf | OntoDB | Note |
+|----------|--------------|----------------|--------|------|
+| Relational | PostgreSQL | ~30K ops/s | **1,126K ops/s** | Write throughput |
+| Vector search | Milvus | ~1ms / 95-99% | **403µs / 100%** | 10K scale |
+| Graph query | Neo4j | ~10ms | **<1ms** | BFS/DFS |
+| OWL reasoning | Apache Jena | ~100ms | **50.8µs** | Incremental fixpoint |
+| Time series | InfluxDB | ~200K ops/s | **1,126K ops/s** | TSM columnar |
+| Rule engine | Drools | ~500µs/10 rules | **34.5µs/10 rules** | DSL syntax |
 
 > See [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md) for full details
 

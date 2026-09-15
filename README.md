@@ -268,14 +268,14 @@ OntoDB：  EntityId = {namespace}::{class}::{pk} → 键前缀路由 → 物理�
 
 ### 性能对标：OntoDB vs 各领域专用数据库
 
-| 功能 | 独立系统 | OntoDB | 说明 |
-|------|---------|--------|------|
-| 关系存储 | PostgreSQL | **1,126K ops/s** | 写入吞吐 |
-| 向量搜索 | Milvus | **403µs / 100%召回** | 10K规模 |
-| 图查询 | Neo4j | **<1ms** | BFS/DFS |
-| OWL推理 | Jena | **50.8µs** | 增量不动点 |
-| 时序存储 | InfluxDB | **1,126K ops/s** | TSM列式 |
-| 规则引擎 | Drools | **34.5µs/10条** | DSL语法 |
+| 功能 | 专用数据库 | 专用数据库性能 | OntoDB | 说明 |
+|------|-----------|--------------|--------|------|
+| 关系存储 | PostgreSQL | ~30K ops/s | **1,126K ops/s** | 写入吞吐 |
+| 向量搜索 | Milvus | ~1ms / 95-99% | **403µs / 100%** | 10K规模 |
+| 图查询 | Neo4j | ~10ms | **<1ms** | BFS/DFS |
+| OWL推理 | Apache Jena | ~100ms | **50.8µs** | 增量不动点 |
+| 时序存储 | InfluxDB | ~200K ops/s | **1,126K ops/s** | TSM列式 |
+| 规则引擎 | Drools | ~500µs/10条 | **34.5µs/10条** | DSL语法 |
 
 > 详见 [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md)
 
