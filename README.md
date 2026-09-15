@@ -442,6 +442,8 @@ OntoDB 采用双许可模式：
 - 详见 [LICENSE.COMMERCIAL](LICENSE.COMMERCIAL)
 - 联系方式：license@ontovalue.com
 
+**合规声明：** 违反 BUSL-1.1 条款使用 OntoDB（包括但不限于：移除版权声明、提供 DBaaS 托管服务）将承担法律责任。发现违规使用请举报：license@ontovalue.com
+
 ---
 
 ## 贡献

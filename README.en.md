@@ -432,6 +432,8 @@ OntoDB uses a dual licensing model:
 - See [LICENSE.COMMERCIAL](LICENSE.COMMERCIAL)
 - Contact: license@ontovalue.com
 
+**Compliance Notice:** Using OntoDB in violation of BUSL-1.1 terms (including but not limited to: removing copyright notices, providing DBaaS hosting services) will result in legal liability. Report violations to: license@ontovalue.com
+
 ---
 
 ## Contributing
