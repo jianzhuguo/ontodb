@@ -6,7 +6,11 @@ Licensed Work: OntoDB — An ontology-driven semantic multi-modal database
 The Licensed Work is (c) 2024-2026 OntoDB Team
 
 Additional Use Grant: You may use the Licensed Work for any purpose
-except as described in the Restricted Use section below.
+except as described in the Restricted Use section below, provided that
+your organization's annual revenue does not exceed RMB 20,000,000
+(approximately USD 2,800,000). Organizations whose annual revenue
+exceeds this threshold must obtain a commercial license from the Licensor
+to use the Licensed Work.
 
 Restricted Use: You may not use the Licensed Work, or any component
 thereof, to provide a managed database service, hosted database service,

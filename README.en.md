@@ -419,9 +419,11 @@ OntoDB uses a dual licensing model:
 | **Enterprise** | Commercial | Full features, requires purchased license |
 
 **Community (BUSL-1.1):**
+- Allowed: organizations with annual revenue below RMB 20M (~USD 2.8M) use for free
 - Allowed: internal use, local deployment, secondary development, non-commercial distribution
 - Allowed: enterprise self-hosting, embedding in SaaS products
 - Prohibited: offering OntoDB as a cloud database service (DBaaS)
+- Organizations exceeding RMB 20M annual revenue must purchase a commercial license
 - Auto-converts to Apache License 2.0 on 2031-09-15
 - See [LICENSE](LICENSE)
 
