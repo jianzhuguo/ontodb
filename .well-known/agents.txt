@@ -61,7 +61,7 @@ performance:
   reasoning_speedup: 100
 
 # License
-license: AGPL-3.0 (Community) / Commercial (Enterprise)
+license: BUSL-1.1 (Community) / Commercial (Enterprise)
 
 # Contact
 contact:

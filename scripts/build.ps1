@@ -1,5 +1,5 @@
 # OntoDB Build Script (Windows)
-# Supports building community (AGPL) and enterprise editions
+# Supports building community (BUSL-1.1) and enterprise editions
 
 param(
     [ValidateSet("community", "enterprise-standard", "enterprise-gov")]
@@ -18,11 +18,11 @@ Write-Host "========================================" -ForegroundColor Cyan
 
 switch ($Edition) {
     "community" {
-        Write-Host "Building Community Edition (AGPL-3.0)..." -ForegroundColor Green
+        Write-Host "Building Community Edition (BUSL-1.1)..." -ForegroundColor Green
         cargo build --release
         Write-Host ""
         Write-Host "Build complete: target/release/ontodb-server.exe" -ForegroundColor Green
-        Write-Host "License: AGPL-3.0" -ForegroundColor Yellow
+        Write-Host "License: BUSL-1.1" -ForegroundColor Yellow
     }
     "enterprise-standard" {
         Write-Host "Building Enterprise Standard Edition..." -ForegroundColor Green

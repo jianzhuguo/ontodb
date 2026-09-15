@@ -119,10 +119,10 @@ OntoDB uses a dual licensing model:
 
 | Edition | License | Description |
 |---------|---------|-------------|
-| **Community** | AGPL-3.0 | Free to use, modifications must be open source |
+| **Community** | BUSL-1.1 | Free to use, modifications must be open source |
 | **Enterprise** | Commercial | Production use, no open source requirement |
 
-**Community Edition (AGPL-3.0)**:
+**Community Edition (BUSL-1.1)**:
 - Free to use, modify, and distribute
 - If providing network services, modified code must be open source
 - See [LICENSE](LICENSE)
