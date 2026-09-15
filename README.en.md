@@ -256,7 +256,7 @@ One OntoDB instance serves N tenants/projects with low ops cost and data securit
 | 10 rules | **34.5µs** |
 | 1000 rules | **1.79ms** |
 
-### Unified Replacement Comparison
+### Performance vs Domain-Specific Databases
 
 | Function | Standalone System | OntoDB | Note |
 |----------|------------------|--------|------|
