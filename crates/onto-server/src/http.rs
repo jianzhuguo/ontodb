@@ -577,6 +577,8 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/backup/verify", post(verify_backup_endpoint))
         .route("/api/restore", post(restore_endpoint))
         .route("/api/flush", post(flush))
+        // Living data activation
+        .route("/api/activate", post(activate_entries))
         // Transaction endpoints
         .route("/api/transaction/begin", post(transaction_begin))
         .route("/api/transaction/execute", post(transaction_execute))
@@ -703,6 +705,8 @@ pub fn build_router_with_auth(
         .route("/api/backup/verify", post(verify_backup_endpoint))
         .route("/api/restore", post(restore_endpoint))
         .route("/api/flush", post(flush))
+        // Living data activation
+        .route("/api/activate", post(activate_entries))
         // Transaction endpoints
         .route("/api/transaction/begin", post(transaction_begin))
         .route("/api/transaction/execute", post(transaction_execute))
@@ -1269,11 +1273,14 @@ async fn execute_query(
         _ => "OTHER",
     };
 
+    let t_parse = start.elapsed().as_secs_f64() * 1000.0;
+    let t_exec_start = std::time::Instant::now();
     let result = if onto_query::QueryExecutor::is_read_only_query(&ast) {
         state.executor.execute_read(&ast)
     } else {
         state.executor.execute(&ast)
     };
+    let t_exec = t_exec_start.elapsed().as_secs_f64() * 1000.0;
     let result = match result {
         Ok(r) => r,
         Err(e) => {
@@ -1330,10 +1337,25 @@ async fn execute_query(
 
     let elapsed_ms = elapsed * 1000.0;
 
+    let t_serialize_start = std::time::Instant::now();
     let data = match result {
         onto_query::QueryResult::Success(msg) => json!({ "message": msg }),
         onto_query::QueryResult::Rows(rows) => json!(rows),
     };
+    let t_serialize = t_serialize_start.elapsed().as_secs_f64() * 1000.0;
+
+    // Log timing breakdown for slow queries
+    if elapsed >= SLOW_QUERY_THRESHOLD_SECS {
+        tracing::info!(
+            target: "query_timing",
+            parse_ms = t_parse,
+            exec_ms = t_exec,
+            serialize_ms = t_serialize,
+            total_ms = elapsed_ms,
+            rows = match &data { serde_json::Value::Array(a) => a.len(), _ => 0 },
+            "query timing breakdown"
+        );
+    }
 
     let response = ApiResponse::success(data, elapsed_ms);
     (StatusCode::OK, PrettyJson(response, req.pretty))
@@ -3413,6 +3435,80 @@ async fn flush(State(state): State<AppState>) -> impl IntoResponse {
             )
         }
     }
+}
+
+/// POST /api/activate — Activate living data entries (set initial value scores).
+///
+/// Request body:
+/// ```json
+/// {
+///     "class": "Protein",
+///     "delta": 0.5,
+///     "namespace": "sembio"   // optional, defaults to "default"
+/// }
+/// ```
+///
+/// Scans all entries of the given class and calls `activate()` on each.
+async fn activate_entries(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let class = match req["class"].as_str() {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error("'class' field required".to_string())),
+            );
+        }
+    };
+
+    let delta = req["delta"].as_f64().unwrap_or(0.5);
+    let ns = req["namespace"].as_str().unwrap_or("default");
+
+    // Scan all entries of this class
+    // Key format: "{namespace}.{class}::{pk}" (dot separator between ns and class)
+    let prefix = format!("{}.{}::", ns, class);
+    let entries = match state.executor.engine().scan_prefix(prefix.as_bytes()) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<Value>::error(format!("Scan failed: {}", e))),
+            );
+        }
+    };
+
+    let mut activated = 0usize;
+    let mut errors = 0usize;
+
+    for (key, _) in &entries {
+        let key_str = String::from_utf8_lossy(key);
+        // Extract PK from key: namespace::class::pk
+        if let Some(pk) = key_str.split("::").last() {
+            match state.executor.engine().activate(class, pk, delta, "batch_import") {
+                Ok(()) => activated += 1,
+                Err(_) => errors += 1,
+            }
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(
+            json!({
+                "class": class,
+                "namespace": ns,
+                "activated": activated,
+                "errors": errors,
+                "delta": delta
+            }),
+            elapsed,
+        )),
+    )
 }
 
 // ── Sharding API ──────────────────────────────────────────────────

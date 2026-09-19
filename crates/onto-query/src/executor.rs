@@ -318,6 +318,9 @@ pub struct QueryExecutor {
     /// Set by `USE NAMESPACE <name>`, defaults to "default".
     /// All EntityId created by this executor use this namespace.
     current_namespace: Mutex<String>,
+    /// Cached row counts per table: table_name → (count, last_updated).
+    /// Avoids full table scan for COUNT(*) queries.
+    row_count_cache: Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>,
 }
 
 /// Column-level statistics collected by ANALYZE.
@@ -459,6 +462,7 @@ impl QueryExecutor {
             shard_router: std::sync::RwLock::new(None),
             shard_manager: Mutex::new(None),
             current_namespace: Mutex::new("default".to_string()),
+            row_count_cache: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -466,6 +470,23 @@ impl QueryExecutor {
     fn arm_timeout(&self) {
         let deadline = now_nanos() + self.config.query_timeout.as_nanos() as u64;
         self.query_deadline.store(deadline, Ordering::Relaxed);
+    }
+
+    /// Get cached row count for a table, or compute and cache it.
+    /// Cache TTL: 60 seconds.
+    fn get_cached_row_count(&self, engine: &LsmEngine, table: &str) -> Option<u64> {
+        let cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(count, ref updated)) = cache.get(table) {
+            if updated.elapsed().as_secs() < 60 {
+                return Some(count);
+            }
+        }
+        None
+    }
+
+    fn set_cached_row_count(&self, table: &str, count: u64) {
+        let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(table.to_string(), (count, std::time::Instant::now()));
     }
 
     /// Returns an error if the current query has exceeded its timeout.
@@ -1344,6 +1365,23 @@ impl QueryExecutor {
             stats.total_time_us += elapsed_us;
             if let QueryAst::Select { from, .. } = ast {
                 *stats.table_scan_counts.entry(from.clone()).or_insert(0) += 1;
+            }
+        }
+
+        // Invalidate row count cache for the affected table
+        if result.is_ok() {
+            let table = match ast {
+                QueryAst::Insert { class, .. }
+                | QueryAst::BatchInsert { class, .. }
+                | QueryAst::BatchUpsert { class, .. }
+                | QueryAst::InsertSelect { class, .. }
+                | QueryAst::Delete { class, .. }
+                | QueryAst::Update { class, .. } => Some(class.as_str()),
+                _ => None,
+            };
+            if let Some(t) = table {
+                let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+                cache.remove(t);
             }
         }
 
@@ -4658,6 +4696,27 @@ impl QueryExecutor {
         filter: &Option<FilterExpr>,
         columns: &SelectColumns,
     ) -> Result<Vec<Map<String, Value>>> {
+        // Fast path: unfiltered COUNT(*) with cached row count
+        if filter.is_none() {
+            if let Some(cached) = self.get_cached_row_count(engine, table) {
+                let mut row = Map::new();
+                let alias = match columns {
+                    SelectColumns::Columns(items) => {
+                        items.first().and_then(|item| {
+                            if let SelectItem::Aggregate(a) = item {
+                                Some(a.alias.clone().unwrap_or_else(|| "COUNT(*)".to_string()))
+                            } else {
+                                None
+                            }
+                        }).unwrap_or_else(|| "COUNT(*)".to_string())
+                    }
+                    _ => "COUNT(*)".to_string(),
+                };
+                row.insert(alias, Value::Number(cached.into()));
+                return Ok(vec![row]);
+            }
+        }
+
         let class_hierarchy = self.get_class_hierarchy_read(engine, table);
         let fast_filter_cols = Self::extract_fast_filter_columns(filter);
         let mut count: u64 = 0;
@@ -4729,6 +4788,12 @@ impl QueryExecutor {
         };
         let mut result_row = Map::new();
         result_row.insert(count_key, Value::Number(serde_json::Number::from(count)));
+
+        // Cache the count for future COUNT(*) queries
+        if filter.is_none() {
+            self.set_cached_row_count(table, count);
+        }
+
         Ok(vec![result_row])
     }
 

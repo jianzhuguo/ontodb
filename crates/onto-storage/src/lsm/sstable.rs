@@ -930,6 +930,34 @@ impl<'a> SsTableIterator<'a> {
     pub fn next(&mut self) {
         self.advance_to_next_entry();
     }
+
+    /// Seek to the first key >= `target`. Uses binary search on block index
+    /// to jump directly to the right block, then scans within the block.
+    /// This avoids linear scanning from the beginning for prefix scans.
+    pub fn seek(&mut self, target: &[u8]) {
+        // Find the block that might contain `target`
+        match self.table.find_block(target) {
+            Ok(idx) => {
+                if let Err(_) = self.load_block(idx) {
+                    self.valid = false;
+                    return;
+                }
+                // Scan within the block to find first key >= target
+                loop {
+                    if !self.valid {
+                        break;
+                    }
+                    if self.key() >= target {
+                        break;
+                    }
+                    self.advance_to_next_entry();
+                }
+            }
+            Err(_) => {
+                self.valid = false;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

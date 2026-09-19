@@ -538,7 +538,13 @@ impl LsmEngine {
     /// This leverages the LSM-Tree's sorted key structure:
     /// entries with `{class}::` prefix are contiguous in sorted order.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.scan_prefix_internal(prefix, None)
+        self.scan_prefix_internal(prefix, None, None)
+    }
+
+    /// Scan with prefix, returning at most `limit` entries.
+    /// Stops scanning SSTs once limit is reached — avoids full table scan for LIMIT queries.
+    pub fn scan_prefix_limit(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_prefix_internal(prefix, None, Some(limit))
     }
 
     /// Internal scan implementation shared by scan_prefix and scan_prefix_with_visibility.
@@ -547,6 +553,7 @@ impl LsmEngine {
         &self,
         prefix: &[u8],
         vis: Option<&crate::mvcc::Visibility>,
+        limit: Option<usize>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.drain_compaction_notifications();
 
@@ -604,9 +611,8 @@ impl LsmEngine {
         for sst in &sst_handles {
             let mut iter = sst.iter()?;
 
-            while iter.is_valid() && iter.key() < prefix {
-                iter.next();
-            }
+            // Use seek to jump directly to the prefix start instead of linear scan
+            iter.seek(prefix);
 
             while iter.is_valid() {
                 if !iter.key().starts_with(prefix) {
@@ -628,6 +634,14 @@ impl LsmEngine {
                 }
 
                 iter.next();
+            }
+
+            // Early exit: if limit is set and we have enough Put entries, skip remaining SSTs
+            if let Some(lim) = limit {
+                let put_count = seen.values().filter(|(_, _, k)| *k == EntryKind::Put).count();
+                if put_count >= lim {
+                    break;
+                }
             }
         }
 
@@ -678,6 +692,13 @@ impl LsmEngine {
             .filter(|(_, (_, _, kind))| *kind == EntryKind::Put)
             .map(|(key, (value, _, _))| (key, value))
             .collect();
+
+        // If limit is set, return only the first `limit` entries
+        let result = if let Some(lim) = limit {
+            result.into_iter().take(lim).collect()
+        } else {
+            result
+        };
 
         Ok(result)
     }
@@ -1696,7 +1717,7 @@ impl LsmEngine {
         prefix: &[u8],
         vis: &crate::mvcc::Visibility,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.scan_prefix_internal(prefix, Some(vis))
+        self.scan_prefix_internal(prefix, Some(vis), None)
     }
 
     /// Returns the number of active transactions.
