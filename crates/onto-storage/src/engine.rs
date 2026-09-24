@@ -100,6 +100,10 @@ pub struct LsmEngine {
     /// Secondary index manager (RwLock for concurrent read-path access).
     index_manager: RwLock<IndexManager>,
 
+    /// Index creation progress: (total_entries, processed_entries, class.column)
+    /// When no index creation is in progress, total = 0.
+    index_progress: Arc<std::sync::Mutex<Option<(String, usize, usize)>>>,
+
     /// Vector index manager — HNSW (RwLock for concurrent read-path access).
     vector_index_manager: RwLock<VectorIndexManager>,
 
@@ -150,7 +154,15 @@ impl PreLoadEngine {
         }
         let entries = wal::replay_wal(&wal_path)?;
         let mut max_seq = 0u64;
+        let mut skipped_index_entries = 0u64;
         for entry in entries {
+            // Skip index entries during WAL replay — indexes are rebuilt
+            // separately by rebuild_indexes() after the engine is loaded.
+            if entry.key.starts_with(b"__idx__") {
+                skipped_index_entries += 1;
+                max_seq = max_seq.max(entry.seq_no);
+                continue;
+            }
             match entry.kind {
                 EntryKind::Put => {
                     self.write_state
@@ -163,6 +175,12 @@ impl PreLoadEngine {
                     .delete_with_seq(entry.key, entry.seq_no),
             }
             max_seq = max_seq.max(entry.seq_no);
+        }
+        if skipped_index_entries > 0 {
+            tracing::info!(
+                skipped_index_entries,
+                "Skipped index entries during WAL replay (will be rebuilt)"
+            );
         }
         self.seq_counter = AtomicU64::new(max_seq + 1);
         Ok(())
@@ -288,6 +306,7 @@ impl LsmEngine {
             seq_counter: pre_engine.seq_counter,
             sst_counter,
             index_manager: RwLock::new(index_manager),
+            index_progress: Arc::new(std::sync::Mutex::new(None)),
             vector_index_manager: RwLock::new(VectorIndexManager::new()),
             compaction_sender,
             compaction_notif_receiver: Mutex::new(compaction_notif_receiver),
@@ -336,6 +355,9 @@ impl LsmEngine {
 
         // Rebuild secondary indexes from persisted index entries
         engine.rebuild_indexes()?;
+
+        // Validate rebuilt indexes — remove any corrupted ones
+        engine.validate_indexes();
 
         // Rebuild vector indexes from persisted metadata
         engine.rebuild_vector_indexes()?;
@@ -538,13 +560,101 @@ impl LsmEngine {
     /// This leverages the LSM-Tree's sorted key structure:
     /// entries with `{class}::` prefix are contiguous in sorted order.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.scan_prefix_internal(prefix, None, None)
+        eprintln!("[STORAGE scan_prefix] prefix='{}', len={}", String::from_utf8_lossy(prefix), prefix.len());
+        let result = self.scan_prefix_internal(prefix, None, None)?;
+        eprintln!("[STORAGE scan_prefix] returned {} entries", result.len());
+        Ok(result)
+    }
+
+    /// Recovery mode: returns ALL Put entries regardless of tombstones.
+    /// Used to recover data that was deleted.
+    pub fn scan_prefix_recovery(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        eprintln!("[STORAGE recovery] prefix='{}', len={}", String::from_utf8_lossy(prefix), prefix.len());
+        self.drain_compaction_notifications();
+
+        let mut results: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        // Collect SST paths under lock
+        let sst_paths: Vec<PathBuf> = {
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let mut paths = Vec::new();
+            for level in levels.iter().rev() {
+                for sst_info in level.iter() {
+                    if !prefix.is_empty() {
+                        let sst_max = sst_info.max_key.as_slice();
+                        if sst_max < prefix {
+                            continue;
+                        }
+                        let sst_min = sst_info.min_key.as_slice();
+                        if !Self::prefix_may_overlap(prefix, sst_min, sst_max) {
+                            continue;
+                        }
+                    }
+                    paths.push(sst_info.path.clone());
+                }
+            }
+            paths
+        };
+
+        // Open SST handles from cache
+        let sst_handles: Vec<Arc<SsTable>> = {
+            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut handles = Vec::with_capacity(sst_paths.len());
+            for path in &sst_paths {
+                if let Some(sst) = cache.get(path) {
+                    handles.push(Arc::clone(sst));
+                } else {
+                    let sst = Arc::new(SsTable::open(path)?);
+                    cache.insert(path.to_path_buf(), Arc::clone(&sst));
+                    handles.push(sst);
+                }
+            }
+            handles
+        };
+
+        // Scan ALL SSTs, collect ALL Put entries (no tombstone filtering)
+        for sst in &sst_handles {
+            let mut iter = sst.iter()?;
+            iter.seek(prefix);
+            while iter.is_valid() {
+                if !iter.key().starts_with(prefix) {
+                    break;
+                }
+                if iter.kind() == EntryKind::Put {
+                    results.push((iter.key().to_vec(), iter.value().to_vec()));
+                }
+                iter.next();
+            }
+        }
+
+        // Also scan MemTables
+        {
+            let ws = self.write_state.read();
+            if let Some(ref imm) = ws.immutable_memtable {
+                for entry in imm.scan_prefix(prefix) {
+                    if entry.kind == EntryKind::Put {
+                        results.push((entry.key.clone(), entry.value.clone()));
+                    }
+                }
+            }
+            for entry in ws.memtable.scan_prefix(prefix) {
+                if entry.kind == EntryKind::Put {
+                    results.push((entry.key.clone(), entry.value.clone()));
+                }
+            }
+        }
+
+        eprintln!("[STORAGE recovery] returned {} Put entries", results.len());
+        Ok(results)
     }
 
     /// Scan with prefix, returning at most `limit` entries.
     /// Stops scanning SSTs once limit is reached — avoids full table scan for LIMIT queries.
     pub fn scan_prefix_limit(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.scan_prefix_internal(prefix, None, Some(limit))
+        eprintln!("[STORAGE scan_prefix_limit] prefix='{}', limit={}", String::from_utf8_lossy(prefix), limit);
+        let result = self.scan_prefix_internal(prefix, None, Some(limit))?;
+        eprintln!("[STORAGE scan_prefix_limit] returned {} entries", result.len());
+        Ok(result)
     }
 
     /// Internal scan implementation shared by scan_prefix and scan_prefix_with_visibility.
@@ -573,21 +683,26 @@ impl LsmEngine {
         let sst_paths: Vec<PathBuf> = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let mut paths = Vec::new();
+            let mut skipped = 0usize;
             for level in levels.iter().rev() {
                 for sst_info in level.iter() {
                     if !prefix.is_empty() {
                         let sst_max = sst_info.max_key.as_slice();
                         if sst_max < prefix {
+                            skipped += 1;
                             continue;
                         }
                         let sst_min = sst_info.min_key.as_slice();
                         if !Self::prefix_may_overlap(prefix, sst_min, sst_max) {
+                            skipped += 1;
                             continue;
                         }
                     }
                     paths.push(sst_info.path.clone());
                 }
             }
+            eprintln!("[STORAGE internal] prefix='{}', limit={:?}, selected={} SSTs, skipped={} SSTs, total_levels={}",
+                String::from_utf8_lossy(prefix), limit, paths.len(), skipped, levels.len());
             paths
         };
 
@@ -608,12 +723,16 @@ impl LsmEngine {
         };
 
         // Step 2: Scan SSTables OUTSIDE the lock (I/O-heavy)
-        for sst in &sst_handles {
+        for (sst_idx, sst) in sst_handles.iter().enumerate() {
             let mut iter = sst.iter()?;
 
             // Use seek to jump directly to the prefix start instead of linear scan
             iter.seek(prefix);
 
+            let mut sst_count = 0usize;
+            let mut sst_put_count = 0usize;
+            let mut sst_del_count = 0usize;
+            let mut overridden_count = 0usize;
             while iter.is_valid() {
                 if !iter.key().starts_with(prefix) {
                     break;
@@ -623,9 +742,24 @@ impl LsmEngine {
                 let seq = iter.seq_no();
                 let kind = iter.kind();
 
+                if kind == EntryKind::Put {
+                    sst_put_count += 1;
+                } else {
+                    sst_del_count += 1;
+                }
+
                 if is_visible(seq) {
                     let should_update = match seen.get(&key) {
-                        Some((_, existing_seq, _)) => seq > *existing_seq,
+                        Some((_, existing_seq, existing_kind)) => {
+                            if seq > *existing_seq {
+                                if *existing_kind == EntryKind::Put && kind == EntryKind::Delete {
+                                    overridden_count += 1;
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        }
                         None => true,
                     };
                     if should_update {
@@ -633,16 +767,19 @@ impl LsmEngine {
                     }
                 }
 
+                sst_count += 1;
                 iter.next();
             }
-
-            // Early exit: if limit is set and we have enough Put entries, skip remaining SSTs
-            if let Some(lim) = limit {
-                let put_count = seen.values().filter(|(_, _, k)| *k == EntryKind::Put).count();
-                if put_count >= lim {
-                    break;
-                }
+            if sst_count > 0 || prefix.len() < 20 {
+                eprintln!("[STORAGE sst_scan] sst_idx={}, prefix='{}', entries={}, puts={}, dels={}, overridden={}, seen_total={}",
+                    sst_idx, String::from_utf8_lossy(prefix), sst_count, sst_put_count, sst_del_count, overridden_count, seen.len());
             }
+
+            // NOTE: Do NOT early-exit based on put_count here.
+            // Newer SSTs (higher sst_idx) may contain tombstones that override
+            // Put entries from older SSTs. Exiting early would return "phantom
+            // live" entries that are actually deleted. The SST list is already
+            // pruned by prefix range, so scanning all of them is cheap.
         }
 
         // Step 3: Scan MemTables (read lock — concurrent with other readers)
@@ -686,21 +823,136 @@ impl LsmEngine {
             }
         }
 
-        // Filter out tombstones and collect
-        let result: Vec<(Vec<u8>, Vec<u8>)> = seen
-            .into_iter()
-            .filter(|(_, (_, _, kind))| *kind == EntryKind::Put)
-            .map(|(key, (value, _, _))| (key, value))
-            .collect();
+        // Filter out tombstones, with early termination when limit is set
+        let total_seen = seen.len();
+        let tombstone_count = seen.values().filter(|(_, _, kind)| *kind != EntryKind::Put).count();
+        let put_count = total_seen - tombstone_count;
+        // Show sample tombstone keys (first 5) for debugging
+        if tombstone_count > 0 && tombstone_count == total_seen {
+            let sample: Vec<String> = seen.keys().take(5)
+                .map(|k| String::from_utf8_lossy(k).to_string())
+                .collect();
+            eprintln!("[STORAGE filter] ALL TOMBSTONES! prefix='{}', seen={}, tombstones={}, sample_keys={:?}",
+                String::from_utf8_lossy(prefix), total_seen, tombstone_count, sample);
+        }
 
-        // If limit is set, return only the first `limit` entries
-        let result = if let Some(lim) = limit {
-            result.into_iter().take(lim).collect()
+        // When limit is set, stop collecting as soon as we have enough live entries.
+        // This avoids materializing the entire result set for large tables.
+        let mut result: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        if let Some(lim) = limit {
+            result.reserve(lim.min(put_count));
+            for (key, (value, _, kind)) in seen {
+                if kind == EntryKind::Put {
+                    result.push((key, value));
+                    if result.len() >= lim {
+                        break;
+                    }
+                }
+            }
         } else {
-            result
-        };
+            result = seen
+                .into_iter()
+                .filter(|(_, (_, _, kind))| *kind == EntryKind::Put)
+                .map(|(key, (value, _, _))| (key, value))
+                .collect();
+        }
+
+        eprintln!("[STORAGE filter] prefix='{}', limit={:?}, seen={}, puts={}, tombstones={}, after_filter={}",
+            String::from_utf8_lossy(prefix), limit, total_seen, put_count, tombstone_count, result.len());
 
         Ok(result)
+    }
+
+    /// Count live entries matching a prefix. More efficient than scan_prefix().len()
+    /// because it uses a lightweight HashSet for keys instead of storing values.
+    /// Returns (live_count, tombstone_count).
+    pub fn count_prefix(&self, prefix: &[u8]) -> Result<(usize, usize)> {
+        let mut seen: HashMap<Vec<u8>, (SeqNo, EntryKind)> = HashMap::new();
+
+        // Scan SSTables
+        let sst_paths: Vec<PathBuf> = {
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let mut paths = Vec::new();
+            for level in levels.iter().rev() {
+                for sst_info in level.iter() {
+                    if !prefix.is_empty() {
+                        if sst_info.max_key.as_slice() < prefix {
+                            continue;
+                        }
+                        if !Self::prefix_may_overlap(prefix, sst_info.min_key.as_slice(), sst_info.max_key.as_slice()) {
+                            continue;
+                        }
+                    }
+                    paths.push(sst_info.path.clone());
+                }
+            }
+            paths
+        };
+
+        let sst_handles: Vec<Arc<SsTable>> = {
+            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut handles = Vec::with_capacity(sst_paths.len());
+            for path in &sst_paths {
+                if let Some(sst) = cache.get(path) {
+                    handles.push(Arc::clone(sst));
+                } else {
+                    let sst = Arc::new(SsTable::open(path)?);
+                    cache.insert(path.to_path_buf(), Arc::clone(&sst));
+                    handles.push(sst);
+                }
+            }
+            handles
+        };
+
+        for sst in &sst_handles {
+            let mut iter = sst.iter()?;
+            iter.seek(prefix);
+            while iter.is_valid() {
+                if !iter.key().starts_with(prefix) {
+                    break;
+                }
+                let key = iter.key().to_vec();
+                let seq = iter.seq_no();
+                let kind = iter.kind();
+                let should_update = match seen.get(&key) {
+                    Some((existing_seq, _)) => seq > *existing_seq,
+                    None => true,
+                };
+                if should_update {
+                    seen.insert(key, (seq, kind));
+                }
+                iter.next();
+            }
+        }
+
+        // Scan MemTables
+        {
+            let ws = self.write_state.read();
+            if let Some(ref imm) = ws.immutable_memtable {
+                for entry in imm.scan_prefix(prefix) {
+                    let should_update = match seen.get(&entry.key) {
+                        Some((existing_seq, _)) => entry.seq_no > *existing_seq,
+                        None => true,
+                    };
+                    if should_update {
+                        seen.insert(entry.key.clone(), (entry.seq_no, entry.kind));
+                    }
+                }
+            }
+            for entry in ws.memtable.scan_prefix(prefix) {
+                let should_update = match seen.get(&entry.key) {
+                    Some((existing_seq, _)) => entry.seq_no > *existing_seq,
+                    None => true,
+                };
+                if should_update {
+                    seen.insert(entry.key.clone(), (entry.seq_no, entry.kind));
+                }
+            }
+        }
+
+        let tombstones = seen.values().filter(|(_, kind)| *kind != EntryKind::Put).count();
+        let live = seen.len() - tombstones;
+        Ok((live, tombstones))
     }
 
     /// Checks if a prefix could match any key in the range [min_key, max_key].
@@ -1095,14 +1347,147 @@ impl LsmEngine {
                 .index_manager
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
+            let active_keys: std::collections::HashSet<(String, String)> =
+                mgr.all_index_keys().into_iter().collect();
+            let mut orphaned = 0usize;
+
+            for (key, _value) in &index_entries {
+                if let Some((class, column, _, _)) =
+                    crate::index::IndexManager::parse_index_key(key)
+                {
+                    if !active_keys.contains(&(class, column)) {
+                        orphaned += 1;
+                    }
+                }
+            }
+
+            // Rebuild the actual in-memory index from entries
             mgr.rebuild_from_entries(&index_entries);
+
+            if orphaned > 0 {
+                tracing::warn!(
+                    orphaned_index_entries = orphaned,
+                    "Found orphaned index entries from interrupted CREATE INDEX. \
+                     These will be cleaned up during compaction."
+                );
+                drop(mgr); // Release index_manager lock before acquiring write_state
+                self.cleanup_orphaned_index_entries(&index_entries, &active_keys)?;
+            }
+
             tracing::info!(
-                "Rebuilt {} index entries across {} indexes",
-                index_entries.len(),
-                mgr.index_count()
+                "Rebuilt {} index entries across {} indexes ({} orphaned skipped)",
+                index_entries.len() - orphaned,
+                self.index_manager.read().unwrap_or_else(|e| e.into_inner()).index_count(),
+                orphaned
             );
         }
         Ok(())
+    }
+
+    /// Write delete tombstones for orphaned index entries so compaction can reclaim them.
+    fn cleanup_orphaned_index_entries(
+        &self,
+        entries: &[(Vec<u8>, Vec<u8>)],
+        active_keys: &std::collections::HashSet<(String, String)>,
+    ) -> Result<()> {
+        let mut ws = self.write_state.write();
+        let mut cleaned = 0usize;
+        for (key, _value) in entries {
+            if let Some((class, column, _, _)) =
+                crate::index::IndexManager::parse_index_key(key)
+            {
+                if !active_keys.contains(&(class, column)) {
+                    let seq = self.next_seq();
+                    let entry = Entry::delete(key.clone(), seq);
+                    ws.wal.append(&entry)?;
+                    ws.memtable.delete_with_seq(key.clone(), seq);
+                    cleaned += 1;
+                }
+            }
+        }
+        if cleaned > 0 {
+            ws.wal.flush_buf()?;
+            tracing::info!(cleaned = cleaned, "Wrote tombstones for orphaned index entries");
+        }
+        Ok(())
+    }
+
+    /// Validates all registered indexes by performing a probe (insert + lookup + delete).
+    /// Corrupted indexes are logged and removed so they can be rebuilt on demand.
+    fn validate_indexes(&self) {
+        let index_keys: Vec<(String, String)> = self
+            .index_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .all_index_keys();
+
+        let mut corrupted = Vec::new();
+        for (class, column) in &index_keys {
+            let probe_pk = b"__probe_pk__";
+            let mut mgr = self
+                .index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            // Insert probe entry
+            mgr.index_document(
+                class,
+                probe_pk,
+                &serde_json::Map::from_iter(vec![(
+                    column.clone(),
+                    serde_json::Value::String("__validate_probe__".to_string()),
+                )]),
+            );
+            // Lookup to verify
+            let results = mgr.lookup_eq(
+                class,
+                column,
+                &serde_json::Value::String("__validate_probe__".to_string()),
+            );
+            // Remove probe entry
+            mgr.deindex_document(
+                class,
+                probe_pk,
+                &serde_json::Map::from_iter(vec![(
+                    column.clone(),
+                    serde_json::Value::String("__validate_probe__".to_string()),
+                )]),
+            );
+            drop(mgr);
+
+            match results {
+                Some(ref pks) if pks.iter().any(|pk| pk == probe_pk) => {
+                    // Index is functional
+                }
+                _ => {
+                    tracing::warn!(
+                        table = class.as_str(),
+                        column = column.as_str(),
+                        "Index validation failed — marking for removal"
+                    );
+                    corrupted.push((class.clone(), column.clone()));
+                }
+            }
+        }
+
+        // Remove corrupted indexes
+        if !corrupted.is_empty() {
+            let mut mgr = self
+                .index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for (class, column) in &corrupted {
+                mgr.drop_index(class, column);
+                tracing::warn!(
+                    table = class.as_str(),
+                    column = column.as_str(),
+                    "Removed corrupted index — will be rebuilt on next CREATE INDEX"
+                );
+            }
+            tracing::info!(
+                count = corrupted.len(),
+                "Index validation complete — removed corrupted indexes"
+            );
+        }
     }
 
     /// Rebuilds vector indexes by scanning persisted metadata and document data.
@@ -1728,9 +2113,19 @@ impl LsmEngine {
     // =================================================================
     //  Index API
     // =================================================================
+
+    /// Returns the current index creation progress.
+    /// Returns (class.column, total_entries, processed_entries) if in progress, None otherwise.
+    pub fn index_creation_progress(&self) -> Option<(String, usize, usize)> {
+        self.index_progress.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Creates a secondary index on a class.column.
     /// Automatically backfills existing data for the class.
     pub fn create_index(&self, class: &str, column: &str) -> Result<()> {
+        let start = std::time::Instant::now();
+        tracing::info!(table = class, column = column, "Index creation started");
+
         self.index_manager
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -1739,34 +2134,91 @@ impl LsmEngine {
         // Backfill: scan all existing entries for this class and index them
         let prefix = format!("{}::", class);
         let entries = self.scan_prefix(prefix.as_bytes())?;
+        let total_estimate = entries.len();
 
-        // Phase 1: Insert into index under a single write lock (not per-document)
-        let all_index_entries: Vec<(Vec<u8>, Vec<u8>)> = {
-            let mut mgr = self
-                .index_manager
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            let mut all = Vec::new();
-            for (pk, val_bytes) in &entries {
-                if let Some(doc) = parse_doc_bytes(val_bytes) {
-                    if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
-                        all.extend(mgr.index_document(class, pk, &doc));
+        // Track progress
+        {
+            let label = format!("{}.{}", class, column);
+            let mut prog = self.index_progress.lock().unwrap_or_else(|e| e.into_inner());
+            *prog = Some((label, total_estimate, 0));
+        }
+
+        // Phase 1+2: Process in batches, releasing locks between batches
+        // to avoid blocking the query engine for the entire duration.
+        const BATCH_SIZE: usize = 5000;
+        let mut processed = 0usize;
+        let mut batch_start = 0usize;
+
+        while batch_start < entries.len() {
+            let batch_end = (batch_start + BATCH_SIZE).min(entries.len());
+
+            // Index batch under index_manager write lock (short hold)
+            let batch_entries: Vec<(Vec<u8>, Vec<u8>)> = {
+                let mut mgr = self
+                    .index_manager
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut batch = Vec::new();
+                for (pk, val_bytes) in &entries[batch_start..batch_end] {
+                    if let Some(doc) = parse_doc_bytes(val_bytes) {
+                        if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
+                            batch.extend(mgr.index_document(class, pk, &doc));
+                        }
                     }
                 }
-            }
-            all
-        };
+                batch
+            };
 
-        // Phase 2: Persist index entries to WAL + MemTable under a single write lock
-        if !all_index_entries.is_empty() {
-            let mut ws = self.write_state.write();
-            for (key, value) in all_index_entries {
-                let seq = self.next_seq();
-                ws.wal.append_raw_put(&key, &value, seq)?;
-                ws.memtable.put_with_seq(key, value, seq);
+            // Persist batch to WAL + MemTable under write_state lock (short hold)
+            if !batch_entries.is_empty() {
+                let mut ws = self.write_state.write();
+                for (key, value) in batch_entries {
+                    let seq = self.next_seq();
+                    ws.wal.append_raw_put(&key, &value, seq)?;
+                    ws.memtable.put_with_seq(key, value, seq);
+                }
+                ws.wal.flush_buf()?;
             }
-            ws.wal.flush_buf()?;
+
+            processed += batch_end - batch_start;
+
+            // Update progress tracker
+            {
+                let mut prog = self.index_progress.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ref mut p) = *prog {
+                    p.2 = processed;
+                }
+            }
+
+            if processed % 10000 == 0 || batch_end >= entries.len() {
+                tracing::info!(
+                    rows_processed = processed,
+                    total_estimate,
+                    "Index creation progress"
+                );
+            }
+
+            batch_start = batch_end;
+
+            // Yield to let queries through between batches
+            std::thread::yield_now();
         }
+
+        // Clear progress
+        {
+            let mut prog = self.index_progress.lock().unwrap_or_else(|e| e.into_inner());
+            *prog = None;
+        }
+
+        let elapsed_ms = start.elapsed().as_millis();
+        let entries_count = total_estimate;
+        tracing::info!(
+            table = class,
+            column = column,
+            elapsed_ms,
+            entries = entries_count,
+            "Index creation completed"
+        );
 
         Ok(())
     }

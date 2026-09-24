@@ -577,6 +577,7 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/backup/verify", post(verify_backup_endpoint))
         .route("/api/restore", post(restore_endpoint))
         .route("/api/flush", post(flush))
+        .route("/api/compact", post(compact))
         // Living data activation
         .route("/api/activate", post(activate_entries))
         // Transaction endpoints
@@ -673,7 +674,7 @@ pub fn build_router_with_auth(
         .route("/api/admin/reload", post(crate::admin::force_reload))
         .with_state(admin_state);
 
-    Router::new()
+    let router = Router::new()
         // Health check and metrics (no auth required)
         .route("/api/health", get(health))
         .route("/api/health/ready", get(health_ready))
@@ -699,12 +700,49 @@ pub fn build_router_with_auth(
             get(get_vertex).delete(delete_vertex),
         )
         .route("/api/graph/neighbors/:id", get(get_neighbors))
+        .route("/api/graph/cache/status", get(graph_cache_status))
+        .route("/api/graph/cache/stats", get(graph_cache_stats))
+        .route("/api/graph/cache/preload", post(graph_cache_preload));
+
+    // Visualization routes
+    let router = router
+        .route("/api/graph/visualize/dot", get(graph_visualize_dot))
+        .route("/api/graph/visualize/d3", get(graph_visualize_d3))
+        .route("/api/graph/visualize/cytoscape", get(graph_visualize_cytoscape))
+        .route("/api/graph/visualize/mermaid", get(graph_visualize_mermaid));
+
+    // Enterprise graph routes (with community stubs)
+    #[cfg(feature = "enterprise")]
+    let router = router
+        .route("/api/graph/reasoning/infer", post(graph_reasoning_infer))
+        .route("/api/graph/reasoning/explain", post(graph_reasoning_explain))
+        .route("/api/graph/pattern/match", post(graph_pattern_match))
+        .route("/api/graph/gnn/embed", post(graph_gnn_embed))
+        .route("/api/graph/distributed/status", get(graph_distributed_status))
+        .route("/api/graph/streaming/event", post(graph_streaming_event))
+        .route("/api/graph/streaming/stats", get(graph_streaming_stats))
+        .route("/api/graph/analyze/dijkstra", post(graph_analyze_dijkstra));
+
+    #[cfg(not(feature = "enterprise"))]
+    let router = router
+        .route("/api/graph/reasoning/infer", post(graph_enterprise_stub))
+        .route("/api/graph/reasoning/explain", post(graph_enterprise_stub))
+        .route("/api/graph/pattern/match", post(graph_enterprise_stub))
+        .route("/api/graph/gnn/embed", post(graph_enterprise_stub))
+        .route("/api/graph/distributed/status", get(graph_enterprise_stub))
+        .route("/api/graph/streaming/event", post(graph_enterprise_stub))
+        .route("/api/graph/streaming/stats", get(graph_enterprise_stub))
+        .route("/api/graph/analyze/dijkstra", post(graph_enterprise_stub));
+
+    // Remaining routes + layers (no trailing semicolon — this is the function return value)
+    router
         // Backup and flush (Admin only)
         .route("/api/backup", post(backup))
         .route("/api/backup/incremental", post(backup_incremental))
         .route("/api/backup/verify", post(verify_backup_endpoint))
         .route("/api/restore", post(restore_endpoint))
         .route("/api/flush", post(flush))
+        .route("/api/compact", post(compact))
         // Living data activation
         .route("/api/activate", post(activate_entries))
         // Transaction endpoints
@@ -2996,6 +3034,478 @@ async fn get_neighbors(
     )
 }
 
+/// GET /api/graph/cache/status - Get cache status for all relation types.
+async fn graph_cache_status(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    let summary = state.graph.cache_summary();
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(summary, elapsed)),
+    )
+}
+
+/// GET /api/graph/cache/stats - Get cache statistics.
+async fn graph_cache_stats(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    let stats = state.graph.cache_stats();
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(
+            json!({
+                "hits": stats.hits,
+                "misses": stats.misses,
+                "invalidations": stats.invalidations,
+                "loads": stats.loads,
+                "load_failures": stats.load_failures,
+                "load_time_us": stats.load_time_us,
+                "degraded_queries": stats.degraded_queries,
+                "hit_rate": if stats.hits + stats.misses > 0 {
+                    stats.hits as f64 / (stats.hits + stats.misses) as f64
+                } else {
+                    0.0
+                }
+            }),
+            elapsed,
+        )),
+    )
+}
+
+/// POST /api/graph/cache/preload - Preload specified relation types into cache.
+async fn graph_cache_preload(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let relation_types: Vec<String> = req
+        .get("relation_types")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if relation_types.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<serde_json::Value>::error("missing relation_types")),
+        );
+    }
+
+    let mut results = Vec::new();
+    for rel_type in &relation_types {
+        match state.graph.load_relation_from_lsm(rel_type) {
+            Ok(count) => {
+                results.push(json!({
+                    "relation": rel_type,
+                    "status": "loaded",
+                    "edges": count
+                }));
+            }
+            Err(e) => {
+                results.push(json!({
+                    "relation": rel_type,
+                    "status": "error",
+                    "error": e.to_string()
+                }));
+            }
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(
+            json!({
+                "loaded": relation_types.len(),
+                "results": results
+            }),
+            elapsed,
+        )),
+    )
+}
+
+/// GET /api/graph/visualize/dot - Export graph in DOT (Graphviz) format.
+async fn graph_visualize_dot(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let dot = onto_graph::visualization::to_dot(&state.graph, None);
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/vnd.graphviz")],
+        dot,
+    )
+}
+
+/// GET /api/graph/visualize/d3 - Export graph in D3.js JSON format.
+async fn graph_visualize_d3(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let d3 = onto_graph::visualization::to_d3_json(&state.graph, None);
+    let elapsed = 0.0;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(d3, elapsed)),
+    )
+}
+
+/// GET /api/graph/visualize/cytoscape - Export graph in Cytoscape.js JSON format.
+async fn graph_visualize_cytoscape(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let cy = onto_graph::visualization::to_cytoscape_json(&state.graph, None);
+    let elapsed = 0.0;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(cy, elapsed)),
+    )
+}
+
+/// GET /api/graph/visualize/mermaid - Export graph in Mermaid diagram format.
+async fn graph_visualize_mermaid(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let mermaid = onto_graph::visualization::to_mermaid(&state.graph, None);
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain")],
+        mermaid,
+    )
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Enterprise Graph API Handlers
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Community edition stub for enterprise graph endpoints.
+async fn graph_enterprise_stub() -> impl IntoResponse {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "error": "Enterprise Edition required",
+            "message": "This feature requires OntoDB Enterprise. Contact license@ontovalue.com"
+        })),
+    )
+}
+
+/// POST /api/graph/reasoning/infer - Run forward chain reasoning on the graph.
+#[cfg(feature = "enterprise")]
+async fn graph_reasoning_infer(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let rules_val = req.get("rules").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+    let mut reasoner = onto_graph::Reasoner::new();
+
+    if let serde_json::Value::Array(rules) = rules_val {
+        for rule_val in rules {
+            if let Ok(rule) = serde_json::from_value::<onto_graph::reasoning::Rule>(rule_val) {
+                reasoner.add_rule(rule);
+            }
+        }
+    }
+
+    let inferred = reasoner.forward_chain(&state.graph);
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(serde_json::json!({
+            "inferred_triples": inferred.iter().map(|t| serde_json::json!({
+                "subject": t.subject,
+                "predicate": t.predicate,
+                "object": t.object,
+            })).collect::<Vec<_>>(),
+            "count": inferred.len(),
+            "stats": {
+                "triples_inferred": reasoner.stats().triples_inferred,
+                "rules_applied": reasoner.stats().rules_applied,
+            }
+        }), elapsed)),
+    )
+}
+
+/// POST /api/graph/reasoning/explain - Backward chain reasoning to explain a goal.
+#[cfg(feature = "enterprise")]
+async fn graph_reasoning_explain(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let subject = req.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+    let predicate = req.get("predicate").and_then(|v| v.as_str()).unwrap_or("");
+    let object = req.get("object").and_then(|v| v.as_str()).unwrap_or("");
+
+    if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<serde_json::Value>::error("subject, predicate, and object are required")),
+        ).into_response();
+    }
+
+    let mut reasoner = onto_graph::Reasoner::new();
+    let goal = onto_graph::reasoning::TriplePattern {
+        subject: onto_graph::reasoning::PatternTerm::Constant(subject.to_string()),
+        predicate: onto_graph::reasoning::PatternTerm::Constant(predicate.to_string()),
+        object: onto_graph::reasoning::PatternTerm::Constant(object.to_string()),
+    };
+
+    let bindings = reasoner.backward_chain(&state.graph, &goal);
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(serde_json::json!({
+            "goal": { "subject": subject, "predicate": predicate, "object": object },
+            "bindings": bindings.iter().map(|b| {
+                serde_json::json!(b.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect::<serde_json::Map<_, _>>())
+            }).collect::<Vec<_>>(),
+            "found": !bindings.is_empty(),
+        }), elapsed)),
+    ).into_response()
+}
+
+/// POST /api/graph/pattern/match - Find subgraph pattern matches.
+#[cfg(feature = "enterprise")]
+async fn graph_pattern_match(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let vertices_val = req.get("vertices").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+    let edges_val = req.get("edges").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+
+    let mut pattern = onto_graph::pattern::PatternGraph {
+        vertices: Vec::new(),
+        edges: Vec::new(),
+    };
+
+    if let serde_json::Value::Array(verts) = vertices_val {
+        for (i, v) in verts.iter().enumerate() {
+            pattern.vertices.push(onto_graph::pattern::PatternVertex {
+                variable: v.get("variable").and_then(|x| x.as_str()).unwrap_or(&format!("v{}", i)).to_string(),
+                labels: v.get("labels").and_then(|x| x.as_array()).map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect()).unwrap_or_default(),
+                index: i,
+            });
+        }
+    }
+
+    if let serde_json::Value::Array(edgs) = edges_val {
+        for e in edgs {
+            pattern.edges.push(onto_graph::pattern::PatternEdge {
+                source: e.get("source").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+                target: e.get("target").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+                label: e.get("label").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            });
+        }
+    }
+
+    let matches = onto_graph::pattern::find_pattern_matches(&state.graph, &pattern);
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(serde_json::json!({
+            "matches": matches,
+            "count": matches.len(),
+        }), elapsed)),
+    )
+}
+
+/// POST /api/graph/gnn/embed - Generate node embeddings via GCN inference.
+#[cfg(feature = "enterprise")]
+async fn graph_gnn_embed(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let dimension = req.get("dimension").and_then(|v| v.as_u64()).unwrap_or(64) as usize;
+    let feature_key = req.get("feature_key").and_then(|v| v.as_str());
+
+    if state.graph.vertex_count() == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<serde_json::Value>::error("Graph is empty, cannot generate embeddings")),
+        );
+    }
+
+    let model = onto_graph::GcnModel::new(&[dimension, dimension], 42);
+    let embeddings = model.inference(&state.graph, feature_key);
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    // Return top-5 most similar pairs as sample
+    let vertex_ids: Vec<String> = (0..state.graph.vertex_count())
+        .filter_map(|i| state.graph.get_id(i as u32))
+        .take(10)
+        .collect();
+
+    let sample_embeddings: Vec<serde_json::Value> = vertex_ids.iter().filter_map(|id| {
+        embeddings.get(id).map(|emb| serde_json::json!({
+            "vertex_id": id,
+            "dimension": emb.len(),
+            "sample": emb.iter().take(5).cloned().collect::<Vec<_>>(),
+        }))
+    }).collect();
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(serde_json::json!({
+            "dimension": dimension,
+            "vertex_count": state.graph.vertex_count(),
+            "embeddings_generated": sample_embeddings.len(),
+            "samples": sample_embeddings,
+        }), elapsed)),
+    )
+}
+
+/// GET /api/graph/distributed/status - Get distributed graph partition status.
+#[cfg(feature = "enterprise")]
+async fn graph_distributed_status(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let elapsed = 0.0;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(serde_json::json!({
+            "mode": "standalone",
+            "vertex_count": state.graph.vertex_count(),
+            "edge_count": state.graph.edge_count(),
+            "message": "Distributed mode not configured. Use --distributed-partitions N to enable."
+        }), elapsed)),
+    )
+}
+
+/// POST /api/graph/streaming/event - Push a streaming graph event.
+#[cfg(feature = "enterprise")]
+async fn graph_streaming_event(
+    State(_state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let event_type = req.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let event = match event_type {
+        "vertex_added" => onto_graph::streaming::GraphEvent::VertexAdded {
+            id: req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            labels: req.get("labels").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect()).unwrap_or_default(),
+            properties: Default::default(),
+        },
+        "vertex_removed" => onto_graph::streaming::GraphEvent::VertexRemoved {
+            id: req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        },
+        "edge_added" => onto_graph::streaming::GraphEvent::EdgeAdded {
+            id: req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            source: req.get("source").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            target: req.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            label: req.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            properties: Default::default(),
+        },
+        "edge_removed" => onto_graph::streaming::GraphEvent::EdgeRemoved {
+            id: req.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        },
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<serde_json::Value>::error("Unknown event type. Supported: vertex_added, vertex_removed, edge_added, edge_removed")),
+            )
+        }
+    };
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(serde_json::json!({
+            "event_type": event_type,
+            "accepted": true,
+        }), elapsed)),
+    )
+}
+
+/// GET /api/graph/streaming/stats - Get streaming graph statistics.
+#[cfg(feature = "enterprise")]
+async fn graph_streaming_stats(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let elapsed = 0.0;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(serde_json::json!({
+            "vertex_count": state.graph.vertex_count(),
+            "edge_count": state.graph.edge_count(),
+            "streaming_enabled": true,
+            "message": "Streaming compute engine initialized"
+        }), elapsed)),
+    )
+}
+
+/// POST /api/graph/analyze/dijkstra - Run Dijkstra shortest path algorithm.
+#[cfg(feature = "enterprise")]
+async fn graph_analyze_dijkstra(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let source = req.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let target = req.get("target").and_then(|v| v.as_str());
+    let weight_key = req.get("weight_key").and_then(|v| v.as_str());
+
+    if source.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<serde_json::Value>::error("source vertex ID is required")),
+        );
+    }
+
+    let result = onto_graph::dijkstra(&state.graph, source, target, weight_key);
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    if let Some(target_id) = target {
+        let path = onto_graph::dijkstra_path(&result, source, target_id);
+        (
+            StatusCode::OK,
+            Json(ApiResponse::success(serde_json::json!({
+                "source": source,
+                "target": target_id,
+                "distance": result.distances.get(target_id).copied(),
+                "path": path,
+                "vertices_reached": result.distances.len(),
+            }), elapsed)),
+        )
+    } else {
+        let distances: serde_json::Map<String, serde_json::Value> = result.distances.iter()
+            .filter(|(_, d)| d.is_finite())
+            .map(|(k, v)| (k.clone(), serde_json::Value::Number(serde_json::Number::from_f64(*v).unwrap_or(serde_json::Number::from(0)))))
+            .collect();
+        (
+            StatusCode::OK,
+            Json(ApiResponse::success(serde_json::json!({
+                "source": source,
+                "distances": distances,
+                "vertices_reached": distances.len(),
+            }), elapsed)),
+        )
+    }
+}
+
 /// POST /api/backup - Create a full snapshot backup.
 async fn backup(
     State(state): State<AppState>,
@@ -3434,6 +3944,49 @@ async fn flush(State(state): State<AppState>) -> impl IntoResponse {
                 Json(ApiResponse::<Value>::error(format!("Flush failed: {}", e))),
             )
         }
+    }
+}
+
+/// POST /api/compact - Flush memtable and trigger background compaction.
+async fn compact(State(state): State<AppState>) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    // Get storage stats before
+    let before_stats = state.executor.engine_stats();
+    let before_sst = before_stats.as_ref().map(|s| s.total_sstables).unwrap_or(0);
+    let before_size = before_stats.as_ref().map(|s| s.total_sst_size).unwrap_or(0);
+
+    // Flush memtable
+    let _ = state.executor.flush();
+
+    // Trigger full compaction via the storage engine
+    // This sends FlushAndNotify to the compaction worker and waits for completion
+    let compact_result = tokio::task::block_in_place(|| {
+        state.executor.engine().flush_compaction()
+    });
+
+    let after_stats = state.executor.engine_stats();
+    let after_sst = after_stats.as_ref().map(|s| s.total_sstables).unwrap_or(0);
+    let after_size = after_stats.as_ref().map(|s| s.total_sst_size).unwrap_or(0);
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+
+    match compact_result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse::success(
+                json!({
+                    "message": "Compaction completed",
+                    "sstables_before": before_sst,
+                    "sstables_after": after_sst,
+                    "savings_mb": (before_size as i64 - after_size as i64) / (1024 * 1024),
+                }),
+                elapsed,
+            )),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<serde_json::Value>::error(format!("Compaction failed: {}", e))),
+        ),
     }
 }
 

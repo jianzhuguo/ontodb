@@ -61,7 +61,7 @@ default = []
 
 raft = []
 sharding = []
-enterprise = ["dep:onto-enterprise"]
+enterprise = ["dep:onto-enterprise", "onto-graph/enterprise", "onto-query/enterprise"]
 cdc-kafka = []
 cdc-webhook = []
 encryption = []

@@ -121,6 +121,9 @@ impl<'a> TraversalEngine<'a> {
     }
 
     /// Single-hop traversal: get neighbors of a vertex.
+    ///
+    /// When `edge_label` is specified and the edge label index is populated,
+    /// uses the index for O(matching) instead of O(all_edges) scan (#3 optimization).
     pub fn hop(
         &self,
         vertex_id: &str,
@@ -129,6 +132,14 @@ impl<'a> TraversalEngine<'a> {
         vertex_filter: Option<&PropertyFilter>,
         edge_filter: Option<&PropertyFilter>,
     ) -> Result<Vec<Vertex>, GraphError> {
+        // Fast path: use edge label index when label is specified and index exists
+        if let Some(label) = edge_label {
+            if self.store.edge_label_count() > 0 && edge_filter.is_none() {
+                return self.hop_label_indexed(vertex_id, direction, label, vertex_filter);
+            }
+        }
+
+        // Fallback: scan all edges and filter
         let edges = match direction {
             Direction::Out => self.store.get_out_edges(vertex_id),
             Direction::In => self.store.get_in_edges(vertex_id),
@@ -183,6 +194,60 @@ impl<'a> TraversalEngine<'a> {
         Ok(result)
     }
 
+    /// Fast hop using edge label index — O(matching_edges) instead of O(all_edges).
+    fn hop_label_indexed(
+        &self,
+        vertex_id: &str,
+        direction: Direction,
+        edge_label: &str,
+        vertex_filter: Option<&PropertyFilter>,
+    ) -> Result<Vec<Vertex>, GraphError> {
+        let label_edge_ids: HashSet<String> =
+            self.store.get_edge_ids_by_label(edge_label).into_iter().collect();
+
+        let edge_ids = match direction {
+            Direction::Out => self.store.get_out_edge_ids(vertex_id),
+            Direction::In => self.store.get_in_edge_ids(vertex_id),
+            Direction::Both => {
+                let mut ids = self.store.get_out_edge_ids(vertex_id);
+                ids.extend(self.store.get_in_edge_ids(vertex_id));
+                ids
+            }
+        };
+
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+
+        for eid in &edge_ids {
+            if !label_edge_ids.contains(eid) {
+                continue;
+            }
+            let edge = match self.store.get_edge(eid) {
+                Some(e) => e,
+                None => continue,
+            };
+            let target_id = match direction {
+                Direction::In => &edge.from,
+                _ => &edge.to,
+            };
+            if seen.contains(target_id) {
+                continue;
+            }
+            seen.insert(target_id.clone());
+
+            if let Some(vertex) = self.store.get_vertex(target_id) {
+                if let Some(f) = vertex_filter {
+                    if !f.matches(&vertex.properties) {
+                        continue;
+                    }
+                }
+                result.push(vertex);
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Multi-hop BFS traversal (unified - uses fast BFS internally).
     /// Returns full TraversalResult with paths, vertices, and edges.
     /// Set `with_paths=true` to enable lazy path reconstruction.
@@ -194,9 +259,18 @@ impl<'a> TraversalEngine<'a> {
         edge_label: Option<&str>,
         vertex_filter: Option<&PropertyFilter>,
     ) -> Result<TraversalResult, GraphError> {
-        // For filtered BFS, use the string-based approach
-        // For unfiltered BFS, use the fast integer-based approach
-        if edge_label.is_some() {
+        // For filtered BFS, use edge label index when available (P0 optimization)
+        if let Some(label) = edge_label {
+            // Use label-indexed BFS if the label exists in the index
+            if self.store.edge_label_count() > 0 {
+                return self.traverse_bfs_label_indexed(
+                    start_id,
+                    max_depth,
+                    direction,
+                    label,
+                    vertex_filter,
+                );
+            }
             return self.traverse_bfs_filtered(
                 start_id,
                 max_depth,
@@ -213,15 +287,17 @@ impl<'a> TraversalEngine<'a> {
 
         let visited_indices = self.store.bfs_fast(start_idx, max_depth, direction);
 
+        // P1: Batch vertex lookup instead of individual lock acquisitions
+        let visited_ids: Vec<String> = visited_indices
+            .iter()
+            .filter_map(|&idx| self.store.get_id(idx))
+            .collect();
+        let batch_vertices = self.store.get_vertices_batch(&visited_ids);
+
         let mut result_vertices = Vec::new();
 
-        for &idx in &visited_indices {
-            let vertex_id = self
-                .store
-                .get_id(idx)
-                .ok_or_else(|| GraphError::VertexNotFound(format!("idx {}", idx)))?;
-
-            if let Some(vertex) = self.store.get_vertex(&vertex_id) {
+        for (_id, vertex) in batch_vertices {
+            if let Some(vertex) = vertex {
                 if let Some(f) = vertex_filter {
                     if !f.matches(&vertex.properties) {
                         continue;
@@ -372,7 +448,117 @@ impl<'a> TraversalEngine<'a> {
         })
     }
 
+    /// BFS with edge label filtering using the edge label index (P0 optimization).
+    ///
+    /// Instead of scanning all edges of a vertex and filtering by label,
+    /// this pre-fetches the set of edge IDs for the given label and only
+    /// traverses matching edges.  O(matching_edges) instead of O(all_edges).
+    fn traverse_bfs_label_indexed(
+        &self,
+        start_id: &str,
+        max_depth: usize,
+        direction: Direction,
+        edge_label: &str,
+        vertex_filter: Option<&PropertyFilter>,
+    ) -> Result<TraversalResult, GraphError> {
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+        let mut result_vertices = Vec::new();
+
+        queue.push_back((start_id.to_string(), 0));
+        visited.insert(start_id.to_string());
+
+        while let Some((current_id, depth)) = queue.pop_front() {
+            // Add vertex if depth > 0 (skip start node)
+            if depth > 0 {
+                if let Some(vertex) = self.store.get_vertex(&current_id) {
+                    if let Some(f) = vertex_filter {
+                        if !f.matches(&vertex.properties) {
+                            continue;
+                        }
+                    }
+                    result_vertices.push(vertex);
+                }
+            }
+
+            if depth >= max_depth {
+                continue;
+            }
+
+            // Use edge label index to find relevant edges efficiently
+            let neighbor_ids = match direction {
+                Direction::Out => {
+                    let out_ids = self.store.get_out_edge_ids(&current_id);
+                    let label_edges = self.store.get_edges_by_label(edge_label);
+                    let label_edge_ids: HashSet<&str> =
+                        label_edges.iter().map(|e| e.id.as_str()).collect();
+                    out_ids
+                        .iter()
+                        .filter(|eid| label_edge_ids.contains(eid.as_str()))
+                        .filter_map(|eid| self.store.get_edge(eid))
+                        .map(|e| e.to)
+                        .collect::<Vec<_>>()
+                }
+                Direction::In => {
+                    let in_ids = self.store.get_in_edge_ids(&current_id);
+                    let label_edges = self.store.get_edges_by_label(edge_label);
+                    let label_edge_ids: HashSet<&str> =
+                        label_edges.iter().map(|e| e.id.as_str()).collect();
+                    in_ids
+                        .iter()
+                        .filter(|eid| label_edge_ids.contains(eid.as_str()))
+                        .filter_map(|eid| self.store.get_edge(eid))
+                        .map(|e| e.from)
+                        .collect::<Vec<_>>()
+                }
+                Direction::Both => {
+                    let mut ids = Vec::new();
+                    let label_edges = self.store.get_edges_by_label(edge_label);
+                    let label_edge_ids: HashSet<&str> =
+                        label_edges.iter().map(|e| e.id.as_str()).collect();
+
+                    let out_ids = self.store.get_out_edge_ids(&current_id);
+                    ids.extend(
+                        out_ids
+                            .iter()
+                            .filter(|eid| label_edge_ids.contains(eid.as_str()))
+                            .filter_map(|eid| self.store.get_edge(eid))
+                            .map(|e| e.to),
+                    );
+
+                    let in_ids = self.store.get_in_edge_ids(&current_id);
+                    ids.extend(
+                        in_ids
+                            .iter()
+                            .filter(|eid| label_edge_ids.contains(eid.as_str()))
+                            .filter_map(|eid| self.store.get_edge(eid))
+                            .map(|e| e.from),
+                    );
+                    ids
+                }
+            };
+
+            for next_id in neighbor_ids {
+                if visited.contains(&next_id) {
+                    continue;
+                }
+                visited.insert(next_id.clone());
+                queue.push_back((next_id, depth + 1));
+            }
+        }
+
+        Ok(TraversalResult {
+            vertices: result_vertices,
+            edges: Vec::new(),
+            paths: Vec::new(),
+            visited_count: visited.len(),
+        })
+    }
+
     /// Multi-hop DFS traversal.
+    ///
+    /// Uses push/pop backtracking to avoid O(depth) vector allocations
+    /// at each recursive call (#5 optimization).
     pub fn traverse_dfs(
         &self,
         start_id: &str,
@@ -386,6 +572,9 @@ impl<'a> TraversalEngine<'a> {
         let mut result_edges = Vec::new();
         let mut result_paths = Vec::new();
 
+        let mut path_verts = vec![start_id.to_string()];
+        let mut path_edges: Vec<String> = Vec::new();
+
         self.dfs_recursive(
             start_id,
             0,
@@ -397,8 +586,8 @@ impl<'a> TraversalEngine<'a> {
             &mut result_vertices,
             &mut result_edges,
             &mut result_paths,
-            &[start_id.to_string()],
-            &[],
+            &mut path_verts,
+            &mut path_edges,
         )?;
 
         Ok(TraversalResult {
@@ -425,8 +614,8 @@ impl<'a> TraversalEngine<'a> {
         result_vertices: &mut Vec<Vertex>,
         result_edges: &mut Vec<Edge>,
         result_paths: &mut Vec<TraversalPath>,
-        path_verts: &[String],
-        path_edges: &[String],
+        path_verts: &mut Vec<String>,
+        path_edges: &mut Vec<String>,
     ) -> Result<(), GraphError> {
         if depth > Self::MAX_DFS_RECURSION_DEPTH {
             return Err(GraphError::TraversalError(format!(
@@ -446,13 +635,13 @@ impl<'a> TraversalEngine<'a> {
                         return Ok(());
                     }
                 }
-                result_vertices.push(vertex.clone());
                 result_paths.push(TraversalPath {
-                    vertex_ids: path_verts.to_vec(),
-                    edge_ids: path_edges.to_vec(),
-                    target: vertex,
+                    vertex_ids: path_verts.clone(),
+                    edge_ids: path_edges.clone(),
+                    target: vertex.clone(),
                     length: depth,
                 });
+                result_vertices.push(vertex);
             }
         } else {
             visited.insert(current_id.to_string());
@@ -486,11 +675,9 @@ impl<'a> TraversalEngine<'a> {
 
             result_edges.push(edge.clone());
 
-            let mut new_path_verts = path_verts.to_vec();
-            new_path_verts.push(next_id.clone());
-
-            let mut new_path_edges = path_edges.to_vec();
-            new_path_edges.push(edge.id.clone());
+            // Push onto path (backtracking pattern)
+            path_verts.push(next_id.clone());
+            path_edges.push(edge.id.clone());
 
             self.dfs_recursive(
                 &next_id,
@@ -503,29 +690,52 @@ impl<'a> TraversalEngine<'a> {
                 result_vertices,
                 result_edges,
                 result_paths,
-                &new_path_verts,
-                &new_path_edges,
+                path_verts,
+                path_edges,
             )?;
+
+            // Pop from path (backtrack)
+            path_verts.pop();
+            path_edges.pop();
         }
 
         Ok(())
     }
 
     /// Find shortest path between two vertices (BFS).
+    ///
+    /// Uses parent map + edge tracking for O(V) memory instead of O(V × depth)
+    /// path cloning (#4 optimization).
     pub fn shortest_path(
         &self,
         from_id: &str,
         to_id: &str,
         max_depth: usize,
     ) -> Result<Option<TraversalPath>, GraphError> {
-        let mut visited = HashSet::new();
+        let mut visited: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
         let mut queue = VecDeque::new();
 
-        queue.push_back((from_id.to_string(), 0, vec![from_id.to_string()], vec![]));
-        visited.insert(from_id.to_string());
+        queue.push_back((from_id.to_string(), 0usize));
+        visited.insert(from_id.to_string(), (None, None));
 
-        while let Some((current_id, depth, path_verts, path_edges)) = queue.pop_front() {
+        while let Some((current_id, depth)) = queue.pop_front() {
             if current_id == to_id && depth > 0 {
+                // Reconstruct path from parent map
+                let mut path_verts = Vec::new();
+                let mut path_edges = Vec::new();
+                let mut cur = to_id.to_string();
+                loop {
+                    path_verts.push(cur.clone());
+                    if let Some((Some(parent), Some(edge_id))) = visited.get(&cur) {
+                        path_edges.push(edge_id.clone());
+                        cur = parent.clone();
+                    } else {
+                        break;
+                    }
+                }
+                path_verts.reverse();
+                path_edges.reverse();
+
                 let target = self
                     .store
                     .get_vertex(to_id)
@@ -544,18 +754,11 @@ impl<'a> TraversalEngine<'a> {
 
             for edge in self.store.get_out_edges(&current_id) {
                 let next_id = edge.to.clone();
-                if visited.contains(&next_id) {
+                if visited.contains_key(&next_id) {
                     continue;
                 }
-                visited.insert(next_id.clone());
-
-                let mut new_path_verts = path_verts.clone();
-                new_path_verts.push(next_id.clone());
-
-                let mut new_path_edges = path_edges.clone();
-                new_path_edges.push(edge.id.clone());
-
-                queue.push_back((next_id, depth + 1, new_path_verts, new_path_edges));
+                visited.insert(next_id.clone(), (Some(current_id.clone()), Some(edge.id.clone())));
+                queue.push_back((next_id, depth + 1));
             }
         }
 

@@ -99,7 +99,10 @@ impl CompactionWorker {
         let (sender, receiver) = mpsc::channel();
         let (notif_sender, notif_receiver) = mpsc::channel();
 
-        let handle = thread::spawn(move || {
+        let handle = thread::Builder::new()
+            .name("compaction-worker".into())
+            .stack_size(32 * 1024 * 1024) // 32MB stack for large sort operations
+            .spawn(move || {
             let mut worker = Self {
                 levels: levels_clone,
                 options,
@@ -110,7 +113,7 @@ impl CompactionWorker {
                 pending_deletions: Vec::new(),
             };
             worker.run();
-        });
+        }).expect("failed to spawn compaction worker thread");
 
         (levels, sender, notif_receiver, handle)
     }
@@ -125,26 +128,37 @@ impl CompactionWorker {
                     }
                 }
                 Ok(CompactionMsg::FlushAndNotify) => {
-                    // Perform all pending compaction
+                    // Perform all pending compaction (includes small file merge)
                     if let Err(e) = self.try_compact() {
                         tracing::error!("Background compaction failed: {}", e);
                     }
                     // Keep compacting until no more is needed
                     loop {
-                        let score = {
+                        let (score, excessive) = {
                             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
                             if levels.len() < 2 {
                                 break;
                             }
                             let mut best = 0.0f64;
+                            let mut excessive = false;
+                            for (_i, level) in levels.iter().enumerate().skip(1) {
+                                if level.len() > 1000 {
+                                    excessive = true;
+                                }
+                            }
                             for level in 0..levels.len() - 1 {
                                 let s = self.compaction_score(&levels, level);
                                 if s > best {
                                     best = s;
                                 }
                             }
-                            best
+                            (best, excessive)
                         };
+                        // If levels have too many small files, let merge_small_files
+                        // handle it across multiple ticks instead of spinning here
+                        if excessive {
+                            break;
+                        }
                         if score <= 1.0 {
                             break;
                         }
@@ -180,6 +194,26 @@ impl CompactionWorker {
         for path in self.pending_deletions.drain(..) {
             self.sst_cache.remove(&path);
             let _ = fs::remove_file(&path);
+        }
+
+        // Run small file merge FIRST — this reduces file count before normal
+        // compaction, preventing OOM when normal compaction tries to open
+        // thousands of tiny overlapping SSTables.
+        if let Err(e) = self.merge_small_files() {
+            tracing::warn!("Small file merge failed (non-fatal): {}", e);
+        }
+
+        // Check if any level has too many files — if so, skip normal compaction
+        // and let merge_small_files reduce the count over multiple ticks.
+        const MAX_FILES_PER_LEVEL: usize = 1000;
+        let excessive_files = {
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            levels.iter().enumerate().any(|(i, l)| i > 0 && l.len() > MAX_FILES_PER_LEVEL)
+        };
+
+        if excessive_files {
+            // Skip normal compaction; merge_small_files will handle it
+            return Ok(());
         }
 
         // Find the level with the highest compaction score
@@ -220,7 +254,16 @@ impl CompactionWorker {
         if target == 0 {
             return 0.0;
         }
-        size as f64 / target as f64
+        let size_score = size as f64 / target as f64;
+        // Penalize levels with too many files — push compaction to drain them faster.
+        // Each file above 100 adds 0.01 to the score.
+        let file_count = levels[level].len();
+        let file_penalty = if file_count > 100 {
+            (file_count - 100) as f64 * 0.01
+        } else {
+            0.0
+        };
+        size_score + file_penalty
     }
 
     /// Returns the target size for a level.
@@ -278,10 +321,12 @@ impl CompactionWorker {
         };
 
         // Step 2: Find overlapping SSTables in level N+1 (snapshot, don't remove)
+        // Cap at 32 files to avoid OOM during large merges
+        const MAX_OVERLAP_FILES: usize = 16;
         let next_level = level + 1;
         let next_level_ssts: Vec<SsTableInfo> = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-            levels[next_level]
+            let mut overlapping: Vec<SsTableInfo> = levels[next_level]
                 .iter()
                 .filter(|sst_info| {
                     Self::ranges_overlap(
@@ -292,7 +337,9 @@ impl CompactionWorker {
                     )
                 })
                 .cloned()
-                .collect()
+                .collect();
+            overlapping.truncate(MAX_OVERLAP_FILES);
+            overlapping
         };
 
         // Step 3: Collect all entries from SSTables
@@ -362,7 +409,7 @@ impl CompactionWorker {
         }
 
         // Step 6: Write merged entries to new SSTables (I/O-heavy, outside lock)
-        let target_sst_size = self.options.block_size * 16;
+        let target_sst_size = 64 * 1024 * 1024; // 64MB per output SST
         let mut builder = SsTableBuilder::new();
         builder.set_compression_level(self.options.compression_level);
         let mut new_ssts = Vec::new();
@@ -462,6 +509,192 @@ impl CompactionWorker {
             next_level,
             ssts_to_compact.len(),
             next_level_ssts.len()
+        );
+
+        Ok(())
+    }
+
+    /// Merge small SSTables into larger ones to prevent file count explosion.
+    /// Processes a BATCH of small files per call to avoid OOM. Called from
+    /// try_compact on every tick, so it makes steady progress.
+    fn merge_small_files(&mut self) -> Result<()> {
+        const SMALL_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32MB
+        const MIN_FILES_TO_MERGE: usize = 4;
+        const MERGE_BATCH_SIZE: usize = 40;
+        // Target output size MUST exceed SMALL_FILE_THRESHOLD to prevent infinite re-merging.
+        // Set to 2x threshold so merged files are definitively "not small".
+        const TARGET_OUTPUT_SIZE: u64 = 96 * 1024 * 1024; // 96MB
+
+        // Find the level with the most small files
+        let (target_level, mut small_files) = {
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let mut best_level = None;
+            let mut best_files = Vec::new();
+
+            for (level_idx, level) in levels.iter().enumerate() {
+                let small: Vec<SsTableInfo> = level
+                    .iter()
+                    .filter(|s| s.size < SMALL_FILE_THRESHOLD)
+                    .cloned()
+                    .collect();
+                if small.len() >= MIN_FILES_TO_MERGE && small.len() > best_files.len() {
+                    best_level = Some(level_idx);
+                    best_files = small;
+                }
+            }
+
+            match best_level {
+                Some(l) => (l, best_files),
+                None => return Ok(()),
+            }
+        };
+
+        // Limit to one batch to bound memory usage
+        small_files.truncate(MERGE_BATCH_SIZE);
+        let batch_size = small_files.len();
+
+        tracing::info!(
+            "Merging batch of {} small L{} SSTables (< 32MB each)",
+            batch_size,
+            target_level
+        );
+
+        // Collect entries from this batch only
+        let mut all_entries: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
+        for sst_info in &small_files {
+            match SsTable::open(&sst_info.path) {
+                Ok(sst) => {
+                    let mut iter = sst.iter()?;
+                    while iter.is_valid() {
+                        all_entries.push((
+                            iter.key().to_vec(),
+                            iter.value().to_vec(),
+                            iter.seq_no(),
+                            iter.kind(),
+                        ));
+                        iter.next();
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to open SST {}: {}", sst_info.path.display(), e);
+                }
+            }
+        }
+
+        if all_entries.is_empty() {
+            return Ok(());
+        }
+
+        // Sort by key for efficient output
+        all_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Deduplicate by key (keep latest seq_no per key)
+        let mut deduped: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
+        for entry in all_entries {
+            if let Some(last) = deduped.last_mut() {
+                if last.0 == entry.0 {
+                    if entry.2 > last.2 {
+                        *last = entry;
+                    }
+                    continue;
+                }
+            }
+            deduped.push(entry);
+        }
+
+        // Write new larger SSTs — output stays in same level.
+        // Target size (96MB) exceeds SMALL_FILE_THRESHOLD (32MB) so merged files
+        // will NOT be re-classified as small files, breaking the infinite loop.
+        let mut new_ssts: Vec<SsTableInfo> = Vec::new();
+        let mut builder = SsTableBuilder::new();
+        builder.set_compression_level(self.options.compression_level);
+        let mut current_size: u64 = 0;
+        let mut batch_min_key: Vec<u8> = Vec::new();
+        let total_entries = deduped.len() as u64;
+
+        tracing::info!(
+            "Merge write phase: {} deduped entries from {} input files",
+            total_entries,
+            batch_size
+        );
+
+        for (key, value, seq, kind) in &deduped {
+            if batch_min_key.is_empty() {
+                batch_min_key = key.clone();
+            }
+            let entry = match kind {
+                EntryKind::Put => Entry::put(key.clone(), value.clone(), *seq),
+                EntryKind::Delete => Entry::delete(key.clone(), *seq),
+            };
+            builder.add(&entry);
+            current_size += key.len() as u64 + value.len() as u64 + 16;
+
+            if current_size >= TARGET_OUTPUT_SIZE {
+                let id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
+                let path = self.options.data_dir.join(format!("L{}_{}.sst", target_level, id));
+                tracing::info!(
+                    "Merge flushing SST: current_size={} ({}MB)",
+                    current_size,
+                    current_size / 1024 / 1024
+                );
+                let sst = builder.build(&path)?;
+                let metadata = fs::metadata(&path)?;
+                new_ssts.push(SsTableInfo {
+                    path,
+                    size: metadata.len(),
+                    min_key: batch_min_key.clone(),
+                    max_key: sst.max_key().to_vec(),
+                });
+                builder = SsTableBuilder::new();
+                builder.set_compression_level(self.options.compression_level);
+                current_size = 0;
+                batch_min_key = Vec::new();
+            }
+        }
+
+        // Flush remaining entries
+        if !batch_min_key.is_empty() {
+            let id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
+            let path = self.options.data_dir.join(format!("L{}_{}.sst", target_level, id));
+            let sst = builder.build(&path)?;
+            let metadata = fs::metadata(&path)?;
+            new_ssts.push(SsTableInfo {
+                path,
+                size: metadata.len(),
+                min_key: batch_min_key,
+                max_key: sst.max_key().to_vec(),
+            });
+        }
+
+        let new_count = new_ssts.len();
+        let total_output_size: u64 = new_ssts.iter().map(|s| s.size).sum();
+
+        tracing::info!(
+            "Merge write complete: {} entries → {} SSTs ({}MB total)",
+            total_entries,
+            new_count,
+            total_output_size / 1024 / 1024
+        );
+
+        // Replace small files with new larger files and schedule old ones for deletion
+        {
+            let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let small_paths: std::collections::HashSet<PathBuf> =
+                small_files.iter().map(|s| s.path.clone()).collect();
+
+            levels[target_level].retain(|s| !small_paths.contains(&s.path));
+            levels[target_level].extend(new_ssts);
+            levels[target_level].sort_by(|a, b| a.min_key.cmp(&b.min_key));
+
+            self.pending_deletions.extend(small_paths);
+        }
+
+        tracing::info!(
+            "Small file merge batch complete (L{}): {} small files → {} larger files ({}MB)",
+            target_level,
+            batch_size,
+            new_count,
+            total_output_size / 1024 / 1024
         );
 
         Ok(())

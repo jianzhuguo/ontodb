@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Graph data model and traversal engine for OntoDB"
 
+[features]
+default = []
+# Enterprise features: distributed, streaming, GNN, reasoning, pattern matching
+enterprise = ["rayon"]
+
 [dependencies]
 onto-core = { workspace = true }
 onto-storage = { workspace = true }
@@ -13,6 +18,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = "0.12"
+# Rayon only required for enterprise parallel features
+rayon = { version = "1.10", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

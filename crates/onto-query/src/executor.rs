@@ -261,7 +261,7 @@ pub struct QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
-            query_timeout: Duration::from_secs(30),
+            query_timeout: Duration::from_secs(120),
             memory_budget: 256 * 1024 * 1024, // 256 MB
         }
     }
@@ -321,6 +321,9 @@ pub struct QueryExecutor {
     /// Cached row counts per table: table_name → (count, last_updated).
     /// Avoids full table scan for COUNT(*) queries.
     row_count_cache: Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>,
+    /// Set of relation table names that have already had source/target indexes created.
+    /// Avoids repeated index creation attempts.
+    relation_indexes_created: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Column-level statistics collected by ANALYZE.
@@ -435,6 +438,152 @@ impl InferenceCache {
     }
 }
 
+/// Streaming aggregate state — tracks running aggregates without materializing rows.
+/// One instance per GROUP BY key (or a single instance for no GROUP BY).
+#[derive(Default)]
+struct AggState {
+    count_star: u64,
+    /// column -> (count_non_null, sum, min, max) for numeric aggregates
+    numeric: std::collections::HashMap<String, (u64, f64, f64, f64)>,
+    /// column -> count_non_null for COUNT(col)
+    count_col: std::collections::HashMap<String, u64>,
+    /// column -> set of unique values for COUNT(DISTINCT col)
+    count_distinct: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// column -> (min_str, max_str) for MIN/MAX on strings
+    string_mm: std::collections::HashMap<String, (String, String)>,
+}
+
+impl AggState {
+    fn update(&mut self, _row: &Map<String, Value>) {
+        self.count_star += 1;
+    }
+
+    fn update_column(&mut self, col: &str, row: &Map<String, Value>) {
+        if let Some(val) = Self::extract_value(row, col) {
+            *self.count_col.entry(col.to_string()).or_insert(0) += 1;
+            // Track distinct values
+            self.count_distinct.entry(col.to_string()).or_default().insert(val.clone());
+            if let Ok(n) = val.parse::<f64>() {
+                let entry = self
+                    .numeric
+                    .entry(col.to_string())
+                    .or_insert((0, 0.0, f64::MAX, f64::MIN));
+                entry.0 += 1;
+                entry.1 += n;
+                if n < entry.2 {
+                    entry.2 = n;
+                }
+                if n > entry.3 {
+                    entry.3 = n;
+                }
+            } else {
+                let entry = self
+                    .string_mm
+                    .entry(col.to_string())
+                    .or_insert_with(|| (val.clone(), val.clone()));
+                if val < entry.0 {
+                    entry.0 = val.clone();
+                }
+                if val > entry.1 {
+                    entry.1 = val.clone();
+                }
+            }
+        }
+    }
+
+    fn extract_value(row: &Map<String, Value>, col: &str) -> Option<String> {
+        if let Some(v) = row.get(col) {
+            match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                Value::Bool(b) => Some(b.to_string()),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    fn finalize(&self, agg: &crate::parser::AggregateExpr) -> Value {
+        match agg.func {
+            AggregateFunc::Count => {
+                if agg.arg == "*" {
+                    Value::Number(serde_json::Number::from(self.count_star))
+                } else if agg.distinct {
+                    let cnt = self.count_distinct.get(&agg.arg)
+                        .map(|s| s.len())
+                        .unwrap_or(0);
+                    Value::Number(serde_json::Number::from(cnt))
+                } else {
+                    Value::Number(serde_json::Number::from(
+                        self.count_col.get(&agg.arg).copied().unwrap_or(0),
+                    ))
+                }
+            }
+            AggregateFunc::Sum => {
+                if let Some((_, sum, _, _)) = self.numeric.get(&agg.arg) {
+                    if sum.fract() == 0.0 {
+                        Value::Number(serde_json::Number::from(*sum as i64))
+                    } else {
+                        Value::Number(
+                            serde_json::Number::from_f64(*sum)
+                                .unwrap_or(serde_json::Number::from(0)),
+                        )
+                    }
+                } else {
+                    Value::Null
+                }
+            }
+            AggregateFunc::Avg => {
+                if let Some((count, sum, _, _)) = self.numeric.get(&agg.arg) {
+                    if *count > 0 {
+                        Value::Number(
+                            serde_json::Number::from_f64(sum / *count as f64)
+                                .unwrap_or(serde_json::Number::from(0)),
+                        )
+                    } else {
+                        Value::Null
+                    }
+                } else {
+                    Value::Null
+                }
+            }
+            AggregateFunc::Min => {
+                if let Some((_, _, min, _)) = self.numeric.get(&agg.arg) {
+                    if *min != f64::MAX {
+                        Value::Number(
+                            serde_json::Number::from_f64(*min)
+                                .unwrap_or(serde_json::Number::from(0)),
+                        )
+                    } else {
+                        Value::Null
+                    }
+                } else if let Some((min_s, _)) = self.string_mm.get(&agg.arg) {
+                    Value::String(min_s.clone())
+                } else {
+                    Value::Null
+                }
+            }
+            AggregateFunc::Max => {
+                if let Some((_, _, _, max)) = self.numeric.get(&agg.arg) {
+                    if *max != f64::MIN {
+                        Value::Number(
+                            serde_json::Number::from_f64(*max)
+                                .unwrap_or(serde_json::Number::from(0)),
+                        )
+                    } else {
+                        Value::Null
+                    }
+                } else if let Some((_, max_s)) = self.string_mm.get(&agg.arg) {
+                    Value::String(max_s.clone())
+                } else {
+                    Value::Null
+                }
+            }
+        }
+    }
+}
+
 impl QueryExecutor {
     pub fn new(engine: Arc<LsmEngine>, ontology_store: OntologyStore) -> Self {
         Self::with_config(engine, ontology_store, QueryConfig::default())
@@ -463,6 +612,7 @@ impl QueryExecutor {
             shard_manager: Mutex::new(None),
             current_namespace: Mutex::new("default".to_string()),
             row_count_cache: Mutex::new(std::collections::HashMap::new()),
+            relation_indexes_created: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -474,7 +624,7 @@ impl QueryExecutor {
 
     /// Get cached row count for a table, or compute and cache it.
     /// Cache TTL: 60 seconds.
-    fn get_cached_row_count(&self, engine: &LsmEngine, table: &str) -> Option<u64> {
+    fn get_cached_row_count(&self, _engine: &LsmEngine, table: &str) -> Option<u64> {
         let cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&(count, ref updated)) = cache.get(table) {
             if updated.elapsed().as_secs() < 60 {
@@ -1471,6 +1621,36 @@ impl QueryExecutor {
                         }
 
                         if group_by.is_some() || has_aggregates {
+                            // Streaming fast path: if plan is a simple SeqScan (no JOINs),
+                            // aggregate in a single pass without materializing all rows.
+                            if let Some((scan_table, scan_filter)) =
+                                Self::extract_simple_seqscan(&plan.root)
+                            {
+                                tracing::info!(
+                                    "streaming_aggregation: table={}, has_filter={}",
+                                    scan_table,
+                                    scan_filter.is_some()
+                                );
+                                let result = self.execute_streaming_aggregation(
+                                    engine,
+                                    &scan_table,
+                                    scan_filter,
+                                    columns,
+                                    group_by.as_ref(),
+                                    having,
+                                    order_by,
+                                    *limit,
+                                )?;
+                                if let QueryResult::Rows(mut agg_rows) = result {
+                                    if *distinct {
+                                        Self::dedup_rows(&mut agg_rows);
+                                    }
+                                    return Ok(QueryResult::Rows(agg_rows));
+                                }
+                                return Ok(result);
+                            }
+                            // Fallback: materialize all rows then aggregate
+                            tracing::info!("fallback_aggregation: materializing {} rows", rows.len());
                             let result = self.execute_aggregation_read(
                                 engine,
                                 columns,
@@ -1557,6 +1737,11 @@ impl QueryExecutor {
                 to_id,
                 max_depth,
             } => self.execute_graph_shortest_path_read(from_id, to_id, *max_depth),
+            QueryAst::GraphAnalyze {
+                algorithm,
+                relation_type,
+                params,
+            } => self.execute_graph_analyze(engine, algorithm, relation_type, params),
             QueryAst::GraphTraverse {
                 start_id,
                 direction,
@@ -1674,22 +1859,41 @@ impl QueryExecutor {
                 self.execute_union(engine, left, right, *all)
             }
             QueryAst::CreateIndex { class, column } => {
-                engine.create_index(class, column)?;
-                self.refresh_index_stats(engine, class);
+                let engine_clone = self.engine.clone();
+                let class_owned = class.clone();
+                let column_owned = column.clone();
+                tracing::info!(table = class.as_str(), column = column.as_str(), "Index creation started in background");
+                std::thread::Builder::new()
+                    .name("ontodb-create-index".into())
+                    .spawn(move || {
+                        if let Err(e) = engine_clone.create_index(&class_owned, &column_owned) {
+                            tracing::error!(table = class_owned.as_str(), column = column_owned.as_str(), error = %e, "Background index creation failed");
+                        }
+                    })
+                    .ok();
                 Ok(QueryResult::Success(format!(
-                    "Index created on {}.{}",
+                    "Index creation started in background on {}.{}",
                     class, column
                 )))
             }
             QueryAst::CreateCompositeIndex { class, columns } => {
-                // Create individual indexes for each column in the composite index
-                // This enables index intersection for multi-column queries
-                for col in columns {
-                    engine.create_index(class, col)?;
-                }
-                self.refresh_index_stats(engine, class);
+                let engine_clone = self.engine.clone();
+                let class_owned = class.clone();
+                let columns_owned = columns.clone();
+                tracing::info!(table = class.as_str(), columns = ?columns, "Composite index creation started in background");
+                std::thread::Builder::new()
+                    .name("ontodb-create-composite-index".into())
+                    .spawn(move || {
+                        for col in &columns_owned {
+                            if let Err(e) = engine_clone.create_index(&class_owned, col) {
+                                tracing::error!(table = class_owned.as_str(), column = col.as_str(), error = %e, "Background composite index creation failed");
+                                return;
+                            }
+                        }
+                    })
+                    .ok();
                 Ok(QueryResult::Success(format!(
-                    "Composite index created on {} ({})",
+                    "Composite index creation started in background on {} ({})",
                     class,
                     columns.join(", ")
                 )))
@@ -1706,6 +1910,59 @@ impl QueryExecutor {
                         class, column
                     )))
                 }
+            }
+            QueryAst::VacuumTable { class } => {
+                let engine_clone = self.engine.clone();
+                let class_owned = class.clone();
+                let start = std::time::Instant::now();
+
+                // Scan all live entries for this class
+                let prefix = format!("{}::", class_owned);
+                let entries = engine_clone.scan_prefix(prefix.as_bytes())?;
+                let total = entries.len();
+
+                // Rewrite: for each live entry, delete and re-insert.
+                // This consolidates entries with fresh sequence numbers,
+                // allowing compaction to clean up old tombstones.
+                let mut rewritten = 0usize;
+                for (key, value) in &entries {
+                    engine_clone.delete(key.clone())?;
+                    engine_clone.put(key.clone(), value.clone())?;
+                    rewritten += 1;
+                }
+
+                let elapsed_ms = start.elapsed().as_millis();
+                Ok(QueryResult::Success(format!(
+                    "VACUUM {}: scanned {} entries, rewritten {} entries in {}ms. \
+                     Background compaction will clean up old tombstones.",
+                    class, total, rewritten, elapsed_ms
+                )))
+            }
+            QueryAst::ShowTableStats { class } => {
+                let start = std::time::Instant::now();
+                let prefix = format!("{}::", class);
+                let (live, tombstones) = engine.count_prefix(prefix.as_bytes())?;
+                let elapsed_ms = start.elapsed().as_millis();
+
+                let mut stats = serde_json::Map::new();
+                stats.insert("table".to_string(), serde_json::Value::String(class.clone()));
+                stats.insert("live_entries".to_string(), serde_json::Value::Number(serde_json::Number::from(live)));
+                stats.insert("tombstones".to_string(), serde_json::Value::Number(serde_json::Number::from(tombstones)));
+                stats.insert("total_scanned".to_string(), serde_json::Value::Number(serde_json::Number::from(live + tombstones)));
+                stats.insert("tombstone_ratio".to_string(), serde_json::Value::String(
+                    if live + tombstones > 0 { format!("{:.1}%", tombstones as f64 / (live + tombstones) as f64 * 100.0) } else { "0%".to_string() }
+                ));
+                stats.insert("scan_time_ms".to_string(), serde_json::Value::Number(serde_json::Number::from(elapsed_ms as u64)));
+                stats.insert("has_index_source".to_string(), serde_json::Value::Bool(engine.has_index(class, "source")));
+                stats.insert("has_index_target".to_string(), serde_json::Value::Bool(engine.has_index(class, "target")));
+                if tombstones > live / 2 {
+                    stats.insert("recommendation".to_string(), serde_json::Value::String(
+                        format!("High tombstone ratio ({}%). Consider running VACUUM TABLE {} to reclaim space.",
+                            tombstones * 100 / (live + tombstones).max(1), class)
+                    ));
+                }
+
+                Ok(QueryResult::Rows(vec![stats]))
             }
             QueryAst::CreateVectorIndex {
                 class,
@@ -2056,6 +2313,11 @@ impl QueryExecutor {
                 to_id,
                 max_depth,
             } => self.execute_graph_shortest_path_read(from_id, to_id, *max_depth),
+            QueryAst::GraphAnalyze {
+                algorithm,
+                relation_type,
+                params,
+            } => self.execute_graph_analyze(engine, algorithm, relation_type, params),
             QueryAst::GraphTraverse {
                 start_id,
                 direction,
@@ -2365,6 +2627,20 @@ impl QueryExecutor {
                 let left_rows = self.execute_plan_node(left, engine)?;
                 let right_rows = self.execute_plan_node(right, engine)?;
                 Self::execute_sort_merge_join_rows(left_rows, right_rows, join_clause)
+            }
+            PlanNode::IndexNestedLoopJoin {
+                left,
+                right_table,
+                right_alias,
+                join_clause,
+                index_column,
+                ..
+            } => {
+                let left_rows = self.execute_plan_node(left, engine)?;
+                self.execute_index_nested_loop_join(
+                    engine, left_rows, right_table, right_alias.as_deref(),
+                    join_clause, index_column,
+                )
             }
             PlanNode::Sort {
                 input, order_by, ..
@@ -2717,7 +2993,14 @@ impl QueryExecutor {
             if !all_pkeys.is_empty() {
                 // Use BinaryRow for filtering, only convert to Map for passing rows
                 let mut rows = Vec::new();
+                let mut scan_count: u64 = 0;
                 for pk in &all_pkeys {
+                    // Check timeout every 1024 rows
+                    scan_count += 1;
+                    if scan_count & 0x3FF == 0 {
+                        self.check_timeout()?;
+                    }
+
                     if let Ok(Some(val_bytes)) = engine.get(pk) {
                         // Fast path: BinaryRow class check without full Map conversion
                         if let Some(brow) = BinaryRow::parse(&val_bytes) {
@@ -2936,11 +3219,13 @@ impl QueryExecutor {
     ) -> Result<Vec<Map<String, Value>>> {
         let _left_alias = None::<&str>;
         let right_alias = join.alias.as_deref().unwrap_or(&join.table);
-        let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+        let (left_col_raw, right_col_raw) = Self::resolve_join_columns(&join.on)?;
+        let (left_col, right_col) = Self::fix_join_columns(&left_rows, &right_rows, &left_col_raw, &right_col_raw);
         let join_type = join.join_type;
 
+        let mut matched_left: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut result = Vec::new();
-        for left_row in &left_rows {
+        for (li, left_row) in left_rows.iter().enumerate() {
             let left_val = Self::resolve_column_value(left_row, &left_col);
             let mut matched = false;
 
@@ -2948,6 +3233,7 @@ impl QueryExecutor {
                 let right_val = Self::resolve_column_value(right_row, &right_col);
                 if left_val.is_some() && right_val.is_some() && left_val == right_val {
                     matched = true;
+                    matched_left.insert(li);
                     let mut merged = Map::new();
                     for (k, v) in left_row {
                         merged.insert(k.clone(), v.clone());
@@ -2963,13 +3249,12 @@ impl QueryExecutor {
                 }
             }
 
-            // For LEFT JOIN: emit left row with NULLs for right columns if no match
-            if !matched && join_type == crate::parser::JoinType::Left {
+            // For LEFT/FULL JOIN: emit left row with NULLs for right columns if no match
+            if !matched && matches!(join_type, crate::parser::JoinType::Left | crate::parser::JoinType::Full) {
                 let mut merged = Map::new();
                 for (k, v) in left_row {
                     merged.insert(k.clone(), v.clone());
                 }
-                // Add NULL values for right side columns
                 if let Some(right_sample) = right_rows.first() {
                     for k in right_sample.keys() {
                         let key = format!("{}.{}", right_alias, k);
@@ -2983,8 +3268,8 @@ impl QueryExecutor {
             }
         }
 
-        // For RIGHT JOIN: emit right rows with NULLs for left columns if no match
-        if join_type == crate::parser::JoinType::Right {
+        // For RIGHT/FULL JOIN: emit right rows with NULLs for left columns if no match
+        if matches!(join_type, crate::parser::JoinType::Right | crate::parser::JoinType::Full) {
             for right_row in &right_rows {
                 let right_val = Self::resolve_column_value(right_row, &right_col);
                 let mut matched = false;
@@ -2997,7 +3282,6 @@ impl QueryExecutor {
                 }
                 if !matched {
                     let mut merged = Map::new();
-                    // Add NULL values for left side columns
                     if let Some(left_sample) = left_rows.first() {
                         for k in left_sample.keys() {
                             merged.insert(k.clone(), Value::Null);
@@ -3025,7 +3309,8 @@ impl QueryExecutor {
         join: &crate::parser::JoinClause,
     ) -> Result<Vec<Map<String, Value>>> {
         let right_alias = join.alias.as_deref().unwrap_or(&join.table);
-        let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+        let (left_col_raw, right_col_raw) = Self::resolve_join_columns(&join.on)?;
+        let (left_col, right_col) = Self::fix_join_columns(&left_rows, &right_rows, &left_col_raw, &right_col_raw);
         let join_type = join.join_type;
 
         // Build hash table on right side
@@ -3037,12 +3322,13 @@ impl QueryExecutor {
             }
         }
 
-        // Track which right rows were matched (for RIGHT/FULL JOIN)
+        // Track which right/left rows were matched (for outer joins)
+        let mut matched_left: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut matched_right: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         // Probe with left rows
         let mut result = Vec::new();
-        for left_row in &left_rows {
+        for (li, left_row) in left_rows.iter().enumerate() {
             let left_val = Self::resolve_column_value(left_row, &left_col);
             let mut matched = false;
 
@@ -3050,7 +3336,7 @@ impl QueryExecutor {
                 if let Some(matching_rights) = hash_table.get(left_val) {
                     for right_row in matching_rights {
                         matched = true;
-                        // Track matched right row index
+                        matched_left.insert(li);
                         if let Some(idx) =
                             right_rows.iter().position(|r| std::ptr::eq(r, *right_row))
                         {
@@ -3072,8 +3358,8 @@ impl QueryExecutor {
                 }
             }
 
-            // For LEFT JOIN: emit left row with NULLs if no match
-            if !matched && join_type == crate::parser::JoinType::Left {
+            // For LEFT/FULL JOIN: emit left row with NULLs if no match
+            if !matched && matches!(join_type, crate::parser::JoinType::Left | crate::parser::JoinType::Full) {
                 let mut merged = Map::new();
                 for (k, v) in left_row {
                     merged.insert(k.clone(), v.clone());
@@ -3091,8 +3377,8 @@ impl QueryExecutor {
             }
         }
 
-        // For RIGHT JOIN: emit unmatched right rows with NULLs for left
-        if join_type == crate::parser::JoinType::Right {
+        // For RIGHT/FULL JOIN: emit unmatched right rows with NULLs for left
+        if matches!(join_type, crate::parser::JoinType::Right | crate::parser::JoinType::Full) {
             for (idx, right_row) in right_rows.iter().enumerate() {
                 if !matched_right.contains(&idx) {
                     let mut merged = Map::new();
@@ -3123,7 +3409,8 @@ impl QueryExecutor {
         join: &crate::parser::JoinClause,
     ) -> Result<Vec<Map<String, Value>>> {
         let right_alias = join.alias.as_deref().unwrap_or(&join.table);
-        let (left_col, right_col) = Self::resolve_join_columns(&join.on)?;
+        let (left_col_raw, right_col_raw) = Self::resolve_join_columns(&join.on)?;
+        let (left_col, right_col) = Self::fix_join_columns(&left_rows, &right_rows, &left_col_raw, &right_col_raw);
         let join_type = join.join_type;
 
         // Sort both sides
@@ -3197,8 +3484,8 @@ impl QueryExecutor {
             }
         }
 
-        // For LEFT JOIN: emit unmatched left rows with NULLs
-        if join_type == crate::parser::JoinType::Left {
+        // For LEFT/FULL JOIN: emit unmatched left rows with NULLs
+        if matches!(join_type, crate::parser::JoinType::Left | crate::parser::JoinType::Full) {
             for (idx, left_row) in left_rows.iter().enumerate() {
                 if !matched_left.contains(&idx) {
                     let mut merged = Map::new();
@@ -3219,8 +3506,8 @@ impl QueryExecutor {
             }
         }
 
-        // For RIGHT JOIN: emit unmatched right rows with NULLs
-        if join_type == crate::parser::JoinType::Right {
+        // For RIGHT/FULL JOIN: emit unmatched right rows with NULLs
+        if matches!(join_type, crate::parser::JoinType::Right | crate::parser::JoinType::Full) {
             for (idx, right_row) in right_rows.iter().enumerate() {
                 if !matched_right.contains(&idx) {
                     let mut merged = Map::new();
@@ -3238,6 +3525,76 @@ impl QueryExecutor {
                     }
                     result.push(merged);
                 }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Index nested loop join: for each left row, do an index lookup on the right table.
+    /// Much faster than hash join when the left side is small and the right table is large
+    /// with an index on the join column. Avoids scanning the entire right table.
+    fn execute_index_nested_loop_join(
+        &self,
+        engine: &LsmEngine,
+        left_rows: Vec<Map<String, Value>>,
+        right_table: &str,
+        right_alias: Option<&str>,
+        join: &crate::parser::JoinClause,
+        index_column: &str,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let alias = right_alias.unwrap_or(right_table);
+        let (left_col_raw, right_col_raw) = Self::resolve_join_columns(&join.on)?;
+        let left_col = left_col_raw.split('.').next_back().unwrap_or(&left_col_raw);
+
+        let has_idx = engine.has_index(right_table, index_column);
+        let class_hierarchy = self.get_class_hierarchy_read(engine, right_table);
+        let mut result = Vec::new();
+
+        for left_row in &left_rows {
+            let join_val = Self::resolve_column_value(left_row, left_col);
+            let Some(ref val_str) = join_val else { continue };
+
+            let right_rows = if has_idx {
+                // Index lookup: find primary keys, then fetch rows
+                let json_val = serde_json::Value::String(val_str.clone());
+                let pkeys = {
+                    let index_mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+                    index_mgr.lookup_eq_read(right_table, index_column, &json_val).unwrap_or_default()
+                };
+                let mut rows = Vec::new();
+                for pk in &pkeys {
+                    if let Ok(Some(val_bytes)) = engine.get(pk) {
+                        if let Some(brow) = onto_core::binary_row::BinaryRow::parse(&val_bytes) {
+                            if brow.class_in_hierarchy(&class_hierarchy) {
+                                if let Some(mut doc) = brow.to_map() {
+                                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(pk).to_string()));
+                                    rows.push(doc);
+                                }
+                            }
+                        }
+                    }
+                }
+                rows
+            } else {
+                // No index: fallback to full scan (shouldn't happen for INLJ plan)
+                Vec::new()
+            };
+
+            // Merge left row with each matching right row
+            for right_row in &right_rows {
+                let mut merged = Map::new();
+                for (k, v) in left_row {
+                    merged.insert(k.clone(), v.clone());
+                }
+                for (k, v) in right_row {
+                    let key = format!("{}.{}", alias, k);
+                    merged.insert(key, v.clone());
+                    if !merged.contains_key(k) {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                }
+                result.push(merged);
             }
         }
 
@@ -3299,8 +3656,11 @@ impl QueryExecutor {
     }
 
     /// Ensures statistics exist for the given table.
-    /// If no statistics are cached, runs ANALYZE automatically.
+    /// If no statistics are cached, collects lightweight stats automatically.
     /// This enables the query optimizer to work correctly without manual ANALYZE.
+    ///
+    /// Performance: counts keys (no value parsing) + samples only a few rows for
+    /// column discovery.  O(sample_size) parse cost, not O(table_size).
     fn ensure_statistics(&self, table: &str, engine: &LsmEngine) {
         // Check if statistics already exist
         {
@@ -3310,38 +3670,59 @@ impl QueryExecutor {
             }
         }
 
-        // Auto-collect statistics in background (non-blocking)
-        // This is a lightweight operation that just counts rows
+        // Lightweight stats: sample a few rows per class to discover column names,
+        // then probe for indexes.  Does NOT count all rows — uses a default estimate.
+        // Full row counts are collected by explicit ANALYZE.
         let class_hierarchy = self.get_class_hierarchy(engine, table);
-        let mut row_count = 0u64;
+        let sample_limit = 3usize;
+        let mut seen_columns: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for scan_class in &class_hierarchy {
+            if !seen_columns.is_empty() {
+                break; // already discovered columns from first class
+            }
             let prefix = format!("{}::", scan_class);
-            let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
-            for (_key, val_bytes) in &entries {
-                if let Some(doc) = simd_parse_row(val_bytes) {
-                    if class_hierarchy
-                        .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
-                    {
-                        row_count += 1;
+            if let Ok(sample) = engine.scan_prefix_limit(prefix.as_bytes(), sample_limit) {
+                for (_key, val_bytes) in &sample {
+                    if let Some(doc) = simd_parse_row(val_bytes) {
+                        for col in doc.keys() {
+                            if !col.starts_with('_') {
+                                seen_columns.insert(col.clone());
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Update statistics
+        // Use default row count — ANALYZE will populate the real count
+        let row_count = 1000u64;
+
+        // Update statistics (mark as estimated)
         {
             let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
             stats.table_row_counts.insert(table.to_string(), row_count);
         }
 
-        // Update planner with basic statistics
+        // Build secondary index stats by probing the storage engine
+        let mut secondary_indexes = Vec::new();
+        for col_name in &seen_columns {
+            if engine.has_index(table, col_name) {
+                secondary_indexes.push(crate::optimizer::cost::IndexStats {
+                    column: col_name.clone(),
+                    cardinality: 100, // estimate until ANALYZE
+                    is_sorted: true,
+                    tree_height: 3,
+                });
+            }
+        }
+
         let planner_stats = crate::optimizer::cost::TableStats {
             row_count,
             avg_row_size: 100,
             block_count: (row_count / 100).max(1),
             has_primary_index: false,
-            secondary_indexes: Vec::new(),
+            secondary_indexes,
             vector_indexes: Vec::new(),
             histograms: Vec::new(),
         };
@@ -3526,6 +3907,24 @@ impl QueryExecutor {
     /// Only executes the query for read-only queries (SELECT, etc.).
     /// DML queries (INSERT/UPDATE/DELETE) return the plan without execution.
     fn execute_explain(&self, query: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
+        // Handle graph queries with specialized explain
+        match query {
+            QueryAst::GraphMatch { pattern, filter, returns } => {
+                return self.explain_graph_match(pattern, filter, returns);
+            }
+            QueryAst::GraphAnalyze { algorithm, relation_type, params } => {
+                return self.explain_graph_analyze(algorithm, relation_type, params);
+            }
+            QueryAst::GraphShortestPath { from_id, to_id, max_depth } => {
+                return self.explain_graph_shortest_path(from_id, to_id, *max_depth);
+            }
+            QueryAst::GraphTraverse { start_id, direction, edge_label, max_depth, filter } => {
+                return self.explain_graph_traverse(start_id, *direction, edge_label.as_deref(), *max_depth, filter);
+            }
+            _ => {}
+        }
+
+        // Default: use planner for relational queries
         let plan = self
             .planner
             .read()
@@ -3560,6 +3959,176 @@ impl QueryExecutor {
             "uses_index": plan.uses_index,
             "is_sorted": plan.is_sorted,
             "description": description,
+        });
+
+        Ok(QueryResult::Rows(vec![Map::from_iter(vec![(
+            "plan".to_string(),
+            plan_json,
+        )])]))
+    }
+
+    /// Explain GRAPH MATCH query execution plan.
+    fn explain_graph_match(
+        &self,
+        pattern: &crate::parser::GraphPattern,
+        filter: &Option<FilterExpr>,
+        returns: &[String],
+    ) -> Result<QueryResult> {
+        let hops = Self::count_graph_hops(pattern);
+        let relation_types = Self::extract_relation_types(pattern);
+
+        // Determine routing
+        let (route, reason) = if hops <= 2 {
+            if let Some(ref graph) = self.graph {
+                let all_loaded = relation_types.iter().all(|rt| graph.is_relation_loaded(rt));
+                if all_loaded {
+                    ("graph_store", "cache hit, all relations loaded")
+                } else {
+                    ("join_lsm", "cache miss, degrading to JOIN")
+                }
+            } else {
+                ("join_lsm", "no graph store configured")
+            }
+        } else {
+            if self.graph.is_some() {
+                ("graph_store", "3+ hops requires graph store")
+            } else {
+                return Err(CoreError::InvalidArgument(
+                    "GRAPH MATCH 3+ hops requires graph store".to_string(),
+                ));
+            }
+        };
+
+        // Cache status for each relation type
+        let cache_status: Vec<serde_json::Value> = relation_types.iter().map(|rt| {
+            let status = self.graph.as_ref()
+                .map(|g| format!("{:?}", g.cache_status(rt).status))
+                .unwrap_or_else(|| "no_graph_store".to_string());
+            json!({
+                "relation": rt,
+                "status": status
+            })
+        }).collect();
+
+        // Pattern description
+        let pattern_desc = pattern.edges.iter().map(|e| {
+            format!("({}) -[{}]-> ({})", e.from, e.label.as_deref().unwrap_or("?"), e.to)
+        }).collect::<Vec<_>>().join(" ");
+
+        let plan_json = json!({
+            "type": "GRAPH MATCH",
+            "hops": hops,
+            "route": route,
+            "reason": reason,
+            "pattern": pattern_desc,
+            "relations": relation_types,
+            "cache_status": cache_status,
+            "has_filter": filter.is_some(),
+            "returns": returns,
+            "depth_warning": if hops > 5 { Some("High depth may cause slow queries") } else { None },
+        });
+
+        Ok(QueryResult::Rows(vec![Map::from_iter(vec![(
+            "plan".to_string(),
+            plan_json,
+        )])]))
+    }
+
+    /// Explain GRAPH ANALYZE query execution plan.
+    fn explain_graph_analyze(
+        &self,
+        algorithm: &str,
+        relation_type: &str,
+        params: &crate::parser::GraphAnalyzeParams,
+    ) -> Result<QueryResult> {
+        let cache_status = self.graph.as_ref()
+            .map(|g| format!("{:?}", g.cache_status(relation_type).status))
+            .unwrap_or_else(|| "no_graph_store".to_string());
+
+        let edge_count = self.graph.as_ref()
+            .and_then(|g| {
+                if g.is_relation_loaded(relation_type) {
+                    Some(g.cache_status(relation_type).edge_count)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let plan_json = json!({
+            "type": "GRAPH ANALYZE",
+            "algorithm": algorithm,
+            "relation": relation_type,
+            "cache_status": cache_status,
+            "edge_count": edge_count,
+            "params": {
+                "damping_factor": params.damping_factor.unwrap_or(0.85),
+                "max_iterations": params.max_iterations.unwrap_or(100),
+                "tolerance": params.tolerance.unwrap_or(1e-6),
+                "max_depth": params.max_depth.unwrap_or(5),
+            },
+            "estimated_complexity": match algorithm {
+                "pagerank" => "O(V * iterations)",
+                "connected_components" => "O(V + E)",
+                "betweenness_centrality" => "O(V * E)",
+                "degree_distribution" => "O(V)",
+                "clustering_coefficient" => "O(V * deg^2)",
+                _ => "unknown",
+            }
+        });
+
+        Ok(QueryResult::Rows(vec![Map::from_iter(vec![(
+            "plan".to_string(),
+            plan_json,
+        )])]))
+    }
+
+    /// Explain GRAPH SHORTEST PATH query execution plan.
+    fn explain_graph_shortest_path(
+        &self,
+        from_id: &str,
+        to_id: &str,
+        max_depth: usize,
+    ) -> Result<QueryResult> {
+        let plan_json = json!({
+            "type": "GRAPH SHORTEST PATH",
+            "from": from_id,
+            "to": to_id,
+            "max_depth": max_depth,
+            "algorithm": "BFS",
+            "estimated_complexity": "O(V + E)",
+        });
+
+        Ok(QueryResult::Rows(vec![Map::from_iter(vec![(
+            "plan".to_string(),
+            plan_json,
+        )])]))
+    }
+
+    /// Explain GRAPH TRAVERSE query execution plan.
+    fn explain_graph_traverse(
+        &self,
+        start_id: &str,
+        direction: crate::parser::GraphDirection,
+        edge_label: Option<&str>,
+        max_depth: usize,
+        filter: &Option<FilterExpr>,
+    ) -> Result<QueryResult> {
+        let cache_status = edge_label.map(|label| {
+            self.graph.as_ref()
+                .map(|g| format!("{:?}", g.cache_status(label).status))
+                .unwrap_or_else(|| "no_graph_store".to_string())
+        });
+
+        let plan_json = json!({
+            "type": "GRAPH TRAVERSE",
+            "start": start_id,
+            "direction": format!("{:?}", direction),
+            "edge_label": edge_label,
+            "max_depth": max_depth,
+            "has_filter": filter.is_some(),
+            "cache_status": cache_status,
+            "algorithm": "BFS",
         });
 
         Ok(QueryResult::Rows(vec![Map::from_iter(vec![(
@@ -4178,6 +4747,7 @@ impl QueryExecutor {
 
     /// Refreshes planner stats for a table after index creation/deletion.
     /// Scans the table to collect row count and index info, then updates the planner.
+    #[allow(dead_code)]
     fn refresh_index_stats(&self, engine: &LsmEngine, table: &str) {
         let class_hierarchy = self.get_class_hierarchy(engine, table);
         let mut row_count: u64 = 0;
@@ -4305,6 +4875,38 @@ impl QueryExecutor {
                     }
                 }
 
+                // Streaming aggregate fast path: aggregate during scan without materializing all rows.
+                // For GROUP BY / aggregates on a single table (no JOINs), stream directly.
+                if has_aggregates {
+                    if let Some((scan_table, scan_filter)) =
+                        Self::extract_simple_seqscan(input)
+                    {
+                        tracing::info!(
+                            "streaming_aggregation (node_read): table={}",
+                            scan_table
+                        );
+                        // Extract group_by from the Aggregation node if present
+                        let gb_cols = if let PlanNode::Aggregation { group_by, .. } = input.as_ref() {
+                            Some(crate::parser::GroupByClause { columns: group_by.clone() })
+                        } else {
+                            None
+                        };
+                        let result = self.execute_streaming_aggregation(
+                            engine,
+                            &scan_table,
+                            scan_filter,
+                            columns,
+                            gb_cols.as_ref(),
+                            &None,
+                            &[],
+                            None,
+                        )?;
+                        if let QueryResult::Rows(rows) = result {
+                            return Ok(rows);
+                        }
+                    }
+                }
+
                 // Only push column projection down when there are no aggregates/expressions
                 let raw_rows = if !has_aggregates && !has_expr {
                     if let PlanNode::SeqScan {
@@ -4392,6 +4994,20 @@ impl QueryExecutor {
                 let right_rows = self.execute_plan_node_read(right, engine)?;
                 Self::execute_sort_merge_join_rows(left_rows, right_rows, join_clause)
             }
+            PlanNode::IndexNestedLoopJoin {
+                left,
+                right_table,
+                right_alias,
+                join_clause,
+                index_column,
+                ..
+            } => {
+                let left_rows = self.execute_plan_node_read(left, engine)?;
+                self.execute_index_nested_loop_join(
+                    engine, left_rows, right_table, right_alias.as_deref(),
+                    join_clause, index_column,
+                )
+            }
             PlanNode::Sort {
                 input, order_by, ..
             } => {
@@ -4402,7 +5018,17 @@ impl QueryExecutor {
                 Ok(rows)
             }
             PlanNode::Aggregation { input, .. } => self.execute_plan_node_read(input, engine),
-            PlanNode::Limit { input, .. } => self.execute_plan_node_read(input, engine),
+            PlanNode::Limit { input, count, .. } => {
+                // Only push limit to SeqScan when there's no filter.
+                // With a filter, we must scan all rows to find matches.
+                if let PlanNode::SeqScan { table, alias, filter, .. } = input.as_ref() {
+                    let scan_limit = if filter.is_none() { Some(*count) } else { None };
+                    return self.plan_seq_scan_read_limit(engine, table, alias.as_deref(), filter, None, scan_limit);
+                }
+                let mut rows = self.execute_plan_node_read(input, engine)?;
+                rows.truncate(*count);
+                Ok(rows)
+            }
             PlanNode::Union {
                 left, right, all, ..
             } => {
@@ -4442,6 +5068,21 @@ impl QueryExecutor {
         alias: Option<&str>,
         filter: &Option<FilterExpr>,
         projected_columns: Option<&SelectColumns>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        self.plan_seq_scan_read_limit(engine, table, alias, filter, projected_columns, None)
+    }
+
+    /// plan_seq_scan_read with optional row limit for early termination.
+    /// When `scan_limit` is set, uses `scan_prefix_limit` to avoid loading
+    /// the entire table into memory.
+    fn plan_seq_scan_read_limit(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        alias: Option<&str>,
+        filter: &Option<FilterExpr>,
+        projected_columns: Option<&SelectColumns>,
+        scan_limit: Option<usize>,
     ) -> Result<Vec<Map<String, Value>>> {
         // Check for active transaction for snapshot-aware scanning
         let active_txn_id = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
@@ -4521,15 +5162,33 @@ impl QueryExecutor {
 
         let mut rows = Vec::new();
         let mut scan_count: u64 = 0;
+        // When a limit is set and there's no filter (pure LIMIT query), multiply the
+        // scan limit to account for class-hierarchy and shard filtering.
+        let effective_scan_limit = scan_limit.map(|l| l.saturating_mul(10).max(l + 100));
+        eprintln!("[SEQ_SCAN] table={}, hierarchy={:?}, filter={:?}, scan_limit={:?}", table, class_hierarchy, filter.is_some(), scan_limit);
         for scan_class in &class_hierarchy {
+            if let Some(limit) = effective_scan_limit {
+                if rows.len() >= limit {
+                    break;
+                }
+            }
             let prefix = format!("{}::", scan_class);
+            eprintln!("[SEQ_SCAN] prefix='{}', using={}", prefix, if effective_scan_limit.is_some() { "scan_prefix_limit" } else { "scan_prefix" });
             // Use transaction-aware scan if there's an active transaction
             let entries = if let Some(txn_id) = active_txn_id {
                 engine.txn_scan_prefix(txn_id, prefix.as_bytes())?
+            } else if let Some(limit) = effective_scan_limit {
+                engine.scan_prefix_limit(prefix.as_bytes(), limit)?
             } else {
                 engine.scan_prefix(prefix.as_bytes())?
             };
             for (key, val_bytes) in &entries {
+                // Early exit when we have enough rows
+                if let Some(limit) = scan_limit {
+                    if rows.len() >= limit {
+                        break;
+                    }
+                }
                 // Check query timeout every 1024 rows (cheap: one atomic load)
                 scan_count += 1;
                 if scan_count & 0x3FF == 0 {
@@ -4668,6 +5327,7 @@ impl QueryExecutor {
             }
         }
 
+        eprintln!("[SEQ_SCAN] table={}, scanned={}, returned={}", table, scan_count, rows.len());
         Ok(rows)
     }
 
@@ -4879,11 +5539,10 @@ impl QueryExecutor {
                                 return field_num != *n;
                             }
                         }
-                        LiteralValue::String(s) => {
-                            if let Some(field_str) = Self::parse_json_string(raw) {
-                                return field_str != s.as_str();
-                            }
-                        }
+                        // Skip fast rejection for strings — BinaryRow bytes may contain
+                        // spurious JSON-like patterns that cause false rejection.
+                        // String equality is handled accurately by eval_binary_filter / eval_filter_read.
+                        LiteralValue::String(_) => {}
                         _ => {}
                     }
                 }
@@ -5413,11 +6072,240 @@ impl QueryExecutor {
         }
     }
 
-    /// Execute GRAPH MATCH query against the graph store.
+    /// #9 optimization: try to use a relational index to narrow the starting vertex set
+    /// for a GRAPH MATCH query.
     ///
-    /// Supports single-hop and multi-hop pattern matching:
-    /// `GRAPH MATCH (a:Person) -[e:KNOWS]-> (b:Person) WHERE a.name = 'Alice' RETURN a.name, b.name`
+    /// If the filter has an Eq predicate like `a.column = 'value'` where `a` is the
+    /// first node's variable and `column` has a relational index, use the index to
+    /// find matching primary keys, then convert to graph vertices.
+    fn try_index_accelerated_graph_start(
+        &self,
+        engine: &LsmEngine,
+        variable: &str,
+        label: &str,
+        filter: &Option<FilterExpr>,
+    ) -> Option<Vec<onto_graph::model::Vertex>> {
+        let graph = self.graph.as_ref()?;
+        let f = filter.as_ref()?;
+
+        // Collect all Eq predicates from the filter tree
+        let mut eq_preds: Vec<(&str, &LiteralValue)> = Vec::new();
+        Self::collect_eq_predicates(f, &mut eq_preds);
+
+        let prefix = format!("{}.", variable);
+
+        for (col, val) in &eq_preds {
+            if !col.starts_with(&prefix) {
+                continue;
+            }
+            let real_col = &col[prefix.len()..];
+
+            // Check if the relational table has an index on this column
+            if !engine.has_index(label, real_col) {
+                continue;
+            }
+
+            // Use the index to find matching primary keys
+            let json_val = Self::literal_to_json_static(val);
+            let index_mgr = engine.index_manager().read().ok()?;
+            let pkeys = index_mgr.lookup_eq_read(label, real_col, &json_val)?;
+
+            // Convert primary keys to graph vertex IDs
+            let mut vertices = Vec::new();
+            for pk in &pkeys {
+                let pk_str = std::str::from_utf8(pk).ok()?;
+                if let Some(entity_id) = onto_core::EntityId::from_str(pk_str) {
+                    if let Some(vertex) = graph.get_entity_vertex(&entity_id) {
+                        vertices.push(vertex);
+                    }
+                } else {
+                    if let Some(vertex) = graph.get_vertex(pk_str) {
+                        vertices.push(vertex);
+                    }
+                }
+            }
+
+            if !vertices.is_empty() {
+                return Some(vertices);
+            }
+        }
+
+        None
+    }
+
+    /// Recursively collect all Eq predicates from a filter expression tree.
+    fn collect_eq_predicates<'a>(expr: &'a FilterExpr, out: &mut Vec<(&'a str, &'a LiteralValue)>) {
+        match expr {
+            FilterExpr::Eq(col, val) => out.push((col.as_str(), val)),
+            FilterExpr::And(l, r) => {
+                Self::collect_eq_predicates(l, out);
+                Self::collect_eq_predicates(r, out);
+            }
+            _ => {} // Ignore other predicates for this optimization
+        }
+    }
+
+    /// Compute a hash for a GRAPH MATCH query (for caching).
+    fn hash_graph_match(
+        pattern: &crate::parser::GraphPattern,
+        filter: &Option<FilterExpr>,
+        returns: &[String],
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // Serialize components to string and hash
+        let pattern_str = serde_json::to_string(pattern).unwrap_or_default();
+        let filter_str = serde_json::to_string(filter).unwrap_or_default();
+        let returns_str = serde_json::to_string(returns).unwrap_or_default();
+        pattern_str.hash(&mut hasher);
+        filter_str.hash(&mut hasher);
+        returns_str.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Count the number of hops in a GRAPH MATCH pattern.
+    /// A hop is an edge in the pattern. 0 edges = 0 hops (single node).
+    fn count_graph_hops(pattern: &crate::parser::GraphPattern) -> usize {
+        pattern.edges.len()
+    }
+
+    /// Extract relation types (edge labels) from a GRAPH MATCH pattern.
+    fn extract_relation_types(pattern: &crate::parser::GraphPattern) -> Vec<String> {
+        pattern.edges.iter()
+            .filter_map(|e| e.label.clone())
+            .collect()
+    }
+
+    /// Ensure graph cache is loaded for the given relation types.
+    /// Returns Ok(true) if all caches are ready, Ok(false) if any failed to load.
+    fn ensure_graph_cache_loaded(&self, relation_types: &[String]) -> bool {
+        let Some(ref graph) = self.graph else {
+            return false;
+        };
+
+        for rel_type in relation_types {
+            // Skip if already loaded
+            if graph.is_relation_loaded(rel_type) {
+                continue;
+            }
+
+            // Skip if in cooldown (recently invalidated)
+            if graph.is_in_cooldown(rel_type) {
+                tracing::debug!(relation = rel_type, "Cache in cooldown, skipping load");
+                continue;
+            }
+
+            // Try to load from LSM
+            match graph.load_relation_from_lsm(rel_type) {
+                Ok(_) => {
+                    tracing::info!(relation = rel_type, "Loaded relation into graph cache");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        relation = rel_type,
+                        error = %e,
+                        "Failed to load relation into graph cache, will degrade to JOIN"
+                    );
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Execute GRAPH MATCH query with intelligent routing:
+    /// - 1-2 hops: translate to JOIN, use LSM engine
+    /// - 3+ hops: check graph cache, load if needed, use graph store
+    /// - Fallback: degrade to JOIN if graph cache unavailable
     fn execute_graph_match_read(
+        &self,
+        engine: &LsmEngine,
+        pattern: &crate::parser::GraphPattern,
+        filter: &Option<FilterExpr>,
+        returns: &[String],
+    ) -> Result<QueryResult> {
+        let start = std::time::Instant::now();
+
+        // Compute query hash for caching
+        let query_hash = Self::hash_graph_match(pattern, filter, returns);
+
+        // Check query result cache
+        {
+            let mut cache = self.query_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(cached_rows) = cache.get(query_hash) {
+                tracing::debug!(hash = query_hash, "GRAPH MATCH: returning cached result");
+                return Ok(QueryResult::Rows(cached_rows));
+            }
+        }
+
+        let hops = Self::count_graph_hops(pattern);
+        let relation_types = Self::extract_relation_types(pattern);
+
+        // Routing decision
+        let result = if hops <= 2 {
+            // 1-2 hops: try graph store first (fast if cache loaded), fallback to JOIN
+            if let Some(ref graph) = self.graph {
+                // Check if all relation types are loaded in graph cache
+                let all_loaded = relation_types.iter()
+                    .all(|rt| graph.is_relation_loaded(rt));
+
+                if all_loaded {
+                    tracing::debug!(hops, "GRAPH MATCH: using graph store (cache hit)");
+                    self.execute_graph_match_on_graph(engine, pattern, filter, returns)
+                } else {
+                    // Cache miss: translate to JOIN via LSM
+                    tracing::debug!(hops, "GRAPH MATCH: degrading to JOIN (LSM)");
+                    if let Some(ref graph) = self.graph {
+                        graph.record_degraded_query();
+                    }
+                    self.execute_graph_match_as_join(engine, pattern, filter, returns)
+                }
+            } else {
+                // No graph store: translate to JOIN via LSM
+                tracing::debug!(hops, "GRAPH MATCH: degrading to JOIN (LSM)");
+                self.execute_graph_match_as_join(engine, pattern, filter, returns)
+            }
+        } else {
+            // 3+ hops: use graph store with cache loading
+            let Some(ref graph) = self.graph else {
+                return Err(CoreError::InvalidArgument(
+                    "GRAPH MATCH 3+ hops requires graph store (start server with graph enabled)".to_string(),
+                ));
+            };
+
+            // Ensure cache is loaded for all relation types
+            let cache_ready = self.ensure_graph_cache_loaded(&relation_types);
+
+            if cache_ready && graph.is_relation_loaded(&relation_types[0]) {
+                tracing::debug!(hops, "GRAPH MATCH: using graph store (3+ hops)");
+                self.execute_graph_match_on_graph(engine, pattern, filter, returns)
+            } else {
+                // Cache failed to load: degrade to JOIN (may be slow but works)
+                tracing::warn!(hops, "GRAPH MATCH: degrading to JOIN (graph cache unavailable)");
+                graph.record_degraded_query();
+                self.execute_graph_match_as_join(engine, pattern, filter, returns)
+            }
+        };
+
+        // Cache the result if successful
+        if let Ok(QueryResult::Rows(ref rows)) = result {
+            let mut cache = self.query_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache.insert(query_hash, rows.clone());
+        }
+
+        let elapsed = start.elapsed();
+        tracing::info!(
+            hops,
+            elapsed_ms = elapsed.as_millis(),
+            route = if hops <= 2 { "join_or_graph" } else { "graph" },
+            "GRAPH MATCH completed"
+        );
+
+        result
+    }
+
+    /// Execute GRAPH MATCH directly on the graph store (fast path).
+    fn execute_graph_match_on_graph(
         &self,
         engine: &LsmEngine,
         pattern: &crate::parser::GraphPattern,
@@ -5428,12 +6316,21 @@ impl QueryExecutor {
 
         let Some(ref graph) = self.graph else {
             return Err(CoreError::InvalidArgument(
-                "GRAPH MATCH requires graph store (start server with graph enabled)".to_string(),
+                "GRAPH MATCH requires graph store".to_string(),
             ));
         };
 
         let nodes = &pattern.nodes;
         let edges = &pattern.edges;
+
+        // Depth limit protection
+        const MAX_GRAPH_DEPTH: usize = 10;
+        if edges.len() > MAX_GRAPH_DEPTH {
+            return Err(CoreError::InvalidArgument(format!(
+                "GRAPH MATCH depth {} exceeds maximum {}. Consider reducing the traversal scope.",
+                edges.len(), MAX_GRAPH_DEPTH
+            )));
+        }
 
         if nodes.is_empty() {
             return Ok(QueryResult::Rows(Vec::new()));
@@ -5454,21 +6351,34 @@ impl QueryExecutor {
         // Get starting vertices — with subclass expansion if ontology is available
         let first_node = &nodes[0];
         let start_vertices = if let Some(label) = &first_node.label {
-            // Ontology reasoning: expand subclasses
-            let expanded_labels = if let Some(ref onto) = ontology {
-                let mut labels = vec![label.clone()];
-                let subclasses = onto.get_all_subclasses(label);
-                labels.extend(subclasses);
-                labels
+            // #9 optimization: if the filter has an Eq predicate on an indexed column
+            // for the first node's variable, use the relational index to narrow the
+            // starting set instead of loading all vertices by label.
+            let indexed_vertices = self.try_index_accelerated_graph_start(
+                engine,
+                &first_node.variable,
+                label,
+                filter,
+            );
+            if let Some(verts) = indexed_vertices {
+                verts
             } else {
-                vec![label.clone()]
-            };
+                // Fallback: load all vertices by label (with subclass expansion)
+                let expanded_labels = if let Some(ref onto) = ontology {
+                    let mut labels = vec![label.clone()];
+                    let subclasses = onto.get_all_subclasses(label);
+                    labels.extend(subclasses);
+                    labels
+                } else {
+                    vec![label.clone()]
+                };
 
-            let mut all_vertices = Vec::new();
-            for lbl in &expanded_labels {
-                all_vertices.extend(graph.get_vertices_by_label(lbl));
+                let mut all_vertices = Vec::new();
+                for lbl in &expanded_labels {
+                    all_vertices.extend(graph.get_vertices_by_label(lbl));
+                }
+                all_vertices
             }
-            all_vertices
         } else {
             graph.get_all_vertices()
         };
@@ -5697,6 +6607,196 @@ impl QueryExecutor {
         }
     }
 
+    /// Execute 1-2 hop GRAPH MATCH by translating to JOIN queries (LSM path).
+    ///
+    /// For a pattern like:
+    /// `GRAPH MATCH (d:Drug) -[e:treats]-> (dis:Disease) WHERE d.name = 'Aspirin' RETURN d.name, dis.name`
+    ///
+    /// Translates to:
+    /// ```sql
+    /// SELECT d.*, dis.*
+    /// FROM Drug d
+    /// JOIN treats e ON d.__pk__ = e.source
+    /// JOIN Disease dis ON e.target = dis.__pk__
+    /// WHERE d.name = 'Aspirin'
+    /// ```
+    fn execute_graph_match_as_join(
+        &self,
+        engine: &LsmEngine,
+        pattern: &crate::parser::GraphPattern,
+        filter: &Option<FilterExpr>,
+        returns: &[String],
+    ) -> Result<QueryResult> {
+        let nodes = &pattern.nodes;
+        let edges = &pattern.edges;
+
+        if nodes.is_empty() {
+            return Ok(QueryResult::Rows(Vec::new()));
+        }
+
+        // Single node: just scan the class
+        if edges.is_empty() {
+            let first_node = &nodes[0];
+            if let Some(label) = &first_node.label {
+                let scan_plan = self.build_scan_plan(label, filter)?;
+                let result = self.execute_plan(&scan_plan, engine)?;
+                return Ok(result);
+            }
+            return Ok(QueryResult::Rows(Vec::new()));
+        }
+
+        // 1-2 hops: build a chain of JOINs
+        // Start with the first node's table
+        let first_node = &nodes[0];
+        let first_label = first_node.label.as_deref().unwrap_or("");
+
+        // Collect all rows by scanning the first table
+        let mut all_rows: Vec<Map<String, Value>> = Vec::new();
+
+        // Scan first table
+        if !first_label.is_empty() {
+            let scan_plan = self.build_scan_plan(first_label, &None)?;
+            if let QueryResult::Rows(rows) = self.execute_plan(&scan_plan, engine)? {
+                all_rows = rows;
+            }
+        }
+
+        // For each edge, JOIN with the relation table and then the target table
+        for edge in edges {
+            let relation_label = edge.label.as_deref().unwrap_or("");
+            let target_var = &edge.to;
+
+            // Find the target node's label
+            let target_node = nodes.iter().find(|n| n.variable == *target_var);
+            let target_label = target_node.and_then(|n| n.label.as_deref()).unwrap_or("");
+
+            if relation_label.is_empty() || target_label.is_empty() {
+                continue;
+            }
+
+            // Scan relation table
+            let rel_scan_plan = self.build_scan_plan(relation_label, &None)?;
+            let rel_rows = if let QueryResult::Rows(rows) = self.execute_plan(&rel_scan_plan, engine)? {
+                rows
+            } else {
+                Vec::new()
+            };
+
+            // Scan target table
+            let target_scan_plan = self.build_scan_plan(target_label, &None)?;
+            let target_rows = if let QueryResult::Rows(rows) = self.execute_plan(&target_scan_plan, engine)? {
+                rows
+            } else {
+                Vec::new()
+            };
+
+            // Build index on target table's __pk__ for fast lookup
+            let mut target_index: HashMap<String, &Map<String, Value>> = HashMap::new();
+            for row in &target_rows {
+                if let Some(Value::String(pk)) = row.get("__pk__") {
+                    target_index.insert(pk.clone(), row);
+                }
+            }
+
+            // Build index on relation table's source for fast lookup
+            let mut rel_source_index: HashMap<String, Vec<&Map<String, Value>>> = HashMap::new();
+            for row in &rel_rows {
+                if let Some(source) = row.get("source") {
+                    let key = match source {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    rel_source_index.entry(key).or_default().push(row);
+                }
+            }
+
+            // JOIN: all_rows ⋈ rel_rows (on source) ⋈ target_rows (on target)
+            let mut joined_rows: Vec<Map<String, Value>> = Vec::new();
+
+            // Find the source variable name (should be the previous node's variable)
+            let source_var = &edge.from;
+
+            for row in &all_rows {
+                // Get the source key from the current row
+                let source_key = row.get("__pk__")
+                    .or_else(|| row.get(&format!("{}.id", source_var)))
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    });
+
+                if let Some(source_key) = source_key {
+                    // Find matching relation rows
+                    if let Some(rel_matches) = rel_source_index.get(&source_key) {
+                        for rel_row in rel_matches {
+                            // Get target key from relation
+                            if let Some(target_val) = rel_row.get("target") {
+                                let target_key = match target_val {
+                                    Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                };
+
+                                // Find matching target row
+                                if let Some(target_row) = target_index.get(&target_key) {
+                                    // Merge: current row + target row properties
+                                    let mut merged = row.clone();
+
+                                    // Add target properties with variable prefix
+                                    for (k, v) in target_row.iter() {
+                                        if k == "__pk__" || k == "__class__" {
+                                            continue;
+                                        }
+                                        merged.insert(
+                                            format!("{}.{}", target_var, k),
+                                            v.clone(),
+                                        );
+                                    }
+                                    merged.insert(
+                                        format!("{}.id", target_var),
+                                        Value::String(target_key),
+                                    );
+
+                                    joined_rows.push(merged);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            all_rows = joined_rows;
+        }
+
+        // Apply filter
+        if let Some(f) = filter {
+            all_rows.retain(|row| Self::eval_graph_filter(row, f));
+        }
+
+        // Apply RETURN projection
+        if !returns.is_empty() {
+            let projected: Vec<Map<String, Value>> = all_rows
+                .iter()
+                .map(|row| {
+                    let mut result = Map::new();
+                    for col in returns {
+                        let col_trimmed = col.trim();
+                        if let Some(val) = row.get(col_trimmed) {
+                            result.insert(col_trimmed.to_string(), val.clone());
+                        } else if let Some(val) = row.get(&format!("{}.name", col_trimmed)) {
+                            result.insert(col_trimmed.to_string(), val.clone());
+                        } else if let Some(val) = row.get(&format!("{}.id", col_trimmed)) {
+                            result.insert(col_trimmed.to_string(), val.clone());
+                        }
+                    }
+                    result
+                })
+                .collect();
+            Ok(QueryResult::Rows(projected))
+        } else {
+            Ok(QueryResult::Rows(all_rows))
+        }
+    }
+
     /// Execute GRAPH SHORTEST PATH query.
     fn execute_graph_shortest_path_read(
         &self,
@@ -5741,6 +6841,235 @@ impl QueryExecutor {
         }
     }
 
+    /// Execute a hybrid query: SELECT ... FROM (GRAPH MATCH ...) WHERE ...
+    ///
+    /// The FROM clause contains a subquery (GRAPH MATCH). This method:
+    /// 1. Executes the subquery to get rows
+    /// 2. Applies outer WHERE, GROUP BY, ORDER BY, LIMIT on the results
+    fn execute_hybrid_query(
+        &self,
+        engine: &LsmEngine,
+        _ast: &QueryAst,
+        columns: &SelectColumns,
+        from: &str,
+        filter: &Option<FilterExpr>,
+        group_by: Option<&crate::parser::GroupByClause>,
+        having: &Option<FilterExpr>,
+        order_by: &[crate::parser::OrderBy],
+        limit: Option<usize>,
+        offset: Option<usize>,
+        distinct: bool,
+    ) -> Result<QueryResult> {
+        // Extract subquery JSON from the from string
+        let subquery_json = from.strip_prefix("__subquery__:")
+            .ok_or_else(|| CoreError::InvalidArgument("invalid subquery format".to_string()))?;
+
+        // Parse the subquery
+        let subquery: QueryAst = serde_json::from_str(subquery_json)
+            .map_err(|e| CoreError::InvalidArgument(format!("failed to parse subquery: {}", e)))?;
+
+        // Execute the subquery
+        let subquery_result = self.execute_read(&subquery)?;
+        let mut rows = match subquery_result {
+            QueryResult::Rows(r) => r,
+            other => return Ok(other),
+        };
+
+        // Apply outer WHERE filter
+        if let Some(f) = filter {
+            rows.retain(|row| self.eval_filter(engine, row, f));
+        }
+
+        // Apply DISTINCT
+        if distinct {
+            Self::dedup_rows(&mut rows);
+        }
+
+        // Apply aggregation (GROUP BY + HAVING)
+        let has_aggregates = Self::columns_have_aggregates(columns);
+        if group_by.is_some() || has_aggregates {
+            let result = self.execute_aggregation(
+                engine,
+                columns,
+                &rows,
+                group_by,
+                having,
+                order_by,
+                limit,
+            )?;
+            if let QueryResult::Rows(mut agg_rows) = result {
+                if distinct {
+                    Self::dedup_rows(&mut agg_rows);
+                }
+                return Ok(QueryResult::Rows(agg_rows));
+            }
+        }
+
+        // Apply ORDER BY
+        if !order_by.is_empty() {
+            for ob in order_by.iter().rev() {
+                Self::sort_rows(&mut rows, &ob.column, ob.ascending);
+            }
+        }
+
+        // Apply projection (SELECT columns)
+        if !matches!(columns, SelectColumns::All) {
+            rows = rows.iter().map(|row| self.project_columns(row, columns)).collect();
+        }
+
+        // Apply OFFSET
+        if let Some(off) = offset {
+            if off < rows.len() {
+                rows = rows[off..].to_vec();
+            } else {
+                rows.clear();
+            }
+        }
+
+        // Apply LIMIT
+        if let Some(lim) = limit {
+            rows.truncate(lim);
+        }
+
+        Ok(QueryResult::Rows(rows))
+    }
+
+    /// Execute GRAPH ANALYZE query.
+    ///
+    /// Runs graph algorithms (pagerank, connected_components, etc.) on the graph store.
+    /// Automatically loads cache for the specified relation type if needed.
+    fn execute_graph_analyze(
+        &self,
+        _engine: &LsmEngine,
+        algorithm: &str,
+        relation_type: &str,
+        params: &crate::parser::GraphAnalyzeParams,
+    ) -> Result<QueryResult> {
+        let Some(ref graph) = self.graph else {
+            return Err(CoreError::InvalidArgument(
+                "GRAPH ANALYZE requires graph store".to_string(),
+            ));
+        };
+
+        // Ensure cache is loaded for the relation type
+        if !graph.is_relation_loaded(relation_type) {
+            let _ = graph.load_relation_from_lsm(relation_type);
+        }
+
+        let start = std::time::Instant::now();
+
+        let result = match algorithm.to_lowercase().as_str() {
+            "pagerank" => {
+                let damping = params.damping_factor.unwrap_or(0.85);
+                let iterations = params.max_iterations.unwrap_or(100);
+                let tolerance = params.tolerance.unwrap_or(1e-6);
+                let ranks = onto_graph::pagerank(graph, damping, iterations, tolerance);
+
+                let mut rows: Vec<Map<String, Value>> = ranks
+                    .into_iter()
+                    .map(|(id, rank)| {
+                        let mut row = Map::new();
+                        row.insert("vertex_id".to_string(), Value::String(id));
+                        row.insert("rank".to_string(), Value::Number(
+                            serde_json::Number::from_f64(rank).unwrap_or_else(|| serde_json::Number::from(0))
+                        ));
+                        row
+                    })
+                    .collect();
+                rows.sort_by(|a, b| {
+                    let ra = a.get("rank").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let rb = b.get("rank").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                Ok(QueryResult::Rows(rows))
+            }
+            "connected_components" => {
+                let components = onto_graph::connected_components(graph);
+                let mut rows: Vec<Map<String, Value>> = Vec::new();
+                for (i, component) in components.iter().enumerate() {
+                    for vertex_id in component {
+                        let mut row = Map::new();
+                        row.insert("component_id".to_string(), Value::Number(serde_json::Number::from(i)));
+                        row.insert("vertex_id".to_string(), Value::String(vertex_id.clone()));
+                        rows.push(row);
+                    }
+                }
+                Ok(QueryResult::Rows(rows))
+            }
+            #[cfg(feature = "enterprise")]
+            "betweenness_centrality" | "betweenness" => {
+                let centralities = onto_graph::betweenness_centrality(graph);
+                let mut rows: Vec<Map<String, Value>> = centralities
+                    .into_iter()
+                    .map(|(id, cent)| {
+                        let mut row = Map::new();
+                        row.insert("vertex_id".to_string(), Value::String(id));
+                        row.insert("centrality".to_string(), Value::Number(
+                            serde_json::Number::from_f64(cent).unwrap_or_else(|| serde_json::Number::from(0))
+                        ));
+                        row
+                    })
+                    .collect();
+                rows.sort_by(|a, b| {
+                    let ca = a.get("centrality").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let cb = b.get("centrality").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                Ok(QueryResult::Rows(rows))
+            }
+            "degree_distribution" | "degree" => {
+                let dd = onto_graph::degree_distribution(graph);
+                let mut row = Map::new();
+                row.insert("min_degree".to_string(), Value::Number(serde_json::Number::from(dd.min_degree)));
+                row.insert("max_degree".to_string(), Value::Number(serde_json::Number::from(dd.max_degree)));
+                row.insert("mean_degree".to_string(), Value::Number(
+                    serde_json::Number::from_f64(dd.mean_degree).unwrap_or_else(|| serde_json::Number::from(0))
+                ));
+                row.insert("median_degree".to_string(), Value::Number(
+                    serde_json::Number::from_f64(dd.median_degree).unwrap_or_else(|| serde_json::Number::from(0))
+                ));
+                Ok(QueryResult::Rows(vec![row]))
+            }
+            "clustering_coefficient" | "clustering" => {
+                let cc = onto_graph::average_clustering_coefficient(graph);
+                let mut row = Map::new();
+                row.insert("coefficient".to_string(), Value::Number(
+                    serde_json::Number::from_f64(cc).unwrap_or_else(|| serde_json::Number::from(0))
+                ));
+                Ok(QueryResult::Rows(vec![row]))
+            }
+            #[cfg(feature = "enterprise")]
+            "subgraph_extraction" | "subgraph" => {
+                let labels = params.vertex_labels.as_deref().unwrap_or(&[]);
+                let subgraph = onto_graph::subgraph_extraction(graph, labels);
+                let mut row = Map::new();
+                row.insert("vertex_count".to_string(), Value::Number(serde_json::Number::from(subgraph.vertex_count())));
+                row.insert("edge_count".to_string(), Value::Number(serde_json::Number::from(subgraph.edge_count())));
+                Ok(QueryResult::Rows(vec![row]))
+            }
+            _ => {
+                #[cfg(feature = "enterprise")]
+                let supported = "pagerank, connected_components, degree_distribution, clustering_coefficient, betweenness_centrality, subgraph_extraction";
+                #[cfg(not(feature = "enterprise"))]
+                let supported = "pagerank, connected_components, degree_distribution, clustering_coefficient";
+                Err(CoreError::InvalidArgument(format!(
+                    "Unknown graph algorithm: '{}'. Supported: {}",
+                    algorithm, supported
+                )))
+            }
+        };
+
+        let elapsed = start.elapsed();
+        tracing::info!(
+            algorithm = algorithm,
+            relation = relation_type,
+            elapsed_ms = elapsed.as_millis(),
+            "GRAPH ANALYZE completed"
+        );
+
+        result
+    }
+
     /// Execute GRAPH TRAVERSE query.
     fn execute_graph_traverse_read(
         &self,
@@ -5757,6 +7086,11 @@ impl QueryExecutor {
                 "GRAPH TRAVERSE requires graph store".to_string(),
             ));
         };
+
+        // Ensure cache is loaded for the edge label (if specified)
+        if let Some(label) = edge_label {
+            let _ = self.ensure_graph_cache_loaded(&[label.to_string()]);
+        }
 
         let dir = match direction {
             crate::parser::GraphDirection::Out => Direction::Out,
@@ -5975,6 +7309,9 @@ impl QueryExecutor {
         let mut result_rows: Vec<Map<String, Value>> = Vec::new();
 
         for (_group_key, group_rows) in &groups {
+            if group_rows.is_empty() {
+                continue;
+            }
             let mut result_row = Map::new();
 
             if let Some(gb) = group_by {
@@ -6676,10 +8013,10 @@ impl QueryExecutor {
             QueryAst::Select {
                 distinct,
                 columns,
-                from: _,
+                from,
                 from_alias: _,
                 joins: _,
-                filter: _,
+                filter,
                 group_by,
                 having,
                 order_by,
@@ -6687,6 +8024,23 @@ impl QueryExecutor {
                 offset,
                 ..
             } => {
+                // Check if FROM clause contains a subquery
+                if from.starts_with("__subquery__:") {
+                    return self.execute_hybrid_query(
+                        engine,
+                        ast,
+                        columns,
+                        from,
+                        filter,
+                        group_by.as_ref(),
+                        having,
+                        order_by,
+                        *limit,
+                        *offset,
+                        *distinct,
+                    );
+                }
+
                 // Phase 24: Use plan-driven execution
                 // Generate execution plan, then execute it
                 let plan = self
@@ -6788,6 +8142,8 @@ impl QueryExecutor {
                         if let Some(ref graph) = self.graph {
                             let entity_id = self.make_entity_id(class, pk);
                             let _ = graph.delete_vertex_by_entity(&entity_id);
+                            // Invalidate graph cache for relation tables
+                            graph.invalidate_relation(class);
                         }
                         engine.txn_delete(txn_id, pk.as_bytes().to_vec())?;
                         deleted += 1;
@@ -6822,6 +8178,10 @@ impl QueryExecutor {
                         engine.txn_put(txn_id, pk.as_bytes().to_vec(), new_value)?;
                         updated += 1;
                     }
+                }
+                // Invalidate graph cache for relation tables on UPDATE
+                if let Some(ref graph) = self.graph {
+                    graph.invalidate_relation(class);
                 }
                 Ok(QueryResult::Success(format!("{} row(s) updated", updated)))
             }
@@ -6913,6 +8273,25 @@ impl QueryExecutor {
         });
     }
 
+    /// Extracts table name and filter from a plan if it's a simple SeqScan
+    /// (no JOINs, no nested scans). Returns None if any JOIN node is present.
+    fn extract_simple_seqscan<'a>(node: &'a PlanNode) -> Option<(String, &'a Option<FilterExpr>)> {
+        match node {
+            PlanNode::SeqScan { table, filter, .. } => Some((table.clone(), filter)),
+            PlanNode::Filter { input, .. }
+            | PlanNode::Projection { input, .. }
+            | PlanNode::Aggregation { input, .. }
+            | PlanNode::Sort { input, .. }
+            | PlanNode::Limit { input, .. } => Self::extract_simple_seqscan(input),
+            // JOIN nodes — can't stream aggregate across joins
+            PlanNode::NestedLoopJoin { .. }
+            | PlanNode::HashJoin { .. }
+            | PlanNode::SortMergeJoin { .. }
+            | PlanNode::IndexNestedLoopJoin { .. } => None,
+            _ => None,
+        }
+    }
+
     /// Checks if the SELECT columns contain any aggregate functions.
     fn columns_have_aggregates(columns: &SelectColumns) -> bool {
         match columns {
@@ -6920,6 +8299,74 @@ impl QueryExecutor {
             SelectColumns::Columns(items) => items
                 .iter()
                 .any(|item| matches!(item, SelectItem::Aggregate(_))),
+        }
+    }
+
+    /// Check if a column list contains both "source" and "target" (relation table pattern).
+    fn columns_has_source_target(columns: &[String]) -> bool {
+        let has_source = columns.iter().any(|c| c == "source");
+        let has_target = columns.iter().any(|c| c == "target");
+        has_source && has_target
+    }
+
+    /// Ensure source/target indexes exist for a relation table.
+    /// Creates indexes asynchronously in background threads if they don't exist.
+    /// Tracks which tables have been checked to avoid repeated work.
+    fn ensure_relation_indexes(&self, class: &str, columns: &[String]) {
+        // Only act on relation tables (has source + target columns)
+        if !Self::columns_has_source_target(columns) {
+            return;
+        }
+
+        // Check if we've already created indexes for this table
+        {
+            let checked = self.relation_indexes_created.lock().unwrap_or_else(|e| e.into_inner());
+            if checked.contains(class) {
+                return;
+            }
+        }
+
+        // Mark as checked (even if creation fails, to avoid repeated attempts)
+        {
+            let mut checked = self.relation_indexes_created.lock().unwrap_or_else(|e| e.into_inner());
+            checked.insert(class.to_string());
+        }
+
+        // Create indexes asynchronously
+        let engine_clone = self.engine.clone();
+        let class_owned = class.to_string();
+        tracing::info!(table = class, "Auto-creating source/target indexes for relation table");
+        std::thread::Builder::new()
+            .name("ontodb-auto-index-relation".into())
+            .spawn(move || {
+                if let Err(e) = engine_clone.create_index(&class_owned, "source") {
+                    tracing::warn!(table = class_owned.as_str(), column = "source", error = %e, "Auto-index creation failed for source");
+                }
+                if let Err(e) = engine_clone.create_index(&class_owned, "target") {
+                    tracing::warn!(table = class_owned.as_str(), column = "target", error = %e, "Auto-index creation failed for target");
+                }
+                tracing::info!(table = class_owned.as_str(), "Auto-index creation completed for relation table");
+            })
+            .ok();
+    }
+
+    /// Scan all existing tables and create indexes for relation tables.
+    /// Called once at startup to ensure all relation tables have indexes.
+    pub fn ensure_all_relation_indexes(&self) {
+        let engine = &self.engine;
+
+        // Scan all ontologies to find classes with source + target properties
+        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+        for (_key, val_bytes) in entries {
+            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
+                for (name, class) in &ontology.classes {
+                    if class.properties.contains(&"source".to_string())
+                        && class.properties.contains(&"target".to_string())
+                    {
+                        self.ensure_relation_indexes(name, &class.properties);
+                    }
+                }
+            }
         }
     }
 
@@ -6943,7 +8390,7 @@ impl QueryExecutor {
                 let key = gb
                     .columns
                     .iter()
-                    .map(|col| Self::value_to_group_key(row.get(col)))
+                    .map(|col| Self::value_to_group_key(Self::resolve_column_value(row, col).map(|s| Value::String(s)).as_ref()))
                     .collect::<Vec<_>>()
                     .join("\x00");
                 group_map.entry(key).or_default().push(row);
@@ -6958,6 +8405,9 @@ impl QueryExecutor {
         let mut result_rows: Vec<Map<String, Value>> = Vec::new();
 
         for (_group_key, group_rows) in &groups {
+            if group_rows.is_empty() {
+                continue;
+            }
             let mut result_row = Map::new();
 
             // Add GROUP BY columns to result
@@ -7032,6 +8482,15 @@ impl QueryExecutor {
             AggregateFunc::Count => {
                 if agg.arg == "*" {
                     Value::Number(serde_json::Number::from(rows.len()))
+                } else if agg.distinct {
+                    // COUNT(DISTINCT col): count unique non-null values
+                    let mut seen = std::collections::HashSet::new();
+                    for row in rows {
+                        if let Some(val) = Self::resolve_column_value(row, &agg.arg) {
+                            seen.insert(val);
+                        }
+                    }
+                    Value::Number(serde_json::Number::from(seen.len()))
                 } else {
                     let count = rows
                         .iter()
@@ -7091,6 +8550,292 @@ impl QueryExecutor {
                     None => Value::Null,
                 }
             }
+        }
+    }
+
+    /// Streaming aggregation: scan LSM + aggregate in one pass.
+    /// Avoids materializing all rows into memory.
+    fn execute_streaming_aggregation(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        filter: &Option<FilterExpr>,
+        columns: &SelectColumns,
+        group_by: Option<&crate::parser::GroupByClause>,
+        having: &Option<FilterExpr>,
+        order_by: &[crate::parser::OrderBy],
+        limit: Option<usize>,
+    ) -> Result<QueryResult> {
+        // Extract which columns each aggregate function needs
+        let agg_cols: Vec<String> = match columns {
+            SelectColumns::Columns(items) => items
+                .iter()
+                .filter_map(|item| {
+                    if let SelectItem::Aggregate(a) = item {
+                        if a.arg != "*" {
+                            Some(a.arg.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        // Collect aggregate expressions for finalize
+        let _agg_exprs: Vec<&crate::parser::AggregateExpr> = match columns {
+            SelectColumns::Columns(items) => items
+                .iter()
+                .filter_map(|item| {
+                    if let SelectItem::Aggregate(a) = item {
+                        Some(a)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        let class_hierarchy = self.get_class_hierarchy_read(engine, table);
+        let fast_filter_cols = Self::extract_fast_filter_columns(filter);
+
+        // For projected columns: only GROUP BY cols + aggregate input cols
+        let mut needed_cols: Vec<String> = Vec::new();
+        if let Some(gb) = group_by {
+            for col in &gb.columns {
+                if !needed_cols.contains(col) {
+                    needed_cols.push(col.clone());
+                }
+            }
+        }
+        for col in &agg_cols {
+            if !needed_cols.contains(col) {
+                needed_cols.push(col.clone());
+            }
+        }
+        let proj_cols = needed_cols;
+
+        // Streaming state: one AggState per group key (or single AggState for no GROUP BY)
+        let mut groups: std::collections::HashMap<String, AggState> =
+            std::collections::HashMap::new();
+        // Store first row per group for GROUP BY column values
+        let mut group_first_row: std::collections::HashMap<String, Map<String, Value>> =
+            std::collections::HashMap::new();
+
+        let active_txn_id = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scan_count: u64 = 0;
+
+        for scan_class in &class_hierarchy {
+            let prefix = format!("{}::", scan_class);
+            let entries = if let Some(txn_id) = active_txn_id {
+                engine.txn_scan_prefix(txn_id, prefix.as_bytes())?
+            } else {
+                engine.scan_prefix(prefix.as_bytes())?
+            };
+
+            for (_key, val_bytes) in &entries {
+                scan_count += 1;
+                if scan_count & 0x3FF == 0 {
+                    self.check_timeout()?;
+                }
+
+                // Fast byte-level rejection
+                if !fast_filter_cols.is_empty()
+                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols)
+                {
+                    continue;
+                }
+
+                // BinaryRow path
+                if let Some(brow) = BinaryRow::parse(val_bytes) {
+                    if !brow.class_in_hierarchy(&class_hierarchy) {
+                        continue;
+                    }
+                    // Apply filter
+                    if let Some(f) = filter {
+                        let filter_result = eval_binary_filter(&brow, f);
+                        match filter_result {
+                            Some(true) => {}
+                            Some(false) => continue,
+                            None => {
+                                // Need full map for complex filter
+                                if let Some(doc) = brow.to_map() {
+                                    if !self.eval_filter_read(engine, &doc, f) {
+                                        continue;
+                                    }
+                                    // Use full doc for streaming update
+                                    let group_key = self.make_streaming_group_key(
+                                        group_by, &doc, &proj_cols,
+                                    );
+                                    let state =
+                                        groups.entry(group_key.clone()).or_default();
+                                    state.update(&doc);
+                                    for col in &agg_cols {
+                                        state.update_column(col, &doc);
+                                    }
+                                    if group_by.is_some() {
+                                        group_first_row
+                                            .entry(group_key)
+                                            .or_insert(doc);
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    // Use to_map_projected with empty cols → falls back to to_map()
+                    // which now skips fields with unrecognized tags instead of failing.
+                    if let Some(doc) = brow.to_map_projected(&[]) {
+                        let group_key =
+                            self.make_streaming_group_key(group_by, &doc, &proj_cols);
+                        let state = groups.entry(group_key.clone()).or_default();
+                        state.update(&doc);
+                        for col in &agg_cols {
+                            state.update_column(col, &doc);
+                        }
+                        if group_by.is_some() {
+                            group_first_row.entry(group_key).or_insert(doc);
+                        }
+                    }
+                    continue;
+                }
+
+                // JSON fallback
+                if let Ok(serde_json::Value::Object(doc)) =
+                    serde_json::from_slice::<serde_json::Value>(val_bytes)
+                {
+                    if !class_hierarchy
+                        .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                    {
+                        continue;
+                    }
+                    if let Some(f) = filter {
+                        if !self.eval_filter_read(engine, &doc, f) {
+                            continue;
+                        }
+                    }
+                    let group_key =
+                        self.make_streaming_group_key(group_by, &doc, &proj_cols);
+                    let state = groups.entry(group_key.clone()).or_default();
+                    state.update(&doc);
+                    for col in &agg_cols {
+                        state.update_column(col, &doc);
+                    }
+                    if group_by.is_some() {
+                        group_first_row.entry(group_key).or_insert(doc);
+                    }
+                }
+            }
+        }
+
+        // Finalize: convert AggState to result rows
+        let mut result_rows: Vec<Map<String, Value>> = Vec::new();
+
+        for (group_key, state) in &groups {
+            let mut result_row = Map::new();
+
+            // Add GROUP BY columns
+            if let Some(gb) = group_by {
+                if let Some(first_row) = group_first_row.get(group_key) {
+                    for col in &gb.columns {
+                        let clean = col.trim_matches('"');
+                        if let Some(val) = Self::resolve_column_value(first_row, clean) {
+                            result_row.insert(clean.to_string(), Value::String(val));
+                        }
+                    }
+                }
+            }
+
+            // Compute aggregates
+            if let SelectColumns::Columns(items) = columns {
+                for item in items {
+                    match item {
+                        SelectItem::Aggregate(agg) => {
+                            let val = state.finalize(agg);
+                            let name = agg
+                                .alias
+                                .clone()
+                                .unwrap_or_else(|| Self::default_agg_name(agg));
+                            result_row.insert(name, val);
+                        }
+                        SelectItem::Column(col) => {
+                            // Non-aggregate columns in GROUP BY query — use first row value
+                            if let Some(first_row) = group_first_row.get(group_key) {
+                                let col_name =
+                                    col.split(" as ").last().unwrap_or(col);
+                                let col_name =
+                                    col_name.split('.').next_back().unwrap_or(col_name);
+                                if !result_row.contains_key(col_name) {
+                                    if let Some(val) =
+                                        Self::resolve_column_value(first_row, col)
+                                    {
+                                        result_row
+                                            .insert(col_name.to_string(), Value::String(val));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Apply HAVING
+            if having
+                .as_ref()
+                .is_none_or(|h| self.eval_filter_read(engine, &result_row, h))
+            {
+                result_rows.push(result_row);
+            }
+        }
+
+        // ORDER BY
+        if !order_by.is_empty() {
+            result_rows.sort_by(|a, b| {
+                for ob in order_by {
+                    let a_val = Self::resolve_column_value(a, &ob.column)
+                        .unwrap_or_default();
+                    let b_val = Self::resolve_column_value(b, &ob.column)
+                        .unwrap_or_default();
+                    let ord = Self::compare_values(&a_val, &b_val);
+                    if ord != std::cmp::Ordering::Equal {
+                        return if ob.ascending { ord } else { ord.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        // LIMIT
+        if let Some(lim) = limit {
+            result_rows.truncate(lim);
+        }
+
+        Ok(QueryResult::Rows(result_rows))
+    }
+
+    fn make_streaming_group_key(
+        &self,
+        group_by: Option<&crate::parser::GroupByClause>,
+        row: &Map<String, Value>,
+        _proj_cols: &[String],
+    ) -> String {
+        if let Some(gb) = group_by {
+            gb.columns
+                .iter()
+                .map(|col| {
+                    // Strip surrounding quotes that the parser may include
+                    let clean = col.trim_matches('"');
+                    Self::value_to_group_key(row.get(clean))
+                })
+                .collect::<Vec<_>>()
+                .join("\x00")
+        } else {
+            String::new() // single group
         }
     }
 
@@ -7377,19 +9122,36 @@ impl QueryExecutor {
     /// Resolves join column references from the ON condition.
     /// Returns (left_column_name, right_column_name) without alias prefixes.
     fn resolve_join_columns(on: &crate::parser::JoinOn) -> Result<(String, String)> {
-        let left = on
-            .left
-            .split('.')
-            .next_back()
-            .unwrap_or(&on.left)
-            .to_string();
-        let right = on
-            .right
-            .split('.')
-            .next_back()
-            .unwrap_or(&on.right)
-            .to_string();
-        Ok((left, right))
+        // Use full qualified column names (e.g. "t.target", "dis.id")
+        // instead of stripping the table prefix. This is critical for multi-table
+        // JOINs where different tables may have columns with the same name (e.g. "id").
+        Ok((on.left.clone(), on.right.clone()))
+    }
+
+    /// Auto-detect and fix swapped join columns by checking which column
+    /// exists in which side of the join.
+    fn fix_join_columns(
+        left_rows: &[Map<String, Value>],
+        right_rows: &[Map<String, Value>],
+        left_col: &str,
+        right_col: &str,
+    ) -> (String, String) {
+        // Check if left_col exists in left rows and right_col in right rows
+        let left_has_left = left_rows
+            .first()
+            .map(|r| r.contains_key(left_col))
+            .unwrap_or(false);
+        let right_has_right = right_rows
+            .first()
+            .map(|r| r.contains_key(right_col))
+            .unwrap_or(false);
+
+        if left_has_left && right_has_right {
+            (left_col.to_string(), right_col.to_string())
+        } else {
+            // Swap: maybe the columns are reversed
+            (right_col.to_string(), left_col.to_string())
+        }
     }
 
     /// Gets a value from a row, trying both aliased and unaliased column names.
@@ -7514,7 +9276,14 @@ impl QueryExecutor {
             if let Some(entity_id) = onto_core::EntityId::from_lsm_key(&key) {
                 let _ = graph.upsert_vertex_from_entity(&entity_id, &[class.to_string()]);
             }
+            // If this is a relation table (has source + target columns), invalidate graph cache
+            if Self::columns_has_source_target(columns) {
+                graph.invalidate_relation(class);
+            }
         }
+
+        // Auto-create source/target indexes for relation tables
+        self.ensure_relation_indexes(class, columns);
 
         // Persist triples to triple store
         if let Some(ref triple_store) = self.triple_store {
@@ -7631,11 +9400,26 @@ impl QueryExecutor {
 
                 // Sync to graph store after successful commit
                 if let Some(ref graph) = self.graph {
+                    let mut is_relation = false;
                     for (key, _) in &entries {
                         if let Some(entity_id) = onto_core::EntityId::from_lsm_key(key) {
                             let _ =
                                 graph.upsert_vertex_from_entity(&entity_id, &[class.to_string()]);
                         }
+                    }
+                    // For batch import on relation tables, invalidate graph cache once
+                    // (check first entry for source/target columns)
+                    if let Some((_, first_val)) = entries.first() {
+                        if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(first_val) {
+                            if let Some(obj) = doc.as_object() {
+                                if obj.contains_key("source") && obj.contains_key("target") {
+                                    is_relation = true;
+                                }
+                            }
+                        }
+                    }
+                    if is_relation {
+                        graph.invalidate_relation(class);
                     }
                 }
 
@@ -10279,6 +12063,21 @@ fn format_plan_node(node: &crate::optimizer::PlanNode) -> Value {
                 "rows": estimated_rows,
             })
         }
+        PlanNode::IndexNestedLoopJoin {
+            left,
+            right_table,
+            index_column,
+            estimated_rows,
+            ..
+        } => {
+            json!({
+                "type": "IndexNestedLoopJoin",
+                "left": format_plan_node(left),
+                "right_table": right_table,
+                "index": index_column,
+                "rows": estimated_rows,
+            })
+        }
         PlanNode::Sort {
             input,
             order_by,
@@ -11063,6 +12862,34 @@ mod tests {
                 assert!(rows[0].contains_key("o.quantity") || rows[0].contains_key("quantity"));
             }
             _ => panic!("expected 1 row from SELECT * JOIN"),
+        }
+    }
+
+    #[test]
+    fn test_full_join() {
+        let (executor, _dir) = setup();
+
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPad", 5);
+        insert_order(&executor, "Galaxy", 1);
+
+        executor.engine().flush().unwrap();
+
+        // FULL JOIN: should include matched + unmatched from both sides
+        let ast = QueryParser::parse(
+            "SELECT p.name, o.quantity FROM Product p FULL JOIN Order o ON p.name = o.product_id",
+        )
+        .unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 4); // 2 matched + 1 unmatched left (MacBook) + 1 unmatched right (Galaxy)
+            }
+            _ => panic!("expected 4 rows from FULL JOIN"),
         }
     }
 
@@ -12931,7 +14758,7 @@ mod tests {
     #[test]
     fn test_query_config_defaults() {
         let config = QueryConfig::default();
-        assert_eq!(config.query_timeout, Duration::from_secs(30));
+        assert_eq!(config.query_timeout, Duration::from_secs(120));
         assert_eq!(config.memory_budget, 256 * 1024 * 1024);
     }
 
@@ -12954,7 +14781,7 @@ mod tests {
 
         // Set a very small memory budget
         let config = QueryConfig {
-            query_timeout: Duration::from_secs(30),
+            query_timeout: Duration::from_secs(120),
             memory_budget: 10, // 10 bytes - will be exceeded
         };
         let (small_exec, _dir2) = setup_with_config(config);

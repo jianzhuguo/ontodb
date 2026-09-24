@@ -348,6 +348,18 @@ impl IndexManager {
         seen.len()
     }
 
+    /// Returns all registered index keys as (class, column) pairs.
+    pub fn all_index_keys(&self) -> Vec<(String, String)> {
+        let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        for key in self.indexes.keys() {
+            seen.insert(key.clone());
+        }
+        for key in self.disk_indexes.keys() {
+            seen.insert(key.clone());
+        }
+        seen.into_iter().collect()
+    }
+
     /// Looks up primary keys for a given class, column, and value using the index.
     /// Returns None if no index exists on that column.
     /// Checks both in-memory and disk-based indexes.
@@ -555,36 +567,45 @@ impl IndexManager {
     /// If a disk-based index is missing (e.g., corrupted `.idx` file was deleted),
     /// it is automatically recreated from the LSM entries.
     pub fn rebuild_from_entries(&mut self, entries: &[(Vec<u8>, Vec<u8>)]) {
+        // Group entries by (class, column) for O(n) bulk loading of in-memory indexes
+        let mut per_index: HashMap<(String, String), Vec<(Vec<u8>, Vec<u8>)>> = HashMap::new();
         for (key, _value) in entries {
             if let Some((class, column, encoded_val, pk)) = Self::parse_index_key(key) {
-                // Rebuild in-memory index
-                let tree = self
-                    .indexes
-                    .entry((class.clone(), column.clone()))
-                    .or_insert_with(|| BPlusTree::new(&class, &column));
-                tree.insert(encoded_val.clone(), pk.clone());
+                per_index
+                    .entry((class, column))
+                    .or_default()
+                    .push((encoded_val, pk));
+            }
+        }
 
-                // Rebuild disk-based index — create if missing
-                let disk_key = (class.clone(), column.clone());
-                if !self.disk_indexes.contains_key(&disk_key) {
-                    // Disk index missing (corrupted file was deleted or never existed) — recreate
-                    if let Some(path) = self.index_path(&class, &column) {
-                        match BTreeIndex::create(&path, &class, &column) {
-                            Ok(idx) => {
-                                self.disk_indexes.insert(disk_key.clone(), idx);
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Warning: failed to create disk index {}.{}: {}",
-                                    class, column, e
-                                );
-                                continue;
-                            }
+        for ((class, column), index_entries) in per_index {
+            // Rebuild disk-based index — create if missing, insert entries individually
+            let disk_key = (class.clone(), column.clone());
+            if !self.disk_indexes.contains_key(&disk_key) {
+                if let Some(path) = self.index_path(&class, &column) {
+                    match BTreeIndex::create(&path, &class, &column) {
+                        Ok(idx) => {
+                            self.disk_indexes.insert(disk_key.clone(), idx);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: failed to create disk index {}.{}: {}",
+                                class, column, e
+                            );
+                            // Still bulk-load the in-memory index even if disk fails
+                            let tree = self
+                                .indexes
+                                .entry((class.clone(), column.clone()))
+                                .or_insert_with(|| BPlusTree::new(&class, &column));
+                            tree.bulk_load(index_entries);
+                            continue;
                         }
                     }
                 }
-                if let Some(disk_idx) = self.disk_indexes.get_mut(&disk_key) {
-                    if let Err(e) = disk_idx.insert(&encoded_val, pk) {
+            }
+            if let Some(disk_idx) = self.disk_indexes.get_mut(&disk_key) {
+                for (encoded_val, pk) in &index_entries {
+                    if let Err(e) = disk_idx.insert(encoded_val, pk.clone()) {
                         eprintln!(
                             "Warning: disk index rebuild failed for {}.{}: {}",
                             class, column, e
@@ -592,6 +613,17 @@ impl IndexManager {
                     }
                 }
             }
+
+            // Bulk load in-memory index — O(n) instead of O(n²) with individual inserts
+            tracing::info!(
+                entries = index_entries.len(),
+                "Using O(n) bulk_load for index construction"
+            );
+            let tree = self
+                .indexes
+                .entry((class.clone(), column.clone()))
+                .or_insert_with(|| BPlusTree::new(&class, &column));
+            tree.bulk_load(index_entries);
         }
 
         // Flush all disk indexes after rebuild (with fsync)
@@ -602,7 +634,7 @@ impl IndexManager {
 
     /// Parses an index key into its components.
     /// Format: `__idx__{class}__{column}::{encoded_value}::{primary_key}`
-    fn parse_index_key(key: &[u8]) -> Option<(String, String, Vec<u8>, Vec<u8>)> {
+    pub fn parse_index_key(key: &[u8]) -> Option<(String, String, Vec<u8>, Vec<u8>)> {
         let key_str = std::str::from_utf8(key).ok()?;
 
         // Strip prefix

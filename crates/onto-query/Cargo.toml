@@ -24,6 +24,8 @@ hex = "0.4"
 [features]
 default = []
 sharding = []
+# Pass through enterprise feature to onto-graph
+enterprise = ["onto-graph/enterprise"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

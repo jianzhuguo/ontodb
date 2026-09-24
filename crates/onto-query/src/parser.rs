@@ -180,6 +180,12 @@ pub enum QueryAst {
     /// DROP INDEX <name> ON <class> (<column>)
     DropIndex { class: String, column: String },
 
+    /// VACUUM TABLE <class> — remove tombstones and rewrite live entries
+    VacuumTable { class: String },
+
+    /// SHOW TABLE STATS <class> — display table statistics
+    ShowTableStats { class: String },
+
     /// CREATE VECTOR INDEX ON <class> (<column>) METRIC <metric> DIMENSION <dim>
     CreateVectorIndex {
         class: String,
@@ -284,6 +290,15 @@ pub enum QueryAst {
         max_depth: usize,
     },
 
+    /// GRAPH ANALYZE <algorithm> FROM <relation_type> [PARAMS ...]
+    /// Supported algorithms: pagerank, connected_components, betweenness_centrality,
+    /// degree_distribution, clustering_coefficient, subgraph_extraction
+    GraphAnalyze {
+        algorithm: String,
+        relation_type: String,
+        params: GraphAnalyzeParams,
+    },
+
     /// SYSTEM ACTIVATE '<class>::<pk>' '<reason>' — Activate a live data entity
     SystemActivate { entity: String, reason: String },
 
@@ -326,8 +341,24 @@ pub enum GraphDirection {
     Both,
 }
 
+/// Parameters for GRAPH ANALYZE queries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GraphAnalyzeParams {
+    /// PageRank damping factor (default: 0.85)
+    pub damping_factor: Option<f64>,
+    /// Maximum iterations for iterative algorithms (default: 100)
+    pub max_iterations: Option<usize>,
+    /// Convergence tolerance (default: 1e-6)
+    pub tolerance: Option<f64>,
+    /// Maximum depth for traversal-based algorithms (default: 5)
+    pub max_depth: Option<usize>,
+    /// Vertex labels for subgraph extraction
+    pub vertex_labels: Option<Vec<String>>,
+}
+
 /// Graph pattern for MATCH queries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+
 pub struct GraphPattern {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
@@ -383,6 +414,8 @@ impl QueryAst {
             QueryAst::CreateMaterializedView { .. } => false,
             QueryAst::DropMaterializedView { .. } => false,
             QueryAst::RefreshMaterializedView { .. } => false,
+            QueryAst::VacuumTable { .. } => false,
+            QueryAst::ShowTableStats { .. } => true,
 
             // Transaction control
             QueryAst::Begin => false,
@@ -405,6 +438,7 @@ impl QueryAst {
             QueryAst::GraphTraverse { .. } => true,
             QueryAst::GraphMatch { .. } => true,
             QueryAst::GraphShortestPath { .. } => true,
+            QueryAst::GraphAnalyze { .. } => true,
 
             // Backup/Restore/Flush/Activate
             QueryAst::SystemActivate { .. } => false,
@@ -687,12 +721,13 @@ pub enum SelectItem {
     Expression(ValueExpr),
 }
 
-/// An aggregate function in SELECT: COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col)
+/// An aggregate function in SELECT: COUNT(*), COUNT(DISTINCT col), SUM(col), AVG(col), MIN(col), MAX(col)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregateExpr {
     pub func: AggregateFunc,
     pub arg: String, // column name or "*" for COUNT(*)
     pub alias: Option<String>,
+    pub distinct: bool, // true for COUNT(DISTINCT col)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -888,6 +923,7 @@ pub enum JoinType {
     Left,
     Right,
     Full,
+    Cross,
 }
 
 /// A JOIN clause: JOIN <table> [AS <alias>] ON <left_col> = <right_col>
@@ -943,6 +979,12 @@ impl QueryParser {
             Self::parse_create_index(input)
         } else if starts_with("DROP INDEX") {
             Self::parse_drop_index(input)
+        } else if starts_with("VACUUM TABLE") {
+            let rest = input[12..].trim().to_string();
+            Ok(QueryAst::VacuumTable { class: rest })
+        } else if starts_with("SHOW TABLE STATS") {
+            let rest = input[16..].trim().to_string();
+            Ok(QueryAst::ShowTableStats { class: rest })
         } else if starts_with("ANALYZE") {
             Self::parse_analyze(input)
         } else if starts_with("BEGIN") {
@@ -976,6 +1018,8 @@ impl QueryParser {
             Self::parse_insert_edge(input)
         } else if starts_with("GRAPH TRAVERSE") {
             Self::parse_graph_traverse(input)
+        } else if starts_with("GRAPH ANALYZE") {
+            Self::parse_graph_analyze(input)
         } else if starts_with("GRAPH MATCH") {
             Self::parse_graph_match(input)
         } else if starts_with("GRAPH SHORTEST PATH") {
@@ -1688,7 +1732,71 @@ impl QueryParser {
     }
 
     /// Parses `FROM <table> [AS <alias>]` and returns (table, alias, rest).
+    /// Also supports subqueries: `FROM (GRAPH MATCH ...) [AS <alias>]`
     fn parse_from_clause(input: &str) -> Result<(String, Option<String>, String)> {
+        let trimmed = input.trim();
+
+        // Check for subquery: FROM (GRAPH MATCH ...) or FROM (SELECT ...)
+        if trimmed.starts_with('(') {
+            // Find matching closing parenthesis
+            let mut depth = 0;
+            let mut end = 0;
+            for (i, ch) in trimmed.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if end == 0 {
+                return Err(CoreError::InvalidArgument("unmatched '(' in FROM subquery".to_string()));
+            }
+
+            let inner = trimmed[1..end].trim();
+            let rest = trimmed[end + 1..].trim();
+
+            // Parse the subquery
+            let subquery = Self::parse(inner)?;
+            let subquery_json = serde_json::to_string(&subquery)
+                .map_err(|e| CoreError::InvalidArgument(format!("failed to serialize subquery: {}", e)))?;
+
+            // Check for alias
+            let (alias, rest) = if starts_with_ignore_ascii_case(rest, "AS") {
+                let rest = rest[2..].trim();
+                let (alias, rest) = Self::parse_word(rest)?;
+                (Some(alias), rest)
+            } else if !rest.is_empty()
+                && !starts_with_ignore_ascii_case(rest, "WHERE")
+                && !starts_with_ignore_ascii_case(rest, "JOIN")
+                && !starts_with_ignore_ascii_case(rest, "LEFT")
+                && !starts_with_ignore_ascii_case(rest, "RIGHT")
+                && !starts_with_ignore_ascii_case(rest, "FULL")
+                && !starts_with_ignore_ascii_case(rest, "INNER")
+                && !starts_with_ignore_ascii_case(rest, "ON")
+                && !starts_with_ignore_ascii_case(rest, "GROUP")
+                && !starts_with_ignore_ascii_case(rest, "HAVING")
+                && !starts_with_ignore_ascii_case(rest, "ORDER")
+                && !starts_with_ignore_ascii_case(rest, "LIMIT")
+            {
+                // Implicit alias
+                let (alias, rest) = Self::parse_word(rest)?;
+                (Some(alias), rest)
+            } else {
+                (None, rest.to_string())
+            };
+
+            // Return a special table name that encodes the subquery
+            let table_name = format!("__subquery__:{}", subquery_json);
+            return Ok((table_name, alias, rest));
+        }
+
         let (table, rest) = Self::parse_word(input)?;
 
         if starts_with_ignore_ascii_case(&rest, "AS") {
@@ -1716,13 +1824,33 @@ impl QueryParser {
         }
     }
 
-    /// Parses zero or more `JOIN <table> [AS <alias>] ON <left> = <right>` clauses.
+    /// Parses zero or more `JOIN <table> [AS <alias>] ON <left> = <right>` clauses,
+    /// plus comma-separated implicit cross joins (`FROM A, B WHERE ...`).
     fn parse_joins(input: &str) -> Result<(Vec<JoinClause>, String)> {
         let mut joins = Vec::new();
         let mut rest = input.to_string();
 
         loop {
             let trimmed = rest.trim();
+
+            // Check for comma-separated implicit cross join
+            if trimmed.starts_with(',') {
+                let after_comma = trimmed[1..].trim();
+                // Parse table name and optional alias
+                let (table, alias, after_table) = Self::parse_from_clause(after_comma)?;
+                // For comma joins, the ON condition is in WHERE — use a placeholder
+                joins.push(JoinClause {
+                    table,
+                    alias,
+                    on: JoinOn {
+                        left: String::new(),
+                        right: String::new(),
+                    },
+                    join_type: JoinType::Cross,
+                });
+                rest = after_table.to_string();
+                continue;
+            }
 
             // Detect join type
             let (join_type, skip_len) = if starts_with_ignore_ascii_case(trimmed, "LEFT OUTER JOIN")
@@ -1764,16 +1892,17 @@ impl QueryParser {
             let eq_pos = Self::find_unquoted(on_input, "=").ok_or_else(|| {
                 CoreError::InvalidArgument("expected '=' in ON clause".to_string())
             })?;
-            let left = safe_slice(on_input, 0, eq_pos).trim().to_string();
+            let left = Self::strip_identifier_quotes(safe_slice(on_input, 0, eq_pos).trim());
             let right_on = safe_slice_from(on_input, eq_pos + 1).trim();
 
             // Right side ends at WHERE/JOIN/ORDER/LIMIT or end of string
-            let (right, rest_after_on) = Self::consume_until_keywords(
+            let (right_raw, rest_after_on) = Self::consume_until_keywords(
                 right_on,
                 &[
-                    "WHERE", "JOIN", "LEFT", "RIGHT", "FULL", "ORDER BY", "LIMIT",
+                    "WHERE", "JOIN", "LEFT", "RIGHT", "FULL", "GROUP BY", "ORDER BY", "LIMIT",
                 ],
             );
+            let right = Self::strip_identifier_quotes(right_raw.trim());
 
             joins.push(JoinClause {
                 table,
@@ -1883,7 +2012,16 @@ impl QueryParser {
                         "empty or malformed aggregate function".to_string(),
                     ));
                 }
-                let arg = safe_slice(part, open + 1, close).trim().to_string();
+                let arg_raw = safe_slice(part, open + 1, close).trim().to_string();
+
+                // Handle COUNT(DISTINCT col)
+                let (arg, distinct) = if func == AggregateFunc::Count
+                    && arg_raw.to_uppercase().starts_with("DISTINCT ")
+                {
+                    (arg_raw[9..].trim().to_string(), true)
+                } else {
+                    (arg_raw, false)
+                };
 
                 // Check for alias: ... AS alias
                 let after = safe_slice_from(part, close + 1).trim();
@@ -1895,7 +2033,7 @@ impl QueryParser {
                     None
                 };
 
-                items.push(SelectItem::Aggregate(AggregateExpr { func, arg, alias }));
+                items.push(SelectItem::Aggregate(AggregateExpr { func, arg, alias, distinct }));
             } else {
                 // Regular column, possibly with alias
                 // Handle: `name`, `p.name`, `name as n`
@@ -4068,6 +4206,87 @@ impl QueryParser {
         })
     }
 
+    /// Parses GRAPH ANALYZE <algorithm> FROM <relation_type> [PARAMS ...]
+    ///
+    /// Supported algorithms:
+    /// - pagerank [DAMPING <f>] [ITERATIONS <n>] [TOLERANCE <f>]
+    /// - connected_components
+    /// - betweenness_centrality
+    /// - degree_distribution
+    /// - clustering_coefficient
+    /// - subgraph_extraction [LABELS <l1>,<l2>,...]
+    fn parse_graph_analyze(input: &str) -> Result<QueryAst> {
+        let mut remaining = input[14..].trim().to_string(); // Skip "GRAPH ANALYZE"
+
+        // Parse algorithm name
+        let (algorithm, rest) = Self::parse_word(&remaining)?;
+        remaining = rest.trim().to_string();
+
+        // Parse FROM <relation_type>
+        remaining = remaining
+            .strip_prefix("FROM")
+            .ok_or_else(|| CoreError::InvalidArgument("expected FROM <relation_type>".to_string()))?
+            .trim()
+            .to_string();
+
+        let (relation_type, rest) = Self::parse_word(&remaining)?;
+        remaining = rest.trim().to_string();
+
+        // Parse optional parameters
+        let mut params = GraphAnalyzeParams::default();
+
+        while !remaining.is_empty() {
+            if starts_with_ignore_ascii_case(&remaining, "DAMPING") {
+                remaining = remaining[7..].trim().to_string();
+                let (val_str, rest) = Self::parse_word(&remaining)?;
+                params.damping_factor = val_str.parse().ok();
+                remaining = rest.trim().to_string();
+            } else if starts_with_ignore_ascii_case(&remaining, "ITERATIONS") {
+                remaining = remaining[10..].trim().to_string();
+                let (val_str, rest) = Self::parse_word(&remaining)?;
+                params.max_iterations = val_str.parse().ok();
+                remaining = rest.trim().to_string();
+            } else if starts_with_ignore_ascii_case(&remaining, "TOLERANCE") {
+                remaining = remaining[9..].trim().to_string();
+                let (val_str, rest) = Self::parse_word(&remaining)?;
+                params.tolerance = val_str.parse().ok();
+                remaining = rest.trim().to_string();
+            } else if starts_with_ignore_ascii_case(&remaining, "DEPTH") {
+                remaining = remaining[5..].trim().to_string();
+                let (val_str, rest) = Self::parse_word(&remaining)?;
+                params.max_depth = val_str.parse().ok();
+                remaining = rest.trim().to_string();
+            } else if starts_with_ignore_ascii_case(&remaining, "LABELS") {
+                remaining = remaining[6..].trim().to_string();
+                // Parse comma-separated labels until end of input or next keyword
+                let labels_str: String = remaining.split_whitespace()
+                    .take_while(|w| !w.eq_ignore_ascii_case("DAMPING") 
+                        && !w.eq_ignore_ascii_case("ITERATIONS")
+                        && !w.eq_ignore_ascii_case("TOLERANCE")
+                        && !w.eq_ignore_ascii_case("DEPTH"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let labels: Vec<String> = labels_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                // Advance remaining past the labels
+                let consumed = labels_str.len();
+                remaining = remaining[consumed..].trim().to_string();
+                params.vertex_labels = Some(labels);
+            } else {
+                break;
+            }
+        }
+
+        Ok(QueryAst::GraphAnalyze {
+            algorithm,
+            relation_type,
+            params,
+        })
+    }
+
     /// Parses SYSTEM ACTIVATE '<class>::<pk>' '<reason>'
     fn parse_system_activate(input: &str) -> Result<QueryAst> {
         let rest = input[15..].trim(); // Skip "SYSTEM ACTIVATE"
@@ -4541,6 +4760,122 @@ mod tests {
                     }
                     other => panic!("expected Like, got {:?}", other),
                 }
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    // ===== GRAPH ANALYZE Tests =====
+
+    #[test]
+    fn test_parse_graph_analyze_pagerank() {
+        let ast = QueryParser::parse("GRAPH ANALYZE pagerank FROM treats").unwrap();
+        match ast {
+            QueryAst::GraphAnalyze { algorithm, relation_type, params } => {
+                assert_eq!(algorithm, "pagerank");
+                assert_eq!(relation_type, "treats");
+                assert!(params.damping_factor.is_none()); // default
+            }
+            _ => panic!("expected GraphAnalyze"),
+        }
+    }
+
+    #[test]
+    fn test_parse_graph_analyze_pagerank_with_params() {
+        let ast = QueryParser::parse("GRAPH ANALYZE pagerank FROM treats DAMPING 0.9 ITERATIONS 200 TOLERANCE 1e-8").unwrap();
+        match ast {
+            QueryAst::GraphAnalyze { algorithm, relation_type, params } => {
+                assert_eq!(algorithm, "pagerank");
+                assert_eq!(relation_type, "treats");
+                assert_eq!(params.damping_factor, Some(0.9));
+                assert_eq!(params.max_iterations, Some(200));
+                assert_eq!(params.tolerance, Some(1e-8));
+            }
+            _ => panic!("expected GraphAnalyze"),
+        }
+    }
+
+    #[test]
+    fn test_parse_graph_analyze_connected_components() {
+        let ast = QueryParser::parse("GRAPH ANALYZE connected_components FROM causes").unwrap();
+        match ast {
+            QueryAst::GraphAnalyze { algorithm, relation_type, .. } => {
+                assert_eq!(algorithm, "connected_components");
+                assert_eq!(relation_type, "causes");
+            }
+            _ => panic!("expected GraphAnalyze"),
+        }
+    }
+
+    #[test]
+    fn test_parse_graph_analyze_betweenness() {
+        let ast = QueryParser::parse("GRAPH ANALYZE betweenness_centrality FROM treats").unwrap();
+        match ast {
+            QueryAst::GraphAnalyze { algorithm, relation_type, .. } => {
+                assert_eq!(algorithm, "betweenness_centrality");
+                assert_eq!(relation_type, "treats");
+            }
+            _ => panic!("expected GraphAnalyze"),
+        }
+    }
+
+    #[test]
+    fn test_parse_graph_analyze_subgraph_with_labels() {
+        let ast = QueryParser::parse("GRAPH ANALYZE subgraph_extraction FROM treats LABELS Drug,Disease").unwrap();
+        match ast {
+            QueryAst::GraphAnalyze { algorithm, relation_type, params } => {
+                assert_eq!(algorithm, "subgraph_extraction");
+                assert_eq!(relation_type, "treats");
+                assert_eq!(params.vertex_labels, Some(vec!["Drug".to_string(), "Disease".to_string()]));
+            }
+            _ => panic!("expected GraphAnalyze"),
+        }
+    }
+
+    #[test]
+    fn test_parse_graph_analyze_is_read_only() {
+        let ast = QueryParser::parse("GRAPH ANALYZE pagerank FROM treats").unwrap();
+        assert!(ast.is_read_only());
+    }
+
+    // ===== Hybrid Query Tests =====
+
+    #[test]
+    fn test_parse_hybrid_select_from_graph_match() {
+        let ast = QueryParser::parse(
+            "SELECT * FROM (GRAPH MATCH (d:Drug) -[e:treats]-> (dis:Disease) RETURN d.id, dis.id)"
+        ).unwrap();
+        match ast {
+            QueryAst::Select { from, .. } => {
+                assert!(from.starts_with("__subquery__:"), "FROM should be a subquery, got: {}", from);
+            }
+            _ => panic!("expected Select, got {:?}", ast),
+        }
+    }
+
+    #[test]
+    fn test_parse_hybrid_select_with_where() {
+        let ast = QueryParser::parse(
+            "SELECT * FROM (GRAPH MATCH (d:Drug) -[e:treats]-> (dis:Disease) RETURN d.id) WHERE d.name = 'Aspirin'"
+        ).unwrap();
+        match ast {
+            QueryAst::Select { from, filter, .. } => {
+                assert!(from.starts_with("__subquery__:"));
+                assert!(filter.is_some(), "WHERE clause should be parsed");
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_hybrid_select_with_alias() {
+        let ast = QueryParser::parse(
+            "SELECT * FROM (GRAPH MATCH (d:Drug) -[e:treats]-> (dis:Disease) RETURN d.id) AS results"
+        ).unwrap();
+        match ast {
+            QueryAst::Select { from, from_alias, .. } => {
+                assert!(from.starts_with("__subquery__:"));
+                assert_eq!(from_alias, Some("results".to_string()));
             }
             _ => panic!("expected Select"),
         }
