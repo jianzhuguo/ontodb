@@ -243,9 +243,38 @@ impl PreLoadEngine {
 }
 
 impl LsmEngine {
+    /// Removes orphaned `.sst.tmp` files left by interrupted compaction/flush.
+    /// These are incomplete writes that were not atomically renamed to `.sst`.
+    fn cleanup_tmp_files(data_dir: &std::path::Path) -> Result<()> {
+        let mut cleaned = 0usize;
+        for entry in fs::read_dir(data_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "tmp")
+                && path.file_name().map_or(false, |name| {
+                    name.to_string_lossy().ends_with(".sst.tmp")
+                })
+            {
+                if let Err(e) = fs::remove_file(&path) {
+                    tracing::warn!("Failed to remove orphaned tmp file {:?}: {}", path, e);
+                } else {
+                    cleaned += 1;
+                }
+            }
+        }
+        if cleaned > 0 {
+            tracing::info!(count = cleaned, "Cleaned up orphaned .sst.tmp files");
+        }
+        Ok(())
+    }
+
     /// Opens or creates an LSM engine at the given directory.
     pub fn open(options: StorageOptions) -> Result<Self> {
         fs::create_dir_all(&options.data_dir)?;
+
+        // Clean up orphaned .sst.tmp files from interrupted compaction/flush.
+        // These are incomplete writes that were not atomically renamed.
+        Self::cleanup_tmp_files(&options.data_dir)?;
 
         let wal_path = options.data_dir.join("wal.log");
         let wal = Wal::open(&wal_path)?;

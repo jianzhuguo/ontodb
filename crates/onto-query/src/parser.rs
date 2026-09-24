@@ -415,7 +415,7 @@ impl QueryAst {
             QueryAst::DropMaterializedView { .. } => false,
             QueryAst::RefreshMaterializedView { .. } => false,
             QueryAst::VacuumTable { .. } => false,
-            QueryAst::ShowTableStats { .. } => true,
+            QueryAst::ShowTableStats { .. } => false,
 
             // Transaction control
             QueryAst::Begin => false,

@@ -213,16 +213,27 @@ impl SsTableBuilder {
     }
 
     /// Builds the SSTable and writes it to disk.
+    ///
+    /// Uses write-to-temp-then-rename pattern for crash safety:
+    /// 1. Write all data to `path.sst.tmp`
+    /// 2. fsync the temp file
+    /// 3. Atomic rename to `path.sst`
+    ///
+    /// If the process crashes during step 1-2, the `.tmp` file is orphaned but
+    /// the engine won't load it (wrong extension). Only completed files are loaded.
     pub fn build(mut self, path: impl AsRef<Path>) -> Result<SsTable> {
         // Flush remaining block
         self.flush_block();
+
+        let final_path = path.as_ref().to_path_buf();
+        let tmp_path = final_path.with_extension("sst.tmp");
 
         let mut file = BufWriter::new(
             OpenOptions::new()
                 .create(true)
                 .write(true)
                 .truncate(true)
-                .open(path.as_ref())?,
+                .open(&tmp_path)?,
         );
 
         // Write data blocks
@@ -256,9 +267,15 @@ impl SsTableBuilder {
 
         file.flush()?;
         file.get_ref().sync_all()?;
+        drop(file); // Close the temp file before renaming
+
+        // Atomic rename: only after this point does the engine see the file.
+        // If the process crashes before this line, the .tmp file is orphaned
+        // and will be cleaned up on next startup.
+        std::fs::rename(&tmp_path, &final_path)?;
 
         // Reopen for reading
-        let read_file = File::open(path.as_ref())?;
+        let read_file = File::open(&final_path)?;
         let compressed = self.compression_level > 0;
 
         // Cache the first key (minimum key) for fast access
