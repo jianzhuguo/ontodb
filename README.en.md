@@ -8,41 +8,6 @@ Unified storage of 12 data types, 7-step write-on-insert pipeline, embedded incr
 
 ---
 
-## Edition Comparison
-
-| Feature | Community (BUSL-1.1) | Enterprise (Commercial) |
-|---------|---------------------|------------------------|
-| **Storage Engine** | LSM-Tree + MVCC + WAL | Same as Community |
-| **12 Data Types Unified** | Yes | Yes |
-| **SQL/OntoQL/SPARQL Query** | Yes | Yes |
-| **HNSW Vector Index** | Yes | Yes |
-| **OWL 2 RL Reasoning** | Incremental fixpoint + derivation trace | Same as Community |
-| **7-Step Write Pipeline** | Yes | Yes |
-| **PostgreSQL/MySQL Compatible** | Yes | Yes |
-| **TLS/mTLS** | Yes | Yes |
-| **Audit Chain (SHA256)** | Yes | Yes |
-| **CDC Change Capture** | Yes | Yes |
-| **Data Sharding** | Class/Range/Hash | Enterprise + Cross-shard Query |
-| **Raft Consensus** | Yes | Yes |
-| **Basic Rules API** | DSL + CRUD + Hot Reload | Yes |
-| **Edge Device Support** | Yes | Yes |
-| **Plugin Framework** | Yes | Yes |
-| Advanced Reasoning Engine | No | Full DSL + OWL + Distributed + Profiling |
-| Auto Failover | No | Yes |
-| Cross-Shard Query | No | Yes |
-| Slow Query Monitoring | No | Observability |
-| Full Backup | No | Yes |
-| RBAC Separation of Duties | No | Yes |
-| LDAP/SAML | No | Yes |
-| Data Masking | No | Yes |
-| SM4/AES Encryption | No | Yes |
-| KMS Key Management | No | Yes |
-| Audit Log Rotation | No | Yes |
-| CRC Validation | No | Yes |
-| Rolling Upgrade | No | Yes |
-
----
-
 ## Why OntoDB
 
 | Dimension | Traditional | OntoDB |
