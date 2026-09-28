@@ -182,6 +182,22 @@ fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
                 false
             }
         }
+        // Cross-type: TAG_INT vs String — try parsing string as number
+        (TAG_INT, LiteralValue::String(s)) => {
+            if let Ok(arr) = <[u8; 8]>::try_from(raw) {
+                let int_val = i64::from_be_bytes(arr);
+                // Try parsing string as i64, then as f64
+                if let Ok(n) = s.parse::<i64>() {
+                    int_val == n
+                } else if let Ok(f) = s.parse::<f64>() {
+                    (int_val as f64) == f
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
         (TAG_FLOAT, LiteralValue::Float(n)) => {
             if let Ok(arr) = <[u8; 8]>::try_from(raw) {
                 f64::from_be_bytes(arr) == *n
@@ -196,7 +212,36 @@ fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
                 false
             }
         }
+        // Cross-type: TAG_FLOAT vs String — try parsing string as number
+        (TAG_FLOAT, LiteralValue::String(s)) => {
+            if let Ok(arr) = <[u8; 8]>::try_from(raw) {
+                let float_val = f64::from_be_bytes(arr);
+                if let Ok(f) = s.parse::<f64>() {
+                    float_val == f
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
         (TAG_STRING, LiteralValue::String(s)) => parse_string_value(raw) == Some(s.as_str()),
+        // Cross-type: TAG_STRING vs Int — compare string representation
+        (TAG_STRING, LiteralValue::Int(n)) => {
+            if let Some(s) = parse_string_value(raw) {
+                s == n.to_string()
+            } else {
+                false
+            }
+        }
+        // Cross-type: TAG_STRING vs Float — compare string representation
+        (TAG_STRING, LiteralValue::Float(n)) => {
+            if let Some(s) = parse_string_value(raw) {
+                s == n.to_string()
+            } else {
+                false
+            }
+        }
         _ => false,
     }
 }
@@ -213,6 +258,18 @@ fn binary_lit_ord(tag: u8, raw: &[u8], lit: &LiteralValue) -> Option<std::cmp::O
             let arr: [u8; 8] = raw.try_into().ok()?;
             (i64::from_be_bytes(arr) as f64).partial_cmp(n)
         }
+        // Cross-type: TAG_INT vs String — parse string as number
+        (TAG_INT, LiteralValue::String(s)) => {
+            let arr: [u8; 8] = raw.try_into().ok()?;
+            let int_val = i64::from_be_bytes(arr);
+            if let Ok(n) = s.parse::<i64>() {
+                Some(int_val.cmp(&n))
+            } else if let Ok(f) = s.parse::<f64>() {
+                (int_val as f64).partial_cmp(&f)
+            } else {
+                None
+            }
+        }
         (TAG_FLOAT, LiteralValue::Float(n)) => {
             let arr: [u8; 8] = raw.try_into().ok()?;
             f64::from_be_bytes(arr).partial_cmp(n)
@@ -221,7 +278,27 @@ fn binary_lit_ord(tag: u8, raw: &[u8], lit: &LiteralValue) -> Option<std::cmp::O
             let arr: [u8; 8] = raw.try_into().ok()?;
             f64::from_be_bytes(arr).partial_cmp(&(*n as f64))
         }
+        // Cross-type: TAG_FLOAT vs String — parse string as number
+        (TAG_FLOAT, LiteralValue::String(s)) => {
+            let arr: [u8; 8] = raw.try_into().ok()?;
+            let float_val = f64::from_be_bytes(arr);
+            if let Ok(f) = s.parse::<f64>() {
+                float_val.partial_cmp(&f)
+            } else {
+                None
+            }
+        }
         (TAG_STRING, LiteralValue::String(s)) => parse_string_value(raw).map(|v| v.cmp(s.as_str())),
+        // Cross-type: TAG_STRING vs Int — compare as strings
+        (TAG_STRING, LiteralValue::Int(n)) => {
+            let s = parse_string_value(raw)?;
+            Some(s.cmp(&n.to_string()))
+        }
+        // Cross-type: TAG_STRING vs Float — compare as strings
+        (TAG_STRING, LiteralValue::Float(n)) => {
+            let s = parse_string_value(raw)?;
+            Some(s.cmp(&n.to_string()))
+        }
         _ => None,
     }
 }
@@ -10212,6 +10289,19 @@ impl QueryExecutor {
             (Value::Number(n), LiteralValue::Float(l)) => n.as_f64() == Some(*l),
             (Value::Bool(b), LiteralValue::Bool(l)) => b == l,
             (Value::Null, LiteralValue::Null) => true,
+            // Cross-type: Number vs String
+            (Value::Number(n), LiteralValue::String(s)) => {
+                if let Some(i) = n.as_i64() {
+                    s.parse::<i64>().map_or(false, |x| x == i)
+                } else if let Some(f) = n.as_f64() {
+                    s.parse::<f64>().map_or(false, |x| x == f)
+                } else {
+                    false
+                }
+            }
+            // Cross-type: String vs Int/Float
+            (Value::String(s), LiteralValue::Int(l)) => s == &l.to_string(),
+            (Value::String(s), LiteralValue::Float(l)) => s == &l.to_string(),
             _ => false,
         }
     }
@@ -10386,6 +10476,20 @@ impl QueryExecutor {
             (Value::Number(n), LiteralValue::Float(l)) => n.as_f64() == Some(*l),
             (Value::Bool(b), LiteralValue::Bool(l)) => b == l,
             (Value::Null, LiteralValue::Null) => true,
+            // Cross-type: Number vs String — try parsing string as number
+            (Value::Number(n), LiteralValue::String(s)) => {
+                if let Some(i) = n.as_i64() {
+                    s.parse::<i64>().map_or(false, |x| x == i)
+                } else if let Some(f) = n.as_f64() {
+                    s.parse::<f64>().map_or(false, |x| x == f)
+                } else {
+                    false
+                }
+            }
+            // Cross-type: String vs Int
+            (Value::String(s), LiteralValue::Int(l)) => s == &l.to_string(),
+            // Cross-type: String vs Float
+            (Value::String(s), LiteralValue::Float(l)) => s == &l.to_string(),
             _ => false,
         }
     }
@@ -10693,6 +10797,16 @@ impl QueryExecutor {
             (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().is_some_and(|n| n > *l),
             (Value::Number(n), LiteralValue::Float(l)) => n.as_f64().is_some_and(|n| n > *l),
             (Value::String(s), LiteralValue::String(l)) => s.as_str() > l.as_str(),
+            // Cross-type: Number vs String
+            (Value::Number(n), LiteralValue::String(s)) => {
+                if let Some(i) = n.as_i64() {
+                    s.parse::<i64>().map_or(false, |x| i > x)
+                } else if let Some(f) = n.as_f64() {
+                    s.parse::<f64>().map_or(false, |x| f > x)
+                } else {
+                    false
+                }
+            }
             _ => false,
         }
     }
@@ -10702,6 +10816,16 @@ impl QueryExecutor {
             (Value::Number(n), LiteralValue::Int(l)) => n.as_i64().is_some_and(|n| n < *l),
             (Value::Number(n), LiteralValue::Float(l)) => n.as_f64().is_some_and(|n| n < *l),
             (Value::String(s), LiteralValue::String(l)) => s.as_str() < l.as_str(),
+            // Cross-type: Number vs String
+            (Value::Number(n), LiteralValue::String(s)) => {
+                if let Some(i) = n.as_i64() {
+                    s.parse::<i64>().map_or(false, |x| i < x)
+                } else if let Some(f) = n.as_f64() {
+                    s.parse::<f64>().map_or(false, |x| f < x)
+                } else {
+                    false
+                }
+            }
             _ => false,
         }
     }

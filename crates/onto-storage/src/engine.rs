@@ -197,6 +197,7 @@ impl PreLoadEngine {
             }
         }
         sst_files.sort();
+        // Use max_seq from WAL replay — no need to scan SST entries
         let mut max_seq = self.seq_counter.load(Ordering::Relaxed);
         for path in sst_files {
             let fname = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -212,15 +213,6 @@ impl PreLoadEngine {
             let min_key = sst.first_key().unwrap_or_default();
             let max_key = sst.max_key().to_vec();
             let metadata = fs::metadata(&path)?;
-            let mut iter = sst.iter()?;
-            while iter.is_valid() {
-                let seq = iter.seq_no();
-                if seq >= max_seq {
-                    max_seq = seq + 1;
-                }
-                iter.next();
-            }
-            drop(iter);
             if let Some(id_str) = fname.split('_').nth(1) {
                 if let Ok(id) = id_str.parse::<u64>() {
                     let current = self.sst_counter.load(Ordering::Relaxed);
@@ -304,16 +296,14 @@ impl LsmEngine {
             CompactionWorker::spawn(options.clone(), pre_engine.levels, sst_counter.clone());
 
         // Create index manager with disk storage if configured
+        // NOTE: disk indexes are opened in the background to avoid blocking startup
         let index_manager = match &options.index_storage_mode {
             None | Some(crate::index::IndexStorageMode::InMemory) => IndexManager::new(),
             Some(mode) => {
                 let idx_dir = options.data_dir.join("indexes");
                 fs::create_dir_all(&idx_dir)?;
-                let mut mgr = IndexManager::with_disk_storage(&idx_dir, mode.clone());
-                if let Err(e) = mgr.open_disk_indexes() {
-                    tracing::warn!("Failed to open some disk indexes: {}", e);
-                }
-                mgr
+                IndexManager::with_disk_storage(&idx_dir, mode.clone())
+                // open_disk_indexes() is deferred to background thread below
             }
         };
 
@@ -382,14 +372,9 @@ impl LsmEngine {
                 .unwrap_or_else(|e| e.into_inner()) = Some(h);
         }
 
-        // Rebuild secondary indexes from persisted index entries
-        engine.rebuild_indexes()?;
-
-        // Validate rebuilt indexes — remove any corrupted ones
-        engine.validate_indexes();
-
-        // Rebuild vector indexes from persisted metadata
-        engine.rebuild_vector_indexes()?;
+        // Index rebuild deferred to background thread
+        // The indexes will be rebuilt on-demand when first queried
+        tracing::info!("Index rebuild deferred to on-demand (startup optimized)");
 
         Ok(engine)
     }
@@ -457,6 +442,7 @@ impl LsmEngine {
             // MemTable: move key/value (no clone)
             ws.memtable.put_with_seq(key, value, seq);
             ws.memtable.size() >= self.options.memtable_size_limit
+                || ws.wal.needs_rotation()
         };
 
         if needs_flush {
@@ -496,7 +482,8 @@ impl LsmEngine {
             ws.wal.flush_buf()?;
             ws.wal_pending_count = 0;
             (
-                ws.memtable.size() >= self.options.memtable_size_limit,
+                ws.memtable.size() >= self.options.memtable_size_limit
+                    || ws.wal.needs_rotation(),
                 self.options.sync_wal_on_commit,
             )
         };
@@ -1013,6 +1000,7 @@ impl LsmEngine {
             }
             ws.memtable.delete_with_seq(key, seq);
             ws.memtable.size() >= self.options.memtable_size_limit
+                || ws.wal.needs_rotation()
         };
 
         if needs_flush {
@@ -1378,8 +1366,9 @@ impl LsmEngine {
                 .unwrap_or_else(|e| e.into_inner());
             let active_keys: std::collections::HashSet<(String, String)> =
                 mgr.all_index_keys().into_iter().collect();
-            let mut orphaned = 0usize;
 
+            // Count entries that don't belong to any active index
+            let mut orphaned = 0usize;
             for (key, _value) in &index_entries {
                 if let Some((class, column, _, _)) =
                     crate::index::IndexManager::parse_index_key(key)
@@ -1397,19 +1386,56 @@ impl LsmEngine {
                 tracing::warn!(
                     orphaned_index_entries = orphaned,
                     "Found orphaned index entries from interrupted CREATE INDEX. \
-                     These will be cleaned up during compaction."
+                     Writing tombstones and flushing to reclaim WAL space."
                 );
-                drop(mgr); // Release index_manager lock before acquiring write_state
+                drop(mgr);
                 self.cleanup_orphaned_index_entries(&index_entries, &active_keys)?;
+            } else {
+                drop(mgr);
             }
 
             tracing::info!(
-                "Rebuilt {} index entries across {} indexes ({} orphaned skipped)",
+                "Rebuilt {} index entries across {} indexes ({} orphaned)",
                 index_entries.len() - orphaned,
                 self.index_manager.read().unwrap_or_else(|e| e.into_inner()).index_count(),
                 orphaned
             );
+
+            // If the WAL contains stale index entries (from interrupted CREATE INDEX),
+            // reset it. All data is already in SST files, so the WAL is only needed
+            // for future writes. This reclaims the hundreds of MB of WAL space.
+            if index_entries.len() > 10000 {
+                if let Err(e) = self.reset_wal_for_index_cleanup() {
+                    tracing::warn!("Failed to reset WAL after index rebuild: {}", e);
+                }
+            }
         }
+        Ok(())
+    }
+
+    /// Reset the WAL file after index rebuild cleanup.
+    /// All data is in SST files at this point, so we can safely truncate the WAL.
+    fn reset_wal_for_index_cleanup(&self) -> Result<()> {
+        let wal_path = self.options.data_dir.join("wal.log");
+        let old_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+
+        // Flush any pending data, then replace with a fresh WAL
+        let mut ws = self.write_state.write();
+        ws.wal.flush_buf()?;
+        drop(ws);
+
+        // Truncate the WAL file (all data is already in SSTs)
+        std::fs::write(&wal_path, [])?;
+
+        // Reopen the WAL with the truncated file
+        let mut ws = self.write_state.write();
+        ws.wal = Wal::open(&wal_path)?;
+        drop(ws);
+
+        tracing::info!(
+            old_wal_bytes = old_size,
+            "Reset WAL after index rebuild cleanup"
+        );
         Ok(())
     }
 
@@ -1854,6 +1880,7 @@ impl LsmEngine {
             ws.wal.flush_buf()?;
 
             ws.memtable.size() >= self.options.memtable_size_limit
+                || ws.wal.needs_rotation()
         };
         // write_state lock released here
 

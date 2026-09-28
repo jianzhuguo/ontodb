@@ -18,6 +18,7 @@ use crate::index::btree::BPlusTree;
 use crate::index::disk::BTreeIndex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Prefix for index keys in the LSM-Tree.
 const INDEX_PREFIX: &[u8] = b"__idx__";
@@ -39,7 +40,8 @@ pub struct IndexManager {
     /// In-memory B+Tree indexes, keyed by (class, column).
     indexes: HashMap<(String, String), BPlusTree>,
     /// Disk-based B+Tree indexes, keyed by (class, column).
-    disk_indexes: HashMap<(String, String), BTreeIndex>,
+    /// Uses Mutex for interior mutability to allow read-path lookups.
+    disk_indexes: HashMap<(String, String), Mutex<BTreeIndex>>,
     /// Base directory for disk-based index files.
     data_dir: Option<PathBuf>,
     /// Storage mode configuration.
@@ -89,7 +91,7 @@ impl IndexManager {
             if let std::collections::hash_map::Entry::Vacant(e) = self.disk_indexes.entry(key) {
                 match BTreeIndex::create(&path, class, column) {
                     Ok(idx) => {
-                        e.insert(idx);
+                        e.insert(Mutex::new(idx));
                     }
                     Err(e) => {
                         eprintln!(
@@ -134,7 +136,7 @@ impl IndexManager {
                     match BTreeIndex::open(&path) {
                         Ok(idx) => {
                             let key = (class.to_string(), column.to_string());
-                            self.disk_indexes.insert(key, idx);
+                            self.disk_indexes.insert(key, Mutex::new(idx));
                             // Also create in-memory index
                             self.indexes
                                 .entry((class.to_string(), column.to_string()))
@@ -162,8 +164,8 @@ impl IndexManager {
         let in_memory_removed = self.indexes.remove(&key).is_some();
 
         // Also remove disk-based index
-        let disk_removed = if let Some(mut idx) = self.disk_indexes.remove(&key) {
-            let _ = idx.flush();
+        let disk_removed = if let Some(idx) = self.disk_indexes.remove(&key) {
+            let _ = idx.lock().unwrap().flush();
             // Optionally delete the file
             if let Some(path) = self.index_path(class, column) {
                 let _ = std::fs::remove_file(path);
@@ -217,9 +219,9 @@ impl IndexManager {
                 // Insert into disk-based index
                 if let Some(disk_idx) = self
                     .disk_indexes
-                    .get_mut(&(idx_class.clone(), idx_col.clone()))
+                    .get(&(idx_class.clone(), idx_col.clone()))
                 {
-                    if let Err(e) = disk_idx.insert(&encoded, primary_key.to_vec()) {
+                    if let Err(e) = disk_idx.lock().unwrap().insert(&encoded, primary_key.to_vec()) {
                         eprintln!(
                             "Warning: disk index insert failed for {}.{}: {}",
                             idx_class, idx_col, e
@@ -295,9 +297,9 @@ impl IndexManager {
                 // Remove from disk-based index
                 if let Some(disk_idx) = self
                     .disk_indexes
-                    .get_mut(&(idx_class.clone(), idx_col.clone()))
+                    .get(&(idx_class.clone(), idx_col.clone()))
                 {
-                    if let Err(e) = disk_idx.remove(&encoded, primary_key) {
+                    if let Err(e) = disk_idx.lock().unwrap().remove(&encoded, primary_key) {
                         eprintln!(
                             "Warning: disk index remove failed for {}.{}: {}",
                             idx_class, idx_col, e
@@ -331,8 +333,8 @@ impl IndexManager {
 
     /// Flushes all disk-based indexes to disk (with fsync).
     pub fn flush_disk_indexes(&mut self) {
-        for disk_idx in self.disk_indexes.values_mut() {
-            let _ = disk_idx.flush();
+        for disk_idx in self.disk_indexes.values() {
+            let _ = disk_idx.lock().unwrap().flush();
         }
     }
 
@@ -378,8 +380,8 @@ impl IndexManager {
         }
 
         // Fall back to disk-based index
-        if let Some(disk_idx) = self.disk_indexes.get_mut(&key) {
-            return disk_idx.lookup(&encoded).ok();
+        if let Some(disk_idx) = self.disk_indexes.get(&key) {
+            return disk_idx.lock().unwrap().lookup(&encoded).ok();
         }
 
         None
@@ -405,8 +407,9 @@ impl IndexManager {
         }
 
         // Fall back to disk-based index
-        if let Some(disk_idx) = self.disk_indexes.get_mut(&key) {
+        if let Some(disk_idx) = self.disk_indexes.get(&key) {
             return disk_idx
+                .lock().unwrap()
                 .range_scan(low_bytes.as_deref(), high_bytes.as_deref())
                 .ok();
         }
@@ -431,13 +434,13 @@ impl IndexManager {
         }
 
         // Fall back to disk-based index (use range_scan with lo=encoded, hi=None)
-        if let Some(disk_idx) = self.disk_indexes.get_mut(&key) {
+        if let Some(disk_idx) = self.disk_indexes.get(&key) {
             // GT means strictly greater than, so we need to find the first key > encoded
             // and scan from there. Use range_scan with lo just past encoded.
             // For simplicity, use range_scan with lo=encoded+1 byte
             let mut lo = encoded.clone();
             lo.push(0u8); // This makes it strictly greater
-            return disk_idx.range_scan(Some(&lo), None).ok();
+            return disk_idx.lock().unwrap().range_scan(Some(&lo), None).ok();
         }
 
         None
@@ -460,8 +463,8 @@ impl IndexManager {
         }
 
         // Fall back to disk-based index (use range_scan with lo=None, hi=encoded-1)
-        if let Some(disk_idx) = self.disk_indexes.get_mut(&key) {
-            return disk_idx.range_scan(None, Some(&encoded)).ok();
+        if let Some(disk_idx) = self.disk_indexes.get(&key) {
+            return disk_idx.lock().unwrap().range_scan(None, Some(&encoded)).ok();
         }
 
         None
@@ -469,7 +472,7 @@ impl IndexManager {
 
     // ── Read-only lookup methods (for concurrent read path, &self) ──
 
-    /// Read-only equality lookup using in-memory index only.
+    /// Read-only equality lookup using in-memory index first, then disk-based index.
     pub fn lookup_eq_read(
         &self,
         class: &str,
@@ -478,7 +481,18 @@ impl IndexManager {
     ) -> Option<Vec<Vec<u8>>> {
         let key = (class.to_string(), column.to_string());
         let encoded = Self::encode_value(value);
-        self.indexes.get(&key).map(|tree| tree.lookup(&encoded))
+
+        // Try in-memory index first
+        if let Some(tree) = self.indexes.get(&key) {
+            return Some(tree.lookup(&encoded));
+        }
+
+        // Fall back to disk-based index (uses RefCell for interior mutability)
+        if let Some(disk_idx) = self.disk_indexes.get(&key) {
+            return disk_idx.lock().unwrap().lookup(&encoded).ok();
+        }
+
+        None
     }
 
     /// Read-only range scan using in-memory index only.
@@ -585,7 +599,7 @@ impl IndexManager {
                 if let Some(path) = self.index_path(&class, &column) {
                     match BTreeIndex::create(&path, &class, &column) {
                         Ok(idx) => {
-                            self.disk_indexes.insert(disk_key.clone(), idx);
+                            self.disk_indexes.insert(disk_key.clone(), Mutex::new(idx));
                         }
                         Err(e) => {
                             eprintln!(
@@ -603,9 +617,9 @@ impl IndexManager {
                     }
                 }
             }
-            if let Some(disk_idx) = self.disk_indexes.get_mut(&disk_key) {
+            if let Some(disk_idx) = self.disk_indexes.get(&disk_key) {
                 for (encoded_val, pk) in &index_entries {
-                    if let Err(e) = disk_idx.insert(encoded_val, pk.clone()) {
+                    if let Err(e) = disk_idx.lock().unwrap().insert(encoded_val, pk.clone()) {
                         eprintln!(
                             "Warning: disk index rebuild failed for {}.{}: {}",
                             class, column, e
@@ -627,8 +641,8 @@ impl IndexManager {
         }
 
         // Flush all disk indexes after rebuild (with fsync)
-        for disk_idx in self.disk_indexes.values_mut() {
-            let _ = disk_idx.flush();
+        for disk_idx in self.disk_indexes.values() {
+            let _ = disk_idx.lock().unwrap().flush();
         }
     }
 
