@@ -459,29 +459,41 @@ impl SsTable {
             return Ok(0);
         }
 
-        // Check if already has new footer (flags byte at offset 24 from end)
+        // Check if already has new footer
         if file_len >= 33 {
             let mut f = std::fs::File::open(path_ref)?;
-            f.seek(SeekFrom::End(-9))?; // 33 - 24 = 9 bytes from end to flags
-            let mut flag_buf = [0u8; 1];
-            f.read_exact(&mut flag_buf)?;
-            if flag_buf[0] & FLAG_HAS_MAX_SEQ != 0 {
+            // Read last 33 bytes to verify magic + flags
+            f.seek(SeekFrom::End(-33))?;
+            let mut buf33 = [0u8; 33];
+            f.read_exact(&mut buf33)?;
+            let magic = u64::from_le_bytes(buf33[16..24].try_into().unwrap());
+            let flags = buf33[24];
+            if magic == MAGIC && flags & FLAG_HAS_MAX_SEQ != 0 {
                 return Ok(0); // already upgraded
             }
         }
 
         // Scan all entries for max_seq_no
-        let sst = SsTable::open(path_ref)?;
+        let sst = match SsTable::open(path_ref) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[upgrade_footer] open failed for {:?}: {}", path_ref, e);
+                return Ok(0);
+            }
+        };
         let mut max_seq: SeqNo = 0;
+        let mut entry_count: u64 = 0;
         if let Ok(iter) = sst.iter() {
             let mut it = iter;
             while it.is_valid() {
                 max_seq = max_seq.max(it.seq_no());
+                entry_count += 1;
                 it.next();
             }
         }
 
         if max_seq == 0 {
+            eprintln!("[upgrade_footer] max_seq=0 for {:?} (entries={})", path_ref, entry_count);
             return Ok(0);
         }
 
