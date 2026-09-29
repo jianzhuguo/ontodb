@@ -1226,6 +1226,67 @@ async fn execute_query(
                         }
                     }
                 }
+                onto_query::OntoQLAst::CreateClass { name, extends, .. } => {
+                    if let Some(parent) = extends {
+                        // Handle EXTENDS: update existing class's superclass
+                        match state.executor.add_class_extends(name, parent) {
+                            Ok(()) => {
+                                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                                state.metrics.record_query("ALTER_CLASS_EXTENDS", elapsed_ms / 1000.0, true);
+                                return (
+                                    StatusCode::OK,
+                                    PrettyJson(
+                                        ApiResponse::success(
+                                            json!({"message": format!("Class '{}' now extends '{}'", name, parent)}),
+                                            elapsed_ms,
+                                        ),
+                                        req.pretty,
+                                    ),
+                                );
+                            }
+                            Err(e) => {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    PrettyJson(ApiResponse::<Value>::error(e.to_string()), false),
+                                );
+                            }
+                        }
+                    }
+                    // No EXTENDS: fall through to normal CREATE ONTOLOGY path below
+                    match ontoql_ast.to_query_ast() {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                PrettyJson(ApiResponse::<Value>::error(format!("OntoQL translation error: {}", e)), false),
+                            );
+                        }
+                    }
+                }
+                onto_query::OntoQLAst::CreateProperty { name, domain, range, required, multi_valued, .. } => {
+                    match state.executor.add_ontology_property(name, domain, range, *required, *multi_valued) {
+                        Ok(()) => {
+                            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                            state.metrics.record_query("CREATE_PROPERTY", elapsed_ms / 1000.0, true);
+                            return (
+                                StatusCode::OK,
+                                PrettyJson(
+                                    ApiResponse::success(
+                                        json!({"message": format!("Property '{}' added to '{}'", name, domain)}),
+                                        elapsed_ms,
+                                    ),
+                                    req.pretty,
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                PrettyJson(ApiResponse::<Value>::error(e.to_string()), false),
+                            );
+                        }
+                    }
+                }
                 onto_query::OntoQLAst::SelectTriples {
                     subject,
                     predicate,

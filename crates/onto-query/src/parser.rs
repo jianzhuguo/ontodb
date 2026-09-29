@@ -323,6 +323,23 @@ pub enum QueryAst {
 
     /// DROP ONTOLOGY <name>
     DropOntology { name: String },
+
+    /// CREATE PROPERTY <name> DOMAIN <class> RANGE <type> [REQUIRED] [MULTI_VALUED]
+    /// Adds a property definition to an existing ontology.
+    CreateOntologyProperty {
+        name: String,
+        domain: String,
+        range: String,
+        required: bool,
+        multi_valued: bool,
+    },
+
+    /// ALTER CLASS <name> EXTENDS <parent>
+    /// Updates a class's superclass in its ontology.
+    AlterClassExtends {
+        class_name: String,
+        parent_name: String,
+    },
 }
 
 /// Column definition for CREATE TABLE.
@@ -416,6 +433,8 @@ impl QueryAst {
             QueryAst::RefreshMaterializedView { .. } => false,
             QueryAst::VacuumTable { .. } => false,
             QueryAst::ShowTableStats { .. } => false,
+            QueryAst::CreateOntologyProperty { .. } => false,
+            QueryAst::AlterClassExtends { .. } => false,
 
             // Transaction control
             QueryAst::Begin => false,

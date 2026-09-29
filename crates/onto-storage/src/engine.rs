@@ -186,7 +186,7 @@ impl PreLoadEngine {
         Ok(())
     }
 
-    fn load_sstables(&mut self) -> Result<()> {
+    fn load_sstables(&mut self) -> Result<Vec<PathBuf>> {
         let dir_entries = fs::read_dir(&self.options.data_dir)?;
         let mut sst_files: Vec<PathBuf> = Vec::new();
         for entry in dir_entries {
@@ -197,8 +197,9 @@ impl PreLoadEngine {
             }
         }
         sst_files.sort();
-        // Use max_seq from WAL replay — no need to scan SST entries
+        // Use max_seq from WAL replay AND scan SST entries for their max seq_no
         let mut max_seq = self.seq_counter.load(Ordering::Relaxed);
+        let mut old_ssts: Vec<PathBuf> = Vec::new();
         for path in sst_files {
             let fname = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             let level = fname
@@ -210,6 +211,22 @@ impl PreLoadEngine {
                 continue;
             }
             let sst = SsTable::open(&path)?;
+            // Use max_seq_no from SST footer (O(1)) for new files,
+            // fall back to scanning for old files without the footer.
+            let sst_max_seq = sst.max_seq_no();
+            if sst_max_seq == 0 {
+                // Old format: scan entries to find max seq_no
+                old_ssts.push(path.clone());
+                if let Ok(iter) = sst.iter() {
+                    let mut sst_iter = iter;
+                    while sst_iter.is_valid() {
+                        max_seq = max_seq.max(sst_iter.seq_no());
+                        sst_iter.next();
+                    }
+                }
+            } else {
+                max_seq = max_seq.max(sst_max_seq);
+            }
             let min_key = sst.first_key().unwrap_or_default();
             let max_key = sst.max_key().to_vec();
             let metadata = fs::metadata(&path)?;
@@ -230,7 +247,7 @@ impl PreLoadEngine {
             });
         }
         self.seq_counter.store(max_seq, Ordering::Relaxed);
-        Ok(())
+        Ok(old_ssts)
     }
 }
 
@@ -289,7 +306,34 @@ impl LsmEngine {
             sst_counter: sst_counter.clone(),
         };
         pre_engine.recover()?;
-        pre_engine.load_sstables()?;
+        let old_ssts = pre_engine.load_sstables()?;
+
+        // Spawn background footer upgrade for old SSTs (one-time migration)
+        if !old_ssts.is_empty() {
+            let count = old_ssts.len();
+            tracing::info!("Starting background footer upgrade for {} old SSTs", count);
+            std::thread::Builder::new()
+                .name("sst-footer-upgrade".into())
+                .spawn(move || {
+                    let mut upgraded = 0usize;
+                    for path in &old_ssts {
+                        match SsTable::upgrade_footer(path) {
+                            Ok(seq) if seq > 0 => {
+                                upgraded += 1;
+                                if upgraded % 50 == 0 {
+                                    tracing::info!("Footer upgrade progress: {}/{}", upgraded, count);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!("Footer upgrade failed for {:?}: {}", path, e);
+                            }
+                        }
+                    }
+                    tracing::info!("Footer upgrade complete: {}/{} SSTs upgraded", upgraded, count);
+                })
+                .ok();
+        }
 
         // Spawn the background compaction worker with the loaded levels
         let (levels, compaction_sender, compaction_notif_receiver, _worker_handle) =

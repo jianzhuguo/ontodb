@@ -1435,6 +1435,133 @@ impl QueryExecutor {
         }
     }
 
+    /// Adds a superclass to an existing class in its ontology.
+    /// Uses delete+put to ensure scan_prefix sees the update.
+    pub fn add_class_extends(&self, class_name: &str, parent_name: &str) -> Result<()> {
+        let engine = &self.engine;
+        let ontology_name = class_name;
+        let mut ontology = self
+            .ontology_store
+            .load(Some(onto_ontology::store::DEFAULT_NAMESPACE), ontology_name)
+            .ok()
+            .flatten()
+            .or_else(|| self.ontology_store.load(None, ontology_name).ok().flatten())
+            .ok_or_else(|| {
+                onto_core::CoreError::InvalidArgument(format!(
+                    "Ontology '{}' not found", ontology_name
+                ))
+            })?;
+
+        if let Some(class) = ontology.classes.get_mut(class_name) {
+            if !class.superclasses.contains(&parent_name.to_string()) {
+                class.superclasses.push(parent_name.to_string());
+            }
+        }
+
+        // Delete old entry then save new — ensures scan_prefix sees the update
+        let key = {
+            let mut k = Vec::new();
+            if let Some(ref ns) = ontology.namespace {
+                k.extend_from_slice(b"__ontology__");
+                k.extend_from_slice(ns.as_bytes());
+                k.extend_from_slice(b"::");
+            } else {
+                k.extend_from_slice(b"__ontology__");
+            }
+            k.extend_from_slice(ontology.name.as_bytes());
+            k
+        };
+        engine.delete(key)?;
+        self.ontology_store.save_with_engine(engine, &ontology)?;
+        engine.flush()?;
+        self.inference_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate_ontology(&ontology.name);
+        Ok(())
+    }
+
+    /// Adds a property definition to an existing ontology.
+    pub fn add_ontology_property(
+        &self,
+        name: &str,
+        domain: &str,
+        range: &str,
+        required: bool,
+        multi_valued: bool,
+    ) -> Result<()> {
+        let engine = &self.engine;
+        // Find ontology that contains this class
+        let ontology_name = domain; // ontology named after class
+        let mut ontology = self
+            .ontology_store
+            .load(Some(onto_ontology::store::DEFAULT_NAMESPACE), ontology_name)
+            .ok()
+            .flatten()
+            .or_else(|| self.ontology_store.load(None, ontology_name).ok().flatten())
+            .ok_or_else(|| {
+                onto_core::CoreError::InvalidArgument(format!(
+                    "Ontology '{}' not found for domain '{}'",
+                    ontology_name, domain
+                ))
+            })?;
+
+        let data_type = match onto_ontology::DataType::from_str(range) {
+            Some(dt) => dt,
+            None => {
+                // For object properties, range is a class name — default to String
+                onto_ontology::DataType::String
+            }
+        };
+
+        let property = onto_ontology::Property {
+            name: name.to_string(),
+            description: None,
+            domain: domain.to_string(),
+            range: data_type,
+            required,
+            multi_valued,
+            equivalent_properties: vec![],
+            inverse_of: None,
+            is_transitive: false,
+            is_symmetric: false,
+            is_functional: false,
+            subproperty_of: vec![],
+        };
+
+        ontology
+            .properties
+            .insert(name.to_string(), property);
+        // Also add to class's property list
+        if let Some(class) = ontology.classes.get_mut(domain) {
+            if !class.properties.contains(&name.to_string()) {
+                class.properties.push(name.to_string());
+            }
+        }
+
+        // Delete old entry then save new
+        let key = {
+            let mut k = Vec::new();
+            if let Some(ref ns) = ontology.namespace {
+                k.extend_from_slice(b"__ontology__");
+                k.extend_from_slice(ns.as_bytes());
+                k.extend_from_slice(b"::");
+            } else {
+                k.extend_from_slice(b"__ontology__");
+            }
+            k.extend_from_slice(ontology.name.as_bytes());
+            k
+        };
+        engine.delete(key)?;
+        self.ontology_store.save_with_engine(engine, &ontology)?;
+        engine.flush()?;
+        self.inference_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate_ontology(&ontology.name);
+        Ok(())
+    }
+
     /// Returns the active transaction ID, if any.
     pub fn active_txn_id(&self) -> Option<onto_core::SeqNo> {
         *self.active_txn.lock().unwrap_or_else(|e| e.into_inner())

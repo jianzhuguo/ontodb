@@ -31,6 +31,8 @@ const MAGIC: u64 = 0x4F4E544F_44425353; // "ONTO_DBSS"
 
 /// Flag bit indicating data blocks are zstd-compressed.
 const FLAG_COMPRESSED: u8 = 0x01;
+/// Flag bit indicating footer has max_seq_no field (8 bytes after flags).
+const FLAG_HAS_MAX_SEQ: u8 = 0x02;
 
 /// Block format: [entries...][restart_points...][num_restarts: u32]
 const RESTART_INTERVAL: usize = 16;
@@ -57,6 +59,8 @@ pub struct SsTable {
     /// Cached first key (minimum key) in this SSTable.
     /// Loaded once at open() to avoid repeated disk I/O.
     cached_first_key: Vec<u8>,
+    /// Maximum sequence number in this SSTable (stored in footer for fast startup).
+    max_seq_no: SeqNo,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +87,8 @@ pub struct SsTableBuilder {
     keys_for_bloom: Vec<Vec<u8>>,
     /// zstd compression level (0 = disabled, 1-21 = enabled).
     compression_level: i32,
+    /// Maximum sequence number seen during build.
+    max_seq_no: SeqNo,
 }
 
 impl Default for SsTableBuilder {
@@ -105,6 +111,7 @@ impl SsTableBuilder {
             entry_count_in_block: 0,
             keys_for_bloom: Vec::new(),
             compression_level: 0,
+            max_seq_no: 0,
         }
     }
 
@@ -115,6 +122,7 @@ impl SsTableBuilder {
 
     /// Adds an entry to the SSTable. Entries MUST be added in sorted key order.
     pub fn add(&mut self, entry: &Entry) {
+        self.max_seq_no = self.max_seq_no.max(entry.seq_no);
         self.keys_for_bloom.push(entry.key.clone());
 
         // Record restart point
@@ -141,6 +149,7 @@ impl SsTableBuilder {
     /// Adds an entry by taking ownership, avoiding clones for callers that
     /// no longer need the Entry after this call.
     pub fn add_owned(&mut self, entry: Entry) {
+        self.max_seq_no = self.max_seq_no.max(entry.seq_no);
         // Record restart point
         if self.entry_count_in_block.is_multiple_of(RESTART_INTERVAL) {
             self.restart_points.push(self.current_block.len() as u32);
@@ -254,16 +263,17 @@ impl SsTableBuilder {
         let bloom_data = bloom.to_bytes();
         file.write_all(&bloom_data)?;
 
-        // Write footer: index_offset (8) + bloom_offset (8) + magic (8) + flags (1)
+        // Write footer: index_offset (8) + bloom_offset (8) + magic (8) + flags (1) + max_seq_no (8)
         let flags: u8 = if self.compression_level > 0 {
-            FLAG_COMPRESSED
+            FLAG_COMPRESSED | FLAG_HAS_MAX_SEQ
         } else {
-            0
+            FLAG_HAS_MAX_SEQ
         };
         file.write_all(&index_offset.to_le_bytes())?;
         file.write_all(&bloom_offset.to_le_bytes())?;
         file.write_all(&MAGIC.to_le_bytes())?;
         file.write_all(&[flags])?;
+        file.write_all(&self.max_seq_no.to_le_bytes())?;
 
         file.flush()?;
         file.get_ref().sync_all()?;
@@ -292,6 +302,7 @@ impl SsTableBuilder {
             bloom: Some(bloom),
             compressed,
             cached_first_key,
+            max_seq_no: self.max_seq_no,
         })
     }
 
@@ -332,9 +343,29 @@ impl SsTable {
     /// Opens an existing SSTable file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut file = File::open(path.as_ref())?;
+        let file_len = file.metadata()?.len();
+
+        // Try new footer format first (33 bytes: +max_seq_no), fall back to old (25 bytes)
+        let mut max_seq_no: SeqNo = 0;
+        let has_max_seq = if file_len >= 33 {
+            file.seek(SeekFrom::End(-33))?;
+            let mut buf33 = [0u8; 33];
+            file.read_exact(&mut buf33)?;
+            let magic33 = u64::from_le_bytes(buf33[16..24].try_into().unwrap());
+            let flags33 = buf33[24];
+            if magic33 == MAGIC && flags33 & FLAG_HAS_MAX_SEQ != 0 {
+                max_seq_no = u64::from_le_bytes(buf33[25..33].try_into().unwrap());
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         // Read footer: index_offset (8) + bloom_offset (8) + magic (8) + flags (1)
-        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
+        let footer_size: i64 = if has_max_seq { 33 } else { 25 };
+        file.seek(SeekFrom::End(-footer_size))?;
         let mut footer = [0u8; 25];
         file.read_exact(&mut footer)?;
 
@@ -351,7 +382,7 @@ impl SsTable {
         // Read bloom filter
         file.seek(SeekFrom::Start(bloom_offset))?;
         let file_len = file.metadata()?.len();
-        let bloom_data_len = (file_len - FOOTER_SIZE - bloom_offset) as usize;
+        let bloom_data_len = (file_len - footer_size as u64 - bloom_offset) as usize;
         let mut bloom_data = vec![0u8; bloom_data_len];
         file.read_exact(&mut bloom_data)?;
         let bloom = BloomFilter::from_bytes(&bloom_data);
@@ -408,7 +439,68 @@ impl SsTable {
             bloom,
             compressed,
             cached_first_key,
+            max_seq_no,
         })
+    }
+
+    /// Returns the maximum sequence number in this SSTable.
+    /// Returns 0 for SSTables written before this feature was added.
+    pub fn max_seq_no(&self) -> SeqNo {
+        self.max_seq_no
+    }
+
+    /// Upgrades an old-format SST footer to include max_seq_no.
+    /// Scans all entries once, then appends max_seq_no to the footer.
+    /// Returns the max_seq_no written, or 0 if already upgraded.
+    pub fn upgrade_footer(path: impl AsRef<Path>) -> Result<SeqNo> {
+        let path_ref = path.as_ref();
+        let file_len = std::fs::metadata(path_ref)?.len();
+        if file_len < 25 {
+            return Ok(0);
+        }
+
+        // Check if already has new footer (flags byte at offset 24 from end)
+        if file_len >= 33 {
+            let mut f = std::fs::File::open(path_ref)?;
+            f.seek(SeekFrom::End(-9))?; // 33 - 24 = 9 bytes from end to flags
+            let mut flag_buf = [0u8; 1];
+            f.read_exact(&mut flag_buf)?;
+            if flag_buf[0] & FLAG_HAS_MAX_SEQ != 0 {
+                return Ok(0); // already upgraded
+            }
+        }
+
+        // Scan all entries for max_seq_no
+        let sst = SsTable::open(path_ref)?;
+        let mut max_seq: SeqNo = 0;
+        if let Ok(iter) = sst.iter() {
+            let mut it = iter;
+            while it.is_valid() {
+                max_seq = max_seq.max(it.seq_no());
+                it.next();
+            }
+        }
+
+        if max_seq == 0 {
+            return Ok(0);
+        }
+
+        // Read old footer (last 25 bytes)
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path_ref)?;
+        f.seek(SeekFrom::End(-25))?;
+        let mut old_footer = [0u8; 25];
+        f.read_exact(&mut old_footer)?;
+
+        // Update flags to include FLAG_HAS_MAX_SEQ
+        old_footer[24] |= FLAG_HAS_MAX_SEQ;
+
+        // Write back: old footer (25 bytes) + max_seq_no (8 bytes)
+        f.seek(SeekFrom::End(-25))?;
+        f.write_all(&old_footer)?;
+        f.write_all(&max_seq.to_le_bytes())?;
+        f.sync_all()?;
+
+        Ok(max_seq)
     }
 
     /// Gets a value by key. Returns:
