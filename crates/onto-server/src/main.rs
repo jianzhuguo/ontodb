@@ -332,6 +332,9 @@ fn main() -> Result<()> {
         )
     };
 
+    // Auto-create source/target indexes for all existing relation tables
+    executor.ensure_all_relation_indexes();
+
     if args.interactive {
         run_repl(&executor)?;
     } else {

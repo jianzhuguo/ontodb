@@ -194,13 +194,20 @@ impl<'a> BinaryRow<'a> {
     }
 
     /// Convert the binary row to a `Map<String, Value>`.
+    /// Fields with unrecognized tags are skipped rather than failing the entire conversion.
     pub fn to_map(&self) -> Option<Map<String, Value>> {
         let mut map = Map::with_capacity(self.num_fields as usize);
         for i in 0..self.num_fields as usize {
             let name = self.field_name(i).to_string();
             let (tag, raw) = self.field_value_raw(i);
-            let value = binary_to_serde_value(tag, raw)?;
-            map.insert(name, value);
+            if let Some(value) = binary_to_serde_value(tag, raw) {
+                map.insert(name, value);
+            } else {
+                eprintln!("[to_map] SKIP field='{}' tag={} raw_len={}", name, tag, raw.len());
+            }
+        }
+        if map.len() < self.num_fields as usize {
+            eprintln!("[to_map] {}/{} fields converted, keys={:?}", map.len(), self.num_fields, map.keys().collect::<Vec<_>>());
         }
         Some(map)
     }

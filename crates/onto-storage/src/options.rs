@@ -70,7 +70,7 @@ impl Default for StorageOptions {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("./ontodb_data"),
-            memtable_size_limit: 4 * 1024 * 1024, // 4MB
+            memtable_size_limit: 64 * 1024 * 1024, // 64MB
             block_size: 4096,                     // 4KB
             num_levels: 7,
             size_ratio: 10,

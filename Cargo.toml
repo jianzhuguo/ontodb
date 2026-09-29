@@ -14,6 +14,10 @@ members = [
     "crates/onto-edge-bin",
     "crates/ontodb-rules",
     "tools/migrate-namespace",
+    "tools/check_sst",
+    "tools/recover_data",
+    "tools/fix_key_prefix",
+    "tools/clean_index",
 ]
 
 [workspace.package]

@@ -7,7 +7,7 @@
 //! Generates multiple candidate plans and selects the lowest-cost one.
 
 use super::cost::{CostEstimate, CostModel, FilterSelectivity, IndexStats, TableStats};
-use crate::parser::{FilterExpr, JoinClause, OrderBy, QueryAst, SelectColumns, SelectItem};
+use crate::parser::{FilterExpr, JoinClause, JoinOn, JoinType, LiteralValue, OrderBy, QueryAst, SelectColumns, SelectItem};
 use onto_core::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -78,6 +78,16 @@ pub enum PlanNode {
         left: Box<PlanNode>,
         right: Box<PlanNode>,
         join_clause: JoinClause,
+        estimated_rows: u64,
+    },
+
+    /// Index nested loop join: for each left row, do an index lookup on the right table.
+    IndexNestedLoopJoin {
+        left: Box<PlanNode>,
+        right_table: String,
+        right_alias: Option<String>,
+        join_clause: JoinClause,
+        index_column: String,
         estimated_rows: u64,
     },
 
@@ -279,6 +289,19 @@ impl ExecutionPlan {
                 self.describe_node(left, depth + 1, output);
                 self.describe_node(right, depth + 1, output);
             }
+            PlanNode::IndexNestedLoopJoin {
+                left,
+                right_table,
+                index_column,
+                estimated_rows,
+                ..
+            } => {
+                output.push_str(&format!(
+                    "{}IndexNestedLoopJoin on {} using {} (rows: {})\n",
+                    indent, right_table, index_column, estimated_rows
+                ));
+                self.describe_node(left, depth + 1, output);
+            }
             PlanNode::SortMergeJoin {
                 left,
                 right,
@@ -473,6 +496,157 @@ impl QueryPlanner {
         }
     }
 
+    /// Resolve cross joins (comma-separated tables) by extracting join conditions
+    /// from the WHERE clause. For `FROM A a, B b WHERE a.id = b.a_id AND ...`:
+    /// - Creates a proper JoinClause with ON condition
+    /// - Removes the join condition from WHERE
+    fn resolve_cross_joins(
+        main_table: &str,
+        main_alias: Option<&str>,
+        joins: &[JoinClause],
+        filter: &Option<FilterExpr>,
+    ) -> (Vec<JoinClause>, Option<FilterExpr>) {
+        let mut resolved = Vec::new();
+        let mut remaining_preds: Vec<FilterExpr> = Vec::new();
+
+        // Split WHERE into individual predicates
+        let preds = match filter {
+            Some(f) => Self::split_and_predicates(f),
+            None => {
+                return (joins.to_vec(), None);
+            }
+        };
+
+        // Separate cross joins from normal joins
+        let cross_joins: Vec<&JoinClause> = joins
+            .iter()
+            .filter(|j| matches!(j.join_type, JoinType::Cross))
+            .collect();
+        let normal_joins: Vec<JoinClause> = joins
+            .iter()
+            .filter(|j| !matches!(j.join_type, JoinType::Cross))
+            .cloned()
+            .collect();
+
+        // Build alias -> table mapping
+        let mut alias_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        alias_map.insert(main_table.to_string(), main_table.to_string());
+        if let Some(a) = main_alias {
+            alias_map.insert(a.to_string(), main_table.to_string());
+        }
+        for j in &cross_joins {
+            alias_map.insert(j.table.clone(), j.table.clone());
+            if let Some(a) = &j.alias {
+                alias_map.insert(a.clone(), j.table.clone());
+            }
+        }
+
+        // Track which cross joins have been resolved
+        let mut resolved_cross: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut cross_join_map: std::collections::HashMap<String, &JoinClause> =
+            std::collections::HashMap::new();
+        for j in &cross_joins {
+            let key = j.alias.clone().unwrap_or_else(|| j.table.clone());
+            cross_join_map.insert(key, j);
+        }
+
+        for pred in preds {
+            // Check if this is an equality predicate referencing two different tables.
+            // The parser may represent `c.source = v.id` as Eq("c.source", String("v.id"))
+            // since it doesn't distinguish column refs from string literals.
+            let col_pair = match &pred {
+                FilterExpr::Eq(col_a, LiteralValue::String(col_b))
+                    if col_a.contains('.') && col_b.contains('.') =>
+                {
+                    Some((col_a.clone(), col_b.clone()))
+                }
+                _ => None,
+            };
+
+            if let Some((col_a, col_b)) = col_pair {
+                let cross_refs: Vec<JoinClause> = cross_joins.iter().map(|j| (*j).clone()).collect();
+                let table_a = Self::table_for_column(&col_a, main_table, main_alias, &cross_refs);
+                let table_b = Self::table_for_column(&col_b, main_table, main_alias, &cross_refs);
+
+                if let (Some(ta), Some(tb)) = (&table_a, &table_b) {
+                    if ta != tb {
+                        // This is a cross-table join condition
+                        let join_key = if ta == main_table || Some(ta.as_str()) == main_alias {
+                            tb.clone()
+                        } else {
+                            ta.clone()
+                        };
+
+                        if let Some(cj) = cross_join_map.get(&join_key) {
+                            let key = cj.alias.clone().unwrap_or_else(|| cj.table.clone());
+                            if !resolved_cross.contains(&key) {
+                                resolved.push(JoinClause {
+                                    table: cj.table.clone(),
+                                    alias: cj.alias.clone(),
+                                    on: JoinOn {
+                                        left: col_a,
+                                        right: col_b,
+                                    },
+                                    join_type: JoinType::Inner,
+                                });
+                                resolved_cross.insert(key);
+                            }
+                            continue; // Don't add to remaining
+                        }
+                    }
+                }
+            }
+            remaining_preds.push(pred);
+        }
+
+        // Add unresolved cross joins as-is (shouldn't happen for well-formed queries)
+        for j in &cross_joins {
+            let key = j.alias.clone().unwrap_or_else(|| j.table.clone());
+            if !resolved_cross.contains(&key) {
+                resolved.push((*j).clone());
+            }
+        }
+
+        // Add normal joins
+        resolved.extend(normal_joins);
+
+        let remaining = if remaining_preds.is_empty() {
+            None
+        } else {
+            Some(
+                remaining_preds
+                    .into_iter()
+                    .reduce(|a, b| FilterExpr::And(Box::new(a), Box::new(b)))
+                    .unwrap(),
+            )
+        };
+
+        (resolved, remaining)
+    }
+
+    /// Determine which table a column belongs to based on its prefix.
+    fn table_for_column(
+        col: &str,
+        main_table: &str,
+        main_alias: Option<&str>,
+        joins: &[JoinClause],
+    ) -> Option<String> {
+        if let Some(dot_pos) = col.find('.') {
+            let prefix = &col[..dot_pos];
+            if prefix == main_table || Some(prefix) == main_alias {
+                return Some(main_table.to_string());
+            }
+            for j in joins {
+                if Some(prefix) == j.alias.as_deref() || prefix == j.table {
+                    return Some(j.table.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// Plan a SELECT query with predicate pushdown optimization.
     fn plan_select(
         &self,
@@ -486,6 +660,10 @@ impl QueryPlanner {
         order_by: &[OrderBy],
         limit: Option<usize>,
     ) -> Result<ExecutionPlan> {
+        // Resolve cross joins: extract join conditions from WHERE for comma-separated tables
+        let (resolved_joins, resolved_filter) =
+            Self::resolve_cross_joins(from, from_alias, joins, filter);
+
         let stats = self.stats.get(from).cloned().unwrap_or_else(|| TableStats {
             row_count: 1000,
             avg_row_size: 100,
@@ -498,13 +676,17 @@ impl QueryPlanner {
 
         // Apply predicate pushdown optimization
         let (pushed_filters, remaining_filter) =
-            self.pushdown_predicates(from, from_alias, joins, filter);
+            self.pushdown_predicates(from, from_alias, &resolved_joins, &resolved_filter);
 
         // Generate candidate plans
         let mut candidates = Vec::new();
 
         // Candidate 1: Sequential scan with pushed predicates
-        let main_filter = pushed_filters.get(from).cloned().flatten();
+        let main_filter = pushed_filters
+            .get(from)
+            .cloned()
+            .flatten()
+            .map(Self::strip_filter_prefix);
         let seq_plan = self.plan_seq_scan(
             from,
             from_alias,
@@ -516,6 +698,7 @@ impl QueryPlanner {
             order_by,
             limit,
             columns,
+            &pushed_filters,
         );
         candidates.push(seq_plan);
 
@@ -541,6 +724,7 @@ impl QueryPlanner {
                             order_by,
                             limit,
                             columns,
+                            &pushed_filters,
                         );
                         candidates.push(index_plan);
                     }
@@ -690,6 +874,37 @@ impl QueryPlanner {
         (pushed_filters, remaining)
     }
 
+    /// Strip table prefix from column names in a filter expression.
+    /// `t.column_name` → `column_name`, `column_name` → `column_name`
+    fn strip_filter_prefix(filter: FilterExpr) -> FilterExpr {
+        let strip = |col: &str| -> String {
+            col.split('.').next_back().unwrap_or(col).to_string()
+        };
+        match filter {
+            FilterExpr::Eq(c, v) => FilterExpr::Eq(strip(&c), v),
+            FilterExpr::Ne(c, v) => FilterExpr::Ne(strip(&c), v),
+            FilterExpr::Gt(c, v) => FilterExpr::Gt(strip(&c), v),
+            FilterExpr::Lt(c, v) => FilterExpr::Lt(strip(&c), v),
+            FilterExpr::Gte(c, v) => FilterExpr::Gte(strip(&c), v),
+            FilterExpr::Lte(c, v) => FilterExpr::Lte(strip(&c), v),
+            FilterExpr::Like(c, v) => FilterExpr::Like(strip(&c), v),
+            FilterExpr::Between(c, lo, hi) => FilterExpr::Between(strip(&c), lo, hi),
+            FilterExpr::In(c, v) => FilterExpr::In(strip(&c), v),
+            FilterExpr::IsNull(c) => FilterExpr::IsNull(strip(&c)),
+            FilterExpr::IsNotNull(c) => FilterExpr::IsNotNull(strip(&c)),
+            FilterExpr::And(l, r) => FilterExpr::And(
+                Box::new(Self::strip_filter_prefix(*l)),
+                Box::new(Self::strip_filter_prefix(*r)),
+            ),
+            FilterExpr::Or(l, r) => FilterExpr::Or(
+                Box::new(Self::strip_filter_prefix(*l)),
+                Box::new(Self::strip_filter_prefix(*r)),
+            ),
+            FilterExpr::Not(e) => FilterExpr::Not(Box::new(Self::strip_filter_prefix(*e))),
+            other => other,
+        }
+    }
+
     /// Split AND predicates into individual predicates.
     fn split_and_predicates(expr: &FilterExpr) -> Vec<FilterExpr> {
         match expr {
@@ -733,11 +948,10 @@ impl QueryPlanner {
             if table_prefix == main_table || Some(table_prefix) == main_alias {
                 return Some(main_table.to_string());
             }
-            // Match against join tables - DON'T push down
-            // (join alias references must be resolved after the join)
+            // Match against join tables - push down to reduce scan size
             for join in joins {
                 if table_prefix == join.table || Some(table_prefix) == join.alias.as_deref() {
-                    return None; // Keep as post-join filter
+                    return Some(join.table.clone());
                 }
             }
         }
@@ -759,6 +973,7 @@ impl QueryPlanner {
         order_by: &[OrderBy],
         limit: Option<usize>,
         columns: &SelectColumns,
+        pushed_filters: &HashMap<String, Option<FilterExpr>>,
     ) -> ExecutionPlan {
         // Start with seq scan — push filter directly into the node for scan-time evaluation
         let scan_cost = self.cost_model.seq_scan_cost(stats);
@@ -810,7 +1025,7 @@ impl QueryPlanner {
                 .split('.')
                 .next_back()
                 .unwrap_or(&join.on.right);
-            let has_index = right_stats
+            let has_join_index = right_stats
                 .secondary_indexes
                 .iter()
                 .any(|i| i.column == right_col);
@@ -818,8 +1033,67 @@ impl QueryPlanner {
             // For LIMIT pushdown: if we can push limit, use it for the right side scan
             let effective_limit = if can_push_limit { limit } else { None };
 
-            let right_plan = if has_index {
-                // Use index scan for the right side of join
+            // Get pushed filter for this join table, strip table prefix for scan-time evaluation
+            let join_filter = pushed_filters
+                .get(&join.table)
+                .cloned()
+                .flatten()
+                .map(Self::strip_filter_prefix);
+
+            // Check if any pushed filter column has an index (e.g., genesymbol).
+            // If so, use index scan on that column — highly selective predicates
+            // benefit greatly from index access even though the join column differs.
+            let filter_index_col = join_filter.as_ref().and_then(|f| {
+                let col = match f {
+                    FilterExpr::Eq(c, _)
+                    | FilterExpr::Ne(c, _)
+                    | FilterExpr::Gt(c, _)
+                    | FilterExpr::Lt(c, _)
+                    | FilterExpr::Gte(c, _)
+                    | FilterExpr::Lte(c, _) => c.clone(),
+                    FilterExpr::Like(c, _) => c.clone(),
+                    FilterExpr::Between(c, _, _) => c.clone(),
+                    FilterExpr::In(c, _) => c.clone(),
+                    FilterExpr::IsNull(c) | FilterExpr::IsNotNull(c) => c.clone(),
+                    _ => return None,
+                };
+                if right_stats
+                    .secondary_indexes
+                    .iter()
+                    .any(|i| i.column == col)
+                {
+                    Some(col)
+                } else {
+                    None
+                }
+            });
+
+            let (right_plan, right_plan_rows) = if let Some(ref filt_col) = filter_index_col {
+                // Index scan on pushed filter column (e.g., genesymbol = 'TP53')
+                let index = right_stats
+                    .secondary_indexes
+                    .iter()
+                    .find(|i| &i.column == filt_col)
+                    .unwrap();
+                let selectivity = join_filter
+                    .as_ref()
+                    .map(|f| self.cost_model.estimate_selectivity(&right_stats, f).selectivity)
+                    .unwrap_or(1.0);
+                let index_cost = self
+                    .cost_model
+                    .index_range_scan_cost(&right_stats, index, selectivity);
+                (
+                    PlanNode::IndexScan {
+                        table: join.table.clone(),
+                        alias: join.alias.clone(),
+                        index_column: filt_col.clone(),
+                        filter: join_filter.clone(),
+                        estimated_rows: index_cost.rows,
+                    },
+                    index_cost.rows,
+                )
+            } else if has_join_index {
+                // Index scan on join column
                 let index = right_stats
                     .secondary_indexes
                     .iter()
@@ -828,58 +1102,103 @@ impl QueryPlanner {
                 let index_cost = self
                     .cost_model
                     .index_range_scan_cost(&right_stats, index, 1.0);
-                PlanNode::IndexScan {
-                    table: join.table.clone(),
-                    alias: join.alias.clone(),
-                    index_column: right_col.to_string(),
-                    filter: None,
-                    estimated_rows: index_cost.rows,
-                }
+                (
+                    PlanNode::IndexScan {
+                        table: join.table.clone(),
+                        alias: join.alias.clone(),
+                        index_column: right_col.to_string(),
+                        filter: join_filter.clone(),
+                        estimated_rows: index_cost.rows,
+                    },
+                    index_cost.rows,
+                )
             } else {
-                // Use sequential scan with optional limit pushdown
+                // Sequential scan with optional limit pushdown
                 let right_cost = self.cost_model.seq_scan_cost(&right_stats);
                 let scan_rows = if let Some(lim) = effective_limit {
                     right_cost.rows.min(lim as u64)
                 } else {
                     right_cost.rows
                 };
-                PlanNode::SeqScan {
-                    table: join.table.clone(),
-                    alias: join.alias.clone(),
-                    filter: None,
-                    estimated_rows: scan_rows,
-                }
+                (
+                    PlanNode::SeqScan {
+                        table: join.table.clone(),
+                        alias: join.alias.clone(),
+                        filter: join_filter,
+                        estimated_rows: scan_rows,
+                    },
+                    scan_rows,
+                )
             };
 
-            // Choose join algorithm based on cost
-            let right_cost = self.cost_model.seq_scan_cost(&right_stats);
+            // Use right plan's actual row estimate for join cost (not full table size).
+            let right_cost =
+                CostEstimate::new(right_plan_rows, 0.0, right_plan_rows as f64 * self.cost_model.index_scan_cpu_per_row);
             let hash_cost = self.cost_model.hash_join_cost(&current_cost, &right_cost);
             let sort_merge_cost = self
                 .cost_model
                 .sort_merge_join_cost(&current_cost, &right_cost);
 
-            // Prefer SortMergeJoin for large tables or when data is already sorted
-            // Prefer HashJoin for smaller tables or when memory is available
-            let use_sort_merge = current_cost.rows > 10000
-                || right_cost.rows > 10000
-                || (current_cost.is_sorted && right_cost.is_sorted);
+            // Check if the right table's join column has an index for IndexNestedLoopJoin.
+            // When the left side is small (e.g., filtered to 400 rows) and the right table
+            // is large with an index on the join column, INLJ avoids scanning the entire
+            // right table — each left row does one index lookup instead.
+            let has_join_index = right_stats
+                .secondary_indexes
+                .iter()
+                .any(|i| i.column == right_col);
 
-            if use_sort_merge && sort_merge_cost.total_cost < hash_cost.total_cost {
-                current_node = PlanNode::SortMergeJoin {
-                    left: Box::new(current_node),
-                    right: Box::new(right_plan),
-                    join_clause: join.clone(),
-                    estimated_rows: sort_merge_cost.rows,
-                };
-                current_cost = sort_merge_cost;
+            // IndexNestedLoopJoin cost: left_rows × index_lookup_cost
+            let inlj_cost = if has_join_index {
+                let index = right_stats
+                    .secondary_indexes
+                    .iter()
+                    .find(|i| i.column == right_col)
+                    .unwrap();
+                let lookup_per_row = self.cost_model.index_lookup_cost(&right_stats, index);
+                let total_io = current_cost.io_cost + current_cost.rows as f64 * lookup_per_row.io_cost;
+                let total_cpu = current_cost.cpu_cost + current_cost.rows as f64 * lookup_per_row.cpu_cost;
+                let estimated_output = (current_cost.rows as f64 * self.cost_model.join_selectivity) as u64;
+                CostEstimate::new(estimated_output, total_io, total_cpu)
             } else {
-                current_node = PlanNode::HashJoin {
+                CostEstimate::new(u64::MAX, f64::MAX, f64::MAX)
+            };
+
+            // Choose join strategy: INLJ > SortMerge > Hash (by cost)
+            if has_join_index && current_cost.rows < 100000 && inlj_cost.total_cost < hash_cost.total_cost {
+                // Index Nested Loop Join: small left side + indexed right side
+                current_node = PlanNode::IndexNestedLoopJoin {
                     left: Box::new(current_node),
-                    right: Box::new(right_plan),
+                    right_table: join.table.clone(),
+                    right_alias: join.alias.clone(),
                     join_clause: join.clone(),
-                    estimated_rows: hash_cost.rows,
+                    index_column: right_col.to_string(),
+                    estimated_rows: inlj_cost.rows,
                 };
-                current_cost = hash_cost;
+                current_cost = inlj_cost;
+            } else {
+                // Prefer SortMergeJoin for large tables or when data is already sorted
+                let use_sort_merge = current_cost.rows > 10000
+                    || right_cost.rows > 10000
+                    || (current_cost.is_sorted && right_cost.is_sorted);
+
+                if use_sort_merge && sort_merge_cost.total_cost < hash_cost.total_cost {
+                    current_node = PlanNode::SortMergeJoin {
+                        left: Box::new(current_node),
+                        right: Box::new(right_plan),
+                        join_clause: join.clone(),
+                        estimated_rows: sort_merge_cost.rows,
+                    };
+                    current_cost = sort_merge_cost;
+                } else {
+                    current_node = PlanNode::HashJoin {
+                        left: Box::new(current_node),
+                        right: Box::new(right_plan),
+                        join_clause: join.clone(),
+                        estimated_rows: hash_cost.rows,
+                    };
+                    current_cost = hash_cost;
+                }
             }
         }
 
@@ -938,6 +1257,7 @@ impl QueryPlanner {
         order_by: &[OrderBy],
         limit: Option<usize>,
         columns: &SelectColumns,
+        pushed_filters: &HashMap<String, Option<FilterExpr>>,
     ) -> ExecutionPlan {
         let filter_selectivity = filter
             .as_ref()
@@ -955,7 +1275,7 @@ impl QueryPlanner {
             table: table.to_string(),
             alias: alias.map(|s| s.to_string()),
             index_column: index.column.clone(),
-            filter: None,
+            filter: filter.clone(),
             estimated_rows: index_cost.rows,
         };
         let mut current_cost = index_cost;
@@ -977,20 +1297,74 @@ impl QueryPlanner {
                     histograms: Vec::new(),
                 });
 
-            // Check if join column has an index for potential index scan
             let right_col = join
                 .on
                 .right
                 .split('.')
                 .next_back()
                 .unwrap_or(&join.on.right);
-            let has_index = right_stats
+            let has_join_index = right_stats
                 .secondary_indexes
                 .iter()
                 .any(|i| i.column == right_col);
 
-            let right_plan = if has_index {
-                // Use index scan for the right side of join
+            // Get pushed filter for this join table
+            let join_filter = pushed_filters
+                .get(&join.table)
+                .cloned()
+                .flatten()
+                .map(Self::strip_filter_prefix);
+
+            // Check if any pushed filter column has an index
+            let filter_index_col = join_filter.as_ref().and_then(|f| {
+                let col = match f {
+                    FilterExpr::Eq(c, _)
+                    | FilterExpr::Ne(c, _)
+                    | FilterExpr::Gt(c, _)
+                    | FilterExpr::Lt(c, _)
+                    | FilterExpr::Gte(c, _)
+                    | FilterExpr::Lte(c, _) => c.clone(),
+                    FilterExpr::Like(c, _) => c.clone(),
+                    FilterExpr::Between(c, _, _) => c.clone(),
+                    FilterExpr::In(c, _) => c.clone(),
+                    FilterExpr::IsNull(c) | FilterExpr::IsNotNull(c) => c.clone(),
+                    _ => return None,
+                };
+                if right_stats
+                    .secondary_indexes
+                    .iter()
+                    .any(|i| i.column == col)
+                {
+                    Some(col)
+                } else {
+                    None
+                }
+            });
+
+            let (right_plan, right_plan_rows) = if let Some(ref filt_col) = filter_index_col {
+                let index = right_stats
+                    .secondary_indexes
+                    .iter()
+                    .find(|i| &i.column == filt_col)
+                    .unwrap();
+                let selectivity = join_filter
+                    .as_ref()
+                    .map(|f| self.cost_model.estimate_selectivity(&right_stats, f).selectivity)
+                    .unwrap_or(1.0);
+                let index_cost = self
+                    .cost_model
+                    .index_range_scan_cost(&right_stats, index, selectivity);
+                (
+                    PlanNode::IndexScan {
+                        table: join.table.clone(),
+                        alias: join.alias.clone(),
+                        index_column: filt_col.clone(),
+                        filter: join_filter.clone(),
+                        estimated_rows: index_cost.rows,
+                    },
+                    index_cost.rows,
+                )
+            } else if has_join_index {
                 let index = right_stats
                     .secondary_indexes
                     .iter()
@@ -999,26 +1373,32 @@ impl QueryPlanner {
                 let index_cost = self
                     .cost_model
                     .index_range_scan_cost(&right_stats, index, 1.0);
-                PlanNode::IndexScan {
-                    table: join.table.clone(),
-                    alias: join.alias.clone(),
-                    index_column: right_col.to_string(),
-                    filter: None,
-                    estimated_rows: index_cost.rows,
-                }
+                (
+                    PlanNode::IndexScan {
+                        table: join.table.clone(),
+                        alias: join.alias.clone(),
+                        index_column: right_col.to_string(),
+                        filter: join_filter,
+                        estimated_rows: index_cost.rows,
+                    },
+                    index_cost.rows,
+                )
             } else {
-                // Use sequential scan
                 let right_cost = self.cost_model.seq_scan_cost(&right_stats);
-                PlanNode::SeqScan {
-                    table: join.table.clone(),
-                    alias: join.alias.clone(),
-                    filter: None,
-                    estimated_rows: right_cost.rows,
-                }
+                (
+                    PlanNode::SeqScan {
+                        table: join.table.clone(),
+                        alias: join.alias.clone(),
+                        filter: join_filter,
+                        estimated_rows: right_cost.rows,
+                    },
+                    right_cost.rows,
+                )
             };
 
-            // Use hash join for equi-joins (better performance)
-            let right_cost = self.cost_model.seq_scan_cost(&right_stats);
+            // Use right plan's actual row estimate for join cost
+            let right_cost =
+                CostEstimate::new(right_plan_rows, 0.0, right_plan_rows as f64 * self.cost_model.index_scan_cpu_per_row);
             let join_cost = self.cost_model.hash_join_cost(&current_cost, &right_cost);
 
             current_node = PlanNode::HashJoin {

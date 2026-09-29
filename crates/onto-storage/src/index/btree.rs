@@ -356,18 +356,20 @@ impl BPlusTree {
             _ => unreachable!(),
         };
 
-        // Update parent pointers for children of the new internal node
-        let new_children: Vec<u64> = match self.nodes.get(&new_id).expect("node should exist") {
+        // Update parent pointers for children of the new internal node.
+        // Extract children from the local `new_internal` BEFORE inserting,
+        // since the node isn't in self.nodes yet at this point.
+        let new_children: Vec<u64> = match &new_internal {
             Node::Internal(n) => n.children.clone(),
             _ => unreachable!(),
         };
+        self.nodes.insert(new_id, new_internal);
         for &child_id in &new_children {
             self.node_mut(child_id)
                 .expect("node should exist")
                 .set_parent(Some(new_id));
         }
 
-        self.nodes.insert(new_id, new_internal);
         (promoted_key, new_id)
     }
 
@@ -985,10 +987,162 @@ impl Cursor {
     }
 }
 
-// ══════════════════════════════════════════════════════════════�?
-//  Tests
-// ══════════════════════════════════════════════════════════════�?
+// ======================================================================
+//  Bulk load
+// ======================================================================
 
+impl BPlusTree {
+    /// Builds the tree bottom-up from pre-sorted (key, primary_key) pairs in O(n) time.
+    /// Replaces the entire tree contents. Entries do not need to be perfectly sorted;
+    /// they are sorted internally. Duplicate (key, pk) pairs are deduplicated.
+    pub fn bulk_load(&mut self, entries: Vec<(Vec<u8>, Vec<u8>)>) {
+        let mut entries = entries;
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        // Merge duplicate keys, collecting primary keys per unique key
+        let mut merged: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+        for (key, pk) in entries {
+            if let Some(last) = merged.last_mut() {
+                if last.0 == key {
+                    if !last.1.contains(&pk) {
+                        last.1.push(pk);
+                    }
+                    continue;
+                }
+            }
+            merged.push((key, vec![pk]));
+        }
+
+        let total_pks: usize = merged.iter().map(|(_, pks)| pks.len()).sum();
+
+        self.nodes.clear();
+        self.next_id = 0;
+        self.len = total_pks;
+
+        if merged.is_empty() {
+            let root_id = self.alloc_id();
+            self.nodes.insert(
+                root_id,
+                Node::Leaf(LeafNode {
+                    keys: Vec::new(),
+                    values: Vec::new(),
+                    next: None,
+                    parent: None,
+                }),
+            );
+            self.root = root_id;
+            return;
+        }
+
+        // Build leaf nodes from chunks of MAX_KEYS entries
+        let mut current_level: Vec<(u64, Vec<u8>)> = Vec::new();
+        for chunk in merged.chunks(MAX_KEYS) {
+            let leaf_id = self.alloc_id();
+            let keys: Vec<Vec<u8>> = chunk.iter().map(|(k, _)| k.clone()).collect();
+            let values: Vec<Vec<Vec<u8>>> = chunk.iter().map(|(_, v)| v.clone()).collect();
+            let min_key = keys[0].clone();
+            self.nodes.insert(
+                leaf_id,
+                Node::Leaf(LeafNode {
+                    keys,
+                    values,
+                    next: None,
+                    parent: None,
+                }),
+            );
+            current_level.push((leaf_id, min_key));
+        }
+
+        // Link leaf chain
+        for i in 0..current_level.len().saturating_sub(1) {
+            if let Node::Leaf(n) = self.nodes.get_mut(&current_level[i].0).unwrap() {
+                n.next = Some(current_level[i + 1].0);
+            }
+        }
+
+        // Build internal nodes bottom-up
+        while current_level.len() > 1 {
+            let mut next_level: Vec<(u64, Vec<u8>)> = Vec::new();
+            for chunk in current_level.chunks(MAX_KEYS + 1) {
+                if chunk.len() == 1 {
+                    next_level.push(chunk[0].clone());
+                    continue;
+                }
+                let internal_id = self.alloc_id();
+                let mut keys = Vec::with_capacity(chunk.len() - 1);
+                for (_, child_min_key) in &chunk[1..] {
+                    keys.push(child_min_key.clone());
+                }
+                let children: Vec<u64> = chunk.iter().map(|(id, _)| *id).collect();
+                let min_key = chunk[0].1.clone();
+                self.nodes.insert(
+                    internal_id,
+                    Node::Internal(InternalNode {
+                        keys,
+                        children,
+                        parent: None,
+                    }),
+                );
+                for &(child_id, _) in chunk {
+                    self.nodes
+                        .get_mut(&child_id)
+                        .unwrap()
+                        .set_parent(Some(internal_id));
+                }
+                next_level.push((internal_id, min_key));
+            }
+            current_level = next_level;
+        }
+
+        self.root = current_level[0].0;
+        self.nodes.get_mut(&self.root).unwrap().set_parent(None);
+    }
+
+    /// Bulk loads entries if beneficial, otherwise falls back to individual inserts.
+    /// - Empty tree: calls bulk_load (O(n))
+    /// - Small tree (< 1000): uses regular insert
+    /// - Large tree: collects all existing entries, merges with new ones, rebuilds via bulk_load
+    pub fn bulk_load_or_insert(&mut self, entries: Vec<(Vec<u8>, Vec<u8>)>) {
+        if self.is_empty() {
+            self.bulk_load(entries);
+        } else if self.len() < 1000 {
+            for (key, pk) in entries {
+                self.insert(key, pk);
+            }
+        } else {
+            let mut all = self.all_entries();
+            all.extend(entries);
+            self.bulk_load(all);
+        }
+    }
+
+    /// Extracts all (key, primary_key) pairs from the tree via leaf chain traversal.
+    fn all_entries(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut entries = Vec::new();
+        let mut cursor = self.cursor_first();
+        while cursor.is_valid(self) {
+            let leaf = match self.get_node(cursor.leaf_id) {
+                Some(Node::Leaf(n)) => n,
+                _ => break,
+            };
+            if cursor.idx >= leaf.keys.len() {
+                cursor.advance(self);
+                continue;
+            }
+            let key = &leaf.keys[cursor.idx];
+            for pk in &leaf.values[cursor.idx] {
+                entries.push((key.clone(), pk.clone()));
+            }
+            cursor.idx += 1;
+        }
+        entries
+    }
+}
+
+
+// ======================================================================
+//  Tests
+// ======================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1525,4 +1679,286 @@ mod tests {
         }
         verify_parents(&tree, root, None);
     }
+
+    /// Regression test: bulk sorted insertion (simulates CREATE INDEX backfill)
+    /// used to panic at split_internal with "node should exist" because the
+    /// new internal node was read from self.nodes before being inserted.
+    #[test]
+    fn test_bulk_sorted_insertion_no_panic() {
+        let mut tree = BPlusTree::new("Drug", "drug_id");
+
+        // Insert 5000 keys in sorted order — triggers many internal splits
+        for i in 0..5000u32 {
+            let key = format!("CHEMBL{:08}", i);
+            tree.insert(key.into_bytes(), format!("pk_{}", i).into_bytes());
+        }
+
+        // Verify tree is structurally sound
+        assert_eq!(tree.len(), 5000);
+
+        // Verify all keys are retrievable
+        for i in 0..5000u32 {
+            let key = format!("CHEMBL{:08}", i);
+            let results = tree.lookup(key.as_bytes());
+            assert_eq!(results.len(), 1, "key {} should be found", key);
+        }
+
+        // Verify parent pointers
+        let root = tree.root;
+        fn verify_parents_bulk(tree: &BPlusTree, node_id: u64, expected_parent: Option<u64>) {
+            let node = tree.get_node(node_id).expect("node should exist");
+            assert_eq!(node.parent_id(), expected_parent, "node {} bad parent", node_id);
+            if let Node::Internal(n) = node {
+                for &child_id in &n.children {
+                    verify_parents_bulk(tree, child_id, Some(node_id));
+                }
+            }
+        }
+        verify_parents_bulk(&tree, root, None);
+
+        // Verify range scan works
+        let range = tree.gte_scan(b"CHEMBL00002500");
+        assert_eq!(range.len(), 2500);
+    }
+
+    /// Test that deletion after bulk insertion doesn't corrupt the tree.
+    #[test]
+    fn test_bulk_insert_then_delete() {
+        let mut tree = BPlusTree::new("Test", "col");
+
+        for i in 0..1000u32 {
+            let key = format!("{:06}", i);
+            tree.insert(key.into_bytes(), format!("pk_{}", i).into_bytes());
+        }
+        assert_eq!(tree.len(), 1000);
+
+        // Delete half
+        for i in 0..500u32 {
+            let key = format!("{:06}", i);
+            tree.remove(key.as_bytes(), format!("pk_{}", i).as_bytes());
+        }
+        assert_eq!(tree.len(), 500);
+
+        // Verify remaining keys
+        for i in 500..1000u32 {
+            let key = format!("{:06}", i);
+            let results = tree.lookup(key.as_bytes());
+            assert_eq!(results.len(), 1);
+        }
+
+        // Verify deleted keys are gone
+        for i in 0..500u32 {
+            let key = format!("{:06}", i);
+            let results = tree.lookup(key.as_bytes());
+            assert_eq!(results.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_bulk_load_correctness() {
+        use std::time::Instant;
+
+        let n = 10_000u32;
+
+        // Create entries (sorted)
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
+            .map(|i| {
+                let key = format!("{:010}", i);
+                let pk = format!("pk_{:08}", i);
+                (key.into_bytes(), pk.into_bytes())
+            })
+            .collect();
+
+        // Bulk load
+        let mut tree = BPlusTree::new("Test", "col");
+        let start = Instant::now();
+        tree.bulk_load(entries);
+        let bulk_duration = start.elapsed();
+
+        assert_eq!(tree.len(), n as usize);
+
+        // Verify all entries are retrievable via lookup
+        for i in 0..n {
+            let key = format!("{:010}", i);
+            let pk = format!("pk_{:08}", i);
+            let results = tree.lookup(key.as_bytes());
+            assert_eq!(results.len(), 1, "key {} should have 1 pk", key);
+            assert_eq!(results[0], pk.as_bytes());
+        }
+
+        // Verify parent pointers are correct
+        let root = tree.root;
+        fn verify_parents(tree: &BPlusTree, node_id: u64, expected_parent: Option<u64>) {
+            let node = tree.get_node(node_id).expect("node should exist");
+            assert_eq!(
+                node.parent_id(),
+                expected_parent,
+                "node {} bad parent",
+                node_id
+            );
+            if let Node::Internal(n) = node {
+                for &child_id in &n.children {
+                    verify_parents(tree, child_id, Some(node_id));
+                }
+            }
+        }
+        verify_parents(&tree, root, None);
+
+        // Verify range scan works
+        let range = tree.range_scan(Some(b"0000005000"), Some(b"0000005099"));
+        assert_eq!(range.len(), 100, "range scan should return 100 results");
+
+        // Verify leaf chain integrity (sorted order)
+        let mut cursor = tree.cursor_first();
+        let mut prev_key: Vec<u8> = Vec::new();
+        let mut count = 0usize;
+        while cursor.is_valid(&tree) {
+            if let Node::Leaf(leaf) = tree.get_node(cursor.leaf_id).expect("node should exist") {
+                if cursor.idx >= leaf.keys.len() {
+                    cursor.advance(&tree);
+                    continue;
+                }
+                let k = &leaf.keys[cursor.idx];
+                assert!(k.as_slice() > prev_key.as_slice(), "keys must be sorted");
+                prev_key = k.clone();
+                count += 1;
+                cursor.idx += 1;
+            }
+        }
+        assert_eq!(count, n as usize);
+
+        // Compare timing with individual insert
+        let mut tree2 = BPlusTree::new("Test", "col");
+        let entries2: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
+            .map(|i| {
+                let key = format!("{:010}", i);
+                let pk = format!("pk_{:08}", i);
+                (key.into_bytes(), pk.into_bytes())
+            })
+            .collect();
+
+        let start = Instant::now();
+        for (key, pk) in entries2 {
+            tree2.insert(key, pk);
+        }
+        let insert_duration = start.elapsed();
+
+        println!(
+            "bulk_load: {:?}, individual insert: {:?}, speedup: {:.1}x",
+            bulk_duration,
+            insert_duration,
+            insert_duration.as_secs_f64() / bulk_duration.as_secs_f64().max(0.000001)
+        );
+
+        // Verify the second tree has the same data
+        assert_eq!(tree2.len(), n as usize);
+        let range2 = tree2.range_scan(Some(b"0000005000"), Some(b"0000005099"));
+        assert_eq!(range2, range, "range scan results should match");
+    }
+
+    #[test]
+    fn test_bulk_load_empty() {
+        let mut tree = BPlusTree::new("Test", "col");
+        tree.bulk_load(vec![]);
+        assert_eq!(tree.len(), 0);
+        assert!(tree.is_empty());
+        assert!(tree.get_node(tree.root).expect("node").is_leaf());
+    }
+
+    #[test]
+    fn test_bulk_load_single_entry() {
+        let mut tree = BPlusTree::new("Test", "col");
+        tree.bulk_load(vec![(b"key1".to_vec(), b"pk1".to_vec())]);
+        assert_eq!(tree.len(), 1);
+        let results = tree.lookup(b"key1");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], b"pk1");
+    }
+
+    #[test]
+    fn test_bulk_load_duplicate_keys() {
+        let mut tree = BPlusTree::new("Test", "col");
+        tree.bulk_load(vec![
+            (b"same".to_vec(), b"pk1".to_vec()),
+            (b"same".to_vec(), b"pk2".to_vec()),
+            (b"same".to_vec(), b"pk1".to_vec()), // exact dup
+        ]);
+        assert_eq!(tree.len(), 2); // pk1 deduplicated
+        let results = tree.lookup(b"same");
+        assert_eq!(results.len(), 2);
+        assert!(results.contains(&b"pk1".to_vec()));
+        assert!(results.contains(&b"pk2".to_vec()));
+    }
+
+    #[test]
+    fn test_bulk_load_or_insert_empty_tree() {
+        let mut tree = BPlusTree::new("Test", "col");
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..100u32)
+            .map(|i| {
+                (
+                    format!("{:06}", i).into_bytes(),
+                    format!("pk_{}", i).into_bytes(),
+                )
+            })
+            .collect();
+        tree.bulk_load_or_insert(entries);
+        assert_eq!(tree.len(), 100);
+        for i in 0..100u32 {
+            assert_eq!(tree.lookup(format!("{:06}", i).as_bytes()).len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_bulk_load_or_insert_small_tree() {
+        let mut tree = BPlusTree::new("Test", "col");
+        // Insert a few entries normally
+        for i in 0..10u32 {
+            tree.insert(
+                format!("{:06}", i).into_bytes(),
+                format!("pk_{}", i).into_bytes(),
+            );
+        }
+        // bulk_load_or_insert on small tree should use regular insert
+        let new_entries: Vec<(Vec<u8>, Vec<u8>)> = (100..200u32)
+            .map(|i| {
+                (
+                    format!("{:06}", i).into_bytes(),
+                    format!("pk_{}", i).into_bytes(),
+                )
+            })
+            .collect();
+        tree.bulk_load_or_insert(new_entries);
+        assert_eq!(tree.len(), 110);
+    }
+
+    #[test]
+    fn test_bulk_load_or_insert_large_tree() {
+        let mut tree = BPlusTree::new("Test", "col");
+        // Insert > 1000 entries to trigger bulk path
+        for i in 0..2000u32 {
+            tree.insert(
+                format!("{:06}", i).into_bytes(),
+                format!("pk_{}", i).into_bytes(),
+            );
+        }
+        // Now bulk_load_or_insert should collect existing + new and rebuild
+        let new_entries: Vec<(Vec<u8>, Vec<u8>)> = (5000..5100u32)
+            .map(|i| {
+                (
+                    format!("{:06}", i).into_bytes(),
+                    format!("pk_{}", i).into_bytes(),
+                )
+            })
+            .collect();
+        tree.bulk_load_or_insert(new_entries);
+        assert_eq!(tree.len(), 2100);
+        // Verify old entries
+        assert_eq!(tree.lookup(b"000000").len(), 1);
+        // Verify new entries
+        assert_eq!(tree.lookup(b"005000").len(), 1);
+        // Verify range scan
+        let range = tree.range_scan(Some(b"000050"), Some(b"000099"));
+        assert_eq!(range.len(), 50);
+    }
+
 }

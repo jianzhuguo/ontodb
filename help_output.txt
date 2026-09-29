@@ -1,0 +1,79 @@
+OntoDB - Ontology-driven semantic database
+
+Usage: ontodb-server.exe [OPTIONS]
+
+Options:
+  -d, --data-dir <DATA_DIR>
+          Data directory path [env: STORAGE_DATA_DIR=] [default: ./ontodb_data]
+  -m, --memtable-size <MEMTABLE_SIZE>
+          MemTable size limit in bytes [env: STORAGE_MEMTABLE_SIZE=] [default: 4194304]
+  -i, --interactive
+          Run in interactive mode (REPL)
+  -l, --listen <LISTEN>
+          TCP listen address (enables TCP server mode) [env: SERVER_LISTEN=] [default: 127.0.0.1:7913]
+      --http <HTTP>
+          HTTP listen address (enables HTTP API server mode) [env: SERVER_HTTP=]
+      --auth
+          Enable API key authentication [env: AUTH_ENABLED=]
+      --api-keys-file <API_KEYS_FILE>
+          API keys file path (JSON format) [env: AUTH_API_KEYS_FILE=]
+      --rate-limit <RATE_LIMIT>
+          Default rate limit (requests per minute) [env: RATE_LIMIT_RPM=] [default: 600]
+      --burst-size <BURST_SIZE>
+          Rate limit burst size [env: RATE_LIMIT_BURST=] [default: 100]
+      --no-rate-limit
+          Disable rate limiting [env: RATE_LIMIT_DISABLED=]
+      --audit
+          Enable query audit logging [env: AUDIT_ENABLED=]
+      --audit-dir <AUDIT_DIR>
+          Audit log directory [env: AUDIT_LOG_DIR=] [default: audit_logs]
+      --pgwire <PGWIRE>
+          PG wire protocol listen address (enables PostgreSQL compatibility) [env: PGWIRE_LISTEN=]
+      --mysql <MYSQL>
+          MySQL protocol listen address (enables MySQL compatibility) [env: MYSQL_LISTEN=]
+      --security-audit
+          Run security audit and exit (does not start server)
+      --cdc-enabled
+          Enable CDC (Change Data Capture) and publish to Kafka [env: CDC_ENABLED=]
+      --cdc-kafka-brokers <CDC_KAFKA_BROKERS>
+          Kafka bootstrap servers for CDC (comma-separated) [env: CDC_KAFKA_BROKERS=] [default: localhost:9092]
+      --cdc-topic <CDC_TOPIC>
+          Kafka topic for CDC events [env: CDC_TOPIC=] [default: ontodb-cdc]
+      --raft-node-id <RAFT_NODE_ID>
+          Raft node ID for distributed replication [env: RAFT_NODE_ID=]
+      --raft-listen <RAFT_LISTEN>
+          Raft listen address for inter-node communication [env: RAFT_LISTEN=]
+      --raft-peers <RAFT_PEERS>
+          Raft peer nodes (format: id=addr,id=addr) [env: RAFT_PEERS=]
+      --encryption-enabled
+          Enable storage encryption (Gov/Finance edition only) [env: ENCRYPTION_ENABLED=]
+      --master-key-file <MASTER_KEY_FILE>
+          Master key file path for encryption (Gov/Finance edition only) [env: ENCRYPTION_MASTER_KEY_FILE=]
+      --master-key-env <MASTER_KEY_ENV>
+          Master key from environment variable (Gov/Finance edition only) [env: ENCRYPTION_MASTER_KEY_ENV=]
+      --audit-retention-days <AUDIT_RETENTION_DAYS>
+          Audit retention days (Gov/Finance edition only, default 180 per 绛変繚2.0) [env: AUDIT_RETENTION_DAYS=] [default: 180]
+      --audit-no-compress
+          Disable audit log compression (Gov/Finance edition only) [env: AUDIT_NO_COMPRESS=]
+      --cors-origins <CORS_ORIGINS>
+          Allowed CORS origins (comma-separated). Use "*" for all origins (NOT recommended for production) [env: CORS_ORIGINS=] [default: ""]
+      --tls-cert <TLS_CERT>
+          TLS certificate file path (PEM format). Enables HTTPS when both cert and key are provided [env: TLS_CERT_PATH=]
+      --tls-key <TLS_KEY>
+          TLS private key file path (PEM format). Enables HTTPS when both cert and key are provided [env: TLS_KEY_PATH=]
+      --tls-min-version <TLS_MIN_VERSION>
+          Minimum TLS version: "1.2" or "1.3" (default: "1.2") [env: TLS_MIN_VERSION=] [default: 1.2]
+      --sharding-enabled
+          Enable data sharding [env: SHARDING_ENABLED=]
+      --sharding-config <SHARDING_CONFIG>
+          Shard configuration file path (JSON format) [env: SHARDING_CONFIG_FILE=]
+      --default-shard <DEFAULT_SHARD>
+          Default shard ID for unsharded data [env: SHARDING_DEFAULT_SHARD=] [default: 0]
+      --sharding-auto-rebalance
+          Auto-rebalance when adding new shards [env: SHARDING_AUTO_REBALANCE=]
+      --migration-batch-size <MIGRATION_BATCH_SIZE>
+          Migration batch size (records per batch) [env: SHARDING_MIGRATION_BATCH_SIZE=] [default: 1000]
+      --max-concurrent-migrations <MAX_CONCURRENT_MIGRATIONS>
+          Maximum concurrent migrations [env: SHARDING_MAX_CONCURRENT_MIGRATIONS=] [default: 2]
+  -h, --help
+          Print help

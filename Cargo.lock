@@ -407,6 +407,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
+name = "check-sst"
+version = "0.1.0"
+dependencies = [
+ "onto-core",
+ "onto-storage",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -485,6 +493,14 @@ name = "clap_lex"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
+
+[[package]]
+name = "clean-index"
+version = "0.1.0"
+dependencies = [
+ "onto-core",
+ "onto-storage",
+]
 
 [[package]]
 name = "cmake"
@@ -787,6 +803,14 @@ name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
+
+[[package]]
+name = "fix-key-prefix"
+version = "0.1.0"
+dependencies = [
+ "onto-core",
+ "onto-storage",
+]
 
 [[package]]
 name = "flate2"
@@ -1700,6 +1724,7 @@ dependencies = [
  "onto-storage",
  "parking_lot",
  "rand 0.8.8",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",
@@ -2191,6 +2216,14 @@ dependencies = [
  "rustls-pki-types",
  "time",
  "yasna",
+]
+
+[[package]]
+name = "recover-data"
+version = "0.1.0"
+dependencies = [
+ "onto-core",
+ "onto-storage",
 ]
 
 [[package]]
