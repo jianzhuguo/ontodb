@@ -297,7 +297,18 @@ impl CompactionWorker {
                 if levels[level].is_empty() {
                     return Ok(());
                 }
-                vec![levels[level][0].clone()]
+                // When file count exceeds penalty threshold (100), compact multiple
+                // files at once to accelerate file count reduction.
+                let file_count = levels[level].len();
+                let excess = file_count.saturating_sub(100);
+                if excess > 0 {
+                    let batch = excess.min(8).max(1);
+                    let mut sorted: Vec<SsTableInfo> = levels[level].clone();
+                    sorted.sort_by_key(|s| s.size);
+                    sorted.into_iter().take(batch).collect()
+                } else {
+                    vec![levels[level][0].clone()]
+                }
             };
 
             if ssts.is_empty() {
@@ -321,8 +332,8 @@ impl CompactionWorker {
         };
 
         // Step 2: Find overlapping SSTables in level N+1 (snapshot, don't remove)
-        // Cap at 32 files to avoid OOM during large merges
-        const MAX_OVERLAP_FILES: usize = 16;
+        // Scale overlap cap with number of input files to avoid truncation
+        let max_overlap = 16.max(ssts_to_compact.len() * 4);
         let next_level = level + 1;
         let next_level_ssts: Vec<SsTableInfo> = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
@@ -338,7 +349,7 @@ impl CompactionWorker {
                 })
                 .cloned()
                 .collect();
-            overlapping.truncate(MAX_OVERLAP_FILES);
+            overlapping.truncate(max_overlap);
             overlapping
         };
 
@@ -518,7 +529,7 @@ impl CompactionWorker {
     /// Processes a BATCH of small files per call to avoid OOM. Called from
     /// try_compact on every tick, so it makes steady progress.
     fn merge_small_files(&mut self) -> Result<()> {
-        const SMALL_FILE_THRESHOLD: u64 = 32 * 1024 * 1024; // 32MB
+        const SMALL_FILE_THRESHOLD: u64 = 16 * 1024 * 1024; // 16MB
         const MIN_FILES_TO_MERGE: usize = 4;
         const MERGE_BATCH_SIZE: usize = 40;
         // Target output size MUST exceed SMALL_FILE_THRESHOLD to prevent infinite re-merging.
@@ -603,8 +614,8 @@ impl CompactionWorker {
         }
 
         // Write new larger SSTs — output stays in same level.
-        // Target size (96MB) exceeds SMALL_FILE_THRESHOLD (32MB) so merged files
-        // will NOT be re-classified as small files, breaking the infinite loop.
+        // Target size (96MB uncompressed) exceeds SMALL_FILE_THRESHOLD (16MB) so
+        // merged files (~40MB compressed) will NOT be re-classified as small files.
         let mut new_ssts: Vec<SsTableInfo> = Vec::new();
         let mut builder = SsTableBuilder::new();
         builder.set_compression_level(self.options.compression_level);
