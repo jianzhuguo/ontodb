@@ -14,13 +14,13 @@ use std::path::Path;
 
 /// Entry from an SSTable iterator with comparison support for min-heap.
 #[derive(Debug)]
-struct HeapEntry {
-    key: Vec<u8>,
-    value: Vec<u8>,
-    seq_no: SeqNo,
-    kind: EntryKind,
+pub struct HeapEntry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub seq_no: SeqNo,
+    pub kind: EntryKind,
     /// Index of the source SSTable (for stable sort)
-    source_idx: usize,
+    pub source_idx: usize,
 }
 
 impl PartialEq for HeapEntry {
@@ -38,10 +38,16 @@ impl PartialOrd for HeapEntry {
 }
 
 impl Ord for HeapEntry {
-    /// For min-heap: smaller key first, then smaller seq_no
+    /// BinaryHeap is a max-heap. We want: key ascending, seq_no descending (newest first).
+    /// To get min-key-first from max-heap, reverse the key comparison.
+    /// For same key, we want LARGER seq_no to come out FIRST from max-heap.
     fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(&other.key)
+        // Key: smaller key = higher priority -> reverse for max-heap
+        other.key.cmp(&self.key)
+            // Seq_no: larger seq_no = higher priority -> keep ascending for max-heap
+            // (max-heap pops the largest, so larger seq_no comes first)
             .then(self.seq_no.cmp(&other.seq_no))
+            // Tie-break by source index (smaller index first)
             .then(self.source_idx.cmp(&other.source_idx))
     }
 }
@@ -70,7 +76,7 @@ impl StreamingMergeIterator {
             let iter = SstEntryIterator::new(sst)?;
             
             // Collect first entry from each iterator
-            let mut iter_box = Box::new(iter) as Box<dyn Iterator<Item = _>>;
+            let mut iter_box: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>, SeqNo, EntryKind)>> = Box::new(iter);
             if let Some(entry) = iter_box.next() {
                 heap.push(HeapEntry {
                     key: entry.0,
@@ -128,25 +134,30 @@ impl StreamingMergeIterator {
 }
 
 /// Iterator wrapper for SsTable entries.
+///
+/// Uses unsafe to create a self-referential struct that owns the SSTable.
+/// Drop order is critical: `iter` must be dropped BEFORE `_sst`.
+/// Rust drops fields in declaration order, so `iter` is declared first.
 struct SstEntryIterator {
-    sst: SsTable,
+    /// The iterator borrowing from the SSTable. Dropped FIRST (declared before _sst).
     iter: SsTableIterator<'static>,
-    _sst: Box<SsTable>, // Keep SSTable alive
+    /// Owns the SSTable data. Dropped SECOND (after iter is gone).
+    _sst: Box<SsTable>,
 }
 
 impl SstEntryIterator {
     fn new(sst: SsTable) -> Result<Self, Box<dyn std::error::Error>> {
-        // Safety: We need to create an iterator that borrows the SSTable.
-        // We'll store the SSTable in a Box and leak it to get a 'static reference.
-        // This is safe because we control the lifetime through the iterator.
         let sst_box = Box::new(sst);
-        let sst_ref: &'static SsTable = unsafe { std::mem::transmute(sst_box.as_ref()) };
+        let sst_ptr: *const SsTable = &*sst_box;
+        // SAFETY: sst_ptr is derived from sst_box which is stored in the same struct.
+        // Rust drops fields in declaration order: `iter` (first) then `_sst` (second).
+        // So the iterator is always dropped before the SSTable it borrows from.
+        let sst_ref: &'static SsTable = unsafe { &*sst_ptr };
         let iter = sst_ref.iter()?;
-        
+
         Ok(Self {
-            sst: *sst_box,
             iter,
-            _sst: Box::new(unsafe { std::mem::zeroed() }), // Placeholder
+            _sst: sst_box,
         })
     }
 }
@@ -167,5 +178,228 @@ impl Iterator for SstEntryIterator {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn test_heap_entry_ordering() {
+        // Test: key ascending, seq_no descending (newest first for same key)
+        let entry_a = HeapEntry {
+            key: b"key1".to_vec(),
+            value: b"val1".to_vec(),
+            seq_no: 10,
+            kind: EntryKind::Put,
+            source_idx: 0,
+        };
+        let entry_b = HeapEntry {
+            key: b"key1".to_vec(),
+            value: b"val2".to_vec(),
+            seq_no: 20,
+            kind: EntryKind::Put,
+            source_idx: 1,
+        };
+        let entry_c = HeapEntry {
+            key: b"key2".to_vec(),
+            value: b"val3".to_vec(),
+            seq_no: 5,
+            kind: EntryKind::Put,
+            source_idx: 0,
+        };
+
+        // For max-heap: larger value has higher priority
+        // entry_b (seq_no=20) should have higher priority than entry_a (seq_no=10) for same key
+        assert_eq!(entry_b.cmp(&entry_a), Ordering::Greater);
+        
+        // entry_c (key2) should have higher priority than entry_a (key1) because key2 > key1
+        // but we want smaller key first, so entry_a should have higher priority
+        // In max-heap, Greater means higher priority
+        // entry_a.key < entry_c.key, so entry_a should have higher priority
+        // entry_a.cmp(&entry_c) should return Greater
+        assert_eq!(entry_a.cmp(&entry_c), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_binary_heap_ordering() {
+        // Test BinaryHeap behavior with our Ord implementation
+        let mut heap = BinaryHeap::new();
+        
+        // Push entries with same key, different seq_no
+        heap.push(HeapEntry {
+            key: b"key1".to_vec(),
+            value: b"val1".to_vec(),
+            seq_no: 10,
+            kind: EntryKind::Put,
+            source_idx: 0,
+        });
+        heap.push(HeapEntry {
+            key: b"key1".to_vec(),
+            value: b"val2".to_vec(),
+            seq_no: 20,
+            kind: EntryKind::Put,
+            source_idx: 1,
+        });
+        heap.push(HeapEntry {
+            key: b"key2".to_vec(),
+            value: b"val3".to_vec(),
+            seq_no: 5,
+            kind: EntryKind::Put,
+            source_idx: 0,
+        });
+        
+        // Pop should return: key1/seq20 (newest first for same key), then key1/seq10, then key2/seq5
+        let first = heap.pop().unwrap();
+        assert_eq!(first.key, b"key1");
+        assert_eq!(first.seq_no, 20); // Newest first
+        
+        let second = heap.pop().unwrap();
+        assert_eq!(second.key, b"key1");
+        assert_eq!(second.seq_no, 10);
+        
+        let third = heap.pop().unwrap();
+        assert_eq!(third.key, b"key2");
+        assert_eq!(third.seq_no, 5);
+    }
+
+    #[test]
+    fn test_sst_entry_iterator() {
+        use crate::lsm::sstable::SsTableBuilder;
+        use onto_core::Entry;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.sst");
+
+        // Create a test SSTable
+        let mut builder = SsTableBuilder::new();
+        builder.add(&Entry::put(b"key1".to_vec(), b"val1".to_vec(), 10));
+        builder.add(&Entry::put(b"key2".to_vec(), b"val2".to_vec(), 20));
+        builder.add(&Entry::put(b"key3".to_vec(), b"val3".to_vec(), 30));
+        builder.build(&path).unwrap();
+
+        // Open and iterate
+        let sst = SsTable::open(&path).unwrap();
+        let mut iter = SstEntryIterator::new(sst).unwrap();
+
+        // Should return entries in order
+        let entry1 = iter.next().unwrap();
+        assert_eq!(entry1.0, b"key1");
+        assert_eq!(entry1.2, 10);
+
+        let entry2 = iter.next().unwrap();
+        assert_eq!(entry2.0, b"key2");
+        assert_eq!(entry2.2, 20);
+
+        let entry3 = iter.next().unwrap();
+        assert_eq!(entry3.0, b"key3");
+        assert_eq!(entry3.2, 30);
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_streaming_merge_with_tombstones() {
+        use crate::lsm::sstable::SsTableBuilder;
+        use onto_core::Entry;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+
+        // SSTable 1: key1=v1 (seq=10), key2=v2 (seq=10)
+        let path1 = dir.path().join("sst1.sst");
+        let mut builder = SsTableBuilder::new();
+        builder.add(&Entry::put(b"key1".to_vec(), b"v1".to_vec(), 10));
+        builder.add(&Entry::put(b"key2".to_vec(), b"v2".to_vec(), 10));
+        builder.build(&path1).unwrap();
+
+        // SSTable 2: key1=DELETE (seq=20), key3=v3 (seq=10)
+        let path2 = dir.path().join("sst2.sst");
+        let mut builder = SsTableBuilder::new();
+        builder.add(&Entry::delete(b"key1".to_vec(), 20));
+        builder.add(&Entry::put(b"key3".to_vec(), b"v3".to_vec(), 10));
+        builder.build(&path2).unwrap();
+
+        // Create streaming merge iterator
+        let mut iter = StreamingMergeIterator::new(&[path1, path2]).unwrap();
+
+        // Should return: key1/DELETE (seq=20), key1/v1 (seq=10), key2/v2 (seq=10), key3/v3 (seq=10)
+        // Note: same key appears twice (newest first)
+
+        let entry1 = iter.next().unwrap();
+        assert_eq!(entry1.key, b"key1");
+        assert_eq!(entry1.kind, EntryKind::Delete);
+        assert_eq!(entry1.seq_no, 20);
+
+        let entry2 = iter.next().unwrap();
+        assert_eq!(entry2.key, b"key1");
+        assert_eq!(entry2.kind, EntryKind::Put);
+        assert_eq!(entry2.seq_no, 10);
+
+        let entry3 = iter.next().unwrap();
+        assert_eq!(entry3.key, b"key2");
+        assert_eq!(entry3.kind, EntryKind::Put);
+        assert_eq!(entry3.seq_no, 10);
+
+        let entry4 = iter.next().unwrap();
+        assert_eq!(entry4.key, b"key3");
+        assert_eq!(entry4.kind, EntryKind::Put);
+        assert_eq!(entry4.seq_no, 10);
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_streaming_merge_with_overwrites() {
+        use crate::lsm::sstable::SsTableBuilder;
+        use onto_core::Entry;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+
+        // SSTable 1: key1=v1 (seq=10), key2=v2 (seq=10)
+        let path1 = dir.path().join("sst1.sst");
+        let mut builder = SsTableBuilder::new();
+        builder.add(&Entry::put(b"key1".to_vec(), b"v1".to_vec(), 10));
+        builder.add(&Entry::put(b"key2".to_vec(), b"v2".to_vec(), 10));
+        builder.build(&path1).unwrap();
+
+        // SSTable 2: key1=v1_new (seq=20), key3=v3 (seq=10)
+        let path2 = dir.path().join("sst2.sst");
+        let mut builder = SsTableBuilder::new();
+        builder.add(&Entry::put(b"key1".to_vec(), b"v1_new".to_vec(), 20));
+        builder.add(&Entry::put(b"key3".to_vec(), b"v3".to_vec(), 10));
+        builder.build(&path2).unwrap();
+
+        // Create streaming merge iterator
+        let mut iter = StreamingMergeIterator::new(&[path1, path2]).unwrap();
+
+        // Should return: key1/v1_new (seq=20), key1/v1 (seq=10), key2/v2 (seq=10), key3/v3 (seq=10)
+        // Note: same key appears twice (newest first)
+
+        let entry1 = iter.next().unwrap();
+        assert_eq!(entry1.key, b"key1");
+        assert_eq!(entry1.value, b"v1_new");
+        assert_eq!(entry1.seq_no, 20);
+
+        let entry2 = iter.next().unwrap();
+        assert_eq!(entry2.key, b"key1");
+        assert_eq!(entry2.value, b"v1");
+        assert_eq!(entry2.seq_no, 10);
+
+        let entry3 = iter.next().unwrap();
+        assert_eq!(entry3.key, b"key2");
+        assert_eq!(entry3.value, b"v2");
+        assert_eq!(entry3.seq_no, 10);
+
+        let entry4 = iter.next().unwrap();
+        assert_eq!(entry4.key, b"key3");
+        assert_eq!(entry4.value, b"v3");
+        assert_eq!(entry4.seq_no, 10);
+
+        assert!(iter.next().is_none());
     }
 }

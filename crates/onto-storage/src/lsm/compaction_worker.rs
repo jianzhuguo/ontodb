@@ -353,90 +353,77 @@ impl CompactionWorker {
             overlapping
         };
 
-        // Step 3: Collect all entries from SSTables
-        // Note: For true streaming compaction, a merge iterator could be used
-        // to avoid loading all entries into memory. Current approach loads all entries
-        // but uses efficient deduplication. For very large datasets, consider
-        // implementing a streaming merge with a min-heap.
-        let mut all_entries: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
-
-        for sst_info in &ssts_to_compact {
-            let sst = SsTable::open(&sst_info.path)?;
-            let mut iter = sst.iter()?;
-            while iter.is_valid() {
-                all_entries.push((
-                    iter.key().to_vec(),
-                    iter.value().to_vec(),
-                    iter.seq_no(),
-                    iter.kind(),
-                ));
-                iter.next();
-            }
-        }
-
-        for sst_info in &next_level_ssts {
-            let sst = SsTable::open(&sst_info.path)?;
-            let mut iter = sst.iter()?;
-            while iter.is_valid() {
-                all_entries.push((
-                    iter.key().to_vec(),
-                    iter.value().to_vec(),
-                    iter.seq_no(),
-                    iter.kind(),
-                ));
-                iter.next();
-            }
-        }
-
-        // Step 4: Sort by key, then seq_no descending
-        all_entries.sort_by(|a, b| a.0.cmp(&b.0).then(b.2.cmp(&a.2)));
-
-        // Step 5: Deduplicate + tombstone cleanup
-        // Snapshot levels once to avoid per-entry lock acquisition in the loop
+        // Step 3: Streaming merge using min-heap (O(1) memory per SSTable)
         let (deepest_level, levels_snapshot) = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             (levels.len() - 1, levels.clone())
         };
 
-        let mut merged: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
-        let mut last_key: Option<Vec<u8>> = None;
-
-        for (key, value, seq_no, kind) in &all_entries {
-            if last_key.as_ref() == Some(key) {
-                continue;
-            }
-
-            if *kind == EntryKind::Delete {
-                let can_drop = next_level >= deepest_level
-                    || Self::can_drop_tombstone_static(key, next_level, &levels_snapshot);
-                if can_drop {
-                    last_key = Some(key.clone());
-                    continue;
-                }
-            }
-
-            last_key = Some(key.clone());
-            merged.push((key.clone(), value.clone(), *seq_no, *kind));
+        // Collect all SSTable paths for streaming merge
+        let mut all_sst_paths: Vec<PathBuf> = Vec::new();
+        for sst_info in &ssts_to_compact {
+            all_sst_paths.push(sst_info.path.clone());
+        }
+        for sst_info in &next_level_ssts {
+            all_sst_paths.push(sst_info.path.clone());
         }
 
-        // Step 6: Write merged entries to new SSTables (I/O-heavy, outside lock)
+        // Create streaming merge iterator
+        let mut merge_iter = crate::lsm::streaming_merge::StreamingMergeIterator::new(&all_sst_paths)
+            .map_err(|e| onto_core::CoreError::Custom(format!("Failed to create merge iterator: {}", e)))?;
+
+        // Step 4: Stream entries with dedup + tombstone cleanup, write directly to new SSTables
         let target_sst_size = 64 * 1024 * 1024; // 64MB per output SST
         let mut builder = SsTableBuilder::new();
         builder.set_compression_level(self.options.compression_level);
         let mut new_ssts = Vec::new();
         let mut current_size = 0usize;
-        let mut batch_start_idx = 0usize;
+        let mut last_key: Option<Vec<u8>> = None;
+        let mut batch_first_key: Option<Vec<u8>> = None;
+        let mut entry_count = 0u64;
 
-        for (i, (key, value, seq_no, kind)) in merged.iter().enumerate() {
+        while merge_iter.has_next() {
+            let entry = merge_iter.next().unwrap();
+            let key = entry.key;
+            let value = entry.value;
+            let seq_no = entry.seq_no;
+            let kind = entry.kind;
+
+            // Skip duplicate keys (streaming merge gives newest first per key)
+            if last_key.as_ref() == Some(&key) {
+                continue;
+            }
+
+            // Tombstone cleanup
+            if kind == EntryKind::Delete {
+                let can_drop = next_level >= deepest_level
+                    || Self::can_drop_tombstone_static(&key, next_level, &levels_snapshot);
+                if can_drop {
+                    last_key = Some(key);
+                    continue;
+                }
+            }
+
+            // Track first key of current batch
+            if batch_first_key.is_none() {
+                batch_first_key = Some(key.clone());
+            }
+
+            // Add entry to builder
+            current_size += key.len() + value.len() + 16;
             builder.add(&Entry {
                 key: key.clone(),
-                value: value.clone(),
-                seq_no: *seq_no,
-                kind: *kind,
+                value,
+                seq_no,
+                kind,
             });
-            current_size += key.len() + value.len() + 16;
+            entry_count += 1;
+            last_key = Some(key);
 
+            // Flush SST when target size reached
             if current_size >= target_sst_size {
+                // Throttle: yield between SST flushes to avoid starving queries
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
                 let sst_path = self
                     .options
@@ -448,17 +435,17 @@ impl CompactionWorker {
                 new_ssts.push(SsTableInfo {
                     path: sst_path,
                     size: metadata.len(),
-                    min_key: merged[batch_start_idx].0.clone(),
+                    min_key: batch_first_key.take().unwrap_or_default(),
                     max_key: sst.max_key().to_vec(),
                 });
 
                 builder = SsTableBuilder::new();
                 builder.set_compression_level(self.options.compression_level);
                 current_size = 0;
-                batch_start_idx = i + 1;
             }
         }
 
+        // Flush remaining entries
         if current_size > 0 {
             let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
             let sst_path = self
@@ -471,12 +458,12 @@ impl CompactionWorker {
             new_ssts.push(SsTableInfo {
                 path: sst_path,
                 size: metadata.len(),
-                min_key: merged[batch_start_idx].0.clone(),
+                min_key: batch_first_key.unwrap_or_default(),
                 max_key: sst.max_key().to_vec(),
             });
         }
 
-        // Step 7+8: Atomically update levels, evict cache, and schedule deletions under lock
+        // Step 5: Atomically update levels, evict cache, and schedule deletions under lock
         let evicted_paths = {
             let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -515,19 +502,20 @@ impl CompactionWorker {
         }
 
         tracing::info!(
-            "Background compaction L{}→L{}: merged {} + {} SSTables",
+            "Background compaction L{}→L{}: merged {} + {} SSTables ({} entries)",
             level,
             next_level,
             ssts_to_compact.len(),
-            next_level_ssts.len()
+            next_level_ssts.len(),
+            entry_count
         );
 
         Ok(())
     }
 
     /// Merge small SSTables into larger ones to prevent file count explosion.
-    /// Processes a BATCH of small files per call to avoid OOM. Called from
-    /// try_compact on every tick, so it makes steady progress.
+    /// Uses streaming merge (StreamingMergeIterator) to avoid loading all entries
+    /// into memory. Processes a BATCH of small files per call to bound I/O.
     fn merge_small_files(&mut self) -> Result<()> {
         const SMALL_FILE_THRESHOLD: u64 = 16 * 1024 * 1024; // 16MB
         const MIN_FILES_TO_MERGE: usize = 4;
@@ -570,77 +558,62 @@ impl CompactionWorker {
             target_level
         );
 
-        // Collect entries from this batch only
-        let mut all_entries: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
-        for sst_info in &small_files {
-            match SsTable::open(&sst_info.path) {
-                Ok(sst) => {
-                    let mut iter = sst.iter()?;
-                    while iter.is_valid() {
-                        all_entries.push((
-                            iter.key().to_vec(),
-                            iter.value().to_vec(),
-                            iter.seq_no(),
-                            iter.kind(),
-                        ));
-                        iter.next();
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to open SST {}: {}", sst_info.path.display(), e);
-                }
-            }
-        }
+        // Collect paths for streaming merge
+        let sst_paths: Vec<PathBuf> = small_files.iter().map(|s| s.path.clone()).collect();
 
-        if all_entries.is_empty() {
+        // Use streaming merge iterator - entries come out sorted by key, with
+        // newest seq_no first for each key (dedup happens on-the-fly)
+        let mut merge_iter = match crate::lsm::streaming_merge::StreamingMergeIterator::new(&sst_paths) {
+            Ok(iter) => iter,
+            Err(e) => {
+                tracing::warn!("Failed to create streaming merge iterator: {}", e);
+                return Ok(());
+            }
+        };
+
+        if !merge_iter.has_next() {
             return Ok(());
         }
 
-        // Sort by key for efficient output
-        all_entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Deduplicate by key (keep latest seq_no per key)
-        let mut deduped: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
-        for entry in all_entries {
-            if let Some(last) = deduped.last_mut() {
-                if last.0 == entry.0 {
-                    if entry.2 > last.2 {
-                        *last = entry;
-                    }
-                    continue;
-                }
-            }
-            deduped.push(entry);
-        }
-
-        // Write new larger SSTs — output stays in same level.
-        // Target size (96MB uncompressed) exceeds SMALL_FILE_THRESHOLD (16MB) so
-        // merged files (~40MB compressed) will NOT be re-classified as small files.
+        // Stream entries directly into new SSTables with on-the-fly dedup.
+        // StreamingMergeIterator returns entries sorted by key, with largest seq_no
+        // first for duplicate keys. We keep only the first occurrence of each key.
         let mut new_ssts: Vec<SsTableInfo> = Vec::new();
         let mut builder = SsTableBuilder::new();
         builder.set_compression_level(self.options.compression_level);
         let mut current_size: u64 = 0;
         let mut batch_min_key: Vec<u8> = Vec::new();
-        let total_entries = deduped.len() as u64;
+        let mut last_key: Option<Vec<u8>> = None;
+        let mut total_entries: u64 = 0;
+        let mut deduped_count: u64 = 0;
 
-        tracing::info!(
-            "Merge write phase: {} deduped entries from {} input files",
-            total_entries,
-            batch_size
-        );
+        while merge_iter.has_next() {
+            let entry = merge_iter.next().unwrap();
 
-        for (key, value, seq, kind) in &deduped {
-            if batch_min_key.is_empty() {
-                batch_min_key = key.clone();
+            // Dedup: StreamingMergeIterator returns newest first per key,
+            // so skip subsequent entries with the same key
+            if last_key.as_ref() == Some(&entry.key) {
+                deduped_count += 1;
+                continue;
             }
-            let entry = match kind {
-                EntryKind::Put => Entry::put(key.clone(), value.clone(), *seq),
-                EntryKind::Delete => Entry::delete(key.clone(), *seq),
-            };
-            builder.add(&entry);
-            current_size += key.len() as u64 + value.len() as u64 + 16;
 
+            if batch_min_key.is_empty() {
+                batch_min_key = entry.key.clone();
+            }
+
+            let sst_entry = match entry.kind {
+                EntryKind::Put => Entry::put(entry.key.clone(), entry.value, entry.seq_no),
+                EntryKind::Delete => Entry::delete(entry.key.clone(), entry.seq_no),
+            };
+            builder.add(&sst_entry);
+            current_size += entry.key.len() as u64 + sst_entry.value.len() as u64 + 16;
+            total_entries += 1;
+            last_key = Some(entry.key);
+
+            // Flush SST when target size reached
             if current_size >= TARGET_OUTPUT_SIZE {
+                // Throttle: yield between SST flushes to avoid starving queries
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 let id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
                 let path = self.options.data_dir.join(format!("L{}_{}.sst", target_level, id));
                 tracing::info!(
@@ -681,8 +654,9 @@ impl CompactionWorker {
         let total_output_size: u64 = new_ssts.iter().map(|s| s.size).sum();
 
         tracing::info!(
-            "Merge write complete: {} entries → {} SSTs ({}MB total)",
+            "Merge write complete: {} entries ({} deduped) → {} SSTs ({}MB total)",
             total_entries,
+            deduped_count,
             new_count,
             total_output_size / 1024 / 1024
         );
