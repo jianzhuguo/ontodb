@@ -1689,6 +1689,27 @@ impl LsmEngine {
         Ok(())
     }
 
+    /// Deletes a row and removes its entries from secondary and vector indexes.
+    ///
+    /// [`Self::delete`] only writes an LSM tombstone — index entries survive and
+    /// later COUNT/SELECT via index return stale pks. TRUNCATE and any bulk
+    /// delete path must go through here.
+    pub fn delete_with_deindex(&self, key: Key, value: &[u8]) -> Result<()> {
+        if let Some(class) = Self::extract_class_from_key(&key) {
+            if let Some(doc) = parse_doc_bytes(value) {
+                self.index_manager
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .deindex_document(&class, &key, &doc);
+                self.vector_index_manager
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .deindex_vectors(&key);
+            }
+        }
+        self.delete(key)
+    }
+
     /// Manually flushes the current MemTable to an SSTable.
     /// Call this after a batch of writes to ensure all data is persisted.
     pub fn flush(&self) -> Result<()> {

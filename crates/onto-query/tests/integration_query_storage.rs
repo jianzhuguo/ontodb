@@ -1602,6 +1602,10 @@ fn integration_vector_index_recovery_after_restart() {
         };
         let engine = LsmEngine::open(options).unwrap();
 
+        // open() defers index rebuild to the caller (server does it in a
+        // background thread). Rebuild explicitly here.
+        engine.rebuild_vector_indexes().unwrap();
+
         // Verify vector index exists
         assert!(engine.has_vector_index("Product", "embedding"));
 
@@ -1975,18 +1979,25 @@ fn integration_vector_search_large_dataset() {
 
     exec_ok(
         &executor,
-        "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 8",
+        "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 8 M 8 EF_SEARCH 200",
     );
 
-    // Insert 100 items with distinct vectors
+    // Insert 100 items with two well-separated clusters.
+    // Cluster A (i=0..49): points toward [1,0,...] — first dim dominant.
+    // Cluster B (i=50..99): points toward [0,1,...] — second dim dominant.
     for i in 0..100 {
-        let base = if i < 50 { 0.9 } else { 0.1 };
-        let noise = (i as f64 * 0.001) % 0.1;
+        let (d0, d1) = if i < 50 {
+            // Near [1, 0, ...]: vary slightly within the cluster
+            let t = (i as f64) / 50.0 * 0.05; // 0.00–0.05
+            (0.95 + t, 0.05 - t)
+        } else {
+            // Near [0, 1, ...]: vary slightly within the cluster
+            let t = ((i - 50) as f64) / 50.0 * 0.05;
+            (0.05 - t, 0.95 + t)
+        };
         let vec = format!(
-            "[{}, {}, {}, 0.0, 0.0, 0.0, 0.0, 0.0]",
-            base - noise,
-            0.1 + noise,
-            noise
+            "[{}, {}, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]",
+            d0, d1
         );
         exec_ok(
             &executor,
@@ -2000,7 +2011,7 @@ fn integration_vector_search_large_dataset() {
     }
     engine.flush().unwrap();
 
-    // Search for top-5 nearest to [1,0,...]
+    // Search for top-5 nearest to [1,0,...] — should all be from cluster A (idx < 50)
     let result = exec_ok(
         &executor,
         "VECTOR SEARCH ON Product (embedding) QUERY [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] TOP 5",
@@ -2011,7 +2022,7 @@ fn integration_vector_search_large_dataset() {
             for row in rows {
                 let name = row.get("name").unwrap().as_str().unwrap();
                 let idx: i32 = name.strip_prefix("item_").unwrap().parse().unwrap();
-                assert!(idx < 50, "expected item from first group, got {}", name);
+                assert!(idx < 50, "expected item from first cluster, got {}", name);
             }
         }
         _ => panic!("expected Rows"),

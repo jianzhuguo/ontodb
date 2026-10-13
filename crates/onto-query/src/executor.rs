@@ -34,6 +34,39 @@ fn simd_parse_row(bytes: &[u8]) -> Option<Map<String, Value>> {
     }
 }
 
+/// Parse a storage row with column pruning. Only converts the requested columns
+/// (plus `__class__` for hierarchy checks). Falls back to full parse when columns is empty.
+#[inline]
+fn simd_parse_row_projected(bytes: &[u8], columns: &[String]) -> Option<Map<String, Value>> {
+    if columns.is_empty() {
+        return simd_parse_row(bytes);
+    }
+    if let Some(row) = BinaryRow::parse(bytes) {
+        return row.to_map_projected(columns);
+    }
+    // JSON fallback: parse full, then project
+    let mut buf = bytes.to_vec();
+    match simd_json::to_owned_value(&mut buf) {
+        Ok(val) => {
+            let full = owned_value_to_serde(val)?;
+            let mut projected = Map::with_capacity(columns.len() + 1);
+            if let Some(cls) = full.get("__class__") {
+                projected.insert("__class__".to_string(), cls.clone());
+            }
+            for col in columns {
+                if col == "__class__" || col.starts_with("__") {
+                    continue;
+                }
+                if let Some(val) = full.get(col) {
+                    projected.insert(col.clone(), val.clone());
+                }
+            }
+            Some(projected)
+        }
+        Err(_) => None,
+    }
+}
+
 /// Convert simd_json OwnedValue to serde_json Value.
 fn owned_value_to_serde(val: simd_json::OwnedValue) -> Option<Map<String, Value>> {
     use simd_json::OwnedValue as SVal;
@@ -1835,8 +1868,9 @@ impl QueryExecutor {
                     Some(class.as_str())
                 }
                 QueryAst::Delete { class, .. }
-                | QueryAst::Update { class, .. } => {
-                    // DELETE/UPDATE: invalidate cache
+                | QueryAst::Update { class, .. }
+                | QueryAst::TruncateTable { class } => {
+                    // DELETE/UPDATE/TRUNCATE: invalidate cache
                     let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
                     cache.remove(class);
                     Some(class.as_str())
@@ -2325,11 +2359,21 @@ impl QueryExecutor {
                         break;
                     }
 
-                    // Delete each entry in the batch
-                    for (key, _value) in &entries {
-                        engine_clone.delete(key.clone())?;
+                    // Delete each entry in the batch, deindexing first so
+                    // secondary indexes don't keep stale pks.
+                    for (key, value) in &entries {
+                        engine_clone.delete_with_deindex(key.clone(), value)?;
                         total_deleted += 1;
                     }
+                }
+
+                // Stale COUNT(*) cache must not survive a truncate.
+                {
+                    let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    cache.remove(class);
+                }
+                if let Some(ref graph) = self.graph {
+                    graph.invalidate_relation(class);
                 }
 
                 let elapsed_ms = start.elapsed().as_millis();
@@ -5256,7 +5300,7 @@ impl QueryExecutor {
                 index_column,
                 filter,
                 ..
-            } => self.plan_index_scan_read(engine, table, alias.as_deref(), index_column, filter),
+            } => self.plan_index_scan_read(engine, table, alias.as_deref(), index_column, filter, None),
             PlanNode::IndexLookup {
                 table,
                 alias,
@@ -5357,6 +5401,23 @@ impl QueryExecutor {
                             engine,
                             table,
                             alias.as_deref(),
+                            filter,
+                            Some(columns),
+                        )?
+                    } else if let PlanNode::IndexScan {
+                        table,
+                        alias,
+                        index_column,
+                        filter,
+                        ..
+                    } = input.as_ref()
+                    {
+                        // Push projection down to index scan — avoids full to_map() on every row
+                        self.plan_index_scan_read(
+                            engine,
+                            table,
+                            alias.as_deref(),
+                            index_column,
                             filter,
                             Some(columns),
                         )?
@@ -5485,6 +5546,7 @@ impl QueryExecutor {
                         index_column,
                         filter,
                         Some(*count),
+                        None,
                     );
                 }
                 let mut rows = self.execute_plan_node_read(input, engine)?;
@@ -5561,6 +5623,7 @@ impl QueryExecutor {
                         &idx_col,
                         filter,
                         scan_limit,
+                        projected_columns,
                     )?;
                     return Ok(rows);
                 }
@@ -6402,8 +6465,9 @@ impl QueryExecutor {
         alias: Option<&str>,
         index_column: &str,
         filter: &Option<FilterExpr>,
+        projected_columns: Option<&SelectColumns>,
     ) -> Result<Vec<Map<String, Value>>> {
-        self.plan_index_scan_read_limit(engine, table, alias, index_column, filter, None)
+        self.plan_index_scan_read_limit(engine, table, alias, index_column, filter, None, projected_columns)
     }
 
     /// Index scan with optional row limit: only the first `limit` matching pkeys
@@ -6417,7 +6481,30 @@ impl QueryExecutor {
         index_column: &str,
         filter: &Option<FilterExpr>,
         limit: Option<usize>,
+        projected_columns: Option<&SelectColumns>,
     ) -> Result<Vec<Map<String, Value>>> {
+        // Extract column names for projection pushdown
+        let proj_col_names: Vec<String> = match projected_columns {
+            Some(SelectColumns::Columns(items)) => {
+                let mut cols = Vec::with_capacity(items.len() + 1);
+                for item in items {
+                    if let SelectItem::Column(col) = item {
+                        let real = if let Some(pos) = col.find(" as ") {
+                            &col[..pos]
+                        } else {
+                            col.as_str()
+                        };
+                        let name = real.split('.').next_back().unwrap_or(real).to_string();
+                        if !cols.contains(&name) {
+                            cols.push(name);
+                        }
+                    }
+                }
+                cols
+            }
+            _ => Vec::new(),
+        };
+        let proj_ref: Option<&[String]> = if proj_col_names.is_empty() { None } else { Some(&proj_col_names) };
         let class_hierarchy = self.get_class_hierarchy_read(engine, table);
 
         if let Some(f) = filter {
@@ -6448,7 +6535,7 @@ impl QueryExecutor {
                 all_pkeys.truncate(lim);
             }
             if !all_pkeys.is_empty() {
-                let mut rows = Self::fetch_rows_by_pks_read(engine, &all_pkeys)?;
+                let mut rows = Self::fetch_rows_by_pks_read(engine, &all_pkeys, proj_ref)?;
                 rows.retain(|row| {
                     row.get("__class__")
                         .and_then(|v| v.as_str())
@@ -6506,7 +6593,7 @@ impl QueryExecutor {
             let pkeys = index_mgr
                 .lookup_eq_read(table, index_column, &json_val)
                 .unwrap_or_default();
-            let mut rows = Self::fetch_rows_by_pks_read(engine, &pkeys)?;
+            let mut rows = Self::fetch_rows_by_pks_read(engine, &pkeys, None)?;
             if let Some(a) = alias {
                 Self::apply_alias(&mut rows, a);
             }
@@ -6602,11 +6689,13 @@ impl QueryExecutor {
     fn fetch_rows_by_pks_read(
         engine: &LsmEngine,
         pkeys: &[Vec<u8>],
+        projected_columns: Option<&[String]>,
     ) -> Result<Vec<Map<String, Value>>> {
+        let cols = projected_columns.unwrap_or(&[]);
         let mut rows = Vec::new();
         for pk in pkeys {
             if let Ok(Some(val_bytes)) = engine.get(pk) {
-                if let Some(doc) = simd_parse_row(&val_bytes) {
+                if let Some(doc) = simd_parse_row_projected(&val_bytes, cols) {
                     rows.push(doc);
                 }
             }
@@ -8884,6 +8973,11 @@ impl QueryExecutor {
                 // Invalidate graph cache
                 if let Some(ref graph) = self.graph {
                     graph.invalidate_relation(class);
+                }
+                // Stale COUNT(*) cache must not survive a truncate.
+                {
+                    let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    cache.remove(class);
                 }
 
                 Ok(QueryResult::Success(format!(

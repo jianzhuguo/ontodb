@@ -432,56 +432,25 @@ impl IndexManager {
     }
 
     /// Looks up primary keys for a GT condition.
-    /// Checks both in-memory and disk-based indexes.
+    /// Checks both in-memory and disk-based indexes (merged).
     pub fn lookup_gt(
         &mut self,
         class: &str,
         column: &str,
         value: &serde_json::Value,
     ) -> Option<Vec<Vec<u8>>> {
-        let key = (class.to_string(), column.to_string());
-        let encoded = Self::encode_value(value);
-
-        // Try in-memory index first
-        if let Some(tree) = self.indexes.get(&key) {
-            return Some(tree.gt_scan(&encoded));
-        }
-
-        // Fall back to disk-based index (use range_scan with lo=encoded, hi=None)
-        if let Some(disk_idx) = self.disk_indexes.get(&key) {
-            // GT means strictly greater than, so we need to find the first key > encoded
-            // and scan from there. Use range_scan with lo just past encoded.
-            // For simplicity, use range_scan with lo=encoded+1 byte
-            let mut lo = encoded.clone();
-            lo.push(0u8); // This makes it strictly greater
-            return disk_idx.lock().unwrap().range_scan(Some(&lo), None).ok();
-        }
-
-        None
+        self.lookup_gt_read(class, column, value)
     }
 
     /// Looks up primary keys for a LT condition.
-    /// Checks both in-memory and disk-based indexes.
+    /// Checks both in-memory and disk-based indexes (merged).
     pub fn lookup_lt(
         &mut self,
         class: &str,
         column: &str,
         value: &serde_json::Value,
     ) -> Option<Vec<Vec<u8>>> {
-        let key = (class.to_string(), column.to_string());
-        let encoded = Self::encode_value(value);
-
-        // Try in-memory index first
-        if let Some(tree) = self.indexes.get(&key) {
-            return Some(tree.lt_scan(&encoded));
-        }
-
-        // Fall back to disk-based index (use range_scan with lo=None, hi=encoded-1)
-        if let Some(disk_idx) = self.disk_indexes.get(&key) {
-            return disk_idx.lock().unwrap().range_scan(None, Some(&encoded)).ok();
-        }
-
-        None
+        self.lookup_lt_read(class, column, value)
     }
 
     // ── Read-only lookup methods (for concurrent read path, &self) ──
@@ -1055,5 +1024,188 @@ mod tests {
         let pks = mgr.lookup_eq("Product", "price", &json!(100)).unwrap();
         assert_eq!(pks.len(), 1);
         assert_eq!(pks[0], b"pk1");
+    }
+
+    // ── Hybrid index mode tests ──────────────────────────────────────
+
+    #[test]
+    fn test_hybrid_bulk_load_and_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("indexes");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let mut mgr = IndexManager::with_disk_storage(
+            &data_dir,
+            IndexStorageMode::Hybrid {
+                threshold_entries: 100,
+            },
+        );
+        mgr.create_index("BioAssay", "assay_type");
+
+        // Bulk-load 263 entries (above threshold → disk-backed)
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..263)
+            .map(|i| {
+                let val = if i % 2 == 0 { b"B".to_vec() } else { b"A".to_vec() };
+                (val, format!("pk_{}", i).into_bytes())
+            })
+            .collect();
+        mgr.bulk_load_index("BioAssay", "assay_type", &entries).unwrap();
+
+        // lookup_eq should return all matching pks
+        let pks_b = mgr
+            .lookup_eq("BioAssay", "assay_type", &json!("B"))
+            .unwrap();
+        assert_eq!(pks_b.len(), 132); // 0..263 even = 132
+
+        let pks_a = mgr
+            .lookup_eq("BioAssay", "assay_type", &json!("A"))
+            .unwrap();
+        assert_eq!(pks_a.len(), 131); // 0..263 odd = 131
+
+        // After bulk_load, mem_complete should be set (skips disk merge on lookup)
+        let key = ("BioAssay".to_string(), "assay_type".to_string());
+        assert!(
+            mgr.mem_complete.contains(&key),
+            "mem_complete should be set after bulk_load"
+        );
+    }
+
+    #[test]
+    fn test_hybrid_open_disk_indexes_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("indexes");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Phase 1: Create index with data, then drop manager (simulate shutdown)
+        {
+            let mut mgr = IndexManager::with_disk_storage(
+                &data_dir,
+                IndexStorageMode::Hybrid {
+                    threshold_entries: 50,
+                },
+            );
+            mgr.create_index("Drug", "drug_name");
+
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..100)
+                .map(|i| {
+                    let name = if i < 50 { "aspirin" } else { "ibuprofen" };
+                    (name.as_bytes().to_vec(), format!("drug_{}", i).into_bytes())
+                })
+                .collect();
+            mgr.bulk_load_index("Drug", "drug_name", &entries).unwrap();
+            mgr.flush_disk_indexes();
+        }
+
+        // Phase 2: Reopen — should load disk indexes and merge with memory
+        {
+            let mut mgr = IndexManager::with_disk_storage(
+                &data_dir,
+                IndexStorageMode::Hybrid {
+                    threshold_entries: 50,
+                },
+            );
+            mgr.open_disk_indexes().unwrap();
+
+            // Index should be found
+            assert!(mgr.has_index("Drug", "drug_name"));
+
+            // mem_complete should NOT be set (disk has history, memory is empty)
+            let key = ("Drug".to_string(), "drug_name".to_string());
+            assert!(
+                !mgr.mem_complete.contains(&key),
+                "mem_complete should be cleared after open_disk_indexes"
+            );
+
+            // Lookup should merge memory (empty) + disk (100 entries)
+            let pks = mgr
+                .lookup_eq("Drug", "drug_name", &json!("aspirin"))
+                .unwrap();
+            assert_eq!(pks.len(), 50);
+
+            let pks = mgr
+                .lookup_eq("Drug", "drug_name", &json!("ibuprofen"))
+                .unwrap();
+            assert_eq!(pks.len(), 50);
+        }
+    }
+
+    #[test]
+    fn test_hybrid_mem_complete_marker_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("indexes");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let mut mgr = IndexManager::with_disk_storage(
+            &data_dir,
+            IndexStorageMode::Hybrid {
+                threshold_entries: 10,
+            },
+        );
+        let key = ("Product".to_string(), "color".to_string());
+
+        // After create_index: mem_complete is NOT set
+        mgr.create_index("Product", "color");
+        assert!(!mgr.mem_complete.contains(&key));
+
+        // After bulk_load: mem_complete IS set
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (b"red".to_vec(), b"p1".to_vec()),
+            (b"blue".to_vec(), b"p2".to_vec()),
+        ];
+        mgr.bulk_load_index("Product", "color", &entries).unwrap();
+        assert!(mgr.mem_complete.contains(&key));
+
+        // After drop_index: mem_complete is cleared
+        mgr.drop_index("Product", "color");
+        assert!(!mgr.mem_complete.contains(&key));
+    }
+
+    #[test]
+    fn test_hybrid_range_scan_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("indexes");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Phase 1: Build index with numeric values
+        {
+            let mut mgr = IndexManager::with_disk_storage(
+                &data_dir,
+                IndexStorageMode::Hybrid {
+                    threshold_entries: 50,
+                },
+            );
+            mgr.create_index("Item", "score");
+            let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..200)
+                .map(|i| {
+                    let val = IndexManager::encode_value(&json!(i));
+                    (val, format!("item_{}", i).into_bytes())
+                })
+                .collect();
+            mgr.bulk_load_index("Item", "score", &entries).unwrap();
+            mgr.flush_disk_indexes();
+        }
+
+        // Phase 2: Reopen and do range scan
+        {
+            let mut mgr = IndexManager::with_disk_storage(
+                &data_dir,
+                IndexStorageMode::Hybrid {
+                    threshold_entries: 50,
+                },
+            );
+            mgr.open_disk_indexes().unwrap();
+
+            // Range [50, 99] should return 50 items
+            let pks = mgr
+                .lookup_range("Item", "score", Some(&json!(50)), Some(&json!(99)))
+                .unwrap();
+            assert_eq!(pks.len(), 50);
+
+            // GT 150 should return 49 items (151..199)
+            let pks = mgr
+                .lookup_gt("Item", "score", &json!(150))
+                .unwrap();
+            assert_eq!(pks.len(), 49);
+        }
     }
 }
