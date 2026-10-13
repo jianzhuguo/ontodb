@@ -59,11 +59,32 @@ impl CacheEntry {
 const GRAPH_VERTEX_PREFIX: &str = "__graph_v__";
 const GRAPH_EDGE_PREFIX: &str = "__graph_e__";
 
-/// Maximum number of vertices allowed in the in-memory graph store (DoS protection).
-const MAX_VERTICES: usize = 1_000_000;
+/// Default cap on in-memory vertices (DoS protection). Override via [`GraphLimits`].
+const DEFAULT_MAX_VERTICES: usize = 1_000_000;
 
-/// Maximum memory usage for graph cache in bytes (2GB).
-const MAX_CACHE_MEMORY_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Default cap on graph cache memory (2GB). Override via [`GraphLimits`].
+const DEFAULT_MAX_CACHE_MEMORY_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Runtime limits for the in-memory graph store.
+///
+/// Defaults match the historical hard-coded caps (1M vertices / 2GB cache).
+/// Raise them for large ontologies instead of recompiling.
+#[derive(Debug, Clone)]
+pub struct GraphLimits {
+    /// Maximum number of vertices allowed in memory.
+    pub max_vertices: usize,
+    /// Maximum memory usage for graph cache in bytes.
+    pub max_cache_memory_bytes: usize,
+}
+
+impl Default for GraphLimits {
+    fn default() -> Self {
+        Self {
+            max_vertices: DEFAULT_MAX_VERTICES,
+            max_cache_memory_bytes: DEFAULT_MAX_CACHE_MEMORY_BYTES,
+        }
+    }
+}
 
 /// Batch size for paging when loading relations from LSM.
 const LOAD_BATCH_SIZE: usize = 10_000;
@@ -127,6 +148,8 @@ pub struct GraphStore {
     /// Pending edge changes per relation type (for incremental updates).
     /// Each entry tracks edges that were added or removed since last full load.
     pending_changes: RwLock<HashMap<String, Vec<EdgeChange>>>,
+    /// Runtime caps (vertex count / cache memory).
+    limits: GraphLimits,
 }
 
 /// A pending edge change for incremental cache updates.
@@ -159,6 +182,11 @@ pub struct CacheStats {
 
 impl GraphStore {
     pub fn new() -> Self {
+        Self::with_limits(GraphLimits::default())
+    }
+
+    /// Create a store with custom vertex/cache limits.
+    pub fn with_limits(limits: GraphLimits) -> Self {
         Self {
             vertices: RwLock::new(HashMap::new()),
             edges: RwLock::new(HashMap::new()),
@@ -175,6 +203,7 @@ impl GraphStore {
             last_invalidation: RwLock::new(HashMap::new()),
             cache_stats: RwLock::new(CacheStats::default()),
             pending_changes: RwLock::new(HashMap::new()),
+            limits,
         }
     }
 
@@ -183,6 +212,14 @@ impl GraphStore {
     /// Data is persisted to the engine with `__graph_v__` and `__graph_e__` prefixes.
     /// Call `load_from_engine()` after creation to restore data from disk.
     pub fn with_engine(engine: Arc<onto_storage::LsmEngine>) -> Self {
+        Self::with_engine_and_limits(engine, GraphLimits::default())
+    }
+
+    /// Create a persistent store with custom vertex/cache limits.
+    pub fn with_engine_and_limits(
+        engine: Arc<onto_storage::LsmEngine>,
+        limits: GraphLimits,
+    ) -> Self {
         Self {
             vertices: RwLock::new(HashMap::new()),
             edges: RwLock::new(HashMap::new()),
@@ -199,7 +236,13 @@ impl GraphStore {
             last_invalidation: RwLock::new(HashMap::new()),
             cache_stats: RwLock::new(CacheStats::default()),
             pending_changes: RwLock::new(HashMap::new()),
+            limits,
         }
+    }
+
+    /// Current runtime limits.
+    pub fn limits(&self) -> &GraphLimits {
+        &self.limits
     }
 
     /// Whether this store has persistence enabled.
@@ -448,10 +491,10 @@ impl GraphStore {
         let labels = vertex.labels.clone();
 
         // DoS protection: enforce max vertex count
-        if self.vertices.read().len() >= MAX_VERTICES {
+        if self.vertices.read().len() >= self.limits.max_vertices {
             return Err(GraphError::StorageError(format!(
                 "vertex limit reached ({})",
-                MAX_VERTICES
+                self.limits.max_vertices
             )));
         }
 
@@ -947,6 +990,64 @@ impl GraphStore {
             .get(idx as usize)
             .map(|list| list.iter().map(|(_, eid)| eid.clone()).collect())
             .unwrap_or_default()
+    }
+
+    /// Neighbor IDs reachable from `vertex_id` via out-edges with `label`.
+    ///
+    /// O(degree) membership checks against `edge_label_index` — no per-call
+    /// rebuild of the label's full edge-ID set, no full-edge clones. Neighbor
+    /// identity comes from the adjacency index (`neighbor_idx → id`), so edges
+    /// themselves are never materialized.
+    pub fn get_out_neighbor_ids_by_label(&self, vertex_id: &str, label: &str) -> Vec<String> {
+        let idx = match self.id_to_idx.read().get(vertex_id).copied() {
+            Some(idx) => idx as usize,
+            None => return Vec::new(),
+        };
+        let eli = self.edge_label_index.read();
+        let Some(label_edges) = eli.get(label) else {
+            return Vec::new();
+        };
+        let adj_out = self.adj_out.read();
+        let idx_to_id = self.idx_to_id.read();
+        let Some(list) = adj_out.get(idx) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (nbr_idx, eid) in list.iter() {
+            if label_edges.contains(eid.as_str()) {
+                if let Some(nid) = idx_to_id.get(*nbr_idx as usize) {
+                    out.push(nid.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Neighbor IDs pointing at `vertex_id` via in-edges with `label`.
+    /// Same complexity contract as [`Self::get_out_neighbor_ids_by_label`].
+    pub fn get_in_neighbor_ids_by_label(&self, vertex_id: &str, label: &str) -> Vec<String> {
+        let idx = match self.id_to_idx.read().get(vertex_id).copied() {
+            Some(idx) => idx as usize,
+            None => return Vec::new(),
+        };
+        let eli = self.edge_label_index.read();
+        let Some(label_edges) = eli.get(label) else {
+            return Vec::new();
+        };
+        let adj_in = self.adj_in.read();
+        let idx_to_id = self.idx_to_id.read();
+        let Some(list) = adj_in.get(idx) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (nbr_idx, eid) in list.iter() {
+            if label_edges.contains(eid.as_str()) {
+                if let Some(nid) = idx_to_id.get(*nbr_idx as usize) {
+                    out.push(nid.clone());
+                }
+            }
+        }
+        out
     }
 
     /// Get incoming edge IDs for a vertex without cloning edge data.
@@ -1693,7 +1794,7 @@ impl GraphStore {
 
             // Memory check (rough estimate: ~200 bytes per edge)
             let estimated_memory = edge_count * 200;
-            if estimated_memory >= MAX_CACHE_MEMORY_BYTES {
+            if estimated_memory >= self.limits.max_cache_memory_bytes {
                 return Err(GraphError::StorageError(format!(
                     "Loading relation '{}' would exceed memory limit ({} edges, ~{}MB)",
                     relation_type, edge_count, estimated_memory / (1024 * 1024)
@@ -1828,10 +1929,10 @@ impl GraphStore {
             .sum();
         drop(state);
 
-        if total_memory >= MAX_CACHE_MEMORY_BYTES {
+        if total_memory >= self.limits.max_cache_memory_bytes {
             tracing::warn!(
                 total_mb = total_memory / (1024 * 1024),
-                limit_mb = MAX_CACHE_MEMORY_BYTES / (1024 * 1024),
+                limit_mb = self.limits.max_cache_memory_bytes / (1024 * 1024),
                 "Graph cache memory limit exceeded, evicting LRU"
             );
             self.evict_lru();
@@ -2058,6 +2159,53 @@ mod tests {
 
         let companies = store.get_vertices_by_label("Company");
         assert_eq!(companies.len(), 1);
+    }
+
+    #[test]
+    fn test_graph_limits_vertex_cap() {
+        let store = GraphStore::with_limits(GraphLimits {
+            max_vertices: 2,
+            max_cache_memory_bytes: 1024,
+        });
+        store.add_vertex(Vertex::new("a", vec![])).unwrap();
+        store.add_vertex(Vertex::new("b", vec![])).unwrap();
+        let err = store.add_vertex(Vertex::new("c", vec![]));
+        assert!(err.is_err(), "third vertex must hit the cap");
+        assert_eq!(store.limits().max_vertices, 2);
+    }
+
+    #[test]
+    fn test_neighbor_ids_by_label() {
+        let store = GraphStore::new();
+        store.add_vertex(Vertex::new("a", vec![])).unwrap();
+        store.add_vertex(Vertex::new("b", vec![])).unwrap();
+        store.add_vertex(Vertex::new("c", vec![])).unwrap();
+        store
+            .add_edge(Edge::new("e1", "a", "b", "KNOWS"))
+            .unwrap();
+        store
+            .add_edge(Edge::new("e2", "a", "c", "WORKS_AT"))
+            .unwrap();
+        store
+            .add_edge(Edge::new("e3", "c", "a", "KNOWS"))
+            .unwrap();
+
+        let out_knows = store.get_out_neighbor_ids_by_label("a", "KNOWS");
+        assert_eq!(out_knows, vec!["b".to_string()]);
+
+        let out_works = store.get_out_neighbor_ids_by_label("a", "WORKS_AT");
+        assert_eq!(out_works, vec!["c".to_string()]);
+
+        let in_knows = store.get_in_neighbor_ids_by_label("a", "KNOWS");
+        assert_eq!(in_knows, vec!["c".to_string()]);
+
+        // Unknown label / vertex → empty, no panic
+        assert!(store
+            .get_out_neighbor_ids_by_label("a", "NOPE")
+            .is_empty());
+        assert!(store
+            .get_out_neighbor_ids_by_label("missing", "KNOWS")
+            .is_empty());
     }
 
     #[test]

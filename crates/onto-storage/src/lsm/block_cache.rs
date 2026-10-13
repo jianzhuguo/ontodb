@@ -87,6 +87,19 @@ impl BlockCache {
         }
     }
 
+    /// Takes a cached block by offset, removing it from the cache.
+    /// Avoids cloning when the caller will consume the block (e.g., sequential iteration).
+    pub fn take(&mut self, offset: u64) -> Option<Vec<u8>> {
+        self.counter += 1;
+        if let Some(entry) = self.entries.remove(&offset) {
+            self.hits += 1;
+            Some(entry.data)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
     /// Inserts a block into the cache. May evict the LRU entry if full.
     pub fn put(&mut self, offset: u64, data: Vec<u8>) {
         self.counter += 1;
@@ -165,6 +178,14 @@ impl BlockCache {
     /// Returns true if the cache is empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Dynamically adjusts cache capacity. Evicts entries if over new limit.
+    pub fn set_capacity(&mut self, new_capacity: usize) {
+        self.capacity = new_capacity;
+        while self.entries.len() > self.capacity {
+            self.evict_lru();
+        }
     }
 
     /// Clears all cached entries.

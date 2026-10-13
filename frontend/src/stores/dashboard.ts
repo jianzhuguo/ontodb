@@ -38,10 +38,10 @@ function buildTopology(cluster: ClusterNode, health: HealthResponse, metrics: Me
     label: `Node ${cluster.node_id || '1'}`,
     role: cluster.mode === 'standalone' ? 'standalone' : (cluster.leader === cluster.node_id ? 'leader' : 'follower'),
     health: currentHealth,
-    memory: Math.round((metrics.storage.memtable_size_bytes / (1024 * 1024)) * 100) / 100,
-    storage: metrics.storage.entries,
-    connections: metrics.connections.http.active + metrics.connections.tcp.active,
-    qps: metrics.queries.total,
+    memory: Math.round(((metrics.storage?.memtable_size_bytes ?? 0) / (1024 * 1024)) * 100) / 100,
+    storage: metrics.storage?.entries ?? 0,
+    connections: (metrics.connections?.http?.active ?? 0) + (metrics.connections?.tcp?.active ?? 0),
+    qps: metrics.queries?.total ?? 0,
     position: [0, 0, 0],
   })
 
@@ -102,10 +102,10 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       const history = get().metricsHistory
       const newEntry: MetricsHistory = {
         timestamp: now,
-        qps: metrics.queries.total,
-        latency: metrics.queries.avg_latency_ms,
-        connections: metrics.connections.http.active + metrics.connections.tcp.active,
-        storageEntries: metrics.storage.entries,
+        qps: metrics.queries?.total ?? 0,
+        latency: metrics.queries?.avg_latency_ms ?? 0,
+        connections: (metrics.connections?.http?.active ?? 0) + (metrics.connections?.tcp?.active ?? 0),
+        storageEntries: metrics.storage?.entries ?? 0,
       }
       // Keep last 60 data points
       const newHistory = [...history, newEntry].slice(-60)

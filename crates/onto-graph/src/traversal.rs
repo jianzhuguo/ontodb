@@ -450,9 +450,10 @@ impl<'a> TraversalEngine<'a> {
 
     /// BFS with edge label filtering using the edge label index (P0 optimization).
     ///
-    /// Instead of scanning all edges of a vertex and filtering by label,
-    /// this pre-fetches the set of edge IDs for the given label and only
-    /// traverses matching edges.  O(matching_edges) instead of O(all_edges).
+    /// Neighbor expansion goes through `get_{out,in}_neighbor_ids_by_label`,
+    /// which checks membership in the edge-label index and resolves neighbor
+    /// IDs from the adjacency index. O(degree) per hop — no per-hop rebuild of
+    /// the label's full edge-ID set and no full-edge clones.
     fn traverse_bfs_label_indexed(
         &self,
         start_id: &str,
@@ -485,54 +486,20 @@ impl<'a> TraversalEngine<'a> {
                 continue;
             }
 
-            // Use edge label index to find relevant edges efficiently
-            let neighbor_ids = match direction {
-                Direction::Out => {
-                    let out_ids = self.store.get_out_edge_ids(&current_id);
-                    let label_edges = self.store.get_edges_by_label(edge_label);
-                    let label_edge_ids: HashSet<&str> =
-                        label_edges.iter().map(|e| e.id.as_str()).collect();
-                    out_ids
-                        .iter()
-                        .filter(|eid| label_edge_ids.contains(eid.as_str()))
-                        .filter_map(|eid| self.store.get_edge(eid))
-                        .map(|e| e.to)
-                        .collect::<Vec<_>>()
-                }
-                Direction::In => {
-                    let in_ids = self.store.get_in_edge_ids(&current_id);
-                    let label_edges = self.store.get_edges_by_label(edge_label);
-                    let label_edge_ids: HashSet<&str> =
-                        label_edges.iter().map(|e| e.id.as_str()).collect();
-                    in_ids
-                        .iter()
-                        .filter(|eid| label_edge_ids.contains(eid.as_str()))
-                        .filter_map(|eid| self.store.get_edge(eid))
-                        .map(|e| e.from)
-                        .collect::<Vec<_>>()
-                }
+            let neighbor_ids: Vec<String> = match direction {
+                Direction::Out => self
+                    .store
+                    .get_out_neighbor_ids_by_label(&current_id, edge_label),
+                Direction::In => self
+                    .store
+                    .get_in_neighbor_ids_by_label(&current_id, edge_label),
                 Direction::Both => {
-                    let mut ids = Vec::new();
-                    let label_edges = self.store.get_edges_by_label(edge_label);
-                    let label_edge_ids: HashSet<&str> =
-                        label_edges.iter().map(|e| e.id.as_str()).collect();
-
-                    let out_ids = self.store.get_out_edge_ids(&current_id);
+                    let mut ids = self
+                        .store
+                        .get_out_neighbor_ids_by_label(&current_id, edge_label);
                     ids.extend(
-                        out_ids
-                            .iter()
-                            .filter(|eid| label_edge_ids.contains(eid.as_str()))
-                            .filter_map(|eid| self.store.get_edge(eid))
-                            .map(|e| e.to),
-                    );
-
-                    let in_ids = self.store.get_in_edge_ids(&current_id);
-                    ids.extend(
-                        in_ids
-                            .iter()
-                            .filter(|eid| label_edge_ids.contains(eid.as_str()))
-                            .filter_map(|eid| self.store.get_edge(eid))
-                            .map(|e| e.from),
+                        self.store
+                            .get_in_neighbor_ids_by_label(&current_id, edge_label),
                     );
                     ids
                 }

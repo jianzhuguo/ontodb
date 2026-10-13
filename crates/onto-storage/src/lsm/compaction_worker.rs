@@ -291,24 +291,23 @@ impl CompactionWorker {
             }
 
             let ssts: Vec<SsTableInfo> = if level == 0 {
-                let count = (levels[0].len() / 2).max(2).min(levels[0].len());
+                let count = (levels[0].len() / 2).max(2).min(levels[0].len()).min(4);
                 levels[0].iter().take(count).cloned().collect()
             } else {
                 if levels[level].is_empty() {
                     return Ok(());
                 }
-                // When file count exceeds penalty threshold (100), compact multiple
-                // files at once to accelerate file count reduction.
+                // Cap source SSTables to reduce memory pressure
                 let file_count = levels[level].len();
                 let excess = file_count.saturating_sub(100);
-                if excess > 0 {
-                    let batch = excess.min(8).max(1);
-                    let mut sorted: Vec<SsTableInfo> = levels[level].clone();
-                    sorted.sort_by_key(|s| s.size);
-                    sorted.into_iter().take(batch).collect()
+                let batch = if excess > 0 {
+                    excess.min(4).max(1)
                 } else {
-                    vec![levels[level][0].clone()]
-                }
+                    1
+                };
+                let mut sorted: Vec<SsTableInfo> = levels[level].clone();
+                sorted.sort_by_key(|s| s.size);
+                sorted.into_iter().take(batch).collect()
             };
 
             if ssts.is_empty() {
@@ -332,8 +331,10 @@ impl CompactionWorker {
         };
 
         // Step 2: Find overlapping SSTables in level N+1 (snapshot, don't remove)
-        // Scale overlap cap with number of input files to avoid truncation
-        let max_overlap = 16.max(ssts_to_compact.len() * 4);
+        // Cap total SSTables opened simultaneously to bound memory usage.
+        // Each open SSTable holds bloom filter + index + block cache in memory.
+        const MAX_SSTABLES_PER_MERGE: usize = 20;
+        let max_overlap = MAX_SSTABLES_PER_MERGE.saturating_sub(ssts_to_compact.len()).max(4);
         let next_level = level + 1;
         let next_level_ssts: Vec<SsTableInfo> = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
@@ -354,9 +355,12 @@ impl CompactionWorker {
         };
 
         // Step 3: Streaming merge using min-heap (O(1) memory per SSTable)
+        // Only clone levels deeper than next_level for tombstone checks (saves memory)
         let (deepest_level, levels_snapshot) = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-            (levels.len() - 1, levels.clone())
+            let deepest = levels.len() - 1;
+            let snapshot: Vec<Vec<SsTableInfo>> = levels.iter().skip(next_level + 1).cloned().collect();
+            (deepest, snapshot)
         };
 
         // Collect all SSTable paths for streaming merge
@@ -374,6 +378,8 @@ impl CompactionWorker {
 
         // Step 4: Stream entries with dedup + tombstone cleanup, write directly to new SSTables
         let target_sst_size = 64 * 1024 * 1024; // 64MB per output SST
+        let merge_start = std::time::Instant::now();
+        const MERGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
         let mut builder = SsTableBuilder::new();
         builder.set_compression_level(self.options.compression_level);
         let mut new_ssts = Vec::new();
@@ -383,6 +389,15 @@ impl CompactionWorker {
         let mut entry_count = 0u64;
 
         while merge_iter.has_next() {
+            // Timeout check: abort if merge takes too long
+            if merge_start.elapsed() > MERGE_TIMEOUT {
+                tracing::warn!(
+                    "Compaction merge timed out after {}s, aborting (processed {} entries)",
+                    merge_start.elapsed().as_secs(),
+                    entry_count
+                );
+                return Ok(());
+            }
             let entry = merge_iter.next().unwrap();
             let key = entry.key;
             let value = entry.value;
@@ -519,10 +534,10 @@ impl CompactionWorker {
     fn merge_small_files(&mut self) -> Result<()> {
         const SMALL_FILE_THRESHOLD: u64 = 16 * 1024 * 1024; // 16MB
         const MIN_FILES_TO_MERGE: usize = 4;
-        const MERGE_BATCH_SIZE: usize = 40;
-        // Target output size MUST exceed SMALL_FILE_THRESHOLD to prevent infinite re-merging.
-        // Set to 2x threshold so merged files are definitively "not small".
-        const TARGET_OUTPUT_SIZE: u64 = 96 * 1024 * 1024; // 96MB
+        const MERGE_BATCH_SIZE: usize = 5;
+        // Target must be large enough so compressed output exceeds SMALL_FILE_THRESHOLD.
+        // With ~4x compression ratio, 256MB uncompressed → ~64MB compressed output.
+        const TARGET_OUTPUT_SIZE: u64 = 256 * 1024 * 1024; // 256MB uncompressed target
 
         // Find the level with the most small files
         let (target_level, mut small_files) = {
@@ -687,11 +702,14 @@ impl CompactionWorker {
 
     fn can_drop_tombstone_static(
         key: &[u8],
-        from_level: usize,
-        levels: &[Vec<SsTableInfo>],
+        _from_level: usize,
+        deeper_levels: &[Vec<SsTableInfo>],
     ) -> bool {
-        for level in (from_level + 1)..levels.len() {
-            for sst_info in &levels[level] {
+        // deeper_levels contains levels from (from_level+1) onward.
+        // If any deeper level has an SSTable whose range contains this key,
+        // the tombstone must be preserved.
+        for level_ssts in deeper_levels {
+            for sst_info in level_ssts {
                 if key >= sst_info.min_key.as_slice() && key <= sst_info.max_key.as_slice() {
                     return false;
                 }

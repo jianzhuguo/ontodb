@@ -11,4 +11,5 @@ pub mod group_commit;
 pub mod memory_manager;
 pub mod memtable;
 pub mod sstable;
+pub mod streaming_merge;
 pub mod wal;

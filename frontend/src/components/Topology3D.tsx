@@ -73,7 +73,6 @@ function NodeSphere({ node }: { node: TopologyNode }) {
         color={color}
         anchorX="center"
         anchorY="bottom"
-        font="/fonts/inter.woff2"
       >
         {ROLE_LABELS[node.role]}
       </Text>
@@ -84,7 +83,6 @@ function NodeSphere({ node }: { node: TopologyNode }) {
         color="#94a3b8"
         anchorX="center"
         anchorY="top"
-        font="/fonts/inter.woff2"
       >
         {node.label}
       </Text>

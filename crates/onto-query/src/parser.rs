@@ -183,6 +183,9 @@ pub enum QueryAst {
     /// VACUUM TABLE <class> — remove tombstones and rewrite live entries
     VacuumTable { class: String },
 
+    /// TRUNCATE TABLE <class> — delete all entries for a class efficiently
+    TruncateTable { class: String },
+
     /// SHOW TABLE STATS <class> — display table statistics
     ShowTableStats { class: String },
 
@@ -418,6 +421,7 @@ impl QueryAst {
             QueryAst::Upsert { .. } => false,
             QueryAst::Update { .. } => false,
             QueryAst::Delete { .. } => false,
+            QueryAst::TruncateTable { .. } => false,
             QueryAst::Import { .. } => false,
             QueryAst::Copy { .. } => false,
 
@@ -1001,6 +1005,12 @@ impl QueryParser {
         } else if starts_with("VACUUM TABLE") {
             let rest = input[12..].trim().to_string();
             Ok(QueryAst::VacuumTable { class: rest })
+        } else if starts_with("TRUNCATE TABLE") {
+            let rest = input[14..].trim().to_string();
+            Ok(QueryAst::TruncateTable { class: rest })
+        } else if starts_with("TRUNCATE") {
+            let rest = input[8..].trim().to_string();
+            Ok(QueryAst::TruncateTable { class: rest })
         } else if starts_with("SHOW TABLE STATS") {
             let rest = input[16..].trim().to_string();
             Ok(QueryAst::ShowTableStats { class: rest })

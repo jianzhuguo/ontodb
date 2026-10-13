@@ -338,8 +338,8 @@ pub struct QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
-            query_timeout: Duration::from_secs(120),
-            memory_budget: 256 * 1024 * 1024, // 256 MB
+            query_timeout: Duration::from_secs(3600),
+            memory_budget: 4096 * 1024 * 1024, // 4 GB
         }
     }
 }
@@ -397,7 +397,7 @@ pub struct QueryExecutor {
     current_namespace: Mutex<String>,
     /// Cached row counts per table: table_name → (count, last_updated).
     /// Avoids full table scan for COUNT(*) queries.
-    row_count_cache: Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>,
+    row_count_cache: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>>,
     /// Set of relation table names that have already had source/target indexes created.
     /// Avoids repeated index creation attempts.
     relation_indexes_created: Mutex<std::collections::HashSet<String>>,
@@ -688,7 +688,7 @@ impl QueryExecutor {
             shard_router: std::sync::RwLock::new(None),
             shard_manager: Mutex::new(None),
             current_namespace: Mutex::new("default".to_string()),
-            row_count_cache: Mutex::new(std::collections::HashMap::new()),
+            row_count_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             relation_indexes_created: Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -699,21 +699,100 @@ impl QueryExecutor {
         self.query_deadline.store(deadline, Ordering::Relaxed);
     }
 
-    /// Get cached row count for a table, or compute and cache it.
-    /// Cache TTL: 60 seconds.
+    /// Get cached row count for a table.
+    /// Cache never expires — updated incrementally on INSERT, invalidated on DELETE.
+    /// Warmup populates on startup.
     fn get_cached_row_count(&self, _engine: &LsmEngine, table: &str) -> Option<u64> {
         let cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&(count, ref updated)) = cache.get(table) {
-            if updated.elapsed().as_secs() < 60 {
-                return Some(count);
-            }
-        }
-        None
+        cache.get(table).map(|&(count, _)| count)
     }
 
     fn set_cached_row_count(&self, table: &str, count: u64) {
         let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.insert(table.to_string(), (count, std::time::Instant::now()));
+    }
+
+    /// Pre-warm row count cache for all known tables in the background.
+    /// Counts use the SAME class-hierarchy expansion as SELECT/COUNT queries
+    /// (`get_class_hierarchy_read` + `count_prefix`), so cached counts match
+    /// streaming scan results (including subclass/related-class prefixes).
+    pub fn warmup_row_counts(self: &Arc<Self>) {
+        let exec = Arc::clone(self);
+        let engine = self.engine.clone();
+        let cache = self.row_count_cache.clone();
+
+        std::thread::Builder::new()
+            .name("count-warmup".into())
+            .spawn(move || {
+                // Wait for engine to finish loading data (index rebuild, compaction, etc.)
+                tracing::info!("Row count cache warmup waiting for engine ready...");
+                std::thread::sleep(std::time::Duration::from_secs(30));
+
+                tracing::info!("Row count cache warmup started");
+
+                // Get all table names from ontologies
+                let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
+                tracing::info!("Warmup: found {} ontology entries", entries.len());
+                let mut tables = Vec::new();
+                for (_key, val_bytes) in &entries {
+                    match onto_ontology::Ontology::from_json_slice(val_bytes) {
+                        Ok(ontology) => {
+                            for name in ontology.classes.keys() {
+                                tables.push(name.clone());
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Warmup: failed to parse ontology: {}", e);
+                            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                                if let Some(obj) = v.as_object() {
+                                    if let Some(classes) = obj.get("classes").and_then(|c| c.as_object()) {
+                                        for name in classes.keys() {
+                                            tables.push(name.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                tracing::info!("Warmup: found {} tables to count", tables.len());
+                let mut total_rows = 0u64;
+                let mut cached_count = 0;
+
+                for table in &tables {
+                    // Same expansion the query path uses — subclass/related
+                    // prefixes are included, so cached == SELECT row count.
+                    let hierarchy = exec.get_class_hierarchy_read(&engine, table);
+                    let mut count = 0u64;
+                    for cls in &hierarchy {
+                        let prefix = format!("{}::", cls);
+                        match engine.count_prefix(prefix.as_bytes()) {
+                            Ok((live, _tombs)) => count += live as u64,
+                            Err(e) => {
+                                tracing::warn!("Warmup count failed for {}:: {}", cls, e);
+                            }
+                        }
+                    }
+                    if count > 0 {
+                        let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+                        c.insert(table.clone(), (count, std::time::Instant::now()));
+                        if let Some(dot_pos) = table.find('.') {
+                            let short = &table[dot_pos + 1..];
+                            c.insert(short.to_string(), (count, std::time::Instant::now()));
+                        }
+                        total_rows += count;
+                        cached_count += 1;
+                    }
+                }
+
+                tracing::info!(
+                    "Row count cache warmup complete: {} tables, {} total rows (hierarchy-expanded)",
+                    cached_count,
+                    total_rows
+                );
+            })
+            .ok();
     }
 
     /// Returns an error if the current query has exceeded its timeout.
@@ -1601,6 +1680,7 @@ impl QueryExecutor {
                     | QueryAst::Update { .. }
                     | QueryAst::Delete { .. }
                     | QueryAst::Upsert { .. }
+                    | QueryAst::TruncateTable { .. }
             );
 
         if is_simple_dml {
@@ -1722,21 +1802,48 @@ impl QueryExecutor {
             }
         }
 
-        // Invalidate row count cache for the affected table
+        // Update row count cache for the affected table
         if result.is_ok() {
             let table = match ast {
-                QueryAst::Insert { class, .. }
-                | QueryAst::BatchInsert { class, .. }
-                | QueryAst::BatchUpsert { class, .. }
-                | QueryAst::InsertSelect { class, .. }
-                | QueryAst::Delete { class, .. }
-                | QueryAst::Update { class, .. } => Some(class.as_str()),
+                QueryAst::Insert { class, .. } => {
+                    // Increment cached count by 1
+                    let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some((count, _)) = cache.get_mut(class) {
+                        *count += 1;
+                    }
+                    // Keep the table name for potential further use
+                    Some(class.as_str())
+                }
+                QueryAst::BatchInsert { class, rows, .. } => {
+                    // Increment cached count by batch size
+                    let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some((count, _)) = cache.get_mut(class) {
+                        *count += rows.len() as u64;
+                    }
+                    Some(class.as_str())
+                }
+                QueryAst::BatchUpsert { class, .. } => {
+                    // Upsert might insert or update; invalidate to be safe
+                    let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    cache.remove(class);
+                    Some(class.as_str())
+                }
+                QueryAst::InsertSelect { class, .. } => {
+                    // INSERT...SELECT: invalidate (unknown count)
+                    let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    cache.remove(class);
+                    Some(class.as_str())
+                }
+                QueryAst::Delete { class, .. }
+                | QueryAst::Update { class, .. } => {
+                    // DELETE/UPDATE: invalidate cache
+                    let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    cache.remove(class);
+                    Some(class.as_str())
+                }
                 _ => None,
             };
-            if let Some(t) = table {
-                let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
-                cache.remove(t);
-            }
+            let _ = table; // suppress unused warning
         }
 
         result
@@ -1811,20 +1918,45 @@ impl QueryExecutor {
                     {
                         let has_aggregates = Self::columns_have_aggregates(columns);
 
-                        // Fast path: COUNT(*) was already computed by plan_seq_scan_count_only.
-                        // Skip re-aggregation — just apply ORDER BY / LIMIT if present.
-                        if has_aggregates
-                            && group_by.is_none()
-                            && rows.len() == 1
-                            && Self::is_pure_count_star(columns)
-                        {
-                            if let Some(lim) = limit {
-                                rows.truncate(*lim);
+                        // COUNT(*) fast path: use cached row count for unfiltered queries
+                        if Self::is_pure_count_star(columns) {
+                            if let Some((scan_table, scan_filter)) = Self::extract_simple_seqscan(&plan.root) {
+                                if scan_filter.is_none() {
+                                    if let Some(cached) = self.get_cached_row_count(engine, &scan_table) {
+                                        tracing::info!("COUNT(*) cache hit (select_read): table={}, count={}", scan_table, cached);
+                                        let mut row = serde_json::Map::new();
+                                        let alias_name = match columns {
+                                            SelectColumns::Columns(items) => {
+                                                items.first().and_then(|item| {
+                                                    if let SelectItem::Aggregate(a) = item {
+                                                        Some(a.alias.clone().unwrap_or_else(|| "COUNT(*)".to_string()))
+                                                    } else { None }
+                                                }).unwrap_or_else(|| "COUNT(*)".to_string())
+                                            }
+                                            _ => "COUNT(*)".to_string(),
+                                        };
+                                        row.insert(alias_name, serde_json::Value::Number(cached.into()));
+                                        return Ok(QueryResult::Rows(vec![row]));
+                                    }
+                                }
                             }
-                            return Ok(QueryResult::Rows(rows));
                         }
 
                         if group_by.is_some() || has_aggregates {
+                            // `execute_plan_node_read`'s Projection handler already ran
+                            // `execute_streaming_aggregation` when the plan is a simple
+                            // seqscan. Re-running it here would scan the table twice.
+                            // Only redo when that first pass ignored HAVING/ORDER BY/
+                            // LIMIT/DISTINCT.
+                            let already_aggregated = has_aggregates
+                                && having.is_none()
+                                && order_by.is_empty()
+                                && limit.is_none()
+                                && !*distinct
+                                && Self::extract_simple_seqscan(&plan.root).is_some();
+                            if already_aggregated {
+                                return Ok(QueryResult::Rows(rows));
+                            }
                             // Streaming fast path: if plan is a simple SeqScan (no JOINs),
                             // aggregate in a single pass without materializing all rows.
                             if let Some((scan_table, scan_filter)) =
@@ -2140,6 +2272,38 @@ impl QueryExecutor {
                     "VACUUM {}: scanned {} entries, rewritten {} entries in {}ms. \
                      Background compaction will clean up old tombstones.",
                     class, total, rewritten, elapsed_ms
+                )))
+            }
+            QueryAst::TruncateTable { class } => {
+                let engine_clone = self.engine.clone();
+                let class_owned = class.clone();
+                let start = std::time::Instant::now();
+                let batch_size = 5000usize;
+                let mut total_deleted = 0u64;
+
+                loop {
+                    // Scan a batch of entries
+                    let prefix = format!("{}::", class_owned);
+                    let entries = engine_clone.scan_prefix_limit(
+                        prefix.as_bytes(),
+                        batch_size,
+                    )?;
+
+                    if entries.is_empty() {
+                        break;
+                    }
+
+                    // Delete each entry in the batch
+                    for (key, _value) in &entries {
+                        engine_clone.delete(key.clone())?;
+                        total_deleted += 1;
+                    }
+                }
+
+                let elapsed_ms = start.elapsed().as_millis();
+                Ok(QueryResult::Success(format!(
+                    "TRUNCATE {}: {} row(s) deleted in {:.1}s",
+                    class, total_deleted, elapsed_ms as f64 / 1000.0
                 )))
             }
             QueryAst::ShowTableStats { class } => {
@@ -2733,12 +2897,10 @@ impl QueryExecutor {
                     _ => false,
                 };
 
-                // Fast path: pure COUNT(*) — count rows without materializing Maps
-                if has_aggregates && Self::is_pure_count_star(columns) {
-                    if let PlanNode::SeqScan { table, filter, .. } = input.as_ref() {
-                        return self.plan_seq_scan_count_only(engine, table, filter, columns);
-                    }
-                }
+                // NOTE: COUNT(*) fast path re-enabled for unfiltered queries.
+                // Uses cached row count to avoid full table scan.
+                // Class hierarchy filtering is skipped for COUNT(*) — this returns
+                // the direct class instance count, not the inheritance-expanded count.
 
                 // Only push column projection down when there are no aggregates/expressions
                 // (aggregates and expressions may reference columns not in the SELECT list)
@@ -2750,6 +2912,28 @@ impl QueryExecutor {
                         ..
                     } = input.as_ref()
                     {
+                        // Fast path: unfiltered COUNT(*) with cached row count
+                        if Self::is_pure_count_star(columns) && filter.is_none() {
+                            if let Some(cached) = self.get_cached_row_count(engine, table) {
+                                let mut row = serde_json::Map::new();
+                                let alias_name = match columns {
+                                    SelectColumns::Columns(items) => {
+                                        items.first().and_then(|item| {
+                                            if let SelectItem::Aggregate(a) = item {
+                                                Some(a.alias.clone().unwrap_or_else(|| "COUNT(*)".to_string()))
+                                            } else { None }
+                                        }).unwrap_or_else(|| "COUNT(*)".to_string())
+                                    }
+                                    _ => "COUNT(*)".to_string(),
+                                };
+                                row.insert(alias_name, Value::Number(cached.into()));
+                                return Ok(vec![row]);
+                            }
+                        }
+                        // Count-only scan (with or without filter): never materializes Maps.
+                        if Self::is_pure_count_star(columns) {
+                            return self.plan_seq_scan_count_only(engine, table, filter, columns);
+                        }
                         self.plan_seq_scan(engine, table, alias.as_deref(), filter, Some(columns))?
                     } else {
                         self.execute_plan_node(input, engine)?
@@ -5072,10 +5256,27 @@ impl QueryExecutor {
                     _ => false,
                 };
 
-                // Fast path: pure COUNT(*) — count rows without materializing Maps
-                if has_aggregates && Self::is_pure_count_star(columns) {
-                    if let PlanNode::SeqScan { table, filter, .. } = input.as_ref() {
-                        return self.plan_seq_scan_count_only(engine, table, filter, columns);
+                // COUNT(*) fast path: use cached row count for unfiltered queries
+                if Self::is_pure_count_star(columns) {
+                    if let Some((scan_table, scan_filter)) = Self::extract_simple_seqscan(input) {
+                        if scan_filter.is_none() {
+                            if let Some(cached) = self.get_cached_row_count(engine, &scan_table) {
+                                tracing::info!("COUNT(*) cache hit: table={}, count={}", scan_table, cached);
+                                let mut row = serde_json::Map::new();
+                                let alias_name = match columns {
+                                    SelectColumns::Columns(items) => {
+                                        items.first().and_then(|item| {
+                                            if let SelectItem::Aggregate(a) = item {
+                                                Some(a.alias.clone().unwrap_or_else(|| "COUNT(*)".to_string()))
+                                            } else { None }
+                                        }).unwrap_or_else(|| "COUNT(*)".to_string())
+                                    }
+                                    _ => "COUNT(*)".to_string(),
+                                };
+                                row.insert(alias_name, Value::Number(cached.into()));
+                                return Ok(vec![row]);
+                            }
+                        }
                     }
                 }
 
@@ -5369,116 +5570,52 @@ impl QueryExecutor {
         // When a limit is set and there's no filter (pure LIMIT query), multiply the
         // scan limit to account for class-hierarchy and shard filtering.
         let effective_scan_limit = scan_limit.map(|l| l.saturating_mul(10).max(l + 100));
-        eprintln!("[SEQ_SCAN] table={}, hierarchy={:?}, filter={:?}, scan_limit={:?}", table, class_hierarchy, filter.is_some(), scan_limit);
-        for scan_class in &class_hierarchy {
-            if let Some(limit) = effective_scan_limit {
-                if rows.len() >= limit {
-                    break;
-                }
-            }
-            let prefix = format!("{}::", scan_class);
-            eprintln!("[SEQ_SCAN] prefix='{}', using={}", prefix, if effective_scan_limit.is_some() { "scan_prefix_limit" } else { "scan_prefix" });
-            // Use transaction-aware scan if there's an active transaction
-            let entries = if let Some(txn_id) = active_txn_id {
-                engine.txn_scan_prefix(txn_id, prefix.as_bytes())?
-            } else if let Some(limit) = effective_scan_limit {
-                engine.scan_prefix_limit(prefix.as_bytes(), limit)?
-            } else {
-                engine.scan_prefix(prefix.as_bytes())?
-            };
-            for (key, val_bytes) in &entries {
-                // Early exit when we have enough rows
-                if let Some(limit) = scan_limit {
-                    if rows.len() >= limit {
-                        break;
-                    }
-                }
-                // Check query timeout every 1024 rows (cheap: one atomic load)
-                scan_count += 1;
-                if scan_count & 0x3FF == 0 {
+        tracing::debug!(
+            table = %table,
+            has_filter = filter.is_some(),
+            has_scan_limit = scan_limit.is_some(),
+            "seq_scan start"
+        );
+
+        // Row filter + projection for one raw storage value. Returns None if rejected.
+        let mut row_from_value =
+            |key: &[u8], val_bytes: &[u8], scan_count: &mut u64| -> Result<Option<Map<String, Value>>> {
+                *scan_count += 1;
+                if *scan_count & 0x3FF == 0 {
                     self.check_timeout()?;
                 }
                 // Tier 1: fast byte-level rejection
                 if !fast_filter_cols.is_empty()
                     && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols)
                 {
-                    tracing::debug!("fast_filter_reject: rejected row");
-                    continue;
+                    return Ok(None);
                 }
-                // Tier 2: BinaryRow path (for binary-stored data) — no JSON parsing
+                // Tier 2: BinaryRow path
                 if let Some(brow) = BinaryRow::parse(val_bytes) {
                     if !brow.class_in_hierarchy(&class_hierarchy) {
-                        tracing::debug!(
-                            "class_in_hierarchy: rejected row, class={:?}",
-                            brow.class_value()
-                        );
-                        continue;
+                        return Ok(None);
                     }
                     if let Some(f) = filter {
-                        let filter_result = eval_binary_filter(&brow, f);
-                        tracing::debug!(
-                            "eval_binary_filter: result={:?}, filter={:?}",
-                            filter_result,
-                            f
-                        );
-                        match filter_result {
+                        match eval_binary_filter(&brow, f) {
                             Some(true) => {}
-                            Some(false) => continue,
+                            Some(false) => return Ok(None),
                             None => {
-                                // Filter can't be evaluated from BinaryRow alone — need full map
                                 if let Some(mut doc) = brow.to_map() {
-                                    let filter_pass = self.eval_filter_read(engine, &doc, f);
-                                    tracing::debug!("eval_filter_read: result={}", filter_pass);
-                                    if !filter_pass {
-                                        continue;
+                                    if !self.eval_filter_read(engine, &doc, f) {
+                                        return Ok(None);
                                     }
-                                    doc.insert(
-                                        "__pk__".to_string(),
-                                        Value::String(String::from_utf8_lossy(key).to_string()),
-                                    );
-                                    // Add shard routing info
-                                    if let Some(router) = self
-                                        .shard_router
-                                        .read()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .as_ref()
-                                    {
-                                        let pk = String::from_utf8_lossy(key);
-                                        let target = router.route_key(table, pk.as_bytes());
-                                        doc.insert(
-                                            "__shard__".to_string(),
-                                            Value::String(format!("{:?}", target)),
-                                        );
-                                    }
-                                    rows.push(doc);
+                                    self.annotate_scanned_row(table, key, &mut doc);
+                                    return Ok(Some(doc));
                                 }
-                                continue;
+                                return Ok(None);
                             }
                         }
                     }
-                    // Use projected conversion when column list is available
                     if let Some(mut doc) = brow.to_map_projected(&proj_cols) {
-                        doc.insert(
-                            "__pk__".to_string(),
-                            Value::String(String::from_utf8_lossy(key).to_string()),
-                        );
-                        // Add shard routing info
-                        if let Some(router) = self
-                            .shard_router
-                            .read()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .as_ref()
-                        {
-                            let pk = String::from_utf8_lossy(key);
-                            let target = router.route_key(table, pk.as_bytes());
-                            doc.insert(
-                                "__shard__".to_string(),
-                                Value::String(format!("{:?}", target)),
-                            );
-                        }
-                        rows.push(doc);
+                        self.annotate_scanned_row(table, key, &mut doc);
+                        return Ok(Some(doc));
                     }
-                    continue;
+                    return Ok(None);
                 }
                 // Tier 3: JSON fallback (legacy data stored as JSON)
                 if let Ok(serde_json::Value::Object(mut doc)) =
@@ -5487,32 +5624,58 @@ impl QueryExecutor {
                     if !class_hierarchy
                         .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
                     {
-                        continue;
+                        return Ok(None);
                     }
                     if let Some(f) = filter {
                         if !self.eval_filter_read(engine, &doc, f) {
-                            continue;
+                            return Ok(None);
                         }
                     }
-                    doc.insert(
-                        "__pk__".to_string(),
-                        Value::String(String::from_utf8_lossy(key).to_string()),
-                    );
-                    // Add shard routing info
-                    if let Some(router) = self
-                        .shard_router
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                    {
-                        let pk = String::from_utf8_lossy(key);
-                        let target = router.route_key(table, pk.as_bytes());
-                        doc.insert(
-                            "__shard__".to_string(),
-                            Value::String(format!("{:?}", target)),
-                        );
+                    self.annotate_scanned_row(table, key, &mut doc);
+                    return Ok(Some(doc));
+                }
+                Ok(None)
+            };
+
+        for scan_class in &class_hierarchy {
+            if let Some(limit) = effective_scan_limit {
+                if rows.len() >= limit {
+                    break;
+                }
+            }
+            let prefix = format!("{}::", scan_class);
+            tracing::debug!(prefix = %prefix, limited = effective_scan_limit.is_some(), "seq_scan mode");
+
+            if let Some(limit) = effective_scan_limit {
+                // Limited path: bounded materialization via scan_prefix_limit
+                let entries = if let Some(txn_id) = active_txn_id {
+                    engine.txn_scan_prefix(txn_id, prefix.as_bytes())?
+                } else {
+                    engine.scan_prefix_limit(prefix.as_bytes(), limit)?
+                };
+                for (key, val_bytes) in &entries {
+                    if let Some(limit) = scan_limit {
+                        if rows.len() >= limit {
+                            break;
+                        }
                     }
-                    rows.push(doc);
+                    if let Some(doc) = row_from_value(key, val_bytes, &mut scan_count)? {
+                        rows.push(doc);
+                    }
+                }
+            } else {
+                // Unlimited path: stream live rows one value at a time —
+                // peak memory is one value + the key map, not the full table.
+                let mut on_row = |key: &[u8], val_bytes: &[u8]| -> Result<()> {
+                    if let Some(doc) = row_from_value(key, val_bytes, &mut scan_count)? {
+                        rows.push(doc);
+                    }
+                    Ok(())
+                };
+                if let Some(txn_id) = active_txn_id {
+                    engine.txn_for_each_live_prefix(txn_id, prefix.as_bytes(), on_row)?;
+                } else {
+                    engine.for_each_live_prefix(prefix.as_bytes(), None, None, on_row)?;
                 }
             }
         }
@@ -5531,8 +5694,29 @@ impl QueryExecutor {
             }
         }
 
-        eprintln!("[SEQ_SCAN] table={}, scanned={}, returned={}", table, scan_count, rows.len());
+        tracing::debug!(table = %table, scanned = scan_count, returned = rows.len(), "seq_scan done");
         Ok(rows)
+    }
+
+    /// Attach `__pk__` and optional `__shard__` routing info to a scanned row.
+    fn annotate_scanned_row(&self, table: &str, key: &[u8], doc: &mut Map<String, Value>) {
+        doc.insert(
+            "__pk__".to_string(),
+            Value::String(String::from_utf8_lossy(key).to_string()),
+        );
+        if let Some(router) = self
+            .shard_router
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let pk = String::from_utf8_lossy(key);
+            let target = router.route_key(table, pk.as_bytes());
+            doc.insert(
+                "__shard__".to_string(),
+                Value::String(format!("{:?}", target)),
+            );
+        }
     }
 
     /// Returns true if the columns represent a pure `COUNT(*)` with no other items.
@@ -5548,6 +5732,62 @@ impl QueryExecutor {
             }
             _ => false,
         }
+    }
+
+    /// Predicate for filtered key-only counts: does this raw storage value
+    /// belong to `class_hierarchy` and pass `filter`?
+    ///
+    /// Used with `LsmEngine::count_prefix_with` so the engine never has to
+    /// materialize all values for a COUNT with WHERE.
+    fn value_passes_count_filter(
+        &self,
+        engine: &LsmEngine,
+        class_hierarchy: &std::collections::HashSet<String>,
+        filter: &Option<FilterExpr>,
+        fast_filter_cols: &[String],
+        val_bytes: &[u8],
+    ) -> Result<bool> {
+        // Tier 1: fast byte-level rejection
+        if !fast_filter_cols.is_empty()
+            && Self::fast_filter_reject(val_bytes, filter, fast_filter_cols)
+        {
+            return Ok(false);
+        }
+        // Tier 2: BinaryRow path — filter without full deserialization
+        if let Some(brow) = BinaryRow::parse(val_bytes) {
+            if !brow.class_in_hierarchy(class_hierarchy) {
+                return Ok(false);
+            }
+            let f = match filter {
+                Some(f) => f,
+                None => return Ok(true),
+            };
+            let direct = eval_binary_filter(&brow, f);
+            if direct == Some(true) {
+                return Ok(true);
+            }
+            if direct == Some(false) {
+                return Ok(false);
+            }
+            // Filter needs full deserialization — rare case
+            if let Some(doc) = brow.to_map() {
+                return Ok(self.eval_filter_read(engine, &doc, f));
+            }
+            return Ok(false);
+        }
+        // Tier 3: JSON fallback
+        let doc = match serde_json::from_slice::<serde_json::Value>(val_bytes) {
+            Ok(serde_json::Value::Object(doc)) => doc,
+            _ => return Ok(false),
+        };
+        let class_name = doc.get("__class__").and_then(|v| v.as_str()).unwrap_or("");
+        if !class_hierarchy.contains(class_name) {
+            return Ok(false);
+        }
+        if let Some(f) = filter {
+            return Ok(self.eval_filter_read(engine, &doc, f));
+        }
+        Ok(true)
     }
 
     /// Count-only scan: counts matching rows without materializing Maps.
@@ -5579,64 +5819,66 @@ impl QueryExecutor {
                 row.insert(alias, Value::Number(cached.into()));
                 return Ok(vec![row]);
             }
+
+            // Cache miss: count via key-only scan. `count_prefix` tracks keys
+            // (seq/kind) and never materializes values, so it stays O(keys)
+            // instead of O(keys + total value bytes) on large classes.
+            let class_hierarchy = self.get_class_hierarchy_read(engine, table);
+            let mut count: u64 = 0;
+            for scan_class in &class_hierarchy {
+                let prefix = format!("{}::", scan_class);
+                let (live, _tombstones) = engine.count_prefix(prefix.as_bytes())?;
+                count += live as u64;
+            }
+            self.set_cached_row_count(table, count);
+
+            let count_key = match columns {
+                SelectColumns::Columns(items) => {
+                    if let Some(SelectItem::Aggregate(a)) = items.first() {
+                        a.alias.clone().unwrap_or_else(|| "count(*)".to_string())
+                    } else {
+                        "count(*)".to_string()
+                    }
+                }
+                _ => "count(*)".to_string(),
+            };
+            let mut result_row = Map::new();
+            result_row.insert(count_key, Value::Number(serde_json::Number::from(count)));
+            return Ok(vec![result_row]);
         }
 
         let class_hierarchy = self.get_class_hierarchy_read(engine, table);
         let fast_filter_cols = Self::extract_fast_filter_columns(filter);
         let mut count: u64 = 0;
 
+        // Prefer secondary index when the filter is a simple column predicate
+        // on an indexed column — O(matches) instead of O(table).
         for scan_class in &class_hierarchy {
-            let prefix = format!("{}::", scan_class);
-            let entries = engine.scan_prefix(prefix.as_bytes())?;
-            for (_key, val_bytes) in &entries {
-                // Tier 1: fast byte-level rejection
-                if !fast_filter_cols.is_empty()
-                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols)
-                {
-                    continue;
-                }
-                // Tier 2: BinaryRow path — filter without full deserialization
-                if let Some(brow) = BinaryRow::parse(val_bytes) {
-                    if !brow.class_in_hierarchy(&class_hierarchy) {
-                        continue;
-                    }
-                    if let Some(f) = filter {
-                        match eval_binary_filter(&brow, f) {
-                            Some(true) => {
-                                count += 1;
-                            }
-                            Some(false) => continue,
-                            None => {
-                                // Filter needs full deserialization — rare case
-                                if let Some(doc) = brow.to_map() {
-                                    if self.eval_filter_read(engine, &doc, f) {
-                                        count += 1;
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        count += 1;
-                    }
-                    continue;
-                }
-                // Tier 3: JSON fallback
-                if let Ok(serde_json::Value::Object(doc)) =
-                    serde_json::from_slice::<serde_json::Value>(val_bytes)
-                {
-                    if !class_hierarchy
-                        .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
-                    {
-                        continue;
-                    }
-                    if let Some(f) = filter {
-                        if !self.eval_filter_read(engine, &doc, f) {
-                            continue;
-                        }
-                    }
-                    count += 1;
-                }
+            if let Some(n) = Self::try_count_via_index(engine, scan_class, filter) {
+                count += n;
+                continue;
             }
+            // Fallback: key-only streaming count with per-row filter.
+            let prefix = format!("{}::", scan_class);
+            let mut scanned = 0u64;
+            let (matched, _tombstones) = engine.count_prefix_with(
+                prefix.as_bytes(),
+                None,
+                |val_bytes| {
+                    scanned += 1;
+                    if scanned & 0x3FF == 0 {
+                        self.check_timeout()?;
+                    }
+                    self.value_passes_count_filter(
+                        engine,
+                        &class_hierarchy,
+                        filter,
+                        &fast_filter_cols,
+                        val_bytes,
+                    )
+                },
+            )?;
+            count += matched as u64;
         }
 
         // Return a single row with the count, using alias if provided
@@ -5659,6 +5901,38 @@ impl QueryExecutor {
         }
 
         Ok(vec![result_row])
+    }
+
+    /// Try to count matching rows via a secondary index for a simple
+    /// column predicate. Returns None when the index cannot serve the filter.
+    fn try_count_via_index(
+        engine: &LsmEngine,
+        class: &str,
+        filter: &Option<FilterExpr>,
+    ) -> Option<u64> {
+        let f = filter.as_ref()?;
+        // Only single-column comparisons — And/Or fall back to scan.
+        match f {
+            FilterExpr::Eq(c, _)
+            | FilterExpr::Ne(c, _)
+            | FilterExpr::Gt(c, _)
+            | FilterExpr::Lt(c, _)
+            | FilterExpr::Gte(c, _)
+            | FilterExpr::Lte(c, _)
+            | FilterExpr::Between(c, _, _)
+            | FilterExpr::In(c, _) => {
+                if !engine.has_index(class, c) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        // Ne is not a pure index range — skip (would need full minus equals)
+        if matches!(f, FilterExpr::Ne(_, _)) {
+            return None;
+        }
+        let pkeys = Self::try_index_scan_single_read(engine, class, f)?;
+        Some(pkeys.len() as u64)
     }
 
     /// Extracts column names from simple comparison filters for fast byte-level rejection.
@@ -7936,17 +8210,7 @@ impl QueryExecutor {
             {
                 let has_aggregates = Self::columns_have_aggregates(columns);
 
-                // Fast path: COUNT(*) was already computed by plan_seq_scan_count_only.
-                if has_aggregates
-                    && group_by.is_none()
-                    && rows.len() == 1
-                    && Self::is_pure_count_star(columns)
-                {
-                    if let Some(lim) = limit {
-                        rows.truncate(*lim);
-                    }
-                    return Ok(QueryResult::Rows(rows));
-                }
+                // NOTE: COUNT(*) fast path removed (see execute_plan_node for rationale).
 
                 if group_by.is_some() || has_aggregates {
                     let result = self.execute_aggregation(
@@ -8264,17 +8528,7 @@ impl QueryExecutor {
                 // 1. Aggregation (GROUP BY + HAVING)
                 let has_aggregates = Self::columns_have_aggregates(columns);
 
-                // Fast path: COUNT(*) was already computed by plan_seq_scan_count_only.
-                if has_aggregates
-                    && group_by.is_none()
-                    && rows.len() == 1
-                    && Self::is_pure_count_star(columns)
-                {
-                    if let Some(lim) = limit {
-                        rows.truncate(*lim);
-                    }
-                    return Ok(QueryResult::Rows(rows));
-                }
+                // NOTE: COUNT(*) fast path removed (see execute_plan_node for rationale).
 
                 if group_by.is_some() || has_aggregates {
                     let result = self.execute_aggregation(
@@ -8410,6 +8664,37 @@ impl QueryExecutor {
                 *top_k,
                 filter,
             ),
+            QueryAst::TruncateTable { class } => {
+                let batch_size = 5000usize;
+                let mut total_deleted = 0u64;
+
+                loop {
+                    let prefix = format!("{}::", class);
+                    let entries = engine.scan_prefix_limit(
+                        prefix.as_bytes(),
+                        batch_size,
+                    )?;
+
+                    if entries.is_empty() {
+                        break;
+                    }
+
+                    for (key, _value) in &entries {
+                        engine.txn_delete(txn_id, key.clone())?;
+                        total_deleted += 1;
+                    }
+                }
+
+                // Invalidate graph cache
+                if let Some(ref graph) = self.graph {
+                    graph.invalidate_relation(class);
+                }
+
+                Ok(QueryResult::Success(format!(
+                    "TRUNCATE {}: {} row(s) deleted",
+                    class, total_deleted
+                )))
+            }
             _ => Err(onto_core::CoreError::InvalidArgument(
                 "unsupported statement type in transaction".to_string(),
             )),
@@ -8609,7 +8894,9 @@ impl QueryExecutor {
         let mut result_rows: Vec<Map<String, Value>> = Vec::new();
 
         for (_group_key, group_rows) in &groups {
-            if group_rows.is_empty() {
+            // For queries without GROUP BY, always compute aggregates even on empty groups
+            // (e.g., COUNT(*) on empty table should return 0, not empty result)
+            if group_rows.is_empty() && group_by.is_some() {
                 continue;
             }
             let mut result_row = Map::new();
@@ -8770,23 +9057,79 @@ impl QueryExecutor {
         order_by: &[crate::parser::OrderBy],
         limit: Option<usize>,
     ) -> Result<QueryResult> {
-        // Extract which columns each aggregate function needs
-        let agg_cols: Vec<String> = match columns {
-            SelectColumns::Columns(items) => items
-                .iter()
-                .filter_map(|item| {
-                    if let SelectItem::Aggregate(a) = item {
-                        if a.arg != "*" {
-                            Some(a.arg.clone())
-                        } else {
-                            None
-                        }
+        // Pure unfiltered COUNT(*): count via key-only scan. Avoids materializing
+        // every value byte in the class (the OOM path on multi-GB tables).
+        // Filtered COUNT(*) uses the same key-only streaming path with a
+        // per-row predicate — still never materializes all values at once.
+        if group_by.is_none() && Self::is_pure_count_star(columns) {
+            let class_hierarchy = self.get_class_hierarchy_read(engine, table);
+            let fast_filter_cols = Self::extract_fast_filter_columns(filter);
+            let mut count: u64 = 0;
+            for scan_class in &class_hierarchy {
+                if filter.is_none() {
+                    let prefix = format!("{}::", scan_class);
+                    let (live, _tombstones) = engine.count_prefix(prefix.as_bytes())?;
+                    count += live as u64;
+                } else if let Some(n) = Self::try_count_via_index(engine, scan_class, filter) {
+                    count += n;
+                } else {
+                    let prefix = format!("{}::", scan_class);
+                    let mut scanned = 0u64;
+                    let (matched, _tombstones) = engine.count_prefix_with(
+                        prefix.as_bytes(),
+                        None,
+                        |val_bytes| {
+                            scanned += 1;
+                            if scanned & 0x3FF == 0 {
+                                self.check_timeout()?;
+                            }
+                            self.value_passes_count_filter(
+                                engine,
+                                &class_hierarchy,
+                                filter,
+                                &fast_filter_cols,
+                                val_bytes,
+                            )
+                        },
+                    )?;
+                    count += matched as u64;
+                }
+            }
+            // Only the unfiltered count is the table row count — a filtered
+            // COUNT(*) must not poison the row-count cache.
+            if filter.is_none() {
+                self.set_cached_row_count(table, count);
+            }
+
+            let count_key = match columns {
+                SelectColumns::Columns(items) => {
+                    if let Some(SelectItem::Aggregate(a)) = items.first() {
+                        a.alias.clone().unwrap_or_else(|| "count(*)".to_string())
                     } else {
-                        None
+                        "count(*)".to_string()
                     }
-                })
-                .collect(),
-            _ => Vec::new(),
+                }
+                _ => "count(*)".to_string(),
+            };
+            let mut row = Map::new();
+            row.insert(count_key, Value::Number(serde_json::Number::from(count)));
+            return Ok(QueryResult::Rows(vec![row]));
+        }
+
+        // Extract which columns each aggregate function needs.
+        // Dedupe: SUM(x) + AVG(x) must not push x twice (would double-count sums).
+        let agg_cols: Vec<String> = {
+            let mut cols: Vec<String> = Vec::new();
+            if let SelectColumns::Columns(items) = columns {
+                for item in items {
+                    if let SelectItem::Aggregate(a) = item {
+                        if a.arg != "*" && !cols.contains(&a.arg) {
+                            cols.push(a.arg.clone());
+                        }
+                    }
+                }
+            }
+            cols
         };
 
         // Collect aggregate expressions for finalize
@@ -8835,104 +9178,29 @@ impl QueryExecutor {
 
         for scan_class in &class_hierarchy {
             let prefix = format!("{}::", scan_class);
-            let entries = if let Some(txn_id) = active_txn_id {
-                engine.txn_scan_prefix(txn_id, prefix.as_bytes())?
-            } else {
-                engine.scan_prefix(prefix.as_bytes())?
-            };
-
-            for (_key, val_bytes) in &entries {
+            // Stream live rows one value at a time — no full-result materialization.
+            let mut on_value = |val_bytes: &[u8]| -> Result<()> {
                 scan_count += 1;
                 if scan_count & 0x3FF == 0 {
                     self.check_timeout()?;
                 }
-
-                // Fast byte-level rejection
-                if !fast_filter_cols.is_empty()
-                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols)
-                {
-                    continue;
-                }
-
-                // BinaryRow path
-                if let Some(brow) = BinaryRow::parse(val_bytes) {
-                    if !brow.class_in_hierarchy(&class_hierarchy) {
-                        continue;
-                    }
-                    // Apply filter
-                    if let Some(f) = filter {
-                        let filter_result = eval_binary_filter(&brow, f);
-                        match filter_result {
-                            Some(true) => {}
-                            Some(false) => continue,
-                            None => {
-                                // Need full map for complex filter
-                                if let Some(doc) = brow.to_map() {
-                                    if !self.eval_filter_read(engine, &doc, f) {
-                                        continue;
-                                    }
-                                    // Use full doc for streaming update
-                                    let group_key = self.make_streaming_group_key(
-                                        group_by, &doc, &proj_cols,
-                                    );
-                                    let state =
-                                        groups.entry(group_key.clone()).or_default();
-                                    state.update(&doc);
-                                    for col in &agg_cols {
-                                        state.update_column(col, &doc);
-                                    }
-                                    if group_by.is_some() {
-                                        group_first_row
-                                            .entry(group_key)
-                                            .or_insert(doc);
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                    // Use to_map_projected with empty cols → falls back to to_map()
-                    // which now skips fields with unrecognized tags instead of failing.
-                    if let Some(doc) = brow.to_map_projected(&[]) {
-                        let group_key =
-                            self.make_streaming_group_key(group_by, &doc, &proj_cols);
-                        let state = groups.entry(group_key.clone()).or_default();
-                        state.update(&doc);
-                        for col in &agg_cols {
-                            state.update_column(col, &doc);
-                        }
-                        if group_by.is_some() {
-                            group_first_row.entry(group_key).or_insert(doc);
-                        }
-                    }
-                    continue;
-                }
-
-                // JSON fallback
-                if let Ok(serde_json::Value::Object(doc)) =
-                    serde_json::from_slice::<serde_json::Value>(val_bytes)
-                {
-                    if !class_hierarchy
-                        .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
-                    {
-                        continue;
-                    }
-                    if let Some(f) = filter {
-                        if !self.eval_filter_read(engine, &doc, f) {
-                            continue;
-                        }
-                    }
-                    let group_key =
-                        self.make_streaming_group_key(group_by, &doc, &proj_cols);
-                    let state = groups.entry(group_key.clone()).or_default();
-                    state.update(&doc);
-                    for col in &agg_cols {
-                        state.update_column(col, &doc);
-                    }
-                    if group_by.is_some() {
-                        group_first_row.entry(group_key).or_insert(doc);
-                    }
-                }
+                self.apply_agg_value(
+                    engine,
+                    val_bytes,
+                    &class_hierarchy,
+                    filter,
+                    &fast_filter_cols,
+                    group_by,
+                    &proj_cols,
+                    &agg_cols,
+                    &mut groups,
+                    &mut group_first_row,
+                )
+            };
+            if let Some(txn_id) = active_txn_id {
+                engine.txn_for_each_live_prefix(txn_id, prefix.as_bytes(), |_, v| on_value(v))?;
+            } else {
+                engine.for_each_live_prefix(prefix.as_bytes(), None, None, |_, v| on_value(v))?;
             }
         }
 
@@ -9020,6 +9288,89 @@ impl QueryExecutor {
         }
 
         Ok(QueryResult::Rows(result_rows))
+    }
+
+    /// Apply one raw storage value to the streaming aggregate state.
+    /// Mirrors the filter/class checks of the old inlined scan loop.
+    fn apply_agg_value(
+        &self,
+        engine: &LsmEngine,
+        val_bytes: &[u8],
+        class_hierarchy: &std::collections::HashSet<String>,
+        filter: &Option<FilterExpr>,
+        fast_filter_cols: &[String],
+        group_by: Option<&crate::parser::GroupByClause>,
+        proj_cols: &[String],
+        agg_cols: &[String],
+        groups: &mut std::collections::HashMap<String, AggState>,
+        group_first_row: &mut std::collections::HashMap<String, Map<String, Value>>,
+    ) -> Result<()> {
+        // Fast byte-level rejection
+        if !fast_filter_cols.is_empty()
+            && Self::fast_filter_reject(val_bytes, filter, fast_filter_cols)
+        {
+            return Ok(());
+        }
+
+        let apply_doc = |doc: Map<String, Value>,
+                             groups: &mut std::collections::HashMap<String, AggState>,
+                             group_first_row: &mut std::collections::HashMap<String, Map<String, Value>>| {
+            let group_key = self.make_streaming_group_key(group_by, &doc, proj_cols);
+            let state = groups.entry(group_key.clone()).or_default();
+            state.update(&doc);
+            for col in agg_cols {
+                state.update_column(col, &doc);
+            }
+            if group_by.is_some() {
+                group_first_row.entry(group_key).or_insert(doc);
+            }
+        };
+
+        // BinaryRow path
+        if let Some(brow) = BinaryRow::parse(val_bytes) {
+            if !brow.class_in_hierarchy(class_hierarchy) {
+                return Ok(());
+            }
+            if let Some(f) = filter {
+                match eval_binary_filter(&brow, f) {
+                    Some(true) => {}
+                    Some(false) => return Ok(()),
+                    None => {
+                        if let Some(doc) = brow.to_map() {
+                            if !self.eval_filter_read(engine, &doc, f) {
+                                return Ok(());
+                            }
+                            apply_doc(doc, groups, group_first_row);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            // Use to_map_projected with empty cols → falls back to to_map()
+            // which now skips fields with unrecognized tags instead of failing.
+            if let Some(doc) = brow.to_map_projected(&[]) {
+                apply_doc(doc, groups, group_first_row);
+            }
+            return Ok(());
+        }
+
+        // JSON fallback
+        if let Ok(serde_json::Value::Object(doc)) =
+            serde_json::from_slice::<serde_json::Value>(val_bytes)
+        {
+            if !class_hierarchy
+                .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+            {
+                return Ok(());
+            }
+            if let Some(f) = filter {
+                if !self.eval_filter_read(engine, &doc, f) {
+                    return Ok(());
+                }
+            }
+            apply_doc(doc, groups, group_first_row);
+        }
+        Ok(())
     }
 
     fn make_streaming_group_key(
@@ -13166,6 +13517,84 @@ mod tests {
     }
 
     #[test]
+    fn test_count_star_with_filter() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine().flush().unwrap();
+
+        // Filtered COUNT(*) must stream-filter without materializing rows
+        let ast = QueryParser::parse("SELECT COUNT(*) FROM Product WHERE price > 900").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get("count(*)").unwrap().as_i64().unwrap(), 2);
+            }
+            _ => panic!("expected 1 row with filtered count"),
+        }
+
+        // No matches
+        let ast = QueryParser::parse("SELECT COUNT(*) FROM Product WHERE price > 10000").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows[0].get("count(*)").unwrap().as_i64().unwrap(), 0);
+            }
+            _ => panic!("expected 1 row with zero count"),
+        }
+
+        // Equality filter
+        let ast = QueryParser::parse("SELECT COUNT(*) FROM Product WHERE name = 'iPhone'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows[0].get("count(*)").unwrap().as_i64().unwrap(), 1);
+            }
+            _ => panic!("expected 1 row with filtered count"),
+        }
+    }
+
+    /// COUNT, SELECT row count, and hierarchy-expanded count_prefix sum must agree.
+    #[test]
+    fn test_count_select_hierarchy_consistency() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT COUNT(*) FROM Product").unwrap();
+        let count = match executor.execute(&ast).unwrap() {
+            QueryResult::Rows(rows) => rows[0].get("count(*)").unwrap().as_i64().unwrap(),
+            _ => panic!("expected count row"),
+        };
+
+        let ast = QueryParser::parse("SELECT * FROM Product").unwrap();
+        let select_n = match executor.execute(&ast).unwrap() {
+            QueryResult::Rows(rows) => rows.len() as i64,
+            _ => panic!("expected rows"),
+        };
+        assert_eq!(count, select_n, "COUNT(*) must match SELECT * row count");
+
+        // Warmup formula: sum count_prefix over get_class_hierarchy_read
+        let hierarchy = executor.get_class_hierarchy_read(executor.engine(), "Product");
+        let mut sum = 0u64;
+        for cls in &hierarchy {
+            let (live, _) = executor
+                .engine()
+                .count_prefix(format!("{}::", cls).as_bytes())
+                .unwrap();
+            sum += live as u64;
+        }
+        assert_eq!(
+            sum, count as u64,
+            "hierarchy count_prefix sum must match COUNT(*)"
+        );
+    }
+
+    #[test]
     fn test_sum_avg() {
         let (executor, _dir) = setup();
         insert_row(&executor, "Product", "iPhone", 999);
@@ -13189,6 +13618,35 @@ mod tests {
                 );
             }
             _ => panic!("expected 1 row with sum and avg"),
+        }
+    }
+
+    /// SUM + AVG over the same column must share one accumulator — not double-count.
+    #[test]
+    fn test_sum_avg_same_column_no_double_count() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "A", 100);
+        insert_row(&executor, "Product", "B", 200);
+        insert_row(&executor, "Product", "C", 300);
+        executor.engine().flush().unwrap();
+
+        let ast = QueryParser::parse(
+            "SELECT SUM(price) as total, AVG(price) as avg_price, COUNT(*) as n FROM Product",
+        )
+        .unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                let total = rows[0].get("total").unwrap().as_f64().unwrap();
+                let avg = rows[0].get("avg_price").unwrap().as_f64().unwrap();
+                let n = rows[0].get("n").unwrap().as_i64().unwrap();
+                assert_eq!(total, 600.0, "SUM must be 100+200+300, not doubled");
+                assert_eq!(n, 3);
+                assert!((avg - 200.0).abs() < 0.01, "AVG must be 200, got {}", avg);
+                assert!((total / n as f64 - avg).abs() < 0.01, "sum/count must equal avg");
+            }
+            _ => panic!("expected 1 row"),
         }
     }
 
@@ -14219,6 +14677,9 @@ mod tests {
                 ..Default::default()
             };
             let engine = LsmEngine::open(options).unwrap();
+            // open() defers index rebuild to the caller (the server does it
+            // on a background thread) so startup stays fast.
+            engine.rebuild_vector_indexes().unwrap();
 
             // Vector index should be rebuilt from persisted metadata
             assert!(engine.has_vector_index("Product", "embedding"));
@@ -15009,8 +15470,8 @@ mod tests {
     #[test]
     fn test_query_config_defaults() {
         let config = QueryConfig::default();
-        assert_eq!(config.query_timeout, Duration::from_secs(120));
-        assert_eq!(config.memory_budget, 256 * 1024 * 1024);
+        assert_eq!(config.query_timeout, Duration::from_secs(3600));
+        assert_eq!(config.memory_budget, 4096 * 1024 * 1024);
     }
 
     #[test]
@@ -15032,7 +15493,7 @@ mod tests {
 
         // Set a very small memory budget
         let config = QueryConfig {
-            query_timeout: Duration::from_secs(120),
+            query_timeout: Duration::from_secs(3600),
             memory_budget: 10, // 10 bytes - will be exceeded
         };
         let (small_exec, _dir2) = setup_with_config(config);

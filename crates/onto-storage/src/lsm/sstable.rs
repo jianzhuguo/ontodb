@@ -379,10 +379,35 @@ impl SsTable {
             return Err(CoreError::corruption("invalid SSTable magic number"));
         }
 
+        let file_len = file.metadata()?.len();
+        let footer_bytes = footer_size as u64;
+
+        // Validate footer offsets before any length arithmetic. A truncated or
+        // half-written file can report offsets past the payload region; unchecked
+        // u64 subtraction would underflow into a multi-GB allocation.
+        if file_len < footer_bytes {
+            return Err(CoreError::corruption(format!(
+                "SSTable too short: {} bytes (footer needs {})",
+                file_len, footer_bytes
+            )));
+        }
+        let payload_end = file_len - footer_bytes;
+        if index_offset > payload_end || bloom_offset > payload_end {
+            return Err(CoreError::corruption(format!(
+                "SSTable footer offsets out of range: index_offset={}, bloom_offset={}, payload_end={}",
+                index_offset, bloom_offset, payload_end
+            )));
+        }
+        if index_offset > bloom_offset {
+            return Err(CoreError::corruption(format!(
+                "SSTable footer offset order invalid: index_offset={} > bloom_offset={}",
+                index_offset, bloom_offset
+            )));
+        }
+
         // Read bloom filter
         file.seek(SeekFrom::Start(bloom_offset))?;
-        let file_len = file.metadata()?.len();
-        let bloom_data_len = (file_len - footer_size as u64 - bloom_offset) as usize;
+        let bloom_data_len = (payload_end - bloom_offset) as usize;
         let mut bloom_data = vec![0u8; bloom_data_len];
         file.read_exact(&mut bloom_data)?;
         let bloom = BloomFilter::from_bytes(&bloom_data);
@@ -647,6 +672,41 @@ impl SsTable {
         Ok(block_data)
     }
 
+    /// Prefetch the next `n` data blocks into the block cache (sequential scan).
+    /// Called after loading block `idx` so the following blocks are ready.
+    fn prefetch_after(&self, idx: usize) {
+        let n = 2usize;
+        let start = idx + 1;
+        let end = (idx + 1 + n).min(self.index.len());
+        if start >= end {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        for i in start..end {
+            let offset = self.index[i].offset;
+            let size = self.index[i].size;
+            if inner.block_cache.contains(offset) {
+                continue;
+            }
+            let mut buf = vec![0u8; size as usize];
+            if inner.file.seek(SeekFrom::Start(offset)).is_err() {
+                continue;
+            }
+            if inner.file.read_exact(&mut buf).is_err() {
+                continue;
+            }
+            let data = if self.compressed {
+                match zstd::decode_all(buf.as_slice()) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                }
+            } else {
+                buf
+            };
+            inner.block_cache.put(offset, data);
+        }
+    }
+
     fn search_block(&self, block: &[u8], key: &[u8]) -> Result<Option<(Vec<u8>, SeqNo)>> {
         match self.search_block_full(block, key)? {
             Some((v, seq, EntryKind::Put)) => Ok(Some((v, seq))),
@@ -902,6 +962,8 @@ impl<'a> SsTableIterator<'a> {
         let block_size = self.table.index[idx].size;
         self.block_data = self.table.read_block_at(block_offset, block_size)?;
         self.block_idx = idx;
+        // Warm the next blocks so sequential scan doesn't wait on disk each hop.
+        self.table.prefetch_after(idx);
 
         // Parse restart points
         let data = &self.block_data;
@@ -1032,11 +1094,13 @@ impl<'a> SsTableIterator<'a> {
 
     /// Returns the current key as a zero-copy slice into the block data.
     pub fn key(&self) -> &[u8] {
+        debug_assert!(self.current_key_end <= self.block_data.len());
         &self.block_data[self.current_key_start..self.current_key_end]
     }
 
     /// Returns the current value as a zero-copy slice into the block data.
     pub fn value(&self) -> &[u8] {
+        debug_assert!(self.current_value_end <= self.block_data.len());
         &self.block_data[self.current_value_start..self.current_value_end]
     }
 
@@ -1052,6 +1116,31 @@ impl<'a> SsTableIterator<'a> {
         self.advance_to_next_entry();
     }
 
+    /// Decode all remaining entries in the current block into `out` (batch).
+    ///
+    /// Avoids repeated per-entry bounds/offset work and lets the caller process
+    /// a whole 4KB block at once. Stops at the block boundary; call `next()`
+    /// (or this again) after the block is exhausted to move on.
+    /// Returns the number of entries appended.
+    pub fn drain_current_block(
+        &mut self,
+        out: &mut Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)>,
+    ) -> usize {
+        let start_block = self.block_idx;
+        let mut n = 0;
+        while self.valid && self.block_idx == start_block {
+            out.push((
+                self.key().to_vec(),
+                self.value().to_vec(),
+                self.seq_no(),
+                self.kind(),
+            ));
+            n += 1;
+            self.advance_to_next_entry();
+        }
+        n
+    }
+
     /// Seek to the first key >= `target`. Uses binary search on block index
     /// to jump directly to the right block, then scans within the block.
     /// This avoids linear scanning from the beginning for prefix scans.
@@ -1063,6 +1152,10 @@ impl<'a> SsTableIterator<'a> {
                     self.valid = false;
                     return;
                 }
+                // load_block replaces block_data and resets pos, but leaves
+                // current_* pointing at the previous block's entry. Decode the
+                // first entry of the new block before any key()/value() call.
+                self.advance_to_next_entry();
                 // Scan within the block to find first key >= target
                 loop {
                     if !self.valid {
@@ -1140,6 +1233,136 @@ mod tests {
             iter.next();
         }
         assert_eq!(count, 50);
+    }
+
+    /// Regression: seek() must re-decode the first entry after load_block().
+    /// Previously it reused the previous block's key/value byte offsets against
+    /// the new block buffer, panicking (slice OOB) when the new block was shorter.
+    #[test]
+    fn test_seek_into_smaller_block_after_long_key_block() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("seek_stale_idx.sst");
+
+        // Block 0: first entry has a very long key so current_key_end after
+        // iter()/new() is ~3KB. Fill past the 4096-byte flush threshold.
+        let mut builder = SsTableBuilder::new();
+        let long_key = {
+            let mut k = b"a".to_vec();
+            k.extend(std::iter::repeat(b'x').take(3000));
+            k
+        };
+        builder.add(&Entry::put(long_key.clone(), b"v0".to_vec(), 1));
+        for i in 0..4u32 {
+            let mut key = b"a".to_vec();
+            key.extend(std::iter::repeat(b'y').take(2000));
+            key.push(b'0' + i as u8);
+            builder.add(&Entry::put(key, vec![b'p'; 100], 2 + i as u64));
+        }
+
+        // Final block: a single small entry (short key + short value) so its
+        // decompressed size is far below block 0's first-entry key_end.
+        builder.add(&Entry::put(b"z".to_vec(), b"vz".to_vec(), 100));
+
+        builder.build(&path).expect("should be valid");
+        let sst = SsTable::open(&path).expect("should be valid");
+        assert!(
+            sst.num_blocks() >= 2,
+            "need at least 2 blocks, got {}",
+            sst.num_blocks()
+        );
+
+        // new() positions at block 0's first entry (long key). seek() into the
+        // small final block must not use the stale long-key offsets.
+        let mut iter = sst.iter().expect("should be valid");
+        assert!(iter.is_valid());
+        assert_eq!(iter.key(), long_key.as_slice());
+
+        iter.seek(b"z");
+        assert!(iter.is_valid(), "seek to last-block key must land on an entry");
+        assert_eq!(iter.key(), b"z");
+        assert_eq!(iter.value(), b"vz");
+        assert_eq!(iter.seq_no(), 100);
+    }
+
+    /// seek() across multiple blocks lands on the first key >= target and
+    /// subsequent iteration stays consistent with the new block.
+    #[test]
+    fn test_seek_positions_correctly_across_blocks() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("seek_multi_block.sst");
+
+        let mut builder = SsTableBuilder::new();
+        for i in 0..300u32 {
+            let key = format!("key_{:06}", i);
+            let value = format!("val_{:06}_{}", i, "p".repeat(80));
+            builder.add(&Entry::put(key.into_bytes(), value.into_bytes(), i as u64));
+        }
+        builder.build(&path).expect("should be valid");
+
+        let sst = SsTable::open(&path).expect("should be valid");
+        assert!(
+            sst.num_blocks() >= 2,
+            "need at least 2 blocks, got {}",
+            sst.num_blocks()
+        );
+
+        let mut iter = sst.iter().expect("should be valid");
+        iter.seek(b"key_000150");
+        assert!(iter.is_valid());
+        assert_eq!(iter.key(), b"key_000150");
+        assert_eq!(iter.seq_no(), 150);
+
+        iter.seek(b"key_000000");
+        assert!(iter.is_valid());
+        assert_eq!(iter.key(), b"key_000000");
+
+        // Past-the-end target invalidates the iterator instead of panicking.
+        iter.seek(b"zzz");
+        assert!(!iter.is_valid());
+    }
+
+    /// seek() after mid-iteration must refresh offsets from the target block,
+    /// not the entry the iterator was previously sitting on.
+    #[test]
+    fn test_seek_after_iteration_refreshes_offsets() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("seek_after_iter.sst");
+
+        let mut builder = SsTableBuilder::new();
+        // Long-key block first, then enough small entries to form more blocks.
+        let long_key = {
+            let mut k = b"a".to_vec();
+            k.extend(std::iter::repeat(b'x').take(3000));
+            k
+        };
+        builder.add(&Entry::put(long_key, vec![b'L'; 500], 1));
+        for i in 0..200u32 {
+            let key = format!("m{:05}", i);
+            let value = format!("v{:05}_{}", i, "q".repeat(50));
+            builder.add(&Entry::put(key.into_bytes(), value.into_bytes(), 10 + i as u64));
+        }
+        builder.build(&path).expect("should be valid");
+
+        let sst = SsTable::open(&path).expect("should be valid");
+        assert!(sst.num_blocks() >= 2);
+
+        let mut iter = sst.iter().expect("should be valid");
+        // Walk into the middle of the table so current_* reference a later block.
+        for _ in 0..50 {
+            iter.next();
+        }
+        assert!(iter.is_valid());
+
+        // Jump forward again: offsets must belong to the destination block.
+        iter.seek(b"m00100");
+        assert!(iter.is_valid());
+        assert_eq!(iter.key(), b"m00100");
+        assert_eq!(iter.seq_no(), 110);
+
+        // And backwards to the first block's long key entry.
+        iter.seek(b"a");
+        assert!(iter.is_valid());
+        assert_eq!(iter.seq_no(), 1);
     }
 
     #[test]
@@ -1302,5 +1525,100 @@ mod tests {
 
         // get() should return None for tombstones
         assert!(sst.get(b"key_0000").expect("should be valid").is_none());
+    }
+
+    /// Build a small valid SST used as the base for footer-corruption tests.
+    fn build_valid_sst(path: &std::path::Path) {
+        let mut builder = SsTableBuilder::new();
+        for i in 0..10u32 {
+            let key = format!("k{:04}", i);
+            builder.add(&Entry::put(key.into_bytes(), format!("v{i}").into_bytes(), i as u64));
+        }
+        builder.build(path).expect("should be valid");
+    }
+
+    #[test]
+    fn test_open_rejects_index_offset_past_payload() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("bad_index_off.sst");
+        build_valid_sst(&path);
+
+        // Overwrite index_offset in the 33-byte footer with a huge value.
+        {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("should be valid");
+            let len = f.metadata().expect("should be valid").len();
+            f.seek(SeekFrom::End(-33)).expect("should be valid");
+            let mut footer = [0u8; 33];
+            f.read_exact(&mut footer).expect("should be valid");
+            footer[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+            f.seek(SeekFrom::End(-33)).expect("should be valid");
+            f.write_all(&footer).expect("should be valid");
+            let _ = len;
+        }
+
+        let err = match SsTable::open(&path) {
+            Ok(_) => panic!("must reject oversized index_offset"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("offsets out of range"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_open_rejects_bloom_offset_before_index() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("bad_bloom_off.sst");
+        build_valid_sst(&path);
+
+        // Set bloom_offset < index_offset so the index length would underflow.
+        {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("should be valid");
+            f.seek(SeekFrom::End(-33)).expect("should be valid");
+            let mut footer = [0u8; 33];
+            f.read_exact(&mut footer).expect("should be valid");
+            let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+            footer[8..16].copy_from_slice(&index_offset.saturating_sub(1).to_le_bytes());
+            // Keep magic/flags intact; only the bloom offset is wrong.
+            f.seek(SeekFrom::End(-33)).expect("should be valid");
+            f.write_all(&footer).expect("should be valid");
+        }
+
+        let err = match SsTable::open(&path) {
+            Ok(_) => panic!("must reject bloom_offset < index_offset"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("offset order invalid") || msg.contains("offsets out of range"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_open_rejects_truncated_file() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("truncated.sst");
+        build_valid_sst(&path);
+
+        // Keep only 20 bytes — shorter than either footer format.
+        {
+            let f = std::fs::File::create(&path).expect("should be valid");
+            f.set_len(20).expect("should be valid");
+        }
+
+        assert!(
+            SsTable::open(&path).is_err(),
+            "truncated file must not open"
+        );
     }
 }

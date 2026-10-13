@@ -104,6 +104,35 @@ impl IndexManager {
         }
     }
 
+    /// Bulk-loads (value, pk) pairs into an index in one shot.
+    ///
+    /// Used by CREATE INDEX backfill: replaces per-row `insert` (O(n log n)
+    /// with page splits) with sort + bottom-up page construction (O(n)).
+    /// Entries need not be sorted; duplicates are dropped.
+    pub fn bulk_load_index(
+        &mut self,
+        class: &str,
+        column: &str,
+        entries: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), onto_core::CoreError> {
+        let key = (class.to_string(), column.to_string());
+
+        // In-memory tree: existing bulk_load takes owned (key, pk) pairs and
+        // merges duplicates itself.
+        if let Some(tree) = self.indexes.get_mut(&key) {
+            tree.bulk_load(entries.to_vec());
+        }
+
+        // Disk tree: sort + sequential page fill.
+        if let Some(disk) = self.disk_indexes.get(&key) {
+            let mut idx = disk.lock().unwrap_or_else(|e| e.into_inner());
+            idx.bulk_load(entries)?;
+            idx.flush()?;
+        }
+
+        Ok(())
+    }
+
     /// Opens existing disk-based indexes from the data directory.
     /// Corrupted `.idx` files are automatically deleted so they can be rebuilt.
     pub fn open_disk_indexes(&mut self) -> Result<(), String> {
@@ -371,20 +400,8 @@ impl IndexManager {
         column: &str,
         value: &serde_json::Value,
     ) -> Option<Vec<Vec<u8>>> {
-        let key = (class.to_string(), column.to_string());
-        let encoded = Self::encode_value(value);
-
-        // Try in-memory index first
-        if let Some(tree) = self.indexes.get(&key) {
-            return Some(tree.lookup(&encoded));
-        }
-
-        // Fall back to disk-based index
-        if let Some(disk_idx) = self.disk_indexes.get(&key) {
-            return disk_idx.lock().unwrap().lookup(&encoded).ok();
-        }
-
-        None
+        // Same merged semantics as lookup_eq_read (in-memory + disk).
+        self.lookup_eq_read(class, column, value)
     }
 
     /// Range scan on an indexed column.
@@ -397,24 +414,7 @@ impl IndexManager {
         low: Option<&serde_json::Value>,
         high: Option<&serde_json::Value>,
     ) -> Option<Vec<Vec<u8>>> {
-        let key = (class.to_string(), column.to_string());
-        let low_bytes = low.map(Self::encode_value);
-        let high_bytes = high.map(Self::encode_value);
-
-        // Try in-memory index first
-        if let Some(tree) = self.indexes.get(&key) {
-            return Some(tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref()));
-        }
-
-        // Fall back to disk-based index
-        if let Some(disk_idx) = self.disk_indexes.get(&key) {
-            return disk_idx
-                .lock().unwrap()
-                .range_scan(low_bytes.as_deref(), high_bytes.as_deref())
-                .ok();
-        }
-
-        None
+        self.lookup_range_read(class, column, low, high)
     }
 
     /// Looks up primary keys for a GT condition.
@@ -473,6 +473,8 @@ impl IndexManager {
     // ── Read-only lookup methods (for concurrent read path, &self) ──
 
     /// Read-only equality lookup using in-memory index first, then disk-based index.
+    /// Results are merged: after restart the in-memory tree is empty while the
+    /// disk index holds history, and new writes land in both.
     pub fn lookup_eq_read(
         &self,
         class: &str,
@@ -482,20 +484,27 @@ impl IndexManager {
         let key = (class.to_string(), column.to_string());
         let encoded = Self::encode_value(value);
 
-        // Try in-memory index first
+        let mem_has = self.indexes.contains_key(&key);
+        let disk_has = self.disk_indexes.contains_key(&key);
+        if !mem_has && !disk_has {
+            return None;
+        }
+
+        let mut out: Vec<Vec<u8>> = Vec::new();
         if let Some(tree) = self.indexes.get(&key) {
-            return Some(tree.lookup(&encoded));
+            out.extend(tree.lookup(&encoded));
         }
-
-        // Fall back to disk-based index (uses RefCell for interior mutability)
         if let Some(disk_idx) = self.disk_indexes.get(&key) {
-            return disk_idx.lock().unwrap().lookup(&encoded).ok();
+            if let Ok(pks) = disk_idx.lock().unwrap().lookup(&encoded) {
+                out.extend(pks);
+            }
         }
-
-        None
+        out.sort();
+        out.dedup();
+        Some(out)
     }
 
-    /// Read-only range scan using in-memory index only.
+    /// Read-only range scan using in-memory and disk indexes (merged).
     pub fn lookup_range_read(
         &self,
         class: &str,
@@ -506,12 +515,32 @@ impl IndexManager {
         let key = (class.to_string(), column.to_string());
         let low_bytes = low.map(Self::encode_value);
         let high_bytes = high.map(Self::encode_value);
-        self.indexes
-            .get(&key)
-            .map(|tree| tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref()))
+
+        let mem_has = self.indexes.contains_key(&key);
+        let disk_has = self.disk_indexes.contains_key(&key);
+        if !mem_has && !disk_has {
+            return None;
+        }
+
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        if let Some(tree) = self.indexes.get(&key) {
+            out.extend(tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref()));
+        }
+        if let Some(disk_idx) = self.disk_indexes.get(&key) {
+            if let Ok(pks) = disk_idx
+                .lock()
+                .unwrap()
+                .range_scan(low_bytes.as_deref(), high_bytes.as_deref())
+            {
+                out.extend(pks);
+            }
+        }
+        out.sort();
+        out.dedup();
+        Some(out)
     }
 
-    /// Read-only GT lookup using in-memory index only.
+    /// Read-only GT lookup using in-memory and disk indexes (merged).
     pub fn lookup_gt_read(
         &self,
         class: &str,
@@ -520,10 +549,30 @@ impl IndexManager {
     ) -> Option<Vec<Vec<u8>>> {
         let key = (class.to_string(), column.to_string());
         let encoded = Self::encode_value(value);
-        self.indexes.get(&key).map(|tree| tree.gt_scan(&encoded))
+
+        let mem_has = self.indexes.contains_key(&key);
+        let disk_has = self.disk_indexes.contains_key(&key);
+        if !mem_has && !disk_has {
+            return None;
+        }
+
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        if let Some(tree) = self.indexes.get(&key) {
+            out.extend(tree.gt_scan(&encoded));
+        }
+        if let Some(disk_idx) = self.disk_indexes.get(&key) {
+            let mut lo = encoded.clone();
+            lo.push(0u8);
+            if let Ok(pks) = disk_idx.lock().unwrap().range_scan(Some(&lo), None) {
+                out.extend(pks);
+            }
+        }
+        out.sort();
+        out.dedup();
+        Some(out)
     }
 
-    /// Read-only LT lookup using in-memory index only.
+    /// Read-only LT lookup using in-memory and disk indexes (merged).
     pub fn lookup_lt_read(
         &self,
         class: &str,
@@ -532,7 +581,25 @@ impl IndexManager {
     ) -> Option<Vec<Vec<u8>>> {
         let key = (class.to_string(), column.to_string());
         let encoded = Self::encode_value(value);
-        self.indexes.get(&key).map(|tree| tree.lt_scan(&encoded))
+
+        let mem_has = self.indexes.contains_key(&key);
+        let disk_has = self.disk_indexes.contains_key(&key);
+        if !mem_has && !disk_has {
+            return None;
+        }
+
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        if let Some(tree) = self.indexes.get(&key) {
+            out.extend(tree.lt_scan(&encoded));
+        }
+        if let Some(disk_idx) = self.disk_indexes.get(&key) {
+            if let Ok(pks) = disk_idx.lock().unwrap().range_scan(None, Some(&encoded)) {
+                out.extend(pks);
+            }
+        }
+        out.sort();
+        out.dedup();
+        Some(out)
     }
 
     /// Builds the index key format:

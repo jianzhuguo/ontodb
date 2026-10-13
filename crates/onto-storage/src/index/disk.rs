@@ -159,6 +159,29 @@ pub fn decode_internal_entry(data: &[u8]) -> Option<(&[u8], u32)> {
     Some((key, child_right))
 }
 
+/// Composes the unique on-page key for a (value, pk) pair.
+///
+/// `encode_value` output never contains a raw 0x00 byte (JSON text escapes
+/// control chars), so `value || 0x00 || pk` sorts by value first and stays
+/// unambiguous for prefix scans. One entry per pair — a low-cardinality value
+/// (e.g. `assay_type='B'` with 492k rows) must not accumulate one megabyte
+/// pk-list into a single 4KB leaf entry.
+pub fn compose_key(value: &[u8], pk: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(value.len() + 1 + pk.len());
+    k.extend_from_slice(value);
+    k.push(0u8);
+    k.extend_from_slice(pk);
+    k
+}
+
+/// Value part of a composed key: bytes before the first 0x00 separator.
+pub fn key_value_part(full_key: &[u8]) -> &[u8] {
+    match full_key.iter().position(|&b| b == 0) {
+        Some(p) => &full_key[..p],
+        None => full_key,
+    }
+}
+
 /// Encodes a leaf node entry: `[key_len:2][key][num_pks:2][pk_len:2][pk]...`
 pub fn encode_leaf_entry(key: &[u8], pks: &[Vec<u8>]) -> Vec<u8> {
     let pk_data_len: usize = pks.iter().map(|pk| 2 + pk.len()).sum();
@@ -345,13 +368,29 @@ impl DiskPage {
             return Err(onto_core::CoreError::Custom("page overflow".into()));
         }
 
-        // Allocate space from the data area (grows backward)
-        header.data_start -= entry_size as u16;
+        // Allocate space from the data area (grows backward).
+        // checked_sub: data_start is u16; a bare `-=` wraps and produces a
+        // garbage offset past the page (range start index 65412 on a 4096 page).
+        let new_data_start = (header.data_start as usize).checked_sub(entry_size).ok_or_else(
+            || onto_core::CoreError::Custom("page full: data_start underflow".into()),
+        )?;
+        if new_data_start < new_slot_end {
+            return Err(onto_core::CoreError::Custom(
+                "page full: data collides with slot array".into(),
+            ));
+        }
+        header.data_start = new_data_start as u16;
         let entry_offset = header.data_start;
 
-        // Write entry data
-        self.data[entry_offset as usize..entry_offset as usize + entry_size]
-            .copy_from_slice(entry_data);
+        // Write entry data (bounds guaranteed by the checks above)
+        let start = entry_offset as usize;
+        let end = start + entry_size;
+        if end > PAGE_SIZE {
+            return Err(onto_core::CoreError::Corruption(
+                "insert_entry: entry exceeds page".into(),
+            ));
+        }
+        self.data[start..end].copy_from_slice(entry_data);
 
         // Shift slots from slot_pos..num_entries right by 1
         let num = header.num_entries;
@@ -364,7 +403,9 @@ impl DiskPage {
         self.write_slot(slot_pos, entry_offset, key_len);
 
         header.num_entries += 1;
-        header.free_size -= (entry_size + SLOT_SIZE) as u16;
+        header.free_size = header
+            .free_size
+            .saturating_sub((entry_size + SLOT_SIZE) as u16);
         self.set_header(&header);
 
         Ok(())
@@ -407,7 +448,10 @@ impl DiskPage {
         // Rewrite entries contiguously from the end of the page
         let mut write_pos = PAGE_SIZE;
         for (entry_data, _key_len) in entries.iter().rev() {
-            write_pos -= entry_data.len();
+            write_pos = match write_pos.checked_sub(entry_data.len()) {
+                Some(p) if p >= Self::slot_offset(num) => p,
+                _ => return, // inconsistent page — leave as-is rather than corrupt further
+            };
             self.data[write_pos..write_pos + entry_data.len()].copy_from_slice(entry_data);
         }
 
@@ -1064,16 +1108,35 @@ impl BTreeIndex {
 
     /// Point lookup: returns all primary keys with the given value.
     pub fn lookup(&mut self, key: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let leaf = self.find_leaf(key)?;
+        // Entries are keyed by `value || 0x00 || pk` — scan the prefix.
+        let prefix = compose_key(key, b"");
+        let mut leaf = self.find_leaf(&prefix)?;
+        let mut result = Vec::new();
 
-        // Binary search in the leaf
-        match leaf.binary_search(key) {
-            Ok(i) => {
-                let (_, pks) = leaf.get_leaf(i).unwrap_or_default();
-                Ok(pks)
+        let mut start_idx = match leaf.binary_search(&prefix) {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+        loop {
+            let num = leaf.num_entries();
+            for i in start_idx..num {
+                let (full_key, pks) = leaf.get_leaf(i).unwrap_or_default();
+                if full_key.as_slice() < prefix.as_slice() {
+                    continue;
+                }
+                if !full_key.starts_with(&prefix) {
+                    return Ok(result);
+                }
+                result.extend(pks);
             }
-            Err(_) => Ok(Vec::new()),
+            let right = leaf.header().map(|h| h.right_leaf).unwrap_or(NULL_PAGE);
+            if right == NULL_PAGE {
+                break;
+            }
+            leaf = self.get_page(right)?;
+            start_idx = 0;
         }
+        Ok(result)
     }
 
     /// Range scan: returns all primary keys with values in [lo, hi].
@@ -1082,14 +1145,15 @@ impl BTreeIndex {
         let mut result = Vec::new();
 
         // Find starting leaf
-        let mut leaf = match lo {
-            Some(k) => self.find_leaf(k)?,
+        let lo_prefix = lo.map(|v| compose_key(v, b""));
+        let mut leaf = match &lo_prefix {
+            Some(p) => self.find_leaf(p)?,
             None => self.find_leftmost_leaf()?,
         };
 
         // Find starting position within the leaf
-        let mut start_idx = match lo {
-            Some(k) => match leaf.binary_search(k) {
+        let mut start_idx = match &lo_prefix {
+            Some(p) => match leaf.binary_search(p) {
                 Ok(i) => i,
                 Err(i) => i,
             },
@@ -1100,11 +1164,18 @@ impl BTreeIndex {
         loop {
             let num = leaf.num_entries();
             for i in start_idx..num {
-                let (key, pks) = leaf.get_leaf(i).unwrap_or_default();
+                let (full_key, pks) = leaf.get_leaf(i).unwrap_or_default();
+                let value = key_value_part(&full_key);
                 // Check upper bound
                 if let Some(hi_key) = hi {
-                    if key.as_slice() > hi_key {
+                    if value > hi_key {
                         return Ok(result);
+                    }
+                }
+                // Skip entries below the lower bound (prefix shorter than lo)
+                if let Some(lo_key) = lo {
+                    if value < lo_key {
+                        continue;
                     }
                 }
                 result.extend(pks);
@@ -1125,53 +1196,36 @@ impl BTreeIndex {
     // ── Remove ───────────────────────────────────────────────────
 
     /// Removes a primary key from the entry for the given value.
-    /// If the entry becomes empty, the key is removed from the leaf.
-    /// Handles underflow by redistributing or merging with siblings.
+    /// Entries are stored as unique `value || 0x00 || pk` keys, so this is a
+    /// single-entry delete. Handles underflow by redistributing or merging
+    /// with siblings.
     pub fn remove(&mut self, key: &[u8], pk: &[u8]) -> Result<bool> {
-        let mut leaf = self.find_leaf(key)?;
+        let full_key = compose_key(key, pk);
+        let mut leaf = self.find_leaf(&full_key)?;
         let leaf_id = leaf.page_id;
 
-        // Find the key in the leaf
-        let slot = match leaf.binary_search(key) {
+        // Find the exact (value, pk) entry
+        let slot = match leaf.binary_search(&full_key) {
             Ok(i) => i,
-            Err(_) => return Ok(false), // key not found
+            Err(_) => return Ok(false), // entry not found
         };
 
-        // Get existing PKs and remove the target
-        let (entry_key, mut pks) = leaf
-            .get_leaf(slot)
-            .ok_or_else(|| onto_core::CoreError::Corruption("failed to read leaf entry".into()))?;
-        let pk_pos = pks.iter().position(|p| p.as_slice() == pk);
-        let pk_pos = match pk_pos {
-            Some(i) => i,
-            None => return Ok(false), // pk not found
-        };
-        pks.remove(pk_pos);
+        leaf.remove_entry(slot)?;
+        self.put_page(&leaf)?;
 
-        if pks.is_empty() {
-            // Last PK removed — delete the entire entry
-            leaf.remove_entry(slot)?;
-            self.put_page(&leaf)?;
-
-            // Handle underflow if this isn't the root
-            if leaf_id != self.meta.root_page {
-                let min = Self::min_leaf_entries();
-                if leaf.num_entries() < min {
-                    self.handle_leaf_underflow(leaf_id)?;
-                }
+        // Handle underflow if this isn't the root
+        if leaf_id != self.meta.root_page {
+            let min = Self::min_leaf_entries();
+            if leaf.num_entries() < min {
+                self.handle_leaf_underflow(leaf_id)?;
             }
-
-            // Update parent separator if the first key changed
-            self.update_parent_separator(leaf_id)?;
-
-            // Root collapse: if root is internal with 0 entries, make child the new root
-            self.try_collapse_root()?;
-        } else {
-            // PKs remain — update the entry in place
-            leaf.remove_entry(slot)?;
-            leaf.insert_leaf(slot, &entry_key, &pks)?;
-            self.put_page(&leaf)?;
         }
+
+        // Update parent separator if the first key changed
+        self.update_parent_separator(leaf_id)?;
+
+        // Root collapse: if root is internal with 0 entries, make child the new root
+        self.try_collapse_root()?;
 
         Ok(true)
     }
@@ -1660,35 +1714,177 @@ impl BTreeIndex {
 
     /// Inserts a (key, primary_key) pair into the index.
     pub fn insert(&mut self, key: &[u8], pk: Vec<u8>) -> Result<()> {
-        let mut leaf = self.find_leaf(key)?;
+        // Unique per (value, pk): each leaf entry holds exactly one pk.
+        // A hot value then spreads across many small entries instead of one
+        // entry whose pk-list outgrows the page (the old path recursed
+        // `insert` per pk when `insert_leaf` failed → stack overflow).
+        let full_key = compose_key(key, &pk);
+        let mut leaf = self.find_leaf(&full_key)?;
         let num = leaf.num_entries();
 
-        // Check if key already exists
-        match leaf.binary_search(key) {
-            Ok(i) => {
-                // Key exists — append pk to the existing entry
-                let (existing_key, mut pks) = leaf.get_leaf(i).unwrap_or_default();
-                if !pks.contains(&pk) {
-                    pks.push(pk);
-                    // Remove old entry, insert updated one
-                    leaf.remove_entry(i)?;
-                    leaf.insert_leaf(i, &existing_key, &pks)?;
-                }
-                self.put_page(&leaf)?;
-            }
-            Err(insert_pos) => {
-                // New key — insert at position
-                if num < Self::max_leaf_entries() {
-                    // Leaf has space
-                    leaf.insert_leaf(insert_pos, key, &[pk])?;
-                    self.put_page(&leaf)?;
-                } else {
-                    // Leaf is full — need to split
-                    self.insert_and_split_leaf(leaf, insert_pos, key, pk)?;
-                }
-            }
+        // Duplicate (value, pk) — nothing to do.
+        if leaf.binary_search(&full_key).is_ok() {
+            self.put_page(&leaf)?;
+            return Ok(());
         }
 
+        let insert_pos = match leaf.binary_search(&full_key) {
+            Ok(i) => i, // unreachable: handled above
+            Err(i) => i,
+        };
+        // New unique key — try in-place insert first; split when the page is
+        // full by either entry count OR byte size.
+        if num < Self::max_leaf_entries()
+            && leaf.insert_leaf(insert_pos, &full_key, &[pk.clone()]).is_ok()
+        {
+            self.put_page(&leaf)?;
+        } else {
+            self.insert_and_split_leaf(leaf, insert_pos, &full_key, pk)?;
+        }
+
+        Ok(())
+    }
+
+    /// Replaces the tree contents with `entries` (value, pk pairs), built
+    /// bottom-up: sort, fill leaves sequentially, then fold internal levels.
+    /// O(n) page writes instead of O(n log n) per-row `insert` with splits —
+    /// this is the CREATE INDEX backfill path (600k rows must not take 40 min).
+    ///
+    /// `entries` need not be sorted; duplicate (value, pk) pairs are dropped.
+    pub fn bulk_load(&mut self, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        // Compose unique keys, sort by full key.
+        let mut full: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len());
+        for (value, pk) in entries {
+            full.push((compose_key(value, pk), pk.clone()));
+        }
+        full.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        full.dedup_by(|a, b| a.0 == b.0);
+
+        // Reset to a fresh tree: page 0 = header, page 1 = first leaf.
+        self.meta.num_pages = 2;
+        self.meta.free_list_head = NULL_PAGE;
+        self.meta.root_page = 1;
+
+        // ---- Leaves ----
+        let mut leaf_level: Vec<(u32, Vec<u8>)> = Vec::new(); // (page_id, min_key)
+        let mut leaf_id: u32 = 1;
+        let mut leaf = DiskPage::new(1, PageType::Leaf);
+        let mut leaf_count: u16 = 0;
+        let mut min_key: Vec<u8> = Vec::new();
+        let mut prev_id: u32 = NULL_PAGE;
+
+        {
+            // Seal the current leaf into the level and open the next one.
+            let seal = |leaf: &mut DiskPage,
+                            leaf_id: u32,
+                            prev_id: &mut u32,
+                            min_key: &mut Vec<u8>,
+                            leaf_level: &mut Vec<(u32, Vec<u8>)>,
+                            this: &mut Self|
+             -> Result<u32> {
+                if *prev_id != NULL_PAGE {
+                    let mut prev = this.get_page(*prev_id)?;
+                    prev.set_right_leaf(leaf_id);
+                    this.put_page(&prev)?;
+                }
+                leaf.set_left_leaf(*prev_id);
+                this.put_page(leaf)?;
+                leaf_level.push((leaf_id, std::mem::take(min_key)));
+                *prev_id = leaf_id;
+                this.alloc_page()
+            };
+
+            for (k, pk) in &full {
+                let one: &[Vec<u8>] = std::slice::from_ref(pk);
+                if leaf_count == 0 {
+                    leaf.append_leaf(k, one)
+                        .map_err(|_| onto_core::CoreError::Custom("bulk_load: entry exceeds page".into()))?;
+                    min_key = k.clone();
+                    leaf_count = 1;
+                    continue;
+                }
+                if leaf_count >= Self::max_leaf_entries() || leaf.append_leaf(k, one).is_err() {
+                    // Failed append leaves the page untouched (checks precede mutation).
+                    leaf_id = seal(
+                        &mut leaf,
+                        leaf_id,
+                        &mut prev_id,
+                        &mut min_key,
+                        &mut leaf_level,
+                        self,
+                    )?;
+                    leaf = DiskPage::new(leaf_id, PageType::Leaf);
+                    leaf.append_leaf(k, one).map_err(|_| {
+                        onto_core::CoreError::Custom("bulk_load: entry exceeds page".into())
+                    })?;
+                    min_key = k.clone();
+                    leaf_count = 1;
+                } else {
+                    leaf_count += 1;
+                }
+            }
+            // Seal the final leaf (even when empty — keeps at least one leaf).
+            if prev_id != NULL_PAGE {
+                let mut prev = self.get_page(prev_id)?;
+                prev.set_right_leaf(leaf_id);
+                self.put_page(&prev)?;
+            }
+            leaf.set_left_leaf(prev_id);
+            self.put_page(&leaf)?;
+            leaf_level.push((leaf_id, min_key));
+        }
+
+        // ---- Internal levels, bottom-up ----
+        let mut level = leaf_level;
+        while level.len() > 1 {
+            let mut next: Vec<(u32, Vec<u8>)> = Vec::new();
+            let mut i = 0usize;
+            while i < level.len() {
+                // A trailing single child is promoted unwrapped (no zero-entry node).
+                if i + 1 == level.len() {
+                    next.push(level[i].clone());
+                    break;
+                }
+                let page_id = self.alloc_page()?;
+                let mut page = DiskPage::new(page_id, PageType::Internal);
+                page.set_first_child(level[i].0);
+                let node_min = level[i].1.clone();
+                let mut j = i + 1;
+                while j < level.len() && page.num_entries() < Self::max_internal_entries() {
+                    if page
+                        .append_internal(&level[j].1, level[j].0)
+                        .is_err()
+                    {
+                        break;
+                    }
+                    j += 1;
+                }
+                if j == i + 1 {
+                    return Err(onto_core::CoreError::Custom(
+                        "bulk_load: separator exceeds internal page".into(),
+                    ));
+                }
+                for k in i..j {
+                    let mut child = self.get_page(level[k].0)?;
+                    child.set_parent(page_id);
+                    self.put_page(&child)?;
+                }
+                self.put_page(&page)?;
+                next.push((page_id, node_min));
+                i = j;
+            }
+            level = next;
+        }
+
+        self.meta.root_page = level[0].0;
+        let mut root = self.get_page(self.meta.root_page)?;
+        root.set_parent(NULL_PAGE);
+        self.put_page(&root)?;
+
+        // Persist meta and the new page contents.
+        let cached = self.pool.fetch_mut(HEADER_PAGE_ID, &mut self.file)?;
+        self.meta.encode(&mut cached.data);
+        self.flush()?;
         Ok(())
     }
 
@@ -1815,12 +2011,15 @@ impl BTreeIndex {
             Err(i) => i,
         };
 
-        if num < Self::max_internal_entries() {
-            // Parent has space
-            parent.insert_internal(insert_pos, key, right_child_id)?;
+        // Split when full by entry count OR byte size (long keys fill the
+        // page long before max_internal_entries).
+        if num < Self::max_internal_entries()
+            && parent
+                .insert_internal(insert_pos, key, right_child_id)
+                .is_ok()
+        {
             self.put_page(&parent)?;
         } else {
-            // Parent is full — split parent
             self.split_internal_and_insert(parent, insert_pos, key, right_child_id)?;
         }
 
@@ -2275,6 +2474,105 @@ mod tests {
         assert_eq!(decoded.num_pages, 10);
         assert_eq!(decoded.class, "Product");
         assert_eq!(decoded.column, "price");
+    }
+
+    /// insert_entry must fail cleanly (no panic / u16 wrap) when the page is full
+    /// or the header is inconsistent — the hybrid-index rebuild path hit this as
+    /// `range start index 65412 out of range for slice of length 4096`.
+    #[test]
+    fn test_insert_entry_rejects_overflow() {
+        let mut page = DiskPage::new(1, PageType::Leaf);
+
+        // Oversized entry (larger than free space) must be rejected
+        let big = vec![0u8; PAGE_SIZE];
+        assert!(page.insert_entry(0, &big, 1).is_err());
+
+        // Corrupt data_start so a naive `-=` would wrap past the page
+        {
+            let mut h = page.header().expect("should be valid");
+            h.data_start = 100; // room for only 100 bytes of data
+            h.free_size = 4000; // free_size lies about available space
+            page.set_header(&h);
+        }
+        let entry = vec![7u8; 200]; // 200 > 100 → data_start underflow if unchecked
+        assert!(
+            page.insert_entry(0, &entry, 1).is_err(),
+            "must reject insert that would underflow data_start"
+        );
+        // Header must remain intact enough to keep rejecting
+        let h = page.header().expect("should be valid");
+        assert!(h.data_start as usize + 200 <= PAGE_SIZE + 200);
+    }
+
+    /// bulk_load must produce the same lookup/range_scan results as per-row
+    /// insert, including duplicate values with many pks (the CREATE INDEX path).
+    #[test]
+    fn test_bulk_load_matches_insert() {
+        let dir = tempfile::tempdir().expect("should be valid");
+
+        // 3k rows across 5 hot values — exercises leaf + internal levels.
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..3000u32)
+            .map(|i| {
+                let value = format!("v{}", i % 5);
+                (value.into_bytes(), format!("pk_{i:05}").into_bytes())
+            })
+            .collect();
+
+        let bulk_path = dir.path().join("bulk.idx");
+        let mut bulk = BTreeIndex::create(&bulk_path, "T", "c").expect("should be valid");
+        bulk.bulk_load(&entries).expect("bulk_load should succeed");
+
+        let ins_path = dir.path().join("ins.idx");
+        let mut ins = BTreeIndex::create(&ins_path, "T", "c").expect("should be valid");
+        for (v, pk) in &entries {
+            ins.insert(v, pk.clone()).expect("insert should succeed");
+        }
+
+        for vi in 0..5u32 {
+            let key = format!("v{vi}").into_bytes();
+            let mut b = bulk.lookup(&key).expect("should be valid");
+            let mut i = ins.lookup(&key).expect("should be valid");
+            b.sort();
+            i.sort();
+            assert_eq!(b.len(), 600, "value v{vi} should have 600 pks");
+            assert_eq!(b, i, "bulk vs insert lookup mismatch for v{vi}");
+        }
+
+        let mut b = bulk
+            .range_scan(Some(b"v1"), Some(b"v3"))
+            .expect("should be valid");
+        let mut i = ins
+            .range_scan(Some(b"v1"), Some(b"v3"))
+            .expect("should be valid");
+        b.sort();
+        i.sort();
+        assert_eq!(b.len(), 1800);
+        assert_eq!(b, i, "bulk vs insert range_scan mismatch");
+    }
+
+    /// Large keys fill a leaf by bytes long before max_leaf_entries — insert
+    /// must split instead of failing with "page full".
+    #[test]
+    fn test_btree_insert_splits_on_byte_full() {
+        let dir = tempfile::tempdir().expect("should be valid");
+        let path = dir.path().join("bigkeys.idx");
+        let mut idx = BTreeIndex::create(&path, "Big", "col").expect("should be valid");
+
+        // ~200-byte keys: a 4KB page holds far fewer than max_leaf_entries
+        for i in 0..200u32 {
+            let key = format!("{:0>200}", format!("key_{:06}", i));
+            idx.insert(key.as_bytes(), format!("pk_{i}").into_bytes())
+                .unwrap_or_else(|e| panic!("insert {i} failed: {e}"));
+        }
+
+        // All keys must still be findable after splits
+        for i in 0..200u32 {
+            let key = format!("{:0>200}", format!("key_{:06}", i));
+            let hits = idx
+                .lookup(key.as_bytes())
+                .unwrap_or_else(|e| panic!("lookup {i} failed: {e}"));
+            assert_eq!(hits.len(), 1, "key {i} should hit exactly one pk");
+        }
     }
 
     #[test]

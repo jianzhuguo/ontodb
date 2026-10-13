@@ -2017,3 +2017,86 @@ fn integration_vector_search_large_dataset() {
         _ => panic!("expected Rows"),
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  COUNT(*) key-only path (no value materialization)
+// ═══════════════════════════════════════════════════════════════════
+
+fn count_value(executor: &QueryExecutor, sql: &str, alias: &str) -> i64 {
+    let result = exec_ok(executor, sql);
+    match &result {
+        onto_query::QueryResult::Rows(rows) => {
+            assert_eq!(rows.len(), 1, "COUNT should return one row");
+            rows[0]
+                .get(alias)
+                .unwrap_or_else(|| panic!("missing column {alias} in {:?}", rows[0]))
+                .as_i64()
+                .expect("count should be integer")
+        }
+        other => panic!("expected Rows, got {:?}", other),
+    }
+}
+
+#[test]
+fn integration_count_star_unfiltered_matches_row_scan() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    for i in 0..40 {
+        exec_ok(
+            &executor,
+            &format!(
+                "INSERT INTO Product (name, price) VALUES ('item_{}', {})",
+                i,
+                (i + 1) * 10
+            ),
+        );
+    }
+    // Deletes must be excluded from COUNT(*)
+    for i in 0..5 {
+        exec_ok(&executor, &format!("DELETE FROM Product WHERE name = 'item_{}'", i));
+    }
+
+    // Fresh executor has no row-count cache → exercises count_prefix path.
+    let executor2 = make_executor(&engine);
+    let cnt = count_value(&executor2, "SELECT COUNT(*) as cnt FROM Product", "cnt");
+    assert_eq!(cnt, 35, "unfiltered COUNT(*) should count live rows only");
+
+    // Second call hits the cache and must agree.
+    let cnt2 = count_value(&executor2, "SELECT COUNT(*) as cnt FROM Product", "cnt");
+    assert_eq!(cnt2, 35);
+
+    // Physical scan cross-check.
+    let result = exec_ok(&executor2, "SELECT name FROM Product");
+    match &result {
+        onto_query::QueryResult::Rows(rows) => assert_eq!(rows.len(), 35),
+        other => panic!("expected Rows, got {:?}", other),
+    }
+}
+
+#[test]
+fn integration_count_star_with_filter_still_correct() {
+    let (engine, _dir) = setup_engine(None);
+    let executor = make_executor(&engine);
+
+    for i in 0..30 {
+        exec_ok(
+            &executor,
+            &format!(
+                "INSERT INTO Product (name, price) VALUES ('item_{}', {})",
+                i,
+                (i + 1) * 10
+            ),
+        );
+    }
+
+    let cnt = count_value(
+        &executor,
+        "SELECT COUNT(*) as cnt FROM Product WHERE price > 200",
+        "cnt",
+    );
+    assert_eq!(cnt, 10, "prices 210..300 are 10 rows");
+
+    let cnt_all = count_value(&executor, "SELECT COUNT(*) as cnt FROM Product", "cnt");
+    assert_eq!(cnt_all, 30);
+}

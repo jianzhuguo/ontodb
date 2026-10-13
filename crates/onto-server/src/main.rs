@@ -69,6 +69,27 @@ struct Args {
     #[arg(short, long, default_value = "4194304", env = "STORAGE_MEMTABLE_SIZE")]
     memtable_size: usize,
 
+    /// Secondary index storage mode: inmemory | disk | hybrid
+    #[arg(
+        long,
+        default_value = "inmemory",
+        env = "STORAGE_INDEX_MODE",
+        value_parser = ["inmemory", "disk", "hybrid"]
+    )]
+    index_storage_mode: String,
+
+    /// Hybrid index mode: migrate an index to disk after this many entries
+    #[arg(long, default_value = "100000", env = "STORAGE_INDEX_HYBRID_THRESHOLD")]
+    index_hybrid_threshold: usize,
+
+    /// Max in-memory graph vertices
+    #[arg(long, default_value = "1000000", env = "GRAPH_MAX_VERTICES")]
+    graph_max_vertices: usize,
+
+    /// Max graph cache memory in MB
+    #[arg(long, default_value = "2048", env = "GRAPH_MAX_CACHE_MB")]
+    graph_max_cache_mb: usize,
+
     /// Run in interactive mode (REPL)
     #[arg(short, long)]
     interactive: bool,
@@ -275,9 +296,17 @@ fn main() -> Result<()> {
     }
 
     let data_dir = args.data_dir.clone();
+    let index_storage_mode = match args.index_storage_mode.as_str() {
+        "disk" => onto_storage::IndexStorageMode::DiskBased,
+        "hybrid" => onto_storage::IndexStorageMode::Hybrid {
+            threshold_entries: args.index_hybrid_threshold,
+        },
+        _ => onto_storage::IndexStorageMode::InMemory,
+    };
     let options = StorageOptions {
         data_dir: args.data_dir,
         memtable_size_limit: args.memtable_size,
+        index_storage_mode: Some(index_storage_mode),
         ..Default::default()
     };
 
@@ -305,8 +334,31 @@ fn main() -> Result<()> {
     }
 
     let engine = Arc::new(LsmEngine::open(options)?);
+
+    // Rebuild indexes in background to avoid blocking startup
+    let rebuild_engine = Arc::clone(&engine);
+    std::thread::Builder::new()
+        .name("index-rebuild".into())
+        .spawn(move || {
+            tracing::info!("Background index rebuild started");
+            if let Err(e) = rebuild_engine.open_disk_indexes() {
+                tracing::warn!("open_disk_indexes failed: {}", e);
+            }
+            if let Err(e) = rebuild_engine.rebuild_indexes() {
+                tracing::warn!("Index rebuild failed: {}", e);
+            }
+            if let Err(e) = rebuild_engine.rebuild_vector_indexes() {
+                tracing::warn!("Vector index rebuild failed: {}", e);
+            }
+            tracing::info!("Background index rebuild complete");
+        })
+        .ok();
+
     let ontology_store = OntologyStore::new(Arc::clone(&engine));
-    let graph_store = Arc::new(onto_graph::GraphStore::new());
+    let graph_store = Arc::new(onto_graph::GraphStore::with_limits(onto_graph::GraphLimits {
+        max_vertices: args.graph_max_vertices,
+        max_cache_memory_bytes: args.graph_max_cache_mb.saturating_mul(1024 * 1024),
+    }));
     let triple_store = Arc::new(onto_ontology::TripleStore::new(Arc::clone(&engine)));
 
     // Initialize sharding if enabled
@@ -334,6 +386,9 @@ fn main() -> Result<()> {
 
     // Auto-create source/target indexes for all existing relation tables
     executor.ensure_all_relation_indexes();
+
+    // Pre-warm row count cache in background
+    executor.warmup_row_counts();
 
     if args.interactive {
         run_repl(&executor)?;

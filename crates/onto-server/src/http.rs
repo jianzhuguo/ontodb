@@ -578,6 +578,8 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/restore", post(restore_endpoint))
         .route("/api/flush", post(flush))
         .route("/api/compact", post(compact))
+        // Recovery: export all Put entries (including tombstoned) to JSONL
+        .route("/api/recover", post(recover_entries))
         // Living data activation
         .route("/api/activate", post(activate_entries))
         // Transaction endpoints
@@ -743,6 +745,8 @@ pub fn build_router_with_auth(
         .route("/api/restore", post(restore_endpoint))
         .route("/api/flush", post(flush))
         .route("/api/compact", post(compact))
+        // Recovery: export all Put entries (including tombstoned) to JSONL
+        .route("/api/recover", post(recover_entries))
         // Living data activation
         .route("/api/activate", post(activate_entries))
         // Transaction endpoints
@@ -4049,6 +4053,99 @@ async fn compact(State(state): State<AppState>) -> impl IntoResponse {
             Json(ApiResponse::<serde_json::Value>::error(format!("Compaction failed: {}", e))),
         ),
     }
+}
+
+/// POST /api/recover — Export ALL Put entries (including tombstoned ones) to JSONL.
+///
+/// Request body:
+/// ```json
+/// {
+///     "class": "interacts_with",
+///     "namespace": "sembio",
+///     "output": "E:/data/recovered.jsonl"
+/// }
+/// ```
+async fn recover_entries(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let class = match req["class"].as_str() {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error("'class' field required".to_string())),
+            );
+        }
+    };
+
+    let ns = req["namespace"].as_str().unwrap_or("default");
+    let output = match req["output"].as_str() {
+        Some(o) => o,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error("'output' field required".to_string())),
+            );
+        }
+    };
+
+    let prefix = format!("{}.{}::", ns, class);
+    let entries = match state.executor.engine().scan_prefix_recovery(prefix.as_bytes()) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<Value>::error(format!("Recovery scan failed: {}", e))),
+            );
+        }
+    };
+
+    let total = entries.len();
+    let mut written = 0usize;
+
+    match std::fs::File::create(output) {
+        Ok(file) => {
+            use std::io::Write;
+            let mut writer = std::io::BufWriter::new(file);
+            for (_key, val_bytes) in &entries {
+                // Try BinaryRow format first, then JSON
+                let doc = if let Some(row) = onto_core::binary_row::BinaryRow::parse(val_bytes) {
+                    row.to_map()
+                } else {
+                    match serde_json::from_slice::<serde_json::Value>(val_bytes) {
+                        Ok(serde_json::Value::Object(doc)) => Some(doc),
+                        _ => None,
+                    }
+                };
+                if let Some(doc) = doc {
+                    if let Ok(json) = serde_json::to_string(&doc) {
+                        let _ = writeln!(writer, "{}", json);
+                        written += 1;
+                    }
+                }
+            }
+            let _ = writer.flush();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<Value>::error(format!("Failed to create file: {}", e))),
+            );
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success(serde_json::json!({
+            "total_scanned": total,
+            "written": written,
+            "output": output
+        }), elapsed)),
+    )
 }
 
 /// POST /api/activate — Activate living data entries (set initial value scores).

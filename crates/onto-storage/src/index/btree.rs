@@ -216,7 +216,10 @@ impl BPlusTree {
 
         match idx {
             Ok(i) => {
-                // Key exists �?add primary_key if not duplicate
+                // Key exists — add primary_key if not duplicate. Duplicate
+                // inserts are rare (row-level reindex); the O(n) scan is fine
+                // there. Backfill goes through bulk_load, which dedups in
+                // O(n log n) instead.
                 if let Node::Leaf(n) = self.node_mut(leaf_id).expect("node should exist") {
                     if !n.values[i].contains(&primary_key) {
                         n.values[i].push(primary_key);
@@ -999,18 +1002,25 @@ impl BPlusTree {
         let mut entries = entries;
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        // Merge duplicate keys, collecting primary keys per unique key
+        // Merge duplicate keys, collecting primary keys per unique key.
+        // No `Vec::contains` dedup here: a hot key (e.g. assay_type='B' with
+        // 492k pks) turns that into O(n²) — billions of comparisons. Sort +
+        // dedup per key afterwards is O(n log n) and preserves exact dedup.
         let mut merged: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
         for (key, pk) in entries {
             if let Some(last) = merged.last_mut() {
                 if last.0 == key {
-                    if !last.1.contains(&pk) {
-                        last.1.push(pk);
-                    }
+                    last.1.push(pk);
                     continue;
                 }
             }
             merged.push((key, vec![pk]));
+        }
+        for (_, pks) in merged.iter_mut() {
+            if pks.len() > 1 {
+                pks.sort_unstable();
+                pks.dedup();
+            }
         }
 
         let total_pks: usize = merged.iter().map(|(_, pks)| pks.len()).sum();

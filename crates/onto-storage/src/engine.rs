@@ -38,6 +38,31 @@ fn parse_doc_bytes(bytes: &[u8]) -> Option<serde_json::Map<String, serde_json::V
         _ => None,
     }
 }
+
+/// Fast path for CREATE INDEX backfill: pull one column (+ class check) without
+/// materializing the full document map. `to_map()` on 600k wide rows dominates
+/// backfill time; `get_value` touches only the target field.
+fn extract_index_field(
+    bytes: &[u8],
+    class: &str,
+    column: &str,
+) -> Option<serde_json::Value> {
+    if let Some(row) = BinaryRow::parse(bytes) {
+        if row.class_value() != Some(class) {
+            return None;
+        }
+        return row.get_value(column);
+    }
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(serde_json::Value::Object(doc)) => {
+            if doc.get("__class__").and_then(|v| v.as_str()) != Some(class) {
+                return None;
+            }
+            doc.get(column).cloned()
+        }
+        _ => None,
+    }
+}
 use parking_lot::RwLock as FairRwLock;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -416,9 +441,9 @@ impl LsmEngine {
                 .unwrap_or_else(|e| e.into_inner()) = Some(h);
         }
 
-        // Index rebuild deferred to background thread
-        // The indexes will be rebuilt on-demand when first queried
-        tracing::info!("Index rebuild deferred to on-demand (startup optimized)");
+        // Index rebuild is deferred to on-demand or background thread by caller.
+        // This keeps startup fast (~1s) even with millions of index entries.
+        // Indexes will be rebuilt on first query that needs them.
 
         Ok(engine)
     }
@@ -620,9 +645,9 @@ impl LsmEngine {
     /// This leverages the LSM-Tree's sorted key structure:
     /// entries with `{class}::` prefix are contiguous in sorted order.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        eprintln!("[STORAGE scan_prefix] prefix='{}', len={}", String::from_utf8_lossy(prefix), prefix.len());
+        tracing::debug!(prefix = %String::from_utf8_lossy(prefix), "scan_prefix start");
         let result = self.scan_prefix_internal(prefix, None, None)?;
-        eprintln!("[STORAGE scan_prefix] returned {} entries", result.len());
+        tracing::debug!(prefix = %String::from_utf8_lossy(prefix), count = result.len(), "scan_prefix done");
         Ok(result)
     }
 
@@ -708,13 +733,158 @@ impl LsmEngine {
         Ok(results)
     }
 
-    /// Scan with prefix, returning at most `limit` entries.
-    /// Stops scanning SSTs once limit is reached — avoids full table scan for LIMIT queries.
+    /// Scan with prefix, returning at most `limit` live entries.
+    ///
+    /// Optimized for LIMIT queries: scans **newest-first** (memtable → L0 → …)
+    /// so the first occurrence of each key is the winning version, then stops
+    /// once `limit` live Puts are collected. Does **not** walk the entire
+    /// prefix — older SSTs are skipped entirely once the limit is met.
     pub fn scan_prefix_limit(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        eprintln!("[STORAGE scan_prefix_limit] prefix='{}', limit={}", String::from_utf8_lossy(prefix), limit);
-        let result = self.scan_prefix_internal(prefix, None, Some(limit))?;
-        eprintln!("[STORAGE scan_prefix_limit] returned {} entries", result.len());
+        tracing::debug!(prefix = %String::from_utf8_lossy(prefix), "scan_prefix_limit start");
+        let result = self.scan_prefix_limit_newest(prefix, limit)?;
+        tracing::debug!(prefix = %String::from_utf8_lossy(prefix), count = result.len(), "scan_prefix_limit done");
         Ok(result)
+    }
+
+    /// Newest-first limited scan with early exit.
+    ///
+    /// Visibility rule: first occurrence of a key wins (scan order is
+    /// newest → oldest). Memtables override SSTs; within L0, later-flushed
+    /// (higher path name / max_seq) SSTs are scanned first.
+    fn scan_prefix_limit_newest(
+        &self,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.drain_compaction_notifications();
+
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Newest-first SST list: L0 before L1 … ; within a level, reverse
+        // insertion order (later flushes are newer).
+        let sst_handles: Vec<Arc<SsTable>> = {
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut handles = Vec::new();
+            for level in levels.iter() {
+                // Reverse so later-pushed (newer) SSTs come first
+                for sst_info in level.iter().rev() {
+                    if !prefix.is_empty() {
+                        if sst_info.max_key.as_slice() < prefix {
+                            continue;
+                        }
+                        if !Self::prefix_may_overlap(
+                            prefix,
+                            sst_info.min_key.as_slice(),
+                            sst_info.max_key.as_slice(),
+                        ) {
+                            continue;
+                        }
+                    }
+                    match cache.get(&sst_info.path) {
+                        Some(sst) => handles.push(Arc::clone(sst)),
+                        None => {
+                            let sst = Arc::new(SsTable::open(&sst_info.path)?);
+                            cache.insert(sst_info.path.clone(), Arc::clone(&sst));
+                            handles.push(sst);
+                        }
+                    }
+                }
+            }
+            handles
+        };
+
+        let mut seen: HashMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = HashMap::new();
+        let mut live_puts = 0usize;
+
+        let mut note = |key: Vec<u8>, value: Vec<u8>, seq: SeqNo, kind: EntryKind, seen: &mut HashMap<_, _>, live_puts: &mut usize| -> bool {
+            // returns true if caller should stop (limit reached)
+            if seen.contains_key(&key) {
+                return false; // first-seen wins (newest already recorded)
+            }
+            let is_live = kind == EntryKind::Put;
+            seen.insert(key, (value, seq, kind));
+            if is_live {
+                *live_puts += 1;
+                return *live_puts >= limit;
+            }
+            false
+        };
+
+        // 1. Active memtable (newest)
+        {
+            let ws = self.write_state.read();
+            for entry in ws.memtable.scan_prefix(prefix) {
+                if note(
+                    entry.key.clone(),
+                    entry.value.clone(),
+                    entry.seq_no,
+                    entry.kind,
+                    &mut seen,
+                    &mut live_puts,
+                ) {
+                    return Ok(Self::collect_live(seen, limit));
+                }
+            }
+            // 2. Immutable memtable
+            if let Some(ref imm) = ws.immutable_memtable {
+                for entry in imm.scan_prefix(prefix) {
+                    if note(
+                        entry.key.clone(),
+                        entry.value.clone(),
+                        entry.seq_no,
+                        entry.kind,
+                        &mut seen,
+                        &mut live_puts,
+                    ) {
+                        return Ok(Self::collect_live(seen, limit));
+                    }
+                }
+            }
+        }
+
+        // 3. SSTs newest → oldest, early-exit on limit.
+        // Decode whole blocks at once (batch) + block prefetch (in load_block).
+        for sst in &sst_handles {
+            let mut iter = sst.iter()?;
+            iter.seek(prefix);
+            let mut batch: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::with_capacity(64);
+            loop {
+                if !iter.is_valid() || !iter.key().starts_with(prefix) {
+                    break;
+                }
+                batch.clear();
+                iter.drain_current_block(&mut batch);
+                let mut past_prefix = false;
+                for (key, value, seq, kind) in batch.drain(..) {
+                    if !key.starts_with(prefix) {
+                        past_prefix = true;
+                        break;
+                    }
+                    if note(key, value, seq, kind, &mut seen, &mut live_puts) {
+                        return Ok(Self::collect_live(seen, limit));
+                    }
+                }
+                if past_prefix {
+                    break;
+                }
+            }
+        }
+
+        Ok(Self::collect_live(seen, limit))
+    }
+
+    fn collect_live(
+        seen: HashMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)>,
+        limit: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        seen.into_iter()
+            .filter(|(_, (_, _, kind))| *kind == EntryKind::Put)
+            .take(limit)
+            .map(|(key, (value, _, _))| (key, value))
+            .collect()
     }
 
     /// Internal scan implementation shared by scan_prefix and scan_prefix_with_visibility.
@@ -743,26 +913,27 @@ impl LsmEngine {
         let sst_paths: Vec<PathBuf> = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let mut paths = Vec::new();
-            let mut skipped = 0usize;
             for level in levels.iter().rev() {
                 for sst_info in level.iter() {
                     if !prefix.is_empty() {
                         let sst_max = sst_info.max_key.as_slice();
                         if sst_max < prefix {
-                            skipped += 1;
                             continue;
                         }
                         let sst_min = sst_info.min_key.as_slice();
                         if !Self::prefix_may_overlap(prefix, sst_min, sst_max) {
-                            skipped += 1;
                             continue;
                         }
                     }
                     paths.push(sst_info.path.clone());
                 }
             }
-            eprintln!("[STORAGE internal] prefix='{}', limit={:?}, selected={} SSTs, skipped={} SSTs, total_levels={}",
-                String::from_utf8_lossy(prefix), limit, paths.len(), skipped, levels.len());
+            tracing::debug!(
+                prefix = %String::from_utf8_lossy(prefix),
+                selected = paths.len(),
+                total_levels = levels.len(),
+                "scan_prefix_internal select SSTs"
+            );
             paths
         };
 
@@ -792,7 +963,6 @@ impl LsmEngine {
             let mut sst_count = 0usize;
             let mut sst_put_count = 0usize;
             let mut sst_del_count = 0usize;
-            let mut overridden_count = 0usize;
             while iter.is_valid() {
                 if !iter.key().starts_with(prefix) {
                     break;
@@ -810,16 +980,7 @@ impl LsmEngine {
 
                 if is_visible(seq) {
                     let should_update = match seen.get(&key) {
-                        Some((_, existing_seq, existing_kind)) => {
-                            if seq > *existing_seq {
-                                if *existing_kind == EntryKind::Put && kind == EntryKind::Delete {
-                                    overridden_count += 1;
-                                }
-                                true
-                            } else {
-                                false
-                            }
-                        }
+                        Some((_, existing_seq, _)) => seq > *existing_seq,
                         None => true,
                     };
                     if should_update {
@@ -830,9 +991,15 @@ impl LsmEngine {
                 sst_count += 1;
                 iter.next();
             }
-            if sst_count > 0 || prefix.len() < 20 {
-                eprintln!("[STORAGE sst_scan] sst_idx={}, prefix='{}', entries={}, puts={}, dels={}, overridden={}, seen_total={}",
-                    sst_idx, String::from_utf8_lossy(prefix), sst_count, sst_put_count, sst_del_count, overridden_count, seen.len());
+            if sst_count > 0 {
+                tracing::debug!(
+                    sst_idx,
+                    prefix = %String::from_utf8_lossy(prefix),
+                    entries = sst_count,
+                    puts = sst_put_count,
+                    dels = sst_del_count,
+                    "sst_scan"
+                );
             }
 
             // NOTE: Do NOT early-exit based on put_count here.
@@ -892,8 +1059,13 @@ impl LsmEngine {
             let sample: Vec<String> = seen.keys().take(5)
                 .map(|k| String::from_utf8_lossy(k).to_string())
                 .collect();
-            eprintln!("[STORAGE filter] ALL TOMBSTONES! prefix='{}', seen={}, tombstones={}, sample_keys={:?}",
-                String::from_utf8_lossy(prefix), total_seen, tombstone_count, sample);
+            tracing::debug!(
+                prefix = %String::from_utf8_lossy(prefix),
+                seen = total_seen,
+                tombstones = tombstone_count,
+                sample_keys = ?sample,
+                "all tombstones"
+            );
         }
 
         // When limit is set, stop collecting as soon as we have enough live entries.
@@ -917,8 +1089,14 @@ impl LsmEngine {
                 .collect();
         }
 
-        eprintln!("[STORAGE filter] prefix='{}', limit={:?}, seen={}, puts={}, tombstones={}, after_filter={}",
-            String::from_utf8_lossy(prefix), limit, total_seen, put_count, tombstone_count, result.len());
+        tracing::debug!(
+            prefix = %String::from_utf8_lossy(prefix),
+            seen = total_seen,
+            puts = put_count,
+            tombstones = tombstone_count,
+            after_filter = result.len(),
+            "scan_prefix_internal done"
+        );
 
         Ok(result)
     }
@@ -927,9 +1105,276 @@ impl LsmEngine {
     /// because it uses a lightweight HashSet for keys instead of storing values.
     /// Returns (live_count, tombstone_count).
     pub fn count_prefix(&self, prefix: &[u8]) -> Result<(usize, usize)> {
-        let mut seen: HashMap<Vec<u8>, (SeqNo, EntryKind)> = HashMap::new();
+        self.count_prefix_with(prefix, None, |_| Ok(true))
+    }
 
-        // Scan SSTables
+    /// Count live entries matching a prefix whose value passes `passes`.
+    ///
+    /// Two-pass design (same as [`Self::for_each_live_prefix`]):
+    /// 1. Collect `key → (seq, kind)` only — **no value copies, no filter eval**.
+    /// 2. Re-stream values and evaluate `passes` **only on winning Puts**.
+    ///
+    /// Peak memory is O(keys) plus one value at a time. Filter cost is exactly
+    /// one evaluation per live key (not per version).
+    ///
+    /// Returns (matched_live_count, tombstone_count).
+    pub fn count_prefix_with<F>(
+        &self,
+        prefix: &[u8],
+        vis: Option<&crate::mvcc::Visibility>,
+        mut passes: F,
+    ) -> Result<(usize, usize)>
+    where
+        F: FnMut(&[u8]) -> Result<bool>,
+    {
+        self.drain_compaction_notifications();
+
+        let is_visible = |seq: SeqNo| -> bool {
+            match vis {
+                Some(v) => v.is_visible(seq),
+                None => true,
+            }
+        };
+
+        // ---- Pass 1: winners = key → (seq, kind), no values ----
+        let mut winners: HashMap<Vec<u8>, (SeqNo, EntryKind)> = HashMap::new();
+
+        let sst_handles: Vec<Arc<SsTable>> = {
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut handles = Vec::new();
+            for level in levels.iter().rev() {
+                for sst_info in level.iter() {
+                    if !prefix.is_empty() {
+                        if sst_info.max_key.as_slice() < prefix {
+                            continue;
+                        }
+                        if !Self::prefix_may_overlap(
+                            prefix,
+                            sst_info.min_key.as_slice(),
+                            sst_info.max_key.as_slice(),
+                        ) {
+                            continue;
+                        }
+                    }
+                    match cache.get(&sst_info.path) {
+                        Some(sst) => handles.push(Arc::clone(sst)),
+                        None => {
+                            let sst = Arc::new(SsTable::open(&sst_info.path)?);
+                            cache.insert(sst_info.path.clone(), Arc::clone(&sst));
+                            handles.push(sst);
+                        }
+                    }
+                }
+            }
+            handles
+        };
+
+        {
+            let mut note = |key: Vec<u8>, seq: SeqNo, kind: EntryKind| {
+                let should_update = match winners.get(&key) {
+                    Some((existing_seq, _)) => seq > *existing_seq,
+                    None => true,
+                };
+                if should_update {
+                    winners.insert(key, (seq, kind));
+                }
+            };
+
+            for sst in &sst_handles {
+                let mut iter = sst.iter()?;
+                iter.seek(prefix);
+                let mut batch: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::with_capacity(64);
+                loop {
+                    if !iter.is_valid() || !iter.key().starts_with(prefix) {
+                        break;
+                    }
+                    batch.clear();
+                    iter.drain_current_block(&mut batch);
+                    let mut past = false;
+                    for (key, _val, seq, kind) in batch.drain(..) {
+                        if !key.starts_with(prefix) {
+                            past = true;
+                            break;
+                        }
+                        if is_visible(seq) {
+                            note(key, seq, kind);
+                        }
+                    }
+                    if past {
+                        break;
+                    }
+                }
+            }
+
+            let ws = self.write_state.read();
+            if let Some(ref imm) = ws.immutable_memtable {
+                for entry in imm.scan_prefix(prefix) {
+                    if is_visible(entry.seq_no) {
+                        note(entry.key.clone(), entry.seq_no, entry.kind);
+                    }
+                }
+            }
+            for entry in ws.memtable.scan_prefix(prefix) {
+                if is_visible(entry.seq_no) {
+                    note(entry.key.clone(), entry.seq_no, entry.kind);
+                }
+            }
+        }
+
+        // ---- Pass 2: evaluate filter only on winning Puts ----
+        let mut matched_live = 0usize;
+        let mut pending_puts = winners
+            .values()
+            .filter(|(_, kind)| *kind == EntryKind::Put)
+            .count();
+        let tombstones = winners.len() - pending_puts;
+
+        {
+            fn try_count<F>(
+                winners: &mut HashMap<Vec<u8>, (SeqNo, EntryKind)>,
+                pending_puts: &mut usize,
+                matched_live: &mut usize,
+                passes: &mut F,
+                key: &[u8],
+                seq: SeqNo,
+                kind: EntryKind,
+                value: &[u8],
+            ) -> Result<()>
+            where
+                F: FnMut(&[u8]) -> Result<bool>,
+            {
+                if kind != EntryKind::Put || *pending_puts == 0 {
+                    return Ok(());
+                }
+                let Some((w_seq, w_kind)) = winners.get(key).copied() else {
+                    return Ok(());
+                };
+                if w_seq == seq && w_kind == EntryKind::Put {
+                    if let Some(slot) = winners.get_mut(key) {
+                        slot.1 = EntryKind::Delete; // mark processed
+                    }
+                    *pending_puts -= 1;
+                    if passes(value)? {
+                        *matched_live += 1;
+                    }
+                }
+                Ok(())
+            }
+
+            for sst in &sst_handles {
+                if pending_puts == 0 {
+                    break;
+                }
+                let mut iter = sst.iter()?;
+                iter.seek(prefix);
+                let mut batch: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::with_capacity(64);
+                loop {
+                    if pending_puts == 0 {
+                        break;
+                    }
+                    if !iter.is_valid() || !iter.key().starts_with(prefix) {
+                        break;
+                    }
+                    batch.clear();
+                    iter.drain_current_block(&mut batch);
+                    for (key, val, seq, kind) in batch.drain(..) {
+                        try_count(
+                            &mut winners,
+                            &mut pending_puts,
+                            &mut matched_live,
+                            &mut passes,
+                            &key,
+                            seq,
+                            kind,
+                            &val,
+                        )?;
+                        if pending_puts == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if pending_puts > 0 {
+                let ws = self.write_state.read();
+                if let Some(ref imm) = ws.immutable_memtable {
+                    for entry in imm.scan_prefix(prefix) {
+                        if pending_puts == 0 {
+                            break;
+                        }
+                        try_count(
+                            &mut winners,
+                            &mut pending_puts,
+                            &mut matched_live,
+                            &mut passes,
+                            &entry.key,
+                            entry.seq_no,
+                            entry.kind,
+                            &entry.value,
+                        )?;
+                    }
+                }
+                for entry in ws.memtable.scan_prefix(prefix) {
+                    if pending_puts == 0 {
+                        break;
+                    }
+                    try_count(
+                        &mut winners,
+                        &mut pending_puts,
+                        &mut matched_live,
+                        &mut passes,
+                        &entry.key,
+                        entry.seq_no,
+                        entry.kind,
+                        &entry.value,
+                    )?;
+                }
+            }
+        }
+
+        Ok((matched_live, tombstones))
+    }
+
+    /// Visit every live (Put) entry under `prefix` exactly once, latest-version-wins,
+    /// without materializing the full value set.
+    ///
+    /// Two-pass design:
+    /// 1. Collect `key → (seq, kind)` only (O(keys) memory, no values).
+    /// 2. Re-stream values and invoke `f(key, value)` for each winning Put.
+    ///
+    /// `f` sees each key at most once. Values are discarded after the callback —
+    /// peak row memory is one value plus the key map.
+    ///
+    /// `overlay` (when provided) represents uncommitted write-buffer entries that
+    /// win over storage: `Some(value)` is a Put, `None` is a Delete. Overlay keys
+    /// suppress any storage version of the same key.
+    pub fn for_each_live_prefix<F>(
+        &self,
+        prefix: &[u8],
+        vis: Option<&crate::mvcc::Visibility>,
+        overlay: Option<&std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        self.drain_compaction_notifications();
+
+        let is_visible = |seq: SeqNo| -> bool {
+            match vis {
+                Some(v) => v.is_visible(seq),
+                None => true,
+            }
+        };
+
+        let shadowed = |key: &[u8]| -> bool {
+            overlay.is_some_and(|ov| ov.contains_key(key))
+        };
+
+        // ---- Pass 1: storage winners = key → (seq, kind), no values ----
+        let mut winners: HashMap<Vec<u8>, (SeqNo, EntryKind)> = HashMap::new();
+
         let sst_paths: Vec<PathBuf> = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let mut paths = Vec::new();
@@ -939,7 +1384,11 @@ impl LsmEngine {
                         if sst_info.max_key.as_slice() < prefix {
                             continue;
                         }
-                        if !Self::prefix_may_overlap(prefix, sst_info.min_key.as_slice(), sst_info.max_key.as_slice()) {
+                        if !Self::prefix_may_overlap(
+                            prefix,
+                            sst_info.min_key.as_slice(),
+                            sst_info.max_key.as_slice(),
+                        ) {
                             continue;
                         }
                     }
@@ -964,55 +1413,193 @@ impl LsmEngine {
             handles
         };
 
-        for sst in &sst_handles {
-            let mut iter = sst.iter()?;
-            iter.seek(prefix);
-            while iter.is_valid() {
-                if !iter.key().starts_with(prefix) {
-                    break;
+        {
+            let mut note = |key: Vec<u8>, seq: SeqNo, kind: EntryKind| {
+                if shadowed(&key) {
+                    return;
                 }
-                let key = iter.key().to_vec();
-                let seq = iter.seq_no();
-                let kind = iter.kind();
-                let should_update = match seen.get(&key) {
+                let should_update = match winners.get(&key) {
                     Some((existing_seq, _)) => seq > *existing_seq,
                     None => true,
                 };
                 if should_update {
-                    seen.insert(key, (seq, kind));
+                    winners.insert(key, (seq, kind));
                 }
-                iter.next();
-            }
-        }
+            };
 
-        // Scan MemTables
-        {
+            for sst in &sst_handles {
+                let mut iter = sst.iter()?;
+                iter.seek(prefix);
+                while iter.is_valid() {
+                    if !iter.key().starts_with(prefix) {
+                        break;
+                    }
+                    if is_visible(iter.seq_no()) {
+                        note(iter.key().to_vec(), iter.seq_no(), iter.kind());
+                    }
+                    iter.next();
+                }
+            }
+
             let ws = self.write_state.read();
             if let Some(ref imm) = ws.immutable_memtable {
                 for entry in imm.scan_prefix(prefix) {
-                    let should_update = match seen.get(&entry.key) {
-                        Some((existing_seq, _)) => entry.seq_no > *existing_seq,
-                        None => true,
-                    };
-                    if should_update {
-                        seen.insert(entry.key.clone(), (entry.seq_no, entry.kind));
+                    if is_visible(entry.seq_no) {
+                        note(entry.key.clone(), entry.seq_no, entry.kind);
                     }
                 }
             }
             for entry in ws.memtable.scan_prefix(prefix) {
-                let should_update = match seen.get(&entry.key) {
-                    Some((existing_seq, _)) => entry.seq_no > *existing_seq,
-                    None => true,
-                };
-                if should_update {
-                    seen.insert(entry.key.clone(), (entry.seq_no, entry.kind));
+                if is_visible(entry.seq_no) {
+                    note(entry.key.clone(), entry.seq_no, entry.kind);
                 }
             }
         }
 
-        let tombstones = seen.values().filter(|(_, kind)| *kind != EntryKind::Put).count();
-        let live = seen.len() - tombstones;
-        Ok((live, tombstones))
+        // ---- Pass 2: re-stream values, emit winning Puts, drop value after f ----
+        // consumed[kind=Delete] is used as a "already emitted" marker for Puts.
+        let mut pending_puts = winners
+            .values()
+            .filter(|(_, kind)| *kind == EntryKind::Put)
+            .count();
+
+        {
+            // fn (not closure) so we can still read `pending_puts` in the loops
+            fn try_emit<F>(
+                winners: &mut HashMap<Vec<u8>, (SeqNo, EntryKind)>,
+                pending_puts: &mut usize,
+                f: &mut F,
+                key: &[u8],
+                seq: SeqNo,
+                kind: EntryKind,
+                value: &[u8],
+            ) -> Result<()>
+            where
+                F: FnMut(&[u8], &[u8]) -> Result<()>,
+            {
+                if kind != EntryKind::Put || *pending_puts == 0 {
+                    return Ok(());
+                }
+                let Some((w_seq, w_kind)) = winners.get(key).copied() else {
+                    return Ok(());
+                };
+                if w_seq == seq && w_kind == EntryKind::Put {
+                    if let Some(slot) = winners.get_mut(key) {
+                        slot.1 = EntryKind::Delete; // mark emitted
+                    }
+                    *pending_puts -= 1;
+                    f(key, value)?;
+                }
+                Ok(())
+            }
+
+            for sst in &sst_handles {
+                if pending_puts == 0 {
+                    break;
+                }
+                let mut iter = sst.iter()?;
+                iter.seek(prefix);
+                while iter.is_valid() {
+                    if !iter.key().starts_with(prefix) {
+                        break;
+                    }
+                    if is_visible(iter.seq_no()) {
+                        try_emit(
+                            &mut winners,
+                            &mut pending_puts,
+                            &mut f,
+                            iter.key(),
+                            iter.seq_no(),
+                            iter.kind(),
+                            iter.value(),
+                        )?;
+                    }
+                    iter.next();
+                }
+            }
+
+            if pending_puts > 0 {
+                let ws = self.write_state.read();
+                if let Some(ref imm) = ws.immutable_memtable {
+                    for entry in imm.scan_prefix(prefix) {
+                        if pending_puts == 0 {
+                            break;
+                        }
+                        if is_visible(entry.seq_no) {
+                            try_emit(
+                                &mut winners,
+                                &mut pending_puts,
+                                &mut f,
+                                &entry.key,
+                                entry.seq_no,
+                                entry.kind,
+                                &entry.value,
+                            )?;
+                        }
+                    }
+                }
+                for entry in ws.memtable.scan_prefix(prefix) {
+                    if pending_puts == 0 {
+                        break;
+                    }
+                    if is_visible(entry.seq_no) {
+                        try_emit(
+                            &mut winners,
+                            &mut pending_puts,
+                            &mut f,
+                            &entry.key,
+                            entry.seq_no,
+                            entry.kind,
+                            &entry.value,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // Overlay Puts win outright and may not exist in storage at all.
+        if let Some(ov) = overlay {
+            for (key, val) in ov {
+                if key.starts_with(prefix) {
+                    if let Some(v) = val {
+                        f(key, v)?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Transaction-aware streaming visit: same as [`Self::for_each_live_prefix`]
+    /// but overlays the transaction's own write buffer (uncommitted puts/deletes
+    /// win over committed storage).
+    pub fn txn_for_each_live_prefix<F>(&self, txn_id: SeqNo, prefix: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        let (vis, buf) = {
+            let ws = self.write_state.read();
+            let vis = ws.txn_manager.visibility_for(txn_id);
+            let buf: Vec<(Vec<u8>, WriteOp)> = ws
+                .txn_manager
+                .get(txn_id)
+                .map(|t| {
+                    t.write_buffer_iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (vis, buf)
+        };
+        let overlay: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>> = buf
+            .into_iter()
+            .map(|(k, op)| match op {
+                WriteOp::Put(v) => (k, Some(v)),
+                WriteOp::Delete => (k, None),
+            })
+            .collect();
+        self.for_each_live_prefix(prefix, Some(&vis), Some(&overlay), &mut f)
     }
 
     /// Checks if a prefix could match any key in the range [min_key, max_key].
@@ -1022,10 +1609,29 @@ impl LsmEngine {
     /// 2. min_key starts with prefix (min_key itself has this prefix), OR
     ///    min_key < prefix (the smallest prefixed key is after min_key).
     fn prefix_may_overlap(prefix: &[u8], min_key: &[u8], max_key: &[u8]) -> bool {
-        if prefix > max_key {
+        // Condition 2: can some key starting with `prefix` reach min_key?
+        // True when min_key already carries the prefix (it is itself a match
+        // candidate), or min_key sorts before the prefix range entirely.
+        if !(min_key.starts_with(prefix) || min_key < prefix) {
             return false;
         }
-        min_key.starts_with(prefix) || min_key < prefix
+
+        // Condition 1: can some key starting with `prefix` reach max_key?
+        // The last possible key with this prefix is prefix + 0xFF..., which is
+        // effectively "infinity", so we only need: max_key >= prefix.
+        //
+        // Byte comparison with different lengths is tricky. Compare up to the
+        // shorter length; if equal up to that point, the longer key is "greater".
+        let cmp_len = prefix.len().min(max_key.len());
+        let cmp = &max_key[..cmp_len].cmp(&prefix[..cmp_len]);
+        match cmp {
+            std::cmp::Ordering::Less => false,     // max_key < prefix → no overlap
+            std::cmp::Ordering::Greater => true,   // max_key > prefix → overlap
+            std::cmp::Ordering::Equal => {
+                // Equal up to shorter length: overlap if max_key is at least as long as prefix
+                max_key.len() >= prefix.len()
+            }
+        }
     }
 
     /// Deletes a key (writes a tombstone).
@@ -1400,8 +2006,19 @@ impl LsmEngine {
         self.seq_counter.fetch_add(1, Ordering::AcqRel)
     }
 
+    /// Opens persisted `.idx` files into the index manager.
+    /// Called from the background index-rebuild thread at startup so that
+    /// secondary indexes survive restarts without a full LSM re-scan.
+    pub fn open_disk_indexes(&self) -> std::result::Result<(), String> {
+        self.index_manager
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .open_disk_indexes()
+    }
+
     /// Rebuilds secondary indexes by scanning persisted index entries from SSTables.
-    fn rebuild_indexes(&self) -> Result<()> {
+    /// Can be called from a background thread after engine startup.
+    pub fn rebuild_indexes(&self) -> Result<()> {
         let index_entries = self.scan_prefix(b"__idx__")?;
         if !index_entries.is_empty() {
             let mut mgr = self
@@ -1593,7 +2210,7 @@ impl LsmEngine {
     ///
     /// First tries to load persisted HNSW graph structures (fast path).
     /// Falls back to rebuilding from document data if graph structures not found.
-    fn rebuild_vector_indexes(&self) -> Result<()> {
+    pub fn rebuild_vector_indexes(&self) -> Result<()> {
         let meta_entries = self.scan_prefix(b"__vec_meta__")?;
         if meta_entries.is_empty() {
             return Ok(());
@@ -2231,76 +2848,86 @@ impl LsmEngine {
             .unwrap_or_else(|e| e.into_inner())
             .create_index(class, column);
 
-        // Backfill: scan all existing entries for this class and index them
+        // Backfill: one streaming pass collecting (encoded_value, pk) pairs,
+        // then a single bulk_load. The previous per-row path (parse + tree
+        // insert + WAL put per row) ran ~150 rows/s — 40 min for 600k rows.
         let prefix = format!("{}::", class);
-        let entries = self.scan_prefix(prefix.as_bytes())?;
-        let total_estimate = entries.len();
+        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut lsm_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut total_estimate = 0usize;
 
-        // Track progress
         {
             let label = format!("{}.{}", class, column);
             let mut prog = self.index_progress.lock().unwrap_or_else(|e| e.into_inner());
-            *prog = Some((label, total_estimate, 0));
+            *prog = Some((label, 0, 0));
         }
 
-        // Phase 1+2: Process in batches, releasing locks between batches
-        // to avoid blocking the query engine for the entire duration.
+        self.for_each_live_prefix(prefix.as_bytes(), None, None, |pk, val_bytes| {
+            total_estimate += 1;
+            if let Some(val) = extract_index_field(val_bytes, class, column) {
+                let encoded = crate::IndexManager::encode_value(&val);
+                lsm_entries.push((
+                    crate::IndexManager::make_index_key(class, column, &encoded, pk),
+                    Vec::new(),
+                ));
+                pairs.push((encoded, pk.to_vec()));
+            }
+            if total_estimate % 50_000 == 0 {
+                tracing::info!(
+                    rows = total_estimate,
+                    pairs = pairs.len(),
+                    scan_ms = start.elapsed().as_millis(),
+                    "Index backfill scan progress"
+                );
+            }
+            Ok(())
+        })?;
+        let scan_ms = start.elapsed().as_millis();
+        tracing::info!(
+            rows = total_estimate,
+            pairs = pairs.len(),
+            scan_ms,
+            "Index backfill scan done"
+        );
+
+        {
+            let mut prog = self.index_progress.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref mut p) = *prog {
+                p.1 = total_estimate;
+                p.2 = total_estimate;
+            }
+        }
+
+        // One-shot sort + bottom-up page construction for both trees.
+        {
+            let t = std::time::Instant::now();
+            let mut mgr = self
+                .index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            mgr.bulk_load_index(class, column, &pairs)?;
+            tracing::info!(
+                bulk_ms = t.elapsed().as_millis(),
+                pairs = pairs.len(),
+                "Index bulk_load done"
+            );
+        }
+
+        // Persist index entries to WAL so the index can be rebuilt after restart.
         const BATCH_SIZE: usize = 5000;
-        let mut processed = 0usize;
         let mut batch_start = 0usize;
-
-        while batch_start < entries.len() {
-            let batch_end = (batch_start + BATCH_SIZE).min(entries.len());
-
-            // Index batch under index_manager write lock (short hold)
-            let batch_entries: Vec<(Vec<u8>, Vec<u8>)> = {
-                let mut mgr = self
-                    .index_manager
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner());
-                let mut batch = Vec::new();
-                for (pk, val_bytes) in &entries[batch_start..batch_end] {
-                    if let Some(doc) = parse_doc_bytes(val_bytes) {
-                        if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
-                            batch.extend(mgr.index_document(class, pk, &doc));
-                        }
-                    }
-                }
-                batch
-            };
-
-            // Persist batch to WAL + MemTable under write_state lock (short hold)
-            if !batch_entries.is_empty() {
+        while batch_start < lsm_entries.len() {
+            let batch_end = (batch_start + BATCH_SIZE).min(lsm_entries.len());
+            {
                 let mut ws = self.write_state.write();
-                for (key, value) in batch_entries {
+                for (key, value) in &lsm_entries[batch_start..batch_end] {
                     let seq = self.next_seq();
-                    ws.wal.append_raw_put(&key, &value, seq)?;
-                    ws.memtable.put_with_seq(key, value, seq);
+                    ws.wal.append_raw_put(key, value, seq)?;
+                    ws.memtable.put_with_seq(key.clone(), value.clone(), seq);
                 }
                 ws.wal.flush_buf()?;
             }
-
-            processed += batch_end - batch_start;
-
-            // Update progress tracker
-            {
-                let mut prog = self.index_progress.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(ref mut p) = *prog {
-                    p.2 = processed;
-                }
-            }
-
-            if processed % 10000 == 0 || batch_end >= entries.len() {
-                tracing::info!(
-                    rows_processed = processed,
-                    total_estimate,
-                    "Index creation progress"
-                );
-            }
-
             batch_start = batch_end;
-
-            // Yield to let queries through between batches
             std::thread::yield_now();
         }
 
@@ -2311,12 +2938,12 @@ impl LsmEngine {
         }
 
         let elapsed_ms = start.elapsed().as_millis();
-        let entries_count = total_estimate;
         tracing::info!(
             table = class,
             column = column,
             elapsed_ms,
-            entries = entries_count,
+            entries = pairs.len(),
+            total_scanned = total_estimate,
             "Index creation completed"
         );
 
@@ -3005,6 +3632,275 @@ mod tests {
         assert!(!LsmEngine::prefix_may_overlap(b"Z", b"A", b"B"));
         // empty prefix matches everything �?true
         assert!(LsmEngine::prefix_may_overlap(b"", b"A", b"Z"));
+        // prefix entirely before the SST range
+        assert!(!LsmEngine::prefix_may_overlap(b"001", b"002", b"005"));
+    }
+
+    /// count_prefix must agree with scan_prefix().len() and ignore tombstones.
+    #[test]
+    fn test_count_prefix_matches_scan_and_handles_tombstones() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("should be valid");
+
+        for i in 0..20u32 {
+            let key = format!("Product::{i:03}");
+            engine
+                .put(key.into_bytes(), format!("v{i}").into_bytes())
+                .expect("should be valid");
+        }
+        // Tombstones: 3 deletes should reduce live count
+        for i in 0..3u32 {
+            let key = format!("Product::{i:03}");
+            engine.delete(key.into_bytes()).expect("should be valid");
+        }
+        // Unrelated prefix must not be counted
+        engine
+            .put(b"Order::001".to_vec(), b"x".to_vec())
+            .expect("should be valid");
+
+        let (live, tombs) = engine.count_prefix(b"Product::").expect("should be valid");
+        assert_eq!(live, 17, "20 puts minus 3 deletes");
+        assert_eq!(tombs, 3);
+
+        let scanned = engine.scan_prefix(b"Product::").expect("should be valid");
+        assert_eq!(scanned.len(), live, "count_prefix must match scan_prefix");
+
+        let (olive, _) = engine.count_prefix(b"Order::").expect("should be valid");
+        assert_eq!(olive, 1);
+    }
+
+    /// scan_prefix_limit must return the latest version of each key and
+    /// stop after `limit` live entries (newest-first early exit).
+    #[test]
+    fn test_scan_prefix_limit_latest_wins_and_early_exit() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 256, // force multiple SSTs
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("should be valid");
+
+        // 50 keys; overwrite key 000 with a newer value after some flushes
+        for i in 0..50u32 {
+            let key = format!("T::{i:03}");
+            engine
+                .put(key.into_bytes(), format!("old{i}").into_bytes())
+                .expect("should be valid");
+        }
+        engine.flush().expect("should be valid");
+        engine
+            .put(b"T::000".to_vec(), b"NEWEST".to_vec())
+            .expect("should be valid");
+        engine
+            .delete(b"T::001".to_vec())
+            .expect("should be valid");
+
+        // Unlimited scan_prefix sees 49 live (50 - 1 delete)
+        let all = engine.scan_prefix(b"T::").expect("should be valid");
+        assert_eq!(all.len(), 49);
+
+        // Limited: 5 entries, must include latest T::000 value if present
+        let lim = engine.scan_prefix_limit(b"T::", 5).expect("should be valid");
+        assert!(lim.len() <= 5, "must respect limit, got {}", lim.len());
+        assert!(!lim.is_empty());
+        // If 000 is in the batch (newest-first should surface it early), value must be NEWEST
+        if let Some((_, v)) = lim.iter().find(|(k, _)| k.as_slice() == b"T::000") {
+            assert_eq!(v.as_slice(), b"NEWEST", "must return latest version");
+        }
+        // T::001 is deleted — must not appear
+        assert!(!lim.iter().any(|(k, _)| k.as_slice() == b"T::001"));
+
+        // limit=1 returns exactly 1 live entry
+        let one = engine.scan_prefix_limit(b"T::", 1).expect("should be valid");
+        assert_eq!(one.len(), 1);
+    }
+
+    /// count_prefix_with applies a per-value predicate without materializing
+    /// values into the dedup map, and only evaluates the winning version.
+    #[test]
+    fn test_count_prefix_with_filter_and_tombstones() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("should be valid");
+
+        // 20 puts: even indices have value "keep*", odd have "drop*"
+        for i in 0..20u32 {
+            let key = format!("Product::{i:03}");
+            let val = if i % 2 == 0 { format!("keep{i}") } else { format!("drop{i}") };
+            engine
+                .put(key.into_bytes(), val.into_bytes())
+                .expect("should be valid");
+        }
+        // Delete 3 keys: 000 (keep), 001 (drop), 002 (keep)
+        for i in 0..3u32 {
+            let key = format!("Product::{i:03}");
+            engine.delete(key.into_bytes()).expect("should be valid");
+        }
+        // Overwrite one odd key to "keep" via a newer Put — filter must see the winner
+        engine
+            .put(b"Product::005".to_vec(), b"keep-overwritten".to_vec())
+            .expect("should be valid");
+
+        // Unfiltered: count_prefix_with(|_| true) == count_prefix
+        let (all, tombs) = engine
+            .count_prefix_with(b"Product::", None, |_| Ok(true))
+            .expect("should be valid");
+        let (live, tombs2) = engine.count_prefix(b"Product::").expect("should be valid");
+        assert_eq!(all, live);
+        assert_eq!(tombs, tombs2);
+        assert_eq!(live, 17, "20 puts minus 3 deletes");
+        assert_eq!(tombs, 3);
+
+        // Filtered: only values starting with "keep"
+        let (matched, _) = engine
+            .count_prefix_with(b"Product::", None, |v| {
+                Ok(v.starts_with(b"keep"))
+            })
+            .expect("should be valid");
+        // Deletes remove 000,001,002 (loop 0..3). Surviving "keep" evens:
+        // 004,006,008,010,012,014,016,018 = 8, plus 005 overwritten to keep = 9.
+        assert_eq!(matched, 9, "8 surviving evens + overwritten 005");
+
+        // Pred on the losing (older) version must not be used: 005's old value was "drop5"
+        let (drops, _) = engine
+            .count_prefix_with(b"Product::", None, |v| Ok(v.starts_with(b"drop")))
+            .expect("should be valid");
+        // Odd "drop" survivors: 003,007,009,011,013,015,017,019 (001 deleted, 005 overwritten)
+        assert_eq!(drops, 8);
+    }
+
+    /// count_prefix_with after flush agrees with pre-flush results.
+    #[test]
+    fn test_count_prefix_with_across_flush() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 256,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("should be valid");
+
+        for i in 0..50u32 {
+            let key = format!("Item::{i:04}");
+            let val = if i % 3 == 0 { b"a".to_vec() } else { b"b".to_vec() };
+            engine.put(key.into_bytes(), val).expect("should be valid");
+        }
+
+        let before = engine
+            .count_prefix_with(b"Item::", None, |v| Ok(v == b"a"))
+            .expect("should be valid");
+        engine.flush().expect("should be valid");
+        let after = engine
+            .count_prefix_with(b"Item::", None, |v| Ok(v == b"a"))
+            .expect("should be valid");
+        assert_eq!(before.0, after.0, "matched count must survive flush");
+        assert_eq!(after.0, 17, "i%3==0 for 0..50 → 17 items");
+    }
+
+    /// for_each_live_prefix visits each live key once with the winning value,
+    /// without requiring the caller to hold the full result set.
+    #[test]
+    fn test_for_each_live_prefix_winners_and_overlay() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 256,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("should be valid");
+
+        for i in 0..30u32 {
+            let key = format!("T::{i:03}");
+            engine
+                .put(key.into_bytes(), format!("v{i}").into_bytes())
+                .expect("should be valid");
+        }
+        // Overwrite one key (newer wins)
+        engine
+            .put(b"T::005".to_vec(), b"v5-new".to_vec())
+            .expect("should be valid");
+        // Delete two keys
+        engine.delete(b"T::001".to_vec()).expect("should be valid");
+        engine.delete(b"T::002".to_vec()).expect("should be valid");
+        engine.flush().expect("should be valid");
+
+        let mut seen: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+        engine
+            .for_each_live_prefix(b"T::", None, None, |k, v| {
+                assert!(
+                    seen.insert(k.to_vec(), v.to_vec()).is_none(),
+                    "key {} visited twice",
+                    String::from_utf8_lossy(k)
+                );
+                Ok(())
+            })
+            .expect("should be valid");
+        assert_eq!(seen.len(), 28, "30 puts - 2 deletes");
+        assert_eq!(seen.get(b"T::005".as_slice()).map(|v| v.as_slice()), Some(&b"v5-new"[..]));
+        assert!(!seen.contains_key(b"T::001".as_slice()));
+        assert!(!seen.contains_key(b"T::002".as_slice()));
+
+        // Overlay: put one shadowed key + one new key + one delete
+        let mut ov = std::collections::HashMap::new();
+        ov.insert(b"T::005".to_vec(), Some(b"overlay-005".to_vec())); // shadow storage
+        ov.insert(b"T::030".to_vec(), Some(b"overlay-030".to_vec())); // brand new
+        ov.insert(b"T::003".to_vec(), None); // delete
+
+        let mut seen2: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+        engine
+            .for_each_live_prefix(b"T::", None, Some(&ov), |k, v| {
+                seen2.insert(k.to_vec(), v.to_vec());
+                Ok(())
+            })
+            .expect("should be valid");
+        assert_eq!(seen2.len(), 28, "28 storage live - 003 + 030 = 28");
+        assert_eq!(
+            seen2.get(b"T::005".as_slice()).map(|v| v.as_slice()),
+            Some(&b"overlay-005"[..])
+        );
+        assert_eq!(
+            seen2.get(b"T::030".as_slice()).map(|v| v.as_slice()),
+            Some(&b"overlay-030"[..])
+        );
+        assert!(!seen2.contains_key(b"T::003".as_slice()));
+    }
+
+    /// count_prefix after SST flush must see the same live rows as before flush.
+    #[test]
+    fn test_count_prefix_across_flush() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 256, // force frequent flush
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("should be valid");
+
+        for i in 0..100u32 {
+            let key = format!("Item::{i:04}");
+            engine
+                .put(key.into_bytes(), vec![b'v'; 40])
+                .expect("should be valid");
+        }
+        for i in 0..10u32 {
+            let key = format!("Item::{i:04}");
+            engine.delete(key.into_bytes()).expect("should be valid");
+        }
+        engine.flush().expect("should be valid");
+
+        let (live, tombs) = engine.count_prefix(b"Item::").expect("should be valid");
+        assert_eq!(live, 90);
+        assert_eq!(tombs, 10);
     }
 
     #[test]
@@ -3626,7 +4522,9 @@ mod tests {
             engine.flush().expect("should be valid");
         }
 
-        // Phase 2: Reopen engine �?indexes should be rebuilt automatically
+        // Phase 2: Reopen engine — index entries live in SSTs; rebuild the
+        // in-memory IndexManager from them. `open()` defers this to the caller
+        // (the server does it on a background thread) so startup stays fast.
         {
             let options = StorageOptions {
                 data_dir,
@@ -3634,6 +4532,7 @@ mod tests {
                 ..Default::default()
             };
             let engine = LsmEngine::open(options).expect("should be valid");
+            engine.rebuild_indexes().expect("should be valid");
 
             // Index should exist after restart
             assert!(

@@ -73,11 +73,11 @@ impl Default for StorageOptions {
             memtable_size_limit: 64 * 1024 * 1024, // 64MB
             block_size: 4096,                     // 4KB
             num_levels: 7,
-            size_ratio: 10,
+            size_ratio: 3,
             use_bloom_filter: true,
             bloom_filter_fp_rate: 0.01,
             sync_wal_on_commit: true, // Strong durability by default
-            compression_level: 3,     // zstd level 3 by default (good balance)
+            compression_level: 2,     // zstd level 2 (optimized for compaction speed)
             index_storage_mode: None,
             wal_archive_dir: None,                        // Disabled by default
             wal_archive_max_files: 100,                   // Keep last 100 archives

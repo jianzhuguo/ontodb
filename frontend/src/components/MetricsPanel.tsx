@@ -77,26 +77,26 @@ export function MetricsPanel() {
       {/* Query Stats */}
       <h3 className="text-xs font-semibold uppercase tracking-wider text-onto-dim pt-2">查询统计</h3>
       <div className="grid grid-cols-2 gap-2">
-        <MetricCard label="Total Queries" value={metrics.queries.total} color="#3b82f6" />
-        <MetricCard label="Errors" value={metrics.queries.errors} color={metrics.queries.errors > 0 ? '#ef4444' : '#22c55e'} />
-        <MetricCard label="SELECT" value={metrics.queries.by_type.select} />
-        <MetricCard label="INSERT" value={metrics.queries.by_type.insert} />
-        <MetricCard label="UPDATE" value={metrics.queries.by_type.update} />
-        <MetricCard label="DELETE" value={metrics.queries.by_type.delete} />
-        <MetricCard label="Vector Search" value={metrics.queries.by_type.vector_search} color="#a855f7" />
-        <MetricCard label="Slow Queries" value={metrics.slow_queries.total} color={metrics.slow_queries.total > 0 ? '#eab308' : '#22c55e'} />
+        <MetricCard label="Total Queries" value={metrics.queries?.total ?? 0} color="#3b82f6" />
+        <MetricCard label="Errors" value={metrics.queries?.errors ?? 0} color={(metrics.queries?.errors ?? 0) > 0 ? '#ef4444' : '#22c55e'} />
+        <MetricCard label="SELECT" value={metrics.queries?.by_type?.select ?? 0} />
+        <MetricCard label="INSERT" value={metrics.queries?.by_type?.insert ?? 0} />
+        <MetricCard label="UPDATE" value={metrics.queries?.by_type?.update ?? 0} />
+        <MetricCard label="DELETE" value={metrics.queries?.by_type?.delete ?? 0} />
+        <MetricCard label="Vector Search" value={metrics.queries?.by_type?.vector_search ?? 0} color="#a855f7" />
+        <MetricCard label="Slow Queries" value={metrics.slow_queries?.total ?? 0} color={(metrics.slow_queries?.total ?? 0) > 0 ? '#eab308' : '#22c55e'} />
       </div>
 
       {/* Storage */}
       <h3 className="text-xs font-semibold uppercase tracking-wider text-onto-dim pt-2">存储引擎</h3>
       <div className="grid grid-cols-2 gap-2">
-        <MetricCard label="SSTables" value={metrics.storage.sstable_count} />
-        <MetricCard label="Entries" value={metrics.storage.entries.toLocaleString()} />
-        <MetricCard label="Compactions" value={metrics.storage.compactions} />
+        <MetricCard label="SSTables" value={metrics.storage?.sstable_count ?? 0} />
+        <MetricCard label="Entries" value={(metrics.storage?.entries ?? 0).toLocaleString()} />
+        <MetricCard label="Compactions" value={metrics.storage?.compactions ?? 0} />
         <MetricCard
           label="MemTable"
-          value={`${metrics.storage.memtable_entries} entries`}
-          sub={`${(metrics.storage.memtable_size_bytes / 1024 / 1024).toFixed(2)} MB`}
+          value={`${metrics.storage?.memtable_entries ?? 0} entries`}
+          sub={`${((metrics.storage?.memtable_size_bytes ?? 0) / 1024 / 1024).toFixed(2)} MB`}
         />
       </div>
 
@@ -105,20 +105,20 @@ export function MetricsPanel() {
       <div className="grid grid-cols-2 gap-2">
         <MetricCard
           label="HTTP"
-          value={`${metrics.connections.http.active} active`}
-          sub={`${metrics.connections.http.total} total`}
+          value={`${metrics.connections?.http?.active ?? 0} active`}
+          sub={`${metrics.connections?.http?.total ?? 0} total`}
         />
         <MetricCard
           label="TCP"
-          value={`${metrics.connections.tcp.active} active`}
-          sub={`${metrics.connections.tcp.total} total`}
+          value={`${metrics.connections?.tcp?.active ?? 0} active`}
+          sub={`${metrics.connections?.tcp?.total ?? 0} total`}
         />
         <MetricCard
           label="PG Wire"
-          value={`${metrics.connections.pgwire.active} active`}
-          sub={`${metrics.connections.pgwire.total} total`}
+          value={`${metrics.connections?.pgwire?.active ?? 0} active`}
+          sub={`${metrics.connections?.pgwire?.total ?? 0} total`}
         />
-        <MetricCard label="Auth Failures" value={metrics.auth.failures} color={metrics.auth.failures > 0 ? '#ef4444' : '#22c55e'} />
+        <MetricCard label="Auth Failures" value={metrics.auth?.failures ?? 0} color={(metrics.auth?.failures ?? 0) > 0 ? '#ef4444' : '#22c55e'} />
       </div>
     </div>
   )
