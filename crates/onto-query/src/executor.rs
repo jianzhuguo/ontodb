@@ -386,6 +386,45 @@ fn now_nanos() -> u64 {
     start.elapsed().as_nanos() as u64
 }
 
+/// Heap entry for ORDER BY + LIMIT top-N: keeps the N best rows in sort order
+/// without materializing the full result. `Ord` treats a row as *greater* when
+/// it sorts later under `order`, so `BinaryHeap::pop` yields the worst kept row
+/// (the one to evict when over capacity).
+struct TopNRow {
+    keys: Vec<Value>,
+    order: Vec<(String, bool)>,
+    seq: usize,
+    row: Map<String, Value>,
+}
+
+impl PartialEq for TopNRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.seq == other.seq
+    }
+}
+impl Eq for TopNRow {}
+impl PartialOrd for TopNRow {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TopNRow {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        for (i, (a, b)) in self.keys.iter().zip(&other.keys).enumerate() {
+            let mut ord = QueryExecutor::compare_values_direct(Some(a), Some(b));
+            if let Some((_, asc)) = self.order.get(i) {
+                if !*asc {
+                    ord = ord.reverse();
+                }
+            }
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        self.seq.cmp(&other.seq)
+    }
+}
+
 /// Executes parsed queries with caching support.
 pub struct QueryExecutor {
     engine: Arc<LsmEngine>,
@@ -6734,27 +6773,20 @@ impl QueryExecutor {
     pub const STREAM_BATCH_ROWS: usize = 2048;
 
     /// True when a SELECT can be streamed without full materialization.
-    /// Rejects ORDER BY / GROUP BY / DISTINCT / aggregates / windows / joins.
+    /// Rejects JOINs / windows / HAVING. ORDER BY / GROUP BY / DISTINCT /
+    /// aggregates have dedicated streaming paths inside
+    /// [`Self::execute_read_streaming`].
     pub fn is_streamable_select(ast: &QueryAst) -> bool {
         let QueryAst::Select {
-            distinct,
             columns,
             joins,
-            group_by,
             having,
-            order_by,
             ..
         } = ast
         else {
             return false;
         };
-        if *distinct
-            || !joins.is_empty()
-            || group_by.is_some()
-            || having.is_some()
-            || !order_by.is_empty()
-            || Self::columns_have_aggregates(columns)
-        {
+        if !joins.is_empty() || having.is_some() {
             return false;
         }
         if let SelectColumns::Columns(items) = columns {
@@ -6773,43 +6805,76 @@ impl QueryExecutor {
     /// `sink` returns `false` to stop early (client gone / LIMIT reached).
     /// Returns the number of rows emitted.
     ///
-    /// Only simple single-table SELECTs are streamed; other shapes fall back
-    /// to full materialization and one or more `sink` calls.
+    /// Streaming strategies:
+    /// - plain scan: batch as rows are read
+    /// - DISTINCT: hash-dedupe on the fly
+    /// - ORDER BY matching an index: index-ordered scan (true sorted stream)
+    /// - ORDER BY + LIMIT otherwise: top-N heap (bounded memory)
+    /// - GROUP BY / aggregates: single-pass streaming aggregation
     pub fn execute_read_streaming(
         &self,
         ast: &QueryAst,
         mut sink: impl FnMut(Vec<Map<String, Value>>) -> bool,
     ) -> Result<usize> {
         self.arm_timeout();
-        if !Self::is_streamable_select(ast) {
-            // Fallback: materialize, then emit in batches so the HTTP layer
-            // can still flush incrementally.
+
+        let QueryAst::Select {
+            distinct,
+            columns,
+            from,
+            from_alias,
+            filter,
+            group_by,
+            having: _,
+            order_by,
+            limit,
+            offset,
+            ..
+        } = ast
+        else {
+            // Non-SELECT: materialize then emit.
             let result = self.execute_read(ast)?;
             let rows = match result {
                 QueryResult::Rows(rows) => rows,
                 QueryResult::Success(_) => return Ok(0),
             };
             return Self::emit_rows_in_batches(rows, &mut sink);
-        }
-
-        let QueryAst::Select {
-            columns,
-            from,
-            from_alias,
-            filter: _,
-            limit,
-            offset,
-            ..
-        } = ast
-        else {
-            unreachable!("is_streamable_select");
         };
 
         if !from.starts_with("system.") {
             self.ensure_statistics(from, &self.engine);
         }
 
-        let cached_plan = {
+        // ---- Aggregates / GROUP BY: single-pass streaming aggregation ----
+        if group_by.is_some() || Self::columns_have_aggregates(columns) {
+            let result = self.execute_streaming_aggregation(
+                &self.engine,
+                from,
+                filter,
+                columns,
+                group_by.as_ref(),
+                &None,
+                order_by,
+                *limit,
+            )?;
+            let rows = match result {
+                QueryResult::Rows(rows) => rows,
+                _ => return Ok(0),
+            };
+            return Self::emit_rows_in_batches(rows, &mut sink);
+        }
+
+        let proj_cols = Self::projected_column_names(columns);
+        let proj_ref: Option<&[String]> = if proj_cols.is_empty() {
+            None
+        } else {
+            Some(&proj_cols)
+        };
+        let alias = from_alias.as_deref();
+        let skip = offset.unwrap_or(0);
+        let take = *limit;
+
+        let plan = {
             let ast_hash = Self::hash_ast(ast);
             let cached = self
                 .plan_cache
@@ -6841,30 +6906,174 @@ impl QueryExecutor {
                 plan.ok()
             }
         };
-        let Some(plan) = cached_plan else {
+        let Some(plan) = plan else {
             return Err(CoreError::Custom(
                 "failed to generate execution plan".to_string(),
             ));
         };
 
-        let proj_cols = Self::projected_column_names(columns);
-        let proj_ref: Option<&[String]> = if proj_cols.is_empty() {
-            None
-        } else {
-            Some(&proj_cols)
-        };
-        let alias = from_alias.as_deref();
-        let skip = offset.unwrap_or(0);
-        let take = *limit;
+        // Unwrap Projection / Sort / Limit to reach the scan node. Sorting and
+        // limiting are handled by the streaming paths (index order / top-N).
+        let mut node = &plan.root;
+        loop {
+            match node {
+                PlanNode::Projection { input, columns: pcols, .. } => {
+                    if Self::columns_have_aggregates(pcols) {
+                        break;
+                    }
+                    node = input.as_ref();
+                }
+                PlanNode::Sort { input, .. } => {
+                    node = input.as_ref();
+                }
+                PlanNode::Limit { input, .. } => {
+                    node = input.as_ref();
+                }
+                _ => break,
+            }
+        }
 
+        let (scan_table, scan_filter, index_column) = match node {
+            PlanNode::IndexScan {
+                table,
+                index_column,
+                filter,
+                ..
+            } => (table.clone(), filter.clone(), Some(index_column.clone())),
+            PlanNode::SeqScan {
+                table, filter, ..
+            } => (table.clone(), filter.clone(), None),
+            _ => {
+                // Fallback shape — materialize and emit.
+                let rows = self.execute_plan_node_read(node, &self.engine)?;
+                return Self::emit_rows_in_batches(rows, &mut sink);
+            }
+        };
+
+        // ---- ORDER BY on an indexed column: stream in index order ----
+        // Single-column ORDER BY whose column has a secondary index on *every*
+        // class in the hierarchy can walk the index in key order and emit rows
+        // as they are fetched — no sort, early exit with LIMIT.
+        if order_by.len() == 1 {
+            let ob = &order_by[0];
+            let ob_col = ob
+                .column
+                .split('.')
+                .next_back()
+                .unwrap_or(&ob.column)
+                .trim_matches('"')
+                .to_string();
+            let hierarchy = self.get_class_hierarchy_read(&self.engine, &scan_table);
+            let all_indexed = !hierarchy.is_empty()
+                && hierarchy.iter().all(|c| self.engine.has_index(c, &ob_col));
+            if all_indexed {
+                return self.stream_ordered_index_read(
+                    &self.engine,
+                    &scan_table,
+                    &ob_col,
+                    ob.ascending,
+                    &scan_filter,
+                    proj_ref,
+                    alias,
+                    skip,
+                    take,
+                    &mut sink,
+                );
+            }
+        }
+
+        // ---- Unordered streaming path (with optional DISTINCT / top-N) ----
         let mut emitted = 0usize;
         let mut skipped = 0usize;
         let mut stop = false;
+        let mut seen: std::collections::HashSet<String> = if *distinct {
+            std::collections::HashSet::new()
+        } else {
+            Default::default()
+        };
+        // Top-N for ORDER BY + LIMIT without a usable index: bounded memory,
+        // emits the final sorted page at the end (TTFT is scan-bound either way).
+        // Top-N for ORDER BY + LIMIT when the sort key is *not* the scan's
+        // natural order. If ORDER BY matches the index column, scan order is
+        // already sorted and we can push LIMIT into the lookup.
+        let ob_col_opt = order_by.first().map(|ob| {
+            ob.column
+                .split('.')
+                .next_back()
+                .unwrap_or(&ob.column)
+                .trim_matches('"')
+                .to_string()
+        });
+        let order_matches_scan = order_by.len() == 1
+            && ob_col_opt.as_deref().is_some_and(|c| {
+                index_column.as_deref() == Some(c)
+            });
+        let mut top_n: Option<std::collections::BinaryHeap<TopNRow>> =
+            if !order_by.is_empty() && take.is_some() && !order_matches_scan {
+                Some(std::collections::BinaryHeap::new())
+            } else {
+                None
+            };
+        let use_top_n = top_n.is_some();
+        let ob_spec: Vec<(String, bool)> = order_by
+            .iter()
+            .map(|ob| {
+                let col = ob
+                    .column
+                    .split('.')
+                    .next_back()
+                    .unwrap_or(&ob.column)
+                    .trim_matches('"')
+                    .to_string();
+                (col, ob.ascending)
+            })
+            .collect();
+        let mut seq = 0usize;
+
         {
             let mut sink_batch = |mut rows: Vec<Map<String, Value>>| -> bool {
                 if stop {
                     return false;
                 }
+                if *distinct {
+                    rows.retain(|row| {
+                        // Dedup only on user-visible columns — __pk__/__class__
+                        // are unique per row and would defeat DISTINCT.
+                        let key: String = row
+                            .iter()
+                            .filter(|(k, _)| !k.starts_with("__"))
+                            .map(|(k, v)| format!("{}={}", k, v))
+                            .collect::<Vec<_>>()
+                            .join("\x00");
+                        seen.insert(key)
+                    });
+                }
+                if rows.is_empty() {
+                    return true;
+                }
+
+                // Top-N capture: keep only the LIMIT-best rows, emit at end.
+                if let Some(heap) = top_n.as_mut() {
+                    let lim = take.unwrap_or(usize::MAX);
+                    for row in rows {
+                        seq += 1;
+                        let keys = ob_spec
+                            .iter()
+                            .map(|(col, _)| row.get(col).cloned().unwrap_or(Value::Null))
+                            .collect();
+                        heap.push(TopNRow {
+                            keys,
+                            order: ob_spec.clone(),
+                            seq,
+                            row,
+                        });
+                        if heap.len() > lim {
+                            heap.pop();
+                        }
+                    }
+                    return true;
+                }
+
                 if skipped < skip {
                     let drop_n = (skip - skipped).min(rows.len());
                     rows.drain(..drop_n);
@@ -6897,60 +7106,161 @@ impl QueryExecutor {
                 more
             };
 
-            // Unwrap plan shape: Projection -> scan, or scan directly.
-            let mut node = &plan.root;
-            if let PlanNode::Projection { input, columns: pcols, .. } = node {
-                // Prefer pushdown of projected columns to the scan.
-                if !Self::columns_have_aggregates(pcols) {
-                    node = input.as_ref();
-                }
-            }
-            if let PlanNode::Limit { input, .. } = node {
-                // Streaming respects LIMIT via take; still unwrap to the scan.
-                node = input.as_ref();
-            }
-
-            match node {
-                PlanNode::IndexScan {
-                    table,
-                    index_column,
-                    filter: scan_filter,
-                    ..
-                } => {
-                    // Push LIMIT into the index lookup so we never materialize
-                    // 492k pkeys for `WHERE idx = x LIMIT 1000`.
-                    let lookup_limit = take.map(|l| l.saturating_add(skip).max(1));
+            // LIMIT pushdown is only safe when the output order matches the
+            // scan order. With ORDER BY + top-N we must see every matching row
+            // to know the true top-N, so leave lookup_limit = None.
+            let lookup_limit = if use_top_n {
+                None
+            } else {
+                take.map(|l| l.saturating_add(skip).max(1))
+            };
+            match index_column {
+                Some(idx_col) => {
                     self.stream_index_scan_read(
                         &self.engine,
-                        table,
-                        index_column,
-                        scan_filter,
+                        &scan_table,
+                        &idx_col,
+                        &scan_filter,
                         proj_ref,
                         lookup_limit,
                         &mut sink_batch,
                     )?;
                 }
-                PlanNode::SeqScan {
-                    table,
-                    filter: scan_filter,
-                    ..
-                } => {
+                None => {
                     self.stream_seq_scan_read(
                         &self.engine,
-                        table,
-                        scan_filter,
+                        &scan_table,
+                        &scan_filter,
                         proj_ref,
                         &mut sink_batch,
                     )?;
                 }
-                _ => {
-                    // Unexpected shape — materialize and emit.
-                    let rows = self.execute_plan_node_read(node, &self.engine)?;
-                    Self::emit_rows_in_batches(rows, &mut sink_batch)?;
+            }
+
+            // Drain top-N heap in sorted order.
+            if let Some(mut heap) = top_n.take() {
+                let mut sorted: Vec<Map<String, Value>> = Vec::with_capacity(heap.len());
+                while let Some(item) = heap.pop() {
+                    sorted.push(item.row);
+                }
+                // BinaryHeap pops the "greatest" first. TopNRow::cmp treats a
+                // row as greater when it sorts *later* in ORDER BY, so pop
+                // order is reverse-sorted; reverse to get ASC result order.
+                sorted.reverse();
+                if skipped < skip {
+                    let drop_n = (skip - skipped).min(sorted.len());
+                    sorted.drain(..drop_n);
+                }
+                if let Some(lim) = take {
+                    sorted.truncate(lim);
+                }
+                emitted += sorted.len();
+                if let Some(a) = alias {
+                    Self::apply_alias(&mut sorted, a);
+                }
+                if !sorted.is_empty() {
+                    sink(sorted);
                 }
             }
         }
 
+        Ok(emitted)
+    }
+
+    /// Index-ordered streaming scan: walk the secondary index in key order and
+    /// emit rows as they are fetched. Gives true sorted output (and early exit
+    /// with LIMIT) without a separate sort pass.
+    ///
+    /// Handles a single scan class that has the index; multi-class hierarchies
+    /// fall back to the caller's unordered path (each class is sorted on its
+    /// own, so a global merge would need the index values).
+    fn stream_ordered_index_read(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        order_col: &str,
+        ascending: bool,
+        filter: &Option<FilterExpr>,
+        projected_columns: Option<&[String]>,
+        alias: Option<&str>,
+        skip: usize,
+        take: Option<usize>,
+        sink: &mut dyn FnMut(Vec<Map<String, Value>>) -> bool,
+    ) -> Result<usize> {
+        let class_hierarchy = self.get_class_hierarchy_read(engine, table);
+        // Every class must have the index — the caller already checked this,
+        // but re-validate so the function is safe standalone.
+        let indexed: Vec<String> = class_hierarchy
+            .iter()
+            .filter(|c| engine.has_index(c, order_col))
+            .cloned()
+            .collect();
+        if indexed.is_empty() || indexed.len() != class_hierarchy.len() {
+            // Should not happen when called from execute_read_streaming.
+            return Ok(0);
+        }
+
+        // Collect pkeys in index order (one class hierarchy, all indexed).
+        // range_scan with no bounds walks the tree in key order.
+        let mut all_pkeys: Vec<Vec<u8>> = Vec::new();
+        for scan_class in &indexed {
+            let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+            if let Some(tree) = mgr.get_index(scan_class, order_col) {
+                all_pkeys.extend(tree.range_scan(None, None));
+            }
+        }
+        if !ascending {
+            all_pkeys.reverse();
+        }
+
+        // Bound the fetch only when there is no residual filter — a filter can
+        // reject early pkeys, so pre-truncating would drop matching rows.
+        if filter.is_none() {
+            let want = take.map(|t| t.saturating_add(skip)).unwrap_or(all_pkeys.len());
+            if all_pkeys.len() > want {
+                all_pkeys.truncate(want);
+            }
+        }
+
+        let mut emitted = 0usize;
+        let mut skipped = 0usize;
+        Self::fetch_rows_by_pks_stream(
+            engine,
+            &all_pkeys,
+            projected_columns,
+            Self::STREAM_BATCH_ROWS,
+            &mut |mut rows| {
+                // Optional residual filter (e.g. range pred not covered by index).
+                if let Some(f) = filter {
+                    rows.retain(|row| self.eval_filter_read(engine, row, f));
+                }
+                if skipped < skip {
+                    let drop_n = (skip - skipped).min(rows.len());
+                    rows.drain(..drop_n);
+                    skipped += drop_n;
+                    if rows.is_empty() {
+                        return true;
+                    }
+                }
+                if let Some(lim) = take {
+                    let room = lim.saturating_sub(emitted);
+                    if room == 0 {
+                        return false;
+                    }
+                    if rows.len() > room {
+                        rows.truncate(room);
+                    }
+                }
+                emitted += rows.len();
+                if let Some(a) = alias {
+                    Self::apply_alias(&mut rows, a);
+                }
+                if rows.is_empty() {
+                    return true;
+                }
+                sink(rows)
+            },
+        )?;
         Ok(emitted)
     }
 
