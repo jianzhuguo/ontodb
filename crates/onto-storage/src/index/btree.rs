@@ -788,6 +788,44 @@ impl BPlusTree {
         Vec::new()
     }
 
+    /// Number of pks matching `value`, without cloning the pk list.
+    pub fn count(&self, value: &[u8]) -> u64 {
+        let leaf_id = self.find_leaf(value);
+        if let Node::Leaf(n) = self.node(leaf_id).expect("node should exist") {
+            if let Ok(i) = n.keys.binary_search_by(|k| k.as_slice().cmp(value)) {
+                return n.values[i].len() as u64;
+            }
+        }
+        0
+    }
+
+    /// Number of pks in an inclusive [low, high] value range (None = unbounded),
+    /// without cloning any pk.
+    pub fn count_range(&self, low: Option<&[u8]>, high: Option<&[u8]>) -> u64 {
+        let mut total = 0u64;
+        let mut cursor = match low {
+            Some(k) => self.cursor_lower_bound(k),
+            None => self.cursor_first(),
+        };
+        while cursor.is_valid(self) {
+            let leaf = match self.node(cursor.leaf_id).expect("node should exist") {
+                Node::Leaf(n) => n,
+                _ => break,
+            };
+            if cursor.idx >= leaf.keys.len() {
+                cursor.advance(self);
+                continue;
+            }
+            let k = leaf.keys[cursor.idx].as_slice();
+            if high.is_some_and(|h| k > h) {
+                break;
+            }
+            total += leaf.values[cursor.idx].len() as u64;
+            cursor.idx += 1;
+        }
+        total
+    }
+
     /// Finds the leaf node that should contain the given key.
     fn find_leaf(&self, key: &[u8]) -> u64 {
         let mut current = self.root;

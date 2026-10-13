@@ -724,10 +724,7 @@ impl IndexManager {
         }
 
         if mem_has && self.mem_complete.contains(&key) {
-            return self
-                .indexes
-                .get(&key)
-                .map(|tree| tree.lookup(&encoded).len() as u64);
+            return self.indexes.get(&key).map(|tree| tree.count(&encoded));
         }
 
         // Disk count is exact (one entry per pk). If the memory tree also has
@@ -736,7 +733,7 @@ impl IndexManager {
         let mem_cnt = self
             .indexes
             .get(&key)
-            .map(|tree| tree.lookup(&encoded).len())
+            .map(|tree| tree.count(&encoded))
             .unwrap_or(0);
         if mem_cnt > 0 {
             return self.lookup_eq_read(class, column, value).map(|p| p.len() as u64);
@@ -767,18 +764,14 @@ impl IndexManager {
 
         if mem_has && self.mem_complete.contains(&key) {
             return self.indexes.get(&key).map(|tree| {
-                tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref())
-                    .len() as u64
+                tree.count_range(low_bytes.as_deref(), high_bytes.as_deref())
             });
         }
 
         let mem_cnt = self
             .indexes
             .get(&key)
-            .map(|tree| {
-                tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref())
-                    .len()
-            })
+            .map(|tree| tree.count_range(low_bytes.as_deref(), high_bytes.as_deref()))
             .unwrap_or(0);
         if mem_cnt > 0 {
             return self
