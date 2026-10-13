@@ -639,6 +639,97 @@ impl LsmEngine {
         Ok(None)
     }
 
+    /// Batch point-lookup: fetches values for multiple keys efficiently.
+    ///
+    /// Keys are sorted internally so that MemTable range queries and SST
+    /// block reads are sequential rather than random. Returns a Vec of
+    /// `Option<Value>` in the same order as the input `keys`.
+    ///
+    /// Compared to calling [`Self::get`] in a loop, this avoids per-key:
+    /// - lock acquisition (levels, write_state, sst_cache)
+    /// - SST candidate filtering
+    /// - repeated block-cache lock/unlock
+    pub fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Value>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.drain_compaction_notifications();
+
+        // Sort indices by key for sequential access patterns.
+        let mut sorted_idx: Vec<usize> = (0..keys.len()).collect();
+        sorted_idx.sort_unstable_by(|&a, &b| keys[a].cmp(&keys[b]));
+
+        let mut out: Vec<Option<Value>> = vec![None; keys.len()];
+
+        // Phase 1: MemTable lookup under brief read lock.
+        {
+            let ws = self.write_state.read();
+            for &orig_i in &sorted_idx {
+                let key = keys[orig_i].as_slice();
+                if let Some((val, _)) = ws.memtable.get(key) {
+                    out[orig_i] = Some(val.to_vec());
+                } else if let Some(ref imm) = ws.immutable_memtable {
+                    if let Some((val, _)) = imm.get(key) {
+                        out[orig_i] = Some(val.to_vec());
+                    }
+                }
+            }
+        }
+
+        // Phase 2: SST lookup outside write_state lock (I/O heavy).
+        let sst_handles: Vec<(Arc<SsTable>, Vec<u8>, Vec<u8>)> = {
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut handles = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for level in levels.iter() {
+                for sst_info in level.iter().rev() {
+                    if !seen.insert(sst_info.path.clone()) {
+                        continue;
+                    }
+                    if !cache.contains_key(&sst_info.path) {
+                        if let Ok(sst) = SsTable::open(&sst_info.path) {
+                            cache.insert(sst_info.path.clone(), Arc::new(sst));
+                        }
+                    }
+                    if let Some(h) = cache.get(&sst_info.path) {
+                        handles.push((
+                            h.clone(),
+                            sst_info.min_key.clone(),
+                            sst_info.max_key.clone(),
+                        ));
+                    }
+                }
+            }
+            handles
+        };
+
+        // For each unresolved key (sorted), walk SSTs in order.
+        for &orig_i in &sorted_idx {
+            if out[orig_i].is_some() {
+                continue;
+            }
+            let key = keys[orig_i].as_slice();
+            for (sst, min, max) in &sst_handles {
+                if key < min.as_slice() || key > max.as_slice() {
+                    continue;
+                }
+                match sst.get_full(key) {
+                    Ok(Some((value, _, EntryKind::Put))) => {
+                        out[orig_i] = Some(value);
+                        break;
+                    }
+                    Ok(Some((_, _, EntryKind::Delete))) => break,
+                    Ok(None) => continue,
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Scans all entries whose key starts with the given prefix.
     /// Returns a sorted Vec of (key, value) pairs.
     ///

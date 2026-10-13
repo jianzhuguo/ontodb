@@ -6692,12 +6692,12 @@ impl QueryExecutor {
         projected_columns: Option<&[String]>,
     ) -> Result<Vec<Map<String, Value>>> {
         let cols = projected_columns.unwrap_or(&[]);
-        let mut rows = Vec::new();
-        for pk in pkeys {
-            if let Ok(Some(val_bytes)) = engine.get(pk) {
-                if let Some(doc) = simd_parse_row_projected(&val_bytes, cols) {
-                    rows.push(doc);
-                }
+        // Batch fetch all values in one call — avoids per-key lock overhead.
+        let values = engine.multi_get(pkeys)?;
+        let mut rows = Vec::with_capacity(values.len());
+        for val_bytes in values.into_iter().flatten() {
+            if let Some(doc) = simd_parse_row_projected(&val_bytes, cols) {
+                rows.push(doc);
             }
         }
         Ok(rows)
@@ -11099,12 +11099,11 @@ impl QueryExecutor {
 
     /// Fetches rows by their primary keys (plan-driven path, no txn).
     fn fetch_rows_by_pks(engine: &LsmEngine, pkeys: &[Vec<u8>]) -> Result<Vec<Map<String, Value>>> {
-        let mut rows = Vec::new();
-        for pk in pkeys {
-            if let Ok(Some(val_bytes)) = engine.get(pk) {
-                if let Some(doc) = simd_parse_row(&val_bytes) {
-                    rows.push(doc);
-                }
+        let values = engine.multi_get(pkeys)?;
+        let mut rows = Vec::with_capacity(values.len());
+        for val_bytes in values.into_iter().flatten() {
+            if let Some(doc) = simd_parse_row(&val_bytes) {
+                rows.push(doc);
             }
         }
         Ok(rows)
