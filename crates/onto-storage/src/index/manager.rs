@@ -117,6 +117,10 @@ impl IndexManager {
     /// Used by CREATE INDEX backfill: replaces per-row `insert` (O(n log n)
     /// with page splits) with sort + bottom-up page construction (O(n)).
     /// Entries need not be sorted; duplicates are dropped.
+    ///
+    /// If the in-memory tree already holds entries (INSERTs that ran while the
+    /// backfill scan was in flight), they are merged in so the rebuild does not
+    /// wipe them.
     pub fn bulk_load_index(
         &mut self,
         class: &str,
@@ -125,16 +129,30 @@ impl IndexManager {
     ) -> Result<(), onto_core::CoreError> {
         let key = (class.to_string(), column.to_string());
 
-        // In-memory tree: existing bulk_load takes owned (key, pk) pairs and
-        // merges duplicates itself.
+        // In-memory tree: merge with any entries that landed after the scan
+        // started, then one sort + bottom-up rebuild.
         if let Some(tree) = self.indexes.get_mut(&key) {
-            tree.bulk_load(entries.to_vec());
+            if tree.is_empty() {
+                tree.bulk_load(entries.to_vec());
+            } else {
+                let mut all = tree.all_entries();
+                all.extend(entries.iter().cloned());
+                tree.bulk_load(all);
+            }
         }
 
-        // Disk tree: sort + sequential page fill.
+        // Disk tree: empty tree takes the O(n) bulk_load fast path; a non-empty
+        // tree means concurrent inserts already landed — per-row insert so the
+        // rebuild does not drop them.
         if let Some(disk) = self.disk_indexes.get(&key) {
             let mut idx = disk.lock().unwrap_or_else(|e| e.into_inner());
-            idx.bulk_load(entries)?;
+            if idx.is_empty() {
+                idx.bulk_load(entries)?;
+            } else {
+                for (val, pk) in entries {
+                    idx.insert(val, pk.clone())?;
+                }
+            }
             idx.flush()?;
         }
 

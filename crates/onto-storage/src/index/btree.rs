@@ -1204,7 +1204,7 @@ impl BPlusTree {
     }
 
     /// Extracts all (key, primary_key) pairs from the tree via leaf chain traversal.
-    fn all_entries(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub fn all_entries(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut entries = Vec::new();
         let mut cursor = self.cursor_first();
         while cursor.is_valid(self) {

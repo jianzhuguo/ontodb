@@ -2277,65 +2277,57 @@ impl QueryExecutor {
                 self.execute_union(engine, left, right, *all)
             }
             QueryAst::CreateIndex { class, column } => {
-                let engine_clone = self.engine.clone();
-                let class_owned = class.clone();
-                let column_owned = column.clone();
-                tracing::info!(table = class.as_str(), column = column.as_str(), "Index creation started in background");
-                // Stats were collected before this index existed — drop the
-                // cached entry so the planner re-probes and can pick IndexScan.
+                // Synchronous: bulk_load backfill is fast enough (600k rows in
+                // seconds) that the old background-thread version only bought
+                // latency while racing concurrent INSERT/SELECT against a
+                // half-built index.
+                tracing::info!(table = class.as_str(), column = column.as_str(), "Index creation started");
                 {
                     let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
                     stats.table_row_counts.remove(class);
                 }
-                // Cached plans were built without this index — drop them too.
                 self.plan_cache
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clear();
-                let stats_handle = Arc::clone(&self.runtime_stats);
-                let plan_cache_handle = Arc::clone(&self.plan_cache);
-                let class_for_stats = class.clone();
-                std::thread::Builder::new()
-                    .name("ontodb-create-index".into())
-                    .spawn(move || {
-                        if let Err(e) = engine_clone.create_index(&class_owned, &column_owned) {
-                            tracing::error!(table = class_owned.as_str(), column = column_owned.as_str(), error = %e, "Background index creation failed");
-                        }
-                        // Index now exists — re-collect stats so IndexScan is chosen.
-                        stats_handle
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .table_row_counts
-                            .remove(&class_for_stats);
-                        plan_cache_handle
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .clear();
-                    })
-                    .ok();
+                engine.create_index(class, column)?;
+                // Index now exists — re-collect stats so IndexScan is chosen.
+                {
+                    let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
+                    stats.table_row_counts.remove(class);
+                }
+                self.plan_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
                 Ok(QueryResult::Success(format!(
-                    "Index creation started in background on {}.{}",
+                    "Index created on {}.{}",
                     class, column
                 )))
             }
             QueryAst::CreateCompositeIndex { class, columns } => {
-                let engine_clone = self.engine.clone();
-                let class_owned = class.clone();
-                let columns_owned = columns.clone();
-                tracing::info!(table = class.as_str(), columns = ?columns, "Composite index creation started in background");
-                std::thread::Builder::new()
-                    .name("ontodb-create-composite-index".into())
-                    .spawn(move || {
-                        for col in &columns_owned {
-                            if let Err(e) = engine_clone.create_index(&class_owned, col) {
-                                tracing::error!(table = class_owned.as_str(), column = col.as_str(), error = %e, "Background composite index creation failed");
-                                return;
-                            }
-                        }
-                    })
-                    .ok();
+                tracing::info!(table = class.as_str(), columns = ?columns, "Composite index creation started");
+                {
+                    let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
+                    stats.table_row_counts.remove(class);
+                }
+                self.plan_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                for col in columns {
+                    engine.create_index(class, col)?;
+                }
+                {
+                    let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
+                    stats.table_row_counts.remove(class);
+                }
+                self.plan_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
                 Ok(QueryResult::Success(format!(
-                    "Composite index creation started in background on {} ({})",
+                    "Composite index created on {} ({})",
                     class,
                     columns.join(", ")
                 )))
@@ -10202,7 +10194,7 @@ impl QueryExecutor {
     }
 
     /// Ensure source/target indexes exist for a relation table.
-    /// Creates indexes asynchronously in background threads if they don't exist.
+    /// Creates indexes synchronously if they don't exist.
     /// Tracks which tables have been checked to avoid repeated work.
     fn ensure_relation_indexes(&self, class: &str, columns: &[String]) {
         // Only act on relation tables (has source + target columns)
@@ -10224,22 +10216,14 @@ impl QueryExecutor {
             checked.insert(class.to_string());
         }
 
-        // Create indexes asynchronously
-        let engine_clone = self.engine.clone();
-        let class_owned = class.to_string();
         tracing::info!(table = class, "Auto-creating source/target indexes for relation table");
-        std::thread::Builder::new()
-            .name("ontodb-auto-index-relation".into())
-            .spawn(move || {
-                if let Err(e) = engine_clone.create_index(&class_owned, "source") {
-                    tracing::warn!(table = class_owned.as_str(), column = "source", error = %e, "Auto-index creation failed for source");
-                }
-                if let Err(e) = engine_clone.create_index(&class_owned, "target") {
-                    tracing::warn!(table = class_owned.as_str(), column = "target", error = %e, "Auto-index creation failed for target");
-                }
-                tracing::info!(table = class_owned.as_str(), "Auto-index creation completed for relation table");
-            })
-            .ok();
+        if let Err(e) = self.engine.create_index(class, "source") {
+            tracing::warn!(table = class, column = "source", error = %e, "Auto-index creation failed for source");
+        }
+        if let Err(e) = self.engine.create_index(class, "target") {
+            tracing::warn!(table = class, column = "target", error = %e, "Auto-index creation failed for target");
+        }
+        tracing::info!(table = class, "Auto-index creation completed for relation table");
     }
 
     /// Scan all existing tables and create indexes for relation tables.

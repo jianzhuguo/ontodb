@@ -1044,6 +1044,21 @@ impl BTreeIndex {
         &self.meta
     }
 
+    /// Returns true if the index holds no entries.
+    ///
+    /// Cheap check: the root is an empty leaf. An internal root means the tree
+    /// has split and is necessarily non-empty.
+    pub fn is_empty(&mut self) -> bool {
+        let root_id = self.meta.root_page;
+        if root_id == NULL_PAGE {
+            return true;
+        }
+        match self.get_page(root_id) {
+            Ok(page) => page.page_type() == PageType::Leaf && page.num_entries() == 0,
+            Err(_) => true,
+        }
+    }
+
     /// Flushes all dirty pages to disk and fsync.
     pub fn flush(&mut self) -> Result<()> {
         self.pool.flush(&mut self.file)?;
