@@ -799,6 +799,28 @@ impl BPlusTree {
         0
     }
 
+    /// Walk every unique key in order, invoking `f(encoded_key, pk_count)`.
+    /// `f` returns `false` to stop early. O(distinct keys), never clones pk lists.
+    pub fn for_each_key_count(&self, mut f: impl FnMut(&[u8], u64) -> bool) {
+        let mut cursor = self.cursor_first();
+        while cursor.is_valid(self) {
+            let leaf = match self.node(cursor.leaf_id).expect("node should exist") {
+                Node::Leaf(n) => n,
+                _ => break,
+            };
+            if cursor.idx >= leaf.keys.len() {
+                cursor.advance(self);
+                continue;
+            }
+            let k = leaf.keys[cursor.idx].as_slice();
+            let cnt = leaf.values[cursor.idx].len() as u64;
+            if !f(k, cnt) {
+                return;
+            }
+            cursor.idx += 1;
+        }
+    }
+
     /// Number of pks in an inclusive [low, high] value range (None = unbounded),
     /// without cloning any pk.
     pub fn count_range(&self, low: Option<&[u8]>, high: Option<&[u8]>) -> u64 {

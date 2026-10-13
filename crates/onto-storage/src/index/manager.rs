@@ -756,6 +756,60 @@ impl IndexManager {
         })
     }
 
+    /// Distinct index values with their pk counts, in index-key order.
+    /// Powers index-driven `GROUP BY col` / `SELECT DISTINCT col` without
+    /// scanning the base table. Returns None when no index exists.
+    ///
+    /// When the memory tree is `mem_complete` it is authoritative and the disk
+    /// merge is skipped. Otherwise memory and disk counts are merged (a pk can
+    /// appear on both sides after restart, so the count is a union estimate
+    /// only when one side is empty — same rule as `lookup_eq_read`).
+    pub fn distinct_counts_read(
+        &self,
+        class: &str,
+        column: &str,
+    ) -> Option<Vec<(Vec<u8>, u64)>> {
+        let key = (class.to_string(), column.to_string());
+        let mem_has = self.indexes.contains_key(&key);
+        let disk_has = self.disk_indexes.contains_key(&key);
+        if !mem_has && !disk_has {
+            return None;
+        }
+
+        if mem_has && self.mem_complete.contains(&key) {
+            let mut out = Vec::new();
+            if let Some(tree) = self.indexes.get(&key) {
+                tree.for_each_key_count(|k, n| {
+                    out.push((k.to_vec(), n));
+                    true
+                });
+            }
+            return Some(out);
+        }
+
+        // Merge path: prefer whichever side has data. When both have data the
+        // union count is unknown without pk materialization — use max() which
+        // is exact when one side is empty and a safe lower bound otherwise.
+        let mut merged: std::collections::BTreeMap<Vec<u8>, u64> = std::collections::BTreeMap::new();
+        if let Some(tree) = self.indexes.get(&key) {
+            tree.for_each_key_count(|k, n| {
+                *merged.entry(k.to_vec()).or_insert(0) += n;
+                true
+            });
+        }
+        if let Some(disk_idx) = self.disk_indexes.get(&key) {
+            let mut disk = disk_idx.lock().unwrap();
+            let _ = disk.for_each_value_count(|v, n| {
+                *merged.entry(v.to_vec()).or_insert(0) += n;
+                true
+            });
+        }
+        if merged.is_empty() {
+            return None;
+        }
+        Some(merged.into_iter().collect())
+    }
+
     /// Builds the index key format:
     /// __idx__{class}__{column}::{encoded_value}::{primary_key}
     pub fn make_index_key(class: &str, column: &str, value: &[u8], primary_key: &[u8]) -> Vec<u8> {
@@ -791,6 +845,43 @@ impl IndexManager {
             }
             serde_json::Value::Bool(b) => if *b { b"1" } else { b"0" }.to_vec(),
             _ => val.to_string().into_bytes(),
+        }
+    }
+
+    /// Best-effort inverse of [`Self::encode_value`] for reading index keys
+    /// back as JSON values (GROUP BY / DISTINCT pushdown).
+    ///
+    /// The encoding is lossy for bools (collide with strings "0"/"1") and for
+    /// non-finite numbers; those fall back to a string. Integers and floats
+    /// round-trip through the zero-padded forms.
+    pub fn decode_value(encoded: &[u8]) -> serde_json::Value {
+        // Integer form: 20 digits, offset by i64::MIN.
+        if encoded.len() == 20 && encoded.iter().all(|b| b.is_ascii_digit()) {
+            if let Ok(s) = std::str::from_utf8(encoded) {
+                if let Ok(u) = s.parse::<u128>() {
+                    let i = u as i128 - 9223372036854775808i128;
+                    return serde_json::Value::from(i as i64);
+                }
+            }
+        }
+        // Float form: {:020.10} — 20 chars total, decimal point at col 10.
+        if encoded.len() == 20 {
+            if let Ok(s) = std::str::from_utf8(encoded) {
+                if s.matches('.').count() == 1 {
+                    if let Ok(f) = s.trim().parse::<f64>() {
+                        if let Some(n) = serde_json::Number::from_f64(f) {
+                            return serde_json::Value::Number(n);
+                        }
+                    }
+                }
+            }
+        }
+        // Everything else (including bools "0"/"1") as string.
+        match std::str::from_utf8(encoded) {
+            Ok(s) => serde_json::Value::String(s.to_string()),
+            Err(_) => {
+                serde_json::Value::String(String::from_utf8_lossy(encoded).into_owned())
+            }
         }
     }
 

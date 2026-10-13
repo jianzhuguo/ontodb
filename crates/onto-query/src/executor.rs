@@ -16,6 +16,7 @@ use onto_core::{CoreError, Result};
 use onto_ontology::{DataType, OntologyStore, Reasoner};
 use onto_sharding::{ShardManager, ShardMap, ShardRouter};
 use onto_storage::LsmEngine;
+use onto_storage::IndexManager;
 use serde_json::{json, Map, Value};
 
 /// Parse a storage row from bytes. Tries binary format first (fast), then falls back to JSON.
@@ -6106,6 +6107,309 @@ impl QueryExecutor {
     /// Try to count matching rows via a secondary index for a simple
     /// column predicate. Returns None when the index cannot serve the filter.
     /// Uses the count-only index APIs — no pk materialization.
+    /// Index-driven `GROUP BY col` with only COUNT(*) aggregates.
+    /// Reads (value, count) pairs straight from the secondary index —
+    /// O(distinct values) instead of O(rows). Returns None when the shape
+    /// cannot be served from the index (caller falls back to row scan).
+    fn try_index_group_by_counts(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        gb: &crate::parser::GroupByClause,
+        columns: &SelectColumns,
+        filter: &Option<FilterExpr>,
+        order_by: &[crate::parser::OrderBy],
+        limit: Option<usize>,
+    ) -> Result<Option<Vec<Map<String, Value>>>> {
+        // Only single-column GROUP BY.
+        if gb.columns.len() != 1 {
+            return Ok(None);
+        }
+        // A WHERE filter on a different column needs row-level evaluation.
+        // (A filter on the same grouped column is handled below via eq count.)
+        if let Some(f) = filter {
+            let fcol = Self::filter_column(f);
+            let gcol = gb.columns[0].trim_matches('"');
+            if fcol.as_deref() != Some(gcol) {
+                return Ok(None);
+            }
+            if !matches!(f, FilterExpr::Eq(_, _)) {
+                return Ok(None);
+            }
+        }
+
+        // Every selected item must be the group column or COUNT(*).
+        let group_col = gb.columns[0].trim_matches('"').to_string();
+        if let SelectColumns::Columns(items) = columns {
+            for item in items {
+                match item {
+                    SelectItem::Column(c) => {
+                        let name = c
+                            .split(" as ")
+                            .next()
+                            .unwrap_or(c)
+                            .split('.')
+                            .next_back()
+                            .unwrap_or(c)
+                            .trim_matches('"');
+                        if name != group_col {
+                            return Ok(None);
+                        }
+                    }
+                    SelectItem::Aggregate(a) => {
+                        if a.func != AggregateFunc::Count
+                            || (a.arg != "*" && a.arg.trim_matches('"') != group_col)
+                            || a.distinct
+                        {
+                            return Ok(None);
+                        }
+                    }
+                    _ => return Ok(None),
+                }
+            }
+        }
+
+        // Every class in the hierarchy must contribute. Classes that have the
+        // index are served from it; classes that do not are scanned (usually
+        // empty or tiny subclasses).
+        let hierarchy = self.get_class_hierarchy_read(engine, table);
+        if hierarchy.is_empty() {
+            return Ok(None);
+        }
+        let indexed: Vec<String> = hierarchy
+            .iter()
+            .filter(|c| engine.has_index(c, &group_col))
+            .cloned()
+            .collect();
+        if indexed.is_empty() {
+            return Ok(None);
+        }
+
+        // Accumulate counts per encoded value across the hierarchy.
+        let mut counts: std::collections::BTreeMap<Vec<u8>, u64> = std::collections::BTreeMap::new();
+        {
+            let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+            for scan_class in &indexed {
+                match filter {
+                    Some(FilterExpr::Eq(_, val)) => {
+                        // Filter on the grouped column: a single group.
+                        let json_val = Self::literal_to_json_static(val);
+                        let enc = IndexManager::encode_value(&json_val);
+                        let n = mgr.count_eq_read(scan_class, &group_col, &json_val).unwrap_or(0);
+                        *counts.entry(enc).or_insert(0) += n;
+                    }
+                    _ => {
+                        if let Some(pairs) = mgr.distinct_counts_read(scan_class, &group_col) {
+                            for (enc, n) in pairs {
+                                *counts.entry(enc).or_insert(0) += n;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Scan hierarchy classes that lack the index and merge their counts.
+        let mut scanned_any = false;
+        for scan_class in &hierarchy {
+            if engine.has_index(scan_class, &group_col) {
+                continue;
+            }
+            scanned_any = true;
+            let prefix = format!("{}::", scan_class);
+            let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
+            for (_key, val_bytes) in &entries {
+                if val_bytes == b"__deleted__" {
+                    continue;
+                }
+                let Some(doc) = simd_parse_row(val_bytes) else {
+                    continue;
+                };
+                if let Some(f) = filter {
+                    if !self.eval_filter_read(engine, &doc, f) {
+                        continue;
+                    }
+                }
+                let enc = match doc.get(&group_col) {
+                    Some(v) => IndexManager::encode_value(v),
+                    None => continue,
+                };
+                *counts.entry(enc).or_insert(0) += 1;
+            }
+        }
+        if counts.is_empty() && !scanned_any && filter.is_none() {
+            return Ok(None);
+        }
+
+        // Build result rows matching the streaming-aggregation output shape.
+        let mut rows: Vec<Map<String, Value>> = Vec::with_capacity(counts.len());
+        for (enc, count) in &counts {
+            let decoded = IndexManager::decode_value(enc);
+            let mut row = Map::new();
+            // GROUP BY column is emitted as a string in the row-scan path
+            // (value_to_sort_key); keep the same shape for compatibility.
+            row.insert(
+                group_col.clone(),
+                Value::String(match &decoded {
+                    Value::String(s) => s.clone(),
+                    other => Self::value_to_sort_key(other),
+                }),
+            );
+            if let SelectColumns::Columns(items) = columns {
+                for item in items {
+                    match item {
+                        SelectItem::Column(_) => {}
+                        SelectItem::Aggregate(a) => {
+                            let name = a
+                                .alias
+                                .clone()
+                                .unwrap_or_else(|| Self::default_agg_name(a));
+                            row.insert(name, Value::Number((*count).into()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            rows.push(row);
+        }
+
+        // ORDER BY on the result.
+        if !order_by.is_empty() {
+            rows.sort_by(|a, b| {
+                for ob in order_by {
+                    let av = Self::resolve_column_value(a, &ob.column).unwrap_or_default();
+                    let bv = Self::resolve_column_value(b, &ob.column).unwrap_or_default();
+                    let ord = Self::compare_values(&av, &bv);
+                    if ord != std::cmp::Ordering::Equal {
+                        return if ob.ascending { ord } else { ord.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        if let Some(lim) = limit {
+            rows.truncate(lim);
+        }
+        Ok(Some(rows))
+    }
+
+    /// Index-driven `SELECT DISTINCT col`: one row per unique index key.
+    /// Returns None when the shape is not a single indexed column.
+    fn try_index_distinct(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        columns: &SelectColumns,
+        filter: &Option<FilterExpr>,
+        order_by: &[crate::parser::OrderBy],
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<Option<Vec<Map<String, Value>>>> {
+        // Exactly one projected column, no expressions.
+        let col_name = match columns {
+            SelectColumns::Columns(items) if items.len() == 1 => match &items[0] {
+                SelectItem::Column(c) => c
+                    .split(" as ")
+                    .next()
+                    .unwrap_or(c)
+                    .split('.')
+                    .next_back()
+                    .unwrap_or(c)
+                    .trim_matches('"')
+                    .to_string(),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        // No filter (a filter on the same column could work, but keep it simple).
+        if filter.is_some() {
+            return Ok(None);
+        }
+
+        let hierarchy = self.get_class_hierarchy_read(engine, table);
+        if hierarchy.is_empty() {
+            return Ok(None);
+        }
+        let indexed: Vec<String> = hierarchy
+            .iter()
+            .filter(|c| engine.has_index(c, &col_name))
+            .cloned()
+            .collect();
+        if indexed.is_empty() {
+            return Ok(None);
+        }
+
+        let mut counts: std::collections::BTreeMap<Vec<u8>, u64> = std::collections::BTreeMap::new();
+        {
+            let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+            for scan_class in &indexed {
+                if let Some(pairs) = mgr.distinct_counts_read(scan_class, &col_name) {
+                    for (enc, n) in pairs {
+                        *counts.entry(enc).or_insert(0) += n;
+                    }
+                }
+            }
+        }
+
+        // Classes without the index contribute via a prefix scan.
+        for scan_class in &hierarchy {
+            if engine.has_index(scan_class, &col_name) {
+                continue;
+            }
+            let prefix = format!("{}::", scan_class);
+            let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
+            for (_key, val_bytes) in &entries {
+                if val_bytes == b"__deleted__" {
+                    continue;
+                }
+                let Some(doc) = simd_parse_row(val_bytes) else {
+                    continue;
+                };
+                if let Some(v) = doc.get(&col_name) {
+                    *counts.entry(IndexManager::encode_value(v)).or_insert(0) += 1;
+                }
+            }
+        }
+        if counts.is_empty() {
+            return Ok(None);
+        }
+
+        let mut rows: Vec<Map<String, Value>> = Vec::with_capacity(counts.len());
+        for enc in counts.keys() {
+            let decoded = IndexManager::decode_value(enc);
+            let mut row = Map::new();
+            row.insert(col_name.clone(), decoded);
+            rows.push(row);
+        }
+
+        // DISTINCT result order follows the index (value order) unless
+        // ORDER BY says otherwise.
+        if !order_by.is_empty() {
+            rows.sort_by(|a, b| {
+                for ob in order_by {
+                    let av = Self::resolve_column_value(a, &ob.column).unwrap_or_default();
+                    let bv = Self::resolve_column_value(b, &ob.column).unwrap_or_default();
+                    let ord = Self::compare_values(&av, &bv);
+                    if ord != std::cmp::Ordering::Equal {
+                        return if ob.ascending { ord } else { ord.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        let skip = offset.unwrap_or(0);
+        if skip < rows.len() {
+            rows.drain(..skip);
+        } else {
+            rows.clear();
+        }
+        if let Some(lim) = limit {
+            rows.truncate(lim);
+        }
+        Ok(Some(rows))
+    }
+
     fn try_count_via_index(
         engine: &LsmEngine,
         class: &str,
@@ -6847,6 +7151,22 @@ impl QueryExecutor {
 
         // ---- Aggregates / GROUP BY: single-pass streaming aggregation ----
         if group_by.is_some() || Self::columns_have_aggregates(columns) {
+            // Index-driven GROUP BY: single grouped column with only COUNT(*)
+            // and the column is indexed — read (value, count) pairs straight
+            // from the index. O(distinct) instead of O(rows).
+            if let Some(gb) = group_by.as_ref() {
+                if let Some(result) = self.try_index_group_by_counts(
+                    &self.engine,
+                    from,
+                    gb,
+                    columns,
+                    filter,
+                    order_by,
+                    *limit,
+                )? {
+                    return Self::emit_rows_in_batches(result, &mut sink);
+                }
+            }
             let result = self.execute_streaming_aggregation(
                 &self.engine,
                 from,
@@ -6862,6 +7182,21 @@ impl QueryExecutor {
                 _ => return Ok(0),
             };
             return Self::emit_rows_in_batches(rows, &mut sink);
+        }
+
+        // ---- DISTINCT single indexed column: enumerate index keys ----
+        if *distinct {
+            if let Some(rows) = self.try_index_distinct(
+                &self.engine,
+                from,
+                columns,
+                filter,
+                order_by,
+                *limit,
+                *offset,
+            )? {
+                return Self::emit_rows_in_batches(rows, &mut sink);
+            }
         }
 
         let proj_cols = Self::projected_column_names(columns);

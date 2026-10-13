@@ -1260,6 +1260,59 @@ impl BTreeIndex {
         Ok(count)
     }
 
+    /// Walk every distinct value in order, invoking `f(value_bytes, pk_count)`.
+    /// Entries are stored as `value||0x00||pk`, so equal values form a run —
+    /// O(entries) zero-copy walk that never materializes pk lists.
+    /// `f` returns `false` to stop early.
+    pub fn for_each_value_count(
+        &mut self,
+        mut f: impl FnMut(&[u8], u64) -> bool,
+    ) -> Result<()> {
+        let mut leaf = self.find_leftmost_leaf()?;
+        let mut start_idx = 0;
+        let mut cur_val: Vec<u8> = Vec::new();
+        let mut cur_count: u64 = 0;
+        let mut have_val = false;
+
+        loop {
+            let num = leaf.num_entries();
+            for i in start_idx..num {
+                let Some(full_key) = leaf.slot_key(i) else {
+                    continue;
+                };
+                let value = key_value_part(full_key);
+                if !have_val {
+                    cur_val.clear();
+                    cur_val.extend_from_slice(value);
+                    cur_count = 1;
+                    have_val = true;
+                    continue;
+                }
+                if value == cur_val.as_slice() {
+                    cur_count += 1;
+                    continue;
+                }
+                // Value changed — emit the completed run.
+                if !f(&cur_val, cur_count) {
+                    return Ok(());
+                }
+                cur_val.clear();
+                cur_val.extend_from_slice(value);
+                cur_count = 1;
+            }
+            let right = leaf.header().map(|h| h.right_leaf).unwrap_or(NULL_PAGE);
+            if right == NULL_PAGE {
+                break;
+            }
+            leaf = self.get_page(right)?;
+            start_idx = 0;
+        }
+        if have_val {
+            f(&cur_val, cur_count);
+        }
+        Ok(())
+    }
+
     /// Range scan: returns all primary keys with values in [lo, hi].
     /// If lo is None, scans from the beginning. If hi is None, scans to the end.
     pub fn range_scan(&mut self, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<Vec<Vec<u8>>> {
