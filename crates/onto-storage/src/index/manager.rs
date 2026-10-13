@@ -660,6 +660,94 @@ impl IndexManager {
         }
     }
 
+    /// Count of primary keys matching an equality predicate, without
+    /// materializing the pk list. Returns None when no index exists.
+    pub fn count_eq_read(
+        &self,
+        class: &str,
+        column: &str,
+        value: &serde_json::Value,
+    ) -> Option<u64> {
+        let key = (class.to_string(), column.to_string());
+        let encoded = Self::encode_value(value);
+
+        let mem_has = self.indexes.contains_key(&key);
+        let disk_has = self.disk_indexes.contains_key(&key);
+        if !mem_has && !disk_has {
+            return None;
+        }
+
+        if mem_has && self.mem_complete.contains(&key) {
+            return self
+                .indexes
+                .get(&key)
+                .map(|tree| tree.lookup(&encoded).len() as u64);
+        }
+
+        // Disk count is exact (one entry per pk). If the memory tree also has
+        // rows (partially rebuilt), the union is unknown without materializing;
+        // fall back to the merged lookup in that rare case.
+        let mem_cnt = self
+            .indexes
+            .get(&key)
+            .map(|tree| tree.lookup(&encoded).len())
+            .unwrap_or(0);
+        if mem_cnt > 0 {
+            return self.lookup_eq_read(class, column, value).map(|p| p.len() as u64);
+        }
+        self.disk_indexes.get(&key).and_then(|disk_idx| {
+            disk_idx.lock().unwrap().count_value(&encoded).ok()
+        })
+    }
+
+    /// Count of primary keys in an inclusive [low, high] value range
+    /// (None bound = unbounded). Returns None when no index exists.
+    pub fn count_range_read(
+        &self,
+        class: &str,
+        column: &str,
+        low: Option<&serde_json::Value>,
+        high: Option<&serde_json::Value>,
+    ) -> Option<u64> {
+        let key = (class.to_string(), column.to_string());
+        let low_bytes = low.map(Self::encode_value);
+        let high_bytes = high.map(Self::encode_value);
+
+        let mem_has = self.indexes.contains_key(&key);
+        let disk_has = self.disk_indexes.contains_key(&key);
+        if !mem_has && !disk_has {
+            return None;
+        }
+
+        if mem_has && self.mem_complete.contains(&key) {
+            return self.indexes.get(&key).map(|tree| {
+                tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref())
+                    .len() as u64
+            });
+        }
+
+        let mem_cnt = self
+            .indexes
+            .get(&key)
+            .map(|tree| {
+                tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref())
+                    .len()
+            })
+            .unwrap_or(0);
+        if mem_cnt > 0 {
+            return self
+                .lookup_range_read(class, column, low, high)
+                .map(|p| p.len() as u64);
+        }
+        self.disk_indexes.get(&key).and_then(|disk_idx| {
+            disk_idx
+                .lock()
+                .unwrap()
+                .count_range(low_bytes.as_deref(), high_bytes.as_deref())
+                .ok()
+        })
+    }
+
     /// Builds the index key format:
     /// __idx__{class}__{column}::{encoded_value}::{primary_key}
     pub fn make_index_key(class: &str, column: &str, value: &[u8], primary_key: &[u8]) -> Vec<u8> {

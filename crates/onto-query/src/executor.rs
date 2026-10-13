@@ -5905,34 +5905,65 @@ impl QueryExecutor {
 
     /// Try to count matching rows via a secondary index for a simple
     /// column predicate. Returns None when the index cannot serve the filter.
+    /// Uses the count-only index APIs — no pk materialization.
     fn try_count_via_index(
         engine: &LsmEngine,
         class: &str,
         filter: &Option<FilterExpr>,
     ) -> Option<u64> {
         let f = filter.as_ref()?;
-        // Only single-column comparisons — And/Or fall back to scan.
+        let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
         match f {
-            FilterExpr::Eq(c, _)
-            | FilterExpr::Ne(c, _)
-            | FilterExpr::Gt(c, _)
-            | FilterExpr::Lt(c, _)
-            | FilterExpr::Gte(c, _)
-            | FilterExpr::Lte(c, _)
-            | FilterExpr::Between(c, _, _)
-            | FilterExpr::In(c, _) => {
+            FilterExpr::Eq(c, v) => {
                 if !engine.has_index(class, c) {
                     return None;
                 }
+                let json_val = Self::literal_to_json_static(v);
+                mgr.count_eq_read(class, c, &json_val)
             }
-            _ => return None,
+            FilterExpr::Gt(c, v) | FilterExpr::Gte(c, v) | FilterExpr::Lt(c, v) | FilterExpr::Lte(c, v) => {
+                if !engine.has_index(class, c) {
+                    return None;
+                }
+                let json_val = Self::literal_to_json_static(v);
+                let (lo, hi, strict): (Option<serde_json::Value>, Option<serde_json::Value>, bool) =
+                    match f {
+                        FilterExpr::Gt(_, _) => (Some(json_val.clone()), None, true),
+                        FilterExpr::Gte(_, _) => (Some(json_val.clone()), None, false),
+                        FilterExpr::Lt(_, _) => (None, Some(json_val.clone()), true),
+                        FilterExpr::Lte(_, _) => (None, Some(json_val.clone()), false),
+                        _ => unreachable!(),
+                    };
+                let part = mgr.count_range_read(class, c, lo.as_ref(), hi.as_ref())?;
+                if strict {
+                    // Range counts are inclusive; subtract the boundary value.
+                    let eq = mgr.count_eq_read(class, c, &json_val)?;
+                    Some(part.saturating_sub(eq))
+                } else {
+                    Some(part)
+                }
+            }
+            FilterExpr::Between(c, lo, hi) => {
+                if !engine.has_index(class, c) {
+                    return None;
+                }
+                let lo_json = Self::literal_to_json_static(lo);
+                let hi_json = Self::literal_to_json_static(hi);
+                mgr.count_range_read(class, c, Some(&lo_json), Some(&hi_json))
+            }
+            FilterExpr::In(c, vals) => {
+                if !engine.has_index(class, c) {
+                    return None;
+                }
+                let mut total = 0u64;
+                for v in vals {
+                    let json_val = Self::literal_to_json_static(v);
+                    total += mgr.count_eq_read(class, c, &json_val)?;
+                }
+                Some(total)
+            }
+            _ => None,
         }
-        // Ne is not a pure index range — skip (would need full minus equals)
-        if matches!(f, FilterExpr::Ne(_, _)) {
-            return None;
-        }
-        let pkeys = Self::try_index_scan_single_read(engine, class, f)?;
-        Some(pkeys.len() as u64)
     }
 
     /// Extracts column names from simple comparison filters for fast byte-level rejection.

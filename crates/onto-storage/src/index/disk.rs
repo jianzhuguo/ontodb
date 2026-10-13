@@ -1139,6 +1139,90 @@ impl BTreeIndex {
         Ok(result)
     }
 
+    /// Count primary keys with the given value, without decoding any pk.
+    ///
+    /// One entry per (value, pk) means the match count equals the number of
+    /// keys carrying the `value || 0x00` prefix. Scanning `slot_key` is
+    /// zero-copy — the COUNT(*) path must not materialize 500k pks just to
+    /// take `.len()` of them (that alone cost ~200ms on a hot value).
+    pub fn count_value(&mut self, key: &[u8]) -> Result<u64> {
+        let prefix = compose_key(key, b"");
+        let mut leaf = self.find_leaf(&prefix)?;
+        let mut count = 0u64;
+
+        let mut start_idx = match leaf.binary_search(&prefix) {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+        loop {
+            let num = leaf.num_entries();
+            for i in start_idx..num {
+                let Some(full_key) = leaf.slot_key(i) else {
+                    continue;
+                };
+                if full_key < prefix.as_slice() {
+                    continue;
+                }
+                if !full_key.starts_with(&prefix) {
+                    return Ok(count);
+                }
+                count += 1;
+            }
+            let right = leaf.header().map(|h| h.right_leaf).unwrap_or(NULL_PAGE);
+            if right == NULL_PAGE {
+                break;
+            }
+            leaf = self.get_page(right)?;
+            start_idx = 0;
+        }
+        Ok(count)
+    }
+
+    /// Count primary keys whose value part lies in [lo, hi] (inclusive bounds;
+    /// None = unbounded). Same zero-copy walk as `count_value`.
+    pub fn count_range(&mut self, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<u64> {
+        let lo_prefix = lo.map(|v| compose_key(v, b""));
+        let mut leaf = match &lo_prefix {
+            Some(p) => self.find_leaf(p)?,
+            None => self.find_leftmost_leaf()?,
+        };
+        let mut start_idx = match &lo_prefix {
+            Some(p) => match leaf.binary_search(p) {
+                Ok(i) => i,
+                Err(i) => i,
+            },
+            None => 0,
+        };
+        let mut count = 0u64;
+        loop {
+            let num = leaf.num_entries();
+            for i in start_idx..num {
+                let Some(full_key) = leaf.slot_key(i) else {
+                    continue;
+                };
+                let value = key_value_part(full_key);
+                if let Some(hi_key) = hi {
+                    if value > hi_key {
+                        return Ok(count);
+                    }
+                }
+                if let Some(lo_key) = lo {
+                    if value < lo_key {
+                        continue;
+                    }
+                }
+                count += 1;
+            }
+            let right = leaf.header().map(|h| h.right_leaf).unwrap_or(NULL_PAGE);
+            if right == NULL_PAGE {
+                break;
+            }
+            leaf = self.get_page(right)?;
+            start_idx = 0;
+        }
+        Ok(count)
+    }
+
     /// Range scan: returns all primary keys with values in [lo, hi].
     /// If lo is None, scans from the beginning. If hi is None, scans to the end.
     pub fn range_scan(&mut self, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<Vec<Vec<u8>>> {
