@@ -8,15 +8,19 @@
 //! health checks, and Prometheus metrics.
 
 use axum::{
+    body::Body,
     extract::State,
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
 };
+use bytes::Bytes;
+use futures::stream::{self, StreamExt};
 use onto_query::{OntoQLParser, QueryAst, QueryExecutor, QueryParser};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::convert::Infallible;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -33,6 +37,57 @@ impl<T: Serialize> IntoResponse for PrettyJson<T> {
         } else {
             serde_json::to_string(&self.0).unwrap_or_else(|_| "{}".to_string())
         };
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response()
+    }
+}
+
+/// Streaming JSON array response for large row sets.
+///
+/// Serializes rows one-at-a-time into a `Body::from_stream`, avoiding the
+/// intermediate `serde_json::Value` tree and the single monolithic `String`
+/// allocation that `PrettyJson` requires.  Each row becomes its own chunk so
+/// axum can flush bytes to the socket while later rows are still being
+/// serialized.  Field order matches `ApiResponse::success`.
+struct StreamedRows {
+    rows: Vec<serde_json::Map<String, Value>>,
+    elapsed_ms: f64,
+}
+
+impl IntoResponse for StreamedRows {
+    fn into_response(self) -> axum::response::Response {
+        let StreamedRows { rows, elapsed_ms } = self;
+
+        // Header: {"success":true,"data":[
+        let header = r#"{"success":true,"data":["#.to_string();
+        // Footer: ],"elapsed_ms":<ms>}
+        let footer = format!(r#"],"elapsed_ms":{}}}"#, elapsed_ms);
+
+        // Build a stream: header chunk → one chunk per row (with comma) → footer.
+        let header_chunk = stream::once(async move { Ok::<_, Infallible>(Bytes::from(header)) });
+
+        let row_chunks = stream::iter(rows.into_iter().enumerate().map(|(i, row)| {
+            let mut buf = Vec::with_capacity(256);
+            if i > 0 {
+                buf.push(b',');
+            }
+            // Serialize the row object directly — no intermediate Value tree.
+            if serde_json::to_writer(&mut buf, &row).is_err() {
+                buf.extend_from_slice(b"null");
+            }
+            Ok::<_, Infallible>(Bytes::from(buf))
+        }));
+
+        let footer_chunk = stream::once(async move {
+            Ok::<_, Infallible>(Bytes::from(footer))
+        });
+
+        let body_stream = header_chunk.chain(row_chunks).chain(footer_chunk);
+        let body = Body::from_stream(body_stream);
+
         (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             body,
@@ -1033,7 +1088,7 @@ async fn execute_query(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<QueryRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let start = std::time::Instant::now();
     let client_ip = addr.ip().to_string();
 
@@ -1066,13 +1121,13 @@ async fn execute_query(
                                         ),
                                         req.pretty,
                                     ),
-                                );
+                                ).into_response();
                             }
                             Err(e) => {
                                 return (
                                     StatusCode::INTERNAL_SERVER_ERROR,
                                     PrettyJson(ApiResponse::<Value>::error(e), false),
-                                );
+                                ).into_response();
                             }
                         }
                     } else {
@@ -1084,7 +1139,7 @@ async fn execute_query(
                                 ),
                                 false,
                             ),
-                        );
+                        ).into_response();
                     }
                 }
                 onto_query::OntoQLAst::InsertTriples { triples } => {
@@ -1112,13 +1167,13 @@ async fn execute_query(
                                         ),
                                         req.pretty,
                                     ),
-                                );
+                                ).into_response();
                             }
                             Err(e) => {
                                 return (
                                     StatusCode::INTERNAL_SERVER_ERROR,
                                     PrettyJson(ApiResponse::<Value>::error(e), false),
-                                );
+                                ).into_response();
                             }
                         }
                     } else {
@@ -1130,7 +1185,7 @@ async fn execute_query(
                                 ),
                                 false,
                             ),
-                        );
+                        ).into_response();
                     }
                 }
                 onto_query::OntoQLAst::DeleteTriple {
@@ -1156,13 +1211,13 @@ async fn execute_query(
                                         ),
                                         req.pretty,
                                     ),
-                                );
+                                ).into_response();
                             }
                             Err(e) => {
                                 return (
                                     StatusCode::INTERNAL_SERVER_ERROR,
                                     PrettyJson(ApiResponse::<Value>::error(e), false),
-                                );
+                                ).into_response();
                             }
                         }
                     } else {
@@ -1174,7 +1229,7 @@ async fn execute_query(
                                 ),
                                 false,
                             ),
-                        );
+                        ).into_response();
                     }
                 }
                 onto_query::OntoQLAst::DropClass { name } => {
@@ -1194,13 +1249,13 @@ async fn execute_query(
                                     ),
                                     req.pretty,
                                 ),
-                            );
+                            ).into_response();
                         }
                         Err(e) => {
                             return (
                                 StatusCode::BAD_REQUEST,
                                 PrettyJson(ApiResponse::<Value>::error(e.to_string()), false),
-                            );
+                            ).into_response();
                         }
                     }
                 }
@@ -1220,13 +1275,13 @@ async fn execute_query(
                                     ),
                                     req.pretty,
                                 ),
-                            );
+                            ).into_response();
                         }
                         Err(e) => {
                             return (
                                 StatusCode::BAD_REQUEST,
                                 PrettyJson(ApiResponse::<Value>::error(e.to_string()), false),
-                            );
+                            ).into_response();
                         }
                     }
                 }
@@ -1246,13 +1301,13 @@ async fn execute_query(
                                         ),
                                         req.pretty,
                                     ),
-                                );
+                                ).into_response();
                             }
                             Err(e) => {
                                 return (
                                     StatusCode::INTERNAL_SERVER_ERROR,
                                     PrettyJson(ApiResponse::<Value>::error(e.to_string()), false),
-                                );
+                                ).into_response();
                             }
                         }
                     }
@@ -1263,7 +1318,7 @@ async fn execute_query(
                             return (
                                 StatusCode::BAD_REQUEST,
                                 PrettyJson(ApiResponse::<Value>::error(format!("OntoQL translation error: {}", e)), false),
-                            );
+                            ).into_response();
                         }
                     }
                 }
@@ -1281,13 +1336,13 @@ async fn execute_query(
                                     ),
                                     req.pretty,
                                 ),
-                            );
+                            ).into_response();
                         }
                         Err(e) => {
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 PrettyJson(ApiResponse::<Value>::error(e.to_string()), false),
-                            );
+                            ).into_response();
                         }
                     }
                 }
@@ -1317,13 +1372,13 @@ async fn execute_query(
                                     ApiResponse::success(json!(rows), elapsed_ms),
                                     req.pretty,
                                 ),
-                            );
+                            ).into_response();
                         }
                         Err(e) => {
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 PrettyJson(ApiResponse::<Value>::error(e.to_string()), false),
-                            );
+                            ).into_response();
                         }
                     }
                 }
@@ -1342,7 +1397,7 @@ async fn execute_query(
                                     )),
                                     false,
                                 ),
-                            );
+                            ).into_response();
                         }
                     }
                 }
@@ -1360,7 +1415,7 @@ async fn execute_query(
                             ApiResponse::<Value>::error(format!("Parse error: {}", e)),
                             false,
                         ),
-                    );
+                    ).into_response();
                 }
             }
         }
@@ -1406,7 +1461,7 @@ async fn execute_query(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 PrettyJson(ApiResponse::<Value>::error(safe_msg), false),
-            );
+            ).into_response();
         }
     };
 
@@ -1441,27 +1496,56 @@ async fn execute_query(
     let elapsed_ms = elapsed * 1000.0;
 
     let t_serialize_start = std::time::Instant::now();
-    let data = match result {
-        onto_query::QueryResult::Success(msg) => json!({ "message": msg }),
-        onto_query::QueryResult::Rows(rows) => json!(rows),
-    };
-    let t_serialize = t_serialize_start.elapsed().as_secs_f64() * 1000.0;
-
-    // Log timing breakdown for slow queries
-    if elapsed >= SLOW_QUERY_THRESHOLD_SECS {
-        tracing::info!(
-            target: "query_timing",
-            parse_ms = t_parse,
-            exec_ms = t_exec,
-            serialize_ms = t_serialize,
-            total_ms = elapsed_ms,
-            rows = match &data { serde_json::Value::Array(a) => a.len(), _ => 0 },
-            "query timing breakdown"
-        );
+    match result {
+        onto_query::QueryResult::Success(msg) => {
+            let t_serialize = t_serialize_start.elapsed().as_secs_f64() * 1000.0;
+            if elapsed >= SLOW_QUERY_THRESHOLD_SECS {
+                tracing::info!(
+                    target: "query_timing",
+                    parse_ms = t_parse,
+                    exec_ms = t_exec,
+                    serialize_ms = t_serialize,
+                    total_ms = elapsed_ms,
+                    rows = 0,
+                    "query timing breakdown"
+                );
+            }
+            let response = ApiResponse::success(json!({ "message": msg }), elapsed_ms);
+            (StatusCode::OK, PrettyJson(response, req.pretty)).into_response()
+        }
+        onto_query::QueryResult::Rows(rows) => {
+            let row_count = rows.len();
+            let t_serialize = t_serialize_start.elapsed().as_secs_f64() * 1000.0;
+            if elapsed >= SLOW_QUERY_THRESHOLD_SECS {
+                tracing::info!(
+                    target: "query_timing",
+                    parse_ms = t_parse,
+                    exec_ms = t_exec,
+                    serialize_ms = t_serialize,
+                    total_ms = elapsed_ms,
+                    rows = row_count,
+                    "query timing breakdown"
+                );
+            }
+            // Stream rows directly into the response body — skips the
+            // intermediate `json!(rows)` Value tree and the monolithic
+            // `to_string` allocation that dominate serialize_ms on large sets.
+            // pretty=true falls back to PrettyJson (streaming emits compact JSON).
+            if req.pretty {
+                let response = ApiResponse::success(json!(rows), elapsed_ms);
+                (StatusCode::OK, PrettyJson(response, true)).into_response()
+            } else {
+                (
+                    StatusCode::OK,
+                    StreamedRows {
+                        rows,
+                        elapsed_ms,
+                    },
+                )
+                    .into_response()
+            }
+        }
     }
-
-    let response = ApiResponse::success(data, elapsed_ms);
-    (StatusCode::OK, PrettyJson(response, req.pretty))
 }
 
 /// POST /sparql - Execute a SPARQL query.
