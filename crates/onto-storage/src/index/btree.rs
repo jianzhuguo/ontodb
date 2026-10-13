@@ -771,6 +771,23 @@ impl BPlusTree {
         Vec::new()
     }
 
+    /// Like [`Self::lookup`], but returns at most `limit` pks.
+    pub fn lookup_limited(&self, value: &[u8], limit: usize) -> Vec<Vec<u8>> {
+        let leaf_id = self.find_leaf(value);
+
+        if let Node::Leaf(n) = self.node(leaf_id).expect("node should exist") {
+            if let Ok(i) = n.keys.binary_search_by(|k| k.as_slice().cmp(value)) {
+                let pks = &n.values[i];
+                if pks.len() <= limit {
+                    return pks.clone();
+                }
+                return pks[..limit].to_vec();
+            }
+        }
+
+        Vec::new()
+    }
+
     /// Finds the leaf node that should contain the given key.
     fn find_leaf(&self, key: &[u8]) -> u64 {
         let mut current = self.root;

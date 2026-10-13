@@ -1139,6 +1139,43 @@ impl BTreeIndex {
         Ok(result)
     }
 
+    /// Like [`Self::lookup`], but stops after collecting `limit` pks.
+    pub fn lookup_limited(&mut self, key: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+        let prefix = compose_key(key, b"");
+        let mut leaf = self.find_leaf(&prefix)?;
+        let mut result: Vec<Vec<u8>> = Vec::new();
+
+        let mut start_idx = match leaf.binary_search(&prefix) {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+        loop {
+            let num = leaf.num_entries();
+            for i in start_idx..num {
+                let (full_key, pks) = leaf.get_leaf(i).unwrap_or_default();
+                if full_key.as_slice() < prefix.as_slice() {
+                    continue;
+                }
+                if !full_key.starts_with(&prefix) {
+                    return Ok(result);
+                }
+                for pk in pks {
+                    result.push(pk);
+                    if result.len() >= limit {
+                        return Ok(result);
+                    }
+                }
+            }
+            let right = leaf.header().map(|h| h.right_leaf).unwrap_or(NULL_PAGE);
+            if right == NULL_PAGE {
+                break;
+            }
+            leaf = self.get_page(right)?;
+            start_idx = 0;
+        }
+        Ok(result)
+    }
+
     /// Count primary keys with the given value, without decoding any pk.
     ///
     /// One entry per (value, pk) means the match count equals the number of

@@ -1863,6 +1863,14 @@ impl QueryExecutor {
 
         let result = match ast {
             QueryAst::Select { .. } => {
+                // Collect table stats (incl. which columns have indexes) BEFORE
+                // planning — otherwise the planner sees an empty secondary_indexes
+                // list and never picks IndexScan, and the bad plan gets cached.
+                if let QueryAst::Select { from, .. } = ast {
+                    if !from.starts_with("system.") {
+                        self.ensure_statistics(from, engine);
+                    }
+                }
                 // Check plan cache first
                 let cached_plan = {
                     let ast_hash = Self::hash_ast(ast);
@@ -2199,12 +2207,36 @@ impl QueryExecutor {
                 let class_owned = class.clone();
                 let column_owned = column.clone();
                 tracing::info!(table = class.as_str(), column = column.as_str(), "Index creation started in background");
+                // Stats were collected before this index existed — drop the
+                // cached entry so the planner re-probes and can pick IndexScan.
+                {
+                    let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
+                    stats.table_row_counts.remove(class);
+                }
+                // Cached plans were built without this index — drop them too.
+                self.plan_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                let stats_handle = Arc::clone(&self.runtime_stats);
+                let plan_cache_handle = Arc::clone(&self.plan_cache);
+                let class_for_stats = class.clone();
                 std::thread::Builder::new()
                     .name("ontodb-create-index".into())
                     .spawn(move || {
                         if let Err(e) = engine_clone.create_index(&class_owned, &column_owned) {
                             tracing::error!(table = class_owned.as_str(), column = column_owned.as_str(), error = %e, "Background index creation failed");
                         }
+                        // Index now exists — re-collect stats so IndexScan is chosen.
+                        stats_handle
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .table_row_counts
+                            .remove(&class_for_stats);
+                        plan_cache_handle
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clear();
                     })
                     .ok();
                 Ok(QueryResult::Success(format!(
@@ -5424,11 +5456,36 @@ impl QueryExecutor {
             }
             PlanNode::Aggregation { input, .. } => self.execute_plan_node_read(input, engine),
             PlanNode::Limit { input, count, .. } => {
-                // Only push limit to SeqScan when there's no filter.
-                // With a filter, we must scan all rows to find matches.
+                // Push the limit to SeqScan even with a filter: we only need
+                // `count` *matching* rows, not all matches. plan_seq_scan_read_limit
+                // keeps filtering until it has collected enough (or the scan ends).
                 if let PlanNode::SeqScan { table, alias, filter, .. } = input.as_ref() {
-                    let scan_limit = if filter.is_none() { Some(*count) } else { None };
-                    return self.plan_seq_scan_read_limit(engine, table, alias.as_deref(), filter, None, scan_limit);
+                    return self.plan_seq_scan_read_limit(
+                        engine,
+                        table,
+                        alias.as_deref(),
+                        filter,
+                        None,
+                        Some(*count),
+                    );
+                }
+                // Same for IndexScan: fetch only `count` rows via the index.
+                if let PlanNode::IndexScan {
+                    table,
+                    alias,
+                    index_column,
+                    filter,
+                    ..
+                } = input.as_ref()
+                {
+                    return self.plan_index_scan_read_limit(
+                        engine,
+                        table,
+                        alias.as_deref(),
+                        index_column,
+                        filter,
+                        Some(*count),
+                    );
                 }
                 let mut rows = self.execute_plan_node_read(input, engine)?;
                 rows.truncate(*count);
@@ -5489,6 +5546,27 @@ impl QueryExecutor {
         projected_columns: Option<&SelectColumns>,
         scan_limit: Option<usize>,
     ) -> Result<Vec<Map<String, Value>>> {
+        // If the filter is a simple indexed-column predicate, use the index
+        // directly. The planner may still choose SeqScan (stale/absent stats),
+        // which is fatal for low-selectivity filters where LIMIT early-exit
+        // can't help (e.g. drug_name = 'x' matching 1 of 23k rows).
+        if let Some(f) = filter {
+            if Self::filter_is_indexable(f) {
+                let idx_col = Self::filter_column(f).unwrap_or_default();
+                if engine.has_index(table, &idx_col) {
+                    let rows = self.plan_index_scan_read_limit(
+                        engine,
+                        table,
+                        alias,
+                        &idx_col,
+                        filter,
+                        scan_limit,
+                    )?;
+                    return Ok(rows);
+                }
+            }
+        }
+
         // Check for active transaction for snapshot-aware scanning
         let active_txn_id = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -5567,9 +5645,15 @@ impl QueryExecutor {
 
         let mut rows = Vec::new();
         let mut scan_count: u64 = 0;
-        // When a limit is set and there's no filter (pure LIMIT query), multiply the
-        // scan limit to account for class-hierarchy and shard filtering.
-        let effective_scan_limit = scan_limit.map(|l| l.saturating_mul(10).max(l + 100));
+        // Pure LIMIT (no filter): bound the raw scan, multiplying for
+        // class-hierarchy/shard rejection. With a filter we must keep scanning
+        // until enough *matches* are collected, so leave the bound unset and let
+        // the streaming path early-exit on rows.len() instead.
+        let effective_scan_limit = if filter.is_none() {
+            scan_limit.map(|l| l.saturating_mul(10).max(l + 100))
+        } else {
+            None
+        };
         tracing::debug!(
             table = %table,
             has_filter = filter.is_some(),
@@ -5664,18 +5748,32 @@ impl QueryExecutor {
                     }
                 }
             } else {
-                // Unlimited path: stream live rows one value at a time —
-                // peak memory is one value + the key map, not the full table.
-                let mut on_row = |key: &[u8], val_bytes: &[u8]| -> Result<()> {
+                // Streaming path. With a filter+limit we only need `scan_limit`
+                // matching rows — return Ok(false) to stop the scan early.
+                let want = scan_limit;
+                let mut on_row = |key: &[u8], val_bytes: &[u8]| -> Result<bool> {
+                    if let Some(lim) = want {
+                        if rows.len() >= lim {
+                            return Ok(false);
+                        }
+                    }
                     if let Some(doc) = row_from_value(key, val_bytes, &mut scan_count)? {
                         rows.push(doc);
+                        if let Some(lim) = want {
+                            if rows.len() >= lim {
+                                return Ok(false);
+                            }
+                        }
                     }
-                    Ok(())
+                    Ok(true)
                 };
                 if let Some(txn_id) = active_txn_id {
-                    engine.txn_for_each_live_prefix(txn_id, prefix.as_bytes(), on_row)?;
+                    engine.txn_for_each_live_prefix(txn_id, prefix.as_bytes(), |k, v| {
+                        on_row(k, v)?;
+                        Ok(())
+                    })?;
                 } else {
-                    engine.for_each_live_prefix(prefix.as_bytes(), None, None, on_row)?;
+                    engine.for_each_live_prefix_until(prefix.as_bytes(), None, None, &mut on_row)?;
                 }
             }
         }
@@ -5968,6 +6066,34 @@ impl QueryExecutor {
 
     /// Extracts column names from simple comparison filters for fast byte-level rejection.
     /// Returns columns that can be checked without full JSON deserialization.
+    /// True when the filter is a single-column predicate an index can serve.
+    fn filter_is_indexable(f: &FilterExpr) -> bool {
+        matches!(
+            f,
+            FilterExpr::Eq(_, _)
+                | FilterExpr::Gt(_, _)
+                | FilterExpr::Lt(_, _)
+                | FilterExpr::Gte(_, _)
+                | FilterExpr::Lte(_, _)
+                | FilterExpr::Between(_, _, _)
+                | FilterExpr::In(_, _)
+        )
+    }
+
+    /// Column referenced by an indexable filter.
+    fn filter_column(f: &FilterExpr) -> Option<String> {
+        match f {
+            FilterExpr::Eq(c, _)
+            | FilterExpr::Gt(c, _)
+            | FilterExpr::Lt(c, _)
+            | FilterExpr::Gte(c, _)
+            | FilterExpr::Lte(c, _)
+            | FilterExpr::Between(c, _, _)
+            | FilterExpr::In(c, _) => Some(c.clone()),
+            _ => None,
+        }
+    }
+
     fn extract_fast_filter_columns(filter: &Option<FilterExpr>) -> Vec<String> {
         let mut cols = Vec::new();
         if let Some(f) = filter {
@@ -6277,16 +6403,49 @@ impl QueryExecutor {
         index_column: &str,
         filter: &Option<FilterExpr>,
     ) -> Result<Vec<Map<String, Value>>> {
+        self.plan_index_scan_read_limit(engine, table, alias, index_column, filter, None)
+    }
+
+    /// Index scan with optional row limit: only the first `limit` matching pkeys
+    /// are fetched. Without this, `WHERE idx = 'x' LIMIT 100` materialized all
+    /// 492k pkeys and did 492k point lookups before truncating.
+    fn plan_index_scan_read_limit(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        alias: Option<&str>,
+        index_column: &str,
+        filter: &Option<FilterExpr>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Map<String, Value>>> {
         let class_hierarchy = self.get_class_hierarchy_read(engine, table);
 
         if let Some(f) = filter {
             let mut all_pkeys: Vec<Vec<u8>> = Vec::new();
             for scan_class in &class_hierarchy {
                 if engine.has_index(scan_class, index_column) {
-                    if let Some(pkeys) = Self::try_index_scan_single_read(engine, scan_class, f) {
+                    let pkeys = match (f, limit) {
+                        // Eq + LIMIT: bounded lookup — no full pk materialization.
+                        (FilterExpr::Eq(_, val), Some(lim)) => {
+                            let json_val = Self::literal_to_json_static(val);
+                            let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+                            mgr.lookup_eq_read_limit(scan_class, index_column, &json_val, lim)
+                        }
+                        _ => Self::try_index_scan_single_read(engine, scan_class, f),
+                    };
+                    if let Some(pkeys) = pkeys {
                         all_pkeys.extend(pkeys);
                     }
                 }
+                if let Some(lim) = limit {
+                    if all_pkeys.len() >= lim {
+                        all_pkeys.truncate(lim);
+                        break;
+                    }
+                }
+            }
+            if let Some(lim) = limit {
+                all_pkeys.truncate(lim);
             }
             if !all_pkeys.is_empty() {
                 let mut rows = Self::fetch_rows_by_pks_read(engine, &all_pkeys)?;
@@ -6317,6 +6476,12 @@ impl QueryExecutor {
                     Self::apply_alias(&mut rows, a);
                 }
                 return Ok(rows);
+            }
+            // Index answered with 0 hits — it is authoritative for an indexed
+            // column. Do NOT fall back to seq scan (that also caused infinite
+            // recursion: seq_scan short-circuits back here for indexable filters).
+            if engine.has_index(table, index_column) {
+                return Ok(Vec::new());
             }
         }
 
@@ -8798,6 +8963,9 @@ impl QueryExecutor {
     fn extract_simple_seqscan<'a>(node: &'a PlanNode) -> Option<(String, &'a Option<FilterExpr>)> {
         match node {
             PlanNode::SeqScan { table, filter, .. } => Some((table.clone(), filter)),
+            // IndexScan is still a single-table scan with an optional filter —
+            // aggregation/count fast paths can use it via try_count_via_index.
+            PlanNode::IndexScan { table, filter, .. } => Some((table.clone(), filter)),
             PlanNode::Filter { input, .. }
             | PlanNode::Projection { input, .. }
             | PlanNode::Aggregation { input, .. }

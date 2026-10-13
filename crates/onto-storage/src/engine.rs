@@ -1359,6 +1359,24 @@ impl LsmEngine {
     where
         F: FnMut(&[u8], &[u8]) -> Result<()>,
     {
+        self.for_each_live_prefix_until(prefix, vis, overlay, |k, v| {
+            f(k, v)?;
+            Ok(true)
+        })
+    }
+
+    /// Like [`Self::for_each_live_prefix`], but the callback returns `Ok(false)`
+    /// to stop the scan early (e.g. once a LIMIT has been satisfied).
+    pub fn for_each_live_prefix_until<F>(
+        &self,
+        prefix: &[u8],
+        vis: Option<&crate::mvcc::Visibility>,
+        overlay: Option<&std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    {
         self.drain_compaction_notifications();
 
         let is_visible = |seq: SeqNo| -> bool {
@@ -1473,24 +1491,24 @@ impl LsmEngine {
                 seq: SeqNo,
                 kind: EntryKind,
                 value: &[u8],
-            ) -> Result<()>
+            ) -> Result<bool>
             where
-                F: FnMut(&[u8], &[u8]) -> Result<()>,
+                F: FnMut(&[u8], &[u8]) -> Result<bool>,
             {
                 if kind != EntryKind::Put || *pending_puts == 0 {
-                    return Ok(());
+                    return Ok(true);
                 }
                 let Some((w_seq, w_kind)) = winners.get(key).copied() else {
-                    return Ok(());
+                    return Ok(true);
                 };
                 if w_seq == seq && w_kind == EntryKind::Put {
                     if let Some(slot) = winners.get_mut(key) {
                         slot.1 = EntryKind::Delete; // mark emitted
                     }
                     *pending_puts -= 1;
-                    f(key, value)?;
+                    return f(key, value);
                 }
-                Ok(())
+                Ok(true)
             }
 
             for sst in &sst_handles {
@@ -1504,7 +1522,7 @@ impl LsmEngine {
                         break;
                     }
                     if is_visible(iter.seq_no()) {
-                        try_emit(
+                        let keep_going = try_emit(
                             &mut winners,
                             &mut pending_puts,
                             &mut f,
@@ -1513,6 +1531,9 @@ impl LsmEngine {
                             iter.kind(),
                             iter.value(),
                         )?;
+                        if !keep_going {
+                            return Ok(());
+                        }
                     }
                     iter.next();
                 }
@@ -1526,7 +1547,7 @@ impl LsmEngine {
                             break;
                         }
                         if is_visible(entry.seq_no) {
-                            try_emit(
+                            let keep_going = try_emit(
                                 &mut winners,
                                 &mut pending_puts,
                                 &mut f,
@@ -1535,6 +1556,9 @@ impl LsmEngine {
                                 entry.kind,
                                 &entry.value,
                             )?;
+                            if !keep_going {
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -1543,7 +1567,7 @@ impl LsmEngine {
                         break;
                     }
                     if is_visible(entry.seq_no) {
-                        try_emit(
+                        let keep_going = try_emit(
                             &mut winners,
                             &mut pending_puts,
                             &mut f,
@@ -1552,6 +1576,9 @@ impl LsmEngine {
                             entry.kind,
                             &entry.value,
                         )?;
+                        if !keep_going {
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -1562,7 +1589,9 @@ impl LsmEngine {
             for (key, val) in ov {
                 if key.starts_with(prefix) {
                     if let Some(v) = val {
-                        f(key, v)?;
+                        if !f(key, v)? {
+                            return Ok(());
+                        }
                     }
                 }
             }

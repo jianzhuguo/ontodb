@@ -660,6 +660,52 @@ impl IndexManager {
         }
     }
 
+    /// Like [`Self::lookup_eq_read`], but returns at most `limit` pks.
+    /// Used by SELECT ... WHERE indexed = x LIMIT n — avoids materializing
+    /// 500k pks just to keep the first 100.
+    pub fn lookup_eq_read_limit(
+        &self,
+        class: &str,
+        column: &str,
+        value: &serde_json::Value,
+        limit: usize,
+    ) -> Option<Vec<Vec<u8>>> {
+        let key = (class.to_string(), column.to_string());
+        let encoded = Self::encode_value(value);
+
+        let mem_has = self.indexes.contains_key(&key);
+        let disk_has = self.disk_indexes.contains_key(&key);
+        if !mem_has && !disk_has {
+            return None;
+        }
+
+        // Fast path: complete memory tree, take only what we need.
+        if mem_has && self.mem_complete.contains(&key) {
+            return self
+                .indexes
+                .get(&key)
+                .map(|tree| tree.lookup_limited(&encoded, limit));
+        }
+
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        if let Some(tree) = self.indexes.get(&key) {
+            out.extend(tree.lookup_limited(&encoded, limit));
+        }
+        if out.len() < limit {
+            if let Some(disk_idx) = self.disk_indexes.get(&key) {
+                let remain = limit - out.len();
+                if let Ok(pks) = disk_idx.lock().unwrap().lookup_limited(&encoded, remain) {
+                    out.extend(pks);
+                }
+            }
+        }
+        if out.is_empty() && !mem_has && !disk_has {
+            return None;
+        }
+        out.truncate(limit);
+        Some(out)
+    }
+
     /// Count of primary keys matching an equality predicate, without
     /// materializing the pk list. Returns None when no index exists.
     pub fn count_eq_read(
