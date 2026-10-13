@@ -96,6 +96,87 @@ impl IntoResponse for StreamedRows {
     }
 }
 
+/// One event from the executor's row stream.
+enum StreamEvent {
+    Batch(Vec<serde_json::Map<String, Value>>),
+    Error(String),
+    Done,
+}
+
+/// Streaming JSON body built from executor row batches.
+///
+/// First batch is handed over separately so the handler can still return an
+/// HTTP error when the query fails before any row is produced.
+struct StreamedRowsChannel {
+    first: Vec<serde_json::Map<String, Value>>,
+    rx: std::sync::mpsc::Receiver<StreamEvent>,
+    start: std::time::Instant,
+}
+
+impl IntoResponse for StreamedRowsChannel {
+    fn into_response(self) -> axum::response::Response {
+        let StreamedRowsChannel { first, rx, start } = self;
+        let header = r#"{"success":true,"data":["#.to_string();
+
+        // Bridge the sync executor channel into an async byte stream.
+        let (tx, body_rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(8);
+        tokio::task::spawn_blocking(move || {
+            let mut first_row = true;
+            let send_rows = |rows: Vec<serde_json::Map<String, Value>>,
+                                 first_row: &mut bool|
+             -> bool {
+                for row in rows {
+                    let mut buf = Vec::with_capacity(256);
+                    if !*first_row {
+                        buf.push(b',');
+                    }
+                    *first_row = false;
+                    if serde_json::to_writer(&mut buf, &row).is_err() {
+                        buf.extend_from_slice(b"null");
+                    }
+                    if tx.blocking_send(Ok(Bytes::from(buf))).is_err() {
+                        return false;
+                    }
+                }
+                true
+            };
+
+            let _ = tx.blocking_send(Ok(Bytes::from(header)));
+            if !send_rows(first, &mut first_row) {
+                return;
+            }
+            loop {
+                match rx.recv() {
+                    Ok(StreamEvent::Batch(rows)) => {
+                        if !send_rows(rows, &mut first_row) {
+                            return;
+                        }
+                    }
+                    Ok(StreamEvent::Error(_)) | Err(_) => {
+                        // Mid-stream failure: close the array early. Client
+                        // sees a well-formed (truncated) JSON document.
+                        break;
+                    }
+                    Ok(StreamEvent::Done) => break,
+                }
+            }
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let footer = format!(r#"],"elapsed_ms":{}}}"#, elapsed_ms);
+            let _ = tx.blocking_send(Ok(Bytes::from(footer)));
+        });
+
+        let body_stream = futures::stream::unfold(body_rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let body = Body::from_stream(body_stream);
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response()
+    }
+}
+
 /// Validates a user-supplied filter expression to prevent SQL injection.
 /// Only allows simple comparison expressions (e.g., "price > 100", "name = 'foo'").
 fn validate_filter(filter: &str) -> Result<(), String> {
@@ -1433,6 +1514,121 @@ async fn execute_query(
 
     let t_parse = start.elapsed().as_secs_f64() * 1000.0;
     let t_exec_start = std::time::Instant::now();
+
+    // Streaming path: simple SELECTs without ORDER BY/GROUP BY/etc. start
+    // flushing rows while the rest of the scan is still running. This is what
+    // cuts TTFT — the socket sees the first batch before the full result set
+    // is materialized.
+    let streamable = !req.pretty
+        && onto_query::QueryExecutor::is_read_only_query(&ast)
+        && onto_query::QueryExecutor::is_streamable_select(&ast);
+
+    if streamable {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<StreamEvent>(8);
+        let executor = state.executor.clone();
+        let ast_for_stream = ast.clone();
+        std::thread::spawn(move || {
+            let send = |ev: StreamEvent| -> bool { tx.send(ev).is_ok() };
+            let mut sink = |batch: Vec<serde_json::Map<String, Value>>| -> bool {
+                send(StreamEvent::Batch(batch))
+            };
+            match executor.execute_read_streaming(&ast_for_stream, &mut sink) {
+                Ok(_) => {
+                    let _ = send(StreamEvent::Done);
+                }
+                Err(e) => {
+                    let _ = send(StreamEvent::Error(e.to_string()));
+                }
+            }
+        });
+
+        // Wait for the first event so pre-row failures can still be HTTP errors.
+        let first = rx.recv();
+        let t_exec = t_exec_start.elapsed().as_secs_f64() * 1000.0;
+        match first {
+            Ok(StreamEvent::Batch(batch)) => {
+                let row_count = batch.len();
+                let elapsed = start.elapsed().as_secs_f64();
+                state.metrics.record_query(query_type, elapsed, true);
+                let audit_entry = state.audit.create_query_entry(
+                    &client_ip,
+                    None,
+                    query_type,
+                    query,
+                    elapsed * 1000.0,
+                    true,
+                    None,
+                );
+                state.audit.log(audit_entry);
+                if elapsed >= SLOW_QUERY_THRESHOLD_SECS {
+                    state.metrics.slow_queries_total.inc();
+                    tracing::warn!(
+                        target: "slow_query",
+                        query_type = query_type,
+                        elapsed_ms = elapsed * 1000.0,
+                        query = truncate_utf8(query, 200),
+                        "slow query detected"
+                    );
+                    tracing::info!(
+                        target: "query_timing",
+                        parse_ms = t_parse,
+                        exec_ms = t_exec,
+                        serialize_ms = 0.0,
+                        total_ms = elapsed * 1000.0,
+                        rows = row_count,
+                        "query timing breakdown (streaming, first batch)"
+                    );
+                }
+                return (
+                    StatusCode::OK,
+                    StreamedRowsChannel {
+                        first: batch,
+                        rx,
+                        start,
+                    },
+                )
+                    .into_response();
+            }
+            Ok(StreamEvent::Done) | Err(_) => {
+                // Empty result or the producer died before any batch.
+                let elapsed = start.elapsed().as_secs_f64();
+                state.metrics.record_query(query_type, elapsed, true);
+                let audit_entry = state.audit.create_query_entry(
+                    &client_ip,
+                    None,
+                    query_type,
+                    query,
+                    elapsed * 1000.0,
+                    true,
+                    None,
+                );
+                state.audit.log(audit_entry);
+                let response = ApiResponse::success(json!([]), elapsed * 1000.0);
+                return (StatusCode::OK, PrettyJson(response, false)).into_response();
+            }
+            Ok(StreamEvent::Error(msg)) => {
+                let elapsed = start.elapsed().as_secs_f64();
+                state.metrics.record_query(query_type, elapsed, false);
+                let audit_entry = state.audit.create_query_entry(
+                    &client_ip,
+                    None,
+                    query_type,
+                    query,
+                    elapsed * 1000.0,
+                    false,
+                    Some(msg.clone()),
+                );
+                state.audit.log(audit_entry);
+                let safe_msg = sanitize_error(&msg);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    PrettyJson(ApiResponse::<Value>::error(safe_msg), false),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let result = if onto_query::QueryExecutor::is_read_only_query(&ast) {
         state.executor.execute_read(&ast)
     } else {

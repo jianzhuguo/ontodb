@@ -6703,6 +6703,471 @@ impl QueryExecutor {
         Ok(rows)
     }
 
+    /// Fetch rows in chunks, invoking `sink` after each chunk.
+    /// `sink` returns `false` to stop early (client disconnect / LIMIT).
+    fn fetch_rows_by_pks_stream(
+        engine: &LsmEngine,
+        pkeys: &[Vec<u8>],
+        projected_columns: Option<&[String]>,
+        batch_size: usize,
+        sink: &mut dyn FnMut(Vec<Map<String, Value>>) -> bool,
+    ) -> Result<()> {
+        let cols = projected_columns.unwrap_or(&[]);
+        let batch_size = batch_size.max(1);
+        for chunk in pkeys.chunks(batch_size) {
+            let values = engine.multi_get(chunk)?;
+            let mut rows = Vec::with_capacity(values.len());
+            for val_bytes in values.into_iter().flatten() {
+                if let Some(doc) = simd_parse_row_projected(&val_bytes, cols) {
+                    rows.push(doc);
+                }
+            }
+            if !sink(rows) {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Rows per batch emitted by [`Self::execute_read_streaming`].
+    /// Small enough to cut TTFT, large enough to amortize channel/JSON overhead.
+    pub const STREAM_BATCH_ROWS: usize = 2048;
+
+    /// True when a SELECT can be streamed without full materialization.
+    /// Rejects ORDER BY / GROUP BY / DISTINCT / aggregates / windows / joins.
+    pub fn is_streamable_select(ast: &QueryAst) -> bool {
+        let QueryAst::Select {
+            distinct,
+            columns,
+            joins,
+            group_by,
+            having,
+            order_by,
+            ..
+        } = ast
+        else {
+            return false;
+        };
+        if *distinct
+            || !joins.is_empty()
+            || group_by.is_some()
+            || having.is_some()
+            || !order_by.is_empty()
+            || Self::columns_have_aggregates(columns)
+        {
+            return false;
+        }
+        if let SelectColumns::Columns(items) = columns {
+            if items
+                .iter()
+                .any(|item| matches!(item, SelectItem::WindowFunction(_)))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Stream SELECT rows in batches to `sink`.
+    ///
+    /// `sink` returns `false` to stop early (client gone / LIMIT reached).
+    /// Returns the number of rows emitted.
+    ///
+    /// Only simple single-table SELECTs are streamed; other shapes fall back
+    /// to full materialization and one or more `sink` calls.
+    pub fn execute_read_streaming(
+        &self,
+        ast: &QueryAst,
+        mut sink: impl FnMut(Vec<Map<String, Value>>) -> bool,
+    ) -> Result<usize> {
+        self.arm_timeout();
+        if !Self::is_streamable_select(ast) {
+            // Fallback: materialize, then emit in batches so the HTTP layer
+            // can still flush incrementally.
+            let result = self.execute_read(ast)?;
+            let rows = match result {
+                QueryResult::Rows(rows) => rows,
+                QueryResult::Success(_) => return Ok(0),
+            };
+            return Self::emit_rows_in_batches(rows, &mut sink);
+        }
+
+        let QueryAst::Select {
+            columns,
+            from,
+            from_alias,
+            filter: _,
+            limit,
+            offset,
+            ..
+        } = ast
+        else {
+            unreachable!("is_streamable_select");
+        };
+
+        if !from.starts_with("system.") {
+            self.ensure_statistics(from, &self.engine);
+        }
+
+        let cached_plan = {
+            let ast_hash = Self::hash_ast(ast);
+            let cached = self
+                .plan_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(ast_hash);
+            if cached.is_some() {
+                self.runtime_stats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .plan_cache_hits += 1;
+                cached
+            } else {
+                let plan = self
+                    .planner
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .plan(ast);
+                if let Ok(ref p) = plan {
+                    self.plan_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(ast_hash, p.clone());
+                }
+                self.runtime_stats
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .plan_cache_misses += 1;
+                plan.ok()
+            }
+        };
+        let Some(plan) = cached_plan else {
+            return Err(CoreError::Custom(
+                "failed to generate execution plan".to_string(),
+            ));
+        };
+
+        let proj_cols = Self::projected_column_names(columns);
+        let proj_ref: Option<&[String]> = if proj_cols.is_empty() {
+            None
+        } else {
+            Some(&proj_cols)
+        };
+        let alias = from_alias.as_deref();
+        let skip = offset.unwrap_or(0);
+        let take = *limit;
+
+        let mut emitted = 0usize;
+        let mut skipped = 0usize;
+        let mut stop = false;
+        {
+            let mut sink_batch = |mut rows: Vec<Map<String, Value>>| -> bool {
+                if stop {
+                    return false;
+                }
+                if skipped < skip {
+                    let drop_n = (skip - skipped).min(rows.len());
+                    rows.drain(..drop_n);
+                    skipped += drop_n;
+                    if rows.is_empty() {
+                        return true;
+                    }
+                }
+                if let Some(lim) = take {
+                    let room = lim.saturating_sub(emitted);
+                    if room == 0 {
+                        stop = true;
+                        return false;
+                    }
+                    if rows.len() > room {
+                        rows.truncate(room);
+                    }
+                }
+                emitted += rows.len();
+                if let Some(a) = alias {
+                    Self::apply_alias(&mut rows, a);
+                }
+                if rows.is_empty() {
+                    return true;
+                }
+                let more = sink(rows);
+                if !more {
+                    stop = true;
+                }
+                more
+            };
+
+            // Unwrap plan shape: Projection -> scan, or scan directly.
+            let mut node = &plan.root;
+            if let PlanNode::Projection { input, columns: pcols, .. } = node {
+                // Prefer pushdown of projected columns to the scan.
+                if !Self::columns_have_aggregates(pcols) {
+                    node = input.as_ref();
+                }
+            }
+            if let PlanNode::Limit { input, .. } = node {
+                // Streaming respects LIMIT via take; still unwrap to the scan.
+                node = input.as_ref();
+            }
+
+            match node {
+                PlanNode::IndexScan {
+                    table,
+                    index_column,
+                    filter: scan_filter,
+                    ..
+                } => {
+                    // Push LIMIT into the index lookup so we never materialize
+                    // 492k pkeys for `WHERE idx = x LIMIT 1000`.
+                    let lookup_limit = take.map(|l| l.saturating_add(skip).max(1));
+                    self.stream_index_scan_read(
+                        &self.engine,
+                        table,
+                        index_column,
+                        scan_filter,
+                        proj_ref,
+                        lookup_limit,
+                        &mut sink_batch,
+                    )?;
+                }
+                PlanNode::SeqScan {
+                    table,
+                    filter: scan_filter,
+                    ..
+                } => {
+                    self.stream_seq_scan_read(
+                        &self.engine,
+                        table,
+                        scan_filter,
+                        proj_ref,
+                        &mut sink_batch,
+                    )?;
+                }
+                _ => {
+                    // Unexpected shape — materialize and emit.
+                    let rows = self.execute_plan_node_read(node, &self.engine)?;
+                    Self::emit_rows_in_batches(rows, &mut sink_batch)?;
+                }
+            }
+        }
+
+        Ok(emitted)
+    }
+
+    fn emit_rows_in_batches(
+        rows: Vec<Map<String, Value>>,
+        sink: &mut dyn FnMut(Vec<Map<String, Value>>) -> bool,
+    ) -> Result<usize> {
+        let total = rows.len();
+        for chunk in rows.chunks(Self::STREAM_BATCH_ROWS) {
+            if !sink(chunk.to_vec()) {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Extract bare column names for projection pushdown (same rules as
+    /// `plan_index_scan_read_limit`).
+    fn projected_column_names(columns: &SelectColumns) -> Vec<String> {
+        match columns {
+            SelectColumns::Columns(items) => {
+                let mut cols = Vec::with_capacity(items.len() + 1);
+                for item in items {
+                    if let SelectItem::Column(col) = item {
+                        let real = if let Some(pos) = col.find(" as ") {
+                            &col[..pos]
+                        } else {
+                            col.as_str()
+                        };
+                        let name = real.split('.').next_back().unwrap_or(real).to_string();
+                        if !cols.contains(&name) {
+                            cols.push(name);
+                        }
+                    }
+                }
+                cols
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Streaming index scan: collect pkeys, then fetch rows in batches.
+    /// `lookup_limit` bounds how many pkeys the index itself returns (LIMIT pushdown).
+    fn stream_index_scan_read(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        index_column: &str,
+        filter: &Option<FilterExpr>,
+        projected_columns: Option<&[String]>,
+        lookup_limit: Option<usize>,
+        sink: &mut dyn FnMut(Vec<Map<String, Value>>) -> bool,
+    ) -> Result<()> {
+        let class_hierarchy = self.get_class_hierarchy_read(engine, table);
+        let Some(f) = filter else {
+            return self.stream_seq_scan_read(engine, table, filter, projected_columns, sink);
+        };
+
+        let mut all_pkeys: Vec<Vec<u8>> = Vec::new();
+        for scan_class in &class_hierarchy {
+            if engine.has_index(scan_class, index_column) {
+                let pkeys = match (f, lookup_limit) {
+                    (FilterExpr::Eq(_, val), Some(lim)) => {
+                        let json_val = Self::literal_to_json_static(val);
+                        let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+                        mgr.lookup_eq_read_limit(scan_class, index_column, &json_val, lim)
+                    }
+                    _ => Self::try_index_scan_single_read(engine, scan_class, f),
+                };
+                if let Some(pkeys) = pkeys {
+                    all_pkeys.extend(pkeys);
+                }
+            }
+            if let Some(lim) = lookup_limit {
+                if all_pkeys.len() >= lim {
+                    all_pkeys.truncate(lim);
+                    break;
+                }
+            }
+        }
+        if let Some(lim) = lookup_limit {
+            all_pkeys.truncate(lim);
+        }
+        if all_pkeys.is_empty() {
+            if engine.has_index(table, index_column) {
+                return Ok(());
+            }
+            return self.stream_seq_scan_read(engine, table, filter, projected_columns, sink);
+        }
+
+        let hierarchy = class_hierarchy;
+        Self::fetch_rows_by_pks_stream(
+            engine,
+            &all_pkeys,
+            projected_columns,
+            Self::STREAM_BATCH_ROWS,
+            &mut |mut rows| {
+                rows.retain(|row| {
+                    row.get("__class__")
+                        .and_then(|v| v.as_str())
+                        .map(|c| hierarchy.contains(c))
+                        .unwrap_or(false)
+                });
+                if rows.is_empty() {
+                    return true;
+                }
+                sink(rows)
+            },
+        )
+    }
+
+    /// Streaming sequential scan via `for_each_live_prefix_until`.
+    fn stream_seq_scan_read(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        filter: &Option<FilterExpr>,
+        projected_columns: Option<&[String]>,
+        sink: &mut dyn FnMut(Vec<Map<String, Value>>) -> bool,
+    ) -> Result<()> {
+        let class_hierarchy = self.get_class_hierarchy_read(engine, table);
+        let proj_cols: Vec<String> = projected_columns.unwrap_or(&[]).to_vec();
+        let fast_filter_cols = Self::extract_fast_filter_columns(filter);
+        let batch = Self::STREAM_BATCH_ROWS;
+        let mut buf: Vec<Map<String, Value>> = Vec::with_capacity(batch);
+        let mut scan_count: u64 = 0;
+        let mut stop = false;
+
+        for scan_class in &class_hierarchy {
+            if stop {
+                break;
+            }
+            let prefix = format!("{}::", scan_class);
+            let mut on_row = |key: &[u8], val_bytes: &[u8]| -> Result<bool> {
+                if stop {
+                    return Ok(false);
+                }
+                scan_count += 1;
+                if scan_count & 0x3FF == 0 {
+                    self.check_timeout()?;
+                }
+                if !fast_filter_cols.is_empty()
+                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols)
+                {
+                    return Ok(true);
+                }
+                let mut push = |doc: Map<String, Value>, buf: &mut Vec<Map<String, Value>>| -> bool {
+                    buf.push(doc);
+                    if buf.len() >= batch {
+                        let rows = std::mem::take(buf);
+                        if !sink(rows) {
+                            stop = true;
+                            return false;
+                        }
+                    }
+                    true
+                };
+                if let Some(brow) = BinaryRow::parse(val_bytes) {
+                    if !brow.class_in_hierarchy(&class_hierarchy) {
+                        return Ok(true);
+                    }
+                    if let Some(f) = filter {
+                        match eval_binary_filter(&brow, f) {
+                            Some(true) => {}
+                            Some(false) => return Ok(true),
+                            None => {
+                                let mut doc = match brow.to_map() {
+                                    Some(d) => d,
+                                    None => return Ok(true),
+                                };
+                                if !self.eval_filter_read(engine, &doc, f) {
+                                    return Ok(true);
+                                }
+                                self.annotate_scanned_row(table, key, &mut doc);
+                                return Ok(push(doc, &mut buf));
+                            }
+                        }
+                    }
+                    if let Some(mut doc) = brow.to_map_projected(&proj_cols) {
+                        self.annotate_scanned_row(table, key, &mut doc);
+                        return Ok(push(doc, &mut buf));
+                    }
+                    return Ok(true);
+                }
+                // JSON fallback
+                if let Ok(serde_json::Value::Object(mut doc)) =
+                    serde_json::from_slice::<serde_json::Value>(val_bytes)
+                {
+                    let cls = doc
+                        .get("__class__")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !class_hierarchy.contains(cls) {
+                        return Ok(true);
+                    }
+                    if let Some(f) = filter {
+                        if !self.eval_filter_read(engine, &doc, f) {
+                            return Ok(true);
+                        }
+                    }
+                    self.annotate_scanned_row(table, key, &mut doc);
+                    return Ok(push(doc, &mut buf));
+                }
+                Ok(true)
+            };
+            engine.for_each_live_prefix_until(prefix.as_bytes(), None, None, &mut on_row)?;
+            if stop {
+                break;
+            }
+        }
+        if !stop && !buf.is_empty() {
+            let rows = std::mem::take(&mut buf);
+            sink(rows);
+        }
+        Ok(())
+    }
+
     /// Read-only vector search with &LsmEngine.
     fn plan_vector_search_read(
         &self,
