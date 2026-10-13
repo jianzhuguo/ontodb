@@ -42,6 +42,11 @@ pub struct IndexManager {
     /// Disk-based B+Tree indexes, keyed by (class, column).
     /// Uses Mutex for interior mutability to allow read-path lookups.
     disk_indexes: HashMap<(String, String), Mutex<BTreeIndex>>,
+    /// Keys whose in-memory tree is known to hold the complete entry set
+    /// (bulk_load / rebuild). Lookups skip the disk merge for these — merging
+    /// 500k pks from disk on every query costs ~250ms for nothing when both
+    /// sides are in sync. Cleared whenever the memory tree is recreated empty.
+    mem_complete: std::collections::HashSet<(String, String)>,
     /// Base directory for disk-based index files.
     data_dir: Option<PathBuf>,
     /// Storage mode configuration.
@@ -54,6 +59,7 @@ impl IndexManager {
         Self {
             indexes: HashMap::new(),
             disk_indexes: HashMap::new(),
+            mem_complete: std::collections::HashSet::new(),
             data_dir: None,
             _storage_mode: IndexStorageMode::default(),
         }
@@ -64,6 +70,7 @@ impl IndexManager {
         Self {
             indexes: HashMap::new(),
             disk_indexes: HashMap::new(),
+            mem_complete: std::collections::HashSet::new(),
             data_dir: Some(data_dir.to_path_buf()),
             _storage_mode: mode,
         }
@@ -85,6 +92,7 @@ impl IndexManager {
         self.indexes
             .entry(key.clone())
             .or_insert_with(|| BPlusTree::new(class, column));
+        self.mem_complete.remove(&key);
 
         // Create disk-based index if configured
         if let Some(path) = self.index_path(class, column) {
@@ -130,6 +138,9 @@ impl IndexManager {
             idx.flush()?;
         }
 
+        // Memory tree now holds the complete entry set.
+        self.mem_complete.insert(key);
+
         Ok(())
     }
 
@@ -165,11 +176,13 @@ impl IndexManager {
                     match BTreeIndex::open(&path) {
                         Ok(idx) => {
                             let key = (class.to_string(), column.to_string());
-                            self.disk_indexes.insert(key, Mutex::new(idx));
-                            // Also create in-memory index
+                            self.disk_indexes.insert(key.clone(), Mutex::new(idx));
+                            // Also create in-memory index (empty — disk holds the
+                            // history until rebuilt; mark incomplete so lookups merge).
                             self.indexes
                                 .entry((class.to_string(), column.to_string()))
                                 .or_insert_with(|| BPlusTree::new(class, column));
+                            self.mem_complete.remove(&key);
                         }
                         Err(e) => {
                             eprintln!(
@@ -190,6 +203,7 @@ impl IndexManager {
     /// Drops an index on a class.column.
     pub fn drop_index(&mut self, class: &str, column: &str) -> bool {
         let key = (class.to_string(), column.to_string());
+        self.mem_complete.remove(&key);
         let in_memory_removed = self.indexes.remove(&key).is_some();
 
         // Also remove disk-based index
@@ -473,8 +487,10 @@ impl IndexManager {
     // ── Read-only lookup methods (for concurrent read path, &self) ──
 
     /// Read-only equality lookup using in-memory index first, then disk-based index.
-    /// Results are merged: after restart the in-memory tree is empty while the
-    /// disk index holds history, and new writes land in both.
+    /// Results are merged only when the in-memory tree is not known-complete
+    /// (e.g. right after restart). When bulk_load/rebuild has populated memory
+    /// fully, the disk merge is skipped — merging 500k pks per query costs
+    /// ~250ms for nothing.
     pub fn lookup_eq_read(
         &self,
         class: &str,
@@ -490,18 +506,35 @@ impl IndexManager {
             return None;
         }
 
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        if let Some(tree) = self.indexes.get(&key) {
-            out.extend(tree.lookup(&encoded));
+        if mem_has && self.mem_complete.contains(&key) {
+            return self.indexes.get(&key).map(|tree| tree.lookup(&encoded));
         }
-        if let Some(disk_idx) = self.disk_indexes.get(&key) {
-            if let Ok(pks) = disk_idx.lock().unwrap().lookup(&encoded) {
-                out.extend(pks);
+
+        // Merge only when both sides may hold rows; a single source is already
+        // unique+sorted (disk walks value||0x00||pk in order), so skip the
+        // 500k-element sort/dedup on the restart path.
+        let mem_pks = self.indexes.get(&key).map(|tree| tree.lookup(&encoded));
+        let disk_pks = match self.disk_indexes.get(&key) {
+            Some(disk_idx) => disk_idx.lock().unwrap().lookup(&encoded).ok(),
+            None => None,
+        };
+        match (mem_pks, disk_pks) {
+            (Some(mut m), Some(d)) => {
+                if m.is_empty() {
+                    return Some(d);
+                }
+                if d.is_empty() {
+                    return Some(m);
+                }
+                m.extend(d);
+                m.sort();
+                m.dedup();
+                Some(m)
             }
+            (Some(m), None) => Some(m),
+            (None, Some(d)) => Some(d),
+            (None, None) => None,
         }
-        out.sort();
-        out.dedup();
-        Some(out)
     }
 
     /// Read-only range scan using in-memory and disk indexes (merged).
@@ -522,22 +555,26 @@ impl IndexManager {
             return None;
         }
 
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        if let Some(tree) = self.indexes.get(&key) {
-            out.extend(tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref()));
+        if mem_has && self.mem_complete.contains(&key) {
+            return self
+                .indexes
+                .get(&key)
+                .map(|tree| tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref()));
         }
-        if let Some(disk_idx) = self.disk_indexes.get(&key) {
-            if let Ok(pks) = disk_idx
+
+        let mem_pks = self
+            .indexes
+            .get(&key)
+            .map(|tree| tree.range_scan(low_bytes.as_deref(), high_bytes.as_deref()));
+        let disk_pks = match self.disk_indexes.get(&key) {
+            Some(disk_idx) => disk_idx
                 .lock()
                 .unwrap()
                 .range_scan(low_bytes.as_deref(), high_bytes.as_deref())
-            {
-                out.extend(pks);
-            }
-        }
-        out.sort();
-        out.dedup();
-        Some(out)
+                .ok(),
+            None => None,
+        };
+        Self::merge_pks(mem_pks, disk_pks)
     }
 
     /// Read-only GT lookup using in-memory and disk indexes (merged).
@@ -556,20 +593,20 @@ impl IndexManager {
             return None;
         }
 
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        if let Some(tree) = self.indexes.get(&key) {
-            out.extend(tree.gt_scan(&encoded));
+        if mem_has && self.mem_complete.contains(&key) {
+            return self.indexes.get(&key).map(|tree| tree.gt_scan(&encoded));
         }
-        if let Some(disk_idx) = self.disk_indexes.get(&key) {
-            let mut lo = encoded.clone();
-            lo.push(0u8);
-            if let Ok(pks) = disk_idx.lock().unwrap().range_scan(Some(&lo), None) {
-                out.extend(pks);
+
+        let mem_pks = self.indexes.get(&key).map(|tree| tree.gt_scan(&encoded));
+        let disk_pks = match self.disk_indexes.get(&key) {
+            Some(disk_idx) => {
+                let mut lo = encoded.clone();
+                lo.push(0u8);
+                disk_idx.lock().unwrap().range_scan(Some(&lo), None).ok()
             }
-        }
-        out.sort();
-        out.dedup();
-        Some(out)
+            None => None,
+        };
+        Self::merge_pks(mem_pks, disk_pks)
     }
 
     /// Read-only LT lookup using in-memory and disk indexes (merged).
@@ -588,18 +625,39 @@ impl IndexManager {
             return None;
         }
 
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        if let Some(tree) = self.indexes.get(&key) {
-            out.extend(tree.lt_scan(&encoded));
+        if mem_has && self.mem_complete.contains(&key) {
+            return self.indexes.get(&key).map(|tree| tree.lt_scan(&encoded));
         }
-        if let Some(disk_idx) = self.disk_indexes.get(&key) {
-            if let Ok(pks) = disk_idx.lock().unwrap().range_scan(None, Some(&encoded)) {
-                out.extend(pks);
+
+        let mem_pks = self.indexes.get(&key).map(|tree| tree.lt_scan(&encoded));
+        let disk_pks = match self.disk_indexes.get(&key) {
+            Some(disk_idx) => disk_idx.lock().unwrap().range_scan(None, Some(&encoded)).ok(),
+            None => None,
+        };
+        Self::merge_pks(mem_pks, disk_pks)
+    }
+
+    /// Merges two optional pk lists. Skips sort/dedup when only one side has
+    /// data — a single source is already unique. Both-sides merges are rare
+    /// (only when memory is partially rebuilt after restart).
+    fn merge_pks(mem: Option<Vec<Vec<u8>>>, disk: Option<Vec<Vec<u8>>>) -> Option<Vec<Vec<u8>>> {
+        match (mem, disk) {
+            (Some(mut m), Some(d)) => {
+                if m.is_empty() {
+                    return Some(d);
+                }
+                if d.is_empty() {
+                    return Some(m);
+                }
+                m.extend(d);
+                m.sort();
+                m.dedup();
+                Some(m)
             }
+            (Some(m), None) => Some(m),
+            (None, Some(d)) => Some(d),
+            (None, None) => None,
         }
-        out.sort();
-        out.dedup();
-        Some(out)
     }
 
     /// Builds the index key format:
