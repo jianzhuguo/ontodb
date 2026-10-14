@@ -1093,15 +1093,27 @@ impl<'a> SsTableIterator<'a> {
     }
 
     /// Returns the current key as a zero-copy slice into the block data.
+    /// Returns empty slice if offsets are out of bounds (corrupted entry).
     pub fn key(&self) -> &[u8] {
-        debug_assert!(self.current_key_end <= self.block_data.len());
-        &self.block_data[self.current_key_start..self.current_key_end]
+        if self.current_key_start <= self.current_key_end
+            && self.current_key_end <= self.block_data.len()
+        {
+            &self.block_data[self.current_key_start..self.current_key_end]
+        } else {
+            &[]
+        }
     }
 
     /// Returns the current value as a zero-copy slice into the block data.
+    /// Returns empty slice if offsets are out of bounds (corrupted entry).
     pub fn value(&self) -> &[u8] {
-        debug_assert!(self.current_value_end <= self.block_data.len());
-        &self.block_data[self.current_value_start..self.current_value_end]
+        if self.current_value_start <= self.current_value_end
+            && self.current_value_end <= self.block_data.len()
+        {
+            &self.block_data[self.current_value_start..self.current_value_end]
+        } else {
+            &[]
+        }
     }
 
     pub fn seq_no(&self) -> SeqNo {

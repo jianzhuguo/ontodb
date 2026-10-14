@@ -66,8 +66,16 @@ struct Args {
     data_dir: PathBuf,
 
     /// MemTable size limit in bytes
-    #[arg(short, long, default_value = "4194304", env = "STORAGE_MEMTABLE_SIZE")]
+    #[arg(short, long, default_value = "268435456", env = "STORAGE_MEMTABLE_SIZE")]
     memtable_size: usize,
+
+    /// zstd compression level for SSTable blocks (0 = disabled, 1-21 = enabled)
+    #[arg(long, default_value = "1", env = "STORAGE_COMPRESSION_LEVEL")]
+    compression_level: i32,
+
+    /// Disable fsync on commit (faster writes, survives process crash but not OS crash)
+    #[arg(long, env = "STORAGE_NO_SYNC_WAL")]
+    no_sync_wal: bool,
 
     /// Secondary index storage mode: inmemory | disk | hybrid
     #[arg(
@@ -306,6 +314,8 @@ fn main() -> Result<()> {
     let options = StorageOptions {
         data_dir: args.data_dir,
         memtable_size_limit: args.memtable_size,
+        compression_level: args.compression_level,
+        sync_wal_on_commit: !args.no_sync_wal,
         index_storage_mode: Some(index_storage_mode),
         ..Default::default()
     };
