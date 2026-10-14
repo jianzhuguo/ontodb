@@ -1141,6 +1141,25 @@ impl<'a> SsTableIterator<'a> {
         n
     }
 
+    /// Like [`Self::drain_current_block`], but copies only `(key, seq, kind)`.
+    ///
+    /// Values are skipped entirely (still walked for framing, never allocated).
+    /// Used by COUNT / winner-collection paths that must stay O(keys).
+    /// Returns the number of entries appended.
+    pub fn drain_current_block_keys(
+        &mut self,
+        out: &mut Vec<(Vec<u8>, SeqNo, EntryKind)>,
+    ) -> usize {
+        let start_block = self.block_idx;
+        let mut n = 0;
+        while self.valid && self.block_idx == start_block {
+            out.push((self.key().to_vec(), self.seq_no(), self.kind()));
+            n += 1;
+            self.advance_to_next_entry();
+        }
+        n
+    }
+
     /// Seek to the first key >= `target`. Uses binary search on block index
     /// to jump directly to the right block, then scans within the block.
     /// This avoids linear scanning from the beginning for prefix scans.
@@ -1363,6 +1382,56 @@ mod tests {
         iter.seek(b"a");
         assert!(iter.is_valid());
         assert_eq!(iter.seq_no(), 1);
+    }
+
+    /// drain_current_block_keys must visit every entry in the block with
+    /// (key, seq, kind) only — same coverage as drain_current_block, without
+    /// copying values. COUNT paths rely on this staying O(keys).
+    #[test]
+    fn test_drain_current_block_keys_matches_full_drain() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("drain_keys.sst");
+
+        let mut builder = SsTableBuilder::new();
+        for i in 0..80u32 {
+            let key = format!("k{:04}", i);
+            let value = format!("v{:04}_{}", i, "x".repeat(200));
+            let entry = if i % 7 == 0 {
+                Entry::delete(key.into_bytes(), 10 + i as u64)
+            } else {
+                Entry::put(key.into_bytes(), value.into_bytes(), 10 + i as u64)
+            };
+            builder.add(&entry);
+        }
+        builder.build(&path).expect("should be valid");
+        let sst = SsTable::open(&path).expect("should be valid");
+
+        // Full drain reference.
+        let mut full = Vec::new();
+        {
+            let mut iter = sst.iter().expect("should be valid");
+            while iter.is_valid() {
+                iter.drain_current_block(&mut full);
+            }
+        }
+        assert!(!full.is_empty());
+
+        // Key-only drain must match on (key, seq, kind).
+        let mut keys = Vec::new();
+        {
+            let mut iter = sst.iter().expect("should be valid");
+            while iter.is_valid() {
+                iter.drain_current_block_keys(&mut keys);
+            }
+        }
+        assert_eq!(keys.len(), full.len());
+        for (i, ((k, seq, kind), (fk, _fv, fseq, fkind))) in
+            keys.iter().zip(full.iter()).enumerate()
+        {
+            assert_eq!(k, fk, "key mismatch at {i}");
+            assert_eq!(seq, fseq, "seq mismatch at {i}");
+            assert_eq!(kind, fkind, "kind mismatch at {i}");
+        }
     }
 
     #[test]

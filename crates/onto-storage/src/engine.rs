@@ -1193,31 +1193,28 @@ impl LsmEngine {
     }
 
     /// Count live entries matching a prefix. More efficient than scan_prefix().len()
-    /// because it uses a lightweight HashSet for keys instead of storing values.
-    /// Returns (live_count, tombstone_count).
+    /// because it never copies values. Returns (live_count, tombstone_count).
     pub fn count_prefix(&self, prefix: &[u8]) -> Result<(usize, usize)> {
-        self.count_prefix_with(prefix, None, |_| Ok(true))
+        // Pass 1 only: every winning Put is live. No value predicate → no pass 2.
+        let winners = self.collect_prefix_winners(prefix, None)?;
+        let mut live = 0usize;
+        let mut tombstones = 0usize;
+        for kind in winners.values().map(|(_, k)| *k) {
+            match kind {
+                EntryKind::Put => live += 1,
+                EntryKind::Delete => tombstones += 1,
+            }
+        }
+        Ok((live, tombstones))
     }
 
-    /// Count live entries matching a prefix whose value passes `passes`.
-    ///
-    /// Two-pass design (same as [`Self::for_each_live_prefix`]):
-    /// 1. Collect `key → (seq, kind)` only — **no value copies, no filter eval**.
-    /// 2. Re-stream values and evaluate `passes` **only on winning Puts**.
-    ///
-    /// Peak memory is O(keys) plus one value at a time. Filter cost is exactly
-    /// one evaluation per live key (not per version).
-    ///
-    /// Returns (matched_live_count, tombstone_count).
-    pub fn count_prefix_with<F>(
+    /// Collect latest-version-wins `key → (seq, kind)` under `prefix`.
+    /// Never copies or retains values — used by COUNT paths.
+    fn collect_prefix_winners(
         &self,
         prefix: &[u8],
         vis: Option<&crate::mvcc::Visibility>,
-        mut passes: F,
-    ) -> Result<(usize, usize)>
-    where
-        F: FnMut(&[u8]) -> Result<bool>,
-    {
+    ) -> Result<HashMap<Vec<u8>, (SeqNo, EntryKind)>> {
         self.drain_compaction_notifications();
 
         let is_visible = |seq: SeqNo| -> bool {
@@ -1227,7 +1224,6 @@ impl LsmEngine {
             }
         };
 
-        // ---- Pass 1: winners = key → (seq, kind), no values ----
         let mut winners: HashMap<Vec<u8>, (SeqNo, EntryKind)> = HashMap::new();
 
         let sst_handles: Vec<Arc<SsTable>> = {
@@ -1275,15 +1271,16 @@ impl LsmEngine {
             for sst in &sst_handles {
                 let mut iter = sst.iter()?;
                 iter.seek(prefix);
-                let mut batch: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::with_capacity(64);
+                // Key-only batch: values are framed past but never copied.
+                let mut batch: Vec<(Vec<u8>, SeqNo, EntryKind)> = Vec::with_capacity(64);
                 loop {
                     if !iter.is_valid() || !iter.key().starts_with(prefix) {
                         break;
                     }
                     batch.clear();
-                    iter.drain_current_block(&mut batch);
+                    iter.drain_current_block_keys(&mut batch);
                     let mut past = false;
-                    for (key, _val, seq, kind) in batch.drain(..) {
+                    for (key, seq, kind) in batch.drain(..) {
                         if !key.starts_with(prefix) {
                             past = true;
                             break;
@@ -1313,7 +1310,31 @@ impl LsmEngine {
             }
         }
 
-        // ---- Pass 2: evaluate filter only on winning Puts ----
+        Ok(winners)
+    }
+
+    /// Count live entries matching a prefix whose value passes `passes`.
+    ///
+    /// Two-pass design (same as [`Self::for_each_live_prefix`]):
+    /// 1. Collect `key → (seq, kind)` only — **no value copies, no filter eval**.
+    /// 2. Re-stream values zero-copy and evaluate `passes` **only on winning Puts**.
+    ///
+    /// Pass 1 never allocates values. Pass 2 streams one entry at a time via
+    /// slices into the block buffer; values are discarded after the predicate.
+    /// Peak memory is O(keys) plus one block buffer.
+    ///
+    /// Returns (matched_live_count, tombstone_count).
+    pub fn count_prefix_with<F>(
+        &self,
+        prefix: &[u8],
+        vis: Option<&crate::mvcc::Visibility>,
+        mut passes: F,
+    ) -> Result<(usize, usize)>
+    where
+        F: FnMut(&[u8]) -> Result<bool>,
+    {
+        let mut winners = self.collect_prefix_winners(prefix, vis)?;
+
         let mut matched_live = 0usize;
         let mut pending_puts = winners
             .values()
@@ -1321,6 +1342,7 @@ impl LsmEngine {
             .count();
         let tombstones = winners.len() - pending_puts;
 
+        // ---- Pass 2: evaluate filter only on winning Puts (zero-copy values) ----
         {
             fn try_count<F>(
                 winners: &mut HashMap<Vec<u8>, (SeqNo, EntryKind)>,
@@ -1353,37 +1375,28 @@ impl LsmEngine {
                 Ok(())
             }
 
+            let sst_handles = self.snapshot_sst_handles(prefix)?;
             for sst in &sst_handles {
                 if pending_puts == 0 {
                     break;
                 }
                 let mut iter = sst.iter()?;
                 iter.seek(prefix);
-                let mut batch: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::with_capacity(64);
-                loop {
-                    if pending_puts == 0 {
+                while iter.is_valid() && pending_puts > 0 {
+                    if !iter.key().starts_with(prefix) {
                         break;
                     }
-                    if !iter.is_valid() || !iter.key().starts_with(prefix) {
-                        break;
-                    }
-                    batch.clear();
-                    iter.drain_current_block(&mut batch);
-                    for (key, val, seq, kind) in batch.drain(..) {
-                        try_count(
-                            &mut winners,
-                            &mut pending_puts,
-                            &mut matched_live,
-                            &mut passes,
-                            &key,
-                            seq,
-                            kind,
-                            &val,
-                        )?;
-                        if pending_puts == 0 {
-                            break;
-                        }
-                    }
+                    try_count(
+                        &mut winners,
+                        &mut pending_puts,
+                        &mut matched_live,
+                        &mut passes,
+                        iter.key(),
+                        iter.seq_no(),
+                        iter.kind(),
+                        iter.value(),
+                    )?;
+                    iter.next();
                 }
             }
 
@@ -1425,6 +1438,38 @@ impl LsmEngine {
         }
 
         Ok((matched_live, tombstones))
+    }
+
+    /// Snapshot open SST handles overlapping `prefix` (opens missing files).
+    fn snapshot_sst_handles(&self, prefix: &[u8]) -> Result<Vec<Arc<SsTable>>> {
+        let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut handles = Vec::new();
+        for level in levels.iter().rev() {
+            for sst_info in level.iter() {
+                if !prefix.is_empty() {
+                    if sst_info.max_key.as_slice() < prefix {
+                        continue;
+                    }
+                    if !Self::prefix_may_overlap(
+                        prefix,
+                        sst_info.min_key.as_slice(),
+                        sst_info.max_key.as_slice(),
+                    ) {
+                        continue;
+                    }
+                }
+                match cache.get(&sst_info.path) {
+                    Some(sst) => handles.push(Arc::clone(sst)),
+                    None => {
+                        let sst = Arc::new(SsTable::open(&sst_info.path)?);
+                        cache.insert(sst_info.path.clone(), Arc::clone(&sst));
+                        handles.push(sst);
+                    }
+                }
+            }
+        }
+        Ok(handles)
     }
 
     /// Visit every live (Put) entry under `prefix` exactly once, latest-version-wins,
