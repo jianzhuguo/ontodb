@@ -890,7 +890,11 @@ impl BufferPool {
         }
 
         self.touch(page_id);
-        Ok(self.cache.get(&page_id).expect("should be valid"))
+        self.cache.get(&page_id).ok_or_else(|| {
+            onto_core::CoreError::Corruption(format!(
+                "buffer pool: page {page_id} not in cache after fetch"
+            ))
+        })
     }
 
     /// Fetches a page for writing (marks it as dirty).
@@ -912,7 +916,11 @@ impl BufferPool {
         }
 
         self.touch(page_id);
-        let page = self.cache.get_mut(&page_id).expect("should be valid");
+        let page = self.cache.get_mut(&page_id).ok_or_else(|| {
+            onto_core::CoreError::Corruption(format!(
+                "buffer pool: page {page_id} not in cache after fetch_mut"
+            ))
+        })?;
         page.dirty = true;
         Ok(page)
     }
