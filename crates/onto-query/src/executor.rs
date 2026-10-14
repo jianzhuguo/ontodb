@@ -10000,13 +10000,26 @@ impl QueryExecutor {
                 class,
                 assignments,
                 filter,
+                limit,
             } => {
-                // Plan-driven UPDATE: scan + filter via plan, then update matching rows
-                let scan_plan = self.build_scan_plan(class, filter)?;
-                let plan_result = self.execute_plan(&scan_plan, engine)?;
-                let rows = match plan_result {
-                    QueryResult::Rows(r) => r,
-                    other => return Ok(other),
+                // Collect matching rows. With LIMIT, use the early-exit scan so we
+                // don't materialize the whole table before truncating.
+                let rows = match limit {
+                    Some(n) => self.plan_seq_scan_read_limit(
+                        engine,
+                        class,
+                        None,
+                        filter,
+                        None,
+                        Some(*n),
+                    )?,
+                    None => {
+                        let scan_plan = self.build_scan_plan(class, filter)?;
+                        match self.execute_plan(&scan_plan, engine)? {
+                            QueryResult::Rows(r) => r,
+                            other => return Ok(other),
+                        }
+                    }
                 };
                 let mut updated = 0usize;
                 for row in &rows {
@@ -10014,7 +10027,14 @@ impl QueryExecutor {
                         let mut doc = row.clone();
                         doc.remove("__pk__"); // Don't persist the virtual pk column
                         for (col, val) in assignments {
-                            let json_val = self.literal_to_json(val);
+                            // SET dst = src copies the source column from the current row.
+                            let json_val = match val {
+                                LiteralValue::Column(src) => row
+                                    .get(src)
+                                    .cloned()
+                                    .unwrap_or(Value::Null),
+                                other => self.literal_to_json(other),
+                            };
                             let json_val = Self::try_parse_vector(json_val);
                             doc.insert(col.clone(), json_val);
                         }
@@ -12225,6 +12245,10 @@ impl QueryExecutor {
                     arr.iter().map(Self::literal_to_json_static).collect();
                 serde_json::Value::Array(json_arr)
             }
+            LiteralValue::Column(name) => {
+                tracing::error!("unresolved column ref '{}' in literal_to_json_static", name);
+                serde_json::Value::Null
+            }
         }
     }
 
@@ -13819,6 +13843,11 @@ impl QueryExecutor {
             LiteralValue::Array(arr) => {
                 let json_arr: Vec<Value> = arr.iter().map(|v| self.literal_to_json(v)).collect();
                 Value::Array(json_arr)
+            }
+            // Column refs are resolved against the row before literal_to_json.
+            LiteralValue::Column(name) => {
+                tracing::error!("unresolved column ref '{}' in literal_to_json", name);
+                Value::Null
             }
         }
     }

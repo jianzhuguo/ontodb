@@ -143,11 +143,12 @@ pub enum QueryAst {
         offset: Option<usize>,
     },
 
-    /// UPDATE <class> SET ... WHERE ...
+    /// UPDATE <class> SET ... WHERE ... [LIMIT n]
     Update {
         class: String,
         assignments: Vec<(String, LiteralValue)>,
         filter: Option<FilterExpr>,
+        limit: Option<usize>,
     },
 
     /// DELETE FROM <class> [WHERE ...]
@@ -634,6 +635,7 @@ impl<'a> ParamSubstitutor<'a> {
                 class,
                 assignments,
                 filter,
+                limit,
             } => Ok(QueryAst::Update {
                 class: class.clone(),
                 assignments: assignments
@@ -644,6 +646,7 @@ impl<'a> ParamSubstitutor<'a> {
                     .as_ref()
                     .map(|f| self.substitute_filter(f))
                     .transpose()?,
+                limit: *limit,
             }),
             QueryAst::Delete { class, filter } => Ok(QueryAst::Delete {
                 class: class.clone(),
@@ -910,6 +913,9 @@ pub enum LiteralValue {
     ParamName(String),
     /// Array literal ([1.0, 2.0, 3.0])
     Array(Vec<LiteralValue>),
+    /// Column reference on the RHS of SET (e.g. `SET synonym = synonyms`).
+    /// At execution time this copies the source column's value from the row.
+    Column(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1578,6 +1584,7 @@ impl QueryParser {
     }
 
     /// Parses SET assignments: col1 = val1, col2 = val2
+    /// Bare identifiers on the RHS are column references (`SET dst = src`).
     fn parse_set_assignments(input: &str) -> Result<Vec<(String, LiteralValue)>> {
         Self::split_quoted(input, ',')
             .iter()
@@ -1586,10 +1593,32 @@ impl QueryParser {
                 let eq_pos = Self::find_unquoted(s, "=")
                     .ok_or_else(|| CoreError::InvalidArgument("expected '=' in SET".to_string()))?;
                 let col = Self::strip_surrounding_quotes(safe_slice(s, 0, eq_pos).trim());
-                let val = Self::parse_literal(safe_slice_from(s, eq_pos + 1).trim())?;
+                let val = Self::parse_set_value(safe_slice_from(s, eq_pos + 1).trim())?;
                 Ok((col, val))
             })
             .collect::<Result<Vec<_>>>()
+    }
+
+    /// Parses a SET RHS: quoted/number/null → literal; bare identifier → column ref.
+    fn parse_set_value(s: &str) -> Result<LiteralValue> {
+        let s = s.trim();
+        // Quoted string / NULL / bool / number / array go through normal literal parsing.
+        if s.starts_with('\'')
+            || s.starts_with('[')
+            || s.eq_ignore_ascii_case("NULL")
+            || s.eq_ignore_ascii_case("TRUE")
+            || s.eq_ignore_ascii_case("FALSE")
+            || s.parse::<i64>().is_ok()
+            || s.parse::<f64>().is_ok()
+        {
+            return Self::parse_literal(s);
+        }
+        // Bare identifier (possibly quoted with double quotes) → column reference.
+        let ident = Self::strip_surrounding_quotes(s);
+        if ident.is_empty() {
+            return Ok(LiteralValue::String(String::new()));
+        }
+        Ok(LiteralValue::Column(ident.to_string()))
     }
 
     /// Simple matching paren finder (no quote handling needed for values).
@@ -2685,6 +2714,21 @@ impl QueryParser {
             (*rest, None)
         };
 
+        // Optional LIMIT at end of WHERE (or after SET if no WHERE)
+        let (filter_str, limit) = if let Some(fstr) = filter_str {
+            if let Some(lp) = find_unquoted_ignore_ascii_case(fstr, " LIMIT ") {
+                let lim_str = safe_slice_from(fstr, lp + 7).trim();
+                let n: usize = lim_str
+                    .parse()
+                    .map_err(|_| CoreError::InvalidArgument("invalid LIMIT".to_string()))?;
+                (Some(safe_slice(fstr, 0, lp).trim()), Some(n))
+            } else {
+                (Some(fstr), None)
+            }
+        } else {
+            (None, None)
+        };
+
         // Split assignments by comma, respecting quotes
         let assignments: Vec<(String, LiteralValue)> = Self::split_quoted(set_part, ',')
             .iter()
@@ -2693,7 +2737,7 @@ impl QueryParser {
                 let eq_pos = Self::find_unquoted(s, "=")
                     .ok_or_else(|| CoreError::InvalidArgument("expected '=' in SET".to_string()))?;
                 let col = Self::strip_surrounding_quotes(safe_slice(s, 0, eq_pos).trim());
-                let val = Self::parse_literal(safe_slice_from(s, eq_pos + 1).trim())?;
+                let val = Self::parse_set_value(safe_slice_from(s, eq_pos + 1).trim())?;
                 Ok((col, val))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2708,6 +2752,7 @@ impl QueryParser {
             class,
             assignments,
             filter,
+            limit,
         })
     }
 
@@ -4769,6 +4814,34 @@ mod tests {
                 assert_eq!(class, "Person");
                 assert_eq!(assignments[0].0, "name");
             }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    /// Bare identifiers on SET RHS are column refs; quoted strings stay literals.
+    #[test]
+    fn test_update_set_column_copy() {
+        let ast = QueryParser::parse("UPDATE T SET synonym = synonyms WHERE synonym IS NULL")
+            .unwrap();
+        match ast {
+            QueryAst::Update {
+                class, assignments, ..
+            } => {
+                assert_eq!(class, "T");
+                match &assignments[0].1 {
+                    LiteralValue::Column(src) => assert_eq!(src, "synonyms"),
+                    other => panic!("expected Column ref, got {:?}", other),
+                }
+            }
+            _ => panic!("expected Update"),
+        }
+
+        let ast = QueryParser::parse("UPDATE T SET synonym = 'synonyms'").unwrap();
+        match ast {
+            QueryAst::Update { assignments, .. } => match &assignments[0].1 {
+                LiteralValue::String(s) => assert_eq!(s, "synonyms"),
+                other => panic!("expected String literal, got {:?}", other),
+            },
             _ => panic!("expected Update"),
         }
     }
