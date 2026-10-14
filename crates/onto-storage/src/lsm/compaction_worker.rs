@@ -123,14 +123,22 @@ impl CompactionWorker {
 
     /// Main loop: waits for messages and performs compaction when needed.
     fn run(&mut self) {
+        // Periodic compaction check: even without flush messages, check every
+        // 60s if any level needs compaction. This is essential when the
+        // memtable is large (256MB+) — flushes are rare, and without a
+        // periodic trigger the SST backlog never gets compacted.
+        let mut idle_ticks: u64 = 0;
+        let periodic_interval: u64 = 600; // 600 × 100ms = 60s
         loop {
             match self.receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(CompactionMsg::Flushed { level: _ }) => {
+                    idle_ticks = 0;
                     if let Err(e) = self.try_compact() {
                         tracing::error!("Background compaction failed: {}", e);
                     }
                 }
                 Ok(CompactionMsg::FlushAndNotify) => {
+                    idle_ticks = 0;
                     // Perform all pending compaction (includes small file merge)
                     if let Err(e) = self.try_compact() {
                         tracing::error!("Background compaction failed: {}", e);
@@ -180,8 +188,12 @@ impl CompactionWorker {
                     break;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Err(e) = self.try_compact() {
-                        tracing::error!("Background compaction failed: {}", e);
+                    idle_ticks += 1;
+                    if idle_ticks >= periodic_interval {
+                        idle_ticks = 0;
+                        if let Err(e) = self.try_compact() {
+                            tracing::error!("Background compaction failed: {}", e);
+                        }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {

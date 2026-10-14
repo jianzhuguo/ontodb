@@ -2290,7 +2290,13 @@ impl BTreeIndex {
         let mut inserted = false;
 
         for i in 0..num {
-            let (k, child) = parent.get_internal(i).expect("should be valid");
+            let (k, child) = match parent.get_internal(i) {
+                Some(entry) => entry,
+                None => {
+                    tracing::warn!("split_internal_and_insert: corrupted entry at slot {i}/{num}, skipping");
+                    continue;
+                }
+            };
             if !inserted && i == insert_pos {
                 all_entries.push((key.to_vec(), right_child_id));
                 inserted = true;
@@ -2329,7 +2335,13 @@ impl BTreeIndex {
             self.put_page(&fc)?;
         }
         for i in 0..new_internal.num_entries() {
-            let (_, child_id) = new_internal.get_internal(i).expect("should be valid");
+            let (_, child_id) = match new_internal.get_internal(i) {
+                Some(entry) => entry,
+                None => {
+                    tracing::warn!("split_internal_and_insert: corrupted new_internal entry at slot {i}, skipping");
+                    continue;
+                }
+            };
             let mut child = self.get_page(child_id)?;
             child.set_parent(new_page_id);
             self.put_page(&child)?;
