@@ -1402,16 +1402,22 @@ impl BTreeIndex {
         leaf.remove_entry(slot)?;
         self.put_page(&leaf)?;
 
-        // Handle underflow if this isn't the root
+        // Handle underflow if this isn't the root.
+        // After a merge the leaf may no longer exist as a separate page —
+        // skip update_parent_separator in that case (merge already fixed
+        // the parent), otherwise find_child_index reports "child not found".
+        let mut merged_away = false;
         if leaf_id != self.meta.root_page {
             let min = Self::min_leaf_entries();
             if leaf.num_entries() < min {
-                self.handle_leaf_underflow(leaf_id)?;
+                merged_away = self.handle_leaf_underflow(leaf_id)?;
             }
         }
 
         // Update parent separator if the first key changed
-        self.update_parent_separator(leaf_id)?;
+        if !merged_away {
+            self.update_parent_separator(leaf_id)?;
+        }
 
         // Root collapse: if root is internal with 0 entries, make child the new root
         self.try_collapse_root()?;
@@ -1430,14 +1436,15 @@ impl BTreeIndex {
     }
 
     /// Handles underflow in a leaf by borrowing from siblings or merging.
-    fn handle_leaf_underflow(&mut self, leaf_id: u32) -> Result<()> {
+    /// Returns true if the leaf was merged away (no longer a separate page).
+    fn handle_leaf_underflow(&mut self, leaf_id: u32) -> Result<bool> {
         let leaf = self.get_page(leaf_id)?;
         let header = leaf
             .header()
             .ok_or_else(|| onto_core::CoreError::Corruption("invalid page header".into()))?;
         let parent_id = header.parent;
         if parent_id == NULL_PAGE {
-            return Ok(());
+            return Ok(false);
         }
 
         let parent = self.get_page(parent_id)?;
@@ -1451,7 +1458,7 @@ impl BTreeIndex {
             let left = self.get_page(left_id)?;
             if left.num_entries() > Self::min_leaf_entries() {
                 self.redistribute_leaf_left(parent_id, child_idx)?;
-                return Ok(());
+                return Ok(false);
             }
         }
 
@@ -1461,18 +1468,20 @@ impl BTreeIndex {
             let right = self.get_page(right_id)?;
             if right.num_entries() > Self::min_leaf_entries() {
                 self.redistribute_leaf_right(parent_id, child_idx)?;
-                return Ok(());
+                return Ok(false);
             }
         }
 
-        // Merge with a sibling
+        // Merge with a sibling — the leaf is absorbed and ceases to exist.
         if child_idx > 0 {
             self.merge_leaves(parent_id, child_idx - 1, child_idx)?;
+            Ok(true)
         } else if num_children > 1 {
             self.merge_leaves(parent_id, child_idx, child_idx + 1)?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-
-        Ok(())
     }
 
     /// Handles underflow in an internal node by borrowing or merging.
@@ -1542,10 +1551,7 @@ impl BTreeIndex {
 
         // Update parent separator to new first key of leaf
         let new_first = leaf.get_leaf(0).map(|(k, _)| k).unwrap_or_default();
-        let mut parent = self.get_page(parent_id)?;
-        parent.remove_entry(child_idx - 1)?;
-        parent.insert_internal(child_idx - 1, &new_first, leaf_id)?;
-        self.put_page(&parent)?;
+        self.replace_parent_entry(parent_id, child_idx - 1, &new_first, leaf_id)?;
 
         Ok(())
     }
@@ -1572,16 +1578,13 @@ impl BTreeIndex {
 
         // Update parent separator to new first key of right
         let new_first = right.get_leaf(0).map(|(k, _)| k).unwrap_or_default();
-        let mut parent = self.get_page(parent_id)?;
-        parent.remove_entry(child_idx)?;
-        parent.insert_internal(child_idx, &new_first, right_id)?;
-        self.put_page(&parent)?;
+        self.replace_parent_entry(parent_id, child_idx, &new_first, right_id)?;
 
         Ok(())
     }
 
     /// Merges two adjacent leaf nodes. left absorbs right.
-    fn merge_leaves(&mut self, parent_id: u32, left_idx: u16, right_idx: u16) -> Result<()> {
+    fn merge_leaves(&mut self, parent_id: u32, left_idx: u16, right_idx: u16) -> Result<bool> {
         let parent = self.get_page(parent_id)?;
         let left_id = self.get_child(&parent, left_idx)?;
         let right_id = self.get_child(&parent, right_idx)?;
@@ -1604,6 +1607,18 @@ impl BTreeIndex {
                 onto_core::CoreError::Corruption("failed to read right leaf entry".into())
             })?;
             all_entries.push((key, pks));
+        }
+
+        // Pre-check capacity: if the combined entries don't fit in one page,
+        // skip the merge. Slightly-underfull nodes are valid; a failed
+        // mid-rebuild corrupts the tree.
+        let usable = PAGE_SIZE - HEADER_SIZE;
+        let needed: usize = all_entries
+            .iter()
+            .map(|(k, pks)| encode_leaf_entry(k, pks).len() + SLOT_SIZE)
+            .sum();
+        if needed > usable {
+            return Ok(false);
         }
 
         // Rebuild left page from scratch to avoid fragmentation issues
@@ -1652,7 +1667,7 @@ impl BTreeIndex {
             self.handle_internal_underflow(parent_id)?;
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Redistributes from left internal sibling.
@@ -1688,10 +1703,7 @@ impl BTreeIndex {
         self.put_page(&node)?;
 
         // Update parent separator
-        let mut parent = self.get_page(parent_id)?;
-        parent.remove_entry(child_idx - 1)?;
-        parent.insert_internal(child_idx - 1, &left_key, node_id)?;
-        self.put_page(&parent)?;
+        self.replace_parent_entry(parent_id, child_idx - 1, &left_key, node_id)?;
 
         // Update moved child's parent pointer
         let mut moved = self.get_page(left_child)?;
@@ -1729,10 +1741,7 @@ impl BTreeIndex {
         self.put_page(&right)?;
 
         // Update parent separator
-        let mut parent = self.get_page(parent_id)?;
-        parent.remove_entry(child_idx)?;
-        parent.insert_internal(child_idx, &right_key, right_id)?;
-        self.put_page(&parent)?;
+        self.replace_parent_entry(parent_id, child_idx, &right_key, right_id)?;
 
         // Update moved child's parent pointer
         let mut moved = self.get_page(right_first)?;
@@ -1773,6 +1782,16 @@ impl BTreeIndex {
         for i in 0..num_right {
             let (key, child) = right.get_internal(i).expect("should be valid");
             all_entries.push((key, child));
+        }
+
+        // Pre-check capacity: skip merge if the combined node won't fit.
+        let usable = PAGE_SIZE - HEADER_SIZE;
+        let needed: usize = all_entries
+            .iter()
+            .map(|(k, _)| encode_internal_entry(k, 0).len() + SLOT_SIZE)
+            .sum();
+        if needed > usable {
+            return Ok(());
         }
 
         // Rebuild left page from scratch
@@ -1816,6 +1835,8 @@ impl BTreeIndex {
     }
 
     /// Updates the parent separator key for a leaf whose first key may have changed.
+    /// Atomically rebuilds the parent page — remove+insert on a full page can
+    /// fail mid-way and leave the parent missing an entry.
     fn update_parent_separator(&mut self, leaf_id: u32) -> Result<()> {
         let leaf = self.get_page(leaf_id)?;
         let header = leaf.header().expect("should be valid");
@@ -1832,13 +1853,50 @@ impl BTreeIndex {
         }
 
         let new_first_key = leaf.get_leaf(0).map(|(k, _)| k).unwrap_or_default();
-        let mut parent = self.get_page(parent_id)?;
-        // The separator for child_idx is at slot child_idx-1
-        // It stores (key, child_right=leaf_id). We need to update the key.
-        parent.remove_entry(child_idx - 1)?;
-        parent.insert_internal(child_idx - 1, &new_first_key, leaf_id)?;
-        self.put_page(&parent)?;
+        self.replace_parent_entry(parent_id, child_idx - 1, &new_first_key, leaf_id)?;
+        Ok(())
+    }
 
+    /// Atomically replaces entry `slot` in an internal page by rebuilding the
+    /// whole page from its current entries. Avoids the remove-then-insert
+    /// pattern that corrupts the parent when the new key is larger.
+    fn replace_parent_entry(
+        &mut self,
+        parent_id: u32,
+        slot: u16,
+        new_key: &[u8],
+        child_right: u32,
+    ) -> Result<()> {
+        let parent = self.get_page(parent_id)?;
+        let num = parent.num_entries();
+        if slot >= num {
+            return Err(onto_core::CoreError::Corruption(
+                "replace_parent_entry: slot out of bounds".into(),
+            ));
+        }
+
+        // Collect all entries, substituting the one at `slot`.
+        let first = parent.first_child();
+        let parent_ptr = parent.header().expect("valid").parent;
+        let mut entries: Vec<(Vec<u8>, u32)> = Vec::with_capacity(num as usize);
+        for i in 0..num {
+            if i == slot {
+                entries.push((new_key.to_vec(), child_right));
+            } else {
+                entries.push(parent.get_internal(i).ok_or_else(|| {
+                    onto_core::CoreError::Corruption("failed to read internal entry".into())
+                })?);
+            }
+        }
+
+        // Rebuild from scratch — all-or-nothing.
+        let mut page = DiskPage::new(parent_id, PageType::Internal);
+        page.set_parent(parent_ptr);
+        page.set_first_child(first);
+        for (i, (k, c)) in entries.iter().enumerate() {
+            page.insert_internal(i as u16, k, *c)?;
+        }
+        self.put_page(&page)?;
         Ok(())
     }
 

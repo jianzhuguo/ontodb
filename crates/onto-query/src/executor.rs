@@ -10236,14 +10236,16 @@ impl QueryExecutor {
             checked.insert(class.to_string());
         }
 
-        tracing::info!(table = class, "Auto-creating source/target indexes for relation table");
-        if let Err(e) = self.engine.create_index(class, "source") {
-            tracing::warn!(table = class, column = "source", error = %e, "Auto-index creation failed for source");
+        for col in ["source", "target"] {
+            if self.engine.has_index(class, col) {
+                tracing::info!(table = class, column = col, "Index already exists, skipping backfill");
+                continue;
+            }
+            tracing::info!(table = class, column = col, "Auto-creating index for relation table");
+            if let Err(e) = self.engine.create_index(class, col) {
+                tracing::warn!(table = class, column = col, error = %e, "Auto-index creation failed");
+            }
         }
-        if let Err(e) = self.engine.create_index(class, "target") {
-            tracing::warn!(table = class, column = "target", error = %e, "Auto-index creation failed for target");
-        }
-        tracing::info!(table = class, "Auto-index creation completed for relation table");
     }
 
     /// Scan all existing tables and create indexes for relation tables.

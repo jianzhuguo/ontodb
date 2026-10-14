@@ -323,10 +323,13 @@ impl HnswIndex {
         }
     }
 
-    /// Prune a node's neighbors to max_neighbors.
+    /// Prune a node's neighbors to max_neighbors using the diversity
+    /// heuristic (same as select_nearest). Keeps a neighbor only if it is
+    /// closer to this node than to any already-kept neighbor — preserves
+    /// long-range cross-cluster edges that pure nearest-N would discard.
     /// CRITICAL: We NEVER remove the edge back to the newly connected node.
     fn prune_node_neighbors(&mut self, node_idx: usize, layer: usize, max_neighbors: usize) {
-        // Sort neighbors by distance to this node (avoid cloning vector)
+        // Sort neighbors by distance to this node
         let mut with_dist: Vec<(usize, f32)> = self.nodes[node_idx].neighbors[layer]
             .iter()
             .map(|&i| {
@@ -342,12 +345,36 @@ impl HnswIndex {
             .collect();
         with_dist.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
-        // Keep the nearest max_neighbors
-        let keep: Vec<usize> = with_dist
-            .iter()
-            .take(max_neighbors)
-            .map(|(i, _)| *i)
-            .collect();
+        // Diversity heuristic: keep e only if d(e, node_idx) < d(e, r) for
+        // every already-kept r.  Falls back to nearest-remaining to fill up.
+        let mut keep: Vec<usize> = Vec::with_capacity(max_neighbors);
+        let mut rest: Vec<usize> = Vec::new();
+        for &(i, dist_self) in &with_dist {
+            if keep.len() >= max_neighbors {
+                rest.push(i);
+                continue;
+            }
+            let diverse = keep.iter().all(|&k| {
+                let d_ik = distance(
+                    &self.nodes[i].entry.vector,
+                    &self.nodes[k].entry.vector,
+                    self.config.metric,
+                );
+                dist_self < d_ik
+            });
+            if diverse {
+                keep.push(i);
+            } else {
+                rest.push(i);
+            }
+        }
+        for i in rest {
+            if keep.len() >= max_neighbors {
+                break;
+            }
+            keep.push(i);
+        }
+
         let remove: Vec<usize> = self.nodes[node_idx].neighbors[layer]
             .iter()
             .filter(|i| !keep.contains(i))
@@ -541,6 +568,11 @@ impl HnswIndex {
     }
 
     /// Select the M nearest from candidates.
+    /// Select up to `m` neighbors from candidates using the HNSW diversity
+    /// heuristic (paper Algorithm 4). A candidate is kept only if it is closer
+    /// to the query than to any already-selected neighbor — this spreads edges
+    /// across clusters and keeps the graph connected for clustered data.
+    /// Falls back to nearest-remaining when the diversity filter is too strict.
     fn select_nearest(&self, query: &[f32], candidates: &[usize], m: usize) -> Vec<usize> {
         if candidates.len() <= m {
             return candidates.to_vec();
@@ -555,8 +587,39 @@ impl HnswIndex {
             })
             .collect();
         with_dist.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-        with_dist.truncate(m);
-        with_dist.into_iter().map(|(i, _)| i).collect()
+
+        // Diversity heuristic: keep candidate e only if d(e,q) < d(e,r) for
+        // every already-selected r.  This prevents the neighbor list from
+        // collapsing into a single cluster.
+        let mut selected: Vec<usize> = Vec::with_capacity(m);
+        let mut rest: Vec<usize> = Vec::new();
+        for &(i, dist_q) in &with_dist {
+            if selected.len() >= m {
+                rest.push(i);
+                continue;
+            }
+            let diverse = selected.iter().all(|&s| {
+                let d_er = distance(
+                    &self.nodes[i].entry.vector,
+                    &self.nodes[s].entry.vector,
+                    self.config.metric,
+                );
+                dist_q < d_er
+            });
+            if diverse {
+                selected.push(i);
+            } else {
+                rest.push(i);
+            }
+        }
+        // Fill remaining slots with nearest non-selected candidates.
+        for i in rest {
+            if selected.len() >= m {
+                break;
+            }
+            selected.push(i);
+        }
+        selected
     }
 
     /// Get neighbors at a layer.

@@ -74,6 +74,8 @@ pub struct CompactionWorker {
     sst_cache: HashMap<PathBuf, SsTable>,
     /// Files pending deletion (deferred until next compaction cycle).
     pending_deletions: Vec<PathBuf>,
+    /// Skip compaction until this instant (backoff after merge timeout).
+    cooldown_until: Option<std::time::Instant>,
 }
 
 impl CompactionWorker {
@@ -111,6 +113,7 @@ impl CompactionWorker {
                 notif_sender: Some(notif_sender),
                 sst_cache: HashMap::new(),
                 pending_deletions: Vec::new(),
+                cooldown_until: None,
             };
             worker.run();
         }).expect("failed to spawn compaction worker thread");
@@ -190,6 +193,15 @@ impl CompactionWorker {
 
     /// Checks all levels and performs compaction on the most urgent one.
     fn try_compact(&mut self) -> Result<()> {
+        // Respect cooldown after a timed-out merge — prevents immediately
+        // re-attempting the same oversized compaction.
+        if let Some(until) = self.cooldown_until {
+            if std::time::Instant::now() < until {
+                return Ok(());
+            }
+            self.cooldown_until = None;
+        }
+
         // Delete files from previous compaction cycles (deferred to avoid race with engine)
         for path in self.pending_deletions.drain(..) {
             self.sst_cache.remove(&path);
@@ -382,7 +394,7 @@ impl CompactionWorker {
         const MERGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
         let mut builder = SsTableBuilder::new();
         builder.set_compression_level(self.options.compression_level);
-        let mut new_ssts = Vec::new();
+        let mut new_ssts: Vec<SsTableInfo> = Vec::new();
         let mut current_size = 0usize;
         let mut last_key: Option<Vec<u8>> = None;
         let mut batch_first_key: Option<Vec<u8>> = None;
@@ -396,7 +408,21 @@ impl CompactionWorker {
                     merge_start.elapsed().as_secs(),
                     entry_count
                 );
-                return Ok(());
+                // Delete partial output SSTs so we don't leak files.
+                for sst in &new_ssts {
+                    let _ = fs::remove_file(&sst.path);
+                }
+                // Back off before the next compaction attempt — prevents
+                // immediately re-triggering the same oversized merge.
+                self.cooldown_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+                // Return Err so the caller's retry loop breaks instead of
+                // immediately re-triggering the same oversized compaction.
+                return Err(onto_core::CoreError::Custom(format!(
+                    "compaction merge timed out after {}s ({} entries)",
+                    MERGE_TIMEOUT.as_secs(),
+                    entry_count
+                )));
             }
             let entry = merge_iter.next().unwrap();
             let key = entry.key;

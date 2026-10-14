@@ -180,36 +180,37 @@ impl IndexManager {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("idx") {
-                let filename = path.file_stem().and_then(|f| f.to_str()).unwrap_or("");
-                if let Some((class, column)) = filename.split_once('_') {
-                    // Validate before opening — if corrupted, delete and skip
-                    if !BTreeIndex::validate(&path) {
+                // Validate before opening — if corrupted, delete and skip
+                if !BTreeIndex::validate(&path) {
+                    eprintln!(
+                        "Warning: corrupted disk index {}, deleting for rebuild",
+                        path.display()
+                    );
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                match BTreeIndex::open(&path) {
+                    Ok(idx) => {
+                        // Use class/column from the file header, not the filename —
+                        // filenames like `a.b_with_c.idx` are ambiguous when the
+                        // class name itself contains underscores.
+                        let meta = idx.meta();
+                        let key = (meta.class.clone(), meta.column.clone());
+                        self.disk_indexes.insert(key.clone(), Mutex::new(idx));
+                        // Also create in-memory index (empty — disk holds the
+                        // history until rebuilt; mark incomplete so lookups merge).
+                        self.indexes
+                            .entry(key.clone())
+                            .or_insert_with(|| BPlusTree::new(&key.0, &key.1));
+                        self.mem_complete.remove(&key);
+                    }
+                    Err(e) => {
                         eprintln!(
-                            "Warning: corrupted disk index {}, deleting for rebuild",
-                            path.display()
+                            "Warning: failed to open disk index {}, deleting: {}",
+                            path.display(),
+                            e
                         );
                         let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
-                    match BTreeIndex::open(&path) {
-                        Ok(idx) => {
-                            let key = (class.to_string(), column.to_string());
-                            self.disk_indexes.insert(key.clone(), Mutex::new(idx));
-                            // Also create in-memory index (empty — disk holds the
-                            // history until rebuilt; mark incomplete so lookups merge).
-                            self.indexes
-                                .entry((class.to_string(), column.to_string()))
-                                .or_insert_with(|| BPlusTree::new(class, column));
-                            self.mem_complete.remove(&key);
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "Warning: failed to open disk index {}, deleting: {}",
-                                path.display(),
-                                e
-                            );
-                            let _ = std::fs::remove_file(&path);
-                        }
                     }
                 }
             }

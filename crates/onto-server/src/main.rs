@@ -335,15 +335,18 @@ fn main() -> Result<()> {
 
     let engine = Arc::new(LsmEngine::open(options)?);
 
-    // Rebuild indexes in background to avoid blocking startup
+    // Open disk indexes synchronously so has_index() sees existing indexes
+    // before ensure_all_relation_indexes() runs (avoids full re-backfill on restart).
+    if let Err(e) = engine.open_disk_indexes() {
+        tracing::warn!("open_disk_indexes failed: {}", e);
+    }
+
+    // Rebuild in-memory index content in background to avoid blocking startup
     let rebuild_engine = Arc::clone(&engine);
     std::thread::Builder::new()
         .name("index-rebuild".into())
         .spawn(move || {
             tracing::info!("Background index rebuild started");
-            if let Err(e) = rebuild_engine.open_disk_indexes() {
-                tracing::warn!("open_disk_indexes failed: {}", e);
-            }
             if let Err(e) = rebuild_engine.rebuild_indexes() {
                 tracing::warn!("Index rebuild failed: {}", e);
             }
