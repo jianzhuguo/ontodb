@@ -99,15 +99,14 @@ fn is_dst_size_too_small(err: usize) -> bool {
 
 /// Decompress a zstd frame, refusing frames that would blow past `max_out`.
 ///
-/// Uses the one-shot `ZSTD_decompress` path (not the streaming decoder) and
-/// reserves `ZSTD_WILDCOPY_MARGIN` bytes of output slack so a corrupt match
-/// cannot store past the allocation even if zstd's length check is bypassed.
+/// Uses the one-shot `ZSTD_decompress` path (not the streaming decoder).
 ///
-/// Destination is a fully-initialized `vec![0u8; cap]` passed as `&mut [u8]`.
-/// The `Vec` `WriteBuf` impl calls `set_len` without checking capacity, which
-/// can produce `ptr=dangling, len>0` — that exact shape showed up as a
-/// compaction crash (`memcpy` from address 1). Slice `WriteBuf` never mutates
-/// length, so it cannot mint an invalid `Vec`.
+/// Critical sizing: allocate `out_cap + ZSTD_WILDCOPY_MARGIN`, but hand zstd
+/// only `&mut buf[..out_cap]`. `ZSTD_wildcopy` may store up to 32 bytes past
+/// the logical output end — if `dstCapacity` includes the slack, a frame that
+/// fills the buffer lets wildcopy write past the allocation and trash the
+/// heap. Slice `WriteBuf` also avoids `Vec::set_len` (which can mint
+/// `ptr=dangling, len>0`).
 fn decompress_limited(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
     if src.is_empty() {
         return Err(CoreError::corruption("empty zstd block"));
@@ -133,17 +132,20 @@ fn decompress_limited(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
         }
     };
 
-    // Wildcopy slack: ZSTD_wildcopy may store up to 32 bytes past the
-    // intended end on the fast path, so the allocation must have room.
     let margin = ZSTD_WILDCOPY_MARGIN;
 
-    let try_once = |cap: usize| -> std::result::Result<(Vec<u8>, usize), usize> {
-        if cap == 0 {
+    /// Decompress into a buffer sized `out_cap + margin`, with zstd's
+    /// destination capacity limited to `out_cap` so wildcopy stays inside
+    /// the allocation.
+    let try_once = |out_cap: usize| -> std::result::Result<(Vec<u8>, usize), usize> {
+        if out_cap == 0 {
             return Err((-64i64) as usize);
         }
-        let mut buf = vec![0u8; cap];
-        let written = zstd::zstd_safe::decompress(&mut buf[..], src)?;
-        if written > buf.len() {
+        let alloc = out_cap.saturating_add(margin);
+        let mut buf = vec![0u8; alloc];
+        // Only expose out_cap bytes to zstd — the tail is wildcopy slack.
+        let written = zstd::zstd_safe::decompress(&mut buf[..out_cap], src)?;
+        if written > out_cap {
             return Err((-70i64) as usize);
         }
         buf.truncate(written);
@@ -152,8 +154,7 @@ fn decompress_limited(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
 
     // Known content size (one-shot frames): allocate exactly what we need.
     if let Some(n) = declared {
-        let cap = n.saturating_add(margin);
-        let (buf, written) = try_once(cap)
+        let (buf, written) = try_once(n)
             .map_err(|e| CoreError::corruption(format!("zstd decompression failed: {}", e)))?;
         if written > max_out {
             return Err(CoreError::corruption(format!(
@@ -172,8 +173,7 @@ fn decompress_limited(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
         cap = max_out;
     }
     loop {
-        let alloc = cap.saturating_add(margin);
-        match try_once(alloc) {
+        match try_once(cap) {
             Ok((buf, written)) => {
                 if written > max_out {
                     return Err(CoreError::corruption(format!(
@@ -2107,6 +2107,28 @@ mod tests {
 
         // Must still refuse to exceed the cap.
         assert!(super::decompress_limited(&frame, 1024).is_err());
+    }
+
+    /// A frame whose decompressed size exactly fills the destination must
+    /// not let ZSTD_wildcopy write past the allocation. We allocate
+    /// `out + margin` but pass only `out` as dstCapacity.
+    #[test]
+    fn test_decompress_limited_exact_fit_does_not_overflow() {
+        // bulk::compress writes the content size into the frame header.
+        let raw = vec![0x5Au8; 4096];
+        let frame = zstd::bulk::compress(&raw, 1).expect("should be valid");
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&frame).ok().flatten(),
+            Some(raw.len() as u64),
+            "test precondition: declared size is exact"
+        );
+        let out = super::decompress_limited(&frame, raw.len()).expect("should be valid");
+        assert_eq!(out, raw);
+
+        // Exact-cap unknown-size path (streaming frame) with a tight max_out.
+        let frame2 = zstd::encode_all(&raw[..], 1).expect("should be valid");
+        let out2 = super::decompress_limited(&frame2, raw.len()).expect("should be valid");
+        assert_eq!(out2, raw);
     }
 
     /// Uncompressed blocks (compression_level = 0) still round-trip through
