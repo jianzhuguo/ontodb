@@ -307,9 +307,87 @@ pub fn compress_block(data: &[u8]) -> Vec<u8> {
 }
 
 /// Decompress a block using zstd.
+///
+/// Bounded one-shot path — never `zstd::decode_all`. The streaming decoder
+/// can wildcopy-write past the caller buffer on a full/corrupt frame, which
+/// is the heap-corruption class we already fixed in SSTable reads.
 pub fn decompress_block(data: &[u8]) -> onto_core::Result<Vec<u8>> {
-    zstd::decode_all(data)
-        .map_err(|e| onto_core::CoreError::corruption(format!("zstd decompression failed: {}", e)))
+    const MAX_BLOCK: usize = 64 * 1024 * 1024;
+    if data.is_empty() {
+        return Err(onto_core::CoreError::corruption("empty zstd block"));
+    }
+    let declared = match zstd::zstd_safe::get_frame_content_size(data) {
+        Ok(Some(0)) => {
+            return Err(onto_core::CoreError::corruption("zstd frame declares empty content"))
+        }
+        Ok(Some(n)) if n as usize > MAX_BLOCK => {
+            return Err(onto_core::CoreError::corruption(format!(
+                "zstd frame declares {} bytes, exceeds limit {}",
+                n, MAX_BLOCK
+            )))
+        }
+        Ok(Some(n)) => Some(n as usize),
+        Ok(None) => None,
+        Err(_) => {
+            return Err(onto_core::CoreError::corruption("invalid zstd frame header"))
+        }
+    };
+
+    let try_once = |out_cap: usize| -> std::result::Result<Vec<u8>, usize> {
+        if out_cap == 0 {
+            return Err((-64i64) as usize);
+        }
+        // Layout: [out_cap dst][wildcopy slack][guard canary]. zstd only
+        // sees out_cap; intact canary proves nothing wrote past the allocation.
+        const MARGIN: usize = 64;
+        const CANARY: [u8; 16] = [
+            0xC5, 0x9A, 0x3B, 0x71, 0xE2, 0x4D, 0x88, 0x16, 0x5F, 0xA3, 0x0C, 0xD7, 0x64, 0x29,
+            0xB1, 0x7E,
+        ];
+        let canary_start = out_cap.saturating_add(MARGIN);
+        let mut buf = vec![0u8; canary_start.saturating_add(CANARY.len())];
+        buf[canary_start..].copy_from_slice(&CANARY);
+        let written = zstd::zstd_safe::decompress(&mut buf[..out_cap], data)?;
+        if buf[canary_start..] != CANARY[..] {
+            return Err((-80i64) as usize);
+        }
+        buf.truncate(written);
+        Ok(buf)
+    };
+
+    if let Some(n) = declared {
+        return try_once(n).map_err(|e| {
+            if e == (-80i64) as usize {
+                onto_core::CoreError::corruption(
+                    "zstd wrote past output buffer (guard canary smashed — corrupt frame)",
+                )
+            } else {
+                onto_core::CoreError::corruption(format!("zstd decompression failed: {}", e))
+            }
+        });
+    }
+
+    let mut cap = data.len().saturating_mul(4).clamp(64 * 1024, 4 * 1024 * 1024).min(MAX_BLOCK);
+    loop {
+        match try_once(cap) {
+            Ok(buf) => return Ok(buf),
+            Err(e) => {
+                const DST_SIZE_TOO_SMALL: usize = (-70i64) as usize;
+                if e == (-80i64) as usize {
+                    return Err(onto_core::CoreError::corruption(
+                        "zstd wrote past output buffer (guard canary smashed — corrupt frame)",
+                    ));
+                }
+                if e != DST_SIZE_TOO_SMALL || cap >= MAX_BLOCK {
+                    return Err(onto_core::CoreError::corruption(format!(
+                        "zstd decompression failed: {}",
+                        e
+                    )));
+                }
+                cap = cap.saturating_mul(2).min(MAX_BLOCK);
+            }
+        }
+    }
 }
 
 // ── TSM Writer ──

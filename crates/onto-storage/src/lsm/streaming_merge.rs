@@ -11,6 +11,7 @@ use onto_core::{EntryKind, SeqNo};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Entry from an SSTable iterator with comparison support for min-heap.
 #[derive(Debug)]
@@ -153,30 +154,17 @@ impl StreamingMergeIterator {
 
 /// Iterator wrapper for SsTable entries.
 ///
-/// Uses unsafe to create a self-referential struct that owns the SSTable.
-/// Drop order is critical: `iter` must be dropped BEFORE `_sst`.
-/// Rust drops fields in declaration order, so `iter` is declared first.
+/// Owns the table via `Arc` — no self-referential `'static` borrow, so the
+/// value is freely movable and drop-safe without field-order tricks.
 struct SstEntryIterator {
-    /// The iterator borrowing from the SSTable. Dropped FIRST (declared before _sst).
-    iter: SsTableIterator<'static>,
-    /// Owns the SSTable data. Dropped SECOND (after iter is gone).
-    _sst: Box<SsTable>,
+    iter: SsTableIterator,
 }
 
 impl SstEntryIterator {
     fn new(sst: SsTable) -> Result<Self, Box<dyn std::error::Error>> {
-        let sst_box = Box::new(sst);
-        let sst_ptr: *const SsTable = &*sst_box;
-        // SAFETY: sst_ptr is derived from sst_box which is stored in the same struct.
-        // Rust drops fields in declaration order: `iter` (first) then `_sst` (second).
-        // So the iterator is always dropped before the SSTable it borrows from.
-        let sst_ref: &'static SsTable = unsafe { &*sst_ptr };
-        let iter = sst_ref.iter()?;
-
-        Ok(Self {
-            iter,
-            _sst: sst_box,
-        })
+        let sst = Arc::new(sst);
+        let iter = sst.iter()?;
+        Ok(Self { iter })
     }
 }
 

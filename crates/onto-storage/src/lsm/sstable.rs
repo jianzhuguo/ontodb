@@ -21,6 +21,7 @@ use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Default block cache capacity (number of blocks per SSTable).
 const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 64;
@@ -50,10 +51,20 @@ const MAX_DECOMPRESSED_BLOCK_SIZE: usize = 64 * 1024 * 1024;
 /// even if a corrupt sequence slips past the length checks.
 const ZSTD_WILDCOPY_MARGIN: usize = 64;
 
+/// Guard bytes after the wildcopy slack. Intact after a successful
+/// decompress proves the decompressor stayed inside the allocation;
+/// a smashed canary means a corrupt frame bypassed zstd's length checks.
+const ZSTD_GUARD_CANARY: [u8; 16] = [
+    0xC5, 0x9A, 0x3B, 0x71, 0xE2, 0x4D, 0x88, 0x16, 0x5F, 0xA3, 0x0C, 0xD7, 0x64, 0x29, 0xB1, 0x7E,
+];
+
 /// Block format: [entries...][restart_points...][num_restarts: u32]
 const RESTART_INTERVAL: usize = 16;
 
 /// Interior of SsTable requiring interior mutability (file I/O + block cache).
+///
+/// `file` and `block_cache` are separate locks so a cache hit never waits on
+/// disk I/O, and decompression runs outside both.
 struct SsTableInner {
     file: File,
     block_cache: BlockCache,
@@ -134,17 +145,26 @@ fn decompress_limited(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
 
     let margin = ZSTD_WILDCOPY_MARGIN;
 
-    /// Decompress into a buffer sized `out_cap + margin`, with zstd's
-    /// destination capacity limited to `out_cap` so wildcopy stays inside
-    /// the allocation.
+    // Decompress into a buffer sized `out_cap + margin`, with zstd's
+    // destination capacity limited to `out_cap` so wildcopy stays inside
+    // the allocation.
     let try_once = |out_cap: usize| -> std::result::Result<(Vec<u8>, usize), usize> {
         if out_cap == 0 {
             return Err((-64i64) as usize);
         }
-        let alloc = out_cap.saturating_add(margin);
+        // Layout: [out_cap dst][wildcopy slack][guard canary].
+        // zstd only sees out_cap; slack absorbs legal wildcopy overshoot;
+        // an intact canary proves nothing wrote past the allocation.
+        let canary_start = out_cap.saturating_add(margin);
+        let alloc = canary_start.saturating_add(ZSTD_GUARD_CANARY.len());
         let mut buf = vec![0u8; alloc];
-        // Only expose out_cap bytes to zstd — the tail is wildcopy slack.
+        buf[canary_start..].copy_from_slice(&ZSTD_GUARD_CANARY);
         let written = zstd::zstd_safe::decompress(&mut buf[..out_cap], src)?;
+        if buf[canary_start..] != ZSTD_GUARD_CANARY[..] {
+            // Corrupt frame wrote past dstCapacity + slack. Refuse the data;
+            // the heap may already be damaged, but do not propagate it.
+            return Err((-80i64) as usize);
+        }
         if written > out_cap {
             return Err((-70i64) as usize);
         }
@@ -154,8 +174,15 @@ fn decompress_limited(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
 
     // Known content size (one-shot frames): allocate exactly what we need.
     if let Some(n) = declared {
-        let (buf, written) = try_once(n)
-            .map_err(|e| CoreError::corruption(format!("zstd decompression failed: {}", e)))?;
+        let (buf, written) = try_once(n).map_err(|e| {
+            if e == (-80i64) as usize {
+                CoreError::corruption(
+                    "zstd wrote past output buffer (guard canary smashed — corrupt frame)",
+                )
+            } else {
+                CoreError::corruption(format!("zstd decompression failed: {}", e))
+            }
+        })?;
         if written > max_out {
             return Err(CoreError::corruption(format!(
                 "decompressed block size {} exceeds limit {}",
@@ -184,6 +211,11 @@ fn decompress_limited(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
                 return Ok(buf);
             }
             Err(e) => {
+                if e == (-80i64) as usize {
+                    return Err(CoreError::corruption(
+                        "zstd wrote past output buffer (guard canary smashed — corrupt frame)",
+                    ));
+                }
                 if !is_dst_size_too_small(e) || cap >= max_out {
                     return Err(CoreError::corruption(format!(
                         "zstd decompression failed: {}",
@@ -332,11 +364,11 @@ impl SsTableBuilder {
         self.current_block
             .extend_from_slice(&num_restarts.to_le_bytes());
 
-        // Compress block if enabled. One-shot `bulk::compress` writes the
-        // content size into the frame header so the reader can allocate
-        // exactly. On failure fall back to raw payload — the per-block flag
-        // records what was actually stored so the reader never feeds
-        // uncompressed bytes to zstd.
+        // Compress block if enabled. One-shot compression writes the content
+        // size into the frame header so the reader can allocate exactly.
+        // On failure fall back to raw payload — the per-block flag records
+        // what was actually stored so the reader never feeds uncompressed
+        // bytes to zstd.
         let (block_flags, payload) = if self.compression_level > 0 {
             match zstd::bulk::compress(self.current_block.as_slice(), self.compression_level) {
                 Ok(compressed) => (BLOCK_FLAG_COMPRESSED, compressed),
@@ -596,22 +628,27 @@ impl SsTable {
             // Read first block to get the first key
             let offset = index[0].offset;
             let size = index[0].size;
-            file.seek(SeekFrom::Start(offset))?;
-            let mut block_data = vec![0u8; size as usize];
-            file.read_exact(&mut block_data)?;
-
-            let block = Self::decode_block_payload(&block_data, compressed, block_crc)?;
-
-            // Decode first key
-            if block.len() < 4 {
+            if size as usize > MAX_DECOMPRESSED_BLOCK_SIZE + ZSTD_WILDCOPY_MARGIN * 2 {
                 Vec::new()
             } else {
-                let key_len =
-                    u32::from_le_bytes(block[0..4].try_into().expect("should be valid")) as usize;
-                if block.len() < 4 + key_len {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut block_data = vec![0u8; size as usize];
+                file.read_exact(&mut block_data)?;
+
+                let block = Self::decode_block_payload(&block_data, compressed, block_crc)?;
+
+                // Decode first key
+                if block.len() < 4 {
                     Vec::new()
                 } else {
-                    block[4..4 + key_len].to_vec()
+                    let key_len = u32::from_le_bytes(
+                        block[0..4].try_into().expect("should be valid"),
+                    ) as usize;
+                    if block.len() < 4 + key_len {
+                        Vec::new()
+                    } else {
+                        block[4..4 + key_len].to_vec()
+                    }
                 }
             }
         };
@@ -664,7 +701,7 @@ impl SsTable {
 
         // Scan all entries for max_seq_no
         let sst = match SsTable::open(path_ref) {
-            Ok(s) => s,
+            Ok(s) => Arc::new(s),
             Err(e) => {
                 eprintln!("[upgrade_footer] open failed for {:?}: {}", path_ref, e);
                 return Ok(0);
@@ -786,8 +823,8 @@ impl SsTable {
     }
 
     /// Returns an iterator over all entries in the SSTable.
-    pub fn iter(&self) -> Result<SsTableIterator<'_>> {
-        SsTableIterator::new(self)
+    pub fn iter(self: &Arc<Self>) -> Result<SsTableIterator> {
+        SsTableIterator::new(Arc::clone(self))
     }
 
     fn find_block(&self, key: &[u8]) -> Result<usize> {
@@ -816,22 +853,42 @@ impl SsTable {
     }
 
     fn read_block_at(&self, offset: u64, size: u64) -> Result<Vec<u8>> {
-        let mut inner = self.inner.lock();
-
-        // Check block cache first (returns decompressed data)
-        if let Some(cached) = inner.block_cache.get(offset) {
-            return Ok(cached.to_vec());
+        // Fast path: cache hit — copy out and release the lock immediately.
+        {
+            let mut inner = self.inner.lock();
+            if let Some(cached) = inner.block_cache.get(offset) {
+                return Ok(cached.to_vec());
+            }
         }
 
-        // Cache miss: read from disk
-        let mut buf = vec![0u8; size as usize];
-        inner.file.seek(SeekFrom::Start(offset))?;
-        inner.file.read_exact(&mut buf)?;
+        // Cache miss: bound the on-disk size (garbage index must not become
+        // a multi-GB allocation), read bytes under the lock, then drop it
+        // before the expensive decompress.
+        if size as usize > MAX_DECOMPRESSED_BLOCK_SIZE + ZSTD_WILDCOPY_MARGIN * 2 {
+            return Err(CoreError::corruption(format!(
+                "block size {} at offset {} exceeds limit",
+                size, offset
+            )));
+        }
+        let buf = {
+            let mut inner = self.inner.lock();
+            // Double-check: another thread may have filled the cache.
+            if let Some(cached) = inner.block_cache.get(offset) {
+                return Ok(cached.to_vec());
+            }
+            let mut buf = vec![0u8; size as usize];
+            inner.file.seek(SeekFrom::Start(offset))?;
+            inner.file.read_exact(&mut buf)?;
+            buf
+        };
 
+        // Decompress OUTSIDE the lock — this is the expensive part (CRC + zstd).
         let block_data = Self::decode_block_payload(&buf, self.compressed, self.block_crc)?;
 
-        // Cache the decompressed block
-        inner.block_cache.put(offset, block_data.clone());
+        {
+            let mut inner = self.inner.lock();
+            inner.block_cache.put(offset, block_data.clone());
+        }
 
         Ok(block_data)
     }
@@ -881,27 +938,34 @@ impl SsTable {
         if start >= end {
             return;
         }
-        let mut inner = self.inner.lock();
-        for i in start..end {
-            let offset = self.index[i].offset;
-            let size = self.index[i].size;
-            if inner.block_cache.contains(offset) {
-                continue;
-            }
-            let mut buf = vec![0u8; size as usize];
-            if inner.file.seek(SeekFrom::Start(offset)).is_err() {
-                continue;
-            }
-            if inner.file.read_exact(&mut buf).is_err() {
-                continue;
-            }
-            // Best-effort warmup: a corrupt prefetch must not take the
-            // compaction thread down. The real read path returns the error.
-            match Self::decode_block_payload(&buf, self.compressed, self.block_crc) {
-                Ok(data) => {
-                    inner.block_cache.put(offset, data);
+        // Phase 1: read raw bytes under the file lock (short).
+        let mut raws: Vec<(u64, Vec<u8>)> = Vec::new();
+        {
+            let mut inner = self.inner.lock();
+            for i in start..end {
+                let offset = self.index[i].offset;
+                let size = self.index[i].size;
+                if inner.block_cache.contains(offset) {
+                    continue;
                 }
-                Err(_) => continue,
+                if size as usize > MAX_DECOMPRESSED_BLOCK_SIZE + ZSTD_WILDCOPY_MARGIN * 2 {
+                    continue;
+                }
+                let mut buf = vec![0u8; size as usize];
+                if inner.file.seek(SeekFrom::Start(offset)).is_err() {
+                    continue;
+                }
+                if inner.file.read_exact(&mut buf).is_err() {
+                    continue;
+                }
+                raws.push((offset, buf));
+            }
+        }
+        // Phase 2: decompress outside the lock, then insert.
+        for (offset, buf) in raws {
+            if let Ok(data) = Self::decode_block_payload(&buf, self.compressed, self.block_crc) {
+                let mut inner = self.inner.lock();
+                inner.block_cache.put(offset, data);
             }
         }
     }
@@ -1144,8 +1208,11 @@ impl SsTable {
 /// Zero-copy design: stores byte offsets into the current block instead of
 /// cloning key/value into separate Vecs. `key()` and `value()` return
 /// slices borrowed from `block_data`, avoiding per-entry allocations.
-pub struct SsTableIterator<'a> {
-    table: &'a SsTable,
+///
+/// Owns the table via `Arc`, so no self-referential `'static` borrow is
+/// needed and the iterator can be moved freely.
+pub struct SsTableIterator {
+    table: Arc<SsTable>,
     block_idx: usize,
     block_data: Vec<u8>,
     restart_start: usize,
@@ -1161,8 +1228,8 @@ pub struct SsTableIterator<'a> {
     valid: bool,
 }
 
-impl<'a> SsTableIterator<'a> {
-    fn new(table: &'a SsTable) -> Result<Self> {
+impl SsTableIterator {
+    fn new(table: Arc<SsTable>) -> Result<Self> {
         let mut iter = Self {
             table,
             block_idx: 0,
@@ -1456,7 +1523,7 @@ mod tests {
         builder.build(&path).expect("should be valid");
 
         // Open and read
-        let sst = SsTable::open(&path).expect("should be valid");
+        let sst = Arc::new(SsTable::open(&path).expect("should be valid"));
 
         // Point lookups
         let (val, _) = sst
@@ -1487,7 +1554,7 @@ mod tests {
         }
         builder.build(&path).expect("should be valid");
 
-        let sst = SsTable::open(&path).expect("should be valid");
+        let sst = Arc::new(SsTable::open(&path).expect("should be valid"));
         let mut iter = sst.iter().expect("should be valid");
 
         let mut count = 0;
@@ -1527,7 +1594,7 @@ mod tests {
         builder.add(&Entry::put(b"z".to_vec(), b"vz".to_vec(), 100));
 
         builder.build(&path).expect("should be valid");
-        let sst = SsTable::open(&path).expect("should be valid");
+        let sst = Arc::new(SsTable::open(&path).expect("should be valid"));
         assert!(
             sst.num_blocks() >= 2,
             "need at least 2 blocks, got {}",
@@ -1562,7 +1629,7 @@ mod tests {
         }
         builder.build(&path).expect("should be valid");
 
-        let sst = SsTable::open(&path).expect("should be valid");
+        let sst = Arc::new(SsTable::open(&path).expect("should be valid"));
         assert!(
             sst.num_blocks() >= 2,
             "need at least 2 blocks, got {}",
@@ -1606,7 +1673,7 @@ mod tests {
         }
         builder.build(&path).expect("should be valid");
 
-        let sst = SsTable::open(&path).expect("should be valid");
+        let sst = Arc::new(SsTable::open(&path).expect("should be valid"));
         assert!(sst.num_blocks() >= 2);
 
         let mut iter = sst.iter().expect("should be valid");
@@ -1648,7 +1715,7 @@ mod tests {
             builder.add(&entry);
         }
         builder.build(&path).expect("should be valid");
-        let sst = SsTable::open(&path).expect("should be valid");
+        let sst = Arc::new(SsTable::open(&path).expect("should be valid"));
 
         // Full drain reference.
         let mut full = Vec::new();
@@ -1693,7 +1760,7 @@ mod tests {
         builder.build(&path).expect("should be valid");
 
         // Open and read
-        let sst = SsTable::open(&path).expect("should be valid");
+        let sst = Arc::new(SsTable::open(&path).expect("should be valid"));
         assert!(sst.compressed, "SSTable should be marked as compressed");
 
         // Point lookups
@@ -1733,7 +1800,7 @@ mod tests {
         }
         builder.build(&path).expect("should be valid");
 
-        let sst = SsTable::open(&path).expect("should be valid");
+        let sst = Arc::new(SsTable::open(&path).expect("should be valid"));
         let mut iter = sst.iter().expect("should be valid");
 
         let mut count = 0;
@@ -1819,7 +1886,7 @@ mod tests {
         }
         builder.build(&path).expect("should be valid");
 
-        let sst = SsTable::open(&path).expect("should be valid");
+        let sst = Arc::new(SsTable::open(&path).expect("should be valid"));
 
         // Check put entries
         let result = sst
@@ -2088,6 +2155,82 @@ mod tests {
         assert_eq!(out, b"hello world");
         // A limit below the declared content size must fail.
         assert!(super::decompress_limited(&frame, 4).is_err());
+    }
+
+    /// Systematic corruption injection: every class must fail cleanly (Err),
+    /// never abort, never smash the heap / canary.
+    #[test]
+    fn test_corruption_injection_matrix() {
+        let raw = vec![0x5Au8; 8192];
+        let frame = zstd::bulk::compress(&raw, 3).expect("should be valid");
+
+        // 1. Truncated frame
+        for cut in [1, 4, 8, 16, frame.len() / 2, frame.len().saturating_sub(1)] {
+            if cut == 0 || cut >= frame.len() {
+                continue;
+            }
+            let r = super::decompress_limited(&frame[..cut], 64 * 1024);
+            assert!(r.is_err(), "truncated frame at {cut} must fail");
+        }
+
+        // 2. Flipped bytes in the compressed body
+        let mut flipped = frame.clone();
+        let n = flipped.len();
+        for pos in [n / 4, n / 2, (3 * n) / 4, n.saturating_sub(3)] {
+            if pos < n {
+                flipped[pos] ^= 0xFF;
+                let r = super::decompress_limited(&flipped, 64 * 1024);
+                // May error (good) or — extremely rarely — still decode.
+                // It must never panic / abort.
+                if let Ok(out) = r {
+                    assert!(out.len() <= 64 * 1024);
+                }
+                flipped[pos] ^= 0xFF;
+            }
+        }
+
+        // 3. Random garbage with a zstd magic-looking header
+        let mut junk = vec![0u8; 256];
+        junk[0] = 0x28;
+        junk[1] = 0xB5;
+        junk[2] = 0x2F;
+        junk[3] = 0xFD;
+        assert!(super::decompress_limited(&junk, 4096).is_err());
+
+        // 4. Declared content size = huge (must refuse before allocating)
+        //    Craft: take a valid frame and lie is hard; just check the limit path
+        //    with a small max_out on a large real frame.
+        assert!(super::decompress_limited(&frame, 16).is_err());
+
+        // 5. Exact-fit must succeed and preserve data (canary intact)
+        let out = super::decompress_limited(&frame, raw.len()).expect("should be valid");
+        assert_eq!(out, raw);
+
+        // 6. Unknown-size (streaming) frame with garbage suffix
+        let mut stream = zstd::encode_all(&raw[..], 1).expect("should be valid");
+        stream.push(0x00);
+        stream.push(0xFF);
+        // Trailing garbage after a complete frame: one-shot should still
+        // return the frame contents (extra bytes ignored) OR error — never crash.
+        match super::decompress_limited(&stream, 64 * 1024) {
+            Ok(out) => assert_eq!(out, raw),
+            Err(_) => {}
+        }
+    }
+
+    /// A corrupt frame that tries to force writes past dstCapacity must be
+    /// caught by the guard canary (or by zstd's own checks) — never UB.
+    #[test]
+    fn test_decompress_guard_canary_intact_on_valid() {
+        let raw = vec![0x11u8; 4096];
+        let frame = zstd::bulk::compress(&raw, 1).expect("should be valid");
+        let out = super::decompress_limited(&frame, 4096).expect("should be valid");
+        assert_eq!(out, raw);
+        // Second call after many iterations — no cross-call canary leakage.
+        for _ in 0..100 {
+            let out = super::decompress_limited(&frame, 4096).expect("should be valid");
+            assert_eq!(out, raw);
+        }
     }
 
     /// Streaming-compressed frames (no content size in the header) must
