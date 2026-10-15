@@ -237,7 +237,7 @@ impl PreLoadEngine {
             if level >= self.levels.len() {
                 continue;
             }
-            let sst = SsTable::open(&path)?;
+            let sst = Arc::new(SsTable::open(&path)?);
             // Use max_seq_no from SST footer (O(1)) for new files,
             // fall back to scanning for old files without the footer.
             let sst_max_seq = sst.max_seq_no();
@@ -265,7 +265,7 @@ impl PreLoadEngine {
                     }
                 }
             }
-            self.sst_cache.insert(path.clone(), Arc::new(sst));
+            self.sst_cache.insert(path.clone(), sst);
             self.levels[level].push(SsTableInfo {
                 path,
                 size: metadata.len(),
@@ -614,20 +614,8 @@ impl LsmEngine {
             }
         }
 
-        // 3. Snapshot SST handles from cache (may lazily open files).
-        let sst_handles: Vec<Arc<SsTable>> = {
-            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
-            candidates
-                .iter()
-                .filter_map(|path| {
-                    if !cache.contains_key(path) {
-                        let sst = SsTable::open(path).ok()?;
-                        cache.insert(path.clone(), Arc::new(sst));
-                    }
-                    cache.get(path).map(Arc::clone)
-                })
-                .collect()
-        };
+        // 3. Snapshot SST handles from cache (opens happen outside the lock).
+        let sst_handles = self.get_or_open_ssts(&candidates)?;
 
         // 4. Iterate SST handles outside the lock (I/O-heavy).
         for sst in &sst_handles {
@@ -730,6 +718,49 @@ impl LsmEngine {
         }
 
         Ok(out)
+    }
+
+    /// Fetch an SST handle from the cache, opening the file OUTSIDE the
+    /// `sst_cache` lock on a miss. `SsTable::open` reads footer/index/bloom
+    /// from disk — holding the global cache mutex across that serializes
+    /// every concurrent reader behind one cold open.
+    fn get_or_open_sst(&self, path: &std::path::Path) -> Result<Arc<SsTable>> {
+        {
+            let cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(sst) = cache.get(path) {
+                return Ok(Arc::clone(sst));
+            }
+        }
+        // Open outside the lock (I/O-heavy).
+        let sst = Arc::new(SsTable::open(path)?);
+        let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
+        // Double-check: another thread may have inserted while we were opening.
+        if let Some(existing) = cache.get(path) {
+            return Ok(Arc::clone(existing));
+        }
+        cache.insert(path.to_path_buf(), Arc::clone(&sst));
+        Ok(sst)
+    }
+
+    /// Bulk variant of [`Self::get_or_open_sst`]: one brief lock for cache
+    /// hits, then opens only the misses outside the lock. Preserves input order.
+    fn get_or_open_ssts(&self, paths: &[std::path::PathBuf]) -> Result<Vec<Arc<SsTable>>> {
+        let mut handles: Vec<Option<Arc<SsTable>>> = vec![None; paths.len()];
+        let mut missing: Vec<usize> = Vec::new();
+        {
+            let cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
+            for (i, path) in paths.iter().enumerate() {
+                if let Some(sst) = cache.get(path) {
+                    handles[i] = Some(Arc::clone(sst));
+                } else {
+                    missing.push(i);
+                }
+            }
+        }
+        for i in missing {
+            handles[i] = Some(self.get_or_open_sst(&paths[i])?);
+        }
+        Ok(handles.into_iter().map(|h| h.expect("should be valid")).collect())
     }
 
     /// Scans all entries whose key starts with the given prefix.
@@ -856,11 +887,11 @@ impl LsmEngine {
         }
 
         // Newest-first SST list: L0 before L1 … ; within a level, reverse
-        // insertion order (later flushes are newer).
-        let sst_handles: Vec<Arc<SsTable>> = {
+        // insertion order (later flushes are newer). Collect paths under the
+        // brief levels lock, then open outside it.
+        let sst_paths: Vec<std::path::PathBuf> = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
-            let mut handles = Vec::new();
+            let mut paths = Vec::new();
             for level in levels.iter() {
                 // Reverse so later-pushed (newer) SSTs come first
                 for sst_info in level.iter().rev() {
@@ -876,18 +907,12 @@ impl LsmEngine {
                             continue;
                         }
                     }
-                    match cache.get(&sst_info.path) {
-                        Some(sst) => handles.push(Arc::clone(sst)),
-                        None => {
-                            let sst = Arc::new(SsTable::open(&sst_info.path)?);
-                            cache.insert(sst_info.path.clone(), Arc::clone(&sst));
-                            handles.push(sst);
-                        }
-                    }
+                    paths.push(sst_info.path.clone());
                 }
             }
-            handles
+            paths
         };
+        let sst_handles = self.get_or_open_ssts(&sst_paths)?;
 
         let mut seen: HashMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = HashMap::new();
         let mut live_puts = 0usize;
@@ -1030,21 +1055,9 @@ impl LsmEngine {
             paths
         };
 
-        // Step 1: Snapshot SST handles from cache (brief lock — open missing files outside)
-        let sst_handles: Vec<Arc<SsTable>> = {
-            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
-            let mut handles = Vec::with_capacity(sst_paths.len());
-            for path in &sst_paths {
-                if let Some(sst) = cache.get(path) {
-                    handles.push(Arc::clone(sst));
-                } else {
-                    let sst = Arc::new(SsTable::open(path)?);
-                    cache.insert(path.to_path_buf(), Arc::clone(&sst));
-                    handles.push(sst);
-                }
-            }
-            handles
-        };
+        // Step 1: Snapshot SST handles (cache hits under one brief lock;
+        // cold opens happen outside it via get_or_open_sst).
+        let sst_handles = self.get_or_open_ssts(&sst_paths)?;
 
         // Step 2: Scan SSTables OUTSIDE the lock (I/O-heavy)
         for (sst_idx, sst) in sst_handles.iter().enumerate() {

@@ -38,8 +38,8 @@ impl CachedResult {
 /// A cached execution plan.
 #[derive(Debug, Clone)]
 pub struct CachedPlan {
-    /// The cached execution plan.
-    pub plan: ExecutionPlan,
+    /// The cached execution plan (shared — cache hits are an Arc clone).
+    pub plan: std::sync::Arc<ExecutionPlan>,
     /// When this entry was cached.
     pub cached_at: Instant,
     /// Number of times this cache entry was hit.
@@ -266,13 +266,13 @@ impl PlanCache {
     }
 
     /// Get a cached plan for the given query hash.
-    pub fn get(&mut self, query_hash: u64) -> Option<ExecutionPlan> {
+    pub fn get(&mut self, query_hash: u64) -> Option<std::sync::Arc<ExecutionPlan>> {
         self.stats.lookups += 1;
 
         if let Some(entry) = self.entries.get_mut(&query_hash) {
             self.stats.hits += 1;
             entry.last_accessed = Instant::now();
-            let plan = entry.plan.clone();
+            let plan = std::sync::Arc::clone(&entry.plan);
             // Inline touch to avoid double mutable borrow
             if let Some(old_counter) = self.hash_to_counter.remove(&query_hash) {
                 self.access_order.remove(&old_counter);
@@ -295,7 +295,7 @@ impl PlanCache {
 
         let now = Instant::now();
         let entry = CachedPlan {
-            plan,
+            plan: std::sync::Arc::new(plan),
             cached_at: now,
             hit_count: 0,
             last_accessed: now,

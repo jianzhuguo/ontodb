@@ -445,17 +445,34 @@ pub struct QueryExecutor {
     /// Monotonic counter for generating unique document keys.
     doc_counter: AtomicU64,
     /// Runtime execution statistics.
+    /// `stats_lock` guards the HashMaps; hot counters live in atomics so the
+    /// per-query path never takes the mutex just to bump a number.
     runtime_stats: Arc<Mutex<RuntimeStats>>,
+    /// Total queries executed (lock-free).
+    stat_total_queries: AtomicU64,
+    /// Total execution time in microseconds (lock-free).
+    stat_total_time_us: AtomicU64,
+    /// Plan cache hits (lock-free).
+    stat_plan_cache_hits: AtomicU64,
+    /// Plan cache misses (lock-free).
+    stat_plan_cache_misses: AtomicU64,
+    /// Query cache hits (lock-free).
+    stat_query_cache_hits: AtomicU64,
+    /// Query cache misses (lock-free).
+    stat_query_cache_misses: AtomicU64,
     /// Active multi-statement transaction ID (None = auto-commit mode).
     /// Current limitation: only one active transaction per executor.
     /// To support multiple concurrent transactions, this would need to be
     /// changed to a HashMap<ConnectionId, SeqNo> or similar structure.
+    /// `active_txn_flag` is a lock-free hint: 0 = no txn (skip the Mutex).
     active_txn: Mutex<Option<onto_core::SeqNo>>,
+    active_txn_flag: AtomicU64,
     /// Query execution configuration.
     config: QueryConfig,
     /// Inference cache: class name → hierarchy (all super/sub classes).
     /// Cleared on ontology changes (CREATE ONTOLOGY).
-    inference_cache: Mutex<InferenceCache>,
+    /// RwLock: the per-query path only reads (cache hit).
+    inference_cache: std::sync::RwLock<InferenceCache>,
     /// Query deadline in nanoseconds (monotonic). Set before each query execution.
     /// Checked in hot loops to allow early cancellation of slow queries.
     query_deadline: AtomicU64,
@@ -751,9 +768,16 @@ impl QueryExecutor {
             plan_cache: Arc::new(Mutex::new(PlanCache::new(500))),
             doc_counter: AtomicU64::new(0),
             runtime_stats: Arc::new(Mutex::new(RuntimeStats::default())),
+            stat_total_queries: AtomicU64::new(0),
+            stat_total_time_us: AtomicU64::new(0),
+            stat_plan_cache_hits: AtomicU64::new(0),
+            stat_plan_cache_misses: AtomicU64::new(0),
+            stat_query_cache_hits: AtomicU64::new(0),
+            stat_query_cache_misses: AtomicU64::new(0),
             active_txn: Mutex::new(None),
+            active_txn_flag: AtomicU64::new(0),
             config,
-            inference_cache: Mutex::new(InferenceCache::default()),
+            inference_cache: std::sync::RwLock::new(InferenceCache::default()),
             query_deadline: AtomicU64::new(0),
             shard_router: std::sync::RwLock::new(None),
             shard_manager: Mutex::new(None),
@@ -1328,10 +1352,19 @@ impl QueryExecutor {
 
     /// Get runtime execution statistics.
     pub fn runtime_stats(&self) -> RuntimeStats {
-        self.runtime_stats
+        let mut stats = self
+            .runtime_stats
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .clone();
+        // Hot-path counters live in atomics; merge them into the snapshot.
+        stats.total_queries = self.stat_total_queries.load(Ordering::Relaxed);
+        stats.total_time_us = self.stat_total_time_us.load(Ordering::Relaxed);
+        stats.plan_cache_hits = self.stat_plan_cache_hits.load(Ordering::Relaxed);
+        stats.plan_cache_misses = self.stat_plan_cache_misses.load(Ordering::Relaxed);
+        stats.query_cache_hits = self.stat_query_cache_hits.load(Ordering::Relaxed);
+        stats.query_cache_misses = self.stat_query_cache_misses.load(Ordering::Relaxed);
+        stats
     }
 
     /// Get engine storage statistics (SSTable count, total entries, etc.).
@@ -1623,7 +1656,7 @@ impl QueryExecutor {
         self.ontology_store.save_with_engine(engine, &ontology)?;
         engine.flush()?;
         self.inference_cache
-            .lock()
+            .write()
             .unwrap_or_else(|e| e.into_inner())
             .invalidate_ontology(&ontology.name);
         Ok(())
@@ -1704,7 +1737,7 @@ impl QueryExecutor {
         self.ontology_store.save_with_engine(engine, &ontology)?;
         engine.flush()?;
         self.inference_cache
-            .lock()
+            .write()
             .unwrap_or_else(|e| e.into_inner())
             .invalidate_ontology(&ontology.name);
         Ok(())
@@ -1717,10 +1750,7 @@ impl QueryExecutor {
 
     /// Returns true if a multi-statement transaction is active.
     pub fn in_transaction(&self) -> bool {
-        self.active_txn
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+        self.active_txn_flag.load(Ordering::Acquire) != 0
     }
 
     /// Classifies whether a query is read-only (can use a read lock).
@@ -1815,11 +1845,9 @@ impl QueryExecutor {
         }
 
         let elapsed_us = elapsed.as_micros() as u64;
-        {
-            let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
-            stats.total_queries += 1;
-            stats.total_time_us += elapsed_us;
-        }
+        self.stat_total_queries.fetch_add(1, Ordering::Relaxed);
+        self.stat_total_time_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
 
         result
     }
@@ -1834,6 +1862,11 @@ impl QueryExecutor {
     pub fn execute_read(&self, ast: &QueryAst) -> Result<QueryResult> {
         self.arm_timeout();
         let engine = &self.engine;
+
+        // Fast path: no active transaction (the common case) skips the Mutex.
+        if self.active_txn_flag.load(Ordering::Acquire) == 0 {
+            return self.execute_select_read(ast, engine);
+        }
 
         // Check if there's an active multi-statement transaction
         let active_txn = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
@@ -1862,10 +1895,11 @@ impl QueryExecutor {
         }
 
         let elapsed_us = elapsed.as_micros() as u64;
+        self.stat_total_queries.fetch_add(1, Ordering::Relaxed);
+        self.stat_total_time_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
         {
             let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
-            stats.total_queries += 1;
-            stats.total_time_us += elapsed_us;
             if let QueryAst::Select { from, .. } = ast {
                 *stats.table_scan_counts.entry(from.clone()).or_insert(0) += 1;
             }
@@ -1942,7 +1976,7 @@ impl QueryExecutor {
                     }
                 }
                 // Check plan cache first
-                let cached_plan = {
+                let cached_plan: Option<std::sync::Arc<crate::optimizer::ExecutionPlan>> = {
                     let ast_hash = Self::hash_ast(ast);
                     let cached = self
                         .plan_cache
@@ -1950,10 +1984,8 @@ impl QueryExecutor {
                         .unwrap_or_else(|e| e.into_inner())
                         .get(ast_hash);
                     if cached.is_some() {
-                        self.runtime_stats
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .plan_cache_hits += 1;
+                        self.stat_plan_cache_hits
+                            .fetch_add(1, Ordering::Relaxed);
                         cached
                     } else {
                         let plan = self
@@ -1961,17 +1993,22 @@ impl QueryExecutor {
                             .read()
                             .unwrap_or_else(|e| e.into_inner())
                             .plan(ast);
-                        if let Ok(ref p) = plan {
-                            self.plan_cache
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .insert(ast_hash, p.clone());
+                        match plan {
+                            Ok(p) => {
+                                self.plan_cache
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(ast_hash, p.clone());
+                                self.stat_plan_cache_misses
+                                    .fetch_add(1, Ordering::Relaxed);
+                                Some(std::sync::Arc::new(p))
+                            }
+                            Err(e) => {
+                                self.stat_plan_cache_misses
+                                    .fetch_add(1, Ordering::Relaxed);
+                                return Err(e);
+                            }
                         }
-                        self.runtime_stats
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .plan_cache_misses += 1;
-                        plan.ok()
                     }
                 };
 
@@ -2183,10 +2220,11 @@ impl QueryExecutor {
         }
 
         let elapsed_us = elapsed.as_micros() as u64;
+        self.stat_total_queries.fetch_add(1, Ordering::Relaxed);
+        self.stat_total_time_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
         {
             let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
-            stats.total_queries += 1;
-            stats.total_time_us += elapsed_us;
             if let QueryAst::Select { from, .. } = ast {
                 *stats.table_scan_counts.entry(from.clone()).or_insert(0) += 1;
             }
@@ -2258,7 +2296,7 @@ impl QueryExecutor {
                 self.ontology_store.save_with_engine(engine, &ontology)?;
                 // Selective invalidation: only clear caches related to this ontology
                 self.inference_cache
-                    .lock()
+                    .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .invalidate_ontology(&ontology.name);
                 Ok(QueryResult::Success(format!(
@@ -2630,6 +2668,7 @@ impl QueryExecutor {
                 }
                 let txn_id = engine.begin_txn();
                 *txn = Some(txn_id);
+                self.active_txn_flag.store(1, Ordering::Release);
                 Ok(QueryResult::Success(format!(
                     "Transaction started (txn_id={})",
                     txn_id
@@ -2639,6 +2678,7 @@ impl QueryExecutor {
                 let mut txn = self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
                 match txn.take() {
                     Some(txn_id) => {
+                        self.active_txn_flag.store(0, Ordering::Release);
                         engine.commit_txn(txn_id)?;
                         Ok(QueryResult::Success("Transaction committed".to_string()))
                     }
@@ -2651,6 +2691,7 @@ impl QueryExecutor {
                 let mut txn = self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
                 match txn.take() {
                     Some(txn_id) => {
+                        self.active_txn_flag.store(0, Ordering::Release);
                         engine.abort_txn(txn_id)?;
                         Ok(QueryResult::Success("Transaction rolled back".to_string()))
                     }
@@ -2750,7 +2791,7 @@ impl QueryExecutor {
                             engine.delete(key.clone())?;
                             // Invalidate cache
                             self.inference_cache
-                                .lock()
+                                .write()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .invalidate_ontology(&ontology.name);
                             found = true;
@@ -2805,41 +2846,45 @@ impl QueryExecutor {
             ),
             _ => {
                 // For SELECT queries, check plan cache first
-                let cached_plan = if matches!(ast, QueryAst::Select { .. }) {
-                    let ast_hash = Self::hash_ast(ast);
-                    let cached = self
-                        .plan_cache
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(ast_hash);
-                    if cached.is_some() {
-                        self.runtime_stats
+                let cached_plan: Option<std::sync::Arc<crate::optimizer::ExecutionPlan>> =
+                    if matches!(ast, QueryAst::Select { .. }) {
+                        let ast_hash = Self::hash_ast(ast);
+                        let cached = self
+                            .plan_cache
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .plan_cache_hits += 1;
-                        cached
-                    } else {
-                        // Plan cache miss - generate and cache plan
-                        let plan = self
-                            .planner
-                            .read()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .plan(ast);
-                        if let Ok(ref p) = plan {
-                            self.plan_cache
-                                .lock()
+                            .get(ast_hash);
+                        if cached.is_some() {
+                            self.stat_plan_cache_hits
+                                .fetch_add(1, Ordering::Relaxed);
+                            cached
+                        } else {
+                            // Plan cache miss - generate and cache plan
+                            let plan = self
+                                .planner
+                                .read()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .insert(ast_hash, p.clone());
+                                .plan(ast);
+                            match plan {
+                                Ok(p) => {
+                                    self.plan_cache
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .insert(ast_hash, p.clone());
+                                    self.stat_plan_cache_misses
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    Some(std::sync::Arc::new(p))
+                                }
+                                Err(e) => {
+                                    self.stat_plan_cache_misses
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    return Err(e);
+                                }
+                            }
                         }
-                        self.runtime_stats
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .plan_cache_misses += 1;
-                        plan.ok()
-                    }
-                } else {
-                    None
-                };
+                    } else {
+                        None
+                    };
 
                 // Check if there's an active multi-statement transaction
                 let active_txn_id = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
@@ -4106,7 +4151,7 @@ impl QueryExecutor {
         {
             let cache = self
                 .inference_cache
-                .lock()
+                .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.class_hierarchy.get(table) {
                 return cached.clone();
@@ -4137,7 +4182,7 @@ impl QueryExecutor {
         {
             let mut cache = self
                 .inference_cache
-                .lock()
+                .write()
                 .unwrap_or_else(|e| e.into_inner());
             cache
                 .class_hierarchy
@@ -4231,7 +4276,7 @@ impl QueryExecutor {
         {
             let cache = self
                 .inference_cache
-                .lock()
+                .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref cached) = cache.merged_ontology {
                 return cached.clone();
@@ -4261,7 +4306,7 @@ impl QueryExecutor {
         {
             let mut cache = self
                 .inference_cache
-                .lock()
+                .write()
                 .unwrap_or_else(|e| e.into_inner());
             for (name, prop) in &merged.properties {
                 if !cache.inverse_property.contains_key(name) {
@@ -7261,7 +7306,7 @@ impl QueryExecutor {
         let skip = offset.unwrap_or(0);
         let take = *limit;
 
-        let plan = {
+        let plan: Option<std::sync::Arc<crate::optimizer::ExecutionPlan>> = {
             let ast_hash = Self::hash_ast(ast);
             let cached = self
                 .plan_cache
@@ -7269,10 +7314,8 @@ impl QueryExecutor {
                 .unwrap_or_else(|e| e.into_inner())
                 .get(ast_hash);
             if cached.is_some() {
-                self.runtime_stats
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .plan_cache_hits += 1;
+                self.stat_plan_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 cached
             } else {
                 let plan = self
@@ -7280,17 +7323,22 @@ impl QueryExecutor {
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
                     .plan(ast);
-                if let Ok(ref p) = plan {
-                    self.plan_cache
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(ast_hash, p.clone());
+                match plan {
+                    Ok(p) => {
+                        self.plan_cache
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(ast_hash, p.clone());
+                        self.stat_plan_cache_misses
+                            .fetch_add(1, Ordering::Relaxed);
+                        Some(std::sync::Arc::new(p))
+                    }
+                    Err(e) => {
+                        self.stat_plan_cache_misses
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(e);
+                    }
                 }
-                self.runtime_stats
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .plan_cache_misses += 1;
-                plan.ok()
             }
         };
         let Some(plan) = plan else {
@@ -9297,7 +9345,7 @@ impl QueryExecutor {
         {
             let cache = self
                 .inference_cache
-                .lock()
+                .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.class_hierarchy.get(table) {
                 return cached.clone();
@@ -9340,7 +9388,7 @@ impl QueryExecutor {
         {
             let mut cache = self
                 .inference_cache
-                .lock()
+                .write()
                 .unwrap_or_else(|e| e.into_inner());
             cache
                 .class_hierarchy
@@ -9474,7 +9522,7 @@ impl QueryExecutor {
         {
             let cache = self
                 .inference_cache
-                .lock()
+                .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.property_aliases.get(property) {
                 return cached.clone();
@@ -9513,7 +9561,7 @@ impl QueryExecutor {
         {
             let mut cache = self
                 .inference_cache
-                .lock()
+                .write()
                 .unwrap_or_else(|e| e.into_inner());
             cache
                 .property_aliases
@@ -9633,7 +9681,7 @@ impl QueryExecutor {
         ast: &QueryAst,
         engine: &LsmEngine,
         txn_id: u64,
-        cached_plan: Option<&ExecutionPlan>,
+        cached_plan: Option<&std::sync::Arc<crate::optimizer::ExecutionPlan>>,
     ) -> Result<QueryResult> {
         // For SELECT queries with a cached plan, use it directly
         if let (QueryAst::Select { .. }, Some(plan)) = (ast, cached_plan) {
@@ -11931,9 +11979,16 @@ impl QueryExecutor {
     fn hash_ast(ast: &QueryAst) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        // Serialize AST to string and hash it
-        let serialized = serde_json::to_string(ast).unwrap_or_default();
-        serialized.hash(&mut hasher);
+        // Hash the Debug representation without allocating a String.
+        // serde_json::to_string was ~10x more expensive and ran on every query.
+        struct HashWriter<'a, H: Hasher>(&'a mut H);
+        impl<H: Hasher> std::fmt::Write for HashWriter<'_, H> {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                s.hash(self.0);
+                Ok(())
+            }
+        }
+        std::fmt::write(&mut HashWriter(&mut hasher), format_args!("{:?}", ast)).ok();
         hasher.finish()
     }
 
@@ -12413,7 +12468,7 @@ impl QueryExecutor {
         {
             let cache = self
                 .inference_cache
-                .lock()
+                .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.property_aliases.get(property) {
                 return cached.clone();
@@ -12453,7 +12508,7 @@ impl QueryExecutor {
         {
             let mut cache = self
                 .inference_cache
-                .lock()
+                .write()
                 .unwrap_or_else(|e| e.into_inner());
             cache
                 .property_aliases
@@ -12472,7 +12527,7 @@ impl QueryExecutor {
         {
             let cache = self
                 .inference_cache
-                .lock()
+                .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = cache.inverse_property.get(property) {
                 return cached.clone();
@@ -12502,7 +12557,7 @@ impl QueryExecutor {
         {
             let mut cache = self
                 .inference_cache
-                .lock()
+                .write()
                 .unwrap_or_else(|e| e.into_inner());
             cache
                 .inverse_property

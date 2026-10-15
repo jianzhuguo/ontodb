@@ -1519,7 +1519,16 @@ async fn execute_query(
     // flushing rows while the rest of the scan is still running. This is what
     // cuts TTFT — the socket sees the first batch before the full result set
     // is materialized.
+    //
+    // Small result sets skip streaming entirely: `std::thread::spawn` +
+    // channel overhead dominates the actual scan for tiny LIMITs (the
+    // `__ontology__`-shaped query), capping throughput at ~3k rps.
+    let small_limit = match &ast {
+        QueryAst::Select { limit: Some(l), .. } => *l <= 100,
+        _ => false,
+    };
     let streamable = !req.pretty
+        && !small_limit
         && onto_query::QueryExecutor::is_read_only_query(&ast)
         && onto_query::QueryExecutor::is_streamable_select(&ast);
 
@@ -1543,7 +1552,9 @@ async fn execute_query(
         });
 
         // Wait for the first event so pre-row failures can still be HTTP errors.
-        let first = rx.recv();
+        // block_in_place keeps this async worker from being counted as blocked
+        // for scheduling purposes while we wait on the sync channel.
+        let first = tokio::task::block_in_place(|| rx.recv());
         let t_exec = t_exec_start.elapsed().as_secs_f64() * 1000.0;
         match first {
             Ok(StreamEvent::Batch(batch)) => {
@@ -1629,10 +1640,23 @@ async fn execute_query(
         }
     }
 
-    let result = if onto_query::QueryExecutor::is_read_only_query(&ast) {
-        state.executor.execute_read(&ast)
-    } else {
-        state.executor.execute(&ast)
+    let result = {
+        let executor = state.executor.clone();
+        let ast_for_exec = ast.clone();
+        let is_read = onto_query::QueryExecutor::is_read_only_query(&ast);
+        tokio::task::spawn_blocking(move || {
+            if is_read {
+                executor.execute_read(&ast_for_exec)
+            } else {
+                executor.execute(&ast_for_exec)
+            }
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(onto_core::CoreError::Custom(format!(
+                "query task join: {e}"
+            )))
+        })
     };
     let t_exec = t_exec_start.elapsed().as_secs_f64() * 1000.0;
     let result = match result {
@@ -1796,10 +1820,23 @@ async fn sparql_query(
         }
     };
 
-    let result = if onto_query::QueryExecutor::is_read_only_query(&ast) {
-        state.executor.execute_read(&ast)
-    } else {
-        state.executor.execute(&ast)
+    let result = {
+        let executor = state.executor.clone();
+        let ast_for_exec = ast.clone();
+        let is_read = onto_query::QueryExecutor::is_read_only_query(&ast);
+        tokio::task::spawn_blocking(move || {
+            if is_read {
+                executor.execute_read(&ast_for_exec)
+            } else {
+                executor.execute(&ast_for_exec)
+            }
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(onto_core::CoreError::Custom(format!(
+                "query task join: {e}"
+            )))
+        })
     };
     let result = match result {
         Ok(r) => r,
@@ -1930,10 +1967,23 @@ async fn vector_search(
         }
     };
 
-    let result = if onto_query::QueryExecutor::is_read_only_query(&ast) {
-        state.executor.execute_read(&ast)
-    } else {
-        state.executor.execute(&ast)
+    let result = {
+        let executor = state.executor.clone();
+        let ast_for_exec = ast.clone();
+        let is_read = onto_query::QueryExecutor::is_read_only_query(&ast);
+        tokio::task::spawn_blocking(move || {
+            if is_read {
+                executor.execute_read(&ast_for_exec)
+            } else {
+                executor.execute(&ast_for_exec)
+            }
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(onto_core::CoreError::Custom(format!(
+                "query task join: {e}"
+            )))
+        })
     };
     let result = match result {
         Ok(r) => r,
