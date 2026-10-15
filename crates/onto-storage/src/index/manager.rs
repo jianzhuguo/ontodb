@@ -949,13 +949,48 @@ impl IndexManager {
                 }
             }
             if let Some(disk_idx) = self.disk_indexes.get(&disk_key) {
+                let mut failures = 0u32;
+                let mut structural_corruption = false;
                 for (encoded_val, pk) in &index_entries {
-                    if let Err(e) = disk_idx.lock().unwrap().insert(encoded_val, pk.clone()) {
-                        eprintln!(
-                            "Warning: disk index rebuild failed for {}.{}: {}",
-                            class, column, e
-                        );
+                    match disk_idx.lock() {
+                        Ok(mut idx) => {
+                            if let Err(e) = idx.insert(encoded_val, pk.clone()) {
+                                failures += 1;
+                                // Structural corruption (bad page type, broken tree)
+                                // means the whole file is unreliable — delete and rebuild.
+                                if e.to_string().contains("corruption") {
+                                    structural_corruption = true;
+                                    break;
+                                }
+                                if failures <= 3 {
+                                    eprintln!(
+                                        "Warning: disk index rebuild failed for {}.{}: {}",
+                                        class, column, e
+                                    );
+                                }
+                            }
+                        }
+                        Err(poisoned) => {
+                            let mut idx = poisoned.into_inner();
+                            let _ = idx.insert(encoded_val, pk.clone());
+                            failures += 1;
+                        }
                     }
+                }
+                if structural_corruption || failures > (index_entries.len() / 2) as u32 {
+                    eprintln!(
+                        "Warning: disk index {}.{} corrupted ({} failures/{} entries), deleting for rebuild",
+                        class, column, failures, index_entries.len()
+                    );
+                    if let Some(path) = self.index_path(&class, &column) {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    self.disk_indexes.remove(&disk_key);
+                } else if failures > 0 {
+                    eprintln!(
+                        "Warning: disk index {}.{} had {}/{} insert failures (non-fatal)",
+                        class, column, failures, index_entries.len()
+                    );
                 }
             }
 

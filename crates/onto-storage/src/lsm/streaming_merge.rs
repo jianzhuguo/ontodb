@@ -23,9 +23,26 @@ pub struct HeapEntry {
     pub source_idx: usize,
 }
 
+/// Bytes of a Vec, treating an impossible allocation (len > 0, cap == 0)
+/// as empty so `cmp` never feeds a dangling pointer to `memcmp`.
+fn safe_vec_bytes(v: &Vec<u8>) -> &[u8] {
+    if v.capacity() == 0 {
+        &[]
+    } else {
+        v.as_slice()
+    }
+}
+
+/// Owned copy of a slice; never reuses a dangling/empty-allocation Vec.
+fn owned_bytes(s: &[u8]) -> Vec<u8> {
+    s.to_vec()
+}
+
 impl PartialEq for HeapEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.seq_no == other.seq_no
+        safe_vec_bytes(&self.key) == safe_vec_bytes(&other.key)
+            && self.seq_no == other.seq_no
+            && self.source_idx == other.source_idx
     }
 }
 
@@ -43,7 +60,8 @@ impl Ord for HeapEntry {
     /// For same key, we want LARGER seq_no to come out FIRST from max-heap.
     fn cmp(&self, other: &Self) -> Ordering {
         // Key: smaller key = higher priority -> reverse for max-heap
-        other.key.cmp(&self.key)
+        safe_vec_bytes(&other.key)
+            .cmp(safe_vec_bytes(&self.key))
             // Seq_no: larger seq_no = higher priority -> keep ascending for max-heap
             // (max-heap pops the largest, so larger seq_no comes first)
             .then(self.seq_no.cmp(&other.seq_no))
@@ -164,12 +182,14 @@ impl SstEntryIterator {
 
 impl Iterator for SstEntryIterator {
     type Item = (Vec<u8>, Vec<u8>, SeqNo, EntryKind);
-    
+
     fn next(&mut self) -> Option<Self::Item> {
         if self.iter.is_valid() {
+            // Always re-allocate from the (bounds-checked) slice — never
+            // forward a Vec that might carry a dangling empty-allocation ptr.
             let entry = (
-                self.iter.key().to_vec(),
-                self.iter.value().to_vec(),
+                owned_bytes(self.iter.key()),
+                owned_bytes(self.iter.value()),
                 self.iter.seq_no(),
                 self.iter.kind(),
             );

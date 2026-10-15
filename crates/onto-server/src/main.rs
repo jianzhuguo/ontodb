@@ -346,7 +346,7 @@ fn main() -> Result<()> {
     let engine = Arc::new(LsmEngine::open(options)?);
 
     // Open disk indexes synchronously so has_index() sees existing indexes
-    // before ensure_all_relation_indexes() runs (avoids full re-backfill on restart).
+    // before background index rebuild (avoids full re-backfill on restart).
     if let Err(e) = engine.open_disk_indexes() {
         tracing::warn!("open_disk_indexes failed: {}", e);
     }
@@ -396,9 +396,6 @@ fn main() -> Result<()> {
                 .with_triple_store(triple_store),
         )
     };
-
-    // Auto-create source/target indexes for all existing relation tables
-    executor.ensure_all_relation_indexes();
 
     // Pre-warm row count cache in background
     executor.warmup_row_counts();

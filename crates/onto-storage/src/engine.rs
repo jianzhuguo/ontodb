@@ -181,9 +181,11 @@ impl PreLoadEngine {
         let mut max_seq = 0u64;
         let mut skipped_index_entries = 0u64;
         for entry in entries {
-            // Skip index entries during WAL replay — indexes are rebuilt
+            // Skip index Puts during WAL replay — indexes are rebuilt
             // separately by rebuild_indexes() after the engine is loaded.
-            if entry.key.starts_with(b"__idx__") {
+            // Delete tombstones for `__idx__` keys MUST be applied: DROP INDEX
+            // relies on them to suppress rebuild from leftover index entries.
+            if entry.key.starts_with(b"__idx__") && entry.kind == EntryKind::Put {
                 skipped_index_entries += 1;
                 max_seq = max_seq.max(entry.seq_no);
                 continue;
@@ -3137,11 +3139,63 @@ impl LsmEngine {
     }
 
     /// Drops a secondary index.
+    /// Also tombstones all `__idx__` LSM entries for this index so startup
+    /// rebuild does not resurrect it from leftover index entries.
     pub fn drop_index(&self, class: &str, column: &str) -> bool {
+        if let Err(e) = self.tombstone_index_entries(class, column) {
+            tracing::warn!(
+                table = class,
+                column = column,
+                error = %e,
+                "Failed to tombstone LSM index entries on drop"
+            );
+        }
         self.index_manager
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .drop_index(class, column)
+    }
+
+    /// Writes delete tombstones for every `__idx__{class}__{column}::` entry.
+    /// Without this, `rebuild_indexes` recreates the disk index on next startup.
+    fn tombstone_index_entries(&self, class: &str, column: &str) -> Result<()> {
+        // Index key format: `__idx__{class}__{column}::{value}::{pk}`
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(b"__idx__");
+        prefix.extend_from_slice(class.as_bytes());
+        prefix.extend_from_slice(b"__");
+        prefix.extend_from_slice(column.as_bytes());
+        prefix.extend_from_slice(b"::");
+
+        let keys: Vec<Vec<u8>> = self
+            .scan_prefix(&prefix)?
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut ws = self.write_state.write();
+        let mut cleaned = 0usize;
+        for key in keys {
+            let seq = self.next_seq();
+            let entry = Entry::delete(key.clone(), seq);
+            ws.wal.append(&entry)?;
+            ws.memtable.delete_with_seq(key, seq);
+            cleaned += 1;
+        }
+        ws.wal.flush_buf()?;
+        tracing::info!(
+            table = class,
+            column = column,
+            cleaned = cleaned,
+            "Tombstoned LSM index entries on drop"
+        );
+        drop(ws);
+        // Persist tombstones to SSTable so a crash before WAL rotation cannot
+        // resurrect the index via rebuild_from_entries.
+        self.flush_memtable()?;
+        Ok(())
     }
 
     /// Returns true if an index exists on the given class.column.

@@ -29,10 +29,26 @@ const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 64;
 const FOOTER_SIZE: u64 = 25;
 const MAGIC: u64 = 0x4F4E544F_44425353; // "ONTO_DBSS"
 
-/// Flag bit indicating data blocks are zstd-compressed.
+/// Flag bit indicating data blocks are zstd-compressed (table-level hint).
+/// With `FLAG_BLOCK_CRC`, actual compression is decided per block.
 const FLAG_COMPRESSED: u8 = 0x01;
 /// Flag bit indicating footer has max_seq_no field (8 bytes after flags).
 const FLAG_HAS_MAX_SEQ: u8 = 0x02;
+/// Flag bit indicating each data block is stored as
+/// `[u8 block_flags][payload][u32 crc32]` (crc covers flags+payload).
+const FLAG_BLOCK_CRC: u8 = 0x04;
+
+/// Per-block flag: payload is zstd-compressed.
+const BLOCK_FLAG_COMPRESSED: u8 = 0x01;
+
+/// Hard cap on a single block's decompressed size. Blocks flush at ~4 KiB of
+/// entries, but a single huge value can make one larger. Anything above this
+/// is treated as corruption rather than being handed to the decompressor.
+const MAX_DECOMPRESSED_BLOCK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Extra output slack so `ZSTD_wildcopy` cannot store past the allocation
+/// even if a corrupt sequence slips past the length checks.
+const ZSTD_WILDCOPY_MARGIN: usize = 64;
 
 /// Block format: [entries...][restart_points...][num_restarts: u32]
 const RESTART_INTERVAL: usize = 16;
@@ -54,8 +70,11 @@ pub struct SsTable {
     index: Vec<BlockIndexEntry>,
     /// Bloom filter for point lookups.
     bloom: Option<BloomFilter>,
-    /// Whether data blocks are zstd-compressed.
+    /// Whether data blocks are zstd-compressed (legacy table-level flag).
+    /// When `block_crc` is set, per-block flags take precedence.
     compressed: bool,
+    /// Whether each data block carries a per-block header + CRC32 suffix.
+    block_crc: bool,
     /// Cached first key (minimum key) in this SSTable.
     /// Loaded once at open() to avoid repeated disk I/O.
     cached_first_key: Vec<u8>,
@@ -68,6 +87,113 @@ struct BlockIndexEntry {
     last_key: Vec<u8>,
     offset: u64,
     size: u64,
+}
+
+/// `ZSTD_error_dstSize_tooSmall` is -70. zstd-safe 7 reports errors as a raw
+/// wrapping `usize` (e.g. 18446744073709551546), and its `Display` prints that
+/// number — so string matching on the message never matches.
+fn is_dst_size_too_small(err: usize) -> bool {
+    const DST_SIZE_TOO_SMALL: usize = (-70i64) as usize;
+    err == DST_SIZE_TOO_SMALL
+}
+
+/// Decompress a zstd frame, refusing frames that would blow past `max_out`.
+///
+/// Uses the one-shot `ZSTD_decompress` path (not the streaming decoder) and
+/// reserves `ZSTD_WILDCOPY_MARGIN` bytes of output slack so a corrupt match
+/// cannot store past the allocation even if zstd's length check is bypassed.
+///
+/// Destination is a fully-initialized `vec![0u8; cap]` passed as `&mut [u8]`.
+/// The `Vec` `WriteBuf` impl calls `set_len` without checking capacity, which
+/// can produce `ptr=dangling, len>0` — that exact shape showed up as a
+/// compaction crash (`memcpy` from address 1). Slice `WriteBuf` never mutates
+/// length, so it cannot mint an invalid `Vec`.
+fn decompress_limited(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
+    if src.is_empty() {
+        return Err(CoreError::corruption("empty zstd block"));
+    }
+
+    // Size the output from the frame header when present. A declared content
+    // size above the limit (or a header that cannot be parsed) is already
+    // proof of corruption — never hand it to the decompressor.
+    let declared = match zstd::zstd_safe::get_frame_content_size(src) {
+        Ok(Some(0)) => {
+            return Err(CoreError::corruption("zstd frame declares empty content"));
+        }
+        Ok(Some(n)) if n > max_out as u64 => {
+            return Err(CoreError::corruption(format!(
+                "zstd frame declares {} bytes, exceeds limit {}",
+                n, max_out
+            )));
+        }
+        Ok(Some(n)) => Some(n as usize),
+        Ok(None) => None,
+        Err(_) => {
+            return Err(CoreError::corruption("invalid zstd frame header"));
+        }
+    };
+
+    // Wildcopy slack: ZSTD_wildcopy may store up to 32 bytes past the
+    // intended end on the fast path, so the allocation must have room.
+    let margin = ZSTD_WILDCOPY_MARGIN;
+
+    let try_once = |cap: usize| -> std::result::Result<(Vec<u8>, usize), usize> {
+        if cap == 0 {
+            return Err((-64i64) as usize);
+        }
+        let mut buf = vec![0u8; cap];
+        let written = zstd::zstd_safe::decompress(&mut buf[..], src)?;
+        if written > buf.len() {
+            return Err((-70i64) as usize);
+        }
+        buf.truncate(written);
+        Ok((buf, written))
+    };
+
+    // Known content size (one-shot frames): allocate exactly what we need.
+    if let Some(n) = declared {
+        let cap = n.saturating_add(margin);
+        let (buf, written) = try_once(cap)
+            .map_err(|e| CoreError::corruption(format!("zstd decompression failed: {}", e)))?;
+        if written > max_out {
+            return Err(CoreError::corruption(format!(
+                "decompressed block size {} exceeds limit {}",
+                written, max_out
+            )));
+        }
+        return Ok(buf);
+    }
+
+    // Unknown content size (streaming-compressed frames): grow geometrically
+    // from a modest start. Never reserve the hard cap up front — a 64 MiB
+    // allocation per block OOMs the process on this dataset.
+    let mut cap = src.len().saturating_mul(4).clamp(64 * 1024, 4 * 1024 * 1024);
+    if cap > max_out {
+        cap = max_out;
+    }
+    loop {
+        let alloc = cap.saturating_add(margin);
+        match try_once(alloc) {
+            Ok((buf, written)) => {
+                if written > max_out {
+                    return Err(CoreError::corruption(format!(
+                        "decompressed block size {} exceeds limit {}",
+                        written, max_out
+                    )));
+                }
+                return Ok(buf);
+            }
+            Err(e) => {
+                if !is_dst_size_too_small(e) || cap >= max_out {
+                    return Err(CoreError::corruption(format!(
+                        "zstd decompression failed: {}",
+                        e
+                    )));
+                }
+                cap = cap.saturating_mul(2).min(max_out);
+            }
+        }
+    }
 }
 
 /// Builder for constructing an SSTable from sorted entries.
@@ -123,7 +249,14 @@ impl SsTableBuilder {
     /// Adds an entry to the SSTable. Entries MUST be added in sorted key order.
     pub fn add(&mut self, entry: &Entry) {
         self.max_seq_no = self.max_seq_no.max(entry.seq_no);
-        self.keys_for_bloom.push(entry.key.clone());
+        // Dangling empty-allocation Vecs (len > 0, cap == 0) must not be
+        // cloned — that memcpy takes the process down mid-compaction.
+        let key_owned: Vec<u8> = if entry.key.capacity() == 0 {
+            Vec::new()
+        } else {
+            entry.key.clone()
+        };
+        self.keys_for_bloom.push(key_owned.clone());
 
         // Record restart point
         if self.entry_count_in_block.is_multiple_of(RESTART_INTERVAL) {
@@ -131,9 +264,9 @@ impl SsTableBuilder {
         }
 
         if self.current_block_first_key.is_empty() {
-            self.current_block_first_key = entry.key.clone();
+            self.current_block_first_key = key_owned.clone();
         }
-        self.current_block_last_key = entry.key.clone();
+        self.current_block_last_key = key_owned;
 
         // Encode entry into current block
         Self::encode_entry_to(&mut self.current_block, entry);
@@ -150,15 +283,20 @@ impl SsTableBuilder {
     /// no longer need the Entry after this call.
     pub fn add_owned(&mut self, entry: Entry) {
         self.max_seq_no = self.max_seq_no.max(entry.seq_no);
+        let key_owned: Vec<u8> = if entry.key.capacity() == 0 {
+            Vec::new()
+        } else {
+            entry.key.clone()
+        };
         // Record restart point
         if self.entry_count_in_block.is_multiple_of(RESTART_INTERVAL) {
             self.restart_points.push(self.current_block.len() as u32);
         }
 
         if self.current_block_first_key.is_empty() {
-            self.current_block_first_key = entry.key.clone();
+            self.current_block_first_key = key_owned.clone();
         }
-        self.current_block_last_key = entry.key.clone();
+        self.current_block_last_key = key_owned;
 
         // Encode entry into current block (borrows entry)
         Self::encode_entry_to(&mut self.current_block, &entry);
@@ -166,7 +304,12 @@ impl SsTableBuilder {
         self.entry_count_in_block += 1;
 
         // Push key into bloom filter (takes ownership, no clone)
-        self.keys_for_bloom.push(entry.key);
+        self.keys_for_bloom
+            .push(if entry.key.capacity() == 0 {
+                Vec::new()
+            } else {
+                entry.key
+            });
 
         // Flush block if it's large enough
         if self.current_block.len() >= 4096 {
@@ -189,17 +332,28 @@ impl SsTableBuilder {
         self.current_block
             .extend_from_slice(&num_restarts.to_le_bytes());
 
-        // Compress block if enabled
-        let block_data = if self.compression_level > 0 {
-            match zstd::encode_all(self.current_block.as_slice(), self.compression_level) {
-                Ok(compressed) => compressed,
-                Err(_) => self.current_block.clone(), // Fallback to uncompressed
+        // Compress block if enabled. One-shot `bulk::compress` writes the
+        // content size into the frame header so the reader can allocate
+        // exactly. On failure fall back to raw payload — the per-block flag
+        // records what was actually stored so the reader never feeds
+        // uncompressed bytes to zstd.
+        let (block_flags, payload) = if self.compression_level > 0 {
+            match zstd::bulk::compress(self.current_block.as_slice(), self.compression_level) {
+                Ok(compressed) => (BLOCK_FLAG_COMPRESSED, compressed),
+                Err(_) => (0u8, self.current_block.clone()),
             }
         } else {
-            self.current_block.clone()
+            (0u8, self.current_block.clone())
         };
 
-        let block_size = block_data.len() as u64;
+        // New block on-disk format: [flags:1][payload][crc32:4]
+        let mut stored = Vec::with_capacity(1 + payload.len() + 4);
+        stored.push(block_flags);
+        stored.extend_from_slice(&payload);
+        let crc = crc32fast::hash(&stored);
+        stored.extend_from_slice(&crc.to_le_bytes());
+
+        let block_size = stored.len() as u64;
 
         // Record block index
         self.block_entries.push(BlockIndexEntry {
@@ -209,7 +363,7 @@ impl SsTableBuilder {
         });
 
         // Append to main data
-        self.data.extend_from_slice(&block_data);
+        self.data.extend_from_slice(&stored);
         self.current_block_offset += block_size;
 
         // Reset
@@ -264,11 +418,12 @@ impl SsTableBuilder {
         file.write_all(&bloom_data)?;
 
         // Write footer: index_offset (8) + bloom_offset (8) + magic (8) + flags (1) + max_seq_no (8)
-        let flags: u8 = if self.compression_level > 0 {
-            FLAG_COMPRESSED | FLAG_HAS_MAX_SEQ
-        } else {
-            FLAG_HAS_MAX_SEQ
-        };
+        // FLAG_BLOCK_CRC is always set for files written by this builder so the
+        // reader can require per-block CRCs and per-block compression bits.
+        let mut flags: u8 = FLAG_HAS_MAX_SEQ | FLAG_BLOCK_CRC;
+        if self.compression_level > 0 {
+            flags |= FLAG_COMPRESSED;
+        }
         file.write_all(&index_offset.to_le_bytes())?;
         file.write_all(&bloom_offset.to_le_bytes())?;
         file.write_all(&MAGIC.to_le_bytes())?;
@@ -301,17 +456,31 @@ impl SsTableBuilder {
             index: self.block_entries,
             bloom: Some(bloom),
             compressed,
+            block_crc: true,
             cached_first_key,
             max_seq_no: self.max_seq_no,
         })
     }
 
     fn encode_entry_to(buf: &mut Vec<u8>, entry: &Entry) {
+        // An impossible Vec (len > 0 but no allocation) is always a dangling
+        // pointer (typically 0x1). extend_from_slice would memcpy from it and
+        // take the process down during compaction. Treat it as empty instead.
+        let key: &[u8] = if entry.key.capacity() == 0 {
+            &[]
+        } else {
+            entry.key.as_slice()
+        };
+        let value: &[u8] = if entry.value.capacity() == 0 {
+            &[]
+        } else {
+            entry.value.as_slice()
+        };
         // key_len (4) + key + value_len (4) + value + seq_no (8) + kind (1)
-        buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&entry.key);
-        buf.extend_from_slice(&(entry.value.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&entry.value);
+        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        buf.extend_from_slice(value);
         buf.extend_from_slice(&entry.seq_no.to_le_bytes());
         buf.push(match entry.kind {
             EntryKind::Put => 0,
@@ -374,6 +543,7 @@ impl SsTable {
         let magic = u64::from_le_bytes(footer[16..24].try_into().expect("should be valid"));
         let flags = footer[24];
         let compressed = flags & FLAG_COMPRESSED != 0;
+        let block_crc = flags & FLAG_BLOCK_CRC != 0;
 
         if magic != MAGIC {
             return Err(CoreError::corruption("invalid SSTable magic number"));
@@ -417,7 +587,7 @@ impl SsTable {
         let index_data_len = (bloom_offset - index_offset) as usize;
         let mut index_data = vec![0u8; index_data_len];
         file.read_exact(&mut index_data)?;
-        let index = Self::decode_index(&index_data);
+        let index = Self::decode_index(&index_data, index_offset, block_crc)?;
 
         // Cache the first key to avoid repeated disk I/O
         let cached_first_key = if index.is_empty() {
@@ -430,14 +600,7 @@ impl SsTable {
             let mut block_data = vec![0u8; size as usize];
             file.read_exact(&mut block_data)?;
 
-            // Decompress if needed
-            let block = if compressed {
-                zstd::decode_all(&block_data[..]).map_err(|e| {
-                    CoreError::corruption(format!("zstd decompression failed: {}", e))
-                })?
-            } else {
-                block_data
-            };
+            let block = Self::decode_block_payload(&block_data, compressed, block_crc)?;
 
             // Decode first key
             if block.len() < 4 {
@@ -463,6 +626,7 @@ impl SsTable {
             index,
             bloom,
             compressed,
+            block_crc,
             cached_first_key,
             max_seq_no,
         })
@@ -615,6 +779,12 @@ impl SsTable {
         self.index.len()
     }
 
+    /// True if this SSTable uses the per-block CRC format
+    /// (`[flags][payload][crc32]` per block). Legacy files return false.
+    pub fn has_block_crc(&self) -> bool {
+        self.block_crc
+    }
+
     /// Returns an iterator over all entries in the SSTable.
     pub fn iter(&self) -> Result<SsTableIterator<'_>> {
         SsTableIterator::new(self)
@@ -658,18 +828,48 @@ impl SsTable {
         inner.file.seek(SeekFrom::Start(offset))?;
         inner.file.read_exact(&mut buf)?;
 
-        // Decompress if the SSTable uses compression
-        let block_data = if self.compressed {
-            zstd::decode_all(buf.as_slice())
-                .map_err(|e| CoreError::corruption(format!("zstd decompression failed: {}", e)))?
-        } else {
-            buf
-        };
+        let block_data = Self::decode_block_payload(&buf, self.compressed, self.block_crc)?;
 
         // Cache the decompressed block
         inner.block_cache.put(offset, block_data.clone());
 
         Ok(block_data)
+    }
+
+    /// Decode one on-disk block into its raw entry payload.
+    ///
+    /// New format (`block_crc`): `[u8 flags][payload][u32 crc32]`, where the
+    /// CRC covers `flags || payload` and bit0 of `flags` selects zstd.
+    /// Legacy format: payload only, compressed iff the table-level flag is set.
+    fn decode_block_payload(raw: &[u8], compressed: bool, block_crc: bool) -> Result<Vec<u8>> {
+        if block_crc {
+            if raw.len() < 5 {
+                return Err(CoreError::corruption(format!(
+                    "data block too short for CRC format: {} bytes",
+                    raw.len()
+                )));
+            }
+            let (body, crc_bytes) = raw.split_at(raw.len() - 4);
+            let expected = u32::from_le_bytes(crc_bytes.try_into().expect("should be valid"));
+            let actual = crc32fast::hash(body);
+            if actual != expected {
+                return Err(CoreError::corruption(format!(
+                    "data block CRC mismatch: expected {:#010x}, got {:#010x}",
+                    expected, actual
+                )));
+            }
+            let block_flags = body[0];
+            let payload = &body[1..];
+            if block_flags & BLOCK_FLAG_COMPRESSED != 0 {
+                decompress_limited(payload, MAX_DECOMPRESSED_BLOCK_SIZE)
+            } else {
+                Ok(payload.to_vec())
+            }
+        } else if compressed {
+            decompress_limited(raw, MAX_DECOMPRESSED_BLOCK_SIZE)
+        } else {
+            Ok(raw.to_vec())
+        }
     }
 
     /// Prefetch the next `n` data blocks into the block cache (sequential scan).
@@ -695,15 +895,14 @@ impl SsTable {
             if inner.file.read_exact(&mut buf).is_err() {
                 continue;
             }
-            let data = if self.compressed {
-                match zstd::decode_all(buf.as_slice()) {
-                    Ok(d) => d,
-                    Err(_) => continue,
+            // Best-effort warmup: a corrupt prefetch must not take the
+            // compaction thread down. The real read path returns the error.
+            match Self::decode_block_payload(&buf, self.compressed, self.block_crc) {
+                Ok(data) => {
+                    inner.block_cache.put(offset, data);
                 }
-            } else {
-                buf
-            };
-            inner.block_cache.put(offset, data);
+                Err(_) => continue,
+            }
         }
     }
 
@@ -833,41 +1032,60 @@ impl SsTable {
         Some((key, value, seq_no, kind))
     }
 
-    fn decode_index(data: &[u8]) -> Vec<BlockIndexEntry> {
+    /// Decode the block index. `data_end` is the end of the data section
+    /// (start of the index) and is used to reject offsets that would read
+    /// past the payload into the index/footer.
+    ///
+    /// Files written by this builder always append a CRC32 to the index.
+    /// A CRC mismatch on a `block_crc` file is hard corruption. On legacy
+    /// files the CRC is optional; a bad CRC falls back to no-CRC parsing
+    /// only after the resulting entries pass offset validation.
+    fn decode_index(data: &[u8], data_end: u64, block_crc: bool) -> Result<Vec<BlockIndexEntry>> {
         if data.len() < 4 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Check if data has CRC32 suffix (new format)
         // New format: [index_data][crc32: u32]
         // Old format: [index_data] only
-        let index_data = if data.len() >= 8 {
-            // Try to detect if last 4 bytes are a CRC
+        let (index_data, has_valid_crc) = if data.len() >= 8 {
             let potential_crc =
                 u32::from_le_bytes(data[data.len() - 4..].try_into().expect("should be valid"));
             let data_without_crc = &data[..data.len() - 4];
             let computed_crc = crc32fast::hash(data_without_crc);
 
             if computed_crc == potential_crc {
-                // New format with valid CRC - use data without CRC suffix
-                data_without_crc
+                (data_without_crc, true)
             } else {
-                // Old format without CRC - use all data
-                data
+                (data, false)
             }
         } else {
-            // Too small to have CRC, treat as old format
-            data
+            (data, false)
         };
+
+        if block_crc && !has_valid_crc {
+            return Err(CoreError::corruption(
+                "block index CRC mismatch on CRC-format SSTable",
+            ));
+        }
 
         let count =
             u32::from_le_bytes(index_data[0..4].try_into().expect("should be valid")) as usize;
+        // A single SST cannot legitimately have more blocks than bytes/16;
+        // a huge count means we are parsing garbage.
+        if count > index_data.len() {
+            return Err(CoreError::corruption(format!(
+                "block index count {} exceeds index size {}",
+                count,
+                index_data.len()
+            )));
+        }
         let mut entries = Vec::with_capacity(count);
         let mut pos = 4;
 
         for _ in 0..count {
             if pos + 4 > index_data.len() {
-                break;
+                return Err(CoreError::corruption("block index truncated at key_len"));
             }
             let key_len = u32::from_le_bytes(
                 index_data[pos..pos + 4]
@@ -877,13 +1095,13 @@ impl SsTable {
             pos += 4;
 
             if pos + key_len > index_data.len() {
-                break;
+                return Err(CoreError::corruption("block index truncated at last_key"));
             }
             let last_key = index_data[pos..pos + key_len].to_vec();
             pos += key_len;
 
             if pos + 16 > index_data.len() {
-                break;
+                return Err(CoreError::corruption("block index truncated at offset/size"));
             }
             let offset = u64::from_le_bytes(
                 index_data[pos..pos + 8]
@@ -897,6 +1115,19 @@ impl SsTable {
             );
             pos += 16;
 
+            // Offset/size must stay inside the data section. A misparsed
+            // index (e.g. CRC fallback on garbage) would otherwise feed
+            // index/footer bytes to the zstd decoder.
+            if size == 0 {
+                return Err(CoreError::corruption("block index entry with zero size"));
+            }
+            if offset > data_end || size > data_end || offset.saturating_add(size) > data_end {
+                return Err(CoreError::corruption(format!(
+                    "block index entry out of range: offset={}, size={}, data_end={}",
+                    offset, size, data_end
+                )));
+            }
+
             entries.push(BlockIndexEntry {
                 last_key,
                 offset,
@@ -904,7 +1135,7 @@ impl SsTable {
             });
         }
 
-        entries
+        Ok(entries)
     }
 }
 
@@ -1095,22 +1326,23 @@ impl<'a> SsTableIterator<'a> {
     /// Returns the current key as a zero-copy slice into the block data.
     /// Returns empty slice if offsets are out of bounds (corrupted entry).
     pub fn key(&self) -> &[u8] {
-        if self.current_key_start <= self.current_key_end
-            && self.current_key_end <= self.block_data.len()
-        {
-            &self.block_data[self.current_key_start..self.current_key_end]
-        } else {
-            &[]
-        }
+        self.block_slice(self.current_key_start, self.current_key_end)
     }
 
     /// Returns the current value as a zero-copy slice into the block data.
     /// Returns empty slice if offsets are out of bounds (corrupted entry).
     pub fn value(&self) -> &[u8] {
-        if self.current_value_start <= self.current_value_end
-            && self.current_value_end <= self.block_data.len()
-        {
-            &self.block_data[self.current_value_start..self.current_value_end]
+        self.block_slice(self.current_value_start, self.current_value_end)
+    }
+
+    /// Slice `block_data[start..end]`, refusing to build a slice over an
+    /// impossible Vec (len > 0 but no allocation — dangling ptr like 0x1).
+    fn block_slice(&self, start: usize, end: usize) -> &[u8] {
+        if self.block_data.capacity() == 0 && !self.block_data.is_empty() {
+            return &[];
+        }
+        if start <= end && end <= self.block_data.len() {
+            &self.block_data[start..end]
         } else {
             &[]
         }
@@ -1701,5 +1933,224 @@ mod tests {
             SsTable::open(&path).is_err(),
             "truncated file must not open"
         );
+    }
+
+    /// Flip one byte inside the first data block. The per-block CRC must
+    /// catch it on read instead of letting zstd chew on garbage.
+    #[test]
+    fn test_block_crc_mismatch_is_rejected() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("crc_block.sst");
+        let mut builder = SsTableBuilder::new();
+        builder.set_compression_level(3);
+        for i in 0..50u32 {
+            builder.add(&Entry::put(
+                format!("key_{i:04}").into_bytes(),
+                format!("value_{i:04}_{}", "x".repeat(80)).into_bytes(),
+                i as u64,
+            ));
+        }
+        builder.build(&path).expect("should be valid");
+
+        // Corrupt one byte in the first block (after the flags byte).
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("should be valid");
+            f.seek(SeekFrom::Start(2)).expect("should be valid");
+            f.write_all(&[0xFF]).expect("should be valid");
+        }
+
+        // open() reads the first block for cached_first_key, so corruption
+        // there is caught immediately; later blocks surface on get().
+        match SsTable::open(&path) {
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(msg.contains("CRC"), "unexpected error: {msg}");
+            }
+            Ok(sst) => {
+                let err = match sst.get(b"key_0000") {
+                    Err(e) => e,
+                    Ok(v) => panic!("corrupt block must be rejected, got {v:?}"),
+                };
+                let msg = format!("{err}");
+                assert!(msg.contains("CRC"), "unexpected error: {msg}");
+            }
+        }
+    }
+
+    /// A flip inside a zstd-compressed block must produce a clean error,
+    /// never an unbounded wildcopy write.
+    #[test]
+    fn test_corrupt_compressed_payload_errors_not_crashes() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("corrupt_zstd.sst");
+        let mut builder = SsTableBuilder::new();
+        builder.set_compression_level(3);
+        for i in 0..30u32 {
+            builder.add(&Entry::put(
+                format!("k{i:03}").into_bytes(),
+                vec![b'v'; 200],
+                i as u64,
+            ));
+        }
+        builder.build(&path).expect("should be valid");
+
+        // Corrupt bytes in the middle of the first block payload (skip flags+crc).
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("should be valid");
+            f.seek(SeekFrom::Start(8)).expect("should be valid");
+            f.write_all(&[0x00, 0xFF, 0x00, 0xFF]).expect("should be valid");
+        }
+
+        let sst = match SsTable::open(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(msg.contains("CRC") || msg.contains("zstd"), "unexpected: {msg}");
+                return;
+            }
+        };
+        match sst.get(b"k000") {
+            Ok(None) => {}
+            Ok(Some(_)) => {}
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("CRC") || msg.contains("zstd") || msg.contains("corrupt"),
+                    "unexpected error: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Index CRC is mandatory on FLAG_BLOCK_CRC files.
+    #[test]
+    fn test_index_crc_mismatch_is_rejected_on_new_format() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("bad_index_crc.sst");
+        build_valid_sst(&path);
+
+        // Flip the last byte of the index (the CRC32 suffix).
+        {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("should be valid");
+            let len = f.metadata().expect("should be valid").len();
+            // footer is 33 bytes; index ends just before bloom. Easiest: flip
+            // a byte just before the bloom section by targeting the byte at
+            // index_offset + index_len - 1, which is the last CRC byte.
+            // Use footer index/bloom offsets.
+            f.seek(SeekFrom::End(-33)).expect("should be valid");
+            let mut footer = [0u8; 33];
+            f.read_exact(&mut footer).expect("should be valid");
+            let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+            let bloom_offset = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+            // Last byte of index region = bloom_offset - 1 = last CRC byte.
+            let crc_last = bloom_offset - 1;
+            assert!(crc_last >= index_offset);
+            let mut b = [0u8; 1];
+            f.seek(SeekFrom::Start(crc_last)).expect("should be valid");
+            f.read_exact(&mut b).expect("should be valid");
+            b[0] ^= 0xFF;
+            f.seek(SeekFrom::Start(crc_last)).expect("should be valid");
+            f.write_all(&b).expect("should be valid");
+            let _ = len;
+        }
+
+        let err = match SsTable::open(&path) {
+            Ok(_) => panic!("must reject bad index CRC on new-format SST"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("CRC"), "unexpected error: {msg}");
+    }
+
+    /// decompress_limited must reject empty and non-zstd input cleanly.
+    #[test]
+    fn test_decompress_limited_rejects_bad_input() {
+        assert!(super::decompress_limited(&[], 1024).is_err());
+        assert!(super::decompress_limited(b"not a zstd frame at all....", 1024).is_err());
+        // Valid tiny frame must succeed within the limit.
+        let frame = zstd::encode_all(&b"hello world"[..], 1).expect("should be valid");
+        let out = super::decompress_limited(&frame, 1024).expect("should be valid");
+        assert_eq!(out, b"hello world");
+        // A limit below the declared content size must fail.
+        assert!(super::decompress_limited(&frame, 4).is_err());
+    }
+
+    /// Streaming-compressed frames (no content size in the header) must
+    /// decompress without reserving the hard cap up front.
+    #[test]
+    fn test_decompress_limited_unknown_content_size() {
+        // encode_all uses the streaming encoder → ZSTD_CONTENTSIZE_UNKNOWN.
+        let raw = vec![0xABu8; 300_000];
+        let frame = zstd::encode_all(&raw[..], 1).expect("should be valid");
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&frame).ok().flatten(),
+            None,
+            "test precondition: streaming frame has no declared size"
+        );
+        let out = super::decompress_limited(&frame, 4 * 1024 * 1024).expect("should be valid");
+        assert_eq!(out, raw);
+
+        // Must still refuse to exceed the cap.
+        assert!(super::decompress_limited(&frame, 1024).is_err());
+    }
+
+    /// Uncompressed blocks (compression_level = 0) still round-trip through
+    /// the CRC block format.
+    #[test]
+    fn test_uncompressed_crc_blocks_roundtrip() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("raw_crc.sst");
+        let mut builder = SsTableBuilder::new();
+        for i in 0..40u32 {
+            builder.add(&Entry::put(
+                format!("k{i:03}").into_bytes(),
+                format!("v{i:03}").into_bytes(),
+                i as u64,
+            ));
+        }
+        let sst = builder.build(&path).expect("should be valid");
+        assert!(sst.block_crc);
+        assert!(!sst.compressed);
+
+        let reopened = SsTable::open(&path).expect("should be valid");
+        let (val, seq) = reopened.get(b"k010").expect("should be valid").expect("exists");
+        assert_eq!(val, b"v010");
+        assert_eq!(seq, 10);
+    }
+
+    /// Pre-FLAG_BLOCK_CRC SSTables must keep decoding through the legacy
+    /// path (payload only, table-level compression bit).
+    #[test]
+    fn test_legacy_block_format_still_decodes() {
+        let raw = b"legacy payload bytes";
+        let out = SsTable::decode_block_payload(raw, false, false).expect("should be valid");
+        assert_eq!(out, raw);
+
+        let frame = zstd::encode_all(&raw[..], 1).expect("should be valid");
+        let out = SsTable::decode_block_payload(&frame, true, false).expect("should be valid");
+        assert_eq!(out, raw);
+
+        // Corrupt legacy compressed data must error, not crash.
+        let mut bad = frame.clone();
+        if bad.len() > 10 {
+            bad[8] ^= 0xFF;
+        }
+        let res = SsTable::decode_block_payload(&bad, true, false);
+        assert!(res.is_err(), "corrupt legacy zstd must error");
     }
 }

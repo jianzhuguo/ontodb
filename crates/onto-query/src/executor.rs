@@ -471,9 +471,6 @@ pub struct QueryExecutor {
     /// Cached row counts per table: table_name → (count, last_updated).
     /// Avoids full table scan for COUNT(*) queries.
     row_count_cache: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>>,
-    /// Set of relation table names that have already had source/target indexes created.
-    /// Avoids repeated index creation attempts.
-    relation_indexes_created: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Column-level statistics collected by ANALYZE.
@@ -762,7 +759,6 @@ impl QueryExecutor {
             shard_manager: Mutex::new(None),
             current_namespace: Mutex::new("default".to_string()),
             row_count_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            relation_indexes_created: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -6285,8 +6281,14 @@ impl QueryExecutor {
         Ok(Some(rows))
     }
 
-    /// Index-driven `SELECT DISTINCT col`: one row per unique index key.
-    /// Returns None when the shape is not a single indexed column.
+    /// `SELECT DISTINCT col [, col2, ...]`: enumerate unique column value
+    /// combinations without materialising full rows.
+    ///
+    /// * Single indexed column → `distinct_counts_read` on the B+Tree (O(distinct)).
+    /// * Single column, no index → streaming scan + `encode_value` into BTreeMap.
+    /// * Multi-column → streaming scan + length-prefixed composite key.
+    ///
+    /// Returns `None` only when the projection contains expressions or `*`.
     fn try_index_distinct(
         &self,
         engine: &LsmEngine,
@@ -6297,24 +6299,35 @@ impl QueryExecutor {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<Option<Vec<Map<String, Value>>>> {
-        // Exactly one projected column, no expressions.
-        let col_name = match columns {
-            SelectColumns::Columns(items) if items.len() == 1 => match &items[0] {
-                SelectItem::Column(c) => c
-                    .split(" as ")
-                    .next()
-                    .unwrap_or(c)
-                    .split('.')
-                    .next_back()
-                    .unwrap_or(c)
-                    .trim_matches('"')
-                    .to_string(),
-                _ => return Ok(None),
-            },
+        // --- Extract column names (reject expressions / SELECT *) ---
+        let col_names: Vec<String> = match columns {
+            SelectColumns::Columns(items) => {
+                let mut names = Vec::new();
+                for item in items {
+                    match item {
+                        SelectItem::Column(c) => {
+                            let name = c
+                                .split(" as ")
+                                .next()
+                                .unwrap_or(c)
+                                .split('.')
+                                .next_back()
+                                .unwrap_or(c)
+                                .trim_matches('"')
+                                .to_string();
+                            names.push(name);
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                names
+            }
             _ => return Ok(None),
         };
-
-        // No filter (a filter on the same column could work, but keep it simple).
+        if col_names.is_empty() {
+            return Ok(None);
+        }
+        // Filters complicate dedup; fall back to streaming path.
         if filter.is_some() {
             return Ok(None);
         }
@@ -6323,30 +6336,40 @@ impl QueryExecutor {
         if hierarchy.is_empty() {
             return Ok(None);
         }
-        let indexed: Vec<String> = hierarchy
-            .iter()
-            .filter(|c| engine.has_index(c, &col_name))
-            .cloned()
-            .collect();
-        if indexed.is_empty() {
-            return Ok(None);
-        }
+        let is_single = col_names.len() == 1;
+        let first_col = &col_names[0];
 
-        let mut counts: std::collections::BTreeMap<Vec<u8>, u64> = std::collections::BTreeMap::new();
-        {
-            let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
-            for scan_class in &indexed {
-                if let Some(pairs) = mgr.distinct_counts_read(scan_class, &col_name) {
-                    for (enc, n) in pairs {
-                        *counts.entry(enc).or_insert(0) += n;
+        // --- Indexed fast path (single column only) ---
+        // BTreeMap<encoded_key, count> gives ordered unique values.
+        let mut btree: std::collections::BTreeMap<Vec<u8>, u64> =
+            std::collections::BTreeMap::new();
+        let mut used_index = false;
+
+        if is_single {
+            let indexed: Vec<String> = hierarchy
+                .iter()
+                .filter(|c| engine.has_index(c, first_col))
+                .cloned()
+                .collect();
+            if !indexed.is_empty() {
+                used_index = true;
+                let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+                for scan_class in &indexed {
+                    if let Some(pairs) = mgr.distinct_counts_read(scan_class, first_col) {
+                        for (enc, n) in pairs {
+                            *btree.entry(enc).or_insert(0) += n;
+                        }
                     }
                 }
             }
         }
 
-        // Classes without the index contribute via a prefix scan.
+        // --- Scan-based path for remaining (or all) classes ---
+        // Use scan_prefix for speed; for_each_live_prefix_until adds
+        // two-pass overhead that hurts small hierarchy subsets.
         for scan_class in &hierarchy {
-            if engine.has_index(scan_class, &col_name) {
+            // Skip classes already covered by the index.
+            if is_single && used_index && engine.has_index(scan_class, first_col) {
                 continue;
             }
             let prefix = format!("{}::", scan_class);
@@ -6358,20 +6381,57 @@ impl QueryExecutor {
                 let Some(doc) = simd_parse_row(val_bytes) else {
                     continue;
                 };
-                if let Some(v) = doc.get(&col_name) {
-                    *counts.entry(IndexManager::encode_value(v)).or_insert(0) += 1;
+                if is_single {
+                    if let Some(v) = doc.get(first_col) {
+                        btree.entry(IndexManager::encode_value(v)).or_insert(0);
+                    }
+                } else {
+                    let mut composite: Vec<u8> = Vec::new();
+                    for c in &col_names {
+                        if let Some(v) = doc.get(c) {
+                            let enc = IndexManager::encode_value(v);
+                            composite.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+                            composite.extend_from_slice(&enc);
+                        } else {
+                            composite.extend_from_slice(&0u32.to_le_bytes());
+                        }
+                    }
+                    btree.entry(composite).or_insert(0);
                 }
             }
         }
-        if counts.is_empty() {
+
+        if btree.is_empty() {
             return Ok(None);
         }
 
-        let mut rows: Vec<Map<String, Value>> = Vec::with_capacity(counts.len());
-        for enc in counts.keys() {
-            let decoded = IndexManager::decode_value(enc);
+        // --- Decode into output rows ---
+        let mut rows: Vec<Map<String, Value>> = Vec::with_capacity(btree.len());
+        for key in btree.keys() {
             let mut row = Map::new();
-            row.insert(col_name.clone(), decoded);
+            if is_single {
+                row.insert(col_names[0].clone(), IndexManager::decode_value(key));
+            } else {
+                let mut pos = 0usize;
+                for cn in &col_names {
+                    if pos + 4 > key.len() {
+                        break;
+                    }
+                    let len = u32::from_le_bytes([
+                        key[pos],
+                        key[pos + 1],
+                        key[pos + 2],
+                        key[pos + 3],
+                    ]) as usize;
+                    pos += 4;
+                    if pos + len > key.len() {
+                        break;
+                    }
+                    let enc = &key[pos..pos + len];
+                    pos += len;
+                    row.insert(cn.clone(), IndexManager::decode_value(enc));
+                }
+            }
             rows.push(row);
         }
 
@@ -10213,61 +10273,6 @@ impl QueryExecutor {
         has_source && has_target
     }
 
-    /// Ensure source/target indexes exist for a relation table.
-    /// Creates indexes synchronously if they don't exist.
-    /// Tracks which tables have been checked to avoid repeated work.
-    fn ensure_relation_indexes(&self, class: &str, columns: &[String]) {
-        // Only act on relation tables (has source + target columns)
-        if !Self::columns_has_source_target(columns) {
-            return;
-        }
-
-        // Check if we've already created indexes for this table
-        {
-            let checked = self.relation_indexes_created.lock().unwrap_or_else(|e| e.into_inner());
-            if checked.contains(class) {
-                return;
-            }
-        }
-
-        // Mark as checked (even if creation fails, to avoid repeated attempts)
-        {
-            let mut checked = self.relation_indexes_created.lock().unwrap_or_else(|e| e.into_inner());
-            checked.insert(class.to_string());
-        }
-
-        for col in ["source", "target"] {
-            if self.engine.has_index(class, col) {
-                tracing::info!(table = class, column = col, "Index already exists, skipping backfill");
-                continue;
-            }
-            tracing::info!(table = class, column = col, "Auto-creating index for relation table");
-            if let Err(e) = self.engine.create_index(class, col) {
-                tracing::warn!(table = class, column = col, error = %e, "Auto-index creation failed");
-            }
-        }
-    }
-
-    /// Scan all existing tables and create indexes for relation tables.
-    /// Called once at startup to ensure all relation tables have indexes.
-    pub fn ensure_all_relation_indexes(&self) {
-        let engine = &self.engine;
-
-        // Scan all ontologies to find classes with source + target properties
-        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
-        for (_key, val_bytes) in entries {
-            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
-                for (name, class) in &ontology.classes {
-                    if class.properties.contains(&"source".to_string())
-                        && class.properties.contains(&"target".to_string())
-                    {
-                        self.ensure_relation_indexes(name, &class.properties);
-                    }
-                }
-            }
-        }
-    }
-
     /// Executes aggregation: GROUP BY + aggregate functions + HAVING.
     fn execute_aggregation(
         &self,
@@ -11245,9 +11250,6 @@ impl QueryExecutor {
                 graph.invalidate_relation(class);
             }
         }
-
-        // Auto-create source/target indexes for relation tables
-        self.ensure_relation_indexes(class, columns);
 
         // Persist triples to triple store
         if let Some(ref triple_store) = self.triple_store {

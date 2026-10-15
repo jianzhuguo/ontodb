@@ -4293,19 +4293,16 @@ async fn flush(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// POST /api/compact - Flush memtable and trigger background compaction.
+/// Background compaction now automatically merges the last level when file count is high.
 async fn compact(State(state): State<AppState>) -> impl IntoResponse {
     let start = std::time::Instant::now();
 
-    // Get storage stats before
     let before_stats = state.executor.engine_stats();
     let before_sst = before_stats.as_ref().map(|s| s.total_sstables).unwrap_or(0);
     let before_size = before_stats.as_ref().map(|s| s.total_sst_size).unwrap_or(0);
 
-    // Flush memtable
     let _ = state.executor.flush();
 
-    // Trigger full compaction via the storage engine
-    // This sends FlushAndNotify to the compaction worker and waits for completion
     let compact_result = tokio::task::block_in_place(|| {
         state.executor.engine().flush_compaction()
     });

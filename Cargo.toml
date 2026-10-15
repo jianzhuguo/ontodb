@@ -15,6 +15,7 @@ members = [
     "crates/ontodb-rules",
     "tools/migrate-namespace",
     "tools/check_sst",
+    "tools/migrate_sst_format",
     "tools/recover_data",
     "tools/fix_key_prefix",
     "tools/clean_index",
@@ -79,7 +80,8 @@ chrono = "0.4"
 [profile.release]
 opt-level = 3
 codegen-units = 1
-strip = true
+strip = false
+debug = true
 
 [profile.bench]
 opt-level = 3

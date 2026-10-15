@@ -268,6 +268,13 @@ impl CompactionWorker {
             }
         }
 
+        // Last-level self-merge is disabled. Leveled compaction never targets
+        // the deepest level, and the previous 5-file batch rewrite produced
+        // 5 output SSTs with 0 deduped — file count never dropped below the
+        // threshold, so the worker re-merged the same ~24M entries every 60s
+        // (I/O churn + heap-pressure amplifier). L6 file count is left as-is;
+        // reads still work across the remaining SSTs.
+
         Ok(())
     }
 
@@ -743,9 +750,6 @@ impl CompactionWorker {
         _from_level: usize,
         deeper_levels: &[Vec<SsTableInfo>],
     ) -> bool {
-        // deeper_levels contains levels from (from_level+1) onward.
-        // If any deeper level has an SSTable whose range contains this key,
-        // the tombstone must be preserved.
         for level_ssts in deeper_levels {
             for sst_info in level_ssts {
                 if key >= sst_info.min_key.as_slice() && key <= sst_info.max_key.as_slice() {
