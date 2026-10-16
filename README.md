@@ -1,4 +1,4 @@
-﻿# OntoDB — 本体内核嵌入的多模态语义数据库
+# OntoDB — 本体内核嵌入的多模态语义数据库
 
 **[English](README.en.md)** | 中文
 
@@ -34,6 +34,69 @@ OntoDB 用一个引擎解决这件事：
 - 查"EGFR 抑制剂"**自动命中所有子类药物**，新增子类零代码
 
 > **一句话**：别的数据库存数据，OntoDB 让数据可理解、可推理、可校验。
+
+---
+
+## 语义元数据 vs 传统元数据
+
+传统数据库的元数据（如 PostgreSQL 的 `pg_catalog` / `information_schema`）只描述**表结构**——表名、列类型、索引、约束。分类知识、关系语义、蕴含规则都在应用代码里，数据库本身"看不懂"数据。
+
+OntoDB 把**本体（Ontology）** 内嵌进存储内核——它不只是 schema，而是**可推理的领域知识**。
+
+### 逐项对比（以 PostgreSQL 为基线）
+
+| 维度 | PostgreSQL 元数据 | OntoDB 语义元数据 | 差距本质 |
+|------|------------------|------------------|---------|
+| **存储位置** | `pg_catalog` 系统表（独立命名空间） | 与数据同库、同事务 | PG 是"档案柜"，OntoDB 是"活知识" |
+| **描述对象** | 表/列/索引/约束/权限 | 概念/属性/关系/继承/等价 | 结构 vs 语义 |
+| **继承查询** | 表继承（`INHERITS`）**不参与查询展开**，需手动 UNION ALL | `subClassOf` 查询**自动展开子类** | PG 靠应用层硬编码 |
+| **约束类型** | NOT NULL / UNIQUE / CHECK / FK | 上述全部 + **OWL：disjoint / inverseOf / transitive / equivalentClass** | PG 管单表，OWL 管跨表语义 |
+| **推理能力** | 无 | **写入即推理**（增量不动点，50.8µs） | PG 存事实，OntoDB 推新事实 |
+| **关系语义** | 外键只保证引用完整性 | `inverseOf` 自动对称、`transitive` 自动传递 | PG 知道"引用了"，不知道"意味着什么" |
+| **跨模态查询** | 需外挂 pgvector/pgRouting 等扩展 | **12 种模态原生统一查询** | PG 是拼装，OntoDB 是一体 |
+| **标准兼容** | SQL 标准 | SQL + OntoQL + **SPARQL / RDF** | 语义网生态直接对接 |
+| **数据质量门** | 写入时类型检查 | 必填 + 类型 + OWL 限制 + **逻辑一致性** | PG 拦截格式错误，OntoDB 拦截语义矛盾 |
+| **元数据消费方** | 优化器、DDL、BI 工具 | 优化器 + **推理引擎 + 校验器 + 图谱 + AI** | 服务工具 vs 驱动智能 |
+
+### 一个具体例子
+
+查"所有 EGFR 抑制剂"：
+
+```sql
+-- PostgreSQL：必须自己维护子类列表，新药上市要改代码发版
+SELECT * FROM drug
+WHERE class IN ('EGFRInhibitor', 'FirstGenEGFR', 'SecondGenEGFR', 'ThirdGenEGFR');
+
+-- OntoDB：本体声明 subClassOf，查询自动展开
+SELECT * FROM kb.Drug WHERE class = 'EGFRInhibitor';
+-- 吉非替尼、厄洛替尼、奥希替尼、阿美替尼……全部命中，新增子类零改动
+```
+
+**为什么 PG 做不到**：`pg_catalog` 记录的是"drug 表有 class 列"，不记录"EGFRInhibitor 是 KinaseInhibitor 的子类"。这个知识存在应用代码里，不在元数据里。
+
+### 本体定义包含什么
+
+```sql
+CREATE ONTOLOGY kb (
+  CLASS kb.Compound,
+  PROPERTY id         DOMAIN kb.Compound RANGE STRING,
+  PROPERTY smiles     DOMAIN kb.Compound RANGE STRING,
+  PROPERTY inchi_key  DOMAIN kb.Compound RANGE STRING,
+  PROPERTY formula    DOMAIN kb.Compound RANGE STRING,
+  PROPERTY mol_weight DOMAIN kb.Compound RANGE STRING
+)
+```
+
+这不只是建表——它是**可推理的知识定义**：类可 `SUBCLASS OF` 父类形成分类体系，属性可声明 `inverseOf`（抑制↔被抑制）、`transitive`（传递性），类可声明 `disjointWith`（Drug 与 Disease 互斥）。
+
+### 四项核心价值
+
+1. **查询语义自动展开**——`subClassOf` 推理，查父类自动含子类，分类体系越深收益越大
+2. **写入即数据质量门**——注册本体后，每次 INSERT 自动校验必填/类型/OWL 约束，语义矛盾进不了库
+3. **跨模态语义锚点**——图、向量、文档、时序共享同一套本体，关系语义可推理、可演进，不硬编码在查询里
+4. **对接语义网与 AI 生态**——SPARQL/RDF 兼容，可导入 ChEBI/HPO/GO 等标准本体，是 RAG/知识图谱/AI 的标准输入
+
+> **一句话**：普通元数据回答"表长什么样"，OntoDB 的语义元数据回答"数据是什么意思、彼此有什么关系、推得出什么新知识"。
 
 ---
 

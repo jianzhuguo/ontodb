@@ -1,4 +1,4 @@
-﻿# OntoDB — Ontology-Kernel Embedded Multi-Modal Semantic Database
+# OntoDB — Ontology-Kernel Embedded Multi-Modal Semantic Database
 
 English | **[中文](README.md)**
 
@@ -34,6 +34,69 @@ OntoDB solves this in one engine:
 - Querying "EGFR inhibitor" **automatically hits all subclass drugs** — new subclasses need zero code
 
 > **In one line**: other databases store data; OntoDB makes data understandable, inferable, and verifiable.
+
+---
+
+## Semantic Metadata vs Traditional Metadata
+
+Traditional database metadata (PostgreSQL's `pg_catalog` / `information_schema`) only describes **table structure** — table names, column types, indexes, constraints. Taxonomy, relationship semantics, and inference rules live in application code; the database itself cannot "understand" its data.
+
+OntoDB embeds the **Ontology** into the storage kernel — it is not just a schema, but **inferable domain knowledge**.
+
+### Point-by-point comparison (PostgreSQL as baseline)
+
+| Dimension | PostgreSQL Metadata | OntoDB Semantic Metadata | Gap |
+|-----------|-------------------|--------------------------|-----|
+| **Storage location** | `pg_catalog` system tables (separate namespace) | Same database, same transaction | PG is an "archive cabinet"; OntoDB is "living knowledge" |
+| **Describes** | Tables / columns / indexes / constraints / privileges | Concepts / properties / relations / inheritance / equivalence | Structure vs semantics |
+| **Inheritance queries** | Table inheritance (`INHERITS`) **does not participate in query expansion** — manual UNION ALL | `subClassOf` queries **auto-expand subclasses** | PG relies on app-layer hardcoding |
+| **Constraint types** | NOT NULL / UNIQUE / CHECK / FK | All of the above + **OWL: disjoint / inverseOf / transitive / equivalentClass** | PG constrains single tables; OWL governs cross-table semantics |
+| **Reasoning** | None | **Reason-on-Insert** (incremental fixpoint, 50.8µs) | PG stores facts; OntoDB derives new ones |
+| **Relationship semantics** | Foreign keys only guarantee referential integrity | `inverseOf` auto-symmetric, `transitive` auto-propagating | PG knows "references"; not "means" |
+| **Cross-modal queries** | Needs pgvector / pgRouting extensions | **12 modalities natively unified** | PG is assembled; OntoDB is integrated |
+| **Standards** | SQL only | SQL + OntoQL + **SPARQL / RDF** | Direct semantic-web ecosystem access |
+| **Data quality gates** | Type checks on write | Required + type + OWL + **logical consistency** | PG blocks format errors; OntoDB blocks semantic contradictions |
+| **Metadata consumers** | Optimizer, DDL, BI tools | Optimizer + **reasoner + validator + graph + AI** | Serves tools vs drives intelligence |
+
+### A concrete example
+
+Querying "all EGFR inhibitors":
+
+```sql
+-- PostgreSQL: you must maintain the subclass list yourself; new drugs mean code changes
+SELECT * FROM drug
+WHERE class IN ('EGFRInhibitor', 'FirstGenEGFR', 'SecondGenEGFR', 'ThirdGenEGFR');
+
+-- OntoDB: the ontology declares subClassOf; the query auto-expands
+SELECT * FROM kb.Drug WHERE class = 'EGFRInhibitor';
+-- Gefitinib, erlotinib, osimertinib, almonertinib ... all hit, zero code changes for new subclasses
+```
+
+**Why PG cannot do this**: `pg_catalog` records "the drug table has a class column" — it does not record "EGFRInhibitor is a subclass of KinaseInhibitor." That knowledge lives in application code, not in the metadata.
+
+### What an ontology definition contains
+
+```sql
+CREATE ONTOLOGY kb (
+  CLASS kb.Compound,
+  PROPERTY id         DOMAIN kb.Compound RANGE STRING,
+  PROPERTY smiles     DOMAIN kb.Compound RANGE STRING,
+  PROPERTY inchi_key  DOMAIN kb.Compound RANGE STRING,
+  PROPERTY formula    DOMAIN kb.Compound RANGE STRING,
+  PROPERTY mol_weight DOMAIN kb.Compound RANGE STRING
+)
+```
+
+This is not just table creation — it is **inferable knowledge definition**: classes can `SUBCLASS OF` parents forming taxonomies, properties can declare `inverseOf` (inhibits ↔ is-inhibited) and `transitive`, classes can declare `disjointWith` (Drug vs Disease are mutually exclusive).
+
+### Four core values
+
+1. **Semantic query auto-expansion** — `subClassOf` reasoning: query a parent class, get all subclasses automatically; deeper taxonomies mean bigger wins
+2. **Write-time data-quality gates** — once registered, every INSERT is validated for required fields / types / OWL constraints; semantic contradictions cannot enter the database
+3. **Cross-modal semantic anchor** — graph, vector, document, and time series share one ontology; relationship semantics are inferable and evolvable, not hardcoded in queries
+4. **Semantic-web & AI ecosystem** — SPARQL/RDF compatible; imports standard ontologies (ChEBI/HPO/GO); standard input for RAG / knowledge graphs / AI
+
+> **In one line**: ordinary metadata answers "what does the table look like"; OntoDB's semantic metadata answers "what does the data mean, how does it relate, and what new knowledge can be derived."
 
 ---
 
