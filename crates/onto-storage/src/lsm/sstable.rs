@@ -369,10 +369,38 @@ impl SsTableBuilder {
         // On failure fall back to raw payload — the per-block flag records
         // what was actually stored so the reader never feeds uncompressed
         // bytes to zstd.
+        //
+        // Compressor is thread-local and reused: `zstd::bulk::compress` builds
+        // a fresh CCtx (multi-MB workspace) per call, and under heavy compaction
+        // the workspace allocation can fail — zstd 1.5.7 does not check
+        // `cwksp_reserve_failed` after reserving `seqStore.llCode`, so a failed
+        // reservation becomes a NULL write in `ZSTD_seqToCodes`. Reusing the
+        // CCtx keeps the workspace warm and avoids the churn.
         let (block_flags, payload) = if self.compression_level > 0 {
-            match zstd::bulk::compress(self.current_block.as_slice(), self.compression_level) {
-                Ok(compressed) => (BLOCK_FLAG_COMPRESSED, compressed),
-                Err(_) => (0u8, self.current_block.clone()),
+            thread_local! {
+                static COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+                    std::cell::RefCell::new(None);
+            }
+            let result = COMPRESSOR.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                if slot.is_none() {
+                    match zstd::bulk::Compressor::new(self.compression_level) {
+                        Ok(c) => *slot = Some(c),
+                        Err(_) => return None,
+                    }
+                }
+                let compressor = slot.as_mut()?;
+                // Slice WriteBuf: never `Vec::set_len`, same contract as decompress.
+                let bound = zstd::zstd_safe::compress_bound(self.current_block.len());
+                let mut buf = vec![0u8; bound];
+                match compressor.compress_to_buffer(self.current_block.as_slice(), &mut buf[..]) {
+                    Ok(n) => Some(buf[..n].to_vec()),
+                    Err(_) => None,
+                }
+            });
+            match result {
+                Some(compressed) => (BLOCK_FLAG_COMPRESSED, compressed),
+                None => (0u8, self.current_block.clone()),
             }
         } else {
             (0u8, self.current_block.clone())
