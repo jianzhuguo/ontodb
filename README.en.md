@@ -1,4 +1,4 @@
-# OntoDB — Ontology-Kernel Embedded Multi-Modal Semantic Database
+﻿# OntoDB — Ontology-Kernel Embedded Multi-Modal Semantic Database
 
 English | **[中文](README.md)**
 
@@ -10,16 +10,30 @@ Unified storage of 12 data types, 7-step write-on-insert pipeline, embedded incr
 
 ## Why OntoDB
 
+**The reality for most teams**: drugs in MySQL, graphs in Neo4j, vectors in Milvus, time series in InfluxDB, reasoning in Jena — one question spans 5 systems, ETL after every write, taxonomy hard-coded in application logic. **Lots of data, little knowledge.**
+
+OntoDB solves this in one engine:
+
 | Dimension | Traditional | OntoDB |
 |-----------|------------|--------|
 | **Architecture** | MySQL + Neo4j + Milvus + InfluxDB + PostGIS + Jena (6 systems) | **1 system**, 12 data types unified |
 | **Semantics** | ETL after write, seconds to minutes | **Semantic-on-Insert**, 7-step atomic pipeline, microseconds |
 | **Reasoning** | External engine, data shuffling | **OWL reasoning embedded in storage kernel**, zero overhead |
 | **Query** | SQL + Cypher + SPARQL + proprietary API (4 languages) | **OntoQL**, one syntax for relational + graph + vector + reasoning |
+| **Semantic Metadata** | Metadata only describes table structure (`pg_catalog`); taxonomy lives in application code | **Ontology IS the metadata**: class inheritance / equivalence / disjointness are inferable; `subClassOf` queries auto-expand subclasses |
 | **Deployment** | 6 independent systems, complex ops | **3-tier edge**, ESP32 to cloud server, unified architecture |
 | **Multi-tenant** | App-layer tenant_id, easy to miss | **Namespace kernel isolation**, key-prefix routing, zero overhead |
 | **Data Lifetime** | TTL fixed expiry, no value awareness | **Living Data decay**, data lives or dies based on access |
+| **Reliability** | Luck and restarts | **Block-level CRC + guard canary**; corrupted data deterministically rejected; heap-corruption root cause closed |
 | **Cost** | 6 systems x 6 ops x 6 licenses | **1 system**, 80%+ ops cost reduction |
+
+**Production-verified** (a biomedical knowledge graph, 12 cores / 32GB / NVMe):
+
+- **16.35M records** (8.15M entities + 8.21M relation edges) + 2.45M molecular structures, 7×24 online with zero crashes
+- GROUP BY over 607K rows **123ms** (90×); large-table scan **2,546 rps** (238×)
+- Querying "EGFR inhibitor" **automatically hits all subclass drugs** — new subclasses need zero code
+
+> **In one line**: other databases store data; OntoDB makes data understandable, inferable, and verifiable.
 
 ---
 
@@ -195,6 +209,20 @@ One OntoDB instance serves N tenants/projects with low ops cost and data securit
 
 > **1M+ throughput, microsecond reasoning, 100% vector recall. One system unifies 12 data types, replacing 6 independent databases.**
 
+### Production-Verified (a biomedical knowledge graph)
+
+> 12 cores / 32GB RAM / NVMe SSD / **16.35M records** (8.15M entities + 8.21M relation edges) / 14.8GB / 439 SSTables
+
+| Metric | Value |
+|--------|-------|
+| Total records | **16.35M+** (55 entity tables + 21 relation tables) |
+| Molecular structures (SMILES/InChI) | **2.45M** (ChEMBL 35) |
+| GROUP BY over 607K rows | **123ms** (11s before index pushdown, 90×) |
+| Large-table LIMIT scan (16 concurrent) | **2,546 rps** (10.7 rps before, 238×) |
+| P50 latency at 64 concurrent | **25.8ms** (8.9s before) |
+| Mixed-workload soak | **180s / 69,610 queries / 0 errors** |
+| Corrupted-data injection test | **All deterministically rejected, zero crashes** |
+
 ### Storage Engine
 
 | Metric | OntoDB | SQLite | PostgreSQL | Redis |
@@ -236,7 +264,7 @@ One OntoDB instance serves N tenants/projects with low ops cost and data securit
 | Time series | InfluxDB | ~200K ops/s | **1,126K ops/s** | TSM columnar |
 | Rule engine | Drools | ~500µs/10 rules | **34.5µs/10 rules** | DSL syntax |
 
-> See [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md) for full details
+> See [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md) · [Semantic Metadata Deep Dive](docs/marketing/SEMANTIC_METADATA.md)
 
 ---
 
@@ -291,9 +319,14 @@ SELECT * FROM sensor_data WHERE time > '2024-01-01' LIMIT 100;
 
 ## Use Cases
 
+> **Market positioning: the semantic service layer of the big-data stack.** Big-data pipelines (lakehouse / Spark / Flink) handle cold data and batch analytics; OntoDB handles semantic queries and online services — ontology reasoning, unified multi-modal queries, write-time data-quality gates, and knowledge graphs — connected via CDC / import pipelines.
+
+**Delivered proof**: biomedical knowledge graph (16.35M records) — drug / target / disease / adverse-reaction data from ChEMBL / UniProt / ClinVar in one engine. `subClassOf` reasoning makes "EGFR inhibitor" queries automatically hit all subclass drugs. Running 7×24 with zero crashes.
+
 | Scenario | Why OntoDB |
 |----------|-----------|
 | **LLM / AI Companies** | Vector + knowledge graph + reasoning fused, RAG + built-in ontology |
+| **Biopharma / AI4S** | Molecular structure + graph + vector + ontology unified; structure-similarity → target-pathway → adverse-event in one query (delivered) |
 | **Internet Companies** | 12 data types in 1 system, replace MySQL+Redis+Milvus+ES+Neo4j |
 | **SaaS Platforms** | Namespace kernel isolation, one instance for N tenants, zero overhead |
 | **Knowledge Graphs** | OWL reasoning embedded, write-on-reason, traceable derivation chains |
@@ -309,6 +342,29 @@ SELECT * FROM sensor_data WHERE time > '2024-01-01' LIMIT 100;
 | **Multi-Project Data Hub** | One OntoDB instance for N projects, namespace physical isolation |
 | **Edge Computing** | MCU < 100KB to full server, unified data model and API |
 | **Embodied Intelligence** | Edge reasoning + spatio-temporal rules + ontology-driven rule engine |
+
+### Industry Case Studies
+
+| Case | Pain Point | OntoDB Solution | Impact |
+|------|-----------|----------------|--------|
+| **Biomedical knowledge graph** (delivered) | Drug / target / pathway / adverse-event data split across 5 systems; "EGFR inhibitor" queries miss subclasses | 12 modalities in one engine + `subClassOf` auto-expansion | 607K-row aggregate **11s→123ms**; table scan **238×** |
+| **Clinical trial matching** | Eligibility criteria buried in documents; patient screening takes weeks | Ontologized eligibility + reasoning-based matching | Screening **weeks→minutes**, new trials need zero code |
+| **AML transaction graph** | Fund flows split across 3 databases; link mining is manual | Transaction graph + class ontology + transitive risk reasoning | Link mining **×3**, full group-risk coverage |
+| **Equipment fault knowledge graph** | Fault cases unstructured; troubleshooting relies on expert experience | Fault taxonomy ontology + causal graph + sensor time series | Troubleshooting time **-50%**, alert accuracy **+30%** |
+| **Product catalog management** | 5–8-level category trees; "phone" queries need recursive UNION | `subClassOf` auto-expansion + synonym equivalence | **1 SQL** replaces recursive UNION, recall **+35%** |
+
+> Case 1 is a production-verified delivery; cases 2–5 are reference designs with industry-baseline estimates. See [Semantic Metadata Deep Dive](docs/marketing/SEMANTIC_METADATA.md) (Chinese) for details.
+
+### Scenario Fit
+
+Semantic metadata delivers the most value where taxonomies are deep, cross-table joins are dense, and data quality matters:
+
+| Scenario | Taxonomy Depth | Cross-table Links | Quality Bar | Fit |
+|----------|---------------|-------------------|-------------|-----|
+| Biopharma / Chemistry & Materials | ★★★★★ | ★★★★ | ★★★★ | **Highest** (verified) |
+| Healthcare / FinTech | ★★★★ | ★★★★★ | ★★★★ | **High** |
+| Manufacturing / E-Commerce | ★★★★ | ★★★ | ★★★ | **Medium-High** |
+| Smart City / Government | ★★★★ | ★★★★ | ★★★★ | **Medium** |
 
 ---
 
