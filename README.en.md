@@ -100,6 +100,64 @@ This is not just table creation — it is **inferable knowledge definition**: cl
 
 ---
 
+## Vector Search vs Traditional Vector Databases
+
+Traditional stacks treat vectors as isolated float arrays: Milvus / pgvector store embeddings and return Top-K, while business tables and knowledge graphs live in another world. After search you still join back to the business DB; metadata filters either pre-select IDs in SQL or rely on coarse scalar filtering inside the vector DB. **Vectors without knowledge.**
+
+OntoDB embeds vector indexing **in the storage kernel**: vectors share the same database and transactions with documents, graph, and ontology. SQL predicates, graph relations, and ontology reasoning participate natively in search — not bolted on.
+
+### Point-by-point comparison (Milvus / pgvector as baseline)
+
+| Dimension | Milvus / pgvector | OntoDB Vector Capability | Essence of the Gap |
+|-----------|-------------------|--------------------------|--------------------|
+| **Architecture** | Separate vector DB + business DB, post-write ETL | **Same DB, same transactions** as documents / graph / ontology | Assembled vs integrated |
+| **Binary fingerprints** | Usually float32; 1024-d takes 4KB | **1024-bit packed into 128B** (8× smaller), bit-op fast path | Generic embeddings vs specialized for chemistry / binary features |
+| **Distance metrics** | L2 / IP / Cosine typical | L2 / Cosine / IP / **Tanimoto / Hamming** | Native chemical similarity & Hamming |
+| **Filtered search** | Pre-select IDs in SQL then vector, or approximate scalar filter | **VECTOR SEARCH ... WHERE** pushed down in one plan | Two queries vs one fusion |
+| **Knowledge reasoning** | None | Ontology walk after hit (subclass / transitive / equivalence) | Similarity ends at similarity |
+| **Incremental maintenance** | Full rebuild or third-party index tools | **Incremental delta + full snapshot**; bulk vs online split | Ops scripts vs built into engine |
+| **Metadata consistency** | Two systems; scalar filter depends on version | Vector nodes share `{Class}::PK` anchor with documents | Mapping-table risk vs zero mapping |
+
+### A concrete example: molecular similarity search
+
+```sql
+-- Find molecules most similar to aspirin using a 1024-bit Morgan fingerprint
+VECTOR SEARCH ON sembio.Compound (fp)
+QUERY [1.0, 0.0, 1.0, ... ]   -- 0/1 bit vector
+TOP 10
+WHERE mol_weight < 500;        -- optional: SQL predicate pushed down
+```
+
+**Production-verified at 2.45M molecules** (full ChEMBL library, Tanimoto):
+
+| Query molecule | Fingerprint bits | Latency | Top hits (excerpt) |
+|----------------|------------------|---------|---------------------|
+| Aspirin | 24 bits | **21ms** | Carbaspirin, salsalate, phenylaspirinate |
+| Clopidogrel | 45 bits | **41ms** | Bisulfate salt, vicagrel (same-target analog) |
+| Paclitaxel | 86 bits | **39ms** | Taxane side-chain / chloro analogs |
+
+Full-library search in **< 50ms**; self-match distance 0; salts, stereoisomers, and same-scaffold analogs are recalled together.
+
+### Capability list
+
+1. **HNSW graph index** — hierarchical navigable small-world graph; `ef_search` tunable at query time
+2. **Binary fingerprint specialization** — bit-packed storage and Tanimoto/Hamming bit-op fast paths; no 1024-dim float expansion
+3. **Incremental persistence** — small writes as incremental deltas; bulk import automatically switches to full snapshot; restart-safe without full rebuild
+4. **Self-healing structure** — stale-node prune (`COMPACT VECTOR INDEX`), tombstone filtering, duplicate-id collapse
+5. **Cross-modal fusion** — vector + SQL filter + graph traversal + ontology reasoning in one query (OntoQL / hybrid API)
+6. **Unified semantic anchor** — vector doc key, graph vertex, triple subject, and storage PK are the same `{Class}::PK`; zero mapping tables
+
+### Four core values
+
+1. **Search becomes knowledge** — a vector hit is not the end; follow ontology relations to targets, pathways, adverse events
+2. **Designed for domain features** — native fingerprints, Hamming, Tanimoto; not just text embeddings
+3. **No post-write migration** — vectors commit with business data in one transaction; no ETL window, no dual-write drift
+4. **Production-ops ready** — incremental persistence, bulk import path, metrics, snapshot restore in one place
+
+> **In one line**: other vector DBs tell you "which vectors look alike"; OntoDB tells you **which things** look alike — and what that means in a knowledge network.
+
+---
+
 ## 12 Data Types
 
 OntoDB unifies 12 data types in a single storage engine:
@@ -280,6 +338,7 @@ One OntoDB instance serves N tenants/projects with low ops cost and data securit
 |--------|-------|
 | Total records | **16.35M+** (55 entity tables + 21 relation tables) |
 | Molecular structures (SMILES/InChI) | **2.45M** (ChEMBL 35) |
+| **Molecular fingerprint similarity (Tanimoto)** | **21–41ms / 2.45M** |
 | GROUP BY over 607K rows | **123ms** (11s before index pushdown, 90×) |
 | Large-table LIMIT scan (16 concurrent) | **2,546 rps** (10.7 rps before, 238×) |
 | P50 latency at 64 concurrent | **25.8ms** (8.9s before) |
@@ -300,6 +359,7 @@ One OntoDB instance serves N tenants/projects with low ops cost and data securit
 | 10K | **100%** | **403µs** |
 | 50K | **100%** | **1.03ms** |
 | 200K | **99.7%** | **4.06ms** |
+| **2.45M (molecular fingerprints, Tanimoto)** | — | **21–41ms** |
 
 ### OWL Reasoning (World's First Embedded Engine)
 
