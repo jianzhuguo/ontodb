@@ -240,6 +240,41 @@ impl CompactionWorker {
             return Ok(());
         }
 
+        // ── File-count hard trigger (B) ──────────────────────────────────
+        // Size-score alone can sit just under 1.0 forever (we observed L2 at
+        // 0.992), and the deepest level is never a size-score source. When any
+        // level exceeds FILE_COUNT_TRIGGER files, drain it with a bounded
+        // batch regardless of score. This is what unblocks L6.
+        const FILE_COUNT_TRIGGER: usize = 50;
+        let crowded: Option<(usize, usize)> = {
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            levels
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (i, l.len()))
+                .filter(|(_, n)| *n > FILE_COUNT_TRIGGER)
+                .max_by_key(|(_, n)| *n)
+        };
+        if let Some((level, nfiles)) = crowded {
+            let deepest = {
+                let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+                levels.len().saturating_sub(1)
+            };
+            tracing::info!(
+                "File-count trigger: L{} has {} files (> {}), merging batch",
+                level,
+                nfiles,
+                FILE_COUNT_TRIGGER
+            );
+            if level == deepest {
+                // Deepest level: bounded self-merge, never the whole level.
+                self.merge_last_level_batch()?;
+            } else {
+                self.compact_level(level)?;
+            }
+            return Ok(());
+        }
+
         // Find the level with the highest compaction score
         let (best_level, best_score) = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
@@ -268,12 +303,9 @@ impl CompactionWorker {
             }
         }
 
-        // Last-level self-merge is disabled. Leveled compaction never targets
-        // the deepest level, and the previous 5-file batch rewrite produced
-        // 5 output SSTs with 0 deduped — file count never dropped below the
-        // threshold, so the worker re-merged the same ~24M entries every 60s
-        // (I/O churn + heap-pressure amplifier). L6 file count is left as-is;
-        // reads still work across the remaining SSTs.
+        // Deepest-level file count is handled by the file-count trigger above
+        // (bounded self-merge batch). Full-level self-merge stays disabled:
+        // rewriting ~24M entries in one shot OOMs and never reduced file count.
 
         Ok(())
     }
@@ -604,6 +636,223 @@ impl CompactionWorker {
             entry_count
         );
 
+        Ok(())
+    }
+
+    /// Bounded self-merge for the deepest level (C).
+    ///
+    /// The deepest level is never a size-score compaction source, and a full
+    /// self-merge of ~24M entries OOMs / churns without reducing file count.
+    ///
+    /// **2-in-1-out with a size cap** is the only safe file-count reduction
+    /// once L6 files are large:
+    /// - a bigger batch re-splits into N outputs and churns
+    ///   (observed: 8 in → 8 out, 0 deduped)
+    /// - unlimited 2-in-1-out grows files without bound (multi-GB SSTs:
+    ///   rewrite amplification, huge open handles, latency spikes)
+    ///
+    /// So: merge two of the smallest files *only when their combined size
+    /// stays under `MAX_PAIR_BYTES`*. Output is a single SST (no split), so
+    /// each call nets -1 file. Oversized pairs are left alone — L5→L6
+    /// normal compaction is what absorbs those.
+    fn merge_last_level_batch(&mut self) -> Result<()> {
+        const BATCH: usize = 2;
+        // Cap the *pair* so the single output stays in the same ballpark as
+        // the largest SSTs we already run (~500MB). Above this, 2→1 just
+        // manufactures a giant file.
+        const MAX_PAIR_BYTES: u64 = 256 * 1024 * 1024;
+        // Do not split the output: 2 inputs must become 1 file or the level
+        // cannot shrink. Safe because the pair is size-capped above.
+        const TARGET_OUTPUT_SIZE: u64 = u64::MAX;
+        const MIN_FILES: usize = 2;
+
+        // Drop 0-entry empty shells first — they pollute the batch budget.
+        let empties: Vec<PathBuf> = {
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let deepest = levels.len().saturating_sub(1);
+            if deepest == 0 {
+                return Ok(());
+            }
+            levels[deepest]
+                .iter()
+                .filter(|s| s.size < 64)
+                .map(|s| s.path.clone())
+                .collect()
+        };
+        if !empties.is_empty() {
+            {
+                let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+                let deepest = levels.len().saturating_sub(1);
+                let empty_set: std::collections::HashSet<PathBuf> = empties.iter().cloned().collect();
+                levels[deepest].retain(|s| !empty_set.contains(&s.path));
+            }
+            for p in &empties {
+                self.sst_cache.remove(p);
+                self.pending_deletions.push(p.clone());
+            }
+            tracing::info!(
+                count = empties.len(),
+                "Discarded empty-shell SSTs in merge_last_level_batch"
+            );
+        }
+
+        // Pick the batch under the lock, then release before I/O.
+        let (level_idx, batch) = {
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let deepest = levels.len().saturating_sub(1);
+            if deepest == 0 {
+                return Ok(());
+            }
+
+            // Smallest first: steady file-count progress without a huge read.
+            // Only form a pair that stays under MAX_PAIR_BYTES — merging two
+            // already-huge files would just mint one giant SST.
+            let mut sorted: Vec<SsTableInfo> = levels[deepest].clone();
+            sorted.sort_by_key(|s| s.size);
+            let mut picked: Vec<SsTableInfo> = Vec::new();
+            let mut total: u64 = 0;
+            for s in sorted {
+                if picked.len() >= BATCH {
+                    break;
+                }
+                if !picked.is_empty() && total + s.size > MAX_PAIR_BYTES {
+                    break;
+                }
+                if picked.is_empty() && s.size > MAX_PAIR_BYTES {
+                    // A single file already over the cap cannot form a safe pair.
+                    break;
+                }
+                total += s.size;
+                picked.push(s);
+            }
+            if picked.len() < MIN_FILES {
+                return Ok(());
+            }
+            (deepest, picked)
+        };
+
+        let paths: Vec<PathBuf> = batch.iter().map(|s| s.path.clone()).collect();
+        let input_bytes: u64 = batch.iter().map(|s| s.size).sum();
+        tracing::info!(
+            level = level_idx,
+            files = paths.len(),
+            input_mb = input_bytes / (1024 * 1024),
+            "Last-level batched self-merge starting"
+        );
+
+        let mut merge_iter =
+            match crate::lsm::streaming_merge::StreamingMergeIterator::new(&paths) {
+                Ok(iter) => iter,
+                Err(e) => {
+                    tracing::warn!("Failed to create last-level merge iterator: {}", e);
+                    return Ok(());
+                }
+            };
+        if !merge_iter.has_next() {
+            return Ok(());
+        }
+
+        let mut new_ssts: Vec<SsTableInfo> = Vec::new();
+        let mut builder = SsTableBuilder::new();
+        builder.set_compression_level(self.options.compression_level);
+        let mut current_size: u64 = 0;
+        let mut batch_min_key: Vec<u8> = Vec::new();
+        let mut last_key: Option<Vec<u8>> = None;
+        let mut total_entries: u64 = 0;
+        let mut deduped: u64 = 0;
+
+        while merge_iter.has_next() {
+            let entry = merge_iter.next().unwrap();
+            // StreamingMergeIterator yields newest-first per key; keep one.
+            if last_key.as_ref() == Some(&entry.key) {
+                deduped += 1;
+                continue;
+            }
+            if batch_min_key.is_empty() {
+                batch_min_key = entry.key.clone();
+            }
+
+            let sst_entry = match entry.kind {
+                EntryKind::Put => Entry::put(entry.key.clone(), entry.value, entry.seq_no),
+                EntryKind::Delete => Entry::delete(entry.key.clone(), entry.seq_no),
+            };
+            builder.add(&sst_entry);
+            current_size += entry.key.len() as u64 + sst_entry.value.len() as u64 + 16;
+            total_entries += 1;
+            last_key = Some(entry.key);
+
+            if current_size >= TARGET_OUTPUT_SIZE {
+                let id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
+                let path = self
+                    .options
+                    .data_dir
+                    .join(format!("L{}_{}.sst", level_idx, id));
+                let sst = builder.build(&path)?;
+                let metadata = fs::metadata(&path)?;
+                new_ssts.push(SsTableInfo {
+                    path,
+                    size: metadata.len(),
+                    min_key: batch_min_key.clone(),
+                    max_key: sst.max_key().to_vec(),
+                });
+                builder = SsTableBuilder::new();
+                builder.set_compression_level(self.options.compression_level);
+                current_size = 0;
+                batch_min_key = Vec::new();
+            }
+        }
+
+        if !batch_min_key.is_empty() {
+            let id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
+            let path = self
+                .options
+                .data_dir
+                .join(format!("L{}_{}.sst", level_idx, id));
+            let sst = builder.build(&path)?;
+            let metadata = fs::metadata(&path)?;
+            new_ssts.push(SsTableInfo {
+                path,
+                size: metadata.len(),
+                min_key: batch_min_key,
+                max_key: sst.max_key().to_vec(),
+            });
+        }
+
+        // Swap batch → outputs inside one critical section.
+        {
+            let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let remove: std::collections::HashSet<PathBuf> =
+                batch.iter().map(|s| s.path.clone()).collect();
+            levels[level_idx].retain(|s| !remove.contains(&s.path));
+            levels[level_idx].extend(new_ssts.iter().cloned());
+            levels[level_idx].sort_by(|a, b| a.min_key.cmp(&b.min_key));
+        }
+        for s in &batch {
+            self.sst_cache.remove(&s.path);
+            self.pending_deletions.push(s.path.clone());
+        }
+        if let Some(ref sender) = self.notif_sender {
+            let evicted: Vec<PathBuf> = batch.iter().map(|s| s.path.clone()).collect();
+            let _ = sender.send(CompactionNotification::Compacted { evicted_paths: evicted });
+        }
+
+        tracing::info!(
+            level = level_idx,
+            before = batch.len(),
+            after = new_ssts.len(),
+            entries = total_entries,
+            deduped,
+            "Last-level batched self-merge complete"
+        );
+        if new_ssts.len() >= batch.len() {
+            // Non-reducing batch would churn forever at FILE_COUNT_TRIGGER.
+            tracing::warn!(
+                level = level_idx,
+                before = batch.len(),
+                after = new_ssts.len(),
+                "last-level batch did not reduce file count — check TARGET_OUTPUT_SIZE"
+            );
+        }
         Ok(())
     }
 

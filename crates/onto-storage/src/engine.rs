@@ -5214,6 +5214,112 @@ mod tests {
         );
     }
 
+    /// File-count hard trigger: a crowded level must drain via bounded merge
+    /// batches even when size-score stays under 1.0. Also covers deepest-level
+    /// batched self-merge (L6 path) — previously file count only grew.
+    #[test]
+    fn test_file_count_trigger_merges_crowded_level() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            // Tiny memtable → frequent flushes → many SSTs per level.
+            memtable_size_limit: 64,
+            size_ratio: 2,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("should be valid");
+
+        // Enough writes to create well above FILE_COUNT_TRIGGER (50) SSTs
+        // across levels once they fall through L0.
+        let n = 600u32;
+        for i in 0..n {
+            let key = format!("k{:05}", i);
+            let mut val = vec![b'v'; 40];
+            val.extend_from_slice(i.to_string().as_bytes());
+            engine.put(key.into_bytes(), val).expect("should be valid");
+        }
+        engine.flush().expect("flush");
+
+        let before = engine.stats();
+        // Drain: small-file merge + file-count trigger + size-score path.
+        engine.flush_compaction().expect("compaction");
+        // A second pass picks up whatever the first batch left behind.
+        engine.flush_compaction().expect("compaction pass 2");
+
+        let after = engine.stats();
+        println!(
+            "file-count trigger: sstables {} → {} (levels {} → {})",
+            before.total_sstables, after.total_sstables, before.num_levels, after.num_levels
+        );
+
+        // Data must stay intact through batched merges.
+        for i in 0..n {
+            let key = format!("k{:05}", i);
+            let val = engine.get(key.as_bytes()).expect("get").expect("key present");
+            assert!(
+                val.ends_with(i.to_string().as_bytes()),
+                "value for {key} corrupted"
+            );
+        }
+
+        // Crowded levels must not grow without bound. With ~600 tiny writes
+        // the pre-compaction SST count is high; bounded batches should pull it
+        // down or at least hold it (never a regression toward more files).
+        assert!(
+            after.total_sstables <= before.total_sstables,
+            "file-count trigger must not increase SST count ({} → {})",
+            before.total_sstables,
+            after.total_sstables
+        );
+    }
+
+    /// Overwrite-heavy workload: batched merge must dedup stale versions so
+    /// file count shrinks and only the latest value is visible.
+    #[test]
+    fn test_batched_merge_dedups_stale_versions() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 64,
+            size_ratio: 2,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("should be valid");
+
+        // Same 20 keys overwritten many times → multi-version SSTs.
+        for round in 0..30u32 {
+            for i in 0..20u32 {
+                let key = format!("ov{:03}", i);
+                let val = format!("r{round:02}_v{i}");
+                engine.put(key.into_bytes(), val.into_bytes()).expect("put");
+            }
+        }
+        engine.flush().expect("flush");
+        engine.flush_compaction().expect("compaction");
+        engine.flush_compaction().expect("compaction pass 2");
+
+        // Latest version wins.
+        for i in 0..20u32 {
+            let key = format!("ov{:03}", i);
+            let expected = format!("r29_v{i}");
+            let got = engine.get(key.as_bytes()).expect("get").expect("present");
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                expected,
+                "stale version leaked for {key}"
+            );
+        }
+
+        let stats = engine.stats();
+        // 30 rounds × 20 keys = 600 puts on 20 distinct keys. After dedup
+        // merge the SST count must be far below the raw put count.
+        assert!(
+            stats.total_sstables < 60,
+            "dedup merge should collapse stale versions, got {} SSTs",
+            stats.total_sstables
+        );
+    }
+
     #[test]
     fn test_engine_compaction_with_overwrites() {
         let dir = tempdir().expect("should be valid");

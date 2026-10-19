@@ -426,7 +426,7 @@ impl IndexManager {
 
         // Also remove disk-based index
         let disk_removed = if let Some(idx) = self.disk_indexes.remove(&key) {
-            let _ = idx.lock().unwrap().flush();
+            let _ = idx.lock().unwrap_or_else(|e| e.into_inner()).flush();
             // Optionally delete the file
             if let Some(path) = self.index_path(class, column) {
                 let _ = std::fs::remove_file(path);
@@ -482,7 +482,7 @@ impl IndexManager {
                     .disk_indexes
                     .get(&(idx_class.clone(), idx_col.clone()))
                 {
-                    if let Err(e) = disk_idx.lock().unwrap().insert(&encoded, primary_key.to_vec()) {
+                    if let Err(e) = disk_idx.lock().unwrap_or_else(|e| e.into_inner()).insert(&encoded, primary_key.to_vec()) {
                         eprintln!(
                             "Warning: disk index insert failed for {}.{}: {}",
                             idx_class, idx_col, e
@@ -560,7 +560,7 @@ impl IndexManager {
                     .disk_indexes
                     .get(&(idx_class.clone(), idx_col.clone()))
                 {
-                    if let Err(e) = disk_idx.lock().unwrap().remove(&encoded, primary_key) {
+                    if let Err(e) = disk_idx.lock().unwrap_or_else(|e| e.into_inner()).remove(&encoded, primary_key) {
                         eprintln!(
                             "Warning: disk index remove failed for {}.{}: {}",
                             idx_class, idx_col, e
@@ -595,7 +595,7 @@ impl IndexManager {
     /// Flushes all disk-based indexes to disk (with fsync).
     pub fn flush_disk_indexes(&mut self) {
         for disk_idx in self.disk_indexes.values() {
-            let _ = disk_idx.lock().unwrap().flush();
+            let _ = disk_idx.lock().unwrap_or_else(|e| e.into_inner()).flush();
         }
     }
 
@@ -702,7 +702,7 @@ impl IndexManager {
         // 500k-element sort/dedup on the restart path.
         let mem_pks = self.indexes.get(&key).map(|tree| tree.lookup(&encoded));
         let disk_pks = match self.disk_indexes.get(&key) {
-            Some(disk_idx) => disk_idx.lock().unwrap().lookup(&encoded).ok(),
+            Some(disk_idx) => disk_idx.lock().unwrap_or_else(|e| e.into_inner()).lookup(&encoded).ok(),
             None => None,
         };
         match (mem_pks, disk_pks) {
@@ -961,7 +961,7 @@ impl IndexManager {
             out.extend(tree.lookup_limited(&encoded, limit));
         }
         if let Some(disk_idx) = self.disk_indexes.get(&key) {
-            if let Ok(pks) = disk_idx.lock().unwrap().lookup_limited(&encoded, limit) {
+            if let Ok(pks) = disk_idx.lock().unwrap_or_else(|e| e.into_inner()).lookup_limited(&encoded, limit) {
                 out.extend(pks);
             }
         }
@@ -1012,7 +1012,7 @@ impl IndexManager {
             return self.lookup_eq_read(class, column, value).map(|p| p.len() as u64);
         }
         self.disk_indexes.get(&key).and_then(|disk_idx| {
-            disk_idx.lock().unwrap().count_value(&encoded).ok()
+            disk_idx.lock().unwrap_or_else(|e| e.into_inner()).count_value(&encoded).ok()
         })
     }
 
@@ -1102,7 +1102,7 @@ impl IndexManager {
             });
         }
         if let Some(disk_idx) = self.disk_indexes.get(&key) {
-            let mut disk = disk_idx.lock().unwrap();
+            let mut disk = disk_idx.lock().unwrap_or_else(|e| e.into_inner());
             let _ = disk.for_each_value_count(|v, n| {
                 *merged.entry(v.to_vec()).or_insert(0) += n;
                 true

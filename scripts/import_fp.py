@@ -69,6 +69,11 @@ STATUS_MISSING = "missing"
 STATUS_UNWRITTEN = "unwritten"
 STATUS_CONFLICT = "conflict"
 
+# Park unprocessable rows so scan-null (`WHERE fp IS NULL`) terminates
+# instead of re-returning the same bad/no-SMILES rows every page.
+SENTINEL_BAD_SMI = "BAD_SMI"
+SENTINEL_NO_SMI = "NO_SMI"
+
 
 def parse_updated_count(d):
     """Extract N from 'N row(s) updated' in ApiResponse data.message."""
@@ -156,6 +161,13 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--page", type=int, default=1500)
     ap.add_argument("--log", default=r"E:\ontodb\fp_import.log")
+    ap.add_argument(
+        "--scan-null",
+        action="store_true",
+        help="Walk by `WHERE fp IS NULL` instead of id keyset. "
+        "Use when the id index is incomplete and keyset reports "
+        "'no more rows' while NULL fp rows remain.",
+    )
     args = ap.parse_args()
 
     st = load_state() if args.resume else {"last_id": "", "done": 0, "bad_smi": 0}
@@ -171,7 +183,11 @@ def main():
         logf.write(line + "\n")
         logf.flush()
 
-    log(f"start dim={DIM} workers={args.workers} page={args.page} resume={args.resume} last_id={last_id!r} done={total_done}")
+    log(
+        f"start dim={DIM} workers={args.workers} page={args.page} "
+        f"resume={args.resume} scan_null={args.scan_null} "
+        f"last_id={last_id!r} done={total_done}"
+    )
 
     t_start = time.time()
     updated = 0
@@ -188,13 +204,21 @@ def main():
             log(f"limit {args.limit} reached")
             break
 
-        # Keyset range scan; ORDER BY id currently hangs (planner does not use id index).
-        # id > '' walks the index from the start in lexicographic order.
+        # Two walk modes:
+        #   keyset    — id > last_id via the id index (fast, but the index can
+        #               miss rows and report premature EOF)
+        #   scan-null — WHERE fp IS NULL (seq scan, finds every remaining row)
         t0 = time.time()
-        rows = q(
-            f"SELECT id, smiles, fp FROM sembio.Compound WHERE id > '{esc(last_id)}' LIMIT {args.page}",
-            timeout=180,
-        ).get("data") or []
+        if args.scan_null:
+            rows = q(
+                f"SELECT id, smiles, fp FROM sembio.Compound WHERE fp IS NULL LIMIT {args.page}",
+                timeout=300,
+            ).get("data") or []
+        else:
+            rows = q(
+                f"SELECT id, smiles, fp FROM sembio.Compound WHERE id > '{esc(last_id)}' LIMIT {args.page}",
+                timeout=180,
+            ).get("data") or []
         if not rows:
             log("no more rows")
             break
@@ -206,6 +230,7 @@ def main():
         jobs = []
         skipped = 0
         skip_has_fp_page = 0
+        sentinel_ids = set()
         for r in rows:
             cid = r.get("id")
             smi = r.get("smiles")
@@ -222,12 +247,21 @@ def main():
                 skipped += 1
                 skip_no_smi += 1
                 handled_ids.append(cid)
+                # scan-null: leave a sentinel so `WHERE fp IS NULL` does not
+                # return this unprocessable row on every page (was inflating
+                # bad_smi by re-counting the same rows every page).
+                if args.scan_null:
+                    jobs.append((cid, SENTINEL_NO_SMI))
+                    sentinel_ids.add(cid)
                 continue
             b64 = fp_b64(smi)
             if b64 is None:
                 bad_smi += 1
                 skipped += 1
                 handled_ids.append(cid)
+                if args.scan_null:
+                    jobs.append((cid, SENTINEL_BAD_SMI))
+                    sentinel_ids.add(cid)
                 continue
             jobs.append((cid, b64))
 
@@ -239,8 +273,11 @@ def main():
                 for f in as_completed(futs):
                     cid, status, detail = f.result()
                     if status == STATUS_OK:
-                        ok += 1
                         handled_ids.append(cid)
+                        if cid in sentinel_ids:
+                            pass  # parked unprocessable row, not a real fp write
+                        else:
+                            ok += 1
                     elif status == STATUS_ALREADY:
                         # Idempotent hit: row already carries this fp. Not a failure.
                         already += 1
@@ -266,16 +303,17 @@ def main():
 
         updated += ok
         total_done += ok
-        # Advance the keyset only over the contiguous handled prefix in id
-        # order. An all-fail page (timeout/reset) keeps last_id unchanged so
-        # --resume retries the same window; a gap in the middle stops the
-        # advance at the gap so the failed row is not skipped forever.
-        handled_set = set(handled_ids)
-        for cid in sorted(page_ids):
-            if cid in handled_set:
-                last_id = cid
-            else:
-                break
+        # Keyset mode: advance only over the contiguous handled prefix so a
+        # failed row is retried on resume. scan-null mode re-queries
+        # `WHERE fp IS NULL`, so failures stay NULL and are picked up again
+        # automatically — last_id is not used as a cursor.
+        if not args.scan_null:
+            handled_set = set(handled_ids)
+            for cid in sorted(page_ids):
+                if cid in handled_set:
+                    last_id = cid
+                else:
+                    break
         dt = time.time() - t0
         rate = total_done / max(time.time() - t_start, 0.001)
         log(
