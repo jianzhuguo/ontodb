@@ -162,6 +162,6 @@ docs/.obsidian/
 /stamp_*.py
 /stress_*.py
 
-# Local data-import experiments (keep scripts/import_fp.py tracked)
-/scripts/import_adverse_*.py
-/scripts/import_chem_compounds.py
+# Local data-import / mapping utilities (not part of product source)
+/scripts/import_*.py
+/scripts/map_chebi_chembl.py
