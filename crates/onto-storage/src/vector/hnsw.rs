@@ -570,6 +570,13 @@ impl HnswIndex {
         self.dirty.dirty_count()
     }
 
+    /// Drop dirty marks without exporting (after a full snapshot that already
+    /// captured every node). Without this, bulk-insert dirty sets never clear
+    /// and persist_vector_deltas warns forever.
+    pub fn clear_dirty(&mut self) {
+        self.dirty = super::incremental_persist::DirtyTracker::new();
+    }
+
     /// Serializes every dirty node (id + data + neighbors) and clears the
     /// dirty set.  The output feeds `IncrementalSnapshot` for delta persistence.
     pub fn export_dirty_nodes(&mut self) -> Vec<(u32, Vec<u8>)> {

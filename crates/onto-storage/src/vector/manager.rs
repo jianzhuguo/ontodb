@@ -267,6 +267,17 @@ impl VectorIndexManager {
         self.indexes.get(&key).map(|i| i.dirty_count()).unwrap_or(0)
     }
 
+    /// Clear dirty marks (after a full snapshot already captured all nodes).
+    pub fn clear_dirty(&mut self, class: &str, column: &str) {
+        let key = IndexKey {
+            class: class.to_string(),
+            column: column.to_string(),
+        };
+        if let Some(index) = self.indexes.get_mut(&key) {
+            index.clear_dirty();
+        }
+    }
+
     /// Drains dirty nodes into an incremental snapshot blob (self-contained
     /// node records).  Returns the serialized snapshot and the version.
     pub fn save_incremental(&mut self, class: &str, column: &str) -> Option<Vec<u8>> {

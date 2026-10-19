@@ -1585,14 +1585,42 @@ impl QueryExecutor {
             }
         }
 
-        // Collect vector index information
+        // Collect vector index information.
+        // Prefer live manager state: `__vec_meta__` may not be visible to
+        // scan_prefix after WAL/compaction churn even though the in-memory
+        // HNSW index is fully alive (VECTOR SEARCH works, schema said NONE).
         let mut vector_indexes = Vec::new();
+        let mut seen_vec: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let mgr = engine.vector_index_manager().read().unwrap_or_else(|e| e.into_inner());
+            for meta in mgr.list_indexes() {
+                let key = format!("__vec_meta__{}__{}", meta.class, meta.column);
+                seen_vec.insert(key.clone());
+                vector_indexes.push(serde_json::json!({
+                    "key": key,
+                    "metadata": {
+                        "class": meta.class,
+                        "column": meta.column,
+                        "dimension": meta.dimension,
+                        "metric": format!("{:?}", meta.metric),
+                        "m": meta.m,
+                        "ef_construction": meta.ef_construction,
+                        "ef_search": meta.ef_search,
+                    },
+                    "nodes": engine.vector_index_len(&meta.class, &meta.column),
+                    "deleted_keys": engine.vector_deleted_keys_count(),
+                    "pending_backfill": engine.vector_pending_backfill(),
+                    "ready": engine.vector_indexes_ready(),
+                }));
+            }
+        }
         let vec_entries = engine.scan_prefix(b"__vec_meta__").unwrap_or_default();
         for (key, val_bytes) in vec_entries {
             let key_str = String::from_utf8_lossy(&key);
+            if seen_vec.contains(key_str.as_ref()) {
+                continue;
+            }
             if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val_bytes) {
-                // Live node count + tombstone count + ready flag, so probes
-                // don't have to scrape server logs.
                 let (class, column) = meta
                     .get("class")
                     .and_then(|v| v.as_str())

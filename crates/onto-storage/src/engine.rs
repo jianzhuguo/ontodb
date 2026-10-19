@@ -531,12 +531,24 @@ impl LsmEngine {
                 mgr.dirty_count(&class, &column)
             };
             if dirty_count > 20_000 {
-                tracing::warn!(
+                // Bulk insert marked every node dirty. Persisting that as a
+                // delta would write a multi-hundred-MB LSM value. Fall back to
+                // the file snapshot (which captures all nodes) and clear the
+                // dirty set so this warning does not fire every flush.
+                tracing::info!(
                     table = %class,
                     column = %column,
                     dirty = dirty_count,
-                    "Skipping incremental vector delta (too large); full snapshot is authoritative"
+                    "large dirty set — writing full HNSW snapshot instead of delta"
                 );
+                if let Err(e) = self.persist_vector_graph(&class, &column) {
+                    tracing::warn!(
+                        table = %class,
+                        column = %column,
+                        error = %e,
+                        "full snapshot fallback failed; keeping dirty set"
+                    );
+                }
                 continue;
             }
             let blob = self
@@ -625,6 +637,12 @@ impl LsmEngine {
                 return Ok(());
             }
             self.clear_vector_delta(class, column);
+            // Snapshot file now holds every node — drop dirty marks so
+            // persist_vector_deltas does not re-attempt (and warn) forever.
+            self.vector_index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear_dirty(class, column);
             tracing::info!(
                 table = %class,
                 column = %column,
