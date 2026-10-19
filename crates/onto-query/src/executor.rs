@@ -3061,9 +3061,13 @@ impl QueryExecutor {
                             filter: Some(f.clone()),
                             estimated_rows: 100,
                         };
+                        // Mark uses_index so EXPLAIN reflects the real access path
+                        // (regression guard: And+IsNull must not fall back to SeqScan).
                         return Ok(ExecutionPlan::new(
                             node,
-                            crate::optimizer::CostEstimate::zero(),
+                            crate::optimizer::CostEstimate::zero()
+                                .with_index()
+                                .with_sorted(),
                         ));
                     }
                 }
@@ -4632,12 +4636,19 @@ impl QueryExecutor {
             _ => {}
         }
 
-        // Default: use planner for relational queries
-        let plan = self
-            .planner
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .plan(query)?;
+        // DML plans must come from build_scan_plan — that is the path UPDATE/
+        // DELETE actually execute. QueryPlanner::plan only plans SELECT; its
+        // DML fallback is a dummy SeqScan and would hide a full-table rewrite.
+        let plan = match query {
+            QueryAst::Update { class, filter, .. } | QueryAst::Delete { class, filter } => {
+                self.build_scan_plan(class, filter)?
+            }
+            _ => self
+                .planner
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .plan(query)?,
+        };
         let description = plan.describe();
 
         // Only execute for read-only queries; DML should not be executed in EXPLAIN
@@ -14868,6 +14879,180 @@ mod tests {
             }
             other => panic!("expected Success, got {other:?}"),
         }
+    }
+
+    /// Helper: run EXPLAIN and return the plan JSON object.
+    fn explain_plan(executor: &QueryExecutor, sql: &str) -> Value {
+        let ast = QueryParser::parse(&format!("EXPLAIN {sql}")).unwrap();
+        match executor.execute(&ast).unwrap() {
+            QueryResult::Rows(rows) => rows
+                .first()
+                .and_then(|r| r.get("plan"))
+                .cloned()
+                .expect("EXPLAIN must return a plan"),
+            other => panic!("expected Rows from EXPLAIN, got {other:?}"),
+        }
+    }
+
+    /// Regression: `UPDATE ... WHERE id = 'x' AND col IS NULL` must take the
+    /// id index. Treating And as non-indexable made every UPDATE a full-table
+    /// scan and froze the host on 600k-row classes.
+    #[test]
+    fn test_explain_update_and_null_uses_index_scan() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryParser::parse("CREATE INDEX ON Product (name)").unwrap())
+            .unwrap();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "Pixel", 799);
+
+        let plan = explain_plan(
+            &executor,
+            "UPDATE Product SET note = 'x' WHERE name = 'Pixel' AND note IS NULL",
+        );
+        assert_eq!(
+            plan.get("uses_index").and_then(|v| v.as_bool()),
+            Some(true),
+            "UPDATE with And residual must use an index, plan={plan}"
+        );
+        let node = plan.get("plan").expect("plan node");
+        assert_eq!(
+            node.get("type").and_then(|v| v.as_str()),
+            Some("IndexScan"),
+            "expected IndexScan, plan={plan}"
+        );
+        assert_eq!(
+            node.get("index").and_then(|v| v.as_str()),
+            Some("name"),
+            "index column should be the And's indexable conjunct, plan={plan}"
+        );
+    }
+
+    /// Same guard for DELETE — it shares build_scan_plan with UPDATE.
+    #[test]
+    fn test_explain_delete_and_null_uses_index_scan() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryParser::parse("CREATE INDEX ON Product (name)").unwrap())
+            .unwrap();
+        insert_row(&executor, "Product", "iPhone", 999);
+
+        let plan = explain_plan(
+            &executor,
+            "DELETE FROM Product WHERE name = 'iPhone' AND note IS NULL",
+        );
+        assert_eq!(
+            plan.get("uses_index").and_then(|v| v.as_bool()),
+            Some(true),
+            "DELETE with And residual must use an index, plan={plan}"
+        );
+        assert_eq!(
+            plan
+                .get("plan")
+                .and_then(|n| n.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("IndexScan"),
+            "expected IndexScan, plan={plan}"
+        );
+    }
+
+    /// Without an index on the filter column, SeqScan is the only option —
+    /// assert we still produce a coherent plan (and don't pretend to use one).
+    #[test]
+    fn test_explain_update_without_index_falls_back_to_seq_scan() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+
+        let plan = explain_plan(
+            &executor,
+            "UPDATE Product SET note = 'x' WHERE name = 'iPhone' AND note IS NULL",
+        );
+        assert_eq!(
+            plan.get("uses_index").and_then(|v| v.as_bool()),
+            Some(false),
+            "no index on name → must not claim uses_index, plan={plan}"
+        );
+    }
+
+    /// Residual predicate order must not matter: `IsNull AND Eq` picks the
+    /// same index column as `Eq AND IsNull`.
+    #[test]
+    fn test_explain_update_null_and_eq_uses_index_scan() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryParser::parse("CREATE INDEX ON Product (name)").unwrap())
+            .unwrap();
+        insert_row(&executor, "Product", "iPhone", 999);
+
+        let plan = explain_plan(
+            &executor,
+            "UPDATE Product SET note = 'x' WHERE note IS NULL AND name = 'iPhone'",
+        );
+        assert_eq!(
+            plan.get("uses_index").and_then(|v| v.as_bool()),
+            Some(true),
+            "residual-first And must still use the index, plan={plan}"
+        );
+        assert_eq!(
+            plan
+                .get("plan")
+                .and_then(|n| n.get("index"))
+                .and_then(|v| v.as_str()),
+            Some("name"),
+            "plan={plan}"
+        );
+    }
+
+    /// Time-bound canary for the fp-backfill shape: many single-row UPDATEs
+    /// with `AND col IS NULL` on a non-trivial table. An index path stays well
+    /// under the budget; a per-row full-table scan blows it (the freeze mode).
+    #[test]
+    fn test_bulk_update_and_null_time_bounded() {
+        const N_ROWS: usize = 1000;
+        const N_UPDATES: usize = 100;
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryParser::parse("CREATE INDEX ON Product (name)").unwrap())
+            .unwrap();
+
+        for i in 0..N_ROWS {
+            insert_row(&executor, "Product", &format!("item_{i:04}"), i as i64);
+        }
+        executor.engine().flush().unwrap();
+
+        // Sanity: the plan for the bulk shape must be IndexScan before timing.
+        let plan = explain_plan(
+            &executor,
+            "UPDATE Product SET note = 'x' WHERE name = 'item_0000' AND note IS NULL",
+        );
+        assert_eq!(
+            plan.get("uses_index").and_then(|v| v.as_bool()),
+            Some(true),
+            "bulk UPDATE shape must be indexable, plan={plan}"
+        );
+
+        let t0 = std::time::Instant::now();
+        for i in 0..N_UPDATES {
+            let name = format!("item_{i:04}");
+            let ast = QueryParser::parse(&format!(
+                "UPDATE Product SET note = 'x' WHERE name = '{name}' AND note IS NULL"
+            ))
+            .unwrap();
+            match executor.execute(&ast).unwrap() {
+                QueryResult::Success(msg) => {
+                    assert!(msg.starts_with('1'), "update {name} should hit 1 row: {msg}")
+                }
+                other => panic!("expected Success, got {other:?}"),
+            }
+        }
+        let dt = t0.elapsed();
+        assert!(
+            dt < BUDGET,
+            "{N_UPDATES} indexed UPDATEs with AND-null took {dt:?} (budget {BUDGET:?}); \
+             likely fell back to per-row full-table scan"
+        );
     }
 
     #[test]
