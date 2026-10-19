@@ -104,6 +104,64 @@ final_rebuild.py
 
 # Obsidian editor config
 docs/.obsidian/
+/.obsidian/
 
 # Analysis outputs
 /analysis/
+
+# Scratch / crash-dump working dirs
+/dumps/
+/scratch_corrupt_data/
+/scratch_corrupt_data2/
+
+# Local run artifacts (stdout/stderr captures, state checkpoints, results)
+*.err
+*.out
+*_state.json
+/target_backfill_result.txt
+/vecidx.err
+
+# Local analysis notes (root-level markdown writeups)
+/公众号-从间歇崩溃到238倍吞吐.md
+/数据评估报告.md
+
+# Local one-off diagnostic / probe / bench scripts (root level)
+/accept_*.py
+/align_check.py
+/analyze_*.py
+/and_residual_*.py
+/assess_damage.py
+/backfill_target.ps1
+/bench_*.py
+/clear_*.py
+/corrupt_*.py
+/count_*.py
+/create_*.py
+/debug_*.py
+/diag_*.py
+/disasm_*.py
+/drop_*.py
+/dump_*.py
+/fill_*.py
+/fp_*.py
+/gap_*.py
+/ghost_*.py
+/inspect_*.py
+/limit_*.py
+/list_*.py
+/parse_pdb*.py
+/peek_*.py
+/ping_*.py
+/probe_*.py
+/recalc_*.py
+/refill_*.py
+/resolve_*.py
+/run_compact_vec.py
+/sample_*.py
+/search_dump_str.py
+/stamp_*.py
+/stress_*.py
+
+# Local data-import experiments (keep scripts/import_fp.py tracked)
+/scripts/import_adverse_*.py
+/scripts/import_chem_compounds.py
