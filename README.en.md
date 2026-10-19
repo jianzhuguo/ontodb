@@ -128,7 +128,7 @@ TOP 10
 WHERE mol_weight < 500;        -- optional: SQL predicate pushed down
 ```
 
-**Production-verified at 2.45M molecules** (full ChEMBL library, Tanimoto):
+**Production-verified at 2.45M molecules**:
 
 | Query molecule | Fingerprint bits | Latency | Top hits (excerpt) |
 |----------------|------------------|---------|---------------------|
