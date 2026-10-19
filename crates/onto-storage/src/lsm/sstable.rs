@@ -103,14 +103,62 @@ struct BlockIndexEntry {
 /// `ZSTD_error_dstSize_tooSmall` is -70. zstd-safe 7 reports errors as a raw
 /// wrapping `usize` (e.g. 18446744073709551546), and its `Display` prints that
 /// number — so string matching on the message never matches.
-fn is_dst_size_too_small(err: usize) -> bool {
-    const DST_SIZE_TOO_SMALL: usize = (-70i64) as usize;
-    err == DST_SIZE_TOO_SMALL
+fn is_dst_size_too_small(err: isize) -> bool {
+    err == -70
+}
+
+/// Thread-local reused zstd DCtx. Same rationale as the thread-local
+/// `Compressor` on the write side: one-shot `zstd_safe::decompress` builds a
+/// fresh DCtx per call, and a failed workspace reservation in zstd 1.5.7
+/// becomes a NULL write (heap corruption / 0xc0000374) under memory pressure.
+pub(crate) fn zstd_decompress_to(dst: &mut [u8], src: &[u8]) -> std::result::Result<usize, isize> {
+    thread_local! {
+        static DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+            std::cell::RefCell::new(None);
+    }
+    DECOMPRESSOR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            match zstd::bulk::Decompressor::new() {
+                Ok(d) => *slot = Some(d),
+                Err(_) => {
+                    // Fall back to one-shot; still bounded by dst slice.
+                    return zstd::zstd_safe::decompress(dst, src).map_err(|e| e as isize);
+                }
+            }
+        }
+        let dec = slot.as_mut().expect("just initialized");
+        match dec.decompress_to_buffer(src, dst) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                // zstd-safe maps ZSTD codes onto io::Error. Recover the code
+                // so the dstSize_tooSmall retry loop keeps working.
+                if let Some(code) = e.raw_os_error() {
+                    if code != 0 {
+                        return Err(code as isize);
+                    }
+                }
+                let s = e.to_string();
+                // Display is often the raw wrapping usize / negative code.
+                if let Ok(n) = s.trim().parse::<i64>() {
+                    return Err(n as isize);
+                }
+                // ErrorCode Display variants.
+                if s.contains("Destination buffer is too small") || s.contains("dstSize") {
+                    return Err(-70);
+                }
+                if s.contains("prefix") || s.contains("Generic") {
+                    return Err(-1);
+                }
+                Err(-1)
+            }
+        }
+    })
 }
 
 /// Decompress a zstd frame, refusing frames that would blow past `max_out`.
 ///
-/// Uses the one-shot `ZSTD_decompress` path (not the streaming decoder).
+/// Uses a reused one-shot DCtx (not the streaming decoder).
 ///
 /// Critical sizing: allocate `out_cap + ZSTD_WILDCOPY_MARGIN`, but hand zstd
 /// only `&mut buf[..out_cap]`. `ZSTD_wildcopy` may store up to 32 bytes past
@@ -148,9 +196,15 @@ fn decompress_limited(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
     // Decompress into a buffer sized `out_cap + margin`, with zstd's
     // destination capacity limited to `out_cap` so wildcopy stays inside
     // the allocation.
-    let try_once = |out_cap: usize| -> std::result::Result<(Vec<u8>, usize), usize> {
+    //
+    // The DCtx is thread-local and reused, mirroring the compressor side:
+    // `zstd_safe::decompress` builds a fresh DCtx (multi-MB workspace) per
+    // call, and under heavy compaction the workspace allocation can fail —
+    // zstd 1.5.7 does not always check `cwksp_reserve_failed`, so a failed
+    // reservation becomes a NULL write and later surfaces as 0xc0000374.
+    let try_once = |out_cap: usize| -> std::result::Result<(Vec<u8>, usize), isize> {
         if out_cap == 0 {
-            return Err((-64i64) as usize);
+            return Err(-64);
         }
         // Layout: [out_cap dst][wildcopy slack][guard canary].
         // zstd only sees out_cap; slack absorbs legal wildcopy overshoot;
@@ -159,14 +213,14 @@ fn decompress_limited(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
         let alloc = canary_start.saturating_add(ZSTD_GUARD_CANARY.len());
         let mut buf = vec![0u8; alloc];
         buf[canary_start..].copy_from_slice(&ZSTD_GUARD_CANARY);
-        let written = zstd::zstd_safe::decompress(&mut buf[..out_cap], src)?;
+        let written = zstd_decompress_to(&mut buf[..out_cap], src)?;
         if buf[canary_start..] != ZSTD_GUARD_CANARY[..] {
             // Corrupt frame wrote past dstCapacity + slack. Refuse the data;
             // the heap may already be damaged, but do not propagate it.
-            return Err((-80i64) as usize);
+            return Err(-80);
         }
         if written > out_cap {
-            return Err((-70i64) as usize);
+            return Err(-70);
         }
         buf.truncate(written);
         Ok((buf, written))
@@ -175,7 +229,7 @@ fn decompress_limited(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
     // Known content size (one-shot frames): allocate exactly what we need.
     if let Some(n) = declared {
         let (buf, written) = try_once(n).map_err(|e| {
-            if e == (-80i64) as usize {
+            if e == -80 {
                 CoreError::corruption(
                     "zstd wrote past output buffer (guard canary smashed — corrupt frame)",
                 )
@@ -211,7 +265,7 @@ fn decompress_limited(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
                 return Ok(buf);
             }
             Err(e) => {
-                if e == (-80i64) as usize {
+                if e == -80 {
                     return Err(CoreError::corruption(
                         "zstd wrote past output buffer (guard canary smashed — corrupt frame)",
                     ));
@@ -447,6 +501,14 @@ impl SsTableBuilder {
     pub fn build(mut self, path: impl AsRef<Path>) -> Result<SsTable> {
         // Flush remaining block
         self.flush_block();
+
+        // If we actually wrote entries but every seq_no was 0 (e.g. output of
+        // a merge over legacy files whose seqs were zeroed), the footer would
+        // land max_seq_no=0 and the engine would classify the file as a
+        // permanent "old SST" zombie. Stamp a sentinel so it is not.
+        if self.max_seq_no == 0 && !self.keys_for_bloom.is_empty() {
+            self.max_seq_no = 1;
+        }
 
         let final_path = path.as_ref().to_path_buf();
         let tmp_path = final_path.with_extension("sst.tmp");
@@ -705,7 +767,12 @@ impl SsTable {
 
     /// Upgrades an old-format SST footer to include max_seq_no.
     /// Scans all entries once, then appends max_seq_no to the footer.
-    /// Returns the max_seq_no written, or 0 if already upgraded.
+    /// Returns the max_seq_no written, or 0 if already upgraded / nothing to write.
+    ///
+    /// Also repairs "zombie" footers where `FLAG_HAS_MAX_SEQ` is set but the
+    /// stored `max_seq_no` is 0 — those are permanently classified as "old" by
+    /// `load_sstables` and were never fixed because this function used to
+    /// treat the flag alone as "already upgraded".
     pub fn upgrade_footer(path: impl AsRef<Path>) -> Result<SeqNo> {
         let path_ref = path.as_ref();
         let file_len = std::fs::metadata(path_ref)?.len();
@@ -713,7 +780,8 @@ impl SsTable {
             return Ok(0);
         }
 
-        // Check if already has new footer
+        // Check if already has new footer with a real max_seq_no
+        let mut already_33 = false;
         if file_len >= 33 {
             let mut f = std::fs::File::open(path_ref)?;
             // Read last 33 bytes to verify magic + flags
@@ -722,8 +790,13 @@ impl SsTable {
             f.read_exact(&mut buf33)?;
             let magic = u64::from_le_bytes(buf33[16..24].try_into().unwrap());
             let flags = buf33[24];
+            let stored_max_seq = u64::from_le_bytes(buf33[25..33].try_into().unwrap());
             if magic == MAGIC && flags & FLAG_HAS_MAX_SEQ != 0 {
-                return Ok(0); // already upgraded
+                if stored_max_seq > 0 {
+                    return Ok(0); // already upgraded with a real value
+                }
+                // Zombie: flag set but max_seq_no == 0 → fall through and repair.
+                already_33 = true;
             }
         }
 
@@ -747,23 +820,39 @@ impl SsTable {
         }
 
         if max_seq == 0 {
-            eprintln!("[upgrade_footer] max_seq=0 for {:?} (entries={})", path_ref, entry_count);
-            return Ok(0);
+            if entry_count == 0 {
+                eprintln!(
+                    "[upgrade_footer] max_seq=0 for {:?} (entries=0)",
+                    path_ref
+                );
+                return Ok(0);
+            }
+            // Entries exist but every seq_no is 0 (legacy zeroed-seq files).
+            // Stamp a sentinel so load_sstables stops classifying the file as
+            // "old" forever. Reads use level-order first-seen-wins, so a
+            // synthetic seq is safe.
+            max_seq = 1;
         }
 
-        // Read old footer (last 25 bytes)
         let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path_ref)?;
-        f.seek(SeekFrom::End(-25))?;
-        let mut old_footer = [0u8; 25];
-        f.read_exact(&mut old_footer)?;
+        if already_33 {
+            // 33-byte footer already in place — overwrite the trailing max_seq_no.
+            f.seek(SeekFrom::End(-8))?;
+            f.write_all(&max_seq.to_le_bytes())?;
+        } else {
+            // Read old footer (last 25 bytes)
+            f.seek(SeekFrom::End(-25))?;
+            let mut old_footer = [0u8; 25];
+            f.read_exact(&mut old_footer)?;
 
-        // Update flags to include FLAG_HAS_MAX_SEQ
-        old_footer[24] |= FLAG_HAS_MAX_SEQ;
+            // Update flags to include FLAG_HAS_MAX_SEQ
+            old_footer[24] |= FLAG_HAS_MAX_SEQ;
 
-        // Write back: old footer (25 bytes) + max_seq_no (8 bytes)
-        f.seek(SeekFrom::End(-25))?;
-        f.write_all(&old_footer)?;
-        f.write_all(&max_seq.to_le_bytes())?;
+            // Write back: old footer (25 bytes) + max_seq_no (8 bytes)
+            f.seek(SeekFrom::End(-25))?;
+            f.write_all(&old_footer)?;
+            f.write_all(&max_seq.to_le_bytes())?;
+        }
         f.sync_all()?;
 
         Ok(max_seq)

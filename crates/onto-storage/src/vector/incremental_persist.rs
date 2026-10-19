@@ -9,10 +9,15 @@
 //!
 //! Design:
 //! - On insert: mark node as dirty
-//! - On flush: save only dirty nodes + a version counter
-//! - On load: replay base snapshot + incremental deltas
+//! - On flush/shutdown: serialize dirty nodes into an `IncrementalSnapshot`
+//! - On load: replay base snapshot (`__vec_graph__`) + incremental deltas
+//!   (`__vec_delta__`) in version order
 //!
 //! This reduces flush I/O from O(graph_size) to O(changes).
+//!
+//! Node payload is the bincode-serialized `HnswNode` (id + vector data +
+//! neighbor lists), so a delta is self-contained: applying it can insert
+//! brand-new nodes or patch existing ones.
 
 use std::collections::HashSet;
 
@@ -21,6 +26,12 @@ pub struct DirtyTracker {
     dirty_nodes: HashSet<usize>,
     base_version: u64,
     current_version: u64,
+}
+
+impl Default for DirtyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DirtyTracker {
@@ -66,39 +77,30 @@ impl DirtyTracker {
     }
 }
 
-/// A single node delta for incremental persistence.
-#[derive(Debug, Clone)]
-pub struct NodeDelta {
-    pub node_id: usize,
-    pub layer: usize,
-    pub neighbors: Vec<usize>,
-}
-
 /// Incremental persistence format:
-/// [version: u64] [num_deltas: u32] [delta_1] [delta_2] ...
-/// Each delta: [node_id: u32] [layer: u8] [num_neighbors: u16] [neighbor_0: u32] ...
+/// `[version: u64] [num_nodes: u32] [node_1] [node_2] ...`
+/// Each node: `[node_id: u32] [blob_len: u32] [bincode(HnswNode)]`
+#[derive(Debug, Clone)]
 pub struct IncrementalSnapshot {
     pub version: u64,
-    pub deltas: Vec<NodeDelta>,
+    /// (node_id, bincode-serialized HnswNode)
+    pub nodes: Vec<(u32, Vec<u8>)>,
 }
 
 impl IncrementalSnapshot {
-    pub fn new(version: u64, deltas: Vec<NodeDelta>) -> Self {
-        Self { version, deltas }
+    pub fn new(version: u64, nodes: Vec<(u32, Vec<u8>)>) -> Self {
+        Self { version, nodes }
     }
 
     /// Serialize to bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&self.version.to_le_bytes());
-        buf.extend_from_slice(&(self.deltas.len() as u32).to_le_bytes());
-        for delta in &self.deltas {
-            buf.extend_from_slice(&(delta.node_id as u32).to_le_bytes());
-            buf.push(delta.layer as u8);
-            buf.extend_from_slice(&(delta.neighbors.len() as u16).to_le_bytes());
-            for &n in &delta.neighbors {
-                buf.extend_from_slice(&(n as u32).to_le_bytes());
-            }
+        buf.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
+        for (node_id, blob) in &self.nodes {
+            buf.extend_from_slice(&node_id.to_le_bytes());
+            buf.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+            buf.extend_from_slice(blob);
         }
         buf
     }
@@ -109,36 +111,24 @@ impl IncrementalSnapshot {
             return None;
         }
         let version = u64::from_le_bytes(data[0..8].try_into().ok()?);
-        let num_deltas = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
+        let num_nodes = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
         let mut offset = 12;
-        let mut deltas = Vec::with_capacity(num_deltas);
-        for _ in 0..num_deltas {
-            if offset + 7 > data.len() {
+        let mut nodes = Vec::with_capacity(num_nodes);
+        for _ in 0..num_nodes {
+            if offset + 8 > data.len() {
                 return None;
             }
-            let node_id = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+            let node_id = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
             offset += 4;
-            let layer = data[offset] as usize;
-            offset += 1;
-            let num_neighbors =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().ok()?) as usize;
-            offset += 2;
-            let mut neighbors = Vec::with_capacity(num_neighbors);
-            for _ in 0..num_neighbors {
-                if offset + 4 > data.len() {
-                    return None;
-                }
-                neighbors
-                    .push(u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize);
-                offset += 4;
+            let blob_len = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+            offset += 4;
+            if offset + blob_len > data.len() {
+                return None;
             }
-            deltas.push(NodeDelta {
-                node_id,
-                layer,
-                neighbors,
-            });
+            nodes.push((node_id, data[offset..offset + blob_len].to_vec()));
+            offset += blob_len;
         }
-        Some(IncrementalSnapshot { version, deltas })
+        Some(IncrementalSnapshot { version, nodes })
     }
 }
 
@@ -181,31 +171,18 @@ mod tests {
     fn test_incremental_snapshot_serialize() {
         let snapshot = IncrementalSnapshot::new(
             42,
-            vec![
-                NodeDelta {
-                    node_id: 1,
-                    layer: 0,
-                    neighbors: vec![2, 3],
-                },
-                NodeDelta {
-                    node_id: 2,
-                    layer: 1,
-                    neighbors: vec![1],
-                },
-            ],
+            vec![(1, vec![0x01, 0x02, 0x03]), (2, vec![0xAA; 64])],
         );
 
         let bytes = snapshot.to_bytes();
         let restored = IncrementalSnapshot::from_bytes(&bytes).unwrap();
 
         assert_eq!(restored.version, 42);
-        assert_eq!(restored.deltas.len(), 2);
-        assert_eq!(restored.deltas[0].node_id, 1);
-        assert_eq!(restored.deltas[0].layer, 0);
-        assert_eq!(restored.deltas[0].neighbors, vec![2, 3]);
-        assert_eq!(restored.deltas[1].node_id, 2);
-        assert_eq!(restored.deltas[1].layer, 1);
-        assert_eq!(restored.deltas[1].neighbors, vec![1]);
+        assert_eq!(restored.nodes.len(), 2);
+        assert_eq!(restored.nodes[0].0, 1);
+        assert_eq!(restored.nodes[0].1, vec![0x01, 0x02, 0x03]);
+        assert_eq!(restored.nodes[1].0, 2);
+        assert_eq!(restored.nodes[1].1, vec![0xAA; 64]);
     }
 
     #[test]
@@ -214,7 +191,7 @@ mod tests {
         let bytes = snapshot.to_bytes();
         let restored = IncrementalSnapshot::from_bytes(&bytes).unwrap();
         assert_eq!(restored.version, 0);
-        assert!(restored.deltas.is_empty());
+        assert!(restored.nodes.is_empty());
     }
 
     #[test]

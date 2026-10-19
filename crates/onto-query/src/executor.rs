@@ -182,12 +182,12 @@ fn eval_binary_filter(row: &BinaryRow, expr: &FilterExpr) -> Option<bool> {
             let v = eval_binary_filter(row, e)?;
             Some(!v)
         }
-        // Like requires pattern matching on strings — extract and delegate
+        // Like requires pattern matching on strings �?extract and delegate
         FilterExpr::Like(col, pattern) => {
             let s = row.get_str(col)?;
             Some(QueryExecutor::like_match(s, pattern))
         }
-        // Subqueries need engine access — can't evaluate here
+        // Subqueries need engine access �?can't evaluate here
         FilterExpr::InSubquery(..) | FilterExpr::Exists(..) | FilterExpr::NotExists(..) => None,
     }
 }
@@ -216,7 +216,7 @@ fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
                 false
             }
         }
-        // Cross-type: TAG_INT vs String — try parsing string as number
+        // Cross-type: TAG_INT vs String �?try parsing string as number
         (TAG_INT, LiteralValue::String(s)) => {
             if let Ok(arr) = <[u8; 8]>::try_from(raw) {
                 let int_val = i64::from_be_bytes(arr);
@@ -246,7 +246,7 @@ fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
                 false
             }
         }
-        // Cross-type: TAG_FLOAT vs String — try parsing string as number
+        // Cross-type: TAG_FLOAT vs String �?try parsing string as number
         (TAG_FLOAT, LiteralValue::String(s)) => {
             if let Ok(arr) = <[u8; 8]>::try_from(raw) {
                 let float_val = f64::from_be_bytes(arr);
@@ -260,7 +260,7 @@ fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
             }
         }
         (TAG_STRING, LiteralValue::String(s)) => parse_string_value(raw) == Some(s.as_str()),
-        // Cross-type: TAG_STRING vs Int — compare string representation
+        // Cross-type: TAG_STRING vs Int �?compare string representation
         (TAG_STRING, LiteralValue::Int(n)) => {
             if let Some(s) = parse_string_value(raw) {
                 s == n.to_string()
@@ -268,7 +268,7 @@ fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
                 false
             }
         }
-        // Cross-type: TAG_STRING vs Float — compare string representation
+        // Cross-type: TAG_STRING vs Float �?compare string representation
         (TAG_STRING, LiteralValue::Float(n)) => {
             if let Some(s) = parse_string_value(raw) {
                 s == n.to_string()
@@ -292,7 +292,7 @@ fn binary_lit_ord(tag: u8, raw: &[u8], lit: &LiteralValue) -> Option<std::cmp::O
             let arr: [u8; 8] = raw.try_into().ok()?;
             (i64::from_be_bytes(arr) as f64).partial_cmp(n)
         }
-        // Cross-type: TAG_INT vs String — parse string as number
+        // Cross-type: TAG_INT vs String �?parse string as number
         (TAG_INT, LiteralValue::String(s)) => {
             let arr: [u8; 8] = raw.try_into().ok()?;
             let int_val = i64::from_be_bytes(arr);
@@ -312,7 +312,7 @@ fn binary_lit_ord(tag: u8, raw: &[u8], lit: &LiteralValue) -> Option<std::cmp::O
             let arr: [u8; 8] = raw.try_into().ok()?;
             f64::from_be_bytes(arr).partial_cmp(&(*n as f64))
         }
-        // Cross-type: TAG_FLOAT vs String — parse string as number
+        // Cross-type: TAG_FLOAT vs String �?parse string as number
         (TAG_FLOAT, LiteralValue::String(s)) => {
             let arr: [u8; 8] = raw.try_into().ok()?;
             let float_val = f64::from_be_bytes(arr);
@@ -323,12 +323,12 @@ fn binary_lit_ord(tag: u8, raw: &[u8], lit: &LiteralValue) -> Option<std::cmp::O
             }
         }
         (TAG_STRING, LiteralValue::String(s)) => parse_string_value(raw).map(|v| v.cmp(s.as_str())),
-        // Cross-type: TAG_STRING vs Int — compare as strings
+        // Cross-type: TAG_STRING vs Int �?compare as strings
         (TAG_STRING, LiteralValue::Int(n)) => {
             let s = parse_string_value(raw)?;
             Some(s.cmp(&n.to_string()))
         }
-        // Cross-type: TAG_STRING vs Float — compare as strings
+        // Cross-type: TAG_STRING vs Float �?compare as strings
         (TAG_STRING, LiteralValue::Float(n)) => {
             let s = parse_string_value(raw)?;
             Some(s.cmp(&n.to_string()))
@@ -430,7 +430,7 @@ impl Ord for TopNRow {
 pub struct QueryExecutor {
     engine: Arc<LsmEngine>,
     ontology_store: OntologyStore,
-    /// Graph store for unified entity anchor (relational ↔ graph sync).
+    /// Graph store for unified entity anchor (relational �?graph sync).
     /// Optional for backward compatibility.
     graph: Option<Arc<onto_graph::GraphStore>>,
     /// Triple store for persistent RDF triples (SPO/POS/OSP indexes).
@@ -469,7 +469,7 @@ pub struct QueryExecutor {
     active_txn_flag: AtomicU64,
     /// Query execution configuration.
     config: QueryConfig,
-    /// Inference cache: class name → hierarchy (all super/sub classes).
+    /// Inference cache: class name �?hierarchy (all super/sub classes).
     /// Cleared on ontology changes (CREATE ONTOLOGY).
     /// RwLock: the per-query path only reads (cache hit).
     inference_cache: std::sync::RwLock<InferenceCache>,
@@ -485,7 +485,7 @@ pub struct QueryExecutor {
     /// Set by `USE NAMESPACE <name>`, defaults to "default".
     /// All EntityId created by this executor use this namespace.
     current_namespace: Mutex<String>,
-    /// Cached row counts per table: table_name → (count, last_updated).
+    /// Cached row counts per table: table_name �?(count, last_updated).
     /// Avoids full table scan for COUNT(*) queries.
     row_count_cache: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>>,
 }
@@ -543,17 +543,17 @@ impl RuntimeStats {
 /// Avoids re-running the Reasoner on every query.
 #[derive(Debug, Default)]
 struct InferenceCache {
-    /// Class name → set of all classes in hierarchy (superclasses + subclasses + equivalent).
+    /// Class name �?set of all classes in hierarchy (superclasses + subclasses + equivalent).
     class_hierarchy: std::collections::HashMap<String, HashSet<String>>,
-    /// Property name → set of all equivalent/sub-property names.
+    /// Property name �?set of all equivalent/sub-property names.
     property_aliases: std::collections::HashMap<String, HashSet<String>>,
-    /// Property name → inverse property name.
+    /// Property name �?inverse property name.
     inverse_property: std::collections::HashMap<String, Option<String>>,
-    /// Transitive closure cache: (property, subject) → set of all transitive objects.
+    /// Transitive closure cache: (property, subject) �?set of all transitive objects.
     transitive_closure: std::collections::HashMap<(String, String), HashSet<String>>,
     /// Cached merged ontology (all ontologies merged into one). Avoids repeated scan_prefix.
     merged_ontology: Option<onto_ontology::Ontology>,
-    /// Class name → property names (direct + inherited). Fast property lookup.
+    /// Class name �?property names (direct + inherited). Fast property lookup.
     class_properties: std::collections::HashMap<String, Vec<String>>,
 }
 
@@ -602,7 +602,7 @@ impl InferenceCache {
     }
 }
 
-/// Streaming aggregate state — tracks running aggregates without materializing rows.
+/// Streaming aggregate state �?tracks running aggregates without materializing rows.
 /// One instance per GROUP BY key (or a single instance for no GROUP BY).
 #[derive(Default)]
 struct AggState {
@@ -793,7 +793,7 @@ impl QueryExecutor {
     }
 
     /// Get cached row count for a table.
-    /// Cache never expires — updated incrementally on INSERT, invalidated on DELETE.
+    /// Cache never expires �?updated incrementally on INSERT, invalidated on DELETE.
     /// Warmup populates on startup.
     fn get_cached_row_count(&self, _engine: &LsmEngine, table: &str) -> Option<u64> {
         let cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -854,7 +854,7 @@ impl QueryExecutor {
                 let mut cached_count = 0;
 
                 for table in &tables {
-                    // Same expansion the query path uses — subclass/related
+                    // Same expansion the query path uses �?subclass/related
                     // prefixes are included, so cached == SELECT row count.
                     let hierarchy = exec.get_class_hierarchy_read(&engine, table);
                     let mut count = 0u64;
@@ -912,7 +912,7 @@ impl QueryExecutor {
         onto_core::EntityId::new(&ns, class, pk)
     }
 
-    /// Set the graph store for unified entity anchor (relational ↔ graph sync).
+    /// Set the graph store for unified entity anchor (relational �?graph sync).
     pub fn with_graph(mut self, graph: Arc<onto_graph::GraphStore>) -> Self {
         self.graph = Some(graph);
         self
@@ -1074,7 +1074,7 @@ impl QueryExecutor {
         _max_depth: usize,
     ) -> Result<Vec<Map<String, Value>>> {
         let results =
-            self.plan_vector_search(&self.engine, class, column, query_vector, top_k, &None)?;
+            self.plan_vector_search(&self.engine, class, column, query_vector, top_k, None, &None)?;
 
         let Some(ref graph) = self.graph else {
             return Ok(results);
@@ -1212,6 +1212,7 @@ impl QueryExecutor {
             vector_column,
             query_vector,
             top_k,
+            None,
             &None,
         )?;
 
@@ -1382,7 +1383,7 @@ impl QueryExecutor {
         self.engine.backup(backup_dir)
     }
 
-    /// Creates an incremental backup — only files modified since the given time.
+    /// Creates an incremental backup �?only files modified since the given time.
     pub fn backup_incremental(
         &self,
         backup_dir: &std::path::Path,
@@ -1543,16 +1544,44 @@ impl QueryExecutor {
             }
         }
 
-        // Collect index information
+        // Collect index information from the live index manager �?this is the
+        // same source the planner uses via has_index(). Also merge any persisted
+        // __idx_meta__ records for extra fields (entries, format).
         let mut indexes = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (class, column) in engine.list_indexes() {
+            seen.insert((class.clone(), column.clone()));
+            indexes.push(serde_json::json!({
+                "class": class,
+                "column": column,
+            }));
+        }
         let index_entries = engine.scan_prefix(b"__idx_meta__").unwrap_or_default();
         for (key, val_bytes) in index_entries {
             let key_str = String::from_utf8_lossy(&key);
             if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val_bytes) {
-                indexes.push(serde_json::json!({
-                    "key": key_str,
-                    "metadata": meta
-                }));
+                let class = meta.get("class").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let column = meta.get("column").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if seen.contains(&(class.clone(), column.clone())) {
+                    // Enrich the entry we already pushed from the index manager.
+                    if let Some(slot) = indexes.iter_mut().find(|e| {
+                        e.get("class").and_then(|v| v.as_str()) == Some(class.as_str())
+                            && e.get("column").and_then(|v| v.as_str()) == Some(column.as_str())
+                    }) {
+                        if let Some(obj) = slot.as_object_mut() {
+                            if let Some(m) = meta.as_object() {
+                                for (k, v) in m {
+                                    obj.entry(k.clone()).or_insert_with(|| v.clone());
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    indexes.push(serde_json::json!({
+                        "key": key_str,
+                        "metadata": meta
+                    }));
+                }
             }
         }
 
@@ -1562,9 +1591,26 @@ impl QueryExecutor {
         for (key, val_bytes) in vec_entries {
             let key_str = String::from_utf8_lossy(&key);
             if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&val_bytes) {
+                // Live node count + tombstone count + ready flag, so probes
+                // don't have to scrape server logs.
+                let (class, column) = meta
+                    .get("class")
+                    .and_then(|v| v.as_str())
+                    .zip(meta.get("column").and_then(|v| v.as_str()))
+                    .map(|(c, co)| (c.to_string(), co.to_string()))
+                    .unwrap_or_default();
+                let nodes = if class.is_empty() {
+                    None
+                } else {
+                    engine.vector_index_len(&class, &column)
+                };
                 vector_indexes.push(serde_json::json!({
                     "key": key_str,
-                    "metadata": meta
+                    "metadata": meta,
+                    "nodes": nodes,
+                    "deleted_keys": engine.vector_deleted_keys_count(),
+                    "pending_backfill": engine.vector_pending_backfill(),
+                    "ready": engine.vector_indexes_ready(),
                 }));
             }
         }
@@ -1576,7 +1622,7 @@ impl QueryExecutor {
         }))
     }
 
-    /// Drop an ontology by name — deletes the `__ontology__{name}` LSM key.
+    /// Drop an ontology by name �?deletes the `__ontology__{name}` LSM key.
     ///
     /// Uses scan_prefix to check existence instead of get(), because the LSM
     /// engine may have tombstone inconsistencies where get() returns None but
@@ -1639,7 +1685,7 @@ impl QueryExecutor {
             }
         }
 
-        // Delete old entry then save new — ensures scan_prefix sees the update
+        // Delete old entry then save new �?ensures scan_prefix sees the update
         let key = {
             let mut k = Vec::new();
             if let Some(ref ns) = ontology.namespace {
@@ -1690,7 +1736,7 @@ impl QueryExecutor {
         let data_type = match onto_ontology::DataType::from_str(range) {
             Some(dt) => dt,
             None => {
-                // For object properties, range is a class name — default to String
+                // For object properties, range is a class name �?default to String
                 onto_ontology::DataType::String
             }
         };
@@ -1968,7 +2014,7 @@ impl QueryExecutor {
         let result = match ast {
             QueryAst::Select { .. } => {
                 // Collect table stats (incl. which columns have indexes) BEFORE
-                // planning — otherwise the planner sees an empty secondary_indexes
+                // planning �?otherwise the planner sees an empty secondary_indexes
                 // list and never picks IndexScan, and the bad plan gets cached.
                 if let QueryAst::Select { from, .. } = ast {
                     if !from.starts_with("system.") {
@@ -2174,10 +2220,17 @@ impl QueryExecutor {
                 column,
                 query_vector,
                 top_k,
+                ef_search,
                 filter,
-            } => {
-                self.execute_vector_search_read(engine, class, column, query_vector, *top_k, filter)
-            }
+            } => self.execute_vector_search_read(
+                engine,
+                class,
+                column,
+                query_vector,
+                *top_k,
+                *ef_search,
+                filter,
+            ),
             QueryAst::GraphMatch {
                 pattern,
                 filter,
@@ -2234,9 +2287,9 @@ impl QueryExecutor {
     }
 
     /// Lock-free execution dispatch. Called by execute_write_with_engine and execute_select_read.
-    /// Does NOT acquire any engine lock — the caller must hold one.
+    /// Does NOT acquire any engine lock �?the caller must hold one.
     /// Lock-free execution dispatch. Called by execute_write_with_engine and execute_select_read.
-    /// Does NOT acquire any engine lock — the caller must hold one.
+    /// Does NOT acquire any engine lock �?the caller must hold one.
     /// Recursive callers (explain, CTE, union, filters) call this directly.
     fn execute_with_engine_inner(&self, ast: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
         match ast {
@@ -2325,7 +2378,7 @@ impl QueryExecutor {
                     .unwrap_or_else(|e| e.into_inner())
                     .clear();
                 engine.create_index(class, column)?;
-                // Index now exists — re-collect stats so IndexScan is chosen.
+                // Index now exists �?re-collect stats so IndexScan is chosen.
                 {
                     let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
                     stats.table_row_counts.remove(class);
@@ -2489,6 +2542,8 @@ impl QueryExecutor {
                     "innerproduct" | "inner_product" | "dot" => {
                         onto_storage::DistanceMetric::InnerProduct
                     }
+                    "tanimoto" | "jaccard" => onto_storage::DistanceMetric::Tanimoto,
+                    "hamming" => onto_storage::DistanceMetric::Hamming,
                     _ => onto_storage::DistanceMetric::Cosine,
                 };
                 engine.create_vector_index(
@@ -2500,6 +2555,73 @@ impl QueryExecutor {
                     *ef_construction,
                     *ef_search,
                 )?;
+                // Backfill existing documents into the fresh index in bounded
+                // batches.  base64 Bytes decode straight to packed bits (no
+                // 1024-float round-trip); keeps memory flat for 2.45M rows.
+                {
+                    let prefix = format!("{}::", class);
+                    let mut total = 0usize;
+                    let mut batch: Vec<(Vec<u8>, String, String, onto_storage::VecData)> =
+                        Vec::new();
+                    const BATCH: usize = 10_000;
+                    {
+                        let mut sink = |pk: &[u8], val_bytes: &[u8]| -> Result<bool> {
+                            if let Some(doc) = Self::parse_doc_bytes(val_bytes) {
+                                if doc.get("__class__").and_then(|v| v.as_str())
+                                    == Some(class.as_str())
+                                {
+                                    if let Some(data) = doc.get(column.as_str()).and_then(|v| {
+                                        onto_storage::VecData::from_json(v, *dimension)
+                                    }) {
+                                        batch.push((
+                                            pk.to_vec(),
+                                            class.clone(),
+                                            column.clone(),
+                                            data,
+                                        ));
+                                    }
+                                }
+                            }
+                            if batch.len() >= BATCH {
+                                engine
+                                    .vector_index_manager()
+                                    .write()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .index_vector_data_owned(std::mem::take(&mut batch));
+                                total += BATCH;
+                                tracing::info!(
+                                    table = class.as_str(),
+                                    column = column.as_str(),
+                                    indexed = total,
+                                    "Vector index backfill progress"
+                                );
+                            }
+                            Ok(true)
+                        };
+                        engine.for_each_live_prefix_until(
+                            prefix.as_bytes(),
+                            None,
+                            None,
+                            &mut sink,
+                        )?;
+                    }
+                    if !batch.is_empty() {
+                        total += batch.len();
+                        engine
+                            .vector_index_manager()
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .index_vector_data_owned(std::mem::take(&mut batch));
+                    }
+                    tracing::info!(
+                        table = class.as_str(),
+                        column = column.as_str(),
+                        vectors = total,
+                        "Vector index backfill complete"
+                    );
+                    // Persist the full HNSW graph so restarts do not rebuild.
+                    engine.persist_vector_graph(class, column)?;
+                }
                 Ok(QueryResult::Success(format!(
                     "Vector index created on {}.{} (dim={}, metric={:?})",
                     class, column, dimension, distance_metric
@@ -2517,6 +2639,13 @@ impl QueryExecutor {
                         class, column
                     )))
                 }
+            }
+            QueryAst::CompactVectorIndex { class, column } => {
+                let removed = engine.prune_vector_index(class, column)?;
+                Ok(QueryResult::Success(format!(
+                    "Vector index compacted on {}.{} (removed {} stale nodes)",
+                    class, column, removed
+                )))
             }
             QueryAst::CreateMaterializedView { name, query } => {
                 // Execute the query and store results as a materialized view
@@ -2774,7 +2903,7 @@ impl QueryExecutor {
                         name
                     )));
                 }
-                // Store current namespace — all subsequent EntityId will use this
+                // Store current namespace �?all subsequent EntityId will use this
                 *self.current_namespace.lock().unwrap() = name.to_string();
                 Ok(QueryResult::Success(format!(
                     "Now using namespace '{}'",
@@ -2915,8 +3044,31 @@ impl QueryExecutor {
     //  Plan-driven execution engine (Phase 24)
     // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 
-    /// Builds a simple scan+filter plan for DELETE/UPDATE operations.
+    /// Builds a scan+filter plan for DELETE/UPDATE operations.
+    ///
+    /// Prefer index access when the filter is an indexable predicate on an
+    /// indexed column. A raw SeqScan+Filter materializes every row in the table
+    /// before filtering �?fatal on multi-million-row tables (UPDATE/DELETE hang).
     fn build_scan_plan(&self, class: &str, filter: &Option<FilterExpr>) -> Result<ExecutionPlan> {
+        if let Some(f) = filter {
+            if Self::filter_is_indexable(f) {
+                if let Some(idx_col) = Self::filter_column(f) {
+                    if self.engine.has_index(class, &idx_col) {
+                        let node = PlanNode::IndexScan {
+                            table: class.to_string(),
+                            alias: None,
+                            index_column: idx_col,
+                            filter: Some(f.clone()),
+                            estimated_rows: 100,
+                        };
+                        return Ok(ExecutionPlan::new(
+                            node,
+                            crate::optimizer::CostEstimate::zero(),
+                        ));
+                    }
+                }
+            }
+        }
         let mut node = PlanNode::SeqScan {
             table: class.to_string(),
             alias: None,
@@ -3025,9 +3177,10 @@ impl QueryExecutor {
                 column,
                 query_vector,
                 top_k,
+                ef_search,
                 filter,
                 ..
-            } => self.plan_vector_search(engine, table, column, query_vector, *top_k, filter),
+            } => self.plan_vector_search(engine, table, column, query_vector, *top_k, *ef_search, filter),
             PlanNode::Filter {
                 input, predicate, ..
             } => {
@@ -3048,7 +3201,7 @@ impl QueryExecutor {
 
                 // NOTE: COUNT(*) fast path re-enabled for unfiltered queries.
                 // Uses cached row count to avoid full table scan.
-                // Class hierarchy filtering is skipped for COUNT(*) — this returns
+                // Class hierarchy filtering is skipped for COUNT(*) �?this returns
                 // the direct class instance count, not the inheritance-expanded count.
 
                 // Only push column projection down when there are no aggregates/expressions
@@ -3316,7 +3469,7 @@ impl QueryExecutor {
             }
         }
 
-        // Regular table scan — expand class hierarchy via ontology reasoning
+        // Regular table scan �?expand class hierarchy via ontology reasoning
         let class_hierarchy = self.get_class_hierarchy(engine, table);
         tracing::debug!(
             "plan_seq_scan: table='{}', class_hierarchy={:?}",
@@ -3384,13 +3537,13 @@ impl QueryExecutor {
                 if scan_count & 0x3FF == 0 {
                     self.check_timeout()?;
                 }
-                // Tier 1: fast byte-level rejection (definitely doesn't match → skip)
+                // Tier 1: fast byte-level rejection (definitely doesn't match �?skip)
                 if !fast_filter_cols.is_empty()
                     && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols)
                 {
                     continue;
                 }
-                // Tier 2: BinaryRow path (for binary-stored data) — no JSON parsing
+                // Tier 2: BinaryRow path (for binary-stored data) �?no JSON parsing
                 if let Some(brow) = BinaryRow::parse(val_bytes) {
                     if !brow.class_in_hierarchy(&scan_classes) {
                         continue;
@@ -3517,17 +3670,22 @@ impl QueryExecutor {
     ) -> Result<Vec<Map<String, Value>>> {
         let class_hierarchy = self.get_class_hierarchy(engine, table);
 
-        // Try to use the index for the primary lookup across the class hierarchy
+        // Try to use the index for the primary lookup across the class hierarchy.
+        // If any class has an index on this column, trust it: 0 hits means 0 rows.
+        // Falling back to a full table scan on miss is fatal on multi-million-row
+        // tables (UPDATE/DELETE hang for minutes).
         if let Some(f) = filter {
             let mut all_pkeys: Vec<Vec<u8>> = Vec::new();
+            let mut used_index = false;
             for scan_class in &class_hierarchy {
                 if engine.has_index(scan_class, index_column) {
+                    used_index = true;
                     if let Some(pkeys) = Self::try_index_scan_single(engine, scan_class, f)? {
                         all_pkeys.extend(pkeys);
                     }
                 }
             }
-            if !all_pkeys.is_empty() {
+            if used_index {
                 // Use BinaryRow for filtering, only convert to Map for passing rows
                 let mut rows = Vec::new();
                 let mut scan_count: u64 = 0;
@@ -3580,7 +3738,7 @@ impl QueryExecutor {
             }
         }
 
-        // Fallback to full scan
+        // No index on any hierarchy class �?full scan is the only option.
         self.plan_seq_scan(engine, table, alias, filter, None)
     }
 
@@ -3604,7 +3762,19 @@ impl QueryExecutor {
                     .lookup_eq_read(table, index_column, &json_val)
                     .unwrap_or_default()
             };
-            let mut rows = Self::fetch_rows_by_pks(engine, &pkeys)?;
+            let values = engine.multi_get(&pkeys)?;
+            let mut rows = Vec::with_capacity(values.len());
+            for (pk, val_bytes) in pkeys.iter().zip(values.into_iter()) {
+                if let Some(val_bytes) = val_bytes {
+                    if let Some(mut doc) = simd_parse_row(&val_bytes) {
+                        doc.insert(
+                            "__pk__".to_string(),
+                            Value::String(String::from_utf8_lossy(pk).to_string()),
+                        );
+                        rows.push(doc);
+                    }
+                }
+            }
             if let Some(a) = alias {
                 Self::apply_alias(&mut rows, a);
             }
@@ -3621,6 +3791,7 @@ impl QueryExecutor {
         column: &str,
         query_vector: &[f32],
         top_k: usize,
+        ef_search: Option<usize>,
         filter: &Option<FilterExpr>,
     ) -> Result<Vec<Map<String, Value>>> {
         if !engine.has_vector_index(table, column) {
@@ -3671,7 +3842,7 @@ impl QueryExecutor {
                     .vector_index_manager()
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
-                    .search(table, column, query_vector, expanded_top_k)?;
+                    .search_with_ef(table, column, query_vector, expanded_top_k, ef_search)?;
 
                 // Filter candidates
                 let mut filtered = Vec::new();
@@ -3697,7 +3868,7 @@ impl QueryExecutor {
                 .vector_index_manager()
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .search(table, column, query_vector, top_k)?
+                .search_with_ef(table, column, query_vector, top_k, ef_search)?
         };
 
         let mut rows = Vec::new();
@@ -4208,7 +4379,7 @@ impl QueryExecutor {
         }
 
         // Lightweight stats: sample a few rows per class to discover column names,
-        // then probe for indexes.  Does NOT count all rows — uses a default estimate.
+        // then probe for indexes.  Does NOT count all rows �?uses a default estimate.
         // Full row counts are collected by explicit ANALYZE.
         let class_hierarchy = self.get_class_hierarchy(engine, table);
         let sample_limit = 3usize;
@@ -4232,7 +4403,7 @@ impl QueryExecutor {
             }
         }
 
-        // Use default row count — ANALYZE will populate the real count
+        // Use default row count �?ANALYZE will populate the real count
         let row_count = 1000u64;
 
         // Update statistics (mark as estimated)
@@ -4367,12 +4538,12 @@ impl QueryExecutor {
         let targeted = Self::extract_class_filter(filter);
 
         if targeted.is_empty() {
-            // No __class__ constraint — scan full hierarchy but exclude disjoint classes
+            // No __class__ constraint �?scan full hierarchy but exclude disjoint classes
             let disjoint = self.get_disjoint_classes(engine, table);
             return class_hierarchy.difference(&disjoint).cloned().collect();
         }
 
-        // __class__ constraint found — only scan targeted classes
+        // __class__ constraint found �?only scan targeted classes
         let mut scan_classes = HashSet::new();
         for target in &targeted {
             // Expand each targeted class to include its subclasses
@@ -5137,7 +5308,7 @@ impl QueryExecutor {
                 if let Some((class, pk)) = onto_storage::ValueMetadata::parse_meta_key(key) {
                     let cur_score = meta.current_score();
                     // Predict when score drops to 0.4 (cold threshold)
-                    // 0.4 = value_score * e^(-λ * Δt) → Δt = ln(value_score / 0.4) / λ
+                    // 0.4 = value_score * e^(-λ * Δt) �?Δt = ln(value_score / 0.4) / λ
                     let predicted_cold_at = if meta.lambda > 0.0 && cur_score > 0.4 {
                         let dt = (meta.value_score / 0.4).ln() / meta.lambda;
                         meta.last_activated_at + dt as u64
@@ -5386,9 +5557,10 @@ impl QueryExecutor {
                 column,
                 query_vector,
                 top_k,
+                ef_search,
                 filter,
                 ..
-            } => self.plan_vector_search_read(engine, table, column, query_vector, *top_k, filter),
+            } => self.plan_vector_search_read(engine, table, column, query_vector, *top_k, *ef_search, filter),
             PlanNode::Filter {
                 input, predicate, ..
             } => {
@@ -5485,7 +5657,7 @@ impl QueryExecutor {
                         ..
                     } = input.as_ref()
                     {
-                        // Push projection down to index scan — avoids full to_map() on every row
+                        // Push projection down to index scan �?avoids full to_map() on every row
                         self.plan_index_scan_read(
                             engine,
                             table,
@@ -5776,7 +5948,7 @@ impl QueryExecutor {
                 }
                 cols
             }
-            _ => Vec::new(), // SELECT * — use full to_map()
+            _ => Vec::new(), // SELECT * �?use full to_map()
         };
 
         let mut rows = Vec::new();
@@ -5885,7 +6057,7 @@ impl QueryExecutor {
                 }
             } else {
                 // Streaming path. With a filter+limit we only need `scan_limit`
-                // matching rows — return Ok(false) to stop the scan early.
+                // matching rows �?return Ok(false) to stop the scan early.
                 let want = scan_limit;
                 let mut on_row = |key: &[u8], val_bytes: &[u8]| -> Result<bool> {
                     if let Some(lim) = want {
@@ -5987,7 +6159,7 @@ impl QueryExecutor {
         {
             return Ok(false);
         }
-        // Tier 2: BinaryRow path — filter without full deserialization
+        // Tier 2: BinaryRow path �?filter without full deserialization
         if let Some(brow) = BinaryRow::parse(val_bytes) {
             if !brow.class_in_hierarchy(class_hierarchy) {
                 return Ok(false);
@@ -6003,7 +6175,7 @@ impl QueryExecutor {
             if direct == Some(false) {
                 return Ok(false);
             }
-            // Filter needs full deserialization — rare case
+            // Filter needs full deserialization �?rare case
             if let Some(doc) = brow.to_map() {
                 return Ok(self.eval_filter_read(engine, &doc, f));
             }
@@ -6086,7 +6258,7 @@ impl QueryExecutor {
         let mut count: u64 = 0;
 
         // Prefer secondary index when the filter is a simple column predicate
-        // on an indexed column — O(matches) instead of O(table).
+        // on an indexed column �?O(matches) instead of O(table).
         for scan_class in &class_hierarchy {
             if let Some(n) = Self::try_count_via_index(engine, scan_class, filter) {
                 count += n;
@@ -6139,9 +6311,9 @@ impl QueryExecutor {
 
     /// Try to count matching rows via a secondary index for a simple
     /// column predicate. Returns None when the index cannot serve the filter.
-    /// Uses the count-only index APIs — no pk materialization.
+    /// Uses the count-only index APIs �?no pk materialization.
     /// Index-driven `GROUP BY col` with only COUNT(*) aggregates.
-    /// Reads (value, count) pairs straight from the secondary index —
+    /// Reads (value, count) pairs straight from the secondary index �?
     /// O(distinct values) instead of O(rows). Returns None when the shape
     /// cannot be served from the index (caller falls back to row scan).
     fn try_index_group_by_counts(
@@ -6329,9 +6501,9 @@ impl QueryExecutor {
     /// `SELECT DISTINCT col [, col2, ...]`: enumerate unique column value
     /// combinations without materialising full rows.
     ///
-    /// * Single indexed column → `distinct_counts_read` on the B+Tree (O(distinct)).
-    /// * Single column, no index → streaming scan + `encode_value` into BTreeMap.
-    /// * Multi-column → streaming scan + length-prefixed composite key.
+    /// * Single indexed column �?`distinct_counts_read` on the B+Tree (O(distinct)).
+    /// * Single column, no index �?streaming scan + `encode_value` into BTreeMap.
+    /// * Multi-column �?streaming scan + length-prefixed composite key.
     ///
     /// Returns `None` only when the projection contains expressions or `*`.
     fn try_index_distinct(
@@ -6563,6 +6735,54 @@ impl QueryExecutor {
                 }
                 Some(total)
             }
+            // AND of range predicates on one indexed column �?single count_range.
+            FilterExpr::And(_, _) => {
+                let mut conjuncts = Vec::new();
+                Self::split_and_conjuncts(f, &mut conjuncts);
+
+                // `count_range` is only exact when EVERY conjunct is an
+                // inclusive range predicate on the SAME indexed column.
+                // Anything else (IsNull on another column, Like, strict Gt/Lt,
+                // In, Or, ...) is a residual predicate that the count cannot
+                // absorb — falling through with just the range bound used to
+                // silently over-count (e.g. `molregno >= 0 AND fp IS NULL`
+                // counted the whole molregno band and ignored the fp filter).
+                //
+                // Strict Gt/Lt are also excluded here: `range_bounds_for_column`
+                // maps them to inclusive bounds, so a residual would be needed
+                // to drop the boundary rows. Not worth the complexity for the
+                // count fast path — the caller falls back to `count_prefix_with`
+                // which applies the full filter.
+                let mut col: Option<String> = None;
+                for c in &conjuncts {
+                    let cc = match c {
+                        FilterExpr::Eq(cc, _)
+                        | FilterExpr::Gte(cc, _)
+                        | FilterExpr::Lte(cc, _)
+                        | FilterExpr::Between(cc, _, _) => cc,
+                        // Gt/Lt (strict), In, IsNull, IsNotNull, Like, Ne,
+                        // Not, Or, subqueries — residual.
+                        _ => return None,
+                    };
+                    match &col {
+                        None => col = Some(cc.clone()),
+                        Some(want) if want == cc => {}
+                        // Second column → residual.
+                        Some(_) => return None,
+                    }
+                }
+                let col = col?;
+                if !engine.has_index(class, &col) {
+                    return None;
+                }
+                let (lo, hi) = Self::range_bounds_for_column(&Some(f.clone()), &col);
+                if lo.is_some() || hi.is_some() {
+                    let lo_json = lo.as_ref().map(|b| onto_storage::IndexManager::decode_value(b));
+                    let hi_json = hi.as_ref().map(|b| onto_storage::IndexManager::decode_value(b));
+                    return mgr.count_range_read(class, &col, lo_json.as_ref(), hi_json.as_ref());
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -6570,20 +6790,56 @@ impl QueryExecutor {
     /// Extracts column names from simple comparison filters for fast byte-level rejection.
     /// Returns columns that can be checked without full JSON deserialization.
     /// True when the filter is a single-column predicate an index can serve.
-    fn filter_is_indexable(f: &FilterExpr) -> bool {
-        matches!(
-            f,
-            FilterExpr::Eq(_, _)
-                | FilterExpr::Gt(_, _)
-                | FilterExpr::Lt(_, _)
-                | FilterExpr::Gte(_, _)
-                | FilterExpr::Lte(_, _)
-                | FilterExpr::Between(_, _, _)
-                | FilterExpr::In(_, _)
-        )
+    /// Split AND-chains into individual conjuncts.
+    fn split_and_conjuncts<'a>(f: &'a FilterExpr, out: &mut Vec<&'a FilterExpr>) {
+        match f {
+            FilterExpr::And(l, r) => {
+                Self::split_and_conjuncts(l, out);
+                Self::split_and_conjuncts(r, out);
+            }
+            other => out.push(other),
+        }
     }
 
-    /// Column referenced by an indexable filter.
+    fn filter_is_indexable(f: &FilterExpr) -> bool {
+        match f {
+            FilterExpr::Eq(_, _)
+            | FilterExpr::Gt(_, _)
+            | FilterExpr::Lt(_, _)
+            | FilterExpr::Gte(_, _)
+            | FilterExpr::Lte(_, _)
+            | FilterExpr::Between(_, _, _)
+            | FilterExpr::In(_, _) => true,
+            // `WHERE id = 'x' AND fp IS NULL` must still use the id index.
+            // Rejecting And here forced a full-table UPDATE scan and froze the
+            // box on multi-hundred-thousand-row classes.
+            FilterExpr::And(l, r) => {
+                Self::filter_is_indexable(l) || Self::filter_is_indexable(r)
+            }
+            _ => false,
+        }
+    }
+
+    /// True when every conjunct of `f` is an inclusive range predicate
+    /// (Eq/Gte/Lte/Between) on exactly `col`. Used to decide whether a
+    /// range lookup/count can stand in for the full filter, or whether a
+    /// residual predicate still has to be applied to the rows.
+    fn filter_fully_covered_by_column(f: &FilterExpr, col: &str) -> bool {
+        let mut conjuncts = Vec::new();
+        Self::split_and_conjuncts(f, &mut conjuncts);
+        for c in &conjuncts {
+            match c {
+                FilterExpr::Eq(cc, _)
+                | FilterExpr::Gte(cc, _)
+                | FilterExpr::Lte(cc, _)
+                | FilterExpr::Between(cc, _, _) if cc == col => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Column referenced by an indexable filter (first indexable And conjunct).
     fn filter_column(f: &FilterExpr) -> Option<String> {
         match f {
             FilterExpr::Eq(c, _)
@@ -6593,6 +6849,9 @@ impl QueryExecutor {
             | FilterExpr::Lte(c, _)
             | FilterExpr::Between(c, _, _)
             | FilterExpr::In(c, _) => Some(c.clone()),
+            FilterExpr::And(l, r) => {
+                Self::filter_column(l).or_else(|| Self::filter_column(r))
+            }
             _ => None,
         }
     }
@@ -6677,7 +6936,7 @@ impl QueryExecutor {
                                 return field_num != *n;
                             }
                         }
-                        // Skip fast rejection for strings — BinaryRow bytes may contain
+                        // Skip fast rejection for strings �?BinaryRow bytes may contain
                         // spurious JSON-like patterns that cause false rejection.
                         // String equality is handled accurately by eval_binary_filter / eval_filter_read.
                         LiteralValue::String(_) => {}
@@ -6948,30 +7207,51 @@ impl QueryExecutor {
         let class_hierarchy = self.get_class_hierarchy_read(engine, table);
 
         if let Some(f) = filter {
+            // Residual predicates (not expressible as a range on
+            // `index_column`) mean the index result is an over-approximation.
+            // We must over-fetch pkeys so that after the post-filter there are
+            // still `limit` rows; truncating pkeys to `limit` *before* the
+            // filter under-returns.
+            let residual = !Self::filter_fully_covered_by_column(f, index_column);
+            let pk_budget = match (limit, residual) {
+                (Some(l), true) => Some(l.saturating_mul(8).max(64)),
+                (other, _) => other,
+            };
             let mut all_pkeys: Vec<Vec<u8>> = Vec::new();
             for scan_class in &class_hierarchy {
                 if engine.has_index(scan_class, index_column) {
-                    let pkeys = match (f, limit) {
-                        // Eq + LIMIT: bounded lookup — no full pk materialization.
+                    let pkeys = match (f, pk_budget) {
+                        // Eq + LIMIT: bounded lookup �?no full pk materialization.
                         (FilterExpr::Eq(_, val), Some(lim)) => {
                             let json_val = Self::literal_to_json_static(val);
                             let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
                             mgr.lookup_eq_read_limit(scan_class, index_column, &json_val, lim)
                         }
-                        _ => Self::try_index_scan_single_read(engine, scan_class, f),
+                        _ => Self::try_index_scan_single_read(engine, scan_class, f, pk_budget),
                     };
                     if let Some(pkeys) = pkeys {
                         all_pkeys.extend(pkeys);
                     }
                 }
-                if let Some(lim) = limit {
+                if let Some(lim) = pk_budget {
                     if all_pkeys.len() >= lim {
                         all_pkeys.truncate(lim);
                         break;
                     }
                 }
             }
-            if let Some(lim) = limit {
+            if let Some(lim) = pk_budget {
+                all_pkeys.truncate(lim);
+            }
+            // Hierarchy loop can collect the same pk once per indexed class
+            // (parent + subclass both holding the entry). Dedup WITHOUT
+            // re-sorting: range lookups return pkeys in index-value order and
+            // callers (keyset pagination) depend on that order.
+            {
+                let mut seen = std::collections::HashSet::with_capacity(all_pkeys.len());
+                all_pkeys.retain(|pk| seen.insert(pk.clone()));
+            }
+            if let Some(lim) = pk_budget {
                 all_pkeys.truncate(lim);
             }
             if !all_pkeys.is_empty() {
@@ -6982,6 +7262,19 @@ impl QueryExecutor {
                         .map(|c| class_hierarchy.contains(c))
                         .unwrap_or(false)
                 });
+                // Residual predicates (e.g. `molregno >= 0 AND fp IS NULL`)
+                // are not expressible as an index range — the lookup only
+                // bound the indexed column. Re-apply the full filter so rows
+                // that fail a conjunct are dropped. Harmless no-op when the
+                // index range already covers the whole filter.
+                if let Some(f) = filter.as_ref() {
+                    rows.retain(|row| self.eval_filter_read(engine, row, f));
+                }
+                // Only now apply the caller's LIMIT — before the residual
+                // filter this would under-return.
+                if let Some(lim) = limit {
+                    rows.truncate(lim);
+                }
                 // Add shard routing info
                 if let Some(router) = self
                     .shard_router
@@ -7004,7 +7297,7 @@ impl QueryExecutor {
                 }
                 return Ok(rows);
             }
-            // Index answered with 0 hits — it is authoritative for an indexed
+            // Index answered with 0 hits �?it is authoritative for an indexed
             // column. Do NOT fall back to seq scan (that also caused infinite
             // recursion: seq_scan short-circuits back here for indexable filters).
             if engine.has_index(table, index_column) {
@@ -7043,11 +7336,61 @@ impl QueryExecutor {
     }
 
     /// Read-only index scan attempt using in-memory index only.
+    /// `limit` bounds how many pks the index lookup materializes.
     fn try_index_scan_single_read(
         engine: &LsmEngine,
         class: &str,
         filter: &FilterExpr,
+        limit: Option<usize>,
     ) -> Option<Vec<Vec<u8>>> {
+        // AND of predicates on one indexed column: push both bounds into a
+        // single range lookup. Without this, And falls through to None and the
+        // caller reports 0 rows for perfectly valid ranges.
+        if let FilterExpr::And(_, _) = filter {
+            let mut conjuncts = Vec::new();
+            Self::split_and_conjuncts(filter, &mut conjuncts);
+            let col = conjuncts.iter().find_map(|c| Self::filter_column(c))?;
+            if !engine.has_index(class, &col) {
+                return None;
+            }
+            let (lo, hi) = Self::range_bounds_for_column(&Some(filter.clone()), &col);
+            if lo.is_some() || hi.is_some() {
+                let index_mgr = engine
+                    .index_manager()
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                let lo_json = lo.as_ref().map(|b| onto_storage::IndexManager::decode_value(b));
+                let hi_json = hi.as_ref().map(|b| onto_storage::IndexManager::decode_value(b));
+                // With a residual predicate (another column / strict bound)
+                // the range is only an over-approximation. Don't push `limit`
+                // into the lookup — the caller re-applies the full filter and
+                // then truncates, so a tight lookup limit would under-return.
+                let lookup_limit = if Self::filter_fully_covered_by_column(filter, &col) {
+                    limit
+                } else {
+                    limit.map(|l| l.saturating_mul(8).max(64))
+                };
+                return Some(
+                    index_mgr
+                        .lookup_range_read_limit(
+                            class,
+                            &col,
+                            lo_json.as_ref(),
+                            hi_json.as_ref(),
+                            lookup_limit,
+                        )
+                        .unwrap_or_default(),
+                );
+            }
+            // No range bounds extractable — try the first indexable conjunct.
+            for c in &conjuncts {
+                if Self::filter_is_indexable(c) {
+                    return Self::try_index_scan_single_read(engine, class, c, limit);
+                }
+            }
+            return None;
+        }
+
         let col = match filter {
             FilterExpr::Eq(c, _)
             | FilterExpr::Ne(c, _)
@@ -7081,32 +7424,34 @@ impl QueryExecutor {
             FilterExpr::Gt(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
                 index_mgr
-                    .lookup_gt_read(class, &col, &json_val)
+                    .lookup_gt_read_limit(class, &col, &json_val, limit)
                     .unwrap_or_default()
             }
             FilterExpr::Lt(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
                 index_mgr
-                    .lookup_lt_read(class, &col, &json_val)
+                    .lookup_lt_read_limit(class, &col, &json_val, limit)
                     .unwrap_or_default()
             }
             FilterExpr::Gte(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                let tree = index_mgr.get_index(class, &col)?;
-                let encoded = onto_storage::IndexManager::encode_value(&json_val);
-                tree.gte_scan(&encoded)
+                // Inclusive low / open high �?same merge path as Eq/Gt/Lt.
+                // Direct tree.gte_scan skips the disk index after restart.
+                index_mgr
+                    .lookup_range_read_limit(class, &col, Some(&json_val), None, limit)
+                    .unwrap_or_default()
             }
             FilterExpr::Lte(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                let tree = index_mgr.get_index(class, &col)?;
-                let encoded = onto_storage::IndexManager::encode_value(&json_val);
-                tree.lte_scan(&encoded)
+                index_mgr
+                    .lookup_range_read_limit(class, &col, None, Some(&json_val), limit)
+                    .unwrap_or_default()
             }
             FilterExpr::Between(_, low, high) => {
                 let low_json = Self::literal_to_json_static(low);
                 let high_json = Self::literal_to_json_static(high);
                 index_mgr
-                    .lookup_range_read(class, &col, Some(&low_json), Some(&high_json))
+                    .lookup_range_read_limit(class, &col, Some(&low_json), Some(&high_json), limit)
                     .unwrap_or_default()
             }
             FilterExpr::In(_, values) => {
@@ -7132,7 +7477,7 @@ impl QueryExecutor {
         projected_columns: Option<&[String]>,
     ) -> Result<Vec<Map<String, Value>>> {
         let cols = projected_columns.unwrap_or(&[]);
-        // Batch fetch all values in one call — avoids per-key lock overhead.
+        // Batch fetch all values in one call �?avoids per-key lock overhead.
         let values = engine.multi_get(pkeys)?;
         let mut rows = Vec::with_capacity(values.len());
         for val_bytes in values.into_iter().flatten() {
@@ -7249,7 +7594,7 @@ impl QueryExecutor {
         // ---- Aggregates / GROUP BY: single-pass streaming aggregation ----
         if group_by.is_some() || Self::columns_have_aggregates(columns) {
             // Index-driven GROUP BY: single grouped column with only COUNT(*)
-            // and the column is indexed — read (value, count) pairs straight
+            // and the column is indexed �?read (value, count) pairs straight
             // from the index. O(distinct) instead of O(rows).
             if let Some(gb) = group_by.as_ref() {
                 if let Some(result) = self.try_index_group_by_counts(
@@ -7379,7 +7724,7 @@ impl QueryExecutor {
                 table, filter, ..
             } => (table.clone(), filter.clone(), None),
             _ => {
-                // Fallback shape — materialize and emit.
+                // Fallback shape �?materialize and emit.
                 let rows = self.execute_plan_node_read(node, &self.engine)?;
                 return Self::emit_rows_in_batches(rows, &mut sink);
             }
@@ -7388,7 +7733,7 @@ impl QueryExecutor {
         // ---- ORDER BY on an indexed column: stream in index order ----
         // Single-column ORDER BY whose column has a secondary index on *every*
         // class in the hierarchy can walk the index in key order and emit rows
-        // as they are fetched — no sort, early exit with LIMIT.
+        // as they are fetched �?no sort, early exit with LIMIT.
         if order_by.len() == 1 {
             let ob = &order_by[0];
             let ob_col = ob
@@ -7399,9 +7744,14 @@ impl QueryExecutor {
                 .trim_matches('"')
                 .to_string();
             let hierarchy = self.get_class_hierarchy_read(&self.engine, &scan_table);
-            let all_indexed = !hierarchy.is_empty()
-                && hierarchy.iter().all(|c| self.engine.has_index(c, &ob_col));
-            if all_indexed {
+            // Use the ordered index path when the scan table itself is indexed.
+            // Classes without the index are skipped (same as the non-ORDER-BY
+            // index path); falling back to a full sort on a 2.4M-row table is
+            // far worse than that edge case.
+            let table_indexed = hierarchy
+                .iter()
+                .any(|c| c == &scan_table && self.engine.has_index(c, &ob_col));
+            if table_indexed {
                 return self.stream_ordered_index_read(
                     &self.engine,
                     &scan_table,
@@ -7472,7 +7822,7 @@ impl QueryExecutor {
                 }
                 if *distinct {
                     rows.retain(|row| {
-                        // Dedup only on user-visible columns — __pk__/__class__
+                        // Dedup only on user-visible columns �?__pk__/__class__
                         // are unique per row and would defeat DISTINCT.
                         let key: String = row
                             .iter()
@@ -7623,37 +7973,55 @@ impl QueryExecutor {
         sink: &mut dyn FnMut(Vec<Map<String, Value>>) -> bool,
     ) -> Result<usize> {
         let class_hierarchy = self.get_class_hierarchy_read(engine, table);
-        // Every class must have the index — the caller already checked this,
-        // but re-validate so the function is safe standalone.
+        // Walk the index for every hierarchy class that has it. Classes without
+        // the index are skipped �?same semantics as stream_index_scan_read.
         let indexed: Vec<String> = class_hierarchy
             .iter()
             .filter(|c| engine.has_index(c, order_col))
             .cloned()
             .collect();
-        if indexed.is_empty() || indexed.len() != class_hierarchy.len() {
-            // Should not happen when called from execute_read_streaming.
+        if indexed.is_empty() {
             return Ok(0);
         }
 
-        // Collect pkeys in index order (one class hierarchy, all indexed).
-        // range_scan with no bounds walks the tree in key order.
+        // Collect pkeys in index order, with filter bounds pushed into the walk
+        // when the filter is on the same column. Borrowed cursor �?values are
+        // never cloned; only pks are materialized.
+        let (lo_bound, hi_bound) = Self::range_bounds_for_column(filter, order_col);
+        let want = take.map(|t| t.saturating_add(skip));
+        // Over-fetch a little when a residual filter may reject rows.
+        let fetch_lim = if filter.is_some() {
+            want.map(|w| w.saturating_mul(4).max(64))
+        } else {
+            want
+        };
         let mut all_pkeys: Vec<Vec<u8>> = Vec::new();
         for scan_class in &indexed {
             let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
             if let Some(tree) = mgr.get_index(scan_class, order_col) {
-                all_pkeys.extend(tree.range_scan(None, None));
+                let mut cur = tree.range_cursor(lo_bound.as_deref(), hi_bound.as_deref());
+                let mut n = 0usize;
+                while let Some((_, pk)) = cur.current() {
+                    all_pkeys.push(pk.to_vec());
+                    n += 1;
+                    if fetch_lim.is_some_and(|l| n >= l) {
+                        break;
+                    }
+                    cur.advance();
+                }
             }
         }
         if !ascending {
             all_pkeys.reverse();
         }
 
-        // Bound the fetch only when there is no residual filter — a filter can
+        // Bound the fetch only when there is no residual filter �?a filter can
         // reject early pkeys, so pre-truncating would drop matching rows.
         if filter.is_none() {
-            let want = take.map(|t| t.saturating_add(skip)).unwrap_or(all_pkeys.len());
-            if all_pkeys.len() > want {
-                all_pkeys.truncate(want);
+            if let Some(w) = want {
+                if all_pkeys.len() > w {
+                    all_pkeys.truncate(w);
+                }
             }
         }
 
@@ -7712,6 +8080,63 @@ impl QueryExecutor {
         Ok(total)
     }
 
+    /// Extract inclusive [low, high] byte bounds from a filter on `col`, for
+    /// pushing into an index range scan. Exclusive bounds are widened to
+    /// inclusive (residual filter still rejects the boundary). Returns
+    /// `(None, None)` when the filter doesn't constrain `col`.
+    fn range_bounds_for_column(
+        filter: &Option<FilterExpr>,
+        col: &str,
+    ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let Some(f) = filter else {
+            return (None, None);
+        };
+        let mut lo: Option<Vec<u8>> = None;
+        let mut hi: Option<Vec<u8>> = None;
+        // Walk AND-chains; each conjunct that touches `col` tightens the bounds.
+        let mut stack: Vec<&FilterExpr> = vec![f];
+        while let Some(e) = stack.pop() {
+            match e {
+                FilterExpr::And(l, r) => {
+                    stack.push(l);
+                    stack.push(r);
+                }
+                FilterExpr::Eq(c, v) if c == col => {
+                    let b = onto_storage::IndexManager::encode_value(&Self::literal_to_json_static(v));
+                    lo = Some(b.clone());
+                    hi = Some(b);
+                }
+                FilterExpr::Gte(c, v) if c == col => {
+                    let b = onto_storage::IndexManager::encode_value(&Self::literal_to_json_static(v));
+                    lo = Some(lo.map_or(b.clone(), |cur| cur.max(b.clone())));
+                }
+                FilterExpr::Gt(c, v) if c == col => {
+                    // Exclusive low �?use the value itself as inclusive low;
+                    // residual filter drops the boundary row.
+                    let b = onto_storage::IndexManager::encode_value(&Self::literal_to_json_static(v));
+                    lo = Some(lo.map_or(b.clone(), |cur| cur.max(b.clone())));
+                }
+                FilterExpr::Lte(c, v) if c == col => {
+                    let b = onto_storage::IndexManager::encode_value(&Self::literal_to_json_static(v));
+                    hi = Some(hi.map_or(b.clone(), |cur| cur.min(b.clone())));
+                }
+                FilterExpr::Lt(c, v) if c == col => {
+                    // Exclusive high �?inclusive high; residual filter drops it.
+                    let b = onto_storage::IndexManager::encode_value(&Self::literal_to_json_static(v));
+                    hi = Some(hi.map_or(b.clone(), |cur| cur.min(b.clone())));
+                }
+                FilterExpr::Between(c, v1, v2) if c == col => {
+                    let b1 = onto_storage::IndexManager::encode_value(&Self::literal_to_json_static(v1));
+                    let b2 = onto_storage::IndexManager::encode_value(&Self::literal_to_json_static(v2));
+                    lo = Some(lo.map_or(b1.clone(), |cur| cur.max(b1.clone())));
+                    hi = Some(hi.map_or(b2.clone(), |cur| cur.min(b2.clone())));
+                }
+                _ => {}
+            }
+        }
+        (lo, hi)
+    }
+
     /// Extract bare column names for projection pushdown (same rules as
     /// `plan_index_scan_read_limit`).
     fn projected_column_names(columns: &SelectColumns) -> Vec<String> {
@@ -7763,7 +8188,7 @@ impl QueryExecutor {
                         let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
                         mgr.lookup_eq_read_limit(scan_class, index_column, &json_val, lim)
                     }
-                    _ => Self::try_index_scan_single_read(engine, scan_class, f),
+                    _ => Self::try_index_scan_single_read(engine, scan_class, f, lookup_limit),
                 };
                 if let Some(pkeys) = pkeys {
                     all_pkeys.extend(pkeys);
@@ -7775,6 +8200,14 @@ impl QueryExecutor {
                     break;
                 }
             }
+        }
+        if let Some(lim) = lookup_limit {
+            all_pkeys.truncate(lim);
+        }
+        // Order-preserving dedup: range results are in index-value order.
+        {
+            let mut seen = std::collections::HashSet::with_capacity(all_pkeys.len());
+            all_pkeys.retain(|pk| seen.insert(pk.clone()));
         }
         if let Some(lim) = lookup_limit {
             all_pkeys.truncate(lim);
@@ -7799,6 +8232,10 @@ impl QueryExecutor {
                         .map(|c| hierarchy.contains(c))
                         .unwrap_or(false)
                 });
+                // Residual predicates not expressible as an index range.
+                if let Some(f) = filter.as_ref() {
+                    rows.retain(|row| self.eval_filter_read(engine, row, f));
+                }
                 if rows.is_empty() {
                     return true;
                 }
@@ -7921,6 +8358,7 @@ impl QueryExecutor {
         column: &str,
         query_vector: &[f32],
         top_k: usize,
+        ef_search: Option<usize>,
         filter: &Option<FilterExpr>,
     ) -> Result<Vec<Map<String, Value>>> {
         if !engine.has_vector_index(table, column) {
@@ -7954,7 +8392,7 @@ impl QueryExecutor {
                 .vector_index_manager()
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .search(table, column, query_vector, top_k)?
+                .search_with_ef(table, column, query_vector, top_k, ef_search)?
         };
 
         let mut rows = Vec::new();
@@ -7984,7 +8422,7 @@ impl QueryExecutor {
             let prefix = format!("{}::", scan_class);
             let entries = engine.scan_prefix(prefix.as_bytes())?;
             for (key, val_bytes) in &entries {
-                // Tier 1: BinaryRow path (binary-stored data) — no JSON parsing
+                // Tier 1: BinaryRow path (binary-stored data) �?no JSON parsing
                 if let Some(brow) = BinaryRow::parse(val_bytes) {
                     if !brow.class_in_hierarchy(&class_hierarchy) {
                         continue;
@@ -8321,7 +8759,7 @@ impl QueryExecutor {
         let traversal = TraversalEngine::new(graph.as_ref());
         let mut result_rows: Vec<Map<String, Value>> = Vec::new();
 
-        // Get starting vertices — with subclass expansion if ontology is available
+        // Get starting vertices �?with subclass expansion if ontology is available
         let first_node = &nodes[0];
         let start_vertices = if let Some(label) = &first_node.label {
             // #9 optimization: if the filter has an Eq predicate on an indexed column
@@ -8683,7 +9121,7 @@ impl QueryExecutor {
                 }
             }
 
-            // JOIN: all_rows ⋈ rel_rows (on source) ⋈ target_rows (on target)
+            // JOIN: all_rows �?rel_rows (on source) �?target_rows (on target)
             let mut joined_rows: Vec<Map<String, Value>> = Vec::new();
 
             // Find the source variable name (should be the previous node's variable)
@@ -9194,6 +9632,7 @@ impl QueryExecutor {
         column: &str,
         query_vector: &[f32],
         top_k: usize,
+        ef_search: Option<usize>,
         filter: &Option<FilterExpr>,
     ) -> Result<QueryResult> {
         if !engine.has_vector_index(class, column) {
@@ -9234,7 +9673,7 @@ impl QueryExecutor {
                 .vector_index_manager()
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .search(class, column, query_vector, top_k)?
+                .search_with_ef(class, column, query_vector, top_k, ef_search)?
         };
 
         let mut rows = Vec::new();
@@ -10169,6 +10608,7 @@ impl QueryExecutor {
                 column,
                 query_vector,
                 top_k,
+                ef_search,
                 filter,
             } => self.execute_vector_search_txn(
                 engine,
@@ -10177,6 +10617,7 @@ impl QueryExecutor {
                 column,
                 query_vector,
                 *top_k,
+                *ef_search,
                 filter,
             ),
             QueryAst::TruncateTable { class } => {
@@ -10287,7 +10728,7 @@ impl QueryExecutor {
     fn extract_simple_seqscan<'a>(node: &'a PlanNode) -> Option<(String, &'a Option<FilterExpr>)> {
         match node {
             PlanNode::SeqScan { table, filter, .. } => Some((table.clone(), filter)),
-            // IndexScan is still a single-table scan with an optional filter —
+            // IndexScan is still a single-table scan with an optional filter �?
             // aggregation/count fast paths can use it via try_count_via_index.
             PlanNode::IndexScan { table, filter, .. } => Some((table.clone(), filter)),
             PlanNode::Filter { input, .. }
@@ -10295,7 +10736,7 @@ impl QueryExecutor {
             | PlanNode::Aggregation { input, .. }
             | PlanNode::Sort { input, .. }
             | PlanNode::Limit { input, .. } => Self::extract_simple_seqscan(input),
-            // JOIN nodes — can't stream aggregate across joins
+            // JOIN nodes �?can't stream aggregate across joins
             PlanNode::NestedLoopJoin { .. }
             | PlanNode::HashJoin { .. }
             | PlanNode::SortMergeJoin { .. }
@@ -10522,7 +10963,7 @@ impl QueryExecutor {
         // Pure unfiltered COUNT(*): count via key-only scan. Avoids materializing
         // every value byte in the class (the OOM path on multi-GB tables).
         // Filtered COUNT(*) uses the same key-only streaming path with a
-        // per-row predicate — still never materializes all values at once.
+        // per-row predicate �?still never materializes all values at once.
         if group_by.is_none() && Self::is_pure_count_star(columns) {
             let class_hierarchy = self.get_class_hierarchy_read(engine, table);
             let fast_filter_cols = Self::extract_fast_filter_columns(filter);
@@ -10557,7 +10998,7 @@ impl QueryExecutor {
                     count += matched as u64;
                 }
             }
-            // Only the unfiltered count is the table row count — a filtered
+            // Only the unfiltered count is the table row count �?a filtered
             // COUNT(*) must not poison the row-count cache.
             if filter.is_none() {
                 self.set_cached_row_count(table, count);
@@ -10640,7 +11081,7 @@ impl QueryExecutor {
 
         for scan_class in &class_hierarchy {
             let prefix = format!("{}::", scan_class);
-            // Stream live rows one value at a time — no full-result materialization.
+            // Stream live rows one value at a time �?no full-result materialization.
             let mut on_value = |val_bytes: &[u8]| -> Result<()> {
                 scan_count += 1;
                 if scan_count & 0x3FF == 0 {
@@ -10697,7 +11138,7 @@ impl QueryExecutor {
                             result_row.insert(name, val);
                         }
                         SelectItem::Column(col) => {
-                            // Non-aggregate columns in GROUP BY query — use first row value
+                            // Non-aggregate columns in GROUP BY query �?use first row value
                             if let Some(first_row) = group_first_row.get(group_key) {
                                 let col_name =
                                     col.split(" as ").last().unwrap_or(col);
@@ -10808,7 +11249,7 @@ impl QueryExecutor {
                     }
                 }
             }
-            // Use to_map_projected with empty cols → falls back to to_map()
+            // Use to_map_projected with empty cols �?falls back to to_map()
             // which now skips fields with unrecognized tags instead of failing.
             if let Some(doc) = brow.to_map_projected(&[]) {
                 apply_doc(doc, groups, group_first_row);
@@ -11378,7 +11819,7 @@ impl QueryExecutor {
 
     /// Executes a COPY command: direct bulk load without transaction.
     ///
-    /// This is the fastest import path — uses `engine.put_batch()` directly
+    /// This is the fastest import path �?uses `engine.put_batch()` directly
     /// with a single lock acquisition for all rows.
     ///
     /// Syntax: COPY <class> FROM '<file_path>' (FORMAT CSV|JSON)
@@ -11885,6 +12326,7 @@ impl QueryExecutor {
         column: &str,
         query_vector: &[f32],
         top_k: usize,
+        ef_search: Option<usize>,
         filter: &Option<FilterExpr>,
     ) -> Result<QueryResult> {
         // Check that a vector index exists
@@ -11948,7 +12390,7 @@ impl QueryExecutor {
                 .vector_index_manager()
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .search(class, column, query_vector, top_k)?
+                .search_with_ef(class, column, query_vector, top_k, ef_search)?
         };
 
         // Fetch full documents for the search results
@@ -12020,6 +12462,19 @@ impl QueryExecutor {
         class: &str,
         filter: &FilterExpr,
     ) -> Result<Option<Vec<Vec<u8>>>> {
+        // And: use the first indexable conjunct as the index bound; the caller
+        // re-applies the full filter (residual IsNull/Like/...) afterwards.
+        if let FilterExpr::And(_, _) = filter {
+            let mut conjuncts = Vec::new();
+            Self::split_and_conjuncts(filter, &mut conjuncts);
+            for c in &conjuncts {
+                if Self::filter_is_indexable(c) {
+                    return Self::try_index_scan_single(engine, class, c);
+                }
+            }
+            return Ok(None);
+        }
+
         let col = match filter {
             FilterExpr::Eq(c, _)
             | FilterExpr::Ne(c, _)
@@ -12064,21 +12519,16 @@ impl QueryExecutor {
             }
             FilterExpr::Gte(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                let tree = match index_mgr.get_index(class, &col) {
-                    Some(t) => t,
-                    None => return Ok(None),
-                };
-                let encoded = onto_storage::IndexManager::encode_value(&json_val);
-                tree.gte_scan(&encoded)
+                // Inclusive low / open high �?must merge mem+disk like Gt/Lt.
+                index_mgr
+                    .lookup_range_read(class, &col, Some(&json_val), None)
+                    .unwrap_or_default()
             }
             FilterExpr::Lte(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                let tree = match index_mgr.get_index(class, &col) {
-                    Some(t) => t,
-                    None => return Ok(None),
-                };
-                let encoded = onto_storage::IndexManager::encode_value(&json_val);
-                tree.lte_scan(&encoded)
+                index_mgr
+                    .lookup_range_read(class, &col, None, Some(&json_val))
+                    .unwrap_or_default()
             }
             FilterExpr::Between(_, low, high) => {
                 let low_json = Self::literal_to_json_static(low);
@@ -12343,7 +12793,7 @@ impl QueryExecutor {
                         };
                         !eq
                     }
-                    None => false, // missing column → NULL → Ne is false
+                    None => false, // missing column �?NULL �?Ne is false
                 }
             }
             FilterExpr::Gt(col, val) => doc.get(col).is_some_and(|v| self.value_gt(v, val)),
@@ -12423,7 +12873,7 @@ impl QueryExecutor {
             (Value::Number(n), LiteralValue::Float(l)) => n.as_f64() == Some(*l),
             (Value::Bool(b), LiteralValue::Bool(l)) => b == l,
             (Value::Null, LiteralValue::Null) => true,
-            // Cross-type: Number vs String — try parsing string as number
+            // Cross-type: Number vs String �?try parsing string as number
             (Value::Number(n), LiteralValue::String(s)) => {
                 if let Some(i) = n.as_i64() {
                     s.parse::<i64>().map_or(false, |x| x == i)
@@ -13014,7 +13464,7 @@ impl QueryExecutor {
             }
             // ── GIS Functions ──
             "ST_POINT" => {
-                // ST_POINT(lon, lat) → WKB hex string
+                // ST_POINT(lon, lat) �?WKB hex string
                 if args.len() >= 2 {
                     let lon = args[0].as_f64().unwrap_or(0.0);
                     let lat = args[1].as_f64().unwrap_or(0.0);
@@ -13027,7 +13477,7 @@ impl QueryExecutor {
                 }
             }
             "ST_DISTANCE" => {
-                // ST_DISTANCE(geom1, geom2) → distance in meters
+                // ST_DISTANCE(geom1, geom2) �?distance in meters
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -13043,7 +13493,7 @@ impl QueryExecutor {
                 }
             }
             "ST_CONTAINS" => {
-                // ST_CONTAINS(geom1, geom2) → boolean
+                // ST_CONTAINS(geom1, geom2) �?boolean
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -13056,7 +13506,7 @@ impl QueryExecutor {
                 }
             }
             "ST_INTERSECTS" => {
-                // ST_INTERSECTS(geom1, geom2) → boolean
+                // ST_INTERSECTS(geom1, geom2) �?boolean
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -13069,7 +13519,7 @@ impl QueryExecutor {
                 }
             }
             "ST_WITHIN" => {
-                // ST_WITHIN(geom1, geom2) → boolean
+                // ST_WITHIN(geom1, geom2) �?boolean
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -13082,7 +13532,7 @@ impl QueryExecutor {
                 }
             }
             "ST_OVERLAPS" => {
-                // ST_OVERLAPS(geom1, geom2) → boolean
+                // ST_OVERLAPS(geom1, geom2) �?boolean
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -13095,7 +13545,7 @@ impl QueryExecutor {
                 }
             }
             "ST_TOUCHES" => {
-                // ST_TOUCHES(geom1, geom2) → boolean
+                // ST_TOUCHES(geom1, geom2) �?boolean
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -13108,7 +13558,7 @@ impl QueryExecutor {
                 }
             }
             "ST_CROSSES" => {
-                // ST_CROSSES(geom1, geom2) → boolean
+                // ST_CROSSES(geom1, geom2) �?boolean
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -13121,7 +13571,7 @@ impl QueryExecutor {
                 }
             }
             "ST_DISJOINT" => {
-                // ST_DISJOINT(geom1, geom2) → boolean
+                // ST_DISJOINT(geom1, geom2) �?boolean
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -13134,7 +13584,7 @@ impl QueryExecutor {
                 }
             }
             "ST_EQUALS" => {
-                // ST_EQUALS(geom1, geom2) → boolean
+                // ST_EQUALS(geom1, geom2) �?boolean
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -13147,7 +13597,7 @@ impl QueryExecutor {
                 }
             }
             "ST_RELATE" => {
-                // ST_RELATE(geom1, geom2) → relationship string
+                // ST_RELATE(geom1, geom2) �?relationship string
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -13163,7 +13613,7 @@ impl QueryExecutor {
                 }
             }
             "ST_AS_TEXT" => {
-                // ST_AS_TEXT(geom) → WKT string
+                // ST_AS_TEXT(geom) �?WKT string
                 if let Some(geom) = parse_geometry_from_value(&args[0]) {
                     Ok(Value::String(geom.to_wkt()))
                 } else {
@@ -13171,7 +13621,7 @@ impl QueryExecutor {
                 }
             }
             "ST_FROM_TEXT" => {
-                // ST_FROM_TEXT(wkt) → WKB hex string
+                // ST_FROM_TEXT(wkt) �?WKB hex string
                 if let Some(Value::String(wkt)) = args.first() {
                     if let Some(geom) = onto_core::geo::Geometry::from_wkt(wkt) {
                         let wkb = geom.to_wkb();
@@ -13184,7 +13634,7 @@ impl QueryExecutor {
                 }
             }
             "GEOHASH" => {
-                // GEOHASH(lat, lon, precision) → geohash string
+                // GEOHASH(lat, lon, precision) �?geohash string
                 if args.len() >= 2 {
                     let lat = args[0].as_f64().unwrap_or(0.0);
                     let lon = args[1].as_f64().unwrap_or(0.0);
@@ -13197,7 +13647,7 @@ impl QueryExecutor {
                 }
             }
             "ST_X" => {
-                // ST_X(point) → x coordinate (longitude)
+                // ST_X(point) �?x coordinate (longitude)
                 if let Some(geom) = parse_geometry_from_value(&args[0]) {
                     if let onto_core::geo::Geometry::Point(c) = geom {
                         Ok(json!(c.x))
@@ -13209,7 +13659,7 @@ impl QueryExecutor {
                 }
             }
             "ST_Y" => {
-                // ST_Y(point) → y coordinate (latitude)
+                // ST_Y(point) �?y coordinate (latitude)
                 if let Some(geom) = parse_geometry_from_value(&args[0]) {
                     if let onto_core::geo::Geometry::Point(c) = geom {
                         Ok(json!(c.y))
@@ -13221,7 +13671,7 @@ impl QueryExecutor {
                 }
             }
             "ST_GEOMETRY_TYPE" => {
-                // ST_GEOMETRY_TYPE(geom) → geometry type name
+                // ST_GEOMETRY_TYPE(geom) �?geometry type name
                 if let Some(geom) = parse_geometry_from_value(&args[0]) {
                     Ok(Value::String(geom.geometry_type().to_string()))
                 } else {
@@ -13230,7 +13680,7 @@ impl QueryExecutor {
             }
             // ── Time Series Functions ──
             "TS_MEAN" => {
-                // TS_MEAN(array) → mean of numeric array
+                // TS_MEAN(array) �?mean of numeric array
                 if let Some(Value::Array(arr)) = args.first() {
                     let values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                     if values.is_empty() {
@@ -13244,7 +13694,7 @@ impl QueryExecutor {
                 }
             }
             "TS_STDDEV" => {
-                // TS_STDDEV(array) → standard deviation of numeric array
+                // TS_STDDEV(array) �?standard deviation of numeric array
                 if let Some(Value::Array(arr)) = args.first() {
                     let values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                     if values.is_empty() {
@@ -13260,7 +13710,7 @@ impl QueryExecutor {
                 }
             }
             "TS_MIN" => {
-                // TS_MIN(array) → minimum value
+                // TS_MIN(array) �?minimum value
                 if let Some(Value::Array(arr)) = args.first() {
                     let min = arr
                         .iter()
@@ -13276,7 +13726,7 @@ impl QueryExecutor {
                 }
             }
             "TS_MAX" => {
-                // TS_MAX(array) → maximum value
+                // TS_MAX(array) �?maximum value
                 if let Some(Value::Array(arr)) = args.first() {
                     let max = arr
                         .iter()
@@ -13292,7 +13742,7 @@ impl QueryExecutor {
                 }
             }
             "TS_COUNT" => {
-                // TS_COUNT(array) → count of non-null values
+                // TS_COUNT(array) �?count of non-null values
                 if let Some(Value::Array(arr)) = args.first() {
                     let count = arr.iter().filter(|v| !v.is_null()).count();
                     Ok(json!(count))
@@ -13301,7 +13751,7 @@ impl QueryExecutor {
                 }
             }
             "TS_SUM" => {
-                // TS_SUM(array) → sum of numeric values
+                // TS_SUM(array) �?sum of numeric values
                 if let Some(Value::Array(arr)) = args.first() {
                     let sum: f64 = arr.iter().filter_map(|v| v.as_f64()).sum();
                     Ok(json!(sum))
@@ -13310,7 +13760,7 @@ impl QueryExecutor {
                 }
             }
             "TS_ANOMALY_DETECT" => {
-                // TS_ANOMALY_DETECT(array, threshold) → array of anomalous indices
+                // TS_ANOMALY_DETECT(array, threshold) �?array of anomalous indices
                 if let Some(Value::Array(arr)) = args.first() {
                     let values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                     let threshold = args.get(1).and_then(|v| v.as_f64()).unwrap_or(2.0);
@@ -13323,7 +13773,7 @@ impl QueryExecutor {
                 }
             }
             "TS_DTW" => {
-                // TS_DTW(array1, array2) → DTW distance between two sequences
+                // TS_DTW(array1, array2) �?DTW distance between two sequences
                 if args.len() >= 2 {
                     match (&args[0], &args[1]) {
                         (Value::Array(a1), Value::Array(a2)) => {
@@ -13339,7 +13789,7 @@ impl QueryExecutor {
                 }
             }
             "TS_PERCENTILE" => {
-                // TS_PERCENTILE(array, percentile) → percentile value
+                // TS_PERCENTILE(array, percentile) �?percentile value
                 if let Some(Value::Array(arr)) = args.first() {
                     let mut values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                     let percentile = args.get(1).and_then(|v| v.as_f64()).unwrap_or(50.0) / 100.0;
@@ -13356,7 +13806,7 @@ impl QueryExecutor {
                 }
             }
             "TS_MEDIAN" => {
-                // TS_MEDIAN(array) → median value
+                // TS_MEDIAN(array) �?median value
                 if let Some(Value::Array(arr)) = args.first() {
                     let mut values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                     if values.is_empty() {
@@ -13481,7 +13931,7 @@ impl QueryExecutor {
             .find_ontology_for_class_global(engine, class)?
         {
             Some(o) => o,
-            None => return Ok(()), // No ontology defined — skip validation
+            None => return Ok(()), // No ontology defined �?skip validation
         };
 
         let class_def = match ontology.classes.get(class) {
@@ -13540,7 +13990,7 @@ impl QueryExecutor {
             .find_ontology_for_class_global(engine, class)?
         {
             Some(o) => o,
-            None => return Ok(()), // No ontology — no constraints
+            None => return Ok(()), // No ontology �?no constraints
         };
 
         let class_def = match ontology.classes.get(class) {
@@ -14351,6 +14801,76 @@ mod tests {
     }
 
     #[test]
+    fn test_and_filter_stays_indexable() {
+        // `id = 'x' AND fp IS NULL` must keep the id index; treating And as
+        // non-indexable forced a full-table UPDATE scan and froze the host.
+        let f = FilterExpr::And(
+            Box::new(FilterExpr::Eq(
+                "id".to_string(),
+                LiteralValue::String("CHEMBL1".to_string()),
+            )),
+            Box::new(FilterExpr::IsNull("fp".to_string())),
+        );
+        assert!(QueryExecutor::filter_is_indexable(&f));
+        assert_eq!(QueryExecutor::filter_column(&f), Some("id".to_string()));
+
+        // Residual-first order too.
+        let f2 = FilterExpr::And(
+            Box::new(FilterExpr::IsNull("fp".to_string())),
+            Box::new(FilterExpr::Eq(
+                "id".to_string(),
+                LiteralValue::String("CHEMBL1".to_string()),
+            )),
+        );
+        assert!(QueryExecutor::filter_is_indexable(&f2));
+        assert_eq!(QueryExecutor::filter_column(&f2), Some("id".to_string()));
+
+        // No indexable conjunct → still not indexable.
+        let f3 = FilterExpr::And(
+            Box::new(FilterExpr::IsNull("fp".to_string())),
+            Box::new(FilterExpr::Like("smiles".to_string(), "%.%" .to_string())),
+        );
+        assert!(!QueryExecutor::filter_is_indexable(&f3));
+        assert_eq!(QueryExecutor::filter_column(&f3), None);
+    }
+
+    #[test]
+    fn test_update_with_and_null_uses_rows_not_full_scan() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "Pixel", 799);
+
+        // Give the first row a non-null note, leave the second null.
+        let upd = QueryParser::parse(
+            "UPDATE Product SET note = 'hi' WHERE name = 'iPhone'",
+        )
+        .unwrap();
+        executor.execute(&upd).unwrap();
+
+        // Idempotent guard shape used by fp backfill: AND col IS NULL.
+        let upd2 = QueryParser::parse(
+            "UPDATE Product SET note = 'x' WHERE name = 'Pixel' AND note IS NULL",
+        )
+        .unwrap();
+        let r = executor.execute(&upd2).unwrap();
+        match r {
+            QueryResult::Success(msg) => {
+                assert!(msg.starts_with('1'), "expected 1 row updated, got {msg}")
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+
+        // Second run hits 0 rows (note already set).
+        let r2 = executor.execute(&upd2).unwrap();
+        match r2 {
+            QueryResult::Success(msg) => {
+                assert!(msg.starts_with('0'), "expected 0 rows, got {msg}")
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_select_all() {
         let (executor, _dir) = setup();
 
@@ -15030,6 +15550,157 @@ mod tests {
         }
     }
 
+    /// And with a residual conjunct on a second column must NOT be answered
+    /// by a bare `count_range` on the first column — that used to silently
+    /// drop the extra predicate and over-count.
+    #[test]
+    fn test_count_and_residual_conjunct_not_ignored() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine().flush().unwrap();
+
+        // `price > 900 AND name = 'iPhone'` → only iPhone (999) matches.
+        // The old path counted the whole price range (2 rows) and ignored `name`.
+        let ast = QueryParser::parse(
+            "SELECT COUNT(*) FROM Product WHERE price > 900 AND name = 'iPhone'",
+        )
+        .unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(
+                    rows[0].get("count(*)").unwrap().as_i64().unwrap(),
+                    1,
+                    "residual `name = 'iPhone'` must still be applied"
+                );
+            }
+            _ => panic!("expected 1 row with count"),
+        }
+
+        // Symmetric: residual before the range term.
+        let ast = QueryParser::parse(
+            "SELECT COUNT(*) FROM Product WHERE name = 'iPad' AND price > 900",
+        )
+        .unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows[0].get("count(*)").unwrap().as_i64().unwrap(), 0);
+            }
+            _ => panic!("expected 1 row with count"),
+        }
+
+        // Pure same-column range must still be exact.
+        // prices: 799 (iPad), 999 (iPhone), 1999 (MacBook) → [800, 2000] = 2.
+        let ast = QueryParser::parse(
+            "SELECT COUNT(*) FROM Product WHERE price >= 800 AND price <= 2000",
+        )
+        .unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows[0].get("count(*)").unwrap().as_i64().unwrap(), 2);
+            }
+            _ => panic!("expected 1 row with count"),
+        }
+
+        // SELECT must agree with COUNT for the same residual And.
+        let ast = QueryParser::parse(
+            "SELECT name FROM Product WHERE price > 900 AND name = 'iPhone'",
+        )
+        .unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1, "SELECT must apply the residual conjunct too");
+                assert_eq!(rows[0].get("name").unwrap().as_str().unwrap(), "iPhone");
+            }
+            _ => panic!("expected rows"),
+        }
+
+        // LIMIT + residual must not under-return (pkeys are over-fetched and
+        // the LIMIT is applied after the residual filter).
+        let ast = QueryParser::parse(
+            "SELECT name FROM Product WHERE price > 500 LIMIT 2",
+        )
+        .unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2, "LIMIT 2 with residual must return 2 rows");
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    /// Regression: the planner used to emit `Filter(Limit(SeqScan))`, which
+    /// truncates the raw scan to N rows and *then* drops non-matches — so
+    /// `LIMIT N` returned N-1 as soon as one of the first N raw rows failed
+    /// the predicate. `LIMIT` must sit above the filter.
+    #[test]
+    fn test_limit_with_residual_filter_returns_exactly_limit() {
+        let (executor, _dir) = setup();
+        // 10 rows; half have a name that a residual LIKE-style predicate rejects.
+        for i in 0..10 {
+            let name = if i % 2 == 0 { "even" } else { "odd" };
+            insert_row(&executor, "Product", name, 100 + i);
+        }
+        executor.engine().flush().unwrap();
+
+        // `name = 'even'` is an Eq on a non-indexed column when combined with a
+        // range on price → residual. Every limit must return exactly `limit`
+        // rows (5 matches exist, so limits 1..=5 must all be exact).
+        for lim in 1..=5 {
+            let ast = QueryParser::parse(&format!(
+                "SELECT name FROM Product WHERE price > 50 AND name = 'even' LIMIT {}",
+                lim
+            ))
+            .unwrap();
+            let result = executor.execute(&ast).unwrap();
+            match &result {
+                QueryResult::Rows(rows) => {
+                    assert_eq!(
+                        rows.len(),
+                        lim,
+                        "LIMIT {} with residual must return exactly {} rows, got {}",
+                        lim,
+                        lim,
+                        rows.len()
+                    );
+                    for r in rows {
+                        assert_eq!(r.get("name").unwrap().as_str().unwrap(), "even");
+                    }
+                }
+                _ => panic!("expected rows"),
+            }
+        }
+
+        // A residual LIKE predicate is the exact shape that used to under-return.
+        for lim in 1..=4 {
+            let ast = QueryParser::parse(&format!(
+                "SELECT name FROM Product WHERE name LIKE 'e%' LIMIT {}",
+                lim
+            ))
+            .unwrap();
+            let result = executor.execute(&ast).unwrap();
+            match &result {
+                QueryResult::Rows(rows) => {
+                    assert_eq!(
+                        rows.len(),
+                        lim,
+                        "LIKE + LIMIT {} must return exactly {} rows, got {}",
+                        lim,
+                        lim,
+                        rows.len()
+                    );
+                }
+                _ => panic!("expected rows"),
+            }
+        }
+    }
+
     /// COUNT, SELECT row count, and hierarchy-expanded count_prefix sum must agree.
     #[test]
     fn test_count_select_hierarchy_consistency() {
@@ -15095,7 +15766,7 @@ mod tests {
         }
     }
 
-    /// SUM + AVG over the same column must share one accumulator — not double-count.
+    /// SUM + AVG over the same column must share one accumulator �?not double-count.
     #[test]
     fn test_sum_avg_same_column_no_double_count() {
         let (executor, _dir) = setup();
@@ -15732,7 +16403,7 @@ mod tests {
         insert_row(&executor, "Product", "AirPods", 249);
         executor.engine().flush().unwrap();
 
-        // Range query: price > 500 鈥?should use index
+        // Range query: price > 500 �?should use index
         let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price > 500").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
@@ -17120,9 +17791,9 @@ mod tests {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════�?
     //  Import tests
-    // ═══════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════�?
 
     #[test]
     fn test_import_csv_basic() {
@@ -17531,7 +18202,7 @@ mod tests {
         };
         assert!(executor.execute(&ast).is_ok());
 
-        // Same student + same course → should fail
+        // Same student + same course �?should fail
         let ast = QueryAst::Insert {
             class: "Enrollment".to_string(),
             columns: vec!["student".to_string(), "course".to_string()],
@@ -17542,7 +18213,7 @@ mod tests {
         };
         assert!(executor.execute(&ast).is_err());
 
-        // Same student + different course → should succeed
+        // Same student + different course �?should succeed
         let ast = QueryAst::Insert {
             class: "Enrollment".to_string(),
             columns: vec!["student".to_string(), "course".to_string()],
@@ -17553,7 +18224,7 @@ mod tests {
         };
         assert!(executor.execute(&ast).is_ok());
 
-        // Different student + same course → should succeed
+        // Different student + same course �?should succeed
         let ast = QueryAst::Insert {
             class: "Enrollment".to_string(),
             columns: vec!["student".to_string(), "course".to_string()],
@@ -17576,7 +18247,7 @@ mod tests {
         let ontology_store = OntologyStore::new(engine.clone());
         let executor = QueryExecutor::new(engine.clone(), ontology_store);
 
-        // 默认 namespace 是 "default"
+        // 默认 namespace �?"default"
         assert_eq!(executor.current_namespace(), "default");
 
         // 创建 namespace "tenant_a"
@@ -17585,19 +18256,19 @@ mod tests {
         };
         executor.execute(&ast).unwrap();
 
-        // 切换到 tenant_a
+        // 切换�?tenant_a
         let ast = QueryAst::UseNamespace {
             name: "tenant_a".to_string(),
         };
         executor.execute(&ast).unwrap();
         assert_eq!(executor.current_namespace(), "tenant_a");
 
-        // make_entity_id 应使用当前 namespace
+        // make_entity_id 应使用当�?namespace
         let eid = executor.make_entity_id("Device", "001");
         assert_eq!(eid.namespace(), "tenant_a");
         assert_eq!(eid.to_lsm_key(), b"tenant_a::Device::001");
 
-        // 创建 namespace "tenant_b" 并切换
+        // 创建 namespace "tenant_b" 并切�?
         let ast = QueryAst::CreateNamespace {
             name: "tenant_b".to_string(),
         };
@@ -17613,10 +18284,10 @@ mod tests {
         assert_eq!(eid2.namespace(), "tenant_b");
         assert_eq!(eid2.to_lsm_key(), b"tenant_b::Device::001");
 
-        // 同 class+pk 不同 namespace 的 key 不碰撞
+        // �?class+pk 不同 namespace �?key 不碰�?
         assert_ne!(eid.to_lsm_key(), eid2.to_lsm_key());
 
-        // 切换到不存在的 namespace 应报错
+        // 切换到不存在�?namespace 应报�?
         let ast = QueryAst::UseNamespace {
             name: "nonexistent".to_string(),
         };

@@ -315,14 +315,16 @@ impl CompactionWorker {
     /// Performs leveled compaction: merges SSTables from level N into level N+1.
     fn compact_level(&mut self, level: usize) -> Result<()> {
         // Step 1: Snapshot SSTables to compact (don't remove from levels yet)
-        let (ssts_to_compact, compact_min, compact_max) = {
-            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+        let (ssts_to_compact, compact_min, compact_max, empty_ssts) = {
+            let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             if level >= levels.len() - 1 {
                 return Ok(());
             }
 
             let ssts: Vec<SsTableInfo> = if level == 0 {
-                let count = (levels[0].len() / 2).max(2).min(levels[0].len()).min(4);
+                // L0 files can be large (memtable-sized); take a wider batch so
+                // the level drains instead of trickling 2 files at a time.
+                let count = (levels[0].len() / 2).max(4).min(levels[0].len()).min(8);
                 levels[0].iter().take(count).cloned().collect()
             } else {
                 if levels[level].is_empty() {
@@ -341,6 +343,14 @@ impl CompactionWorker {
                 sorted.into_iter().take(batch).collect()
             };
 
+            // Drop 0-entry empty SSTs (57-byte shells). They carry no data and
+            // only pollute the "old SST" footer-upgrade counter.
+            let (empty_ssts, ssts): (Vec<SsTableInfo>, Vec<SsTableInfo>) =
+                ssts.into_iter().partition(|s| s.size < 64);
+            for e in &empty_ssts {
+                levels[level].retain(|s| s.path != e.path);
+            }
+
             if ssts.is_empty() {
                 return Ok(());
             }
@@ -358,8 +368,20 @@ impl CompactionWorker {
                 .unwrap_or(b"")
                 .to_vec();
 
-            (ssts, min, max)
+            (ssts, min, max, empty_ssts)
         };
+
+        // Delete empty-shell SSTs outside the levels lock
+        if !empty_ssts.is_empty() {
+            for e in &empty_ssts {
+                self.sst_cache.remove(&e.path);
+                self.pending_deletions.push(e.path.clone());
+            }
+            tracing::info!(
+                count = empty_ssts.len(),
+                "Discarded empty-shell SSTs during compaction pickup"
+            );
+        }
 
         // Step 2: Find overlapping SSTables in level N+1 (snapshot, don't remove)
         // Cap total SSTables opened simultaneously to bound memory usage.
@@ -367,9 +389,9 @@ impl CompactionWorker {
         const MAX_SSTABLES_PER_MERGE: usize = 20;
         let max_overlap = MAX_SSTABLES_PER_MERGE.saturating_sub(ssts_to_compact.len()).max(4);
         let next_level = level + 1;
-        let next_level_ssts: Vec<SsTableInfo> = {
-            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-            let mut overlapping: Vec<SsTableInfo> = levels[next_level]
+        let (next_level_ssts, empty_next): (Vec<SsTableInfo>, Vec<SsTableInfo>) = {
+            let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let overlapping: Vec<SsTableInfo> = levels[next_level]
                 .iter()
                 .filter(|sst_info| {
                     Self::ranges_overlap(
@@ -381,9 +403,18 @@ impl CompactionWorker {
                 })
                 .cloned()
                 .collect();
-            overlapping.truncate(max_overlap);
-            overlapping
+            let (empty_next, mut kept): (Vec<SsTableInfo>, Vec<SsTableInfo>) =
+                overlapping.into_iter().partition(|s| s.size < 64);
+            for e in &empty_next {
+                levels[next_level].retain(|s| s.path != e.path);
+            }
+            kept.truncate(max_overlap);
+            (kept, empty_next)
         };
+        for e in &empty_next {
+            self.sst_cache.remove(&e.path);
+            self.pending_deletions.push(e.path.clone());
+        }
 
         // Step 3: Streaming merge using min-heap (O(1) memory per SSTable)
         // Only clone levels deeper than next_level for tombstone checks (saves memory)
@@ -410,7 +441,10 @@ impl CompactionWorker {
         // Step 4: Stream entries with dedup + tombstone cleanup, write directly to new SSTables
         let target_sst_size = 64 * 1024 * 1024; // 64MB per output SST
         let merge_start = std::time::Instant::now();
-        const MERGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        // 10 minutes: a single L1 merge can legitimately process millions of
+        // entries (post-cleanup rebalance); 120s aborted those merges and the
+        // LSM could never converge.
+        const MERGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
         let mut builder = SsTableBuilder::new();
         builder.set_compression_level(self.options.compression_level);
         let mut new_ssts: Vec<SsTableInfo> = Vec::new();
@@ -607,6 +641,27 @@ impl CompactionWorker {
                 None => return Ok(()),
             }
         };
+
+        // Discard empty-shell SSTs (57-byte, 0-entry) instead of merging them.
+        let (empty_shells, non_empty): (Vec<SsTableInfo>, Vec<SsTableInfo>) =
+            small_files.into_iter().partition(|s| s.size < 64);
+        small_files = non_empty;
+        if !empty_shells.is_empty() {
+            {
+                let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+                for e in &empty_shells {
+                    levels[target_level].retain(|s| s.path != e.path);
+                }
+            }
+            for e in &empty_shells {
+                self.sst_cache.remove(&e.path);
+                self.pending_deletions.push(e.path.clone());
+            }
+            tracing::info!(
+                count = empty_shells.len(),
+                "Discarded empty-shell SSTs in merge_small_files"
+            );
+        }
 
         // Limit to one batch to bound memory usage
         small_files.truncate(MERGE_BATCH_SIZE);

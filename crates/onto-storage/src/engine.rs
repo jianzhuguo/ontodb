@@ -22,7 +22,7 @@ use crate::lsm::sstable::{SsTable, SsTableBuilder};
 use crate::lsm::wal::{self, Wal};
 use crate::mvcc::{TxnManager, WriteOp};
 use crate::options::StorageOptions;
-use crate::vector::VectorIndexManager;
+use crate::vector::{VecData, VectorIndexManager};
 use onto_core::binary_row::BinaryRow;
 use onto_core::{Entry, EntryKind, Key, Result, SeqNo, Value};
 use std::collections::HashMap;
@@ -183,9 +183,11 @@ impl PreLoadEngine {
         for entry in entries {
             // Skip index Puts during WAL replay — indexes are rebuilt
             // separately by rebuild_indexes() after the engine is loaded.
-            // Delete tombstones for `__idx__` keys MUST be applied: DROP INDEX
+            // Delete tombstones for index keys MUST be applied: DROP INDEX
             // relies on them to suppress rebuild from leftover index entries.
-            if entry.key.starts_with(b"__idx__") && entry.kind == EntryKind::Put {
+            if (entry.key.starts_with(b"__idx2__") || entry.key.starts_with(b"__idx__"))
+                && entry.kind == EntryKind::Put
+            {
                 skipped_index_entries += 1;
                 max_seq = max_seq.max(entry.seq_no);
                 continue;
@@ -480,6 +482,12 @@ impl LsmEngine {
             let _ = handle.join();
         }
 
+        // Persist any dirty HNSW nodes (incremental delta) before exiting so
+        // in-flight vector inserts are not lost between full snapshots.
+        if let Err(e) = self.persist_vector_deltas() {
+            tracing::warn!("Failed to persist vector deltas on shutdown: {}", e);
+        }
+
         // Flush any remaining data
         if let Some(mut ws) = self
             .write_state
@@ -490,6 +498,405 @@ impl LsmEngine {
                 let _ = ws.wal.sync();
             }
         }
+    }
+
+    /// Writes incremental HNSW deltas (`__vec_delta__`) for every index that
+    /// has dirty nodes.  Cheap when nothing changed.  Called on flush_memtable
+    /// and graceful shutdown so vector inserts survive restarts without a
+    /// full graph re-save.
+    pub fn persist_vector_deltas(&self) -> Result<()> {
+        let dirty: Vec<(String, String)> = {
+            let mgr = self
+                .vector_index_manager
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            mgr.list_indexes()
+                .iter()
+                .filter(|m| mgr.has_dirty_nodes(&m.class, &m.column))
+                .map(|m| (m.class.clone(), m.column.clone()))
+                .collect()
+        };
+        if dirty.is_empty() {
+            return Ok(());
+        }
+        for (class, column) in dirty {
+            // Deltas are for small incremental bursts only.  A bulk rebuild
+            // marks every node dirty — persisting that would write a
+            // multi-hundred-MB LSM value and wedge the next startup.
+            let dirty_count = {
+                let mgr = self
+                    .vector_index_manager
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                mgr.dirty_count(&class, &column)
+            };
+            if dirty_count > 20_000 {
+                tracing::warn!(
+                    table = %class,
+                    column = %column,
+                    dirty = dirty_count,
+                    "Skipping incremental vector delta (too large); full snapshot is authoritative"
+                );
+                continue;
+            }
+            let blob = self
+                .vector_index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .save_incremental(&class, &column);
+            if let Some(blob) = blob {
+                if blob.len() > 32 * 1024 * 1024 {
+                    tracing::warn!(
+                        table = %class,
+                        column = %column,
+                        bytes = blob.len(),
+                        "Skipping oversized incremental vector delta"
+                    );
+                    continue;
+                }
+                let key = format!("__vec_delta__{}_{}", class, column).into_bytes();
+                let seq = self.next_seq();
+                let entry = Entry::put(key.clone(), blob.clone(), seq);
+                let mut ws = self.write_state.write();
+                ws.wal.append(&entry)?;
+                ws.wal.flush_buf()?;
+                ws.memtable.put_with_seq(key, blob, seq);
+                tracing::info!(
+                    table = %class,
+                    column = %column,
+                    "Persisted incremental vector index delta"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Tombstones the incremental delta key after a full snapshot is written,
+    /// so the next restart does not replay stale deltas on top of a fresh graph.
+    fn clear_vector_delta(&self, class: &str, column: &str) {
+        let key = format!("__vec_delta__{}_{}", class, column).into_bytes();
+        let seq = self.next_seq();
+        let entry = Entry::delete(key.clone(), seq);
+        if let Some(mut ws) = self.write_state.try_write_for(std::time::Duration::from_secs(1)) {
+            let _ = ws.wal.append(&entry);
+            let _ = ws.wal.flush_buf();
+            ws.memtable.delete_with_seq(key, seq);
+        }
+    }
+
+    /// Persists the current in-memory HNSW graph as a snapshot file
+    /// (`indexes/{class}_{column}.hnsw`) and clears any incremental delta.
+    ///
+    /// File-based on purpose: a 1024-dim graph for millions of vectors is
+    /// hundreds of MB — far beyond a safe single LSM value (SST block limit),
+    /// which corrupts the read path.  Must be called after bulk backfill so
+    /// the graph survives restarts.
+    pub fn persist_vector_graph(&self, class: &str, column: &str) -> Result<()> {
+        let graph_bytes = self
+            .vector_index_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .save_graph(class, column);
+        if let Some(graph_bytes) = graph_bytes {
+            let idx_dir = self.options.data_dir.join("indexes");
+            if let Err(e) = std::fs::create_dir_all(&idx_dir) {
+                tracing::warn!("Failed to create indexes dir: {}", e);
+                return Ok(());
+            }
+            let path = idx_dir.join(format!("{}_{}.hnsw", class, column));
+            // Write to a temp file then rename so a crash cannot leave a torn file.
+            let tmp = path.with_extension("hnsw.tmp");
+            if let Err(e) = std::fs::write(&tmp, &graph_bytes) {
+                tracing::warn!(
+                    table = %class,
+                    column = %column,
+                    error = %e,
+                    "Failed to write HNSW snapshot file"
+                );
+                return Ok(());
+            }
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                tracing::warn!(
+                    table = %class,
+                    column = %column,
+                    error = %e,
+                    "Failed to finalize HNSW snapshot file"
+                );
+                return Ok(());
+            }
+            self.clear_vector_delta(class, column);
+            tracing::info!(
+                table = %class,
+                column = %column,
+                bytes = graph_bytes.len(),
+                path = %path.display(),
+                "Persisted HNSW graph snapshot"
+            );
+        }
+        Ok(())
+    }
+
+    /// Loads a persisted HNSW snapshot file if present.
+    pub fn load_vector_graph_file(&self, class: &str, column: &str) -> Option<Vec<u8>> {
+        let path = self
+            .options
+            .data_dir
+            .join("indexes")
+            .join(format!("{}_{}.hnsw", class, column));
+        std::fs::read(&path).ok()
+    }
+
+    /// Adds document `column` vectors that are not already in the HNSW graph.
+    /// Returns how many vectors were added. Used after a snapshot restore so a
+    /// stale snapshot (written before more rows gained the fp field) does not
+    /// require a full rebuild.
+    /// Backfills missing vectors AND reconciles the restored graph against
+    /// live documents.
+    ///
+    /// `deleted_keys` / `doc_vectors` are in-memory only and do not survive in
+    /// the HNSW snapshot. After a restore the graph therefore still contains
+    /// nodes for documents whose `fp` was later cleared (or that were deleted)
+    /// — those are the "ghost" vectors. This pass rebuilds `doc_vectors` for
+    /// live rows and marks every graph node without a live vector as deleted,
+    /// so search filters them out again.
+    ///
+    /// Split into two phases so the ready-gate window is O(documents) and does
+    /// not grow with the number of missing vectors (HNSW insert is the
+    /// expensive part and is deferred to [`Self::backfill_vector_missing`]):
+    /// - **reconcile** (this fn): note + ghost-mark only. Ghost safety is
+    ///   complete when it returns, so the caller may `mark_ready()`.
+    /// - **backfill** ([`Self::backfill_vector_missing`]): insert missing
+    ///   vectors afterwards. Until it finishes, search can miss those rows
+    ///   (false negatives only — never stale/ghost hits).
+    fn reconcile_vector_index(
+        &self,
+        class: &str,
+        column: &str,
+        dimension: usize,
+        existing: &std::collections::HashSet<Vec<u8>>,
+    ) -> Vec<(Vec<u8>, String, String, crate::vector::hnsw::VecData)> {
+        let prefix = format!("{}::", class);
+        let mut missing: Vec<(Vec<u8>, String, String, crate::vector::hnsw::VecData)> =
+            Vec::new();
+        let mut notes: Vec<(Vec<u8>, String, String, crate::vector::hnsw::VecData)> =
+            Vec::new();
+        let mut ghosts: Vec<Vec<u8>> = Vec::new();
+        let mut seen: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::with_capacity(existing.len());
+        let mut noted = 0usize;
+        let mut marked = 0usize;
+        const VEC_BATCH: usize = 10_000;
+        let cls = class.to_string();
+        let col = column.to_string();
+        {
+            let mut sink = |pk: &[u8], val_bytes: &[u8]| -> Result<bool> {
+                let in_graph = existing.contains(pk);
+                if in_graph {
+                    seen.insert(pk.to_vec());
+                }
+                let has_vec = match parse_doc_bytes(val_bytes) {
+                    Some(doc)
+                        if doc.get("__class__").and_then(|v| v.as_str()) == Some(cls.as_str()) =>
+                    {
+                        match doc
+                            .get(col.as_str())
+                            .and_then(|v| crate::vector::hnsw::VecData::from_json(v, dimension))
+                        {
+                            Some(data) => Some(data),
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if in_graph {
+                    match has_vec {
+                        Some(data) => notes.push((pk.to_vec(), cls.clone(), col.clone(), data)),
+                        // Graph node whose document no longer carries a vector.
+                        None => ghosts.push(pk.to_vec()),
+                    }
+                } else if let Some(data) = has_vec {
+                    // Not in graph: queue for post-gate backfill, do not insert
+                    // here (HNSW insert is what makes the gate window grow).
+                    missing.push((pk.to_vec(), cls.clone(), col.clone(), data));
+                }
+                if notes.len() >= VEC_BATCH {
+                    noted += notes.len();
+                    let mut mgr = self
+                        .vector_index_manager
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    for (pk, c, co, data) in std::mem::take(&mut notes) {
+                        mgr.note_doc_vector(pk, c, co, data);
+                    }
+                }
+                if ghosts.len() >= VEC_BATCH {
+                    marked += ghosts.len();
+                    let mut mgr = self
+                        .vector_index_manager
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    for pk in std::mem::take(&mut ghosts) {
+                        mgr.mark_deleted(pk);
+                    }
+                }
+                Ok(true)
+            };
+            if let Err(e) = self.for_each_live_prefix_until(prefix.as_bytes(), None, None, &mut sink)
+            {
+                tracing::warn!(
+                    table = %class,
+                    column = %column,
+                    error = %e,
+                    "Vector snapshot reconcile scan failed"
+                );
+            }
+        }
+
+        // Graph nodes whose pk never appeared in the live scan: deleted rows
+        // whose tombstone (and thus `deleted_keys`) was lost on restart.
+        for pk in existing.difference(&seen) {
+            ghosts.push(pk.clone());
+        }
+
+        if !notes.is_empty() {
+            noted += notes.len();
+            let mut mgr = self
+                .vector_index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for (pk, c, co, data) in notes {
+                mgr.note_doc_vector(pk, c, co, data);
+            }
+        }
+        if !ghosts.is_empty() {
+            marked += ghosts.len();
+            let mut mgr = self
+                .vector_index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for pk in ghosts {
+                mgr.mark_deleted(pk);
+            }
+        }
+        tracing::info!(
+            table = %class,
+            column = %column,
+            missing = missing.len(),
+            noted,
+            ghosts_marked = marked,
+            "Vector snapshot reconcile complete"
+        );
+        // A large ghost count means historical vectors outlived their
+        // documents (deleted_keys was lost across restart). Surface it as a
+        // warning so operators know to run COMPACT VECTOR INDEX.
+        if marked > 0 {
+            let pct = if existing.is_empty() {
+                0.0
+            } else {
+                (marked as f64) * 100.0 / (existing.len() as f64)
+            };
+            if marked > 100_000 {
+                tracing::error!(
+                    table = %class,
+                    column = %column,
+                    ghosts_marked = marked,
+                    pct = format!("{:.1}%", pct),
+                    "vector ghosts reconciled at scale — run COMPACT VECTOR INDEX ON {} ({})",
+                    class, column
+                );
+            } else if pct > 1.0 {
+                tracing::warn!(
+                    table = %class,
+                    column = %column,
+                    ghosts_marked = marked,
+                    pct = format!("{:.1}%", pct),
+                    "vector ghosts reconciled (>{:.0}% of graph) — consider COMPACT VECTOR INDEX ON {} ({})",
+                    pct, class, column
+                );
+            } else {
+                tracing::warn!(
+                    table = %class,
+                    column = %column,
+                    ghosts_marked = marked,
+                    "vector ghosts reconciled"
+                );
+            }
+        }
+        missing
+    }
+
+    /// Inserts vectors queued by [`Self::reconcile_vector_index`].
+    ///
+    /// Runs **after** `mark_ready`: ghost safety is already established, and
+    /// this only adds nodes (never stale/ghost hits). Inserts are guarded —
+    /// a concurrent UPDATE/DELETE that already handled the document wins and
+    /// the queued copy is skipped, so `insert_data`'s lack of id-dedup cannot
+    /// produce a duplicate node.
+    fn backfill_vector_missing(
+        &self,
+        class: &str,
+        column: &str,
+        missing: Vec<(Vec<u8>, String, String, crate::vector::hnsw::VecData)>,
+    ) -> (usize, usize) {
+        const VEC_BATCH: usize = 10_000;
+        let total = missing.len();
+        if total == 0 {
+            return (0, 0);
+        }
+        let mut inserted = 0usize;
+        let mut skipped = 0usize;
+        let mut batch: Vec<(Vec<u8>, String, String, crate::vector::hnsw::VecData)> =
+            Vec::with_capacity(VEC_BATCH.min(total));
+        for item in missing {
+            batch.push(item);
+            if batch.len() >= VEC_BATCH {
+                let (ins, skp) = self
+                    .vector_index_manager
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .index_vector_data_owned_guarded(std::mem::take(&mut batch));
+                inserted += ins;
+                skipped += skp;
+                self.vector_index_manager
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .sub_pending_backfill(ins + skp);
+                tracing::info!(
+                    table = %class,
+                    column = %column,
+                    inserted,
+                    skipped,
+                    pending = self
+                        .vector_index_manager
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pending_backfill_count(),
+                    "Vector snapshot backfill progress"
+                );
+            }
+        }
+        if !batch.is_empty() {
+            let (ins, skp) = self
+                .vector_index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .index_vector_data_owned_guarded(std::mem::take(&mut batch));
+            inserted += ins;
+            skipped += skp;
+            self.vector_index_manager
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .sub_pending_backfill(ins + skp);
+        }
+        tracing::info!(
+            table = %class,
+            column = %column,
+            inserted,
+            skipped,
+            total,
+            "Vector snapshot backfill complete"
+        );
+        (inserted, skipped)
     }
 
     /// Puts a key-value pair.
@@ -1027,12 +1434,28 @@ impl LsmEngine {
             }
         };
 
-        // Collect SSTable paths under lock, then release
+        // Version selection: newest-first source order + first-seen-wins.
+        //
+        // Do NOT pick the winner by `seq` comparison. `seq` can be 0 (or
+        // duplicated) when a file was rewritten by clean_index / migration,
+        // and `seq > existing` then keeps the OLDER level's version. LSM
+        // level order is always trustworthy: new writes enter at the memtable
+        // and L0, so scanning memtable → L0 → … → L6 and keeping the first
+        // occurrence matches `get()` and `scan_prefix_limit_newest`.
+        let mut note = |key: Vec<u8>, value: Vec<u8>, seq: SeqNo, kind: EntryKind,
+                        seen: &mut HashMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)>| {
+            if is_visible(seq) && !seen.contains_key(&key) {
+                seen.insert(key, (value, seq, kind));
+            }
+        };
+
+        // Newest-first SST list: L0 before L1 … ; within a level, reverse
+        // insertion order (later flushes are newer).
         let sst_paths: Vec<PathBuf> = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let mut paths = Vec::new();
-            for level in levels.iter().rev() {
-                for sst_info in level.iter() {
+            for level in levels.iter() {
+                for sst_info in level.iter().rev() {
                     if !prefix.is_empty() {
                         let sst_max = sst_info.max_key.as_slice();
                         if sst_max < prefix {
@@ -1059,7 +1482,33 @@ impl LsmEngine {
         // cold opens happen outside it via get_or_open_sst).
         let sst_handles = self.get_or_open_ssts(&sst_paths)?;
 
-        // Step 2: Scan SSTables OUTSIDE the lock (I/O-heavy)
+        // Step 2: MemTables FIRST (newest source).
+        {
+            let ws = self.write_state.read();
+            if let Some(ref imm) = ws.immutable_memtable {
+                for entry in imm.scan_prefix(prefix) {
+                    note(
+                        entry.key.clone(),
+                        entry.value.clone(),
+                        entry.seq_no,
+                        entry.kind,
+                        &mut seen,
+                    );
+                }
+            }
+            for entry in ws.memtable.scan_prefix(prefix) {
+                note(
+                    entry.key.clone(),
+                    entry.value.clone(),
+                    entry.seq_no,
+                    entry.kind,
+                    &mut seen,
+                );
+            }
+        }
+
+        // Step 3: Scan SSTables OUTSIDE the lock (I/O-heavy), newest-first.
+        // First-seen-wins: a key already recorded by a newer source is skipped.
         for (sst_idx, sst) in sst_handles.iter().enumerate() {
             let mut iter = sst.iter()?;
 
@@ -1084,15 +1533,7 @@ impl LsmEngine {
                     sst_del_count += 1;
                 }
 
-                if is_visible(seq) {
-                    let should_update = match seen.get(&key) {
-                        Some((_, existing_seq, _)) => seq > *existing_seq,
-                        None => true,
-                    };
-                    if should_update {
-                        seen.insert(key, (value, seq, kind));
-                    }
-                }
+                note(key, value, seq, kind, &mut seen);
 
                 sst_count += 1;
                 iter.next();
@@ -1109,51 +1550,10 @@ impl LsmEngine {
             }
 
             // NOTE: Do NOT early-exit based on put_count here.
-            // Newer SSTs (higher sst_idx) may contain tombstones that override
-            // Put entries from older SSTs. Exiting early would return "phantom
-            // live" entries that are actually deleted. The SST list is already
+            // A later SST in this newest-first list is older, but a key can
+            // still appear only there (not in a newer SST) — and tombstones
+            // already recorded win via first-seen-wins. The SST list is
             // pruned by prefix range, so scanning all of them is cheap.
-        }
-
-        // Step 3: Scan MemTables (read lock — concurrent with other readers)
-        // Uses BTreeMap range query via scan_prefix() — O(log n + matches)
-        // instead of O(total_entries) full iteration + starts_with filter.
-        {
-            let ws = self.write_state.read();
-
-            // Scan immutable MemTable (overrides SSTables)
-            if let Some(ref imm) = ws.immutable_memtable {
-                for entry in imm.scan_prefix(prefix) {
-                    if is_visible(entry.seq_no) {
-                        let should_update = match seen.get(&entry.key) {
-                            Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
-                            None => true,
-                        };
-                        if should_update {
-                            seen.insert(
-                                entry.key.clone(),
-                                (entry.value.clone(), entry.seq_no, entry.kind),
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Scan active MemTable (overrides everything)
-            for entry in ws.memtable.scan_prefix(prefix) {
-                if is_visible(entry.seq_no) {
-                    let should_update = match seen.get(&entry.key) {
-                        Some((_, existing_seq, _)) => entry.seq_no > *existing_seq,
-                        None => true,
-                    };
-                    if should_update {
-                        seen.insert(
-                            entry.key.clone(),
-                            (entry.value.clone(), entry.seq_no, entry.kind),
-                        );
-                    }
-                }
-            }
         }
 
         // Filter out tombstones, with early termination when limit is set
@@ -1241,12 +1641,15 @@ impl LsmEngine {
 
         let mut winners: HashMap<Vec<u8>, (SeqNo, EntryKind)> = HashMap::new();
 
+        // Newest-first SST list: L0 before L1 … ; within a level, reverse
+        // insertion order (later flushes are newer). First-seen-wins below —
+        // do NOT select the winner by `seq` (it can be 0 after clean_index).
         let sst_handles: Vec<Arc<SsTable>> = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
             let mut handles = Vec::new();
-            for level in levels.iter().rev() {
-                for sst_info in level.iter() {
+            for level in levels.iter() {
+                for sst_info in level.iter().rev() {
                     if !prefix.is_empty() {
                         if sst_info.max_key.as_slice() < prefix {
                             continue;
@@ -1274,15 +1677,30 @@ impl LsmEngine {
 
         {
             let mut note = |key: Vec<u8>, seq: SeqNo, kind: EntryKind| {
-                let should_update = match winners.get(&key) {
-                    Some((existing_seq, _)) => seq > *existing_seq,
-                    None => true,
-                };
-                if should_update {
+                // First-seen wins (newest source presents the key first).
+                if !winners.contains_key(&key) {
                     winners.insert(key, (seq, kind));
                 }
             };
 
+            // MemTables first (newest source).
+            {
+                let ws = self.write_state.read();
+                if let Some(ref imm) = ws.immutable_memtable {
+                    for entry in imm.scan_prefix(prefix) {
+                        if is_visible(entry.seq_no) {
+                            note(entry.key.clone(), entry.seq_no, entry.kind);
+                        }
+                    }
+                }
+                for entry in ws.memtable.scan_prefix(prefix) {
+                    if is_visible(entry.seq_no) {
+                        note(entry.key.clone(), entry.seq_no, entry.kind);
+                    }
+                }
+            }
+
+            // Then SSTs, newest-first.
             for sst in &sst_handles {
                 let mut iter = sst.iter()?;
                 iter.seek(prefix);
@@ -1307,20 +1725,6 @@ impl LsmEngine {
                     if past {
                         break;
                     }
-                }
-            }
-
-            let ws = self.write_state.read();
-            if let Some(ref imm) = ws.immutable_memtable {
-                for entry in imm.scan_prefix(prefix) {
-                    if is_visible(entry.seq_no) {
-                        note(entry.key.clone(), entry.seq_no, entry.kind);
-                    }
-                }
-            }
-            for entry in ws.memtable.scan_prefix(prefix) {
-                if is_visible(entry.seq_no) {
-                    note(entry.key.clone(), entry.seq_no, entry.kind);
                 }
             }
         }
@@ -1365,7 +1769,7 @@ impl LsmEngine {
                 matched_live: &mut usize,
                 passes: &mut F,
                 key: &[u8],
-                seq: SeqNo,
+                _seq: SeqNo,
                 kind: EntryKind,
                 value: &[u8],
             ) -> Result<()>
@@ -1375,10 +1779,14 @@ impl LsmEngine {
                 if kind != EntryKind::Put || *pending_puts == 0 {
                     return Ok(());
                 }
-                let Some((w_seq, w_kind)) = winners.get(key).copied() else {
+                let Some((_, w_kind)) = winners.get(key).copied() else {
                     return Ok(());
                 };
-                if w_seq == seq && w_kind == EntryKind::Put {
+                // First Put in newest-first order is the pass-1 winner. Do NOT
+                // match on `seq` — `clean_index` zeroes it and collisions then
+                // pick the OLDER level's value (pass-2 used to walk L6→L0).
+                // `EntryKind::Delete` doubles as the "already processed" mark.
+                if w_kind == EntryKind::Put {
                     if let Some(slot) = winners.get_mut(key) {
                         slot.1 = EntryKind::Delete; // mark processed
                     }
@@ -1390,32 +1798,9 @@ impl LsmEngine {
                 Ok(())
             }
 
-            let sst_handles = self.snapshot_sst_handles(prefix)?;
-            for sst in &sst_handles {
-                if pending_puts == 0 {
-                    break;
-                }
-                let mut iter = sst.iter()?;
-                iter.seek(prefix);
-                while iter.is_valid() && pending_puts > 0 {
-                    if !iter.key().starts_with(prefix) {
-                        break;
-                    }
-                    try_count(
-                        &mut winners,
-                        &mut pending_puts,
-                        &mut matched_live,
-                        &mut passes,
-                        iter.key(),
-                        iter.seq_no(),
-                        iter.kind(),
-                        iter.value(),
-                    )?;
-                    iter.next();
-                }
-            }
-
-            if pending_puts > 0 {
+            // Newest-first: memtable before SSTs. The first Put met for a key
+            // must be the pass-1 winner (same order as collect_prefix_winners).
+            {
                 let ws = self.write_state.read();
                 if let Some(ref imm) = ws.immutable_memtable {
                     for entry in imm.scan_prefix(prefix) {
@@ -1450,18 +1835,48 @@ impl LsmEngine {
                     )?;
                 }
             }
+
+            let sst_handles = self.snapshot_sst_handles(prefix)?;
+            for sst in &sst_handles {
+                if pending_puts == 0 {
+                    break;
+                }
+                let mut iter = sst.iter()?;
+                iter.seek(prefix);
+                while iter.is_valid() && pending_puts > 0 {
+                    if !iter.key().starts_with(prefix) {
+                        break;
+                    }
+                    try_count(
+                        &mut winners,
+                        &mut pending_puts,
+                        &mut matched_live,
+                        &mut passes,
+                        iter.key(),
+                        iter.seq_no(),
+                        iter.kind(),
+                        iter.value(),
+                    )?;
+                    iter.next();
+                }
+            }
         }
 
         Ok((matched_live, tombstones))
     }
 
     /// Snapshot open SST handles overlapping `prefix` (opens missing files).
+    ///
+    /// Order is **newest-first** (L0 → L6, within a level later flushes first),
+    /// matching pass-1's `collect_prefix_winners` walk. Pass-2 relies on this
+    /// so the first Put it meets for a key is the same entry pass-1 chose as
+    /// winner — `seq` must not be used for matching (`clean_index` zeroes it).
     fn snapshot_sst_handles(&self, prefix: &[u8]) -> Result<Vec<Arc<SsTable>>> {
         let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
         let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
         let mut handles = Vec::new();
-        for level in levels.iter().rev() {
-            for sst_info in level.iter() {
+        for level in levels.iter() {
+            for sst_info in level.iter().rev() {
                 if !prefix.is_empty() {
                     if sst_info.max_key.as_slice() < prefix {
                         continue;
@@ -1542,13 +1957,21 @@ impl LsmEngine {
         };
 
         // ---- Pass 1: storage winners = key → (seq, kind), no values ----
+        //
+        // Version selection: newest-first source order + first-seen-wins.
+        // Do NOT pick the winner by `seq` comparison — `seq` can be 0 when a
+        // file was rewritten by clean_index / migration, and `seq > existing`
+        // then keeps the OLDER level's version. LSM level order is always
+        // trustworthy: new writes enter at the memtable and L0.
         let mut winners: HashMap<Vec<u8>, (SeqNo, EntryKind)> = HashMap::new();
 
+        // Newest-first SST list: L0 before L1 … ; within a level, reverse
+        // insertion order (later flushes are newer).
         let sst_paths: Vec<PathBuf> = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let mut paths = Vec::new();
-            for level in levels.iter().rev() {
-                for sst_info in level.iter() {
+            for level in levels.iter() {
+                for sst_info in level.iter().rev() {
                     if !prefix.is_empty() {
                         if sst_info.max_key.as_slice() < prefix {
                             continue;
@@ -1587,15 +2010,31 @@ impl LsmEngine {
                 if shadowed(&key) {
                     return;
                 }
-                let should_update = match winners.get(&key) {
-                    Some((existing_seq, _)) => seq > *existing_seq,
-                    None => true,
-                };
-                if should_update {
+                // First-seen wins: the first source to present a key is the
+                // newest (we walk memtable → L0 → … → L6).
+                if !winners.contains_key(&key) {
                     winners.insert(key, (seq, kind));
                 }
             };
 
+            // MemTables first (newest source).
+            {
+                let ws = self.write_state.read();
+                if let Some(ref imm) = ws.immutable_memtable {
+                    for entry in imm.scan_prefix(prefix) {
+                        if is_visible(entry.seq_no) {
+                            note(entry.key.clone(), entry.seq_no, entry.kind);
+                        }
+                    }
+                }
+                for entry in ws.memtable.scan_prefix(prefix) {
+                    if is_visible(entry.seq_no) {
+                        note(entry.key.clone(), entry.seq_no, entry.kind);
+                    }
+                }
+            }
+
+            // Then SSTs, newest-first.
             for sst in &sst_handles {
                 let mut iter = sst.iter()?;
                 iter.seek(prefix);
@@ -1607,20 +2046,6 @@ impl LsmEngine {
                         note(iter.key().to_vec(), iter.seq_no(), iter.kind());
                     }
                     iter.next();
-                }
-            }
-
-            let ws = self.write_state.read();
-            if let Some(ref imm) = ws.immutable_memtable {
-                for entry in imm.scan_prefix(prefix) {
-                    if is_visible(entry.seq_no) {
-                        note(entry.key.clone(), entry.seq_no, entry.kind);
-                    }
-                }
-            }
-            for entry in ws.memtable.scan_prefix(prefix) {
-                if is_visible(entry.seq_no) {
-                    note(entry.key.clone(), entry.seq_no, entry.kind);
                 }
             }
         }
@@ -1639,7 +2064,7 @@ impl LsmEngine {
                 pending_puts: &mut usize,
                 f: &mut F,
                 key: &[u8],
-                seq: SeqNo,
+                _seq: SeqNo,
                 kind: EntryKind,
                 value: &[u8],
             ) -> Result<bool>
@@ -1649,10 +2074,13 @@ impl LsmEngine {
                 if kind != EntryKind::Put || *pending_puts == 0 {
                     return Ok(true);
                 }
-                let Some((w_seq, w_kind)) = winners.get(key).copied() else {
+                let Some((_, w_kind)) = winners.get(key).copied() else {
                     return Ok(true);
                 };
-                if w_seq == seq && w_kind == EntryKind::Put {
+                // First Put in newest-first order is the pass-1 winner. Do NOT
+                // match on `seq` — `clean_index` zeroes it and collisions then
+                // pick the OLDER level's value (pass-2 used to walk L6→L0).
+                if w_kind == EntryKind::Put {
                     if let Some(slot) = winners.get_mut(key) {
                         slot.1 = EntryKind::Delete; // mark emitted
                     }
@@ -1662,35 +2090,9 @@ impl LsmEngine {
                 Ok(true)
             }
 
-            for sst in &sst_handles {
-                if pending_puts == 0 {
-                    break;
-                }
-                let mut iter = sst.iter()?;
-                iter.seek(prefix);
-                while iter.is_valid() {
-                    if !iter.key().starts_with(prefix) {
-                        break;
-                    }
-                    if is_visible(iter.seq_no()) {
-                        let keep_going = try_emit(
-                            &mut winners,
-                            &mut pending_puts,
-                            &mut f,
-                            iter.key(),
-                            iter.seq_no(),
-                            iter.kind(),
-                            iter.value(),
-                        )?;
-                        if !keep_going {
-                            return Ok(());
-                        }
-                    }
-                    iter.next();
-                }
-            }
-
-            if pending_puts > 0 {
+            // Newest-first: memtable before SSTs, so the first Put met for a
+            // key is the same entry pass-1 chose as winner.
+            {
                 let ws = self.write_state.read();
                 if let Some(ref imm) = ws.immutable_memtable {
                     for entry in imm.scan_prefix(prefix) {
@@ -1731,6 +2133,35 @@ impl LsmEngine {
                             return Ok(());
                         }
                     }
+                }
+            }
+
+            let sst_handles = self.snapshot_sst_handles(prefix)?;
+            for sst in &sst_handles {
+                if pending_puts == 0 {
+                    break;
+                }
+                let mut iter = sst.iter()?;
+                iter.seek(prefix);
+                while iter.is_valid() {
+                    if !iter.key().starts_with(prefix) {
+                        break;
+                    }
+                    if is_visible(iter.seq_no()) {
+                        let keep_going = try_emit(
+                            &mut winners,
+                            &mut pending_puts,
+                            &mut f,
+                            iter.key(),
+                            iter.seq_no(),
+                            iter.kind(),
+                            iter.value(),
+                        )?;
+                        if !keep_going {
+                            return Ok(());
+                        }
+                    }
+                    iter.next();
                 }
             }
         }
@@ -1982,6 +2413,15 @@ impl LsmEngine {
             }
         };
 
+        // Empty memtable → nothing to persist. Building a 0-entry SST here
+        // creates a permanent "old SST" zombie (footer max_seq_no=0) and was
+        // observed bursting 6-7 empty L0 files per reset_wal_for_index_cleanup.
+        if entries_snapshot.is_empty() {
+            let mut ws = self.write_state.write();
+            ws.immutable_memtable = None;
+            return Ok(());
+        }
+
         // Build SSTable from snapshot OUTSIDE the lock (disk I/O)
         // Use add_owned + into_iter to avoid cloning key/value a second time.
         let mut builder = SsTableBuilder::new();
@@ -2029,6 +2469,11 @@ impl LsmEngine {
         let _ = self
             .compaction_sender
             .send(CompactionMsg::Flushed { level: 0 });
+
+        // Persist dirty HNSW nodes as incremental deltas alongside the flush.
+        if let Err(e) = self.persist_vector_deltas() {
+            tracing::warn!("Failed to persist vector deltas on flush: {}", e);
+        }
 
         Ok(())
     }
@@ -2219,8 +2664,25 @@ impl LsmEngine {
 
     /// Rebuilds secondary indexes by scanning persisted index entries from SSTables.
     /// Can be called from a background thread after engine startup.
+    ///
+    /// v1→v2 migration: if no `__idx2__` entries exist but legacy `__idx__`
+    /// entries do, the old index entries and `.idx` files are dropped entirely
+    /// and indexes are rebuilt from the source documents (JSON values are
+    /// exact — no heuristic decoding needed).
     pub fn rebuild_indexes(&self) -> Result<()> {
-        let index_entries = self.scan_prefix(b"__idx__")?;
+        let mut index_entries = self.scan_prefix(b"__idx2__")?;
+        if index_entries.is_empty() {
+            // v1 → v2 migration: drop old, rebuild from documents
+            let v1_entries = self.scan_prefix(b"__idx__")?;
+            if !v1_entries.is_empty() {
+                tracing::info!(
+                    "Found {} legacy __idx__ entries, dropping and rebuilding from documents",
+                    v1_entries.len()
+                );
+                self.migrate_v1_drop_and_rebuild(v1_entries)?;
+                index_entries = self.scan_prefix(b"__idx2__")?;
+            }
+        }
         if !index_entries.is_empty() {
             let mut mgr = self
                 .index_manager
@@ -2264,8 +2726,7 @@ impl LsmEngine {
             );
 
             // If the WAL contains stale index entries (from interrupted CREATE INDEX),
-            // reset it. All data is already in SST files, so the WAL is only needed
-            // for future writes. This reclaims the hundreds of MB of WAL space.
+            // flush memtable then reset it. This reclaims the hundreds of MB of WAL space.
             if index_entries.len() > 10000 {
                 if let Err(e) = self.reset_wal_for_index_cleanup() {
                     tracing::warn!("Failed to reset WAL after index rebuild: {}", e);
@@ -2276,27 +2737,119 @@ impl LsmEngine {
     }
 
     /// Reset the WAL file after index rebuild cleanup.
-    /// All data is in SST files at this point, so we can safely truncate the WAL.
+    ///
+    /// The memtable is flushed to SST *before* the WAL is truncated. Index
+    /// entries written during rebuild live in memtable + WAL; truncating the
+    /// WAL first would leave them unrecoverable if the process crashed before
+    /// the next memtable flush.
     fn reset_wal_for_index_cleanup(&self) -> Result<()> {
+        // Persist memtable to SST so every entry is durable on disk.
+        self.flush_memtable()?;
+
         let wal_path = self.options.data_dir.join("wal.log");
         let old_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
 
-        // Flush any pending data, then replace with a fresh WAL
+        // Truncate under the write lock so no concurrent put() can append to
+        // the WAL between the emptiness check and the file reset.
         let mut ws = self.write_state.write();
+        if !ws.memtable.is_empty() {
+            // Writes arrived during flush_memtable; their WAL records must stay.
+            tracing::warn!(
+                entries = ws.memtable.len(),
+                "Skip WAL reset: memtable not empty after flush"
+            );
+            return Ok(());
+        }
         ws.wal.flush_buf()?;
-        drop(ws);
-
-        // Truncate the WAL file (all data is already in SSTs)
         std::fs::write(&wal_path, [])?;
-
-        // Reopen the WAL with the truncated file
-        let mut ws = self.write_state.write();
         ws.wal = Wal::open(&wal_path)?;
         drop(ws);
 
         tracing::info!(
             old_wal_bytes = old_size,
             "Reset WAL after index rebuild cleanup"
+        );
+        Ok(())
+    }
+
+    /// v1→v2 migration: drop all old index artifacts and rebuild from documents.
+    ///
+    /// 1. Collect (class, column) pairs from legacy `__idx__` entries
+    /// 2. Delete all `.idx` disk index files (old encoding)
+    /// 3. Tombstone all legacy `__idx__` LSM entries (batch, releases lock)
+    /// 4. Rebuild each index from source documents via `create_index` backfill
+    fn migrate_v1_drop_and_rebuild(&self, v1_entries: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+        use std::collections::BTreeSet;
+
+        // Step 1: extract (class, column) pairs from legacy entries
+        let mut index_specs: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut old_keys: Vec<Vec<u8>> = Vec::with_capacity(v1_entries.len());
+        for (key, _) in &v1_entries {
+            old_keys.push(key.clone());
+            if let Some((class, column, _, _)) =
+                crate::index::IndexManager::parse_index_key_v1(key)
+            {
+                index_specs.insert((class, column));
+            }
+        }
+        tracing::info!(
+            "Migration: {} legacy entries, {} index(es) to rebuild: {:?}",
+            old_keys.len(),
+            index_specs.len(),
+            index_specs
+        );
+
+        // Step 2: delete .idx disk index files (old encoding is invalid)
+        {
+            let mgr = self
+                .index_manager
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            for (class, column) in &index_specs {
+                if let Some(path) = mgr.data_dir_ref().map(|d| {
+                    d.join(format!("{}_{}.idx", class, column))
+                }) {
+                    if path.exists() {
+                        let _ = std::fs::remove_file(&path);
+                        tracing::info!("Deleted stale index file: {:?}", path);
+                    }
+                }
+            }
+        }
+
+        // Step 3: tombstone all legacy `__idx__` entries in batches
+        // (holds write lock only per batch, flushes WAL once per batch)
+        for chunk in old_keys.chunks(10_000) {
+            let mut ws = self.write_state.write();
+            for key in chunk {
+                let seq = self.next_seq();
+                let entry = Entry::delete(key.clone(), seq);
+                ws.wal.append(&entry)?;
+                ws.memtable.delete_with_seq(key.clone(), seq);
+            }
+            ws.wal.flush_buf()?;
+            // lock released at end of iteration
+        }
+        tracing::info!("Migration: tombstoned {} legacy index entries", old_keys.len());
+
+        // Step 4: rebuild each index from documents
+        // Drop stale in-memory state first so create_index starts clean.
+        {
+            let mut mgr = self
+                .index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for (class, column) in &index_specs {
+                mgr.drop_index(class, column);
+            }
+        }
+        for (class, column) in &index_specs {
+            tracing::info!("Migration: rebuilding {}.{} from documents", class, column);
+            self.create_index(class, column)?;
+        }
+        tracing::info!(
+            "Migration complete: rebuilt {} index(es) from source documents",
+            index_specs.len()
         );
         Ok(())
     }
@@ -2416,6 +2969,10 @@ impl LsmEngine {
         if meta_entries.is_empty() {
             return Ok(());
         }
+        tracing::info!(
+            count = meta_entries.len(),
+            "Vector index rebuild starting (snapshot file / document backfill)"
+        );
 
         // Parse and recreate vector indexes from metadata
         let mut index_configs: Vec<(
@@ -2436,11 +2993,13 @@ impl LsmEngine {
                 let metric = match metric_str {
                     "L2" => crate::vector::DistanceMetric::L2,
                     "InnerProduct" => crate::vector::DistanceMetric::InnerProduct,
+                    "Tanimoto" | "Jaccard" => crate::vector::DistanceMetric::Tanimoto,
+                    "Hamming" => crate::vector::DistanceMetric::Hamming,
                     _ => crate::vector::DistanceMetric::Cosine,
                 };
-                let m = meta["m"].as_u64().unwrap_or(16) as usize;
-                let ef_construction = meta["ef_construction"].as_u64().unwrap_or(200) as usize;
-                let ef_search = meta["ef_search"].as_u64().unwrap_or(100) as usize;
+                let m = meta["m"].as_u64().unwrap_or(8) as usize;
+                let ef_construction = meta["ef_construction"].as_u64().unwrap_or(32) as usize;
+                let ef_search = meta["ef_search"].as_u64().unwrap_or(64) as usize;
 
                 if !class.is_empty() && !column.is_empty() && dimension > 0 {
                     index_configs.push((
@@ -2456,52 +3015,152 @@ impl LsmEngine {
             }
         }
 
-        // Try to load persisted HNSW graph structures first (fast path)
-        let graph_entries = self.scan_prefix(b"__vec_graph__")?;
-        let mut loaded_graphs: std::collections::HashMap<String, &[u8]> =
-            std::collections::HashMap::new();
-        for (key, val_bytes) in &graph_entries {
-            if let Ok(key_str) = std::str::from_utf8(key) {
-                if let Some(graph_key) = key_str.strip_prefix("__vec_graph__") {
-                    loaded_graphs.insert(graph_key.to_string(), val_bytes.as_slice());
-                }
-            }
-        }
+        // Fast path: load HNSW graph from snapshot files ONLY.
+        //
+        // Legacy `__vec_graph__` LSM entries are deliberately not read: they
+        // can be hundreds of MB in a single value, which (a) makes
+        // scan_prefix load them into memory and (b) trips the SST block-size
+        // limit.  Files under `indexes/*.hnsw` are the one true snapshot
+        // format now.  If no file exists we rebuild from documents.
+        // Incremental deltas are NOT scanned from LSM: a delta entry can be
+        // hundreds of MB and `scan_prefix` materializes values, which wedges
+        // startup.  The file snapshot (`indexes/*.hnsw`) is the single
+        // restore source; anything written after the snapshot is covered by
+        // the document backfill on the next restart.
+        tracing::info!("Vector index restore: using snapshot files only");
+
+        // Phase 1 (gate-blocking): install graphs + reconcile (note/ghost only).
+        // Phase 2 (after mark_ready): insert missing vectors with a guard.
+        // Keeping HNSW inserts out of the gate window makes it O(documents)
+        // and independent of how many vectors need backfilling.
+        let mut pending_backfill: Vec<(
+            String,
+            String,
+            Vec<(Vec<u8>, String, String, crate::vector::hnsw::VecData)>,
+        )> = Vec::new();
 
         // Create the indexes and try to load graph structures
         for (class, column, dimension, metric, m, ef_construction, ef_search) in &index_configs {
             let graph_key = format!("{}_{}", class, column);
 
-            if let Some(graph_data) = loaded_graphs.get(&graph_key) {
-                // Fast path: load HNSW graph structure directly
-                match self
-                    .vector_index_manager
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .load_graph(class, column, graph_data)
-                {
-                    Ok(()) => {
-                        tracing::info!(
-                            "Loaded vector index graph for {}.{} ({} vectors, fast restore)",
-                            class,
-                            column,
-                            self.vector_index_manager
-                                .read()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .index_meta(class, column)
-                                .map(|m| m.dimension)
-                                .unwrap_or(0)
-                        );
-                        continue;
+            let graph_data = self.load_vector_graph_file(class, column);
+            if graph_data.is_none() {
+                tracing::info!(
+                    table = %class,
+                    column = %column,
+                    "No vector snapshot file found, will rebuild from documents"
+                );
+            }
+
+            if let Some(graph_data) = graph_data {
+                // Fast path: load HNSW graph structure directly.
+                // load_graph rejects empty snapshots (written at CREATE INDEX
+                // before any vectors) so we fall through to rebuild.
+                //
+                // Deserialize BEFORE taking the manager write lock: bincode of
+                // a multi-hundred-MB snapshot can take minutes under memory
+                // pressure, and holding the lock that long blocks every search.
+                tracing::info!(
+                    table = %class,
+                    column = %column,
+                    bytes = graph_data.len(),
+                    "Deserializing vector index snapshot (outside lock)"
+                );
+                let deserialize_started = std::time::Instant::now();
+                let loaded = crate::vector::hnsw::HnswIndex::load_from_bytes(&graph_data);
+                tracing::info!(
+                    table = %class,
+                    column = %column,
+                    elapsed_ms = deserialize_started.elapsed().as_millis() as u64,
+                    "Vector snapshot deserialize done"
+                );
+                match loaded {
+                    Ok(index) => {
+                        // Extract the result first: the write guard from
+                        // `.write()` would otherwise live for the whole
+                        // `match` (Rust temporary lifetime) and a later
+                        // `.read()` in the arm deadlocks on the same thread.
+                        let installed = self
+                            .vector_index_manager
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .install_graph(class, column, index);
+                        match installed {
+                            Ok(n) => {
+                                tracing::info!(
+                                    "Loaded vector index graph for {}.{} ({} vectors, fast restore)",
+                                    class,
+                                    column,
+                                    n
+                                );
+                                // Snapshot may be stale (written before a
+                                // scan-visibility fix revealed more fp rows).
+                                // Backfill only the missing pks so we do not
+                                // rebuild 2M+ vectors from scratch.
+                                let existing = self
+                                    .vector_index_manager
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .id_set(class, column);
+                                tracing::info!(
+                                    table = %class,
+                                    column = %column,
+                                    existing = existing.len(),
+                                    "Vector snapshot reconcile scan starting"
+                                );
+                                let missing = self.reconcile_vector_index(
+                                    class,
+                                    column,
+                                    *dimension,
+                                    &existing,
+                                );
+                                if !missing.is_empty() {
+                                    tracing::info!(
+                                        table = %class,
+                                        column = %column,
+                                        pending = missing.len(),
+                                        total = existing.len() + missing.len(),
+                                        "Vector snapshot reconcile queued missing vectors for backfill"
+                                    );
+                                    pending_backfill
+                                        .push((class.clone(), column.clone(), missing));
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to install HNSW graph for {}.{}, dropping stale snapshot and rebuilding: {}",
+                                    class,
+                                    column,
+                                    e
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "Failed to load HNSW graph for {}.{}, falling back to rebuild: {}",
+                            "Failed to deserialize HNSW graph for {}.{}, dropping stale snapshot and rebuilding: {}",
                             class,
                             column,
                             e
                         );
                     }
+                }
+                // Tombstone the unusable snapshot so the next restart
+                // does not retry it and log the same failure again.
+                {
+                    let graph_key = format!("__vec_graph__{}_{}", class, column).into_bytes();
+                    let seq = self.next_seq();
+                    let del = Entry::delete(graph_key.clone(), seq);
+                    if let Some(mut ws) = self.write_state.try_write_for(std::time::Duration::from_secs(1)) {
+                        let _ = ws.wal.append(&del);
+                        let _ = ws.wal.flush_buf();
+                        ws.memtable.delete_with_seq(graph_key, seq);
+                    }
+                    let idx_dir = self.options.data_dir.join("indexes");
+                    let _ = std::fs::remove_file(
+                        idx_dir.join(format!("{}_{}.hnsw", class, column)),
+                    );
                 }
             }
 
@@ -2521,50 +3180,59 @@ impl LsmEngine {
                 );
 
             let prefix = format!("{}::", class);
-            let entries = self.scan_prefix(prefix.as_bytes())?;
-            let mut vectors: Vec<(Vec<u8>, String, String, Vec<f32>)> = Vec::new();
-            for (pk, val_bytes) in entries {
-                if let Some(doc) = parse_doc_bytes(&val_bytes) {
-                    if doc.get("__class__").and_then(|v| v.as_str()) == Some(class.as_str()) {
-                        if let Some(serde_json::Value::Array(arr)) = doc.get(column.as_str()) {
-                            let vec: Vec<f32> = arr
-                                .iter()
-                                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                                .collect();
-                            if vec.len() == *dimension {
-                                vectors.push((pk, class.clone(), column.clone(), vec));
+            let mut total = 0usize;
+            let mut batch: Vec<(Vec<u8>, String, String, VecData)> = Vec::new();
+            const VEC_BATCH: usize = 10_000;
+            {
+                let dim = *dimension;
+                let cls = class.clone();
+                let col = column.clone();
+                let mut sink = |pk: &[u8], val_bytes: &[u8]| -> Result<bool> {
+                    if let Some(doc) = parse_doc_bytes(val_bytes) {
+                        if doc.get("__class__").and_then(|v| v.as_str()) == Some(cls.as_str()) {
+                            // base64 Bytes → Packed directly (no f32 round-trip)
+                            if let Some(data) = doc
+                                .get(col.as_str())
+                                .and_then(|v| VecData::from_json(v, dim))
+                            {
+                                batch.push((pk.to_vec(), cls.clone(), col.clone(), data));
                             }
                         }
                     }
-                }
+                    if batch.len() >= VEC_BATCH {
+                        self.vector_index_manager
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .index_vector_data_owned(std::mem::take(&mut batch));
+                        total += VEC_BATCH;
+                        tracing::info!(
+                            table = %cls,
+                            column = %col,
+                            indexed = total,
+                            "Vector index rebuild progress"
+                        );
+                    }
+                    Ok(true)
+                };
+                self.for_each_live_prefix_until(prefix.as_bytes(), None, None, &mut sink)?;
             }
-            let count = vectors.len();
-            if !vectors.is_empty() {
-                let batch_refs: Vec<(Vec<u8>, &str, &str, Vec<f32>)> = vectors
-                    .iter()
-                    .map(|(pk, c, col, v)| (pk.clone(), c.as_str(), col.as_str(), v.clone()))
-                    .collect();
+            if !batch.is_empty() {
+                total += batch.len();
                 self.vector_index_manager
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
-                    .index_vector_batch(&batch_refs);
+                    .index_vector_data_owned(std::mem::take(&mut batch));
             }
+            let count = total;
 
-            // Persist the rebuilt HNSW graph structure for next restart
-            if let Some(graph_bytes) = self
-                .vector_index_manager
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .save_graph(class, column)
-            {
-                let graph_key = format!("__vec_graph__{}_{}", class, column);
-                let seq = self.next_seq();
-                let entry = Entry::put(graph_key.clone().into_bytes(), graph_bytes, seq);
-                let mut ws = self.write_state.write();
-                let _ = ws.wal.append(&entry);
-                let _ = ws.wal.flush_buf();
-                ws.memtable
-                    .put_with_seq(graph_key.into_bytes(), Vec::new(), seq);
+            // Persist the rebuilt HNSW graph for next restart (file snapshot).
+            if let Err(e) = self.persist_vector_graph(class, column) {
+                tracing::warn!(
+                    table = %class,
+                    column = %column,
+                    error = %e,
+                    "Failed to persist HNSW graph snapshot after rebuild"
+                );
             }
 
             tracing::info!(
@@ -2575,7 +3243,83 @@ impl LsmEngine {
             );
         }
 
+        // Phase 1 done: every restored graph is reconciled (deleted_keys
+        // rebuilt). Ghost safety is complete — safe to serve searches now.
+        // Backfill is deferred so the gate window does not grow with it.
+        {
+            let pending_total: usize = pending_backfill.iter().map(|(_, _, m)| m.len()).sum();
+            self.vector_index_manager
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_pending_backfill(pending_total);
+        }
+        self.vector_index_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .mark_ready();
+
+        // Phase 2 (post-gate): insert missing vectors with the concurrent-write
+        // guard. Search during this window misses these rows (false negatives
+        // only) — see pending_backfill in /api/schema for the remaining count.
+        for (class, column, missing) in pending_backfill {
+            let (_inserted, _skipped) = self.backfill_vector_missing(&class, &column, missing);
+            if let Err(e) = self.persist_vector_graph(&class, &column) {
+                tracing::warn!(
+                    table = %class,
+                    column = %column,
+                    error = %e,
+                    "Failed to persist HNSW graph snapshot after backfill"
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// True once vector indexes have been restored/reconciled and search is safe.
+    pub fn vector_indexes_ready(&self) -> bool {
+        self.vector_index_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_ready()
+    }
+
+    /// Live HNSW node count for one vector index (None if no such index).
+    pub fn vector_index_len(&self, class: &str, column: &str) -> Option<usize> {
+        self.vector_index_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .index_len(class, column)
+    }
+
+    /// Number of tombstoned vector keys currently held in memory.
+    pub fn vector_deleted_keys_count(&self) -> usize {
+        self.vector_index_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .deleted_keys_count()
+    }
+
+    /// Vectors still waiting for background backfill (0 when idle).
+    /// Non-zero means `VECTOR SEARCH` may miss those rows until it drains.
+    pub fn vector_pending_backfill(&self) -> usize {
+        self.vector_index_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_backfill_count()
+    }
+
+    /// In-place prune of `class.column`'s HNSW graph down to live document
+    /// vectors, then persists the compacted snapshot. Returns nodes removed.
+    pub fn prune_vector_index(&self, class: &str, column: &str) -> Result<usize> {
+        let removed = self
+            .vector_index_manager
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .prune_index_to_live(class, column)?;
+        if removed > 0 {
+            self.persist_vector_graph(class, column)?;
+        }
+        Ok(removed)
     }
 
     /// Builds the LSM key for vector index metadata.
@@ -2586,6 +3330,51 @@ impl LsmEngine {
         key.extend_from_slice(b"__");
         key.extend_from_slice(column.as_bytes());
         key
+    }
+
+    /// Builds the LSM key for secondary index metadata.
+    fn make_idx_meta_key(class: &str, column: &str) -> Vec<u8> {
+        let mut key = Vec::new();
+        key.extend_from_slice(b"__idx_meta__");
+        key.extend_from_slice(class.as_bytes());
+        key.extend_from_slice(b"__");
+        key.extend_from_slice(column.as_bytes());
+        key
+    }
+
+    /// Persists secondary index metadata so schema introspection can list
+    /// indexes even before the in-memory index manager is rebuilt.
+    fn write_idx_meta(&self, class: &str, column: &str, entries: usize) -> Result<()> {
+        let meta_key = Self::make_idx_meta_key(class, column);
+        let meta_json = serde_json::json!({
+            "class": class,
+            "column": column,
+            "entries": entries,
+            "format": "v2",
+        });
+        let meta_val = serde_json::to_vec(&meta_json)
+            .map_err(|e| onto_core::CoreError::Serialization(e.to_string()))?;
+        let seq = self.next_seq();
+        let entry = Entry::put(meta_key.clone(), meta_val.clone(), seq);
+        let mut ws = self.write_state.write();
+        ws.wal.append(&entry)?;
+        ws.wal.flush_buf()?;
+        ws.memtable.put_with_seq(meta_key, meta_val, seq);
+        Ok(())
+    }
+
+    /// Removes persisted secondary index metadata on DROP INDEX.
+    fn delete_idx_meta(&self, class: &str, column: &str) {
+        let meta_key = Self::make_idx_meta_key(class, column);
+        let seq = self.next_seq();
+        let del_entry = Entry::delete(meta_key.clone(), seq);
+        let mut ws = self.write_state.write();
+        if let Err(e) = ws.wal.append(&del_entry) {
+            tracing::error!("Failed to write WAL entry for index meta drop: {}", e);
+            return;
+        }
+        let _ = ws.wal.flush_buf();
+        ws.memtable.delete_with_seq(meta_key, seq);
     }
 
     // ══════════════════════════════════════════════════════════════�?    //  MVCC Transaction API
@@ -3138,6 +3927,16 @@ impl LsmEngine {
             *prog = None;
         }
 
+        // Persist index metadata for schema introspection.
+        if let Err(e) = self.write_idx_meta(class, column, pairs.len()) {
+            tracing::warn!(
+                table = class,
+                column = column,
+                error = %e,
+                "Failed to persist index metadata"
+            );
+        }
+
         let elapsed_ms = start.elapsed().as_millis();
         tracing::info!(
             table = class,
@@ -3152,7 +3951,7 @@ impl LsmEngine {
     }
 
     /// Drops a secondary index.
-    /// Also tombstones all `__idx__` LSM entries for this index so startup
+    /// Also tombstones all `__idx2__` LSM entries for this index so startup
     /// rebuild does not resurrect it from leftover index entries.
     pub fn drop_index(&self, class: &str, column: &str) -> bool {
         if let Err(e) = self.tombstone_index_entries(class, column) {
@@ -3163,22 +3962,25 @@ impl LsmEngine {
                 "Failed to tombstone LSM index entries on drop"
             );
         }
+        self.delete_idx_meta(class, column);
         self.index_manager
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .drop_index(class, column)
     }
 
-    /// Writes delete tombstones for every `__idx__{class}__{column}::` entry.
+    /// Writes delete tombstones for every index entry belonging to (class, column).
     /// Without this, `rebuild_indexes` recreates the disk index on next startup.
     fn tombstone_index_entries(&self, class: &str, column: &str) -> Result<()> {
-        // Index key format: `__idx__{class}__{column}::{value}::{pk}`
-        let mut prefix = Vec::new();
-        prefix.extend_from_slice(b"__idx__");
-        prefix.extend_from_slice(class.as_bytes());
-        prefix.extend_from_slice(b"__");
-        prefix.extend_from_slice(column.as_bytes());
-        prefix.extend_from_slice(b"::");
+        // v2 index key format: `__idx2__` || class_len:u16 || class || col_len:u16 || col || ...
+        let cb = class.as_bytes();
+        let kb = column.as_bytes();
+        let mut prefix = Vec::with_capacity(8 + 2 + cb.len() + 2 + kb.len());
+        prefix.extend_from_slice(b"__idx2__");
+        prefix.extend_from_slice(&(cb.len() as u16).to_le_bytes());
+        prefix.extend_from_slice(cb);
+        prefix.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+        prefix.extend_from_slice(kb);
 
         let keys: Vec<Vec<u8>> = self
             .scan_prefix(&prefix)?
@@ -3217,6 +4019,14 @@ impl LsmEngine {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .has_index(class, column)
+    }
+
+    /// Returns all live (class, column) index pairs from the index manager.
+    pub fn list_indexes(&self) -> Vec<(String, String)> {
+        self.index_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .all_index_keys()
     }
 
     /// Returns a reference to the index manager RwLock.
@@ -3297,31 +4107,24 @@ impl LsmEngine {
 
         // Batch insert under single write lock (not per-document)
         if !vectors.is_empty() {
-            let batch_refs: Vec<(Vec<u8>, &str, &str, Vec<f32>)> = vectors
-                .iter()
-                .map(|(pk, v)| (pk.clone(), class, column, v.clone()))
+            let owned: Vec<(Vec<u8>, String, String, Vec<f32>)> = vectors
+                .into_iter()
+                .map(|(pk, v)| (pk, class.to_string(), column.to_string(), v))
                 .collect();
             self.vector_index_manager
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
-                .index_vector_batch(&batch_refs);
+                .index_vector_batch_owned(owned);
         }
 
-        // Persist the HNSW graph structure for fast restart
-        if let Some(graph_bytes) = self
-            .vector_index_manager
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .save_graph(class, column)
-        {
-            let graph_key = format!("__vec_graph__{}_{}", class, column);
-            let seq = self.next_seq();
-            let entry = Entry::put(graph_key.clone().into_bytes(), graph_bytes, seq);
-            let mut ws = self.write_state.write();
-            let _ = ws.wal.append(&entry);
-            let _ = ws.wal.flush_buf();
-            ws.memtable
-                .put_with_seq(graph_key.into_bytes(), Vec::new(), seq);
+        // Persist the HNSW graph for fast restart (file snapshot).
+        if let Err(e) = self.persist_vector_graph(class, column) {
+            tracing::warn!(
+                table = %class,
+                column = %column,
+                error = %e,
+                "Failed to persist HNSW graph snapshot after create"
+            );
         }
 
         Ok(())
@@ -3334,8 +4137,10 @@ impl LsmEngine {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .drop_index(class, column);
-        if removed {
-            // Remove persisted metadata
+        // Always tombstone persisted metadata/graph/delta keys, even when the
+        // in-memory index is missing (e.g. after a failed snapshot load).
+        // Otherwise every restart re-reads the stale snapshot and re-fails.
+        {
             let meta_key = Self::make_vec_meta_key(class, column);
             let seq = self.next_seq();
             let del_entry = Entry::delete(meta_key.clone(), seq);
@@ -3350,7 +4155,6 @@ impl LsmEngine {
             }
             ws.memtable.delete_with_seq(meta_key, seq);
 
-            // Remove persisted graph structure
             let graph_key = format!("__vec_graph__{}_{}", class, column);
             let seq2 = self.next_seq();
             let del_entry2 = Entry::delete(graph_key.clone().into_bytes(), seq2);
@@ -3359,7 +4163,21 @@ impl LsmEngine {
             }
             ws.wal.flush_buf().ok();
             ws.memtable.delete_with_seq(graph_key.into_bytes(), seq2);
+
+            let delta_key = format!("__vec_delta__{}_{}", class, column);
+            let seq3 = self.next_seq();
+            let del_entry3 = Entry::delete(delta_key.clone().into_bytes(), seq3);
+            let _ = ws.wal.append(&del_entry3);
+            let _ = ws.wal.flush_buf();
+            ws.memtable.delete_with_seq(delta_key.into_bytes(), seq3);
         }
+        // Remove the file-based snapshot too.
+        let _ = std::fs::remove_file(
+            self.options
+                .data_dir
+                .join("indexes")
+                .join(format!("{}_{}.hnsw", class, column)),
+        );
         removed
     }
 
@@ -4058,6 +4876,61 @@ mod tests {
             .expect("should be valid");
         assert_eq!(before.0, after.0, "matched count must survive flush");
         assert_eq!(after.0, 17, "i%3==0 for 0..50 → 17 items");
+    }
+
+    /// Version selection must follow level order (newest first), never `seq`.
+    /// `clean_index` can zero `seq`, after which `w_seq == seq` matching picks
+    /// the OLDER level's value. This test overwrites one key across many
+    /// flushes so several SSTs hold different versions of it.
+    #[test]
+    fn test_version_selection_prefers_newest_across_flushes() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 256,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("should be valid");
+
+        // Write v0..v4 of the same key, flushing after each so each version
+        // lands in its own SST. Also write filler keys to force separate SSTs.
+        for i in 0..5u32 {
+            let filler = format!("K::fill{i:03}");
+            engine
+                .put(filler.into_bytes(), b"fill".to_vec())
+                .expect("should be valid");
+            engine
+                .put(b"K::target".to_vec(), format!("v{i}").into_bytes())
+                .expect("should be valid");
+            engine.flush().expect("should be valid");
+        }
+
+        let mut seen: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+        engine
+            .for_each_live_prefix(b"K::", None, None, |k, v| {
+                assert!(
+                    seen.insert(k.to_vec(), v.to_vec()).is_none(),
+                    "key visited twice"
+                );
+                Ok(())
+            })
+            .expect("should be valid");
+        assert_eq!(
+            seen.get(b"K::target".as_slice()).map(|v| v.as_slice()),
+            Some(&b"v4"[..]),
+            "for_each_live_prefix must see the newest version"
+        );
+
+        // count_prefix_with must agree: filter matching only v4 sees 1,
+        // filter matching only v0 sees 0.
+        let only_v4 = engine
+            .count_prefix_with(b"K::", None, |v| Ok(v == b"v4"))
+            .expect("should be valid");
+        assert_eq!(only_v4.0, 1, "only the newest version counts");
+        let only_v0 = engine
+            .count_prefix_with(b"K::", None, |v| Ok(v == b"v0"))
+            .expect("should be valid");
+        assert_eq!(only_v0.0, 0, "superseded version must not count");
     }
 
     /// for_each_live_prefix visits each live key once with the winning value,

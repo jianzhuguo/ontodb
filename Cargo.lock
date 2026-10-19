@@ -1659,6 +1659,7 @@ dependencies = [
 name = "onto-core"
 version = "0.6.2"
 dependencies = [
+ "base64 0.21.7",
  "bincode",
  "crc32fast",
  "serde",
@@ -1860,6 +1861,7 @@ name = "onto-storage"
 version = "0.6.2"
 dependencies = [
  "anyhow",
+ "base64 0.21.7",
  "bincode",
  "bytes",
  "crc32fast",

@@ -5,7 +5,7 @@
 //! B+Tree secondary index module for OntoDB.
 //!
 //! Indexes are stored as key-value entries in the LSM-Tree:
-//!   key:   __idx__{class}__{column}::{value}::{primary_key}
+//!   key:   __idx2__{class_len:u16}{class}{col_len:u16}{col}{val_len:u16}{value}{pk_len:u16}{pk}
 //!   value: empty (just the key matters)
 //!
 //! This allows efficient prefix scanning for range queries
@@ -15,5 +15,5 @@ mod btree;
 pub mod disk;
 mod manager;
 
-pub use btree::BPlusTree;
+pub use btree::{BPlusTree, ValuePkCursor};
 pub use manager::{IndexManager, IndexStorageMode};

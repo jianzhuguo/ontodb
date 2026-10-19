@@ -30,6 +30,7 @@
 //! - Unified entity identity (EntityId)
 
 pub mod binary_row;
+pub mod binary_fp;
 pub mod entity;
 pub mod error;
 pub mod fulltext;

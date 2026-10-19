@@ -30,7 +30,49 @@ pub const SLOT_SIZE: usize = 4;
 pub const INDEX_MAGIC: &[u8; 4] = b"OIDX";
 
 /// Current index file format version.
-pub const INDEX_VERSION: u32 = 1;
+/// v2: type-tagged encode_value + 0x00-escaped keys + length-prefixed LSM index keys.
+pub const INDEX_VERSION: u32 = 2;
+
+// ═══════════════════════════════════════════════════════════════════
+//  Order-preserving byte escaping (0x00-safe keys)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Escapes raw `0x00` bytes as `0x00 0xFF` so the output never contains
+/// the two-byte separator `0x00 0x00`.  Order-preserving: for any two
+/// inputs `a < b`, `escape(a) < escape(b)` under byte-lexicographic order.
+pub fn escape_bytes(data: &[u8]) -> Vec<u8> {
+    let extra = data.iter().filter(|&&b| b == 0).count();
+    let mut out = Vec::with_capacity(data.len() + extra);
+    for &b in data {
+        if b == 0 {
+            out.push(0);
+            out.push(0xFF);
+        } else {
+            out.push(b);
+        }
+    }
+    out
+}
+
+/// Reverses [`escape_bytes`].  `0x00 0xFF` → `0x00`; every other byte is kept.
+pub fn unescape_bytes(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0 && i + 1 < data.len() && data[i + 1] == 0xFF {
+            out.push(0);
+            i += 2;
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Two-byte separator between escaped value and pk in a composed key.
+/// Never appears inside `escape_bytes` output (escaped 0x00 is `0x00 0xFF`).
+pub const KEY_SEPARATOR: [u8; 2] = [0x00, 0x00];
 
 /// Page ID for the file header (page 0).
 pub const HEADER_PAGE_ID: u32 = 0;
@@ -161,24 +203,126 @@ pub fn decode_internal_entry(data: &[u8]) -> Option<(&[u8], u32)> {
 
 /// Composes the unique on-page key for a (value, pk) pair.
 ///
-/// `encode_value` output never contains a raw 0x00 byte (JSON text escapes
-/// control chars), so `value || 0x00 || pk` sorts by value first and stays
-/// unambiguous for prefix scans. One entry per pair — a low-cardinality value
-/// (e.g. `assay_type='B'` with 492k rows) must not accumulate one megabyte
-/// pk-list into a single 4KB leaf entry.
+/// `value` must already be escaped via [`escape_bytes`] so it never contains
+/// the two-byte separator `0x00 0x00`.  The composed key is
+/// `escaped_value || 0x00 0x00 || pk` — sorts by value first, unambiguous
+/// for prefix scans.  One entry per pair — a low-cardinality value must not
+/// accumulate a megabyte pk-list into a single 4KB leaf entry.
 pub fn compose_key(value: &[u8], pk: &[u8]) -> Vec<u8> {
-    let mut k = Vec::with_capacity(value.len() + 1 + pk.len());
+    let mut k = Vec::with_capacity(value.len() + 2 + pk.len());
     k.extend_from_slice(value);
-    k.push(0u8);
+    k.extend_from_slice(&KEY_SEPARATOR);
     k.extend_from_slice(pk);
     k
 }
 
-/// Value part of a composed key: bytes before the first 0x00 separator.
+/// Value part of a composed key: escaped bytes before the `0x00 0x00`
+/// separator.  Scans past `0x00 0xFF` escapes so the value may contain
+/// escaped nulls.  Call [`unescape_bytes`] to recover the raw bytes.
 pub fn key_value_part(full_key: &[u8]) -> &[u8] {
-    match full_key.iter().position(|&b| b == 0) {
-        Some(p) => &full_key[..p],
-        None => full_key,
+    let mut i = 0;
+    while i + 1 < full_key.len() {
+        if full_key[i] == 0 {
+            if full_key[i + 1] == 0 {
+                return &full_key[..i];
+            }
+            // 0x00 0xFF escape — skip both bytes
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    full_key
+}
+
+/// Pk part of a composed key: bytes after the `0x00 0x00` separator.
+pub fn key_pk_part(full_key: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i + 1 < full_key.len() {
+        if full_key[i] == 0 {
+            if full_key[i + 1] == 0 {
+                return &full_key[i + 2..];
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    b""
+}
+
+/// One-entry-at-a-time cursor over disk index (value, pk) pairs.
+///
+/// Buffers only the current entry — `current` returns refs into that buffer so
+/// callers can compare values without cloning them per pk. The full result list
+/// is never materialized inside the cursor.
+pub struct DiskRangeCursor<'a> {
+    idx: &'a mut BTreeIndex,
+    lo: Option<Vec<u8>>,
+    hi: Option<Vec<u8>>,
+    cur_val: Vec<u8>,
+    cur_pk: Vec<u8>,
+    leaf: DiskPage,
+    entry_idx: u16,
+    done: bool,
+}
+
+impl<'a> DiskRangeCursor<'a> {
+    /// Load the entry at (leaf, entry_idx) into the current buffer.
+    /// Returns false when the walk is finished.
+    fn seek_valid(&mut self) -> Result<()> {
+        loop {
+            if self.done {
+                return Ok(());
+            }
+            let num = self.leaf.num_entries();
+            if self.entry_idx >= num {
+                let right = self
+                    .leaf
+                    .header()
+                    .map(|h| h.right_leaf)
+                    .unwrap_or(NULL_PAGE);
+                if right == NULL_PAGE {
+                    self.done = true;
+                    self.cur_val.clear();
+                    self.cur_pk.clear();
+                    return Ok(());
+                }
+                self.leaf = self.idx.get_page(right)?;
+                self.entry_idx = 0;
+                continue;
+            }
+            let (full_key, pks) = self.leaf.get_leaf(self.entry_idx).unwrap_or_default();
+            let value = key_value_part(&full_key);
+            if self.hi.as_ref().is_some_and(|h| value > h.as_slice()) {
+                self.done = true;
+                self.cur_val.clear();
+                self.cur_pk.clear();
+                return Ok(());
+            }
+            if self.lo.as_ref().is_some_and(|l| value < l.as_slice()) {
+                self.entry_idx += 1;
+                continue;
+            }
+            let pk = pks.first().cloned().unwrap_or_default();
+            self.cur_val = value.to_vec();
+            self.cur_pk = pk;
+            return Ok(());
+        }
+    }
+
+    /// Current (value, pk) as refs into the cursor's single-entry buffer.
+    pub fn current(&self) -> Option<(&[u8], &[u8])> {
+        if self.done {
+            return None;
+        }
+        Some((self.cur_val.as_slice(), self.cur_pk.as_slice()))
+    }
+
+    /// Move to the next (value, pk).
+    pub fn advance(&mut self) -> Result<()> {
+        self.entry_idx += 1;
+        self.seek_valid()
     }
 }
 
@@ -1105,6 +1249,18 @@ impl BTreeIndex {
 
     /// Allocates a new page. Returns the new page ID.
     fn alloc_page(&mut self) -> Result<u32> {
+        // Reuse a free page when one is available. Without this the file only
+        // grows: every split appends past EOF even as merges free pages.
+        if self.meta.free_list_head != NULL_PAGE {
+            let page_id = self.meta.free_list_head;
+            let freed = self.get_page(page_id)?;
+            // Free pages store the next pointer in first_child (same slot we
+            // use for internal nodes); NULL_PAGE terminates the list.
+            self.meta.free_list_head = freed.first_child();
+            let cached = self.pool.fetch_mut(HEADER_PAGE_ID, &mut self.file)?;
+            self.meta.encode(&mut cached.data);
+            return Ok(page_id);
+        }
         let page_id = self.meta.num_pages;
         self.meta.num_pages += 1;
 
@@ -1390,7 +1546,67 @@ impl BTreeIndex {
         Ok(result)
     }
 
-    // ── Remove ───────────────────────────────────────────────────
+    /// Like [`Self::range_scan`], but keeps the index value next to each pk so
+    /// callers can merge sources **by value** without destroying sort order.
+    /// Output is sorted by value; pks within one value follow leaf order.
+    /// `limit` stops early once that many pks are collected.
+    ///
+    /// Prefer [`Self::range_cursor`] when merging — it buffers one entry at a
+    /// time and never materializes the full (value, pk) list.
+    pub fn range_scan_pairs(
+        &mut self,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut cur = self.range_cursor(lo, hi)?;
+        let mut result = Vec::new();
+        while let Some((val, pk)) = cur.current() {
+            result.push((val.to_vec(), pk.to_vec()));
+            if limit.is_some_and(|l| result.len() >= l) {
+                break;
+            }
+            cur.advance()?;
+        }
+        Ok(result)
+    }
+
+    /// One-entry-at-a-time walk over (value, pk) in composite-key order
+    /// (`value || 0x00 || pk`). `current` returns refs into the cursor's
+    /// single-entry buffer — the full list is never materialized.
+    pub fn range_cursor(
+        &mut self,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+    ) -> Result<DiskRangeCursor<'_>> {
+        let lo_owned = lo.map(|v| v.to_vec());
+        let hi_owned = hi.map(|v| v.to_vec());
+        let lo_prefix = lo_owned.as_ref().map(|v| compose_key(v, b""));
+        let mut leaf = match &lo_prefix {
+            Some(p) => self.find_leaf(p)?,
+            None => self.find_leftmost_leaf()?,
+        };
+        let mut start_idx = match &lo_prefix {
+            Some(p) => match leaf.binary_search(p) {
+                Ok(i) => i,
+                Err(i) => i,
+            },
+            None => 0,
+        };
+
+        let mut cur = DiskRangeCursor {
+            idx: self,
+            hi: hi_owned,
+            cur_val: Vec::new(),
+            cur_pk: Vec::new(),
+            leaf,
+            entry_idx: start_idx,
+            lo: lo_owned,
+            done: false,
+        };
+        cur.seek_valid()?;
+        Ok(cur)
+    }
 
     /// Removes a primary key from the entry for the given value.
     /// Entries are stored as unique `value || 0x00 || pk` keys, so this is a
@@ -2140,6 +2356,13 @@ impl BTreeIndex {
         let cached = self.pool.fetch_mut(HEADER_PAGE_ID, &mut self.file)?;
         self.meta.encode(&mut cached.data);
         self.flush()?;
+        // Truncate to the live tree size. bulk_load resets num_pages to 2 and
+        // rebuilds, but the file keeps its old length — a 14GB .idx would stay
+        // 14GB forever even when the new tree needs 30k pages.
+        let live_len = (self.meta.num_pages as u64) * (PAGE_SIZE as u64);
+        self.file
+            .set_len(live_len)
+            .map_err(|e| onto_core::CoreError::Custom(format!("bulk_load truncate: {e}")))?;
         Ok(())
     }
 

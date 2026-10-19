@@ -79,6 +79,86 @@ struct Cursor {
     idx: usize,
 }
 
+/// Borrowed walk over (value, pk) pairs in value order.
+///
+/// `current` returns slices into the tree — values are never cloned. `advance`
+/// moves to the next pk (or next key when the pk list is exhausted). Used by the
+/// mem+disk merge so two sources can be compared by (value, pk) without
+/// materializing either side.
+pub struct ValuePkCursor<'a> {
+    tree: &'a BPlusTree,
+    pos: Cursor,
+    /// Inclusive upper bound (`k > high` stops). For LT this is exclusive and
+    /// `seek_valid_lt` applies the strict `<` filter.
+    high: Option<Vec<u8>>,
+    pk_idx: usize,
+    /// LT mode: stop when key >= high (instead of key > high).
+    lt_mode: bool,
+}
+
+impl<'a> ValuePkCursor<'a> {
+    /// Skip exhausted keys/leaves and stop past the high bound.
+    fn seek_valid(&mut self) {
+        while self.pos.is_valid(self.tree) {
+            let leaf = match self.tree.node(self.pos.leaf_id).expect("node should exist") {
+                Node::Leaf(n) => n,
+                _ => break,
+            };
+            if self.pos.idx >= leaf.keys.len() {
+                self.pos.advance(self.tree);
+                self.pk_idx = 0;
+                continue;
+            }
+            let k = leaf.keys[self.pos.idx].as_slice();
+            let stop = match &self.high {
+                Some(h) => {
+                    if self.lt_mode {
+                        k >= h.as_slice()
+                    } else {
+                        k > h.as_slice()
+                    }
+                }
+                None => false,
+            };
+            if stop {
+                self.pos.leaf_id = u64::MAX;
+                break;
+            }
+            if self.pk_idx >= leaf.values[self.pos.idx].len() {
+                self.pos.idx += 1;
+                self.pk_idx = 0;
+                continue;
+            }
+            break;
+        }
+    }
+
+    /// Current (value, pk) as borrowed slices into the tree, or None at end.
+    pub fn current(&self) -> Option<(&'a [u8], &'a [u8])> {
+        if !self.pos.is_valid(self.tree) {
+            return None;
+        }
+        let leaf = match self.tree.node(self.pos.leaf_id).ok()? {
+            Node::Leaf(n) => n,
+            _ => return None,
+        };
+        if self.pos.idx >= leaf.keys.len() {
+            return None;
+        }
+        let vals = &leaf.values[self.pos.idx];
+        if self.pk_idx >= vals.len() {
+            return None;
+        }
+        Some((leaf.keys[self.pos.idx].as_slice(), vals[self.pk_idx].as_slice()))
+    }
+
+    /// Move to the next (value, pk).
+    pub fn advance(&mut self) {
+        self.pk_idx += 1;
+        self.seek_valid();
+    }
+}
+
 /// In-memory B+Tree index for a single indexed column.
 ///
 /// Maps column values to sets of primary keys. The tree supports:
@@ -999,6 +1079,112 @@ impl BPlusTree {
         result
     }
 
+    /// Like [`Self::range_scan`], but keeps the index value next to each pk so
+    /// callers can merge sources **by value** without destroying sort order.
+    /// Output is sorted by value; pks within one value follow tree order.
+    /// `limit` stops early once that many pks are collected.
+    ///
+    /// Prefer [`Self::range_cursor`] when merging sources — it compares borrowed
+    /// values and never clones them per pk.
+    pub fn range_scan_pairs(
+        &self,
+        low: Option<&[u8]>,
+        high: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut cur = self.range_cursor(low, high);
+        let mut result = Vec::new();
+        while let Some((val, pk)) = cur.current() {
+            result.push((val.to_vec(), pk.to_vec()));
+            if limit.is_some_and(|l| result.len() >= l) {
+                break;
+            }
+            cur.advance();
+        }
+        result
+    }
+
+    /// Like [`Self::gt_scan`], keeping values. Output sorted by value.
+    /// `limit` stops early once that many pks are collected.
+    pub fn gt_scan_pairs(
+        &self,
+        threshold: &[u8],
+        limit: Option<usize>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut cur = self.gt_cursor(threshold);
+        let mut result = Vec::new();
+        while let Some((val, pk)) = cur.current() {
+            result.push((val.to_vec(), pk.to_vec()));
+            if limit.is_some_and(|l| result.len() >= l) {
+                break;
+            }
+            cur.advance();
+        }
+        result
+    }
+
+    /// Like [`Self::lt_scan`], keeping values. Output sorted by value.
+    /// `limit` stops early once that many pks are collected.
+    pub fn lt_scan_pairs(
+        &self,
+        threshold: &[u8],
+        limit: Option<usize>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut cur = self.lt_cursor(threshold);
+        let mut result = Vec::new();
+        while let Some((val, pk)) = cur.current() {
+            result.push((val.to_vec(), pk.to_vec()));
+            if limit.is_some_and(|l| result.len() >= l) {
+                break;
+            }
+            cur.advance();
+        }
+        result
+    }
+
+    /// Borrowed (value, pk) walk in value order. Values are never cloned;
+    /// `current` returns slices into the tree. Used by the mem+disk merge.
+    pub fn range_cursor<'a>(&'a self, low: Option<&[u8]>, high: Option<&[u8]>) -> ValuePkCursor<'a> {
+        let mut c = ValuePkCursor {
+            tree: self,
+            pos: match low {
+                Some(k) => self.cursor_lower_bound(k),
+                None => self.cursor_first(),
+            },
+            high: high.map(|h| h.to_vec()),
+            pk_idx: 0,
+            lt_mode: false,
+        };
+        c.seek_valid();
+        c
+    }
+
+    /// Borrowed walk of keys strictly greater than `threshold`.
+    pub fn gt_cursor<'a>(&'a self, threshold: &[u8]) -> ValuePkCursor<'a> {
+        let mut c = ValuePkCursor {
+            tree: self,
+            pos: self.cursor_after(threshold),
+            high: None,
+            pk_idx: 0,
+            lt_mode: false,
+        };
+        c.seek_valid();
+        c
+    }
+
+    /// Borrowed walk of keys strictly less than `threshold`.
+    pub fn lt_cursor<'a>(&'a self, threshold: &[u8]) -> ValuePkCursor<'a> {
+        let mut c = ValuePkCursor {
+            tree: self,
+            pos: self.cursor_first(),
+            high: Some(threshold.to_vec()),
+            pk_idx: 0,
+            lt_mode: true,
+        };
+        c.seek_valid();
+        c
+    }
+
     // ══════════════════════════════════════════════════════════════�?
     //  Cursor helpers
     // ══════════════════════════════════════════════════════════════�?
@@ -1292,6 +1478,83 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&b"pk2".to_vec()));
         assert!(keys.contains(&b"pk3".to_vec()));
+    }
+
+    /// range_scan(Some(low), None) must seek to the first key >= low and stay
+    /// in ascending key order even after leaf splits / internal nodes exist.
+    #[test]
+    fn test_range_scan_lower_bound_after_splits() {
+        let mut tree = BPlusTree::new("Compound", "id");
+        let mut keys: Vec<String> = Vec::new();
+        for i in 0..2000u32 {
+            let k = format!("CHEMBL{}", i * 3);
+            tree.insert(k.as_bytes().to_vec(), k.as_bytes().to_vec());
+            keys.push(k);
+        }
+        keys.sort();
+
+        let low = b"CHEMBL3000".to_vec();
+        let pks = tree.range_scan(Some(&low), None);
+        assert!(!pks.is_empty(), "range_scan(lower) returned nothing");
+
+        let got: Vec<String> = pks
+            .iter()
+            .map(|p| String::from_utf8(p.clone()).unwrap())
+            .collect();
+
+        for g in &got {
+            assert!(g.as_bytes() >= low.as_slice(), "row {g} < lower bound");
+        }
+        for w in got.windows(2) {
+            assert!(w[0] < w[1], "out of order: {} then {}", w[0], w[1]);
+        }
+        let expected_first = keys
+            .iter()
+            .find(|k| k.as_bytes() >= low.as_slice())
+            .unwrap();
+        assert_eq!(&got[0], expected_first, "lower bound seek landed wrong");
+        let expected_count = keys
+            .iter()
+            .filter(|k| k.as_bytes() >= low.as_slice())
+            .count();
+        assert_eq!(got.len(), expected_count, "range_scan(lower) count mismatch");
+
+        let gte = tree.gte_scan(&low);
+        let gte_str: Vec<String> = gte
+            .iter()
+            .map(|p| String::from_utf8(p.clone()).unwrap())
+            .collect();
+        assert_eq!(got, gte_str, "range_scan(low) != gte_scan(low)");
+    }
+
+    /// range_scan(Some(""), None) must agree with gt_scan("") and stay ordered.
+    #[test]
+    fn test_range_scan_empty_lower_bound() {
+        let mut tree = BPlusTree::new("Compound", "id");
+        let mut keys: Vec<String> = Vec::new();
+        for i in 0..500u32 {
+            let k = format!("CHEMBL{}", i * 3);
+            tree.insert(k.as_bytes().to_vec(), k.as_bytes().to_vec());
+            keys.push(k);
+        }
+        keys.sort();
+
+        let pks = tree.range_scan(Some(b""), None);
+        let got: Vec<String> = pks
+            .iter()
+            .map(|p| String::from_utf8(p.clone()).unwrap())
+            .collect();
+        for w in got.windows(2) {
+            assert!(w[0] < w[1], "out of order: {} then {}", w[0], w[1]);
+        }
+        assert_eq!(got.len(), keys.len());
+
+        let gt = tree.gt_scan(b"");
+        let gt_str: Vec<String> = gt
+            .iter()
+            .map(|p| String::from_utf8(p.clone()).unwrap())
+            .collect();
+        assert_eq!(got, gt_str, "range_scan(Some(\"\")) != gt_scan(\"\")");
     }
 
     #[test]

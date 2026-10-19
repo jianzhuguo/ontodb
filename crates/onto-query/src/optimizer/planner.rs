@@ -47,6 +47,7 @@ pub enum PlanNode {
         column: String,
         query_vector: Vec<f32>,
         top_k: usize,
+        ef_search: Option<usize>,
         filter: Option<FilterExpr>,
         estimated_rows: u64,
     },
@@ -478,8 +479,9 @@ impl QueryPlanner {
                 column,
                 query_vector,
                 top_k,
+                ef_search,
                 filter,
-            } => self.plan_vector_search(class, column, query_vector, *top_k, filter),
+            } => self.plan_vector_search(class, column, query_vector, *top_k, *ef_search, filter),
             QueryAst::Union { left, right, all } => self.plan_union(left, right, *all),
             _ => {
                 // For non-SELECT queries, use a simple passthrough plan
@@ -626,6 +628,63 @@ impl QueryPlanner {
         (resolved, remaining)
     }
 
+    /// Attach a residual predicate so that Limit keeps its correct position
+    /// above the filter. Prefers merging the predicate into the scan node's
+    /// own `filter` field (keeps limit pushdown: the scan early-exits after
+    /// collecting `limit` *matches*). Falls back to `Limit(Filter(scan))` for
+    /// shapes whose scan can't absorb the predicate (joins etc.).
+    ///
+    /// Never produces `Filter(Limit(scan))` — that truncates the raw scan
+    /// first and then drops rows, so `LIMIT N` under-returns.
+    fn merge_filter_under_limit(root: PlanNode, pred: FilterExpr) -> PlanNode {
+        fn and(a: Option<FilterExpr>, b: FilterExpr) -> FilterExpr {
+            match a {
+                Some(a) => FilterExpr::And(Box::new(a), Box::new(b)),
+                None => b,
+            }
+        }
+        match root {
+            PlanNode::Limit {
+                input,
+                count,
+                estimated_rows,
+            } => PlanNode::Limit {
+                input: Box::new(Self::merge_filter_under_limit(*input, pred)),
+                count,
+                estimated_rows,
+            },
+            PlanNode::SeqScan {
+                table,
+                alias,
+                filter,
+                estimated_rows,
+            } => PlanNode::SeqScan {
+                table,
+                alias,
+                filter: Some(and(filter, pred)),
+                estimated_rows,
+            },
+            PlanNode::IndexScan {
+                table,
+                alias,
+                index_column,
+                filter,
+                estimated_rows,
+            } => PlanNode::IndexScan {
+                table,
+                alias,
+                index_column,
+                filter: Some(and(filter, pred)),
+                estimated_rows,
+            },
+            other => PlanNode::Filter {
+                input: Box::new(other),
+                predicate: pred,
+                estimated_rows: 0,
+            },
+        }
+    }
+
     /// Determine which table a column belongs to based on its prefix.
     fn table_for_column(
         col: &str,
@@ -741,7 +800,14 @@ impl QueryPlanner {
         });
         let mut best_plan = candidates.into_iter().next().unwrap();
 
-        // Add remaining filter if any predicates couldn't be pushed down
+        // Add remaining filter if any predicates couldn't be pushed down.
+        //
+        // The residual predicate must NOT become a Filter node above Limit:
+        // `Filter(Limit(SeqScan))` truncates the *raw* scan to `limit` rows and
+        // only then drops non-matches, so `LIMIT N` returns N-1 matches as soon
+        // as one of the first N raw rows fails the predicate. Merge it into the
+        // scan node's own filter instead, so the scan's filter+limit path counts
+        // *matching* rows and early-exits at `limit`.
         if let Some(remaining) = remaining_filter {
             let filter_cost = self.cost_model.filter_cost(
                 best_plan.cost.rows,
@@ -751,12 +817,9 @@ impl QueryPlanner {
                     index_column: None,
                 },
             );
+            let new_root = Self::merge_filter_under_limit(best_plan.root, remaining);
             best_plan = ExecutionPlan::new(
-                PlanNode::Filter {
-                    input: Box::new(best_plan.root),
-                    predicate: remaining,
-                    estimated_rows: filter_cost.rows,
-                },
+                new_root,
                 CostEstimate::new(
                     filter_cost.rows,
                     best_plan.cost.io_cost,
@@ -1460,6 +1523,7 @@ impl QueryPlanner {
         column: &str,
         query_vector: &[f32],
         top_k: usize,
+        ef_search: Option<usize>,
         filter: &Option<FilterExpr>,
     ) -> Result<ExecutionPlan> {
         let stats = self
@@ -1497,6 +1561,7 @@ impl QueryPlanner {
             column: column.to_string(),
             query_vector: query_vector.to_vec(),
             top_k,
+            ef_search,
             filter: filter.clone(),
             estimated_rows: cost.rows,
         };

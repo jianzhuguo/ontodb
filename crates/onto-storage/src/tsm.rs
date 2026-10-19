@@ -303,7 +303,32 @@ pub fn decode_integers(data: &[u8], count: usize) -> Option<Vec<i64>> {
 
 /// Compress a block using zstd.
 pub fn compress_block(data: &[u8]) -> Vec<u8> {
-    zstd::encode_all(data, 3).unwrap_or_else(|_| data.to_vec())
+    // Thread-local reused CCtx — `zstd::encode_all` builds a fresh CCtx per
+    // call and can NULL-write under memory pressure (same class as the
+    // SSTable compress fix).
+    thread_local! {
+        static COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+            std::cell::RefCell::new(None);
+    }
+    COMPRESSOR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            match zstd::bulk::Compressor::new(3) {
+                Ok(c) => *slot = Some(c),
+                Err(_) => return data.to_vec(),
+            }
+        }
+        let compressor = slot.as_mut().expect("just initialized");
+        let bound = zstd::zstd_safe::compress_bound(data.len());
+        let mut buf = vec![0u8; bound];
+        match compressor.compress_to_buffer(data, &mut buf[..]) {
+            Ok(n) => {
+                buf.truncate(n);
+                buf
+            }
+            Err(_) => data.to_vec(),
+        }
+    })
 }
 
 /// Decompress a block using zstd.
@@ -311,6 +336,7 @@ pub fn compress_block(data: &[u8]) -> Vec<u8> {
 /// Bounded one-shot path — never `zstd::decode_all`. The streaming decoder
 /// can wildcopy-write past the caller buffer on a full/corrupt frame, which
 /// is the heap-corruption class we already fixed in SSTable reads.
+/// DCtx is thread-local and reused (same contract as compress).
 pub fn decompress_block(data: &[u8]) -> onto_core::Result<Vec<u8>> {
     const MAX_BLOCK: usize = 64 * 1024 * 1024;
     if data.is_empty() {
@@ -333,9 +359,9 @@ pub fn decompress_block(data: &[u8]) -> onto_core::Result<Vec<u8>> {
         }
     };
 
-    let try_once = |out_cap: usize| -> std::result::Result<Vec<u8>, usize> {
+    let try_once = |out_cap: usize| -> std::result::Result<Vec<u8>, isize> {
         if out_cap == 0 {
-            return Err((-64i64) as usize);
+            return Err(-64);
         }
         // Layout: [out_cap dst][wildcopy slack][guard canary]. zstd only
         // sees out_cap; intact canary proves nothing wrote past the allocation.
@@ -347,9 +373,9 @@ pub fn decompress_block(data: &[u8]) -> onto_core::Result<Vec<u8>> {
         let canary_start = out_cap.saturating_add(MARGIN);
         let mut buf = vec![0u8; canary_start.saturating_add(CANARY.len())];
         buf[canary_start..].copy_from_slice(&CANARY);
-        let written = zstd::zstd_safe::decompress(&mut buf[..out_cap], data)?;
+        let written = crate::lsm::sstable::zstd_decompress_to(&mut buf[..out_cap], data)?;
         if buf[canary_start..] != CANARY[..] {
-            return Err((-80i64) as usize);
+            return Err(-80);
         }
         buf.truncate(written);
         Ok(buf)
@@ -357,7 +383,7 @@ pub fn decompress_block(data: &[u8]) -> onto_core::Result<Vec<u8>> {
 
     if let Some(n) = declared {
         return try_once(n).map_err(|e| {
-            if e == (-80i64) as usize {
+            if e == -80 {
                 onto_core::CoreError::corruption(
                     "zstd wrote past output buffer (guard canary smashed — corrupt frame)",
                 )
@@ -372,13 +398,12 @@ pub fn decompress_block(data: &[u8]) -> onto_core::Result<Vec<u8>> {
         match try_once(cap) {
             Ok(buf) => return Ok(buf),
             Err(e) => {
-                const DST_SIZE_TOO_SMALL: usize = (-70i64) as usize;
-                if e == (-80i64) as usize {
+                if e == -80 {
                     return Err(onto_core::CoreError::corruption(
                         "zstd wrote past output buffer (guard canary smashed — corrupt frame)",
                     ));
                 }
-                if e != DST_SIZE_TOO_SMALL || cap >= MAX_BLOCK {
+                if e != -70 || cap >= MAX_BLOCK {
                     return Err(onto_core::CoreError::corruption(format!(
                         "zstd decompression failed: {}",
                         e

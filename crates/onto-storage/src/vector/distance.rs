@@ -13,18 +13,59 @@ pub enum DistanceMetric {
     Cosine,
     /// Inner product (dot product). Higher is more similar (negated for min-heap).
     InnerProduct,
+    /// Hamming distance on bit-packed binary vectors. Lower is more similar.
+    /// For 0/1 fingerprints this equals squared L2.
+    Hamming,
+    /// Tanimoto distance (1 - Jaccard) on bit-packed binary vectors.
+    /// The standard metric for chemical fingerprints. Lower is more similar.
+    Tanimoto,
 }
 
 /// Computes the distance between two vectors using the given metric.
 /// Returns a f32 where LOWER means MORE similar (for L2 and Cosine)
 /// or NEGATIVE means MORE similar (for InnerProduct, negated dot product).
+/// Hamming/Tanimoto metrics operate on bit-packed bytes (not f32 slices);
+/// use [`hamming_packed`] / [`tanimoto_packed`] directly for those.
 pub fn distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "vector dimensions must match");
     match metric {
         DistanceMetric::L2 => l2_distance(a, b),
         DistanceMetric::Cosine => cosine_distance(a, b),
         DistanceMetric::InnerProduct => inner_product_distance(a, b),
+        // Fallback: treat 0/1 f32 bits via L2 (equals Hamming for binary data).
+        DistanceMetric::Hamming | DistanceMetric::Tanimoto => l2_distance(a, b),
     }
+}
+
+/// Hamming distance on bit-packed bytes: number of differing bits.
+/// Lower = more similar. For 0/1 vectors this equals squared L2.
+pub fn hamming_packed(a: &[u8], b: &[u8]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "packed vector lengths must match");
+    let mut bits = 0u32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        bits += (x ^ y).count_ones();
+    }
+    bits as f32
+}
+
+/// Tanimoto distance on bit-packed bytes: 1 - |a∩b|/|a∪b| = 1 - c/(a+b-c)
+/// where c = shared on-bits, a/b = on-bit counts. Lower = more similar.
+/// Standard metric for chemical fingerprints (ECFP/Morgan).
+pub fn tanimoto_packed(a: &[u8], b: &[u8]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "packed vector lengths must match");
+    let mut inter = 0u32;
+    let mut ca = 0u32;
+    let mut cb = 0u32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        inter += (x & y).count_ones();
+        ca += x.count_ones();
+        cb += y.count_ones();
+    }
+    let union = ca + cb - inter;
+    if union == 0 {
+        return 0.0;
+    }
+    1.0 - (inter as f32 / union as f32)
 }
 
 /// L2 (Euclidean) distance: sqrt(sum((a_i - b_i)^2))

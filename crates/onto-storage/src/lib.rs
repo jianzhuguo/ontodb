@@ -49,7 +49,7 @@ pub use options::StorageOptions;
 pub use value_meta::{ValueMetadata, ValueScorer, LAMBDA_2Y, LAMBDA_70D, LAMBDA_7H};
 pub use vector::distance;
 pub use vector::{
-    DistanceMetric, HnswConfig, HnswIndex, SearchResult, VectorEntry, VectorIndexManager,
+    DistanceMetric, HnswConfig, HnswIndex, SearchResult, VecData, VectorEntry, VectorIndexManager,
 };
 
 #[cfg(test)]

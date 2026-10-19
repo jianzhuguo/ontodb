@@ -19,6 +19,7 @@ bytes = "1"
 crossbeam-skiplist = "0.1"
 zstd = { workspace = true }
 rand = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

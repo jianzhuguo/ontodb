@@ -403,6 +403,7 @@ impl CostModel {
                 index_column: None,
             },
             crate::parser::FilterExpr::Between(col, _, _) => {
+                let can_use_index = stats.secondary_indexes.iter().any(|i| &i.column == col);
                 // Try histogram for between selectivity
                 if let Some(hist) = stats.histograms.iter().find(|h| &h.column == col) {
                     if !hist.buckets.is_empty() {
@@ -410,15 +411,23 @@ impl CostModel {
                         let selectivity = self.range_selectivity * 0.5;
                         return FilterSelectivity {
                             selectivity,
-                            can_use_index: false,
-                            index_column: None,
+                            can_use_index,
+                            index_column: if can_use_index {
+                                Some(col.clone())
+                            } else {
+                                None
+                            },
                         };
                     }
                 }
                 FilterSelectivity {
                     selectivity: self.range_selectivity * 0.5,
-                    can_use_index: false,
-                    index_column: None,
+                    can_use_index,
+                    index_column: if can_use_index {
+                        Some(col.clone())
+                    } else {
+                        None
+                    },
                 }
             }
             crate::parser::FilterExpr::In(_, values) => {

@@ -54,6 +54,69 @@ fn find_unquoted_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize
     None
 }
 
+/// End offset of the first conjunct of a WHERE clause: the index of the first
+/// top-level (not inside quotes or parens) ` AND ` / ` OR `, or `input.len()`.
+///
+/// Operator detection (IS NULL / LIKE / BETWEEN / IN) takes everything to the
+/// LEFT of the operator as the column name. Without this bound,
+/// `smiles NOT LIKE '%.%' AND fp IS NULL` finds the ` IS ` of the *second*
+/// conjunct and takes the whole `smiles NOT LIKE '%.%' AND fp` as a column
+/// name — which matches nothing and, for `IS NULL`, is treated as "missing
+/// field == NULL" and therefore matches every row.
+fn first_atom_end(input: &str) -> usize {
+    let bytes = input.as_bytes();
+    let n = bytes.len();
+    let mut in_quote: Option<u8> = None;
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        if let Some(q) = in_quote {
+            if c == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\'' || c == b'"' {
+            in_quote = Some(c);
+            i += 1;
+            continue;
+        }
+        if c == b'(' {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if c == b')' {
+            depth -= 1;
+            i += 1;
+            continue;
+        }
+        if depth == 0 {
+            let rest = &input[i..];
+            for sep in [" AND ", " OR "] {
+                if rest.len() >= sep.len()
+                    && rest[..sep.len()].eq_ignore_ascii_case(sep)
+                {
+                    // Require a word boundary on the left (start or space/
+                    // ')' so `COMMAND` doesn't match ` AND ` inside a name).
+                    return i;
+                }
+            }
+        }
+        i += 1;
+    }
+    n
+}
+
+/// Like [`find_unquoted_ignore_ascii_case`] but only searches the first
+/// conjunct. See [`first_atom_end`].
+fn find_op_in_first_atom(haystack: &str, needle: &str) -> Option<usize> {
+    let end = first_atom_end(haystack);
+    find_unquoted_ignore_ascii_case(&haystack[..end], needle)
+}
+
 /// File format for IMPORT command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImportFormat {
@@ -204,12 +267,18 @@ pub enum QueryAst {
     /// DROP VECTOR INDEX ON <class> (<column>)
     DropVectorIndex { class: String, column: String },
 
+    /// COMPACT VECTOR INDEX ON <class> (<column>) — in-place prune of
+    /// deleted/stale HNSW nodes, then persist the compacted snapshot.
+    CompactVectorIndex { class: String, column: String },
+
     /// VECTOR SEARCH ON <class> (<column>) QUERY [v1, v2, ...] TOP <k> [WHERE ...]
     VectorSearch {
         class: String,
         column: String,
         query_vector: Vec<f32>,
         top_k: usize,
+        /// Optional ef_search override (recall/latency knob).
+        ef_search: Option<usize>,
         filter: Option<FilterExpr>,
     },
 
@@ -433,6 +502,7 @@ impl QueryAst {
             QueryAst::DropIndex { .. } => false,
             QueryAst::CreateVectorIndex { .. } => false,
             QueryAst::DropVectorIndex { .. } => false,
+            QueryAst::CompactVectorIndex { .. } => false,
             QueryAst::CreateMaterializedView { .. } => false,
             QueryAst::DropMaterializedView { .. } => false,
             QueryAst::RefreshMaterializedView { .. } => false,
@@ -996,6 +1066,8 @@ impl QueryParser {
             Self::parse_create_vector_index(input)
         } else if starts_with("DROP VECTOR INDEX") {
             Self::parse_drop_vector_index(input)
+        } else if starts_with("COMPACT VECTOR INDEX") {
+            Self::parse_compact_vector_index(input)
         } else if starts_with("VECTOR SEARCH") {
             Self::parse_vector_search(input)
         } else if starts_with("CREATE MATERIALIZED VIEW") {
@@ -2622,6 +2694,33 @@ impl QueryParser {
         Ok(QueryAst::DropVectorIndex { class, column })
     }
 
+    /// Parses: COMPACT VECTOR INDEX ON <class> (<column>)
+    fn parse_compact_vector_index(input: &str) -> Result<QueryAst> {
+        let on_pos = find_ignore_ascii_case(input, " ON ").ok_or_else(|| {
+            CoreError::InvalidArgument("expected 'ON' after COMPACT VECTOR INDEX".to_string())
+        })?;
+        let rest = safe_slice_from(input, on_pos + 4).trim();
+
+        let paren_open = rest.find('(').ok_or_else(|| {
+            CoreError::InvalidArgument("expected '(column)' in COMPACT VECTOR INDEX".to_string())
+        })?;
+        let class = safe_slice(rest, 0, paren_open).trim().to_string();
+        let paren_close = rest.find(')').ok_or_else(|| {
+            CoreError::InvalidArgument("expected ')' in COMPACT VECTOR INDEX".to_string())
+        })?;
+        let column = safe_slice(rest, paren_open + 1, paren_close)
+            .trim()
+            .to_string();
+
+        if class.is_empty() || column.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "class and column cannot be empty in COMPACT VECTOR INDEX".to_string(),
+            ));
+        }
+
+        Ok(QueryAst::CompactVectorIndex { class, column })
+    }
+
     /// Parses: VECTOR SEARCH ON <class> (<column>) QUERY [v1, v2, ...] TOP <k> [WHERE ...]
     fn parse_vector_search(input: &str) -> Result<QueryAst> {
         let on_pos = find_ignore_ascii_case(input, " ON ").ok_or_else(|| {
@@ -2676,10 +2775,23 @@ impl QueryParser {
             CoreError::InvalidArgument("expected 'TOP' in VECTOR SEARCH".to_string())
         })?;
         let after_top = safe_slice_from(after_vec, top_pos + 3).trim();
-        let (top_str, remaining) = Self::parse_word(after_top)?;
+        let (top_str, mut remaining) = Self::parse_word(after_top)?;
         let top_k = top_str
             .parse::<usize>()
             .map_err(|_| CoreError::InvalidArgument("invalid TOP value".to_string()))?;
+
+        // Parse optional EF <n> (ef_search override)
+        let mut ef_search = None;
+        if starts_with_ignore_ascii_case(&remaining, "EF") {
+            let after_ef = safe_slice_from(&remaining, 2).trim();
+            let (ef_str, rest) = Self::parse_word(after_ef)?;
+            ef_search = Some(
+                ef_str
+                    .parse::<usize>()
+                    .map_err(|_| CoreError::InvalidArgument("invalid EF value".to_string()))?,
+            );
+            remaining = rest;
+        }
 
         // Parse optional WHERE
         let filter = if starts_with_ignore_ascii_case(&remaining, "WHERE") {
@@ -2693,6 +2805,7 @@ impl QueryParser {
             column,
             query_vector,
             top_k,
+            ef_search,
             filter,
         })
     }
@@ -2919,6 +3032,22 @@ impl QueryParser {
         }
     }
 
+    /// Splits a `NOT` suffix off the left-hand side of LIKE / BETWEEN / IN.
+    ///
+    /// The parser locates those operators by searching for `" LIKE "` etc., so
+    /// `smiles NOT LIKE '%.%'` would otherwise take `"smiles NOT"` as the column
+    /// name and match nothing. Returns `(column, negated)`.
+    fn split_trailing_not(col_raw: &str) -> (String, bool) {
+        let t = col_raw.trim_end();
+        if let Some(pos) = t.rfind(char::is_whitespace) {
+            let (head, tail) = t.split_at(pos);
+            if tail.trim_start().eq_ignore_ascii_case("NOT") {
+                return (head.trim_end().to_string(), true);
+            }
+        }
+        (col_raw.trim().to_string(), false)
+    }
+
     fn parse_where(input: &str) -> Result<(Option<FilterExpr>, String)> {
         let input = input.trim();
 
@@ -3029,7 +3158,7 @@ impl QueryParser {
         }
 
         // Check for IS NULL / IS NOT NULL: column IS [NOT] NULL
-        if let Some(is_pos) = find_unquoted_ignore_ascii_case(input, " IS ") {
+        if let Some(is_pos) = find_op_in_first_atom(input, " IS ") {
             let col_raw = safe_slice(input, 0, is_pos).trim();
             let col = Self::strip_identifier_quotes(col_raw);
             let rest = safe_slice_from(input, is_pos + 4).trim();
@@ -3044,20 +3173,23 @@ impl QueryParser {
             }
         }
 
-        // Check for LIKE: column LIKE 'pattern'
-        if let Some(like_pos) = find_unquoted_ignore_ascii_case(input, " LIKE ") {
-            let col_raw = safe_slice(input, 0, like_pos).trim();
-            let col = Self::strip_identifier_quotes(col_raw);
+        // Check for LIKE / NOT LIKE: column [NOT] LIKE 'pattern'
+        if let Some(like_pos) = find_op_in_first_atom(input, " LIKE ") {
+            let (col, negated) = Self::split_trailing_not(safe_slice(input, 0, like_pos));
+            let col = Self::strip_identifier_quotes(&col);
             let rest = safe_slice_from(input, like_pos + 6).trim();
             let (pattern, remaining) = Self::extract_quoted_or_word(rest);
-            let expr = FilterExpr::Like(col, pattern);
+            let mut expr = FilterExpr::Like(col, pattern);
+            if negated {
+                expr = FilterExpr::Not(Box::new(expr));
+            }
             return Self::wrap_chain(expr, &remaining);
         }
 
-        // Check for BETWEEN: column BETWEEN low AND high
-        if let Some(between_pos) = find_unquoted_ignore_ascii_case(input, " BETWEEN ") {
-            let col_raw = safe_slice(input, 0, between_pos).trim();
-            let col = Self::strip_identifier_quotes(col_raw);
+        // Check for BETWEEN / NOT BETWEEN: column [NOT] BETWEEN low AND high
+        if let Some(between_pos) = find_op_in_first_atom(input, " BETWEEN ") {
+            let (col, negated) = Self::split_trailing_not(safe_slice(input, 0, between_pos));
+            let col = Self::strip_identifier_quotes(&col);
             let rest = safe_slice_from(input, between_pos + 9).trim();
 
             if let Some(and_pos) = find_unquoted_ignore_ascii_case(rest, " AND ") {
@@ -3066,15 +3198,18 @@ impl QueryParser {
                 let (high_str, remaining) = Self::extract_quoted_or_word(high_rest);
                 let low = Self::parse_literal(low_str)?;
                 let high = Self::parse_literal(&high_str)?;
-                let expr = FilterExpr::Between(col, low, high);
+                let mut expr = FilterExpr::Between(col, low, high);
+                if negated {
+                    expr = FilterExpr::Not(Box::new(expr));
+                }
                 return Self::wrap_chain(expr, &remaining);
             }
         }
 
-        // Check for IN: column IN (val1, val2, ...) or column IN (SELECT ...)
-        if let Some(in_pos) = find_unquoted_ignore_ascii_case(input, " IN ") {
-            let col_raw = safe_slice(input, 0, in_pos).trim();
-            let col = Self::strip_identifier_quotes(col_raw);
+        // Check for IN / NOT IN: column [NOT] IN (val1, val2, ...) or ... IN (SELECT ...)
+        if let Some(in_pos) = find_op_in_first_atom(input, " IN ") {
+            let (col, negated) = Self::split_trailing_not(safe_slice(input, 0, in_pos));
+            let col = Self::strip_identifier_quotes(&col);
             let rest = safe_slice_from(input, in_pos + 4).trim();
             if rest.starts_with('(') {
                 // Find matching closing paren
@@ -3099,7 +3234,10 @@ impl QueryParser {
                     // Check if it's a subquery
                     if starts_with_ignore_ascii_case(inner, "SELECT") {
                         let subquery = Self::parse(inner)?;
-                        let expr = FilterExpr::InSubquery(col, Box::new(subquery));
+                        let mut expr = FilterExpr::InSubquery(col, Box::new(subquery));
+                        if negated {
+                            expr = FilterExpr::Not(Box::new(expr));
+                        }
                         return Self::wrap_chain(expr, remaining);
                     }
 
@@ -3108,7 +3246,10 @@ impl QueryParser {
                         .split(',')
                         .map(|s| Self::parse_literal(s.trim()))
                         .collect::<Result<Vec<_>>>()?;
-                    let expr = FilterExpr::In(col, values);
+                    let mut expr = FilterExpr::In(col, values);
+                    if negated {
+                        expr = FilterExpr::Not(Box::new(expr));
+                    }
                     return Self::wrap_chain(expr, remaining);
                 }
             }
@@ -3126,9 +3267,12 @@ impl QueryParser {
             ("=", FilterExpr::Eq),
         ];
         let mut best_op: Option<(usize, &str, fn(String, LiteralValue) -> FilterExpr)> = None;
+        let atom_end = first_atom_end(input);
         for &(op_str, op_fn) in operators {
             if let Some(pos) = Self::find_unquoted(input, op_str) {
-                if best_op.is_none() || pos < best_op.unwrap().0 {
+                // Only the first conjunct may own the comparison — otherwise
+                // `x AND y = 1` would take `x AND y` as the column name.
+                if pos < atom_end && (best_op.is_none() || pos < best_op.unwrap().0) {
                     best_op = Some((pos, op_str, op_fn));
                 }
             }
@@ -3318,7 +3462,7 @@ impl QueryParser {
         }
 
         // Check for IS NULL / IS NOT NULL: column IS [NOT] NULL
-        if let Some(is_pos) = find_unquoted_ignore_ascii_case(input, " IS ") {
+        if let Some(is_pos) = find_op_in_first_atom(input, " IS ") {
             let col_raw = safe_slice(input, 0, is_pos).trim();
             let col = Self::strip_identifier_quotes(col_raw);
             let rest = safe_slice_from(input, is_pos + 4).trim();
@@ -3331,19 +3475,23 @@ impl QueryParser {
             }
         }
 
-        // Check for LIKE: column LIKE 'pattern'
-        if let Some(like_pos) = find_unquoted_ignore_ascii_case(input, " LIKE ") {
-            let col_raw = safe_slice(input, 0, like_pos).trim();
-            let col = Self::strip_identifier_quotes(col_raw);
+        // Check for LIKE / NOT LIKE: column [NOT] LIKE 'pattern'
+        if let Some(like_pos) = find_op_in_first_atom(input, " LIKE ") {
+            let (col, negated) = Self::split_trailing_not(safe_slice(input, 0, like_pos));
+            let col = Self::strip_identifier_quotes(&col);
             let rest = safe_slice_from(input, like_pos + 6).trim();
             let (pattern, remaining) = Self::extract_quoted_or_word(rest);
-            return Ok((Some(FilterExpr::Like(col, pattern)), remaining));
+            let mut expr = FilterExpr::Like(col, pattern);
+            if negated {
+                expr = FilterExpr::Not(Box::new(expr));
+            }
+            return Ok((Some(expr), remaining));
         }
 
-        // Check for BETWEEN: column BETWEEN low AND high
-        if let Some(between_pos) = find_unquoted_ignore_ascii_case(input, " BETWEEN ") {
-            let col_raw = safe_slice(input, 0, between_pos).trim();
-            let col = Self::strip_identifier_quotes(col_raw);
+        // Check for BETWEEN / NOT BETWEEN: column [NOT] BETWEEN low AND high
+        if let Some(between_pos) = find_op_in_first_atom(input, " BETWEEN ") {
+            let (col, negated) = Self::split_trailing_not(safe_slice(input, 0, between_pos));
+            let col = Self::strip_identifier_quotes(&col);
             let rest = safe_slice_from(input, between_pos + 9).trim();
 
             if let Some(and_pos) = find_unquoted_ignore_ascii_case(rest, " AND ") {
@@ -3352,14 +3500,18 @@ impl QueryParser {
                 let (high_str, remaining) = Self::extract_quoted_or_word(high_rest);
                 let low = Self::parse_literal(low_str)?;
                 let high = Self::parse_literal(&high_str)?;
-                return Ok((Some(FilterExpr::Between(col, low, high)), remaining));
+                let mut expr = FilterExpr::Between(col, low, high);
+                if negated {
+                    expr = FilterExpr::Not(Box::new(expr));
+                }
+                return Ok((Some(expr), remaining));
             }
         }
 
-        // Check for IN: column IN (val1, val2, ...) or column IN (SELECT ...)
-        if let Some(in_pos) = find_unquoted_ignore_ascii_case(input, " IN ") {
-            let col_raw = safe_slice(input, 0, in_pos).trim();
-            let col = Self::strip_identifier_quotes(col_raw);
+        // Check for IN / NOT IN: column [NOT] IN (val1, val2, ...) or ... IN (SELECT ...)
+        if let Some(in_pos) = find_op_in_first_atom(input, " IN ") {
+            let (col, negated) = Self::split_trailing_not(safe_slice(input, 0, in_pos));
+            let col = Self::strip_identifier_quotes(&col);
             let rest = safe_slice_from(input, in_pos + 4).trim();
             if rest.starts_with('(') {
                 let mut depth = 0i32;
@@ -3383,10 +3535,11 @@ impl QueryParser {
                     // Check if it's a subquery
                     if starts_with_ignore_ascii_case(inner, "SELECT") {
                         let subquery = Self::parse(inner)?;
-                        return Ok((
-                            Some(FilterExpr::InSubquery(col, Box::new(subquery))),
-                            remaining.to_string(),
-                        ));
+                        let mut expr = FilterExpr::InSubquery(col, Box::new(subquery));
+                        if negated {
+                            expr = FilterExpr::Not(Box::new(expr));
+                        }
+                        return Ok((Some(expr), remaining.to_string()));
                     }
 
                     // Otherwise, parse as value list
@@ -3394,7 +3547,11 @@ impl QueryParser {
                         .split(',')
                         .map(|s| Self::parse_literal(s.trim()))
                         .collect::<Result<Vec<_>>>()?;
-                    return Ok((Some(FilterExpr::In(col, values)), remaining.to_string()));
+                    let mut expr = FilterExpr::In(col, values);
+                    if negated {
+                        expr = FilterExpr::Not(Box::new(expr));
+                    }
+                    return Ok((Some(expr), remaining.to_string()));
                 }
             }
         }
@@ -3410,9 +3567,12 @@ impl QueryParser {
             ("=", FilterExpr::Eq),
         ];
         let mut best_op: Option<(usize, &str, fn(String, LiteralValue) -> FilterExpr)> = None;
+        let atom_end = first_atom_end(input);
         for &(op_str, op_fn) in operators {
             if let Some(pos) = Self::find_unquoted(input, op_str) {
-                if best_op.is_none() || pos < best_op.unwrap().0 {
+                // Only the first conjunct may own the comparison — otherwise
+                // `x AND y = 1` would take `x AND y` as the column name.
+                if pos < atom_end && (best_op.is_none() || pos < best_op.unwrap().0) {
                     best_op = Some((pos, op_str, op_fn));
                 }
             }
@@ -4863,6 +5023,162 @@ mod tests {
                     other => panic!("expected Like, got {:?}", other),
                 }
             }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    // ===== NOT LIKE / NOT BETWEEN / NOT IN parsing =====
+    // Regression: `smiles NOT LIKE '%.%'` used to parse the column as
+    // `"smiles NOT"` and therefore match zero rows.
+
+    #[test]
+    fn test_not_like_parses_column_without_not() {
+        let ast = QueryParser::parse("SELECT * FROM T WHERE smiles NOT LIKE '%.%'").unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => match filter.as_ref().unwrap() {
+                FilterExpr::Not(inner) => match inner.as_ref() {
+                    FilterExpr::Like(col, pat) => {
+                        assert_eq!(col, "smiles");
+                        assert_eq!(pat, "%.%");
+                    }
+                    other => panic!("expected Like inside Not, got {:?}", other),
+                },
+                other => panic!("expected Not(Like), got {:?}", other),
+            },
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_not_between_parses_column_without_not() {
+        let ast = QueryParser::parse("SELECT * FROM T WHERE x NOT BETWEEN 1 AND 5").unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => match filter.as_ref().unwrap() {
+                FilterExpr::Not(inner) => match inner.as_ref() {
+                    FilterExpr::Between(col, _, _) => assert_eq!(col, "x"),
+                    other => panic!("expected Between inside Not, got {:?}", other),
+                },
+                other => panic!("expected Not(Between), got {:?}", other),
+            },
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_not_in_parses_column_without_not() {
+        let ast = QueryParser::parse("SELECT * FROM T WHERE id NOT IN ('a', 'b')").unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => match filter.as_ref().unwrap() {
+                FilterExpr::Not(inner) => match inner.as_ref() {
+                    FilterExpr::In(col, vals) => {
+                        assert_eq!(col, "id");
+                        assert_eq!(vals.len(), 2);
+                    }
+                    other => panic!("expected In inside Not, got {:?}", other),
+                },
+                other => panic!("expected Not(In), got {:?}", other),
+            },
+            _ => panic!("expected Select"),
+        }
+    }
+
+    /// Regression: `a AND b IS NULL` used to let the IS-NULL detector see the
+    /// ` IS ` of the SECOND conjunct and take the whole first term as a column
+    /// name (which, for IS NULL, matches every row).
+    #[test]
+    fn test_and_is_null_second_conjunct_not_swallowed() {
+        let ast =
+            QueryParser::parse("SELECT * FROM T WHERE smiles NOT LIKE '%.%' AND fp IS NULL").unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => match filter.as_ref().unwrap() {
+                FilterExpr::And(left, right) => {
+                    match left.as_ref() {
+                        FilterExpr::Not(inner) => match inner.as_ref() {
+                            FilterExpr::Like(col, _) => assert_eq!(col, "smiles"),
+                            other => panic!("left: expected Not(Like), got {:?}", other),
+                        },
+                        other => panic!("left: expected Not(Like), got {:?}", other),
+                    }
+                    match right.as_ref() {
+                        FilterExpr::IsNull(col) => assert_eq!(col, "fp"),
+                        other => panic!("right: expected IsNull(fp), got {:?}", other),
+                    }
+                }
+                other => panic!("expected And, got {:?}", other),
+            },
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_and_is_not_null_second_conjunct() {
+        let ast = QueryParser::parse(
+            "SELECT * FROM T WHERE smiles NOT LIKE '%.%' AND fp IS NOT NULL",
+        )
+        .unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => match filter.as_ref().unwrap() {
+                FilterExpr::And(_, right) => match right.as_ref() {
+                    FilterExpr::IsNotNull(col) => assert_eq!(col, "fp"),
+                    other => panic!("expected IsNotNull(fp), got {:?}", other),
+                },
+                other => panic!("expected And, got {:?}", other),
+            },
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_and_comparison_second_conjunct_not_swallowed() {
+        let ast =
+            QueryParser::parse("SELECT * FROM T WHERE a > 900 AND name = 'iPhone'").unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => match filter.as_ref().unwrap() {
+                FilterExpr::And(left, right) => {
+                    match left.as_ref() {
+                        FilterExpr::Gt(col, _) => assert_eq!(col, "a"),
+                        other => panic!("left: expected Gt(a), got {:?}", other),
+                    }
+                    match right.as_ref() {
+                        FilterExpr::Eq(col, _) => assert_eq!(col, "name"),
+                        other => panic!("right: expected Eq(name), got {:?}", other),
+                    }
+                }
+                other => panic!("expected And, got {:?}", other),
+            },
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_compact_vector_index_parses() {
+        let ast = QueryParser::parse("COMPACT VECTOR INDEX ON sembio.Compound (fp)").unwrap();
+        match ast {
+            QueryAst::CompactVectorIndex { class, column } => {
+                assert_eq!(class, "sembio.Compound");
+                assert_eq!(column, "fp");
+            }
+            other => panic!("expected CompactVectorIndex, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_not_like_with_and_chain() {
+        let ast = QueryParser::parse(
+            "SELECT * FROM T WHERE fp IS NULL AND smiles NOT LIKE '%.%'",
+        )
+        .unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => match filter.as_ref().unwrap() {
+                FilterExpr::And(_, right) => match right.as_ref() {
+                    FilterExpr::Not(inner) => match inner.as_ref() {
+                        FilterExpr::Like(col, _) => assert_eq!(col, "smiles"),
+                        other => panic!("expected Like inside Not, got {:?}", other),
+                    },
+                    other => panic!("expected Not on right of And, got {:?}", other),
+                },
+                other => panic!("expected And, got {:?}", other),
+            },
             _ => panic!("expected Select"),
         }
     }
