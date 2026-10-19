@@ -3,17 +3,18 @@
 
 # Agent metadata
 name: OntoDB
-description: Ontology-driven six-modal semantic database with live data management
+description: Ontology-kernel embedded multi-modal semantic database unifying 12 data types
 version: 0.6.2
 website: https://ontovalue.com
 documentation: https://ontovalue.com/docs
-repository: https://github.com/ontodb/ontodb
+repository: https://gitee.com/ontovalue/ontodb
 
 # Capabilities
 capabilities:
   - relational_query
   - graph_traversal
   - vector_search
+  - binary_fingerprint_similarity
   - ontology_reasoning
   - time_series
   - spatial_query
@@ -37,14 +38,33 @@ query_languages:
   - OntoQL
   - REST API
 
-# Data modalities
+# Data modalities (12 types in one engine)
 data_modalities:
+  - key_value
+  - document
   - relational
   - graph
   - vector
+  - ontology
+  - triple_store
   - time_series
   - spatial
-  - ontology
+  - rules
+  - live_value
+  - namespace
+
+# Vector search
+vector:
+  index: HNSW
+  metrics:
+    - L2
+    - Cosine
+    - InnerProduct
+    - Tanimoto
+    - Hamming
+  binary_fingerprint: 1024-bit packed into 128B
+  production_scale: 2.45M molecular fingerprints
+  latency: 21-41ms at 2.45M (Tanimoto)
 
 # Deployment options
 deployment:
@@ -55,9 +75,9 @@ deployment:
 
 # Performance
 performance:
-  write_throughput: 863618
-  read_throughput: 1256518
-  vector_recall: 100
+  write_throughput: 1126486
+  read_throughput: 1306438
+  vector_latency_ms_2_45m: 21-41
   reasoning_speedup: 100
 
 # License
@@ -67,4 +87,4 @@ license: BUSL-1.1 (Community) / Commercial (Enterprise)
 contact:
   email: dev@ontovalue.com
   github: https://github.com/ontodb/ontodb
-  gitee: https://gitee.com/ontodb/ontodb
+  gitee: https://gitee.com/ontovalue/ontodb

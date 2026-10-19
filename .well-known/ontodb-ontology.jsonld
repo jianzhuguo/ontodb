@@ -11,7 +11,7 @@
       "@id": "onto:OntoDB",
       "@type": "owl:NamedIndividual",
       "rdfs:label": "OntoDB",
-      "rdfs:comment": "An ontology-driven semantic multi-modal database. Version 0.6.2. Supports six data modalities: relational, graph, vector, temporal, spatial, and ontology.",
+      "rdfs:comment": "An ontology-kernel embedded semantic multi-modal database. Version 0.6.2. Unifies 12 data types in one engine: key-value, document, relational, graph, vector, ontology, triple store, time series, spatial, rules, live value, and namespace.",
       "onto:version": "0.6.2"
     },
 
@@ -19,7 +19,7 @@
       "@id": "onto:Database",
       "@type": "owl:Class",
       "rdfs:label": "Database",
-      "rdfs:comment": "The top-level container for data in OntoDB. Supports six data modalities: relational, graph, vector, temporal, spatial, and ontology."
+      "rdfs:comment": "The top-level container for data in OntoDB. Unifies 12 data types: key-value, document, relational, graph, vector, ontology, triple store, time series, spatial, rules, live value, and namespace."
     },
     {
       "@id": "onto:Table",
@@ -79,7 +79,7 @@
       "@id": "onto:VectorIndex",
       "@type": "owl:Class",
       "rdfs:label": "Vector Index",
-      "rdfs:comment": "An HNSW-based index for approximate nearest neighbor search on high-dimensional vectors."
+      "rdfs:comment": "An HNSW-based index for approximate nearest neighbor search. Supports L2, Cosine, InnerProduct, Tanimoto, and Hamming metrics; binary fingerprints pack 1024 bits into 128 bytes."
     },
     {
       "@id": "onto:GraphStore",
