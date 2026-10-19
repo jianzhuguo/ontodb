@@ -260,16 +260,17 @@ impl CompactionWorker {
                 let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
                 levels.len().saturating_sub(1)
             };
-            tracing::info!(
-                "File-count trigger: L{} has {} files (> {}), merging batch",
-                level,
-                nfiles,
-                FILE_COUNT_TRIGGER
-            );
             if level == deepest {
-                // Deepest level: bounded self-merge, never the whole level.
+                // Deepest level: bounded self-merge. Quiet when no size-safe
+                // pair exists (otherwise the trigger logs every tick).
                 self.merge_last_level_batch()?;
             } else {
+                tracing::info!(
+                    "File-count trigger: L{} has {} files (> {}), merging batch",
+                    level,
+                    nfiles,
+                    FILE_COUNT_TRIGGER
+                );
                 self.compact_level(level)?;
             }
             return Ok(());
@@ -657,10 +658,12 @@ impl CompactionWorker {
     /// normal compaction is what absorbs those.
     fn merge_last_level_batch(&mut self) -> Result<()> {
         const BATCH: usize = 2;
-        // Cap the *pair* so the single output stays in the same ballpark as
-        // the largest SSTs we already run (~500MB). Above this, 2→1 just
-        // manufactures a giant file.
-        const MAX_PAIR_BYTES: u64 = 256 * 1024 * 1024;
+        // Cap the *pair* so the single output stays near industry norms
+        // (RocksDB 64MB, Cassandra 160MB; 64–256MB is the common range).
+        // 320MB lets a 258MB pair merge (the case that left the file-count
+        // trigger spinning at a 256MB cap) without welding two large SSTs
+        // into a ~500MB file.
+        const MAX_PAIR_BYTES: u64 = 320 * 1024 * 1024;
         // Do not split the output: 2 inputs must become 1 file or the level
         // cannot shrink. Safe because the pair is size-capped above.
         const TARGET_OUTPUT_SIZE: u64 = u64::MAX;
