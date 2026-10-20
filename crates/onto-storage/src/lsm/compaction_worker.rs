@@ -20,7 +20,7 @@ use crate::options::StorageOptions;
 use onto_core::{Entry, EntryKind, Result, SeqNo};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::{mpsc, Arc};
@@ -346,9 +346,36 @@ impl CompactionWorker {
     }
 
     /// Performs leveled compaction: merges SSTables from level N into level N+1.
+    /// Span (min,max) of Delete-entry keys in one SST, or None when the file
+    /// holds no tombstones. Used for tombstone placement safety.
+    fn tombstone_span(path: &Path) -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut iter = crate::lsm::streaming_merge::StreamingMergeIterator::new(&[path]).ok()?;
+        let mut span: Option<(Vec<u8>, Vec<u8>)> = None;
+        while iter.has_next() {
+            let entry = match iter.next() {
+                Some(e) => e,
+                None => break,
+            };
+            if entry.kind == EntryKind::Delete {
+                match &mut span {
+                    None => span = Some((entry.key.clone(), entry.key.clone())),
+                    Some((lo, hi)) => {
+                        if entry.key < *lo {
+                            *lo = entry.key.clone();
+                        }
+                        if entry.key > *hi {
+                            *hi = entry.key.clone();
+                        }
+                    }
+                }
+            }
+        }
+        span
+    }
+
     fn compact_level(&mut self, level: usize) -> Result<()> {
         // Step 1: Snapshot SSTables to compact (don't remove from levels yet)
-        let (ssts_to_compact, compact_min, compact_max, empty_ssts) = {
+        let (mut ssts_to_compact, compact_min, compact_max, empty_ssts) = {
             let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             if level >= levels.len() - 1 {
                 return Ok(());
@@ -449,13 +476,99 @@ impl CompactionWorker {
             self.pending_deletions.push(e.path.clone());
         }
 
+        // Step 2.5: Tombstone placement safety. L1+ selection merges the
+        // SMALLEST files first, so a small tombstone file sinks below a big
+        // same-key Put file — level-order reads then let the shallower put win
+        // and resurrect the row. When an input file's tombstones are shadowed
+        // by a SHALLOW survivor (levels 0..=level outside the merge), pull the
+        // shadowing file(s) into the merge so the versions resolve together
+        // (newest = tombstone wins). If the expansion would exceed the safety
+        // cap, keep the affected input file OUT of this round — its tombstones
+        // stay at the source level, which is safe (shallow beats deep on read).
+        {
+            const EXPAND_CAP: usize = 40;
+            let mut excluded_inputs: Vec<PathBuf> = Vec::new();
+            let mut kept: Vec<SsTableInfo> = Vec::with_capacity(ssts_to_compact.len());
+            {
+                let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+                let merged_paths: std::collections::HashSet<PathBuf> = ssts_to_compact
+                    .iter()
+                    .chain(next_level_ssts.iter())
+                    .map(|s| s.path.clone())
+                    .collect();
+                let shallow: Vec<SsTableInfo> = levels
+                    .iter()
+                    .take(level + 1)
+                    .flat_map(|l| l.iter())
+                    .filter(|s| !merged_paths.contains(&s.path))
+                    .cloned()
+                    .collect();
+                let mut expanded: std::collections::HashSet<PathBuf> =
+                    std::collections::HashSet::new();
+                for s in &ssts_to_compact {
+                    let shadowed = match Self::tombstone_span(&s.path) {
+                        Some((lo, hi)) => shallow
+                            .iter()
+                            .filter(|o| {
+                                Self::ranges_overlap(&lo, &hi, &o.min_key, &o.max_key)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        None => Vec::new(),
+                    };
+                    if shadowed.is_empty() {
+                        kept.push(s.clone());
+                        continue;
+                    }
+                    let projected = ssts_to_compact.len()
+                        + next_level_ssts.len()
+                        + expanded.len()
+                        + shadowed.len();
+                    if projected > EXPAND_CAP {
+                        excluded_inputs.push(s.path.clone());
+                        continue;
+                    }
+                    for o in shadowed {
+                        if expanded.insert(o.path.clone()) {
+                            kept.push(o);
+                        }
+                    }
+                    kept.push(s.clone());
+                }
+            }
+            if !excluded_inputs.is_empty() {
+                tracing::info!(
+                    excluded = excluded_inputs.len(),
+                    "tombstone placement: deferring input files shadowed by shallow survivors"
+                );
+            }
+            ssts_to_compact = kept;
+        }
+        if ssts_to_compact.is_empty() {
+            return Ok(());
+        }
+
         // Step 3: Streaming merge using min-heap (O(1) memory per SSTable)
-        // Only clone levels deeper than next_level for tombstone checks (saves memory)
-        let (deepest_level, levels_snapshot) = {
+        // Tombstone-drop safety: a tombstone may only be dropped when no SST
+        // that SURVIVES outside this merge could still hold an older version
+        // of the key — at ANY level (shallower survivors included: dropping a
+        // tombstone while a put lives above it resurrects the row; and even
+        // keeping it, moving it below a shallow survivor inverts level-order
+        // reads). Checking only deeper levels missed same-level siblings,
+        // truncated next-level files AND shallower files.
+        let survivor_ranges: Vec<(Vec<u8>, Vec<u8>)> = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-            let deepest = levels.len() - 1;
-            let snapshot: Vec<Vec<SsTableInfo>> = levels.iter().skip(next_level + 1).cloned().collect();
-            (deepest, snapshot)
+            let merged: std::collections::HashSet<PathBuf> = ssts_to_compact
+                .iter()
+                .chain(next_level_ssts.iter())
+                .map(|s| s.path.clone())
+                .collect();
+            levels
+                .iter()
+                .flat_map(|ssts| ssts.iter())
+                .filter(|s| !merged.contains(&s.path))
+                .map(|s| (s.min_key.clone(), s.max_key.clone()))
+                .collect()
         };
 
         // Collect all SSTable paths for streaming merge
@@ -521,11 +634,13 @@ impl CompactionWorker {
                 continue;
             }
 
-            // Tombstone cleanup
+            // Tombstone cleanup: drop only when no surviving SST outside this
+            // merge can hold an older version of the key. The old
+            // `next_level >= deepest_level` shortcut dropped tombstones even
+            // when sibling files were excluded from the batch (truncate/limit),
+            // resurrecting deleted rows.
             if kind == EntryKind::Delete {
-                let can_drop = next_level >= deepest_level
-                    || Self::can_drop_tombstone_static(&key, next_level, &levels_snapshot);
-                if can_drop {
+                if Self::tombstone_safe_to_drop(&key, &survivor_ranges) {
                     last_key = Some(key);
                     continue;
                 }
@@ -1052,16 +1167,18 @@ impl CompactionWorker {
         Ok(())
     }
 
-    fn can_drop_tombstone_static(
-        key: &[u8],
-        _from_level: usize,
-        deeper_levels: &[Vec<SsTableInfo>],
-    ) -> bool {
-        for level_ssts in deeper_levels {
-            for sst_info in level_ssts {
-                if key >= sst_info.min_key.as_slice() && key <= sst_info.max_key.as_slice() {
-                    return false;
-                }
+    /// A tombstone may be dropped only if no SST that survives outside the
+    /// current merge can contain an older version of the key. Checking only
+    /// deeper levels (the old behavior) resurrects deleted rows from
+    /// same-level siblings and truncated next-level files.
+    fn tombstone_safe_to_drop(key: &[u8], survivor_ranges: &[(Vec<u8>, Vec<u8>)]) -> bool {
+        for (min_key, max_key) in survivor_ranges {
+            if min_key.is_empty() && max_key.is_empty() {
+                // Unknown bounds — be conservative.
+                return false;
+            }
+            if key >= min_key.as_slice() && key <= max_key.as_slice() {
+                return false;
             }
         }
         true
@@ -1072,5 +1189,162 @@ impl CompactionWorker {
             return true;
         }
         min_a <= max_b && min_b <= max_a
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onto_core::Entry;
+    use std::path::Path;
+    use std::sync::mpsc;
+    use tempfile::tempdir;
+
+    fn build_sst(dir: &Path, name: &str, entries: Vec<Entry>) -> SsTableInfo {
+        let path = dir.join(name);
+        let mut builder = SsTableBuilder::new();
+        let mut lo: Vec<u8> = Vec::new();
+        let mut hi: Vec<u8> = Vec::new();
+        for e in &entries {
+            if lo.is_empty() || e.key < lo {
+                lo = e.key.clone();
+            }
+            if hi.is_empty() || e.key > hi {
+                hi = e.key.clone();
+            }
+        }
+        for e in entries {
+            builder.add_owned(e);
+        }
+        builder.build(&path).expect("build sst");
+        let meta = std::fs::metadata(&path).expect("meta");
+        SsTableInfo {
+            path,
+            size: meta.len(),
+            min_key: lo,
+            max_key: hi,
+        }
+    }
+
+    fn read_winner(levels: &Arc<Mutex<Vec<Vec<SsTableInfo>>>>, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        let lv = levels.lock().unwrap();
+        for l in lv.iter() {
+            for s in l.iter().rev() {
+                let sst = SsTable::open(&s.path).expect("open");
+                match sst.get_full(key).expect("get") {
+                    Some((val, _, EntryKind::Put)) => return Some(Some(val)),
+                    Some((_, _, EntryKind::Delete)) => return Some(None),
+                    None => {}
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_tombstone_span_detects_deletes() {
+        let dir = tempdir().expect("tempdir");
+        let t = build_sst(
+            dir.path(),
+            "T.sst",
+            vec![
+                Entry::put(b"a".to_vec(), b"1".to_vec(), 1),
+                Entry::delete(b"k000".to_vec(), 1000),
+                Entry::put(b"z".to_vec(), b"2".to_vec(), 2),
+            ],
+        );
+        let span = CompactionWorker::tombstone_span(&t.path);
+        assert_eq!(
+            span,
+            Some((b"k000".to_vec(), b"k000".to_vec())),
+            "must detect delete keys"
+        );
+        let clean = build_sst(
+            dir.path(),
+            "C.sst",
+            vec![Entry::put(b"a".to_vec(), b"1".to_vec(), 1)],
+        );
+        assert_eq!(CompactionWorker::tombstone_span(&clean.path), None);
+    }
+
+    /// Deterministic resurrection repro: a SMALL tombstone file and a BIG    /// same-key put file at the same level. Size-first selection merges the
+    /// tombstone file alone, moving the tombstone DEEPER than the surviving
+    /// put — level-order reads then resurrect the row. The placement fix
+    /// must pull the shadowing put file into the merge instead.
+    #[test]
+    fn test_tombstone_not_placed_below_shadowing_put() {
+        let dir = tempdir().expect("tempdir");
+
+        // L1 file A: 20 puts incl. k000 (large file).
+        let mut put_entries = Vec::new();
+        for i in 0..20u32 {
+            put_entries.push(Entry::put(
+                format!("k{i:03}").into_bytes(),
+                vec![b'v'; 500],
+                10 + i as u64,
+            ));
+        }
+        let a = build_sst(dir.path(), "L1_A.sst", put_entries);
+
+        // L1 file T: one tombstone for k000 (tiny file — merges first).
+        let t = build_sst(
+            dir.path(),
+            "L1_T.sst",
+            vec![Entry::delete(b"k000".to_vec(), 1000)],
+        );
+        assert!(t.size < a.size, "test needs T smaller than A (size-first)");
+
+        let levels: Arc<Mutex<Vec<Vec<SsTableInfo>>>> = Arc::new(Mutex::new(vec![
+            Vec::new(),
+            vec![t, a],
+            Vec::new(),
+        ]));
+
+        let (_tx, rx) = mpsc::channel();
+        let (ntx, _nrx) = mpsc::channel();
+        let mut worker = CompactionWorker {
+            levels: levels.clone(),
+            options: StorageOptions {
+                data_dir: dir.path().to_path_buf(),
+                memtable_size_limit: 1024 * 1024,
+                size_ratio: 2,
+                ..Default::default()
+            },
+            sst_counter: Arc::new(AtomicU64::new(1000)),
+            receiver: rx,
+            notif_sender: Some(ntx),
+            sst_cache: HashMap::new(),
+            pending_deletions: Vec::new(),
+            cooldown_until: None,
+        };
+        worker.compact_level(1).expect("compact");
+
+        // The shadowing put file A must have been pulled INTO the merge:
+        // L1 ends empty and the merged output lives at L2. Without the
+        // placement fix A lingers at L1 and k000 resurrects.
+        {
+            let lv = levels.lock().unwrap();
+            assert!(
+                lv[1].is_empty(),
+                "shadowing put file must join the tombstone merge; L1 still has {} files",
+                lv[1].len()
+            );
+        }
+
+        // k000 must NOT read back as a live Put. Two correct end states:
+        // tombstone visible (Some(None)) or key fully absent (None).
+        // Resurrection looks like Some(Some(_)).
+        let w = read_winner(&levels, b"k000");
+        assert!(
+            !matches!(w, Some(Some(_))),
+            "tombstone landed below a surviving put — row resurrected: {:?}",
+            w
+        );
+        // Sibling puts from A must survive somewhere in the levels.
+        assert_eq!(
+            read_winner(&levels, b"k010"),
+            Some(Some(vec![b'v'; 500])),
+            "merge must not lose unrelated puts"
+        );
     }
 }

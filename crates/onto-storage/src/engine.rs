@@ -159,6 +159,11 @@ pub struct LsmEngine {
 
     /// Handle to the background WAL sync thread for graceful shutdown.
     wal_sync_handle: Mutex<Option<JoinHandle<()>>>,
+
+    /// Serializes flush_memtable. Without it, two concurrent flushes both swap
+    /// into the single `immutable_memtable` slot and the loser's entries are
+    /// silently dropped (observed as lost UPDATEs/DELETEs under bulk load).
+    flush_lock: Mutex<()>,
 }
 
 /// Temporary helper for loading WAL + SSTables before spawning the compaction worker.
@@ -408,6 +413,7 @@ impl LsmEngine {
             memory_manager,
             shutdown: Arc::new(AtomicBool::new(false)),
             wal_sync_handle: Mutex::new(None),
+            flush_lock: Mutex::new(()),
         };
 
         // Spawn background WAL sync thread
@@ -1027,14 +1033,21 @@ impl LsmEngine {
         };
 
         // 2. Check MemTables under read lock (concurrent with other readers).
+        //    A memtable tombstone is terminal: falling through to SSTs would
+        //    resurrect a deleted row from a stale Put below.
         {
             let ws = self.write_state.read();
-            if let Some((val, _)) = ws.memtable.get(key) {
-                return Ok(Some(val.to_vec()));
+            use crate::lsm::memtable::VersionLookup;
+            match ws.memtable.get_version(key) {
+                Some(VersionLookup::Value(v, _)) => return Ok(Some(v)),
+                Some(VersionLookup::Tombstone) => return Ok(None),
+                None => {}
             }
             if let Some(ref imm) = ws.immutable_memtable {
-                if let Some((val, _)) = imm.get(key) {
-                    return Ok(Some(val.to_vec()));
+                match imm.get_version(key) {
+                    Some(VersionLookup::Value(v, _)) => return Ok(Some(v)),
+                    Some(VersionLookup::Tombstone) => return Ok(None),
+                    None => {}
                 }
             }
         }
@@ -1078,15 +1091,37 @@ impl LsmEngine {
         let mut out: Vec<Option<Value>> = vec![None; keys.len()];
 
         // Phase 1: MemTable lookup under brief read lock.
+        // Memtable tombstones are terminal — a deleted key must not fall
+        // through to a stale Put in the SSTs below.
+        let mut deleted = vec![false; keys.len()];
         {
             let ws = self.write_state.read();
+            use crate::lsm::memtable::VersionLookup;
             for &orig_i in &sorted_idx {
                 let key = keys[orig_i].as_slice();
-                if let Some((val, _)) = ws.memtable.get(key) {
-                    out[orig_i] = Some(val.to_vec());
-                } else if let Some(ref imm) = ws.immutable_memtable {
-                    if let Some((val, _)) = imm.get(key) {
-                        out[orig_i] = Some(val.to_vec());
+                let mut resolved = false;
+                match ws.memtable.get_version(key) {
+                    Some(VersionLookup::Value(v, _)) => {
+                        out[orig_i] = Some(v);
+                        resolved = true;
+                    }
+                    Some(VersionLookup::Tombstone) => {
+                        deleted[orig_i] = true;
+                        resolved = true;
+                    }
+                    None => {}
+                }
+                if !resolved {
+                    if let Some(ref imm) = ws.immutable_memtable {
+                        match imm.get_version(key) {
+                            Some(VersionLookup::Value(v, _)) => {
+                                out[orig_i] = Some(v);
+                            }
+                            Some(VersionLookup::Tombstone) => {
+                                deleted[orig_i] = true;
+                            }
+                            None => {}
+                        }
                     }
                 }
             }
@@ -1122,7 +1157,7 @@ impl LsmEngine {
 
         // For each unresolved key (sorted), walk SSTs in order.
         for &orig_i in &sorted_idx {
-            if out[orig_i].is_some() {
+            if out[orig_i].is_some() || deleted[orig_i] {
                 continue;
             }
             let key = keys[orig_i].as_slice();
@@ -1701,19 +1736,22 @@ impl LsmEngine {
                 }
             };
 
-            // MemTables first (newest source).
+            // MemTables first (newest source) — active before immutable:
+            // immutable is OLDER; scanning it first let a stale version win
+            // first-seen-wins over a fresher tombstone/Put in the active
+            // memtable (count-path resurrection window).
             {
                 let ws = self.write_state.read();
+                for entry in ws.memtable.scan_prefix(prefix) {
+                    if is_visible(entry.seq_no) {
+                        note(entry.key.clone(), entry.seq_no, entry.kind);
+                    }
+                }
                 if let Some(ref imm) = ws.immutable_memtable {
                     for entry in imm.scan_prefix(prefix) {
                         if is_visible(entry.seq_no) {
                             note(entry.key.clone(), entry.seq_no, entry.kind);
                         }
-                    }
-                }
-                for entry in ws.memtable.scan_prefix(prefix) {
-                    if is_visible(entry.seq_no) {
-                        note(entry.key.clone(), entry.seq_no, entry.kind);
                     }
                 }
             }
@@ -2035,19 +2073,22 @@ impl LsmEngine {
                 }
             };
 
-            // MemTables first (newest source).
+            // MemTables first (newest source) — active before immutable:
+            // immutable is OLDER; scanning it first let a stale version win
+            // first-seen-wins over a fresher tombstone/Put in the active
+            // memtable (count-path resurrection window).
             {
                 let ws = self.write_state.read();
+                for entry in ws.memtable.scan_prefix(prefix) {
+                    if is_visible(entry.seq_no) {
+                        note(entry.key.clone(), entry.seq_no, entry.kind);
+                    }
+                }
                 if let Some(ref imm) = ws.immutable_memtable {
                     for entry in imm.scan_prefix(prefix) {
                         if is_visible(entry.seq_no) {
                             note(entry.key.clone(), entry.seq_no, entry.kind);
                         }
-                    }
-                }
-                for entry in ws.memtable.scan_prefix(prefix) {
-                    if is_visible(entry.seq_no) {
-                        note(entry.key.clone(), entry.seq_no, entry.kind);
                     }
                 }
             }
@@ -2395,6 +2436,18 @@ impl Drop for LsmEngine {
 impl LsmEngine {
     /// Flushes the current MemTable to an SSTable on disk.
     fn flush_memtable(&self) -> Result<()> {
+        // Serialize flushes: without this guard two concurrent flushes swap
+        // into the single `immutable_memtable` slot and the loser's entries
+        // are silently dropped (lost Puts/Deletes under bulk load).
+        let _flush_guard = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        // A previously failed flush may have left an immutable memtable behind.
+        // Persist it instead of overwriting the slot — overwrite loses data.
+        if self.write_state.read().immutable_memtable.is_some() {
+            tracing::warn!("flush_memtable: persisting leftover immutable memtable");
+            self.persist_immutable_to_sst()?;
+        }
+
         // Step 1: Swap current MemTable to immutable (brief lock)
         {
             let mut ws = self.write_state.write();
@@ -2407,6 +2460,25 @@ impl LsmEngine {
             ws.immutable_memtable = Some(old_mem);
         }
 
+        self.persist_immutable_to_sst()?;
+
+        // Notify the background compaction worker
+        let _ = self
+            .compaction_sender
+            .send(CompactionMsg::Flushed { level: 0 });
+
+        // Persist dirty HNSW nodes as incremental deltas alongside the flush.
+        if let Err(e) = self.persist_vector_deltas() {
+            tracing::warn!("Failed to persist vector deltas on flush: {}", e);
+        }
+
+        Ok(())
+    }
+
+    /// Builds an SST from the current immutable memtable, installs it, clears
+    /// the slot, and rewrites the WAL to cover only unpersisted entries.
+    /// Caller must hold `flush_lock`.
+    fn persist_immutable_to_sst(&self) -> Result<()> {
         // Step 2: Snapshot immutable MemTable entries (brief lock), then build SSTable outside lock
         let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
         let sst_path = self.options.data_dir.join(format!("L0_{}.sst", sst_id));
@@ -2481,16 +2553,6 @@ impl LsmEngine {
             let mut ws = self.write_state.write();
             ws.immutable_memtable = None;
             self.reset_wal_internal(&mut ws)?;
-        }
-
-        // Notify the background compaction worker
-        let _ = self
-            .compaction_sender
-            .send(CompactionMsg::Flushed { level: 0 });
-
-        // Persist dirty HNSW nodes as incremental deltas alongside the flush.
-        if let Err(e) = self.persist_vector_deltas() {
-            tracing::warn!("Failed to persist vector deltas on flush: {}", e);
         }
 
         Ok(())
@@ -2585,6 +2647,10 @@ impl LsmEngine {
     /// 2. Create a new WAL at a temp path
     /// 3. Atomically rename temp → wal.log
     fn reset_wal_internal(&self, ws: &mut WriteState) -> Result<()> {
+        // Rebuild the WAL so it covers exactly the unpersisted entries (the
+        // active memtable). A blind file replace drops records appended during
+        // the SST build window — those writes live in the active memtable and
+        // must stay recoverable (observed as post-restart data loss).
         let wal_path = self.options.data_dir.join("wal.log");
         let tmp_path = self.options.data_dir.join("wal.log.tmp");
 
@@ -2600,13 +2666,28 @@ impl LsmEngine {
             fs::remove_file(&tmp_path)?;
         }
 
-        // Create new WAL at temp path
-        let new_wal = Wal::open(&tmp_path)?;
+        // Build the new WAL from every entry not yet persisted to an SST.
+        let mut new_wal = Wal::open(&tmp_path)?;
+        for e in ws.memtable.entries() {
+            match e.kind {
+                EntryKind::Put => {
+                    let entry = Entry::put(e.key.clone(), e.value.clone(), e.seq_no);
+                    new_wal.append(&entry)?;
+                }
+                EntryKind::Delete => {
+                    let entry = Entry::delete(e.key.clone(), e.seq_no);
+                    new_wal.append(&entry)?;
+                }
+            }
+        }
+        new_wal.flush_buf()?;
+        new_wal.sync()?;
 
         // Atomically replace the old WAL
         fs::rename(&tmp_path, &wal_path)?;
 
         ws.wal = new_wal;
+        ws.wal_pending_count = 0;
         Ok(())
     }
 
@@ -3597,12 +3678,17 @@ impl LsmEngine {
         sst_cache: &HashMap<PathBuf, Arc<SsTable>>,
         key: &[u8],
     ) -> Result<Option<Value>> {
-        if let Some((val, _)) = ws.memtable.get(key) {
-            return Ok(Some(val.to_vec()));
+        use crate::lsm::memtable::VersionLookup;
+        match ws.memtable.get_version(key) {
+            Some(VersionLookup::Value(v, _)) => return Ok(Some(v)),
+            Some(VersionLookup::Tombstone) => return Ok(None),
+            None => {}
         }
         if let Some(ref imm) = ws.immutable_memtable {
-            if let Some((val, _)) = imm.get(key) {
-                return Ok(Some(val.to_vec()));
+            match imm.get_version(key) {
+                Some(VersionLookup::Value(v, _)) => return Ok(Some(v)),
+                Some(VersionLookup::Tombstone) => return Ok(None),
+                None => {}
             }
         }
         for sst in sst_cache.values() {
@@ -4951,6 +5037,172 @@ mod tests {
         assert_eq!(only_v0.0, 0, "superseded version must not count");
     }
 
+    /// Regression: concurrent flush_memtable calls used to race on the single
+    /// `immutable_memtable` slot — the loser's entries vanished from reads
+    /// (lost UPDATE/DELETE under bulk import). Four writers + two flushers on
+    /// a tiny memtable must never lose a write.
+    #[test]
+    fn test_concurrent_flushes_lose_no_writes() {
+        use std::sync::Arc;
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 4096,
+            ..Default::default()
+        };
+        let engine = Arc::new(LsmEngine::open(options).expect("should be valid"));
+
+        let mut handles = Vec::new();
+        for t in 0..4u32 {
+            let e = Arc::clone(&engine);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..300u32 {
+                    let key = format!("R::{t}::{i:04}");
+                    e.put(key.into_bytes(), format!("v{i}").into_bytes())
+                        .expect("put");
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let e = Arc::clone(&engine);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..80 {
+                    let _ = e.flush();
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+
+        for t in 0..4u32 {
+            for i in 0..300u32 {
+                let key = format!("R::{t}::{i:04}");
+                let got = engine.get(key.as_bytes()).expect("get");
+                assert_eq!(
+                    got,
+                    Some(format!("v{i}").into_bytes()),
+                    "lost write {key}"
+                );
+            }
+        }
+        engine.shutdown();
+    }
+
+    /// Regression: a bulk DELETE's tombstones used to be dropped when a
+    /// concurrent flush raced (production incident: DELETE reported N rows
+    /// deleted, rows resurfaced). Under flush pressure tombstones must stick.
+    #[test]
+    fn test_concurrent_flushes_preserve_delete_tombstones() {
+        use std::sync::Arc;
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 4096,
+            ..Default::default()
+        };
+        let engine = Arc::new(LsmEngine::open(options).expect("should be valid"));
+
+        for i in 0..2000u32 {
+            let key = format!("D::{i:04}");
+            engine.put(key.into_bytes(), b"x".to_vec()).expect("put");
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let e = Arc::clone(&engine);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let _ = e.flush();
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        // Bulk-delete half the rows while flushes race.
+        for i in 0..1000u32 {
+            let key = format!("D::{i:04}");
+            engine.delete(key.into_bytes()).expect("delete");
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+
+        for i in 0..1000u32 {
+            let key = format!("D::{i:04}");
+            assert_eq!(
+                engine.get(key.as_bytes()).expect("get"),
+                None,
+                "tombstone lost: {key}"
+            );
+        }
+        for i in 1000..2000u32 {
+            let key = format!("D::{i:04}");
+            assert!(
+                engine.get(key.as_bytes()).expect("get").is_some(),
+                "live row lost: {key}"
+            );
+        }
+        engine.shutdown();
+    }
+
+    /// Regression: reset_wal_internal used to blind-replace wal.log, dropping
+    /// records appended during the SST build window. Those writes stayed
+    /// visible until restart but were unrecoverable after. Simulate a crash
+    /// via shutdown() (syncs WAL, does NOT flush memtable) + reopen.
+    #[test]
+    fn test_wal_covers_writes_during_flush_windows() {
+        use std::sync::Arc;
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 4096,
+            ..Default::default()
+        };
+        let engine = Arc::new(LsmEngine::open(options.clone()).expect("should be valid"));
+
+        let mut handles = Vec::new();
+        for t in 0..3u32 {
+            let e = Arc::clone(&engine);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..250u32 {
+                    let key = format!("W::{t}::{i:04}");
+                    e.put(key.into_bytes(), format!("v{i}").into_bytes())
+                        .expect("put");
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let e = Arc::clone(&engine);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..60 {
+                    let _ = e.flush();
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+        // Simulated crash: WAL is synced, memtable is not flushed to SST.
+        engine.shutdown();
+        drop(engine);
+
+        let engine2 = LsmEngine::open(options).expect("reopen");
+        for t in 0..3u32 {
+            for i in 0..250u32 {
+                let key = format!("W::{t}::{i:04}");
+                let got = engine2.get(key.as_bytes()).expect("get");
+                assert_eq!(
+                    got,
+                    Some(format!("v{i}").into_bytes()),
+                    "write lost across crash: {key}"
+                );
+            }
+        }
+        engine2.shutdown();
+    }
+
     /// for_each_live_prefix visits each live key once with the winning value,
     /// without requiring the caller to hold the full result set.
     #[test]
@@ -6109,5 +6361,97 @@ mod tests {
         // Default should be LAMBDA_2Y (very slow decay)
         assert!((opts.default_lambda - crate::value_meta::LAMBDA_2Y).abs() < 1e-15);
         assert!(!opts.value_scorer_enabled);
+    }
+
+    /// Regression: deleted rows must NEVER resurrect through compaction.
+    /// Mechanism under suspicion: level-order first-seen-wins lets a Put that
+    /// survives at a SHALLOWER level beat a NEWER tombstone that compaction
+    /// moved deeper (kept-tombstone placement inversion). Drive multi-level
+    /// churn so tombstones end up below stale puts; reads must still see the
+    /// deletion.
+    #[test]
+    fn test_tombstones_survive_compaction_no_resurrect() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 64,
+            size_ratio: 2,
+            ..Default::default()
+        };
+        let engine = std::sync::Arc::new(LsmEngine::open(options).expect("should be valid"));
+        for round in 0..8u32 {
+            for i in 0..40u32 {
+                let key = format!("vic{i:03}");
+                let val = format!("r{round}_old");
+                engine.put(key.into_bytes(), val.into_bytes()).expect("put");
+            }
+            for j in 0..60u32 {
+                let key = format!("fill{round:02}_{j:04}");
+                engine.put(key.into_bytes(), vec![b'x'; 40]).expect("put");
+            }
+            engine.flush().expect("flush");
+            let _ = engine.flush_compaction();
+        }
+
+        // Phase 2: delete all victims.
+        for i in 0..40u32 {
+            let key = format!("vic{i:03}");
+            engine.delete(key.into_bytes()).expect("delete");
+        }
+        engine.flush().expect("flush");
+
+        // Phase 3: churn hard WITH a concurrent writer (production had a
+        // multi-million-row rebuild flushing/compacting in parallel) —
+        // concurrent flush/compaction windows are the suspected trigger.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let eng2 = std::sync::Arc::clone(&engine);
+        let stop2 = stop.clone();
+        let bg = std::thread::spawn(move || {
+            let mut j = 0u32;
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let key = format!("bg_{j:06}");
+                let _ = eng2.put(key.into_bytes(), vec![b'g'; 32]);
+                if j % 20 == 0 {
+                    let _ = eng2.flush();
+                    let _ = eng2.flush_compaction();
+                }
+                j += 1;
+            }
+        });
+
+        for round in 0..25u32 {
+            for j in 0..80u32 {
+                let key = format!("churn{round:02}_{j:04}");
+                engine.put(key.into_bytes(), vec![b'c'; 40]).expect("put");
+            }
+            engine.flush().expect("flush");
+            engine.flush_compaction().expect("compaction");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        bg.join().expect("bg");
+        engine.flush().expect("final flush");
+        engine.flush_compaction().expect("final compaction");
+
+        // Deleted keys must stay deleted — point reads, streaming scans AND
+        // scan_prefix (the path SQL SELECT uses).
+        for i in 0..40u32 {
+            let key = format!("vic{i:03}");
+            let got = engine.get(key.as_bytes()).expect("get");
+            assert_eq!(got, None, "tombstone resurrected for {key}");
+        }
+        let mut seen = 0usize;
+        engine
+            .for_each_live_prefix(b"vic", None, None, |_k, _v| {
+                seen += 1;
+                Ok(())
+            })
+            .expect("scan");
+        assert_eq!(seen, 0, "for_each resurrected deleted rows");
+        let scanned = engine.scan_prefix(b"vic").expect("scan_prefix");
+        assert!(
+            scanned.is_empty(),
+            "scan_prefix (SELECT path) resurrected {} deleted rows",
+            scanned.len()
+        );
     }
 }

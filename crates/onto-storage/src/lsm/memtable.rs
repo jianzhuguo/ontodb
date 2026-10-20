@@ -37,6 +37,12 @@ impl MemTableEntry {
     }
 }
 
+/// Result of a winning-version lookup.
+pub enum VersionLookup {
+    Value(Vec<u8>, SeqNo),
+    Tombstone,
+}
+
 /// In-memory sorted store backed by a BTreeMap.
 ///
 /// Uses composite key (user_key, !seq_no) for ordering, so that
@@ -221,6 +227,22 @@ impl MemTable {
             .range(lower..=upper)
             .filter(move |(_, e)| e.key.as_slice() == key)
             .map(|(_, e)| e)
+    }
+
+    /// Winning (newest) version of `key`.
+    ///
+    /// `Some(Tombstone)` means the key is deleted — callers MUST NOT fall
+    /// through to older sources (immutable/SSTs), or a deleted row resurrects
+    /// from a stale Put below. `None` means no version exists here at all.
+    pub fn get_version(&self, key: &[u8]) -> Option<VersionLookup> {
+        for e in self.get_versions(key) {
+            return Some(if e.is_tombstone() {
+                VersionLookup::Tombstone
+            } else {
+                VersionLookup::Value(e.value.clone(), e.seq_no)
+            });
+        }
+        None
     }
 
     /// Returns an iterator over all entries in sorted order.

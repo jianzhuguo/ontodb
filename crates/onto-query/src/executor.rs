@@ -549,6 +549,12 @@ struct InferenceCache {
     property_aliases: std::collections::HashMap<String, HashSet<String>>,
     /// Property name �?inverse property name.
     inverse_property: std::collections::HashMap<String, Option<String>>,
+    /// Property name �?is_symmetric flag. Uncached this made every
+    /// non-matching filter row re-scan all ontologies (DELETE WHERE id=
+    /// froze on large classes).
+    symmetric_property: std::collections::HashMap<String, bool>,
+    /// Property name �?is_transitive flag (same caching rationale).
+    transitive_property: std::collections::HashMap<String, bool>,
     /// Transitive closure cache: (property, subject) �?set of all transitive objects.
     transitive_closure: std::collections::HashMap<(String, String), HashSet<String>>,
     /// Cached merged ontology (all ontologies merged into one). Avoids repeated scan_prefix.
@@ -563,6 +569,8 @@ impl InferenceCache {
         self.class_hierarchy.clear();
         self.property_aliases.clear();
         self.inverse_property.clear();
+        self.symmetric_property.clear();
+        self.transitive_property.clear();
         self.transitive_closure.clear();
         self.merged_ontology = None;
         self.class_properties.clear();
@@ -575,6 +583,8 @@ impl InferenceCache {
         self.class_hierarchy.clear();
         self.property_aliases.clear();
         self.inverse_property.clear();
+        self.symmetric_property.clear();
+        self.transitive_property.clear();
         self.transitive_closure.clear();
         self.merged_ontology = None; // Must rebuild merged ontology
         self.class_properties.clear();
@@ -2087,10 +2097,29 @@ impl QueryExecutor {
                 };
 
                 if let Some(plan) = cached_plan {
-                    let plan_result = self.execute_plan_read(&plan, engine)?;
-                    let mut rows = match plan_result {
-                        QueryResult::Rows(r) => r,
-                        other => return Ok(other),
+                    // Windowed execution: push OFFSET/LIMIT into the scan so
+                    // skipped rows are never materialized (deep OFFSET on
+                    // multi-million-row classes OOM'd the server).
+                    let mut pre_windowed = false;
+                    let mut rows = {
+                        let mut got: Option<Vec<Map<String, Value>>> = None;
+                        let (wskip, wtake) = Self::select_window(ast);
+                        if Self::select_window_eligible(ast) && (wskip > 0 || wtake.is_some()) {
+                            match self.execute_plan_windowed(&plan, engine, wskip, wtake)? {
+                                Some(wrows) => {
+                                    pre_windowed = true;
+                                    got = Some(wrows);
+                                }
+                                None => {}
+                            }
+                        }
+                        match got {
+                            Some(r) => r,
+                            None => match self.execute_plan_read(&plan, engine)? {
+                                QueryResult::Rows(r) => r,
+                                other => return Ok(other),
+                            },
+                        }
                     };
 
                     // Post-processing
@@ -2214,15 +2243,17 @@ impl QueryExecutor {
                             Self::dedup_rows(&mut rows);
                         }
 
-                        if let Some(off) = offset {
-                            if *off < rows.len() {
-                                rows = rows.split_off(*off);
-                            } else {
-                                rows.clear();
+                        if !pre_windowed {
+                            if let Some(off) = offset {
+                                if *off < rows.len() {
+                                    rows = rows.split_off(*off);
+                                } else {
+                                    rows.clear();
+                                }
                             }
-                        }
-                        if let Some(lim) = limit {
-                            rows.truncate(*lim);
+                            if let Some(lim) = limit {
+                                rows.truncate(*lim);
+                            }
                         }
                     }
 
@@ -3684,6 +3715,294 @@ impl QueryExecutor {
                             row.insert(key, val);
                         }
                     }
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+
+    /// True when a SELECT can push OFFSET/LIMIT into the scan window:
+    /// no aggregates, no GROUP BY, no DISTINCT, no window functions and only
+    /// plain column projections. Everything else needs the full row set first.
+    fn select_window_eligible(ast: &QueryAst) -> bool {
+        let QueryAst::Select {
+            distinct,
+            columns,
+            group_by,
+            ..
+        } = ast
+        else {
+            return false;
+        };
+        if *distinct || group_by.is_some() {
+            return false;
+        }
+        match columns {
+            SelectColumns::Columns(items) => items.iter().all(|item| {
+                matches!(item, SelectItem::Column(_))
+                    && !Self::columns_have_aggregates(columns)
+            }),
+            _ => false,
+        }
+    }
+
+    /// OFFSET/LIMIT of a SELECT as (skip, take).
+    fn select_window(ast: &QueryAst) -> (usize, Option<usize>) {
+        if let QueryAst::Select { offset, limit, .. } = ast {
+            ((*offset).unwrap_or(0), *limit)
+        } else {
+            (0, None)
+        }
+    }
+
+    /// Executes a plan with OFFSET/LIMIT applied inside the scan so skipped
+    /// rows are never materialized. The old path collected every matched row
+    /// and then `split_off(offset)` — `LIMIT 2000 OFFSET 2.1M` held 2.1M rows
+    /// in memory and OOM-killed the server on large classes.
+    ///
+    /// Returns `None` when the plan shape is not a windowed-scan candidate;
+    /// the caller then falls back to the full-materialization path.
+    fn execute_plan_windowed(
+        &self,
+        plan: &ExecutionPlan,
+        engine: &LsmEngine,
+        skip: usize,
+        take: Option<usize>,
+    ) -> Result<Option<Vec<Map<String, Value>>>> {
+        // Peel Projection/Limit wrappers. Limit is superseded by the caller's
+        // window; Projection is applied at the end (kept rows only).
+        let mut node = &plan.root;
+        let mut columns: Option<&SelectColumns> = None;
+        loop {
+            match node {
+                PlanNode::Projection { input, columns: cols, .. } => {
+                    if Self::columns_have_aggregates(cols) {
+                        return Ok(None);
+                    }
+                    match cols {
+                        SelectColumns::Columns(items)
+                            if items
+                                .iter()
+                                .all(|i| matches!(i, SelectItem::Column(_))) =>
+                        {
+                            columns = Some(cols);
+                            node = input;
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                PlanNode::Limit { input, .. } => node = input,
+                _ => break,
+            }
+        }
+
+        let (table, alias, filter) = match node {
+            PlanNode::SeqScan {
+                table,
+                alias,
+                filter,
+                ..
+            } => (table, alias, filter.clone()),
+            PlanNode::Filter {
+                input, predicate, ..
+            } => {
+                if let PlanNode::SeqScan {
+                    table,
+                    alias,
+                    filter: inner,
+                    ..
+                } = input.as_ref()
+                {
+                    // Fuse parent predicate with the scan's own filter.
+                    let fused = match inner.clone() {
+                        Some(existing) => {
+                            Some(FilterExpr::And(Box::new(existing), Box::new(predicate.clone())))
+                        }
+                        None => Some(predicate.clone()),
+                    };
+                    (table, alias, fused)
+                } else {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        let mut rows =
+            self.plan_seq_scan_windowed(engine, table, alias.as_deref(), &filter, columns, skip, take)?;
+        if let Some(cols) = columns {
+            rows = rows
+                .iter()
+                .map(|row| self.project_columns(row, cols))
+                .collect();
+        }
+        Ok(Some(rows))
+    }
+
+    /// Windowed variant of [`Self::plan_seq_scan`]: OFFSET/LIMIT applied while
+    /// scanning so skipped rows are never stored (memory O(take)).
+    fn plan_seq_scan_windowed(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        alias: Option<&str>,
+        filter: &Option<FilterExpr>,
+        projected_columns: Option<&SelectColumns>,
+        skip: usize,
+        take: Option<usize>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let active_txn_id = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
+        let class_hierarchy = self.get_class_hierarchy(engine, table);
+        let scan_classes = self.narrow_scan_scope(engine, table, filter, &class_hierarchy);
+        let fast_filter_cols = Self::extract_fast_filter_columns(filter);
+        let proj_cols: Vec<String> = match projected_columns {
+            Some(SelectColumns::Columns(items)) => {
+                let mut cols = Vec::with_capacity(items.len() + 2);
+                for item in items {
+                    if let SelectItem::Column(col) = item {
+                        let real = if let Some(pos) = col.find(" as ") {
+                            &col[..pos]
+                        } else {
+                            col.as_str()
+                        };
+                        let name = real.split('.').next_back().unwrap_or(real).to_string();
+                        if !cols.contains(&name) {
+                            cols.push(name);
+                        }
+                    }
+                }
+                cols
+            }
+            _ => Vec::new(),
+        };
+
+        let mut rows: Vec<Map<String, Value>> = Vec::new();
+        let mut skipped = 0usize;
+        let stop = std::cell::Cell::new(false);
+        let mut scan_count: u64 = 0;
+
+        {
+            let mut handle = |key: &[u8], val_bytes: &[u8]| -> Result<bool> {
+                if stop.get() {
+                    return Ok(false);
+                }
+                scan_count += 1;
+                if scan_count & 0x3FF == 0 {
+                    self.check_timeout()?;
+                }
+                if !fast_filter_cols.is_empty()
+                    && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols)
+                {
+                    return Ok(true);
+                }
+
+                // Build the candidate row (BinaryRow tier first, JSON fallback),
+                // mirroring plan_seq_scan's conversion semantics.
+                let mut doc: Option<Map<String, Value>> = None;
+                if let Some(brow) = BinaryRow::parse(val_bytes) {
+                    if !brow.class_in_hierarchy(&scan_classes) {
+                        return Ok(true);
+                    }
+                    if let Some(f) = filter {
+                        match eval_binary_filter(&brow, f) {
+                            Some(true) => {}
+                            Some(false) => return Ok(true),
+                            None => {
+                                if let Some(mut d) = brow.to_map() {
+                                    if !self.eval_filter(engine, &d, f) {
+                                        return Ok(true);
+                                    }
+                                    d.insert(
+                                        "__pk__".to_string(),
+                                        Value::String(
+                                            String::from_utf8_lossy(key).to_string(),
+                                        ),
+                                    );
+                                    doc = Some(d);
+                                }
+                            }
+                        }
+                    }
+                    if doc.is_none() {
+                        if let Some(mut d) = brow.to_map_projected(&proj_cols) {
+                            d.insert(
+                                "__pk__".to_string(),
+                                Value::String(String::from_utf8_lossy(key).to_string()),
+                            );
+                            doc = Some(d);
+                        }
+                    }
+                } else if let Ok(serde_json::Value::Object(mut d)) =
+                    serde_json::from_slice::<serde_json::Value>(val_bytes)
+                {
+                    if !scan_classes
+                        .contains(d.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
+                    {
+                        return Ok(true);
+                    }
+                    if let Some(f) = filter {
+                        if !self.eval_filter(engine, &d, f) {
+                            return Ok(true);
+                        }
+                    }
+                    d.insert(
+                        "__pk__".to_string(),
+                        Value::String(String::from_utf8_lossy(key).to_string()),
+                    );
+                    doc = Some(d);
+                }
+
+                if let Some(mut d) = doc {
+                    if skipped < skip {
+                        skipped += 1;
+                        return Ok(true);
+                    }
+                    if let Some(lim) = take {
+                        if rows.len() >= lim {
+                            stop.set(true);
+                            return Ok(false);
+                        }
+                    }
+                    if let Some(a) = alias {
+                        let keys: Vec<String> = d.keys().cloned().collect();
+                        for k in keys {
+                            if k != "__class__" {
+                                if let Some(v) = d.remove(&k) {
+                                    d.insert(format!("{}.{}", a, k), v.clone());
+                                    d.insert(k, v);
+                                }
+                            }
+                        }
+                    }
+                    rows.push(d);
+                    if let Some(lim) = take {
+                        if rows.len() >= lim {
+                            stop.set(true);
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
+            };
+
+            for scan_class in &scan_classes {
+                if stop.get() {
+                    break;
+                }
+                let prefix = format!("{}::", scan_class);
+                if let Some(txn_id) = active_txn_id {
+                    engine.txn_for_each_live_prefix(txn_id, prefix.as_bytes(), |k, v| {
+                        handle(k, v)?;
+                        Ok(())
+                    })?;
+                } else {
+                    engine.for_each_live_prefix_until(
+                        prefix.as_bytes(),
+                        None,
+                        None,
+                        |k, v| handle(k, v),
+                    )?;
                 }
             }
         }
@@ -10163,10 +10482,26 @@ impl QueryExecutor {
     ) -> Result<QueryResult> {
         // For SELECT queries with a cached plan, use it directly
         if let (QueryAst::Select { .. }, Some(plan)) = (ast, cached_plan) {
-            let plan_result = self.execute_plan(plan, engine)?;
-            let mut rows = match plan_result {
-                QueryResult::Rows(r) => r,
-                other => return Ok(other),
+            let (wskip, wtake) = Self::select_window(ast);
+            let mut pre_windowed = false;
+            let mut rows = {
+                let mut got: Option<Vec<Map<String, Value>>> = None;
+                if Self::select_window_eligible(ast) && (wskip > 0 || wtake.is_some()) {
+                    match self.execute_plan_windowed(plan, engine, wskip, wtake)? {
+                        Some(wrows) => {
+                            pre_windowed = true;
+                            got = Some(wrows);
+                        }
+                        None => {}
+                    }
+                }
+                match got {
+                    Some(r) => r,
+                    None => match self.execute_plan(plan, engine)? {
+                        QueryResult::Rows(r) => r,
+                        other => return Ok(other),
+                    },
+                }
             };
 
             // Post-processing: aggregation, window functions, DISTINCT, OFFSET/LIMIT
@@ -10224,15 +10559,17 @@ impl QueryExecutor {
                     Self::dedup_rows(&mut rows);
                 }
 
-                if let Some(off) = offset {
-                    if *off < rows.len() {
-                        rows = rows.split_off(*off);
-                    } else {
-                        rows.clear();
+                if !pre_windowed {
+                    if let Some(off) = offset {
+                        if *off < rows.len() {
+                            rows = rows.split_off(*off);
+                        } else {
+                            rows.clear();
+                        }
                     }
-                }
-                if let Some(lim) = limit {
-                    rows.truncate(*lim);
+                    if let Some(lim) = limit {
+                        rows.truncate(*lim);
+                    }
                 }
             }
 
@@ -10491,10 +10828,29 @@ impl QueryExecutor {
                     .plan(ast)?;
 
                 // Execute the plan to get core result rows
-                let plan_result = self.execute_plan(&plan, engine)?;
-                let mut rows = match plan_result {
-                    QueryResult::Rows(r) => r,
-                    other => return Ok(other),
+                // Windowed execution: push OFFSET/LIMIT into the scan so
+                // skipped rows are never materialized (deep OFFSET on
+                // multi-million-row classes OOM'd the server).
+                let (wskip, wtake) = Self::select_window(ast);
+                let mut pre_windowed = false;
+                let mut rows = {
+                    let mut got: Option<Vec<Map<String, Value>>> = None;
+                    if Self::select_window_eligible(ast) && (wskip > 0 || wtake.is_some()) {
+                        match self.execute_plan_windowed(&plan, engine, wskip, wtake)? {
+                            Some(wrows) => {
+                                pre_windowed = true;
+                                got = Some(wrows);
+                            }
+                            None => {}
+                        }
+                    }
+                    match got {
+                        Some(r) => r,
+                        None => match self.execute_plan(&plan, engine)? {
+                            QueryResult::Rows(r) => r,
+                            other => return Ok(other),
+                        },
+                    }
                 };
 
                 // Post-processing steps not yet in the plan:
@@ -10545,15 +10901,17 @@ impl QueryExecutor {
                 }
 
                 // 5. OFFSET then LIMIT (correct pagination order)
-                if let Some(off) = offset {
-                    if *off < rows.len() {
-                        rows = rows.split_off(*off);
-                    } else {
-                        rows.clear();
+                if !pre_windowed {
+                    if let Some(off) = offset {
+                        if *off < rows.len() {
+                            rows = rows.split_off(*off);
+                        } else {
+                            rows.clear();
+                        }
                     }
-                }
-                if let Some(lim) = limit {
-                    rows.truncate(*lim);
+                    if let Some(lim) = limit {
+                        rows.truncate(*lim);
+                    }
                 }
 
                 Ok(QueryResult::Rows(rows))
@@ -10660,6 +11018,9 @@ impl QueryExecutor {
                 filter,
             ),
             QueryAst::TruncateTable { class } => {
+                // Deletes MUST be immediately visible to the next scan batch.
+                // txn_delete buffers in the transaction, so the re-scan kept
+                // returning the same first batch and the loop never terminated.
                 let batch_size = 5000usize;
                 let mut total_deleted = 0u64;
 
@@ -10674,8 +11035,8 @@ impl QueryExecutor {
                         break;
                     }
 
-                    for (key, _value) in &entries {
-                        engine.txn_delete(txn_id, key.clone())?;
+                    for (key, value) in &entries {
+                        engine.delete_with_deindex(key.clone(), value)?;
                         total_deleted += 1;
                     }
                 }
@@ -13059,28 +13420,60 @@ impl QueryExecutor {
     /// Checks if a property is transitive.
     #[allow(dead_code)]
     fn is_transitive_property(&self, engine: &LsmEngine, property: &str) -> bool {
-        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
-        for (_key, val_bytes) in entries {
-            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
-                if let Some(prop_def) = ontology.properties.get(property) {
-                    return prop_def.is_transitive;
-                }
+        {
+            let cache = self
+                .inference_cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(&cached) = cache.transitive_property.get(property) {
+                return cached;
             }
         }
-        false
+        // Use the cached merged ontology — never scan_prefix per call (the
+        // uncached version froze DELETE/UPDATE filters on large classes).
+        let flag = self
+            .get_merged_ontology(engine)
+            .properties
+            .get(property)
+            .map(|p| p.is_transitive)
+            .unwrap_or(false);
+        {
+            let mut cache = self
+                .inference_cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            cache.transitive_property.insert(property.to_string(), flag);
+        }
+        flag
     }
 
     /// Checks if a property is symmetric.
     fn is_symmetric_property(&self, engine: &LsmEngine, property: &str) -> bool {
-        let entries = engine.scan_prefix(b"__ontology__").unwrap_or_default();
-        for (_key, val_bytes) in entries {
-            if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
-                if let Some(prop_def) = ontology.properties.get(property) {
-                    return prop_def.is_symmetric;
-                }
+        {
+            let cache = self
+                .inference_cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(&cached) = cache.symmetric_property.get(property) {
+                return cached;
             }
         }
-        false
+        // Cached-merged-ontology lookup; the old uncached scan_prefix ran once
+        // per filter row and turned `DELETE WHERE id='…'` into a freeze.
+        let flag = self
+            .get_merged_ontology(engine)
+            .properties
+            .get(property)
+            .map(|p| p.is_symmetric)
+            .unwrap_or(false);
+        {
+            let mut cache = self
+                .inference_cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            cache.symmetric_property.insert(property.to_string(), flag);
+        }
+        flag
     }
 
     /// Performs transitive closure lookup for a transitive property.
@@ -15225,6 +15618,228 @@ mod tests {
             }
             _ => panic!("expected Rows"),
         }
+    }
+
+    /// Regression: TRUNCATE in the transaction path used `txn_delete`, whose
+    /// buffered deletes were invisible to the next scan batch — the loop
+    /// re-deleted the same 5000 rows forever. Must terminate on classes larger
+    /// than one scan batch and clear every row.
+    #[test]
+    fn test_truncate_large_class_terminates() {
+        let (executor, _dir) = setup();
+        for i in 0..7000 {
+            insert_row(&executor, "Bulk", &format!("item-{i:05}"), i);
+        }
+        executor.engine().flush().unwrap();
+
+        let start = std::time::Instant::now();
+        let ast = QueryParser::parse("TRUNCATE Bulk").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        let elapsed = start.elapsed();
+        match &result {
+            QueryResult::Success(msg) => {
+                assert!(msg.contains("7000 row(s) deleted"), "got: {msg}")
+            }
+            _ => panic!("expected Success"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(120),
+            "truncate must terminate promptly, took {elapsed:?}"
+        );
+
+        let ast = QueryParser::parse("SELECT COUNT(*) AS n FROM Bulk").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows[0].get("n").unwrap().as_i64().unwrap(), 0);
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    /// Regression: `DELETE WHERE id='…'` with zero matches froze for hours.    /// Every doc has `id`, so all rows fell into property_value_matches'
+    /// inference fallback where is_symmetric_property re-scanned all
+    /// ontologies per row. Now cached — must finish in seconds.
+    #[test]
+    fn test_delete_zero_match_by_id_completes() {
+        let (executor, _dir) = setup();
+        for i in 0..2000 {
+            let ast = QueryAst::Insert {
+                class: "Thing".to_string(),
+                columns: vec!["id".to_string(), "name".to_string(), "price".to_string()],
+                values: vec![
+                    LiteralValue::String(format!("thing-{i:04}")),
+                    LiteralValue::String(format!("n{i}")),
+                    LiteralValue::Int(i),
+                ],
+            };
+            executor.execute(&ast).unwrap();
+        }
+        executor.engine().flush().unwrap();
+
+        let start = std::time::Instant::now();
+        let ast = QueryParser::parse("DELETE FROM Thing WHERE id = 'no-such-id'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        let elapsed = start.elapsed();
+        match &result {
+            QueryResult::Success(msg) => {
+                assert!(msg.contains("0 row(s) deleted"), "got: {msg}")
+            }
+            _ => panic!("expected Success"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "zero-match delete must be fast, took {elapsed:?}"
+        );
+
+        // A matching id delete must still work after the cache change.
+        let ast = QueryParser::parse("DELETE FROM Thing WHERE id = 'thing-0042'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Success(msg) => {
+                assert!(msg.contains("1 row(s) deleted"), "got: {msg}")
+            }
+            _ => panic!("expected Success"),
+        }
+    }
+
+    /// Regression: OFFSET used to materialize every matched row and then
+    /// `split_off(offset)` — `LIMIT n OFFSET <millions>` OOM-killed the server
+    /// on multi-million-row classes. The windowed scan path must skip without
+    /// storing and produce the correct window (SQL order without ORDER BY is
+    /// implementation-defined; the contract checked here is skip/take
+    /// correctness + content parity with the full path).
+    #[test]
+    fn test_windowed_offset_limit_matches_full_materialization() {
+        let (executor, _dir) = setup();
+        for i in 0..2000u32 {
+            let ast = QueryAst::Insert {
+                class: "Page".to_string(),
+                columns: vec!["name".to_string(), "price".to_string()],
+                values: vec![
+                    LiteralValue::String(format!("n{i:04}")),
+                    LiteralValue::Int(i as i64),
+                ],
+            };
+            executor.execute(&ast).unwrap();
+        }
+        executor.engine().flush().unwrap();
+
+        // Full result set (whatever order the engine yields).
+        let full_ast =
+            QueryParser::parse("SELECT name, price FROM Page WHERE price >= 0").unwrap();
+        let full = match executor.execute(&full_ast).unwrap() {
+            QueryResult::Rows(r) => r,
+            other => {
+                let _ = other;
+                panic!("expected Rows")
+            }
+        };
+        assert_eq!(full.len(), 2000);
+
+        // Windowed slice must contain 7 rows from the same result set.
+        let win_ast =
+            QueryParser::parse("SELECT name, price FROM Page WHERE price >= 0 LIMIT 7 OFFSET 1500")
+                .unwrap();
+        let windowed = match executor.execute(&win_ast).unwrap() {
+            QueryResult::Rows(r) => r,
+            other => {
+                let _ = other;
+                panic!("expected Rows")
+            }
+        };
+        assert_eq!(windowed.len(), 7);
+
+        // Slice self-consistency: the window must be a contiguous slice of the
+        // same path's full ordering (skip/take arithmetic correct).
+        let all_ast =
+            QueryParser::parse("SELECT name, price FROM Page WHERE price >= 0").unwrap();
+        let plan_all = {
+            let planner = executor.planner.read().unwrap();
+            planner.plan(&all_ast).unwrap()
+        };
+        let mut scan_all = executor
+            .execute_plan_windowed(&plan_all, executor.engine(), 0, None)
+            .unwrap()
+            .expect("scan shape windowable");
+        assert_eq!(scan_all.len(), 2000);
+        let tail = scan_all.split_off(1500);
+        assert_eq!(
+            serde_json::to_string(&windowed).unwrap(),
+            serde_json::to_string(&tail[..7]).unwrap(),
+            "OFFSET/LIMIT must be a contiguous slice of the scan order"
+        );
+
+        // Content parity: windowed rows are members of the full result set.
+        let full_set: std::collections::HashSet<String> = full
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect();
+        for row in &windowed {
+            assert!(
+                full_set.contains(&serde_json::to_string(row).unwrap()),
+                "windowed row must exist in the full result"
+            );
+        }
+
+        // OFFSET past the end yields empty, not an error.
+        let past =
+            QueryParser::parse("SELECT name FROM Page LIMIT 5 OFFSET 99999").unwrap();
+        match executor.execute(&past).unwrap() {
+            QueryResult::Rows(r) => assert!(r.is_empty()),
+            other => {
+                let _ = other;
+                panic!("expected Rows")
+            }
+        }
+    }
+
+    /// The windowed plan path must be shape-gated: aggregates / DISTINCT /
+    /// window functions need the full set and must fall back.
+    #[test]
+    fn test_select_window_eligibility_gate() {
+        let ok = QueryParser::parse("SELECT name FROM T LIMIT 3 OFFSET 5").unwrap();
+        assert!(QueryExecutor::select_window_eligible(&ok));
+        assert_eq!(QueryExecutor::select_window(&ok), (5, Some(3)));
+
+        let distinct = QueryParser::parse("SELECT DISTINCT name FROM T LIMIT 3 OFFSET 5").unwrap();
+        assert!(!QueryExecutor::select_window_eligible(&distinct));
+
+        let agg = QueryParser::parse("SELECT COUNT(*) FROM T LIMIT 3 OFFSET 5").unwrap();
+        assert!(!QueryExecutor::select_window_eligible(&agg));
+
+        let plain = QueryParser::parse("SELECT name FROM T").unwrap();
+        assert_eq!(QueryExecutor::select_window(&plain), (0, None));
+    }
+
+    /// Deep OFFSET on a scan-rooted plan goes through the windowed executor
+    /// and returns `Some` (the bounded path), not `None`.
+    #[test]
+    fn test_execute_plan_windowed_takes_scan_shape() {
+        let (executor, _dir) = setup();
+        for i in 0..300u32 {
+            let ast = QueryAst::Insert {
+                class: "Win".to_string(),
+                columns: vec!["name".to_string(), "price".to_string()],
+                values: vec![
+                    LiteralValue::String(format!("w{i:03}")),
+                    LiteralValue::Int(i as i64),
+                ],
+            };
+            executor.execute(&ast).unwrap();
+        }
+        executor.engine().flush().unwrap();
+
+        let ast = QueryParser::parse("SELECT name FROM Win LIMIT 4 OFFSET 100").unwrap();
+        let plan = {
+            let planner = executor.planner.read().unwrap();
+            planner.plan(&ast).unwrap()
+        };
+        let rows = executor
+            .execute_plan_windowed(&plan, executor.engine(), 100, Some(4))
+            .unwrap()
+            .expect("scan-rooted shape must be windowable");
+        assert_eq!(rows.len(), 4);
     }
 
     #[test]
