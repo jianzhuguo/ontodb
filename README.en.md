@@ -444,7 +444,7 @@ SELECT * FROM sensor_data WHERE time > '2024-01-01' LIMIT 100;
 
 > **Market positioning: the semantic service layer of the big-data stack.** Big-data pipelines (lakehouse / Spark / Flink) handle cold data and batch analytics; OntoDB handles semantic queries and online services — ontology reasoning, unified multi-modal queries, write-time data-quality gates, and knowledge graphs — connected via CDC / import pipelines.
 
-**Delivered proof**: biomedical knowledge graph (16.35M records) — drug / target / disease / adverse-reaction data from ChEMBL / UniProt / ClinVar in one engine. `subClassOf` reasoning makes "EGFR inhibitor" queries automatically hit all subclass drugs. Running 7×24 with zero crashes.
+
 
 | Scenario | Why OntoDB |
 |----------|-----------|
