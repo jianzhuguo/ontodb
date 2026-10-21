@@ -4053,25 +4053,43 @@ impl QueryExecutor {
                             if !brow.class_in_hierarchy(&class_hierarchy) {
                                 continue;
                             }
-                            // BinaryRow filter evaluation
-                            if let Some(true) = eval_binary_filter(&brow, f) {
-                                if let Some(mut doc) = brow.to_map() {
-                                    doc.insert(
-                                        "__pk__".to_string(),
-                                        Value::String(String::from_utf8_lossy(pk).to_string()),
-                                    );
-                                    rows.push(doc);
+                            // BinaryRow filter evaluation.
+                            //
+                            // `Some(false)` means the predicate was fully
+                            // evaluated and REJECTED the row — it must not
+                            // fall through to the Map fallback, which used to
+                            // re-admit it without any filter (stale rows /
+                            // resurrection for And predicates).
+                            // `None` means we couldn't evaluate on BinaryRow
+                            // (e.g. subquery predicates) — only then defer to
+                            // the Map path, which re-applies the filter.
+                            match eval_binary_filter(&brow, f) {
+                                Some(true) => {
+                                    if let Some(mut doc) = brow.to_map() {
+                                        doc.insert(
+                                            "__pk__".to_string(),
+                                            Value::String(
+                                                String::from_utf8_lossy(pk).to_string(),
+                                            ),
+                                        );
+                                        rows.push(doc);
+                                    }
+                                    continue;
                                 }
-                                continue;
+                                Some(false) => continue,
+                                None => {}
                             }
                         }
-                        // Fallback: full Map parsing
+                        // Fallback: full Map parsing — filter must be
+                        // re-applied here too (BinaryRow parse may have
+                        // failed, or eval_binary_filter declined).
                         if let Some(mut doc) = simd_parse_row(&val_bytes) {
                             if doc
                                 .get("__class__")
                                 .and_then(|v| v.as_str())
                                 .map(|c| class_hierarchy.contains(c))
                                 .unwrap_or(false)
+                                && self.matches_filter(engine, &doc, &Some(f.clone()))
                             {
                                 doc.insert(
                                     "__pk__".to_string(),
@@ -7561,7 +7579,6 @@ impl QueryExecutor {
             }
             _ => Vec::new(),
         };
-        let proj_ref: Option<&[String]> = if proj_col_names.is_empty() { None } else { Some(&proj_col_names) };
         let class_hierarchy = self.get_class_hierarchy_read(engine, table);
 
         if let Some(f) = filter {
@@ -7613,7 +7630,31 @@ impl QueryExecutor {
                 all_pkeys.truncate(lim);
             }
             if !all_pkeys.is_empty() {
-                let mut rows = Self::fetch_rows_by_pks_read(engine, &all_pkeys, proj_ref)?;
+                // The residual filter must see every column it references.
+                // Fetching a narrowed projection first and THEN filtering
+                // mis-evaluates missing columns: `Eq` on a stripped column is
+                // false (row silently vanishes) and `IsNull` on a stripped
+                // column is true (row wrongly admitted). Fetch projection ∪
+                // filter columns, filter, then strip back to the projection.
+                let mut fcols: Vec<String> = Vec::new();
+                if let Some(f) = filter.as_ref() {
+                    Self::collect_filter_columns(f, &mut fcols);
+                }
+                let mut fetch_cols = proj_col_names.clone();
+                let proj_ref_empty = proj_col_names.is_empty();
+                let mut added = false;
+                for c in fcols {
+                    if !fetch_cols.contains(&c) {
+                        fetch_cols.push(c);
+                        added = true;
+                    }
+                }
+                // Empty projection means SELECT * — must fetch full rows. Only
+                // narrow the fetch when the caller asked for explicit columns.
+                let fetch_ref: Option<&[String]> =
+                    if fetch_cols.is_empty() || proj_ref_empty { None } else { Some(&fetch_cols) };
+
+                let mut rows = Self::fetch_rows_by_pks_read(engine, &all_pkeys, fetch_ref)?;
                 rows.retain(|row| {
                     row.get("__class__")
                         .and_then(|v| v.as_str())
@@ -7632,6 +7673,23 @@ impl QueryExecutor {
                 // filter this would under-return.
                 if let Some(lim) = limit {
                     rows.truncate(lim);
+                }
+                // Strip the helper columns the filter needed, keeping only
+                // what the caller asked for (plus __class__ which the row
+                // parser always includes and hierarchy checks rely on).
+                if added {
+                    if let Some(proj) = projected_columns {
+                        rows = rows
+                            .into_iter()
+                            .map(|row| {
+                                let mut out = self.project_columns(&row, proj);
+                                if let Some(c) = row.get("__class__") {
+                                    out.insert("__class__".to_string(), c.clone());
+                                }
+                                out
+                            })
+                            .collect();
+                    }
                 }
                 // Add shard routing info
                 if let Some(router) = self
@@ -8385,15 +8443,55 @@ impl QueryExecutor {
 
         let mut emitted = 0usize;
         let mut skipped = 0usize;
+        // Same contract as plan_index_scan_read_limit: the residual filter must
+        // see every column it references, so fetch projection ∪ filter columns
+        // and strip after filtering.
+        let mut fcols: Vec<String> = Vec::new();
+        if let Some(f) = filter {
+            Self::collect_filter_columns(f, &mut fcols);
+        }
+        let proj_vec: Vec<String> = projected_columns.unwrap_or(&[]).to_vec();
+        let proj_ref_empty = proj_vec.is_empty();
+        let mut fetch_cols = proj_vec.clone();
+        let mut added = false;
+        for c in fcols {
+            if !fetch_cols.contains(&c) {
+                fetch_cols.push(c);
+                added = true;
+            }
+        }
+        // Empty projection means SELECT * — must fetch full rows. Only narrow
+        // the fetch when the caller asked for explicit columns.
+        let fetch_ref: Option<&[String]> =
+            if fetch_cols.is_empty() || proj_ref_empty { None } else { Some(&fetch_cols) };
+
         Self::fetch_rows_by_pks_stream(
             engine,
             &all_pkeys,
-            projected_columns,
+            fetch_ref,
             Self::STREAM_BATCH_ROWS,
             &mut |mut rows| {
                 // Optional residual filter (e.g. range pred not covered by index).
                 if let Some(f) = filter {
                     rows.retain(|row| self.eval_filter_read(engine, row, f));
+                }
+                // Strip helper columns the filter needed (keep __class__).
+                if added && !proj_vec.is_empty() {
+                    rows = rows
+                        .into_iter()
+                        .map(|row| {
+                            let mut out = Map::new();
+                            if let Some(c) = row.get("__class__") {
+                                out.insert("__class__".to_string(), c.clone());
+                            }
+                            for c in &proj_vec {
+                                if let Some(v) = row.get(c) {
+                                    out.insert(c.clone(), v.clone());
+                                }
+                            }
+                            out
+                        })
+                        .collect();
                 }
                 if skipped < skip {
                     let drop_n = (skip - skipped).min(rows.len());
@@ -8578,10 +8676,32 @@ impl QueryExecutor {
         }
 
         let hierarchy = class_hierarchy;
+        // Same contract as plan_index_scan_read_limit: the residual filter must
+        // see every column it references. Fetch projection ∪ filter columns,
+        // filter, then strip back to the caller's projection.
+        let mut fcols: Vec<String> = Vec::new();
+        if let Some(f) = filter {
+            Self::collect_filter_columns(f, &mut fcols);
+        }
+        let proj_vec: Vec<String> = projected_columns.unwrap_or(&[]).to_vec();
+        let proj_ref_empty = proj_vec.is_empty();
+        let mut fetch_cols = proj_vec.clone();
+        let mut added = false;
+        for c in fcols {
+            if !fetch_cols.contains(&c) {
+                fetch_cols.push(c);
+                added = true;
+            }
+        }
+        // Empty projection means SELECT * — must fetch full rows. Only narrow
+        // the fetch when the caller asked for explicit columns.
+        let fetch_ref: Option<&[String]> =
+            if fetch_cols.is_empty() || proj_ref_empty { None } else { Some(&fetch_cols) };
+
         Self::fetch_rows_by_pks_stream(
             engine,
             &all_pkeys,
-            projected_columns,
+            fetch_ref,
             Self::STREAM_BATCH_ROWS,
             &mut |mut rows| {
                 rows.retain(|row| {
@@ -8593,6 +8713,24 @@ impl QueryExecutor {
                 // Residual predicates not expressible as an index range.
                 if let Some(f) = filter.as_ref() {
                     rows.retain(|row| self.eval_filter_read(engine, row, f));
+                }
+                // Strip helper columns the filter needed (keep __class__).
+                if added && !proj_vec.is_empty() {
+                    rows = rows
+                        .into_iter()
+                        .map(|row| {
+                            let mut out = Map::new();
+                            if let Some(c) = row.get("__class__") {
+                                out.insert("__class__".to_string(), c.clone());
+                            }
+                            for c in &proj_vec {
+                                if let Some(v) = row.get(c) {
+                                    out.insert(c.clone(), v.clone());
+                                }
+                            }
+                            out
+                        })
+                        .collect();
                 }
                 if rows.is_empty() {
                     return true;
@@ -15514,6 +15652,212 @@ mod tests {
                 assert_eq!(rows.len(), 2); // iPhone and MacBook
             }
             _ => panic!("expected Rows"),
+        }
+    }
+
+    /// Regression: projection pushdown must not strip columns the residual
+    /// filter needs. `SELECT fp WHERE id=...` used to return 0 rows (Eq on a
+    /// stripped column is false) and `SELECT id,smiles WHERE fp IS NULL`
+    /// matched every row (IsNull on a stripped column is true).
+    #[test]
+    fn test_projection_keeps_filter_columns() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        executor.engine().flush().unwrap();
+
+        // WHERE references `name`, SELECT does not — must still return the row.
+        let ast = QueryParser::parse("SELECT price FROM Product WHERE name = 'iPhone'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1, "row must survive filter on unprojected column");
+                assert_eq!(rows[0].get("price"), Some(&serde_json::json!(999)));
+            }
+            _ => panic!("expected Rows"),
+        }
+
+        // Symmetric case: IS NULL on an unprojected column must not admit
+        // rows where the column is present.
+        let ast = QueryParser::parse("SELECT name FROM Product WHERE price IS NULL").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert!(rows.is_empty(), "price is never NULL here, got {:?}", rows);
+            }
+            _ => panic!("expected Rows"),
+        }
+
+        // SELECT * must return every column — the fetch-union must not
+        // narrow to just the filter columns when no projection is given.
+        let ast = QueryParser::parse("SELECT * FROM Product WHERE name = 'iPhone'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert!(rows[0].get("price").is_some(), "SELECT * dropped price: {:?}", rows[0]);
+                assert!(rows[0].get("name").is_some(), "SELECT * dropped name: {:?}", rows[0]);
+            }
+            _ => panic!("expected Rows"),
+        }
+
+        // And-filter + LIMIT: `id > ... AND col IS NULL` must not drop
+        // requested columns (live repro: SELECT * lost everything but id).
+        let ast = QueryParser::parse(
+            "SELECT name, price FROM Product WHERE name > 'A' AND price IS NULL",
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert!(rows.is_empty(), "price is never NULL here, got {:?}", rows);
+            }
+            _ => panic!("expected Rows"),
+        }
+
+        let ast = QueryParser::parse(
+            "SELECT name FROM Product WHERE name > 'A' AND price > 100",
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2, "iPhone+MacBook, got {:?}", rows);
+                for r in rows {
+                    assert!(r.get("name").is_some(), "And-filter dropped name: {:?}", r);
+                }
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    /// Regression: with a secondary index in play (the production shape), an
+    /// And-filter must not strip requested columns. Live repro:
+    /// `SELECT * WHERE fp IS NULL AND id > 'x'` returned only {__class__, id}
+    /// and `SELECT id, smiles WHERE fp IS NULL AND id > 'x' ORDER BY id`
+    /// dropped smiles — the index-scan fetch narrowed to filter columns.
+    #[test]
+    fn test_index_scan_and_filter_keeps_columns() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryParser::parse("CREATE INDEX ON Product (name)").unwrap())
+            .unwrap();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine().flush().unwrap();
+
+        // And filter on indexed col + unprojected col; SELECT * must keep all.
+        let ast = QueryParser::parse(
+            "SELECT * FROM Product WHERE name > 'A' AND price > 800",
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2, "iPhone+MacBook, got {:?}", rows);
+                for r in rows {
+                    assert!(r.get("price").is_some(), "SELECT * dropped price: {:?}", r);
+                    assert!(r.get("name").is_some(), "SELECT * dropped name: {:?}", r);
+                }
+            }
+            _ => panic!("expected Rows"),
+        }
+
+        // Narrow projection + And residual filter must keep the projection.
+        let ast = QueryParser::parse(
+            "SELECT name, price FROM Product WHERE name > 'A' AND price > 800",
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2, "got {:?}", rows);
+                for r in rows {
+                    assert!(r.get("name").is_some(), "dropped name: {:?}", r);
+                    assert!(r.get("price").is_some(), "dropped price: {:?}", r);
+                }
+            }
+            _ => panic!("expected Rows"),
+        }
+
+        // ORDER BY on the indexed column (the streaming ordered path) —
+        // this is the exact shape that dropped smiles in production.
+        let ast = QueryParser::parse(
+            "SELECT name, price FROM Product WHERE name > 'A' AND price > 800 ORDER BY name",
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2, "got {:?}", rows);
+                for r in rows {
+                    assert!(r.get("name").is_some(), "ORDER BY dropped name: {:?}", r);
+                    assert!(r.get("price").is_some(), "ORDER BY dropped price: {:?}", r);
+                }
+            }
+            _ => panic!("expected Rows"),
+        }
+
+        // ORDER BY without the residual filter on the second column.
+        let ast = QueryParser::parse(
+            "SELECT name, price FROM Product WHERE name > 'A' ORDER BY name",
+        ).unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 3, "got {:?}", rows);
+                for r in rows {
+                    assert!(r.get("name").is_some(), "ORDER BY dropped name: {:?}", r);
+                    assert!(r.get("price").is_some(), "ORDER BY dropped price: {:?}", r);
+                }
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    /// Same contract on the STREAMING path (what HTTP uses) — `execute()`
+    /// goes through execute_plan_node while HTTP goes through
+    /// execute_read_streaming → stream_ordered_index_read. Both must keep
+    /// projected columns when an ORDER BY is present.
+    #[test]
+    fn test_streaming_ordered_keeps_columns() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryParser::parse("CREATE INDEX ON Product (name)").unwrap())
+            .unwrap();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        executor.engine().flush().unwrap();
+
+        for sql in [
+            "SELECT name, price FROM Product WHERE name > 'A' ORDER BY name",
+            "SELECT name, price FROM Product WHERE name = 'iPhone' ORDER BY name",
+            "SELECT name FROM Product WHERE name > 'A' ORDER BY name LIMIT 2",
+            // The live repro shape: residual filter references a column NOT in
+            // the projection → fetch-union adds it, strip runs afterwards.
+            "SELECT name FROM Product WHERE name > 'A' AND price > 800 ORDER BY name",
+            "SELECT name FROM Product WHERE name > 'A' AND price > 800 ORDER BY name LIMIT 2",
+            "SELECT name, price FROM Product WHERE name > 'A' AND price IS NOT NULL ORDER BY name LIMIT 2",
+        ] {
+            let ast = QueryParser::parse(sql).unwrap();
+            let mut collected: Vec<Map<String, Value>> = Vec::new();
+            executor
+                .execute_read_streaming(&ast, &mut |rows| {
+                    collected.extend(rows);
+                    true
+                })
+                .unwrap();
+            assert!(!collected.is_empty(), "no rows for {sql}");
+            for r in &collected {
+                assert!(
+                    r.get("name").is_some(),
+                    "streaming ORDER BY dropped name in `{sql}`: {r:?}"
+                );
+                // price must be present only when it's in the projection.
+                if sql.starts_with("SELECT name, price") {
+                    assert!(
+                        r.get("price").is_some(),
+                        "streaming ORDER BY dropped price in `{sql}`: {r:?}"
+                    );
+                }
+            }
         }
     }
 
