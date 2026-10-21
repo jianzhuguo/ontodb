@@ -725,6 +725,69 @@ impl IndexManager {
     }
 
     /// Read-only range scan using in-memory and disk indexes (merged).
+    /// Walk the index in (value, pk) order and return up to `limit` primary
+    /// keys. Bounds are **pre-encoded** values ([`Self::encode_value`]), not raw
+    /// JSON — callers that already extracted byte bounds from a filter use this
+    /// directly. Delegates to the same mem_complete / disk-only / mem+disk
+    /// merge as [`Self::lookup_range_read_limit`], so results are always in
+    /// key order regardless of which side holds entries.
+    ///
+    /// Ordered execution paths (`ORDER BY`, keyset pagination) **must** use
+    /// this instead of raw `get_index` + `range_cursor` — the latter only
+    /// walks the in-memory tree and silently misses disk entries after
+    /// `open_disk_indexes` creates empty memory trees.
+    pub fn range_pkeys_read_limit(
+        &self,
+        class: &str,
+        column: &str,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Option<Vec<Vec<u8>>> {
+        let key = (class.to_string(), column.to_string());
+
+        let mem_has = self.indexes.contains_key(&key);
+        let disk_has = self.disk_indexes.contains_key(&key);
+        if !mem_has && !disk_has {
+            return None;
+        }
+
+        // Fast path: memory tree is authoritative, already in value order.
+        if mem_has && self.mem_complete.contains(&key) {
+            return self.indexes.get(&key).map(|tree| {
+                collect_pks(tree.range_cursor(lo, hi), limit)
+            });
+        }
+
+        // Single source — already value-ordered, no merge needed.
+        if mem_has && !disk_has {
+            return self.indexes.get(&key).map(|tree| {
+                collect_pks(tree.range_cursor(lo, hi), limit)
+            });
+        }
+        if !mem_has && disk_has {
+            return self
+                .disk_indexes
+                .get(&key)
+                .map(|d| {
+                    let mut idx = d.lock().unwrap_or_else(|e| e.into_inner());
+                    let cur = idx.range_cursor(lo, hi).ok()?;
+                    Some(collect_pks_disk(cur, limit))
+                })
+                .flatten();
+        }
+
+        // Both sources — streaming merge by (value, pk).
+        let tree = self.indexes.get(&key)?;
+        let disk = self.disk_indexes.get(&key)?;
+        let mut disk_idx = disk.lock().unwrap_or_else(|e| e.into_inner());
+        let disk_cur = disk_idx.range_cursor(lo, hi).ok()?;
+        let mem_cur = tree.range_cursor(lo, hi);
+        Some(merge_cursors(mem_cur, disk_cur, limit))
+    }
+
+    /// Range lookup with JSON values (encoded internally). See
+    /// [`Self::range_pkeys_read_limit`] for the pre-encoded variant.
     pub fn lookup_range_read(
         &self,
         class: &str,

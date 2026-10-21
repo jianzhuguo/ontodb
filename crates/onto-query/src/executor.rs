@@ -8401,8 +8401,11 @@ impl QueryExecutor {
         }
 
         // Collect pkeys in index order, with filter bounds pushed into the walk
-        // when the filter is on the same column. Borrowed cursor �?values are
-        // never cloned; only pks are materialized.
+        // when the filter is on the same column.  Use the manager's
+        // `range_pkeys_read_limit` which merges mem+disk (see manager.rs) —
+        // raw `get_index` + `range_cursor` only walks the in-memory tree and
+        // misses disk entries after `open_disk_indexes` creates empty memory
+        // trees.
         let (lo_bound, hi_bound) = Self::range_bounds_for_column(filter, order_col);
         let want = take.map(|t| t.saturating_add(skip));
         // Over-fetch a little when a residual filter may reject rows.
@@ -8414,17 +8417,14 @@ impl QueryExecutor {
         let mut all_pkeys: Vec<Vec<u8>> = Vec::new();
         for scan_class in &indexed {
             let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
-            if let Some(tree) = mgr.get_index(scan_class, order_col) {
-                let mut cur = tree.range_cursor(lo_bound.as_deref(), hi_bound.as_deref());
-                let mut n = 0usize;
-                while let Some((_, pk)) = cur.current() {
-                    all_pkeys.push(pk.to_vec());
-                    n += 1;
-                    if fetch_lim.is_some_and(|l| n >= l) {
-                        break;
-                    }
-                    cur.advance();
-                }
+            if let Some(pkeys) = mgr.range_pkeys_read_limit(
+                scan_class,
+                order_col,
+                lo_bound.as_deref(),
+                hi_bound.as_deref(),
+                fetch_lim,
+            ) {
+                all_pkeys.extend(pkeys);
             }
         }
         if !ascending {
