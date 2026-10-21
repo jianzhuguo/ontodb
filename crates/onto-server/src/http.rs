@@ -1515,20 +1515,29 @@ async fn execute_query(
     let t_parse = start.elapsed().as_secs_f64() * 1000.0;
     let t_exec_start = std::time::Instant::now();
 
-    // Streaming path: simple SELECTs without ORDER BY/GROUP BY/etc. start
-    // flushing rows while the rest of the scan is still running. This is what
-    // cuts TTFT — the socket sees the first batch before the full result set
-    // is materialized.
+    // Streaming path: simple SELECTs start flushing rows while the rest of
+    // the scan is still running. This is what cuts TTFT — the socket sees the
+    // first batch before the full result set is materialized.
     //
-    // Small result sets skip streaming entirely: `std::thread::spawn` +
-    // channel overhead dominates the actual scan for tiny LIMITs (the
+    // Small result sets skip streaming: `std::thread::spawn` + channel
+    // overhead dominates the actual scan for tiny LIMITs (the
     // `__ontology__`-shaped query), capping throughput at ~3k rps.
+    //
+    // Exception: ORDER BY + small LIMIT still streams — the ordered-index
+    // path (`stream_ordered_index_read`) walks the index in key order and
+    // stops after LIMIT rows. Without streaming it would fall back to the
+    // plan executor which, before the index-scan-for-orderby fix, always
+    // chose SeqScan + Sort for bare ORDER BY (43s for LIMIT 15).
+    let has_order_by = match &ast {
+        QueryAst::Select { order_by, .. } => !order_by.is_empty(),
+        _ => false,
+    };
     let small_limit = match &ast {
         QueryAst::Select { limit: Some(l), .. } => *l <= 100,
         _ => false,
     };
     let streamable = !req.pretty
-        && !small_limit
+        && (!small_limit || has_order_by)
         && onto_query::QueryExecutor::is_read_only_query(&ast)
         && onto_query::QueryExecutor::is_streamable_select(&ast);
 

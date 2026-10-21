@@ -761,7 +761,7 @@ impl QueryPlanner {
         );
         candidates.push(seq_plan);
 
-        // Candidate 2: Index scan (if applicable)
+        // Candidate 2: Index scan on a filter column (if applicable)
         if let Some(filter_expr) = &main_filter {
             let selectivity = self.cost_model.estimate_selectivity(&stats, filter_expr);
             if selectivity.can_use_index {
@@ -788,6 +788,38 @@ impl QueryPlanner {
                         candidates.push(index_plan);
                     }
                 }
+            }
+        }
+
+        // Candidate 3: Index scan on the ORDER BY column — even without a
+        // WHERE filter. `SELECT ... ORDER BY id LIMIT n` can walk the index
+        // in key order and stop after n entries (O(log n + n)), which beats
+        // SeqScan + Sort of 2.4M rows by orders of magnitude. Without this
+        // candidate the planner only ever considered IndexScan when a filter
+        // was present, so bare ORDER BY always fell back to full scan + sort.
+        if order_by.len() == 1 && group_by.is_none() && joins.is_empty() {
+            let ob_col = order_by[0]
+                .column
+                .split('.')
+                .next_back()
+                .unwrap_or(&order_by[0].column)
+                .trim_matches('"');
+            if let Some(index) = stats.secondary_indexes.iter().find(|i| i.column == ob_col) {
+                let index_plan = self.plan_index_scan(
+                    from,
+                    from_alias,
+                    &stats,
+                    index,
+                    &main_filter,
+                    joins,
+                    group_by,
+                    having,
+                    order_by,
+                    limit,
+                    columns,
+                    &pushed_filters,
+                );
+                candidates.push(index_plan);
             }
         }
 
@@ -1485,9 +1517,19 @@ impl QueryPlanner {
             current_cost = agg_cost;
         }
 
-        // Index scan is already sorted, so no need for sort unless ORDER BY is on different column
+        // Index scan is already sorted, so no need for sort unless ORDER BY is on different column.
+        // Column names from the parser may carry identifier quotes (`"id"`) —
+        // strip them before comparing so `ORDER BY id` matches index column `id`.
         if !order_by.is_empty() {
-            let needs_sort = order_by.iter().any(|ob| ob.column != index.column);
+            let needs_sort = order_by.iter().any(|ob| {
+                let ob_col = ob
+                    .column
+                    .split('.')
+                    .next_back()
+                    .unwrap_or(&ob.column)
+                    .trim_matches('"');
+                ob_col != index.column
+            });
             if needs_sort {
                 let sort_cost = self.cost_model.sort_cost(&current_cost);
                 current_node = PlanNode::Sort {
@@ -1499,7 +1541,12 @@ impl QueryPlanner {
             }
         }
 
-        // Apply limit
+        // Apply limit. When the scan already produces rows in the required
+        // order (sorted index walk), LIMIT is an early-termination signal —
+        // only `count` entries need to be visited, not the full result set.
+        // Reflect that in the cost or the optimizer will always prefer
+        // SeqScan (whose cost is lowered by its own limit pushdown) over the
+        // far cheaper ordered index walk.
         if let Some(limit_count) = limit {
             let limited_rows = current_cost.rows.min(limit_count as u64);
             current_node = PlanNode::Limit {
@@ -1507,8 +1554,21 @@ impl QueryPlanner {
                 count: limit_count,
                 estimated_rows: limited_rows,
             };
-            current_cost =
-                CostEstimate::new(limited_rows, current_cost.io_cost, current_cost.cpu_cost);
+            if current_cost.is_sorted && (current_cost.rows as usize) > limit_count {
+                // Sorted input: walking `limit_count` index entries instead of
+                // the whole range. Cost scales by the fraction actually visited.
+                let frac = limited_rows as f64 / current_cost.rows.max(1) as f64;
+                current_cost = CostEstimate::new(
+                    limited_rows,
+                    current_cost.io_cost * frac,
+                    current_cost.cpu_cost * frac,
+                )
+                .with_index()
+                .with_sorted();
+            } else {
+                current_cost =
+                    CostEstimate::new(limited_rows, current_cost.io_cost, current_cost.cpu_cost);
+            }
         }
 
         // Note: Projection is added in plan_select after remaining filter

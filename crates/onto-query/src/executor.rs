@@ -11248,10 +11248,14 @@ impl QueryExecutor {
     }
 
     /// Sorts rows by a column. Tries numeric comparison first, falls back to string.
+    /// The column name may carry SQL identifier quotes (`"id"`) from the parser —
+    /// strip them so lookup matches the unquoted keys in the row map. Without
+    /// this, `get(col)` is always None and the sort is a silent no-op.
     fn sort_rows(rows: &mut Vec<Map<String, Value>>, col: &str, ascending: bool) {
+        let clean = col.trim_matches('"');
         rows.sort_by(|a, b| {
-            let a_val = a.get(col);
-            let b_val = b.get(col);
+            let a_val = a.get(clean);
+            let b_val = b.get(clean);
             let ord = Self::compare_values_direct(a_val, b_val);
             if ascending {
                 ord
