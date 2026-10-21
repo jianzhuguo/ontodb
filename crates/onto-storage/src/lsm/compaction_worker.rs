@@ -264,6 +264,20 @@ impl CompactionWorker {
                 // Deepest level: bounded self-merge. Quiet when no size-safe
                 // pair exists (otherwise the trigger logs every tick).
                 self.merge_last_level_batch()?;
+            } else if level == 0 {
+                // L0: collapse in place first. L0 files mutually overlap
+                // (memtable flushes), so L0→L1 tombstone-placement safety
+                // defers almost every batch and the level never drains.
+                // Self-merge cuts file count without sinking tombstones;
+                // once L0 is small, the shadowing set fits under EXPAND_CAP
+                // and normal L0→L1 can proceed.
+                tracing::info!(
+                    "File-count trigger: L0 has {} files (> {}), self-merging batch",
+                    nfiles,
+                    FILE_COUNT_TRIGGER
+                );
+                self.merge_l0_self_batch()?;
+                self.compact_level(0)?;
             } else {
                 tracing::info!(
                     "File-count trigger: L{} has {} files (> {}), merging batch",
@@ -327,7 +341,16 @@ impl CompactionWorker {
         } else {
             0.0
         };
-        size_score + file_penalty
+        let score = size_score + file_penalty;
+        // L0 must drain into L1 even when total size sits under target —
+        // many small overlapping L0 SSTs multiply read amp without ever
+        // tripping the size score. Floor the score so the L0→L1 path runs
+        // once the file-count trigger has thinned the level out.
+        if level == 0 && file_count > 16 {
+            score.max(1.1)
+        } else {
+            score
+        }
     }
 
     /// Returns the target size for a level.
@@ -486,7 +509,16 @@ impl CompactionWorker {
         // cap, keep the affected input file OUT of this round — its tombstones
         // stay at the source level, which is safe (shallow beats deep on read).
         {
+            // L0 files mutually overlap, so the shadowing set can be the whole
+            // level. Cap scales with level size: a fixed 40 would defer every
+            // L0 batch (liveness trap) while L1+ has disjoint ranges and needs
+            // no scaling.
             const EXPAND_CAP: usize = 40;
+            let expand_cap = if level == 0 {
+                (ssts_to_compact.len() * 4).max(EXPAND_CAP)
+            } else {
+                EXPAND_CAP
+            };
             let mut excluded_inputs: Vec<PathBuf> = Vec::new();
             let mut kept: Vec<SsTableInfo> = Vec::with_capacity(ssts_to_compact.len());
             {
@@ -524,7 +556,7 @@ impl CompactionWorker {
                         + next_level_ssts.len()
                         + expanded.len()
                         + shadowed.len();
-                    if projected > EXPAND_CAP {
+                    if projected > expand_cap {
                         excluded_inputs.push(s.path.clone());
                         continue;
                     }
@@ -719,9 +751,12 @@ impl CompactionWorker {
                 next_level_ssts.iter().map(|s| s.path.clone()).collect();
             levels[next_level].retain(|s| !overlap_paths.contains(&s.path));
 
-            // Add new merged SSTables
+            // Add new merged SSTables. Cross-level: level-N inputs are newer
+            // than any level-(N+1) file, so the output is the newest thing in
+            // next_level — append at the end (read via `iter().rev()` first).
+            // Do NOT `sort_by(min_key)`: that breaks the insertion-order-is-age
+            // contract and lets a stale Put beat a newer Tombstone.
             levels[next_level].extend(new_ssts);
-            levels[next_level].sort_by(|a, b| a.min_key.cmp(&b.min_key));
 
             // Evict cache entries and schedule deletions inside the same critical section
             let mut evicted = Vec::new();
@@ -750,6 +785,213 @@ impl CompactionWorker {
             ssts_to_compact.len(),
             next_level_ssts.len(),
             entry_count
+        );
+
+        Ok(())
+    }
+
+    /// L0 in-place self-merge (no sink to L1).
+    ///
+    /// L0 SSTs are memtable flushes with mutually overlapping key ranges, so
+    /// the L0→L1 tombstone-placement guard (Step 2.5 in `compact_level`)
+    /// defers almost every input and the level never drains — a pure liveness
+    /// trap under bulk load. Merging L0 files *among themselves* keeps
+    /// tombstones at L0 (shallow-beats-deep reads stay correct) while cutting
+    /// file count, which is the only goal of the file-count trigger.
+    ///
+    /// Positional invariant: `levels[0]` is flush-ordered (append = newest) and
+    /// the read path does first-seen-wins over `iter().rev()` — list position,
+    /// NOT seq_no, decides which SST wins. So the batch must be the OLDEST
+    /// prefix (low indices) and the output must splice back at the same
+    /// position. Appending merged output at the end would promote stale
+    /// versions over newer non-batched flushes and resurrect deleted rows.
+    fn merge_l0_self_batch(&mut self) -> Result<()> {
+        const L0_SELF_BATCH: usize = 16;
+
+        // Snapshot the oldest L0 SSTs (low indices = early flushes = stale).
+        // Empty shells (<64 B) are discarded rather than merged.
+        let (batch, empty_ssts) = {
+            let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            if levels.is_empty() || levels[0].len() < 2 {
+                return Ok(());
+            }
+            let mut ssts: Vec<SsTableInfo> = Vec::new();
+            let mut empty: Vec<SsTableInfo> = Vec::new();
+            for s in levels[0].iter() {
+                if ssts.len() + empty.len() >= L0_SELF_BATCH {
+                    break;
+                }
+                if s.size < 64 {
+                    empty.push(s.clone());
+                } else {
+                    ssts.push(s.clone());
+                }
+            }
+            for e in &empty {
+                levels[0].retain(|s| s.path != e.path);
+            }
+            (ssts, empty)
+        };
+        for e in &empty_ssts {
+            self.sst_cache.remove(&e.path);
+            self.pending_deletions.push(e.path.clone());
+        }
+        if batch.len() < 2 {
+            return Ok(());
+        }
+
+        // Tombstone-drop safety: a tombstone may only be dropped when no SST
+        // surviving outside this merge can hold an older version of the key.
+        // Same contract as `compact_level` — self-merge must not resurrect
+        // rows whose only remaining Put lives in an L0/L1 file we left out.
+        let survivor_ranges: Vec<(Vec<u8>, Vec<u8>)> = {
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let merged: std::collections::HashSet<PathBuf> =
+                batch.iter().map(|s| s.path.clone()).collect();
+            levels
+                .iter()
+                .flat_map(|ssts| ssts.iter())
+                .filter(|s| !merged.contains(&s.path))
+                .map(|s| (s.min_key.clone(), s.max_key.clone()))
+                .collect()
+        };
+
+        let paths: Vec<PathBuf> = batch.iter().map(|s| s.path.clone()).collect();
+        let mut merge_iter =
+            crate::lsm::streaming_merge::StreamingMergeIterator::new(&paths)
+                .map_err(|e| {
+                    onto_core::CoreError::Custom(format!(
+                        "L0 self-merge iterator failed: {}",
+                        e
+                    ))
+                })?;
+
+        // Output cut size must beat the compression gap. `batch_disk` is
+        // on-disk (compressed) but `current_size` counts raw key+value bytes.
+        // L0 flushes run ~3× compression: 16 × 22 MB ≈ 352 MB disk ≈ 1 GB raw.
+        // A 64 MB cut regurgitates 16+ outputs (no win, merge discarded);
+        // 256 MB yields ~4 outputs — a real 16→4 reduction.
+        let target_sst_size = 256 * 1024 * 1024;
+        let mut builder = SsTableBuilder::new();
+        builder.set_compression_level(self.options.compression_level);
+        let mut new_ssts: Vec<SsTableInfo> = Vec::new();
+        let mut current_size = 0usize;
+        let mut last_key: Option<Vec<u8>> = None;
+        let mut batch_first_key: Option<Vec<u8>> = None;
+        let mut entry_count = 0u64;
+        let mut deduped = 0u64;
+
+        while merge_iter.has_next() {
+            let entry = merge_iter.next().unwrap();
+            let key = entry.key;
+            let value = entry.value;
+            let seq_no = entry.seq_no;
+            let kind = entry.kind;
+
+            // Streaming merge yields newest-first per key: keep one version.
+            if last_key.as_ref() == Some(&key) {
+                deduped += 1;
+                continue;
+            }
+
+            if kind == EntryKind::Delete
+                && Self::tombstone_safe_to_drop(&key, &survivor_ranges)
+            {
+                last_key = Some(key);
+                continue;
+            }
+
+            if batch_first_key.is_none() {
+                batch_first_key = Some(key.clone());
+            }
+            current_size += key.len() + value.len() + 16;
+            builder.add(&Entry {
+                key: key.clone(),
+                value,
+                seq_no,
+                kind,
+            });
+            entry_count += 1;
+            last_key = Some(key);
+
+            if current_size >= target_sst_size {
+                let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
+                let sst_path = self
+                    .options
+                    .data_dir
+                    .join(format!("L0_{}.sst", sst_id));
+                let sst = builder.build(&sst_path)?;
+                let metadata = fs::metadata(&sst_path)?;
+                new_ssts.push(SsTableInfo {
+                    path: sst_path,
+                    size: metadata.len(),
+                    min_key: batch_first_key.take().unwrap_or_default(),
+                    max_key: sst.max_key().to_vec(),
+                });
+                builder = SsTableBuilder::new();
+                builder.set_compression_level(self.options.compression_level);
+                current_size = 0;
+            }
+        }
+        if current_size > 0 {
+            let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
+            let sst_path = self
+                .options
+                .data_dir
+                .join(format!("L0_{}.sst", sst_id));
+            let sst = builder.build(&sst_path)?;
+            let metadata = fs::metadata(&sst_path)?;
+            new_ssts.push(SsTableInfo {
+                path: sst_path,
+                size: metadata.len(),
+                min_key: batch_first_key.unwrap_or_default(),
+                max_key: sst.max_key().to_vec(),
+            });
+        }
+
+        if new_ssts.len() >= batch.len() {
+            // No file-count win (e.g. everything deduped to the same number of
+            // outputs). Drop the outputs — keeping them would churn.
+            tracing::warn!(
+                "L0 self-merge no-win: {} inputs produced {} outputs (target {} B), discarding",
+                batch.len(),
+                new_ssts.len(),
+                target_sst_size
+            );
+            for sst in &new_ssts {
+                let _ = fs::remove_file(&sst.path);
+            }
+            return Ok(());
+        }
+        let out_count = new_ssts.len();
+
+        // Splice the output back at the batch's newest slot. Non-batched L0
+        // files sit at higher indices and stay read-first (`iter().rev()`),
+        // so their newer versions keep winning over the merged output.
+        let evicted = {
+            let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            Self::splice_outputs(&mut levels, 0, &batch, new_ssts);
+
+            let mut evicted = Vec::new();
+            for s in &batch {
+                self.sst_cache.remove(&s.path);
+                evicted.push(s.path.clone());
+                self.pending_deletions.push(s.path.clone());
+            }
+            evicted
+        };
+
+        if let Some(ref sender) = self.notif_sender {
+            let _ = sender.send(CompactionNotification::Compacted { evicted_paths: evicted });
+        }
+
+        tracing::info!(
+            "L0 self-merge: {} → {} SSTables ({} entries, {} deduped, {} empty shells dropped)",
+            batch.len(),
+            out_count,
+            entry_count,
+            deduped,
+            empty_ssts.len()
         );
 
         Ok(())
@@ -936,14 +1178,10 @@ impl CompactionWorker {
             });
         }
 
-        // Swap batch → outputs inside one critical section.
+        // Swap batch → outputs inside one critical section, keeping age order.
         {
             let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-            let remove: std::collections::HashSet<PathBuf> =
-                batch.iter().map(|s| s.path.clone()).collect();
-            levels[level_idx].retain(|s| !remove.contains(&s.path));
-            levels[level_idx].extend(new_ssts.iter().cloned());
-            levels[level_idx].sort_by(|a, b| a.min_key.cmp(&b.min_key));
+            Self::splice_outputs(&mut levels, level_idx, &batch, new_ssts.clone());
         }
         for s in &batch {
             self.sst_cache.remove(&s.path);
@@ -1143,15 +1381,15 @@ impl CompactionWorker {
             total_output_size / 1024 / 1024
         );
 
-        // Replace small files with new larger files and schedule old ones for deletion
+        // Replace small files with new larger files and schedule old ones for
+        // deletion. Splice in place — never `sort_by(min_key)`, which would
+        // destroy the insertion-order-is-age contract the read path needs.
         {
             let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let small_paths: std::collections::HashSet<PathBuf> =
                 small_files.iter().map(|s| s.path.clone()).collect();
 
-            levels[target_level].retain(|s| !small_paths.contains(&s.path));
-            levels[target_level].extend(new_ssts);
-            levels[target_level].sort_by(|a, b| a.min_key.cmp(&b.min_key));
+            Self::splice_outputs(&mut levels, target_level, &small_files, new_ssts);
 
             self.pending_deletions.extend(small_paths);
         }
@@ -1189,6 +1427,50 @@ impl CompactionWorker {
             return true;
         }
         min_a <= max_b && min_b <= max_a
+    }
+
+    /// Replace `batch` with `new_ssts` inside `levels[level_idx]`, preserving
+    /// **insertion order = age order** (the read path's first-hit-wins contract).
+    ///
+    /// The merged output carries the newest versions of the batch's keys, so it
+    /// belongs at the position of the batch's NEWEST member:
+    /// - files inserted later (newer than the whole batch) stay after it and are
+    ///   read first — correct, their versions win;
+    /// - files inserted earlier (older than the whole batch) stay before it and
+    ///   are read after — correct, the output's versions win;
+    /// - files interleaved between batch members are older than the batch's
+    ///   newest member, so the output must still be read before them.
+    ///
+    /// Never `sort_by(min_key)`: that rewires the list into key order and lets
+    /// a stale Put file whose `min_key` sorts later beat a newer Tombstone.
+    fn splice_outputs(
+        levels: &mut Vec<Vec<SsTableInfo>>,
+        level_idx: usize,
+        batch: &[SsTableInfo],
+        new_ssts: Vec<SsTableInfo>,
+    ) {
+        let batch_paths: std::collections::HashSet<&Path> =
+            batch.iter().map(|s| s.path.as_path()).collect();
+        // Position of the newest batch member in the current list.
+        let mut newest_idx = 0usize;
+        for (i, s) in levels[level_idx].iter().enumerate() {
+            if batch_paths.contains(s.path.as_path()) {
+                newest_idx = i;
+            }
+        }
+        // Remove batch members; adjust the splice point by how many of them
+        // sat at or before `newest_idx` (they will be gone when we insert).
+        let mut insert_at = newest_idx;
+        for (i, s) in levels[level_idx].iter().enumerate() {
+            if i < newest_idx && batch_paths.contains(s.path.as_path()) {
+                insert_at -= 1;
+            }
+        }
+        levels[level_idx].retain(|s| !batch_paths.contains(s.path.as_path()));
+        let insert_at = insert_at.min(levels[level_idx].len());
+        for (i, sst) in new_ssts.into_iter().enumerate() {
+            levels[level_idx].insert(insert_at + i, sst);
+        }
     }
 }
 
@@ -1345,6 +1627,163 @@ mod tests {
             read_winner(&levels, b"k010"),
             Some(Some(vec![b'v'; 500])),
             "merge must not lose unrelated puts"
+        );
+    }
+
+    /// L0 liveness: many mutually-overlapping L0 SSTs whose tombstones are
+    /// shadowed by sibling L0 files. `compact_level(0)` defers every input
+    /// (placement safety) and the level never drains. `merge_l0_self_batch`
+    /// must cut file count in place without resurrecting deleted keys.
+    #[test]
+    fn test_l0_self_merge_thins_overcrowded_level() {
+        let dir = tempdir().expect("tempdir");
+
+        // 20 L0 files, same overlapping key span, each with a tombstone + puts.
+        // The tombstone in file i is shadowed by puts in every other file, so
+        // the L0→L1 placement guard would exclude all of them.
+        let mut l0: Vec<SsTableInfo> = Vec::new();
+        for f in 0..20u32 {
+            let mut entries = Vec::new();
+            // Shared tombstone first (d < u) so entries stay key-sorted —
+            // SsTableBuilder requires sorted keys for get() to work.
+            entries.push(Entry::delete(format!("d{f:03}").into_bytes(), 5 + f as u64));
+            // Unique put per file so dedup can't erase the file's payload.
+            entries.push(Entry::put(
+                format!("u{f:03}").into_bytes(),
+                vec![b'v'; 200],
+                10 + f as u64,
+            ));
+            l0.push(build_sst(dir.path(), &format!("L0_{f}.sst"), entries));
+        }
+        let start_files = l0.len();
+        assert!(start_files > 16, "test needs a crowded L0");
+
+        let levels: Arc<Mutex<Vec<Vec<SsTableInfo>>>> =
+            Arc::new(Mutex::new(vec![l0, Vec::new(), Vec::new()]));
+        let (_tx, rx) = mpsc::channel();
+        let (ntx, _nrx) = mpsc::channel();
+        let mut worker = CompactionWorker {
+            levels: levels.clone(),
+            options: StorageOptions {
+                data_dir: dir.path().to_path_buf(),
+                memtable_size_limit: 1024 * 1024,
+                size_ratio: 2,
+                ..Default::default()
+            },
+            sst_counter: Arc::new(AtomicU64::new(1000)),
+            receiver: rx,
+            notif_sender: Some(ntx),
+            sst_cache: HashMap::new(),
+            pending_deletions: Vec::new(),
+            cooldown_until: None,
+        };
+
+        worker.merge_l0_self_batch().expect("self-merge");
+
+        let after = levels.lock().unwrap()[0].len();
+        assert!(
+            after < start_files,
+            "L0 self-merge must reduce file count: {} → {}",
+            start_files,
+            after
+        );
+
+        // No resurrection: every dXXX was deleted and stays deleted.
+        for f in 0..20u32 {
+            let w = read_winner(&levels, format!("d{f:03}").as_bytes());
+            assert!(
+                !matches!(w, Some(Some(_))),
+                "deleted key d{:03} resurrected: {:?}",
+                f,
+                w
+            );
+        }
+        // Unique puts must survive.
+        for f in 0..20u32 {
+            assert_eq!(
+                read_winner(&levels, format!("u{f:03}").as_bytes()),
+                Some(Some(vec![b'v'; 200])),
+                "put u{:03} lost in self-merge",
+                f
+            );
+        }
+    }
+
+    /// Deterministic repro of the flaky `test_tombstones_survive_compaction_no_resurrect`.
+    ///
+    /// Root cause chain:
+    /// 1. `merge_small_files` picks the first N small SSTs by list order and
+    ///    merges ONLY those — same-level siblings outside the batch survive.
+    /// 2. It then `sort_by(min_key)`, rewiring the level into key order and
+    ///    destroying the "insertion order = age order" contract the read path
+    ///    relies on (`engine.rs:1505`: `iter().rev()` = newest first).
+    /// 3. `get()` is first-hit-wins over `iter().rev()`, so after the sort an
+    ///    older Put file whose `min_key` sorts later is read BEFORE a newer
+    ///    Tombstone file whose `min_key` sorts earlier → deleted row resurrects.
+    ///
+    /// The flaky test hits this when the concurrent writer produces a small
+    /// tombstone SST outside `merge_small_files`'s batch; whether it lands
+    /// before/after the merged output in min_key order is timing-dependent.
+    #[test]
+    fn test_merge_small_files_must_not_resurrect_tombstone() {
+        let dir = tempdir().expect("tempdir");
+
+        // 5 small files (the merge batch). One holds the OLD Put k000.
+        let mut l1: Vec<SsTableInfo> = Vec::new();
+        for i in 0..4u32 {
+            l1.push(build_sst(
+                dir.path(),
+                &format!("S{i}.sst"),
+                vec![Entry::put(
+                    format!("k1{i:03}").into_bytes(),
+                    vec![b'v'; 400],
+                    5 + i as u64,
+                )],
+            ));
+        }
+        l1.push(build_sst(
+            dir.path(),
+            "SP.sst",
+            vec![Entry::put(b"k000".to_vec(), b"old".to_vec(), 10)],
+        ));
+        // 6th file — NOT in the batch (truncate(5) drops it). NEWER tombstone
+        // for k000. min_key = a000 so it sorts BEFORE the merged output.
+        l1.push(build_sst(
+            dir.path(),
+            "TD.sst",
+            vec![
+                Entry::put(b"a000".to_vec(), b"x".to_vec(), 20),
+                Entry::delete(b"k000".to_vec(), 20),
+            ],
+        ));
+
+        let levels: Arc<Mutex<Vec<Vec<SsTableInfo>>>> =
+            Arc::new(Mutex::new(vec![Vec::new(), l1, Vec::new()]));
+        let (_tx, rx) = mpsc::channel();
+        let (ntx, _nrx) = mpsc::channel();
+        let mut worker = CompactionWorker {
+            levels: levels.clone(),
+            options: StorageOptions {
+                data_dir: dir.path().to_path_buf(),
+                memtable_size_limit: 1024 * 1024,
+                size_ratio: 2,
+                ..Default::default()
+            },
+            sst_counter: Arc::new(AtomicU64::new(1000)),
+            receiver: rx,
+            notif_sender: Some(ntx),
+            sst_cache: HashMap::new(),
+            pending_deletions: Vec::new(),
+            cooldown_until: None,
+        };
+
+        worker.merge_small_files().expect("merge_small_files");
+
+        let w = read_winner(&levels, b"k000");
+        assert!(
+            !matches!(w, Some(Some(_))),
+            "newer tombstone must beat older put after merge_small_files (got {:?})",
+            w
         );
     }
 }

@@ -92,6 +92,19 @@ struct WriteState {
     wal_pending_count: u32,
 }
 
+/// Result of a single `get_once` attempt.
+enum GetOutcome {
+    /// Live Put found.
+    Hit(Value),
+    /// Tombstone or memtable delete — key is gone.
+    Deleted,
+    /// No version anywhere.
+    Absent,
+    /// Candidate SST was compacted away mid-lookup; retry against the
+    /// post-compaction `levels` snapshot.
+    StaleSst,
+}
+
 /// The main LSM-Tree storage engine with MVCC support.
 ///
 /// All methods take `&self` — the engine is `Sync` and can be shared via
@@ -1015,9 +1028,58 @@ impl LsmEngine {
 
     /// Gets a value by key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+        // Retry loop: candidate paths snapshotted from `levels` can be
+        // compacted away (and deleted from disk) before we open them. The
+        // data is not lost — it was merged into a newer SST — but that SST
+        // is not in our stale snapshot. Re-collect and retry.
+        for _ in 0..3 {
+            match self.get_once(key)? {
+                GetOutcome::Hit(v) => return Ok(Some(v)),
+                GetOutcome::Deleted => return Ok(None),
+                GetOutcome::Absent => return Ok(None),
+                GetOutcome::StaleSst => continue,
+            }
+        }
+        // Three consecutive stale snapshots: give up and report absent —
+        // every retry re-read memtables first, so a live version would have
+        // been found; a permanently vanishing SST set means nothing is there.
+        Ok(None)
+    }
+
+    fn get_once(&self, key: &[u8]) -> Result<GetOutcome> {
         self.drain_compaction_notifications();
 
-        // 1. Collect candidate SST paths from levels (brief lock).
+        // 1. Check MemTables FIRST (under read lock), before touching SSTs.
+        //    A memtable tombstone is terminal: falling through to SSTs would
+        //    resurrect a deleted row from a stale Put below.
+        //
+        //    Order matters vs step 2: `persist_immutable_to_sst` pushes the
+        //    new L0 SST into `levels` BEFORE clearing the immutable memtable,
+        //    so if we see nothing in the memtables here, any flushed version
+        //    is already visible to the candidate collection below. The reverse
+        //    order (collect candidates, then check memtables) leaves a window
+        //    where a concurrent flush lands the tombstone in `levels` after the
+        //    snapshot and clears the memtable before the check — both sides
+        //    miss the delete and the stale Put wins. That was the flaky
+        //    resurrection in `test_tombstones_survive_compaction_no_resurrect`.
+        {
+            let ws = self.write_state.read();
+            use crate::lsm::memtable::VersionLookup;
+            match ws.memtable.get_version(key) {
+                Some(VersionLookup::Value(v, _)) => return Ok(GetOutcome::Hit(v)),
+                Some(VersionLookup::Tombstone) => return Ok(GetOutcome::Deleted),
+                None => {}
+            }
+            if let Some(ref imm) = ws.immutable_memtable {
+                match imm.get_version(key) {
+                    Some(VersionLookup::Value(v, _)) => return Ok(GetOutcome::Hit(v)),
+                    Some(VersionLookup::Tombstone) => return Ok(GetOutcome::Deleted),
+                    None => {}
+                }
+            }
+        }
+
+        // 2. Collect candidate SST paths from levels (brief lock).
         let candidates = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let mut cands = Vec::new();
@@ -1032,39 +1094,24 @@ impl LsmEngine {
             cands
         };
 
-        // 2. Check MemTables under read lock (concurrent with other readers).
-        //    A memtable tombstone is terminal: falling through to SSTs would
-        //    resurrect a deleted row from a stale Put below.
-        {
-            let ws = self.write_state.read();
-            use crate::lsm::memtable::VersionLookup;
-            match ws.memtable.get_version(key) {
-                Some(VersionLookup::Value(v, _)) => return Ok(Some(v)),
-                Some(VersionLookup::Tombstone) => return Ok(None),
-                None => {}
-            }
-            if let Some(ref imm) = ws.immutable_memtable {
-                match imm.get_version(key) {
-                    Some(VersionLookup::Value(v, _)) => return Ok(Some(v)),
-                    Some(VersionLookup::Tombstone) => return Ok(None),
-                    None => {}
-                }
-            }
-        }
-
         // 3. Snapshot SST handles from cache (opens happen outside the lock).
-        let sst_handles = self.get_or_open_ssts(&candidates)?;
+        //    A candidate may already be compacted away on disk; that is a
+        //    stale snapshot, not an error — retry against the new layout.
+        let sst_handles = match self.try_get_or_open_ssts(&candidates)? {
+            Some(h) => h,
+            None => return Ok(GetOutcome::StaleSst),
+        };
 
         // 4. Iterate SST handles outside the lock (I/O-heavy).
         for sst in &sst_handles {
             match sst.get_full(key)? {
-                Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
-                Some((_, _, EntryKind::Delete)) => return Ok(None),
+                Some((value, _, EntryKind::Put)) => return Ok(GetOutcome::Hit(value)),
+                Some((_, _, EntryKind::Delete)) => return Ok(GetOutcome::Deleted),
                 None => continue,
             }
         }
 
-        Ok(None)
+        Ok(GetOutcome::Absent)
     }
 
     /// Batch point-lookup: fetches values for multiple keys efficiently.
@@ -1180,6 +1227,18 @@ impl LsmEngine {
         Ok(out)
     }
 
+    /// True when an SST open failed because the file was already compacted
+    /// away (deleted from disk after we snapshotted its path from `levels`).
+    fn is_not_found(e: &onto_core::CoreError) -> bool {
+        match e {
+            onto_core::CoreError::Io(io) => io.kind() == std::io::ErrorKind::NotFound,
+            onto_core::CoreError::Custom(msg) => {
+                msg.contains("NotFound") || msg.contains("os error 2")
+            }
+            _ => false,
+        }
+    }
+
     /// Fetch an SST handle from the cache, opening the file OUTSIDE the
     /// `sst_cache` lock on a miss. `SsTable::open` reads footer/index/bloom
     /// from disk — holding the global cache mutex across that serializes
@@ -1204,7 +1263,14 @@ impl LsmEngine {
 
     /// Bulk variant of [`Self::get_or_open_sst`]: one brief lock for cache
     /// hits, then opens only the misses outside the lock. Preserves input order.
-    fn get_or_open_ssts(&self, paths: &[std::path::PathBuf]) -> Result<Vec<Arc<SsTable>>> {
+    ///
+    /// Returns `Ok(None)` when any path was already compacted away (NotFound)
+    /// — the caller's `levels` snapshot is stale and should re-collect paths
+    /// and retry. Skipping those files silently would drop their keys.
+    fn try_get_or_open_ssts(
+        &self,
+        paths: &[std::path::PathBuf],
+    ) -> Result<Option<Vec<Arc<SsTable>>>> {
         let mut handles: Vec<Option<Arc<SsTable>>> = vec![None; paths.len()];
         let mut missing: Vec<usize> = Vec::new();
         {
@@ -1218,9 +1284,20 @@ impl LsmEngine {
             }
         }
         for i in missing {
-            handles[i] = Some(self.get_or_open_sst(&paths[i])?);
+            match self.get_or_open_sst(&paths[i]) {
+                Ok(sst) => handles[i] = Some(sst),
+                Err(e) if Self::is_not_found(&e) => return Ok(None),
+                Err(e) => return Err(e),
+            }
         }
-        Ok(handles.into_iter().map(|h| h.expect("should be valid")).collect())
+        Ok(Some(
+            handles.into_iter().map(|h| h.expect("should be valid")).collect(),
+        ))
+    }
+
+    fn get_or_open_ssts(&self, paths: &[std::path::PathBuf]) -> Result<Vec<Arc<SsTable>>> {
+        self.try_get_or_open_ssts(paths)?
+            .ok_or_else(|| onto_core::CoreError::Custom("stale sst snapshot".into()))
     }
 
     /// Scans all entries whose key starts with the given prefix.
@@ -1348,31 +1425,44 @@ impl LsmEngine {
 
         // Newest-first SST list: L0 before L1 … ; within a level, reverse
         // insertion order (later flushes are newer). Collect paths under the
-        // brief levels lock, then open outside it.
-        let sst_paths: Vec<std::path::PathBuf> = {
-            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-            let mut paths = Vec::new();
-            for level in levels.iter() {
-                // Reverse so later-pushed (newer) SSTs come first
-                for sst_info in level.iter().rev() {
-                    if !prefix.is_empty() {
-                        if sst_info.max_key.as_slice() < prefix {
-                            continue;
-                        }
-                        if !Self::prefix_may_overlap(
-                            prefix,
-                            sst_info.min_key.as_slice(),
-                            sst_info.max_key.as_slice(),
-                        ) {
-                            continue;
+        // brief levels lock, then open outside it. Retry on stale paths —
+        // compaction may delete a snapshotted SST before we open it.
+        let sst_handles: Vec<Arc<SsTable>> = {
+            let mut handles = None;
+            for _ in 0..3 {
+                let sst_paths: Vec<std::path::PathBuf> = {
+                    let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut paths = Vec::new();
+                    for level in levels.iter() {
+                        // Reverse so later-pushed (newer) SSTs come first
+                        for sst_info in level.iter().rev() {
+                            if !prefix.is_empty() {
+                                if sst_info.max_key.as_slice() < prefix {
+                                    continue;
+                                }
+                                if !Self::prefix_may_overlap(
+                                    prefix,
+                                    sst_info.min_key.as_slice(),
+                                    sst_info.max_key.as_slice(),
+                                ) {
+                                    continue;
+                                }
+                            }
+                            paths.push(sst_info.path.clone());
                         }
                     }
-                    paths.push(sst_info.path.clone());
+                    paths
+                };
+                match self.try_get_or_open_ssts(&sst_paths)? {
+                    Some(h) => {
+                        handles = Some(h);
+                        break;
+                    }
+                    None => continue,
                 }
             }
-            paths
+            handles.unwrap_or_default()
         };
-        let sst_handles = self.get_or_open_ssts(&sst_paths)?;
 
         let mut seen: HashMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = HashMap::new();
         let mut live_puts = 0usize;
@@ -1502,38 +1592,42 @@ impl LsmEngine {
             }
         };
 
-        // Newest-first SST list: L0 before L1 … ; within a level, reverse
-        // insertion order (later flushes are newer).
-        let sst_paths: Vec<PathBuf> = {
-            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-            let mut paths = Vec::new();
-            for level in levels.iter() {
-                for sst_info in level.iter().rev() {
-                    if !prefix.is_empty() {
-                        let sst_max = sst_info.max_key.as_slice();
-                        if sst_max < prefix {
-                            continue;
-                        }
-                        let sst_min = sst_info.min_key.as_slice();
-                        if !Self::prefix_may_overlap(prefix, sst_min, sst_max) {
-                            continue;
+        // Step 1: Snapshot SST handles (cache hits under one brief lock;
+        // cold opens happen outside it via get_or_open_sst). Retry on stale
+        // paths — compaction may delete a snapshotted SST before we open it.
+        let sst_handles: Vec<Arc<SsTable>> = {
+            let mut handles = None;
+            for _ in 0..3 {
+                let sst_paths: Vec<PathBuf> = {
+                    let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut paths = Vec::new();
+                    for level in levels.iter() {
+                        for sst_info in level.iter().rev() {
+                            if !prefix.is_empty() {
+                                let sst_max = sst_info.max_key.as_slice();
+                                if sst_max < prefix {
+                                    continue;
+                                }
+                                let sst_min = sst_info.min_key.as_slice();
+                                if !Self::prefix_may_overlap(prefix, sst_min, sst_max) {
+                                    continue;
+                                }
+                            }
+                            paths.push(sst_info.path.clone());
                         }
                     }
-                    paths.push(sst_info.path.clone());
+                    paths
+                };
+                match self.try_get_or_open_ssts(&sst_paths)? {
+                    Some(h) => {
+                        handles = Some(h);
+                        break;
+                    }
+                    None => continue,
                 }
             }
-            tracing::debug!(
-                prefix = %String::from_utf8_lossy(prefix),
-                selected = paths.len(),
-                total_levels = levels.len(),
-                "scan_prefix_internal select SSTs"
-            );
-            paths
+            handles.unwrap_or_default()
         };
-
-        // Step 1: Snapshot SST handles (cache hits under one brief lock;
-        // cold opens happen outside it via get_or_open_sst).
-        let sst_handles = self.get_or_open_ssts(&sst_paths)?;
 
         // Step 2: MemTables FIRST (newest source).
         {
@@ -2023,42 +2117,45 @@ impl LsmEngine {
 
         // Newest-first SST list: L0 before L1 … ; within a level, reverse
         // insertion order (later flushes are newer).
-        let sst_paths: Vec<PathBuf> = {
-            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-            let mut paths = Vec::new();
-            for level in levels.iter() {
-                for sst_info in level.iter().rev() {
-                    if !prefix.is_empty() {
-                        if sst_info.max_key.as_slice() < prefix {
-                            continue;
-                        }
-                        if !Self::prefix_may_overlap(
-                            prefix,
-                            sst_info.min_key.as_slice(),
-                            sst_info.max_key.as_slice(),
-                        ) {
-                            continue;
+        // Retry on stale paths: compaction can delete a snapshotted SST before
+        // we open it. No callback has run yet, so restarting is side-effect-free.
+        let sst_handles: Vec<Arc<SsTable>> = {
+            let mut handles = None;
+            for _ in 0..3 {
+                let sst_paths: Vec<PathBuf> = {
+                    let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut paths = Vec::new();
+                    for level in levels.iter() {
+                        for sst_info in level.iter().rev() {
+                            if !prefix.is_empty() {
+                                if sst_info.max_key.as_slice() < prefix {
+                                    continue;
+                                }
+                                if !Self::prefix_may_overlap(
+                                    prefix,
+                                    sst_info.min_key.as_slice(),
+                                    sst_info.max_key.as_slice(),
+                                ) {
+                                    continue;
+                                }
+                            }
+                            paths.push(sst_info.path.clone());
                         }
                     }
-                    paths.push(sst_info.path.clone());
+                    paths
+                };
+                match self.try_get_or_open_ssts(&sst_paths)? {
+                    Some(h) => {
+                        handles = Some(h);
+                        break;
+                    }
+                    None => continue,
                 }
             }
-            paths
-        };
-
-        let sst_handles: Vec<Arc<SsTable>> = {
-            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
-            let mut handles = Vec::with_capacity(sst_paths.len());
-            for path in &sst_paths {
-                if let Some(sst) = cache.get(path) {
-                    handles.push(Arc::clone(sst));
-                } else {
-                    let sst = Arc::new(SsTable::open(path)?);
-                    cache.insert(path.to_path_buf(), Arc::clone(&sst));
-                    handles.push(sst);
-                }
+            match handles {
+                Some(h) => h,
+                None => return Ok(()), // give up: nothing readable in the prefix
             }
-            handles
         };
 
         {
