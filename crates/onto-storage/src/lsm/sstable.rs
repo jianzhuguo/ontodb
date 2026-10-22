@@ -289,19 +289,32 @@ pub struct SsTableBuilder {
     current_block_entries: usize,
     block_entries: Vec<BlockIndexEntry>,
     current_block_offset: u64,
-    current_block_first_key: Vec<u8>,
-    current_block_last_key: Vec<u8>,
     restart_points: Vec<u32>,
     entry_count_in_block: usize,
-    /// Keys collected during add(), used to build bloom filter at build time.
-    /// This is more memory-efficient than pre-allocating a large bloom filter
-    /// for small SSTables.
-    keys_for_bloom: Vec<Vec<u8>>,
+    /// Bloom filter filled incrementally as entries are added. Replaces the
+    /// old `keys_for_bloom: Vec<Vec<u8>>` which held every key for the whole
+    /// SST in millions of tiny allocations and OOM'd large merges.
+    bloom: BloomFilter,
+    /// First key of the SST (for `SsTable::cached_first_key`). Captured once.
+    first_key: Vec<u8>,
+    /// Total entries added. Replaces `keys_for_bloom.is_empty()` checks.
+    entry_count: u64,
+    /// Byte range of the last entry's key inside `current_block`, so
+    /// `flush_block` can recover the index key without cloning per entry.
+    last_key_start: usize,
+    last_key_len: usize,
     /// zstd compression level (0 = disabled, 1-21 = enabled).
     compression_level: i32,
     /// Maximum sequence number seen during build.
     max_seq_no: SeqNo,
 }
+
+/// Default bloom capacity for builders with no entry hint. Sized for a
+/// typical memtable flush (tens of thousands of entries, ~80 KB bit array).
+/// Callers that build large SSTs should pass a better estimate via
+/// `with_expected_entries`; under-estimating only raises the false-positive
+/// rate — never false negatives.
+const DEFAULT_BLOOM_EXPECTED_ENTRIES: usize = 65536;
 
 impl Default for SsTableBuilder {
     fn default() -> Self {
@@ -311,17 +324,26 @@ impl Default for SsTableBuilder {
 
 impl SsTableBuilder {
     pub fn new() -> Self {
+        Self::with_expected_entries(DEFAULT_BLOOM_EXPECTED_ENTRIES)
+    }
+
+    /// Creates a builder whose bloom is sized for `expected_entries`.
+    /// Under-estimating only raises the false-positive rate; correctness is
+    /// preserved either way.
+    pub fn with_expected_entries(expected_entries: usize) -> Self {
         Self {
             data: Vec::new(),
             current_block: Vec::new(),
             current_block_entries: 0,
             block_entries: Vec::new(),
             current_block_offset: 0,
-            current_block_first_key: Vec::new(),
-            current_block_last_key: Vec::new(),
             restart_points: Vec::new(),
             entry_count_in_block: 0,
-            keys_for_bloom: Vec::new(),
+            bloom: BloomFilter::new(expected_entries.max(1), 0.01),
+            first_key: Vec::new(),
+            entry_count: 0,
+            last_key_start: 0,
+            last_key_len: 0,
             compression_level: 0,
             max_seq_no: 0,
         }
@@ -335,27 +357,30 @@ impl SsTableBuilder {
     /// Adds an entry to the SSTable. Entries MUST be added in sorted key order.
     pub fn add(&mut self, entry: &Entry) {
         self.max_seq_no = self.max_seq_no.max(entry.seq_no);
+        self.entry_count += 1;
         // Dangling empty-allocation Vecs (len > 0, cap == 0) must not be
-        // cloned — that memcpy takes the process down mid-compaction.
-        let key_owned: Vec<u8> = if entry.key.capacity() == 0 {
-            Vec::new()
+        // read — that memcpy takes the process down mid-compaction.
+        let key: &[u8] = if entry.key.capacity() == 0 {
+            &[]
         } else {
-            entry.key.clone()
+            entry.key.as_slice()
         };
-        self.keys_for_bloom.push(key_owned.clone());
+        self.bloom.insert(key);
+        if self.first_key.is_empty() && !key.is_empty() {
+            self.first_key.extend_from_slice(key);
+        }
 
         // Record restart point
         if self.entry_count_in_block.is_multiple_of(RESTART_INTERVAL) {
             self.restart_points.push(self.current_block.len() as u32);
         }
 
-        if self.current_block_first_key.is_empty() {
-            self.current_block_first_key = key_owned.clone();
-        }
-        self.current_block_last_key = key_owned;
-
-        // Encode entry into current block
+        // Encode entry into current block; remember where the key landed so
+        // flush_block can slice the index key out without a per-entry clone.
+        let key_start = self.current_block.len() + 4;
         Self::encode_entry_to(&mut self.current_block, entry);
+        self.last_key_start = key_start;
+        self.last_key_len = key.len();
         self.current_block_entries += 1;
         self.entry_count_in_block += 1;
 
@@ -369,33 +394,28 @@ impl SsTableBuilder {
     /// no longer need the Entry after this call.
     pub fn add_owned(&mut self, entry: Entry) {
         self.max_seq_no = self.max_seq_no.max(entry.seq_no);
-        let key_owned: Vec<u8> = if entry.key.capacity() == 0 {
-            Vec::new()
+        self.entry_count += 1;
+        let key: &[u8] = if entry.key.capacity() == 0 {
+            &[]
         } else {
-            entry.key.clone()
+            entry.key.as_slice()
         };
+        self.bloom.insert(key);
+        if self.first_key.is_empty() && !key.is_empty() {
+            self.first_key.extend_from_slice(key);
+        }
+
         // Record restart point
         if self.entry_count_in_block.is_multiple_of(RESTART_INTERVAL) {
             self.restart_points.push(self.current_block.len() as u32);
         }
 
-        if self.current_block_first_key.is_empty() {
-            self.current_block_first_key = key_owned.clone();
-        }
-        self.current_block_last_key = key_owned;
-
-        // Encode entry into current block (borrows entry)
+        let key_start = self.current_block.len() + 4;
         Self::encode_entry_to(&mut self.current_block, &entry);
+        self.last_key_start = key_start;
+        self.last_key_len = key.len();
         self.current_block_entries += 1;
         self.entry_count_in_block += 1;
-
-        // Push key into bloom filter (takes ownership, no clone)
-        self.keys_for_bloom
-            .push(if entry.key.capacity() == 0 {
-                Vec::new()
-            } else {
-                entry.key
-            });
 
         // Flush block if it's large enough
         if self.current_block.len() >= 4096 {
@@ -469,9 +489,19 @@ impl SsTableBuilder {
 
         let block_size = stored.len() as u64;
 
+        // Recover the index key from the block bytes — restart points were
+        // appended after the entries, so the recorded key range is still valid.
+        let last_key = if self.last_key_len > 0
+            && self.last_key_start + self.last_key_len <= self.current_block.len()
+        {
+            self.current_block[self.last_key_start..self.last_key_start + self.last_key_len].to_vec()
+        } else {
+            Vec::new()
+        };
+
         // Record block index
         self.block_entries.push(BlockIndexEntry {
-            last_key: self.current_block_last_key.clone(),
+            last_key,
             offset: self.current_block_offset,
             size: block_size,
         });
@@ -483,10 +513,10 @@ impl SsTableBuilder {
         // Reset
         self.current_block.clear();
         self.current_block_entries = 0;
-        self.current_block_first_key.clear();
-        self.current_block_last_key.clear();
         self.restart_points.clear();
         self.entry_count_in_block = 0;
+        self.last_key_start = 0;
+        self.last_key_len = 0;
     }
 
     /// Builds the SSTable and writes it to disk.
@@ -506,7 +536,7 @@ impl SsTableBuilder {
         // a merge over legacy files whose seqs were zeroed), the footer would
         // land max_seq_no=0 and the engine would classify the file as a
         // permanent "old SST" zombie. Stamp a sentinel so it is not.
-        if self.max_seq_no == 0 && !self.keys_for_bloom.is_empty() {
+        if self.max_seq_no == 0 && self.entry_count > 0 {
             self.max_seq_no = 1;
         }
 
@@ -530,12 +560,9 @@ impl SsTableBuilder {
         let index_data = Self::encode_index(&self.block_entries);
         file.write_all(&index_data)?;
 
-        // Build and write bloom filter
+        // Write bloom filter (built incrementally during add)
         let bloom_offset = index_offset + index_data.len() as u64;
-        let mut bloom = BloomFilter::new(self.keys_for_bloom.len().max(1), 0.01);
-        for key in &self.keys_for_bloom {
-            bloom.insert(key);
-        }
+        let bloom = self.bloom;
         let bloom_data = bloom.to_bytes();
         file.write_all(&bloom_data)?;
 
@@ -566,7 +593,7 @@ impl SsTableBuilder {
         let compressed = self.compression_level > 0;
 
         // Cache the first key (minimum key) for fast access
-        let cached_first_key = self.keys_for_bloom.first().cloned().unwrap_or_default();
+        let cached_first_key = self.first_key;
 
         Ok(SsTable {
             _path: path.as_ref().to_path_buf(),

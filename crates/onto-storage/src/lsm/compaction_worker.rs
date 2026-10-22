@@ -623,7 +623,8 @@ impl CompactionWorker {
         // entries (post-cleanup rebalance); 120s aborted those merges and the
         // LSM could never converge.
         const MERGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-        let mut builder = SsTableBuilder::new();
+        let mut builder =
+            SsTableBuilder::with_expected_entries(target_sst_size as usize / 32);
         builder.set_compression_level(self.options.compression_level);
         let mut new_ssts: Vec<SsTableInfo> = Vec::new();
         let mut current_size = 0usize;
@@ -683,16 +684,18 @@ impl CompactionWorker {
                 batch_first_key = Some(key.clone());
             }
 
-            // Add entry to builder
+            // Add entry to builder. One clone kept for next-iteration dedup;
+            // the rest moves into the builder (bloom insert is by-reference).
             current_size += key.len() + value.len() + 16;
-            builder.add(&Entry {
-                key: key.clone(),
+            let dedup_key = key.clone();
+            builder.add_owned(Entry {
+                key,
                 value,
                 seq_no,
                 kind,
             });
             entry_count += 1;
-            last_key = Some(key);
+            last_key = Some(dedup_key);
 
             // Flush SST when target size reached
             if current_size >= target_sst_size {
@@ -713,7 +716,7 @@ impl CompactionWorker {
                     max_key: sst.max_key().to_vec(),
                 });
 
-                builder = SsTableBuilder::new();
+                builder = SsTableBuilder::with_expected_entries(1 << 21);
                 builder.set_compression_level(self.options.compression_level);
                 current_size = 0;
             }
@@ -872,7 +875,8 @@ impl CompactionWorker {
         // A 64 MB cut regurgitates 16+ outputs (no win, merge discarded);
         // 256 MB yields ~4 outputs — a real 16→4 reduction.
         let target_sst_size = 256 * 1024 * 1024;
-        let mut builder = SsTableBuilder::new();
+        let mut builder =
+            SsTableBuilder::with_expected_entries(target_sst_size as usize / 32);
         builder.set_compression_level(self.options.compression_level);
         let mut new_ssts: Vec<SsTableInfo> = Vec::new();
         let mut current_size = 0usize;
@@ -905,14 +909,15 @@ impl CompactionWorker {
                 batch_first_key = Some(key.clone());
             }
             current_size += key.len() + value.len() + 16;
-            builder.add(&Entry {
-                key: key.clone(),
+            let dedup_key = key.clone();
+            builder.add_owned(Entry {
+                key,
                 value,
                 seq_no,
                 kind,
             });
             entry_count += 1;
-            last_key = Some(key);
+            last_key = Some(dedup_key);
 
             if current_size >= target_sst_size {
                 let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
@@ -928,7 +933,7 @@ impl CompactionWorker {
                     min_key: batch_first_key.take().unwrap_or_default(),
                     max_key: sst.max_key().to_vec(),
                 });
-                builder = SsTableBuilder::new();
+                builder = SsTableBuilder::with_expected_entries(1 << 21);
                 builder.set_compression_level(self.options.compression_level);
                 current_size = 0;
             }
@@ -1113,7 +1118,11 @@ impl CompactionWorker {
         }
 
         let mut new_ssts: Vec<SsTableInfo> = Vec::new();
-        let mut builder = SsTableBuilder::new();
+        // Last-level self-merge writes one unbounded SST; size the bloom
+        // from the input bytes (conservative 32-byte min entry).
+        let input_bytes: u64 = batch.iter().map(|s| s.size).sum();
+        let mut builder =
+            SsTableBuilder::with_expected_entries((input_bytes as usize / 32).max(65536));
         builder.set_compression_level(self.options.compression_level);
         let mut current_size: u64 = 0;
         let mut batch_min_key: Vec<u8> = Vec::new();
@@ -1132,14 +1141,16 @@ impl CompactionWorker {
                 batch_min_key = entry.key.clone();
             }
 
+            current_size += entry.key.len() as u64 + entry.value.len() as u64 + 16;
+            // One clone kept for next-iteration dedup; the rest moves into the builder.
+            let dedup_key = entry.key.clone();
             let sst_entry = match entry.kind {
-                EntryKind::Put => Entry::put(entry.key.clone(), entry.value, entry.seq_no),
-                EntryKind::Delete => Entry::delete(entry.key.clone(), entry.seq_no),
+                EntryKind::Put => Entry::put(entry.key, entry.value, entry.seq_no),
+                EntryKind::Delete => Entry::delete(entry.key, entry.seq_no),
             };
-            builder.add(&sst_entry);
-            current_size += entry.key.len() as u64 + sst_entry.value.len() as u64 + 16;
+            builder.add_owned(sst_entry);
             total_entries += 1;
-            last_key = Some(entry.key);
+            last_key = Some(dedup_key);
 
             if current_size >= TARGET_OUTPUT_SIZE {
                 let id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
@@ -1155,7 +1166,7 @@ impl CompactionWorker {
                     min_key: batch_min_key.clone(),
                     max_key: sst.max_key().to_vec(),
                 });
-                builder = SsTableBuilder::new();
+                builder = SsTableBuilder::with_expected_entries(1 << 21);
                 builder.set_compression_level(self.options.compression_level);
                 current_size = 0;
                 batch_min_key = Vec::new();
@@ -1299,7 +1310,8 @@ impl CompactionWorker {
         // StreamingMergeIterator returns entries sorted by key, with largest seq_no
         // first for duplicate keys. We keep only the first occurrence of each key.
         let mut new_ssts: Vec<SsTableInfo> = Vec::new();
-        let mut builder = SsTableBuilder::new();
+        let mut builder =
+            SsTableBuilder::with_expected_entries(TARGET_OUTPUT_SIZE as usize / 32);
         builder.set_compression_level(self.options.compression_level);
         let mut current_size: u64 = 0;
         let mut batch_min_key: Vec<u8> = Vec::new();
@@ -1321,14 +1333,16 @@ impl CompactionWorker {
                 batch_min_key = entry.key.clone();
             }
 
+            current_size += entry.key.len() as u64 + entry.value.len() as u64 + 16;
+            // One clone kept for next-iteration dedup; the rest moves into the builder.
+            let dedup_key = entry.key.clone();
             let sst_entry = match entry.kind {
-                EntryKind::Put => Entry::put(entry.key.clone(), entry.value, entry.seq_no),
-                EntryKind::Delete => Entry::delete(entry.key.clone(), entry.seq_no),
+                EntryKind::Put => Entry::put(entry.key, entry.value, entry.seq_no),
+                EntryKind::Delete => Entry::delete(entry.key, entry.seq_no),
             };
-            builder.add(&sst_entry);
-            current_size += entry.key.len() as u64 + sst_entry.value.len() as u64 + 16;
+            builder.add_owned(sst_entry);
             total_entries += 1;
-            last_key = Some(entry.key);
+            last_key = Some(dedup_key);
 
             // Flush SST when target size reached
             if current_size >= TARGET_OUTPUT_SIZE {
@@ -1349,7 +1363,7 @@ impl CompactionWorker {
                     min_key: batch_min_key.clone(),
                     max_key: sst.max_key().to_vec(),
                 });
-                builder = SsTableBuilder::new();
+                builder = SsTableBuilder::with_expected_entries(1 << 21);
                 builder.set_compression_level(self.options.compression_level);
                 current_size = 0;
                 batch_min_key = Vec::new();
