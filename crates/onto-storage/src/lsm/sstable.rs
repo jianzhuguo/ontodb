@@ -111,6 +111,15 @@ fn is_dst_size_too_small(err: isize) -> bool {
 /// `Compressor` on the write side: one-shot `zstd_safe::decompress` builds a
 /// fresh DCtx per call, and a failed workspace reservation in zstd 1.5.7
 /// becomes a NULL write (heap corruption / 0xc0000374) under memory pressure.
+///
+/// On decompress error the DCtx is **discarded**: zstd 1.5.7's
+/// `ZSTD_decompressBegin` does not clear `litBuffer` / `litBufferLocation`,
+/// and `ZSTD_allocateLiteralsBuffer` points `litBuffer` into the caller's
+/// `dst` buffer. A failed call can leave those fields dangling at the
+/// previous (now freed) buffer — the next call's `oend` becomes a wild
+/// pointer and `ZSTD_wildcopy` writes off into the weeds (dump 15372).
+/// Recreating the DCtx keeps the warm-workspace benefit on the happy path
+/// while guaranteeing clean state after any failure.
 pub(crate) fn zstd_decompress_to(dst: &mut [u8], src: &[u8]) -> std::result::Result<usize, isize> {
     thread_local! {
         static DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
@@ -131,6 +140,9 @@ pub(crate) fn zstd_decompress_to(dst: &mut [u8], src: &[u8]) -> std::result::Res
         match dec.decompress_to_buffer(src, dst) {
             Ok(n) => Ok(n),
             Err(e) => {
+                // Drop the DCtx so stale litBuffer/litBufferLocation cannot
+                // poison the next decompression.
+                *slot = None;
                 // zstd-safe maps ZSTD codes onto io::Error. Recover the code
                 // so the dstSize_tooSmall retry loop keeps working.
                 if let Some(code) = e.raw_os_error() {
@@ -469,7 +481,14 @@ impl SsTableBuilder {
                 let mut buf = vec![0u8; bound];
                 match compressor.compress_to_buffer(self.current_block.as_slice(), &mut buf[..]) {
                     Ok(n) => Some(buf[..n].to_vec()),
-                    Err(_) => None,
+                    Err(_) => {
+                        // Drop the CCtx: a failed compress can leave the
+                        // zstd 1.5.7 workspace in a half-reserved state
+                        // (seqStore.llCode = NULL) that the next call would
+                        // write through.
+                        *slot = None;
+                        None
+                    }
                 }
             });
             match result {
