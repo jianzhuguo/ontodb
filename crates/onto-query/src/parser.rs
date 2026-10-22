@@ -253,6 +253,15 @@ pub enum QueryAst {
     /// SHOW TABLE STATS <class> — display table statistics
     ShowTableStats { class: String },
 
+    /// SHOW CLASSES / SHOW TABLES — list classes in the ontology
+    ShowClasses,
+
+    /// SHOW SCHEMAS — list namespaces
+    ShowSchemas,
+
+    /// DESCRIBE <class> / SHOW COLUMNS FROM <class> — class property schema
+    Describe { class: String },
+
     /// CREATE VECTOR INDEX ON <class> (<column>) METRIC <metric> DIMENSION <dim>
     CreateVectorIndex {
         class: String,
@@ -508,6 +517,9 @@ impl QueryAst {
             QueryAst::RefreshMaterializedView { .. } => false,
             QueryAst::VacuumTable { .. } => false,
             QueryAst::ShowTableStats { .. } => false,
+            QueryAst::ShowClasses => true,
+            QueryAst::ShowSchemas => true,
+            QueryAst::Describe { .. } => true,
             QueryAst::CreateOntologyProperty { .. } => false,
             QueryAst::AlterClassExtends { .. } => false,
 
@@ -1092,6 +1104,20 @@ impl QueryParser {
         } else if starts_with("SHOW TABLE STATS") {
             let rest = input[16..].trim().to_string();
             Ok(QueryAst::ShowTableStats { class: rest })
+        } else if starts_with("SHOW CLASSES") || starts_with("SHOW TABLES") {
+            Ok(QueryAst::ShowClasses)
+        } else if starts_with("SHOW SCHEMAS") {
+            Ok(QueryAst::ShowSchemas)
+        } else if starts_with("SHOW COLUMNS FROM") {
+            let rest = input["SHOW COLUMNS FROM".len()..].trim().to_string();
+            Ok(QueryAst::Describe { class: rest })
+        } else if starts_with("DESCRIBE") || starts_with("DESC ") {
+            let rest = if starts_with("DESCRIBE") {
+                input["DESCRIBE".len()..].trim().to_string()
+            } else {
+                input["DESC".len()..].trim().to_string()
+            };
+            Ok(QueryAst::Describe { class: rest })
         } else if starts_with("ANALYZE") {
             Self::parse_analyze(input)
         } else if starts_with("BEGIN") {
@@ -4600,6 +4626,55 @@ impl QueryParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_show_classes() {
+        for sql in ["SHOW CLASSES", "SHOW TABLES", "show classes"] {
+            let ast = QueryParser::parse(sql).unwrap();
+            assert!(matches!(ast, QueryAst::ShowClasses), "sql: {}", sql);
+            assert!(ast.is_read_only(), "sql: {}", sql);
+        }
+    }
+
+    #[test]
+    fn test_parse_show_schemas() {
+        let ast = QueryParser::parse("SHOW SCHEMAS").unwrap();
+        assert!(matches!(ast, QueryAst::ShowSchemas));
+        assert!(ast.is_read_only());
+    }
+
+    #[test]
+    fn test_parse_describe() {
+        let ast = QueryParser::parse("DESCRIBE sembio.Variant").unwrap();
+        match ast {
+            QueryAst::Describe { class } => assert_eq!(class, "sembio.Variant"),
+            _ => panic!("expected Describe"),
+        }
+        assert!(QueryParser::parse("DESCRIBE sembio.Variant")
+            .unwrap()
+            .is_read_only());
+
+        let ast = QueryParser::parse("SHOW COLUMNS FROM sembio.Gene").unwrap();
+        match ast {
+            QueryAst::Describe { class } => assert_eq!(class, "sembio.Gene"),
+            _ => panic!("expected Describe from SHOW COLUMNS"),
+        }
+
+        let ast = QueryParser::parse("DESC sembio.Disease").unwrap();
+        match ast {
+            QueryAst::Describe { class } => assert_eq!(class, "sembio.Disease"),
+            _ => panic!("expected Describe from DESC"),
+        }
+    }
+
+    #[test]
+    fn test_parse_show_table_stats_still_works() {
+        let ast = QueryParser::parse("SHOW TABLE STATS sembio.Variant").unwrap();
+        match ast {
+            QueryAst::ShowTableStats { class } => assert_eq!(class, "sembio.Variant"),
+            _ => panic!("expected ShowTableStats"),
+        }
+    }
 
     #[test]
     fn test_parse_insert() {

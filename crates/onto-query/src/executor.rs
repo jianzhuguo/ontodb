@@ -1914,6 +1914,26 @@ impl QueryExecutor {
         match &result {
             Ok(_) => {
                 engine.commit_txn(txn_id)?;
+                // Register/refresh class in row-count cache (SHOW CLASSES discovery)
+                match ast {
+                    QueryAst::Insert { class, .. } => {
+                        let mut cache =
+                            self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+                        let entry = cache
+                            .entry(class.clone())
+                            .or_insert((0, std::time::Instant::now()));
+                        entry.0 += 1;
+                    }
+                    QueryAst::BatchInsert { class, rows, .. } => {
+                        let mut cache =
+                            self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+                        let entry = cache
+                            .entry(class.clone())
+                            .or_insert((0, std::time::Instant::now()));
+                        entry.0 += rows.len() as u64;
+                    }
+                    _ => {}
+                }
             }
             Err(_) => {
                 let _ = engine.abort_txn(txn_id);
@@ -1993,20 +2013,21 @@ impl QueryExecutor {
         if result.is_ok() {
             let table = match ast {
                 QueryAst::Insert { class, .. } => {
-                    // Increment cached count by 1
+                    // Increment cached count by 1 (register class if new)
                     let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some((count, _)) = cache.get_mut(class) {
-                        *count += 1;
-                    }
-                    // Keep the table name for potential further use
+                    let entry = cache
+                        .entry(class.clone())
+                        .or_insert((0, std::time::Instant::now()));
+                    entry.0 += 1;
                     Some(class.as_str())
                 }
                 QueryAst::BatchInsert { class, rows, .. } => {
-                    // Increment cached count by batch size
+                    // Increment cached count by batch size (register class if new)
                     let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some((count, _)) = cache.get_mut(class) {
-                        *count += rows.len() as u64;
-                    }
+                    let entry = cache
+                        .entry(class.clone())
+                        .or_insert((0, std::time::Instant::now()));
+                    entry.0 += rows.len() as u64;
                     Some(class.as_str())
                 }
                 QueryAst::BatchUpsert { class, .. } => {
@@ -2318,6 +2339,9 @@ impl QueryExecutor {
                 *max_depth,
                 filter,
             ),
+            QueryAst::ShowClasses => self.execute_show_classes(engine),
+            QueryAst::ShowSchemas => self.execute_show_schemas(engine),
+            QueryAst::Describe { class } => self.execute_describe(engine, class),
             _ => Err(CoreError::Custom(
                 "unexpected query type in read path".to_string(),
             )),
@@ -2586,6 +2610,9 @@ impl QueryExecutor {
 
                 Ok(QueryResult::Rows(vec![stats]))
             }
+            QueryAst::ShowClasses => self.execute_show_classes(engine),
+            QueryAst::ShowSchemas => self.execute_show_schemas(engine),
+            QueryAst::Describe { class } => self.execute_describe(engine, class),
             QueryAst::CreateVectorIndex {
                 class,
                 column,
@@ -5827,6 +5854,260 @@ impl QueryExecutor {
         }
 
         Ok(QueryResult::Rows(result_rows))
+    }
+
+    /// SHOW CLASSES / SHOW TABLES — list classes from the merged ontology,
+    /// plus any observed-only classes found in the row-count cache.
+    fn execute_show_classes(&self, engine: &LsmEngine) -> Result<QueryResult> {
+        let merged = self.get_merged_ontology(engine);
+        let mut rows: Vec<Map<String, Value>> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Namespace per class: scan ontology entries (merged drops namespace info)
+        let mut class_ns: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (_key, val_bytes) in engine.scan_prefix(b"__ontology__").unwrap_or_default() {
+            if let Ok(onto) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
+                let ns = onto
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| "_default".to_string());
+                for name in onto.classes.keys() {
+                    class_ns.entry(name.clone()).or_insert_with(|| ns.clone());
+                }
+            }
+        }
+
+        let mut names: Vec<String> = merged.classes.keys().cloned().collect();
+        names.sort();
+
+        for name in names {
+            let class = match merged.classes.get(&name) {
+                Some(c) => c,
+                None => continue,
+            };
+            seen.insert(name.clone());
+            let mut row = Map::new();
+            row.insert("class".to_string(), Value::String(name.clone()));
+            row.insert(
+                "namespace".to_string(),
+                Value::String(
+                    class_ns
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_else(|| "_default".to_string()),
+                ),
+            );
+            row.insert(
+                "superclasses".to_string(),
+                Value::String(class.superclasses.join(", ")),
+            );
+            row.insert(
+                "n_properties".to_string(),
+                Value::Number(serde_json::Number::from(class.properties.len() as u64)),
+            );
+            if let Some(desc) = &class.description {
+                row.insert("description".to_string(), Value::String(desc.clone()));
+            }
+            // Live count from cache only — never count_prefix here (100+ classes).
+            if let Some(n) = self.get_cached_row_count(engine, &name) {
+                row.insert(
+                    "approx_rows".to_string(),
+                    Value::Number(serde_json::Number::from(n)),
+                );
+            }
+            rows.push(row);
+        }
+
+        // Observed-only classes (data present, no ontology entry)
+        {
+            let cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut extras: Vec<String> = cache
+                .keys()
+                .filter(|k| !seen.contains(*k) && !k.starts_with('_'))
+                .cloned()
+                .collect();
+            extras.sort();
+            for name in extras {
+                let mut row = Map::new();
+                row.insert("class".to_string(), Value::String(name.clone()));
+                row.insert(
+                    "namespace".to_string(),
+                    Value::String(
+                        class_ns
+                            .get(&name)
+                            .cloned()
+                            .unwrap_or_else(|| "_default".to_string()),
+                    ),
+                );
+                row.insert("superclasses".to_string(), Value::String(String::new()));
+                row.insert(
+                    "n_properties".to_string(),
+                    Value::Number(serde_json::Number::from(0)),
+                );
+                row.insert(
+                    "description".to_string(),
+                    Value::String("(observed: data present, no ontology entry)".to_string()),
+                );
+                if let Some(n) = cache.get(&name).map(|(n, _)| *n) {
+                    row.insert(
+                        "approx_rows".to_string(),
+                        Value::Number(serde_json::Number::from(n)),
+                    );
+                }
+                rows.push(row);
+            }
+        }
+
+        Ok(QueryResult::Rows(rows))
+    }
+
+    /// SHOW SCHEMAS — list namespaces (declared + those referenced by ontologies).
+    fn execute_show_schemas(&self, engine: &LsmEngine) -> Result<QueryResult> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        match self.ontology_store.list_namespaces() {
+            Ok(list) => {
+                for ns in list {
+                    names.insert(ns.name);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("SHOW SCHEMAS: list_namespaces failed: {}", e);
+            }
+        }
+
+        for (_key, val_bytes) in engine.scan_prefix(b"__ontology__").unwrap_or_default() {
+            if let Ok(onto) = onto_ontology::Ontology::from_json_slice(&val_bytes) {
+                names.insert(
+                    onto.namespace
+                        .clone()
+                        .unwrap_or_else(|| "_default".to_string()),
+                );
+            }
+        }
+        if names.is_empty() {
+            names.insert("_default".to_string());
+        }
+
+        let mut rows = Vec::new();
+        for name in names {
+            let mut row = Map::new();
+            row.insert("namespace".to_string(), Value::String(name));
+            rows.push(row);
+        }
+        Ok(QueryResult::Rows(rows))
+    }
+
+    /// DESCRIBE <class> / SHOW COLUMNS FROM <class> — merged ontology properties
+    /// plus columns inferred from a sample of live rows.
+    fn execute_describe(&self, engine: &LsmEngine, class: &str) -> Result<QueryResult> {
+        let class = class.trim().trim_matches('"').trim_matches('\'');
+        if class.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "DESCRIBE requires a class name".to_string(),
+            ));
+        }
+
+        let merged = self.get_merged_ontology(engine);
+        let mut rows: Vec<Map<String, Value>> = Vec::new();
+        let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        if let Some(cls) = merged.classes.get(class) {
+            for prop_name in cls.properties.iter() {
+                known.insert(prop_name.clone());
+                let mut row = Map::new();
+                row.insert("column".to_string(), Value::String(prop_name.clone()));
+                if let Some(prop) = merged.properties.get(prop_name) {
+                    row.insert(
+                        "type".to_string(),
+                        Value::String(prop.range.as_str().to_string()),
+                    );
+                    row.insert("required".to_string(), Value::Bool(prop.required));
+                    row.insert("multi_valued".to_string(), Value::Bool(prop.multi_valued));
+                    if let Some(desc) = &prop.description {
+                        row.insert("description".to_string(), Value::String(desc.clone()));
+                    }
+                } else {
+                    row.insert("type".to_string(), Value::String("STRING".to_string()));
+                    row.insert("required".to_string(), Value::Bool(false));
+                    row.insert("multi_valued".to_string(), Value::Bool(false));
+                }
+                row.insert("source".to_string(), Value::String("ontology".to_string()));
+                rows.push(row);
+            }
+            // Inherited properties
+            for prop in merged.get_class_properties(class) {
+                if known.insert(prop.name.clone()) {
+                    let mut row = Map::new();
+                    row.insert("column".to_string(), Value::String(prop.name.clone()));
+                    row.insert(
+                        "type".to_string(),
+                        Value::String(prop.range.as_str().to_string()),
+                    );
+                    row.insert("required".to_string(), Value::Bool(prop.required));
+                    row.insert("multi_valued".to_string(), Value::Bool(prop.multi_valued));
+                    row.insert(
+                        "source".to_string(),
+                        Value::String("ontology:inherited".to_string()),
+                    );
+                    rows.push(row);
+                }
+            }
+        }
+
+        // Infer extra columns from live rows (covers soft schema / observed-only)
+        let mut inferred: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for scan_class in self.get_class_hierarchy_read(engine, class) {
+            let prefix = format!("{}::", scan_class);
+            if let Ok(sample) = engine.scan_prefix_limit(prefix.as_bytes(), 5) {
+                for (_key, val_bytes) in &sample {
+                    if let Some(doc) = simd_parse_row(val_bytes) {
+                        for (col, val) in &doc {
+                            if col.starts_with('_') {
+                                continue;
+                            }
+                            let t = match val {
+                                Value::Number(n) if n.is_i64() || n.is_u64() => "INT64",
+                                Value::Number(_) => "FLOAT64",
+                                Value::Bool(_) => "BOOL",
+                                Value::Array(_) => "ARRAY",
+                                Value::Object(_) => "OBJECT",
+                                _ => "STRING",
+                            };
+                            inferred
+                                .entry(col.clone())
+                                .or_insert_with(|| t.to_string());
+                        }
+                    }
+                }
+            }
+            if !inferred.is_empty() {
+                break;
+            }
+        }
+
+        for (col, t) in inferred {
+            if known.contains(&col) {
+                continue;
+            }
+            let mut row = Map::new();
+            row.insert("column".to_string(), Value::String(col));
+            row.insert("type".to_string(), Value::String(t));
+            row.insert("required".to_string(), Value::Bool(false));
+            row.insert("multi_valued".to_string(), Value::Bool(false));
+            row.insert("source".to_string(), Value::String("inferred".to_string()));
+            rows.push(row);
+        }
+
+        if rows.is_empty() {
+            return Err(CoreError::InvalidArgument(format!(
+                "class '{}' not found in ontology and no live rows to infer from",
+                class
+            )));
+        }
+        Ok(QueryResult::Rows(rows))
     }
 
     /// Refreshes planner stats for a table after index creation/deletion.
@@ -15521,6 +15802,110 @@ mod tests {
             ],
         };
         executor.execute(&ast).unwrap();
+    }
+
+    #[test]
+    fn test_show_classes_lists_ontology_and_observed() {
+        let (executor, _dir) = setup();
+        // Ontology-backed class
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        insert_row(&executor, "Product", "iPhone", 999);
+        // Observed-only class (data without ontology entry)
+        insert_row(&executor, "Widget", "w1", 1);
+
+        let result = executor
+            .execute_read(&QueryParser::parse("SHOW CLASSES").unwrap())
+            .unwrap();
+        let rows = match result {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        let classes: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r.get("class").and_then(|v| v.as_str()))
+            .collect();
+        assert!(classes.contains(&"Product"), "classes: {:?}", classes);
+        assert!(classes.contains(&"Widget"), "classes: {:?}", classes);
+
+        let product = rows
+            .iter()
+            .find(|r| r.get("class").and_then(|v| v.as_str()) == Some("Product"))
+            .unwrap();
+        assert!(product.get("n_properties").and_then(|v| v.as_u64()).unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_show_schemas_returns_namespaces() {
+        let (executor, _dir) = setup();
+        let result = executor
+            .execute_read(&QueryParser::parse("SHOW SCHEMAS").unwrap())
+            .unwrap();
+        let rows = match result {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        assert!(!rows.is_empty());
+        assert!(rows[0].get("namespace").is_some());
+    }
+
+    #[test]
+    fn test_describe_ontology_and_inferred() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        insert_row(&executor, "Product", "iPhone", 999);
+
+        let result = executor
+            .execute_read(&QueryParser::parse("DESCRIBE Product").unwrap())
+            .unwrap();
+        let rows = match result {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        let cols: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r.get("column").and_then(|v| v.as_str()))
+            .collect();
+        assert!(cols.contains(&"name"), "cols: {:?}", cols);
+        assert!(cols.contains(&"price"), "cols: {:?}", cols);
+
+        // Inferred columns from live rows (no ontology)
+        insert_row(&executor, "Widget", "w1", 1);
+        let result = executor
+            .execute_read(&QueryParser::parse("DESCRIBE Widget").unwrap())
+            .unwrap();
+        let rows = match result {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        let cols: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r.get("column").and_then(|v| v.as_str()))
+            .collect();
+        assert!(cols.contains(&"name"), "inferred cols: {:?}", cols);
+        assert!(rows
+            .iter()
+            .any(|r| r.get("source").and_then(|v| v.as_str()) == Some("inferred")));
+    }
+
+    #[test]
+    fn test_describe_unknown_class_errors() {
+        let (executor, _dir) = setup();
+        let result = executor.execute_read(&QueryParser::parse("DESCRIBE NoSuch").unwrap());
+        assert!(result.is_err());
     }
 
     #[test]
