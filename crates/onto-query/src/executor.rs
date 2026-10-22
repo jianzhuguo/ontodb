@@ -7215,6 +7215,29 @@ impl QueryExecutor {
         true
     }
 
+    /// True when the filter has a conjunct that the index bounds on `col`
+    /// cannot absorb — i.e. a residual that can reject an arbitrary run of
+    /// consecutive index entries (IsNull / LIKE / other column / Or / Not).
+    /// Strict `Gt`/`Lt` on `col` themselves are NOT selective: bounds are
+    /// pushed into the walk and the residual only drops the boundary row.
+    fn has_selective_residual(f: &FilterExpr, col: &str) -> bool {
+        let mut conjuncts = Vec::new();
+        Self::split_and_conjuncts(f, &mut conjuncts);
+        for c in &conjuncts {
+            match c {
+                FilterExpr::Eq(cc, _)
+                | FilterExpr::Gt(cc, _)
+                | FilterExpr::Gte(cc, _)
+                | FilterExpr::Lt(cc, _)
+                | FilterExpr::Lte(cc, _)
+                | FilterExpr::Between(cc, _, _)
+                    if cc == col => {}
+                _ => return true,
+            }
+        }
+        false
+    }
+
     /// Column referenced by an indexable filter (first indexable And conjunct).
     fn filter_column(f: &FilterExpr) -> Option<String> {
         match f {
@@ -7584,12 +7607,15 @@ impl QueryExecutor {
         if let Some(f) = filter {
             // Residual predicates (not expressible as a range on
             // `index_column`) mean the index result is an over-approximation.
-            // We must over-fetch pkeys so that after the post-filter there are
-            // still `limit` rows; truncating pkeys to `limit` *before* the
-            // filter under-returns.
-            let residual = !Self::filter_fully_covered_by_column(f, index_column);
-            let pk_budget = match (limit, residual) {
-                (Some(l), true) => Some(l.saturating_mul(8).max(64)),
+            // A selective residual (IsNull / LIKE / other column) can reject
+            // an arbitrary run of entries, so a fixed over-fetch under-returns
+            // when matches are sparse — collect the full range. A residual
+            // that only adds strict-boundary slack on `index_column` rejects
+            // at most a couple of rows, so a small pad suffices.
+            let selective = Self::has_selective_residual(f, index_column);
+            let pk_budget = match (limit, selective) {
+                (Some(_), true) => None,
+                (Some(l), false) => Some(l.saturating_add(16)),
                 (other, _) => other,
             };
             let mut all_pkeys: Vec<Vec<u8>> = Vec::new();
@@ -8372,9 +8398,11 @@ impl QueryExecutor {
     /// emit rows as they are fetched. Gives true sorted output (and early exit
     /// with LIMIT) without a separate sort pass.
     ///
-    /// Handles a single scan class that has the index; multi-class hierarchies
-    /// fall back to the caller's unordered path (each class is sorted on its
-    /// own, so a global merge would need the index values).
+    /// Pkeys are pulled in **batches** (`range_pkeys_batch_after` /
+    /// `range_pkeys_batch_before`) so a selective residual (IsNull / LIKE /
+    /// other column) that rejects long runs of index entries does not force a
+    /// full-range materialization: the walk keeps going until `take` matches
+    /// are emitted or the range ends.
     fn stream_ordered_index_read(
         &self,
         engine: &LsmEngine,
@@ -8390,7 +8418,7 @@ impl QueryExecutor {
     ) -> Result<usize> {
         let class_hierarchy = self.get_class_hierarchy_read(engine, table);
         // Walk the index for every hierarchy class that has it. Classes without
-        // the index are skipped �?same semantics as stream_index_scan_read.
+        // the index are skipped — same semantics as stream_index_scan_read.
         let indexed: Vec<String> = class_hierarchy
             .iter()
             .filter(|c| engine.has_index(c, order_col))
@@ -8400,52 +8428,12 @@ impl QueryExecutor {
             return Ok(0);
         }
 
-        // Collect pkeys in index order, with filter bounds pushed into the walk
-        // when the filter is on the same column.  Use the manager's
-        // `range_pkeys_read_limit` which merges mem+disk (see manager.rs) —
-        // raw `get_index` + `range_cursor` only walks the in-memory tree and
-        // misses disk entries after `open_disk_indexes` creates empty memory
-        // trees.
         let (lo_bound, hi_bound) = Self::range_bounds_for_column(filter, order_col);
-        let want = take.map(|t| t.saturating_add(skip));
-        // Over-fetch a little when a residual filter may reject rows.
-        let fetch_lim = if filter.is_some() {
-            want.map(|w| w.saturating_mul(4).max(64))
-        } else {
-            want
-        };
-        let mut all_pkeys: Vec<Vec<u8>> = Vec::new();
-        for scan_class in &indexed {
-            let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
-            if let Some(pkeys) = mgr.range_pkeys_read_limit(
-                scan_class,
-                order_col,
-                lo_bound.as_deref(),
-                hi_bound.as_deref(),
-                fetch_lim,
-            ) {
-                all_pkeys.extend(pkeys);
-            }
-        }
-        if !ascending {
-            all_pkeys.reverse();
-        }
-
-        // Bound the fetch only when there is no residual filter �?a filter can
-        // reject early pkeys, so pre-truncating would drop matching rows.
-        if filter.is_none() {
-            if let Some(w) = want {
-                if all_pkeys.len() > w {
-                    all_pkeys.truncate(w);
-                }
-            }
-        }
 
         let mut emitted = 0usize;
         let mut skipped = 0usize;
         // Same contract as plan_index_scan_read_limit: the residual filter must
-        // see every column it references, so fetch projection ∪ filter columns
-        // and strip after filtering.
+        // see every column it references.
         let mut fcols: Vec<String> = Vec::new();
         if let Some(f) = filter {
             Self::collect_filter_columns(f, &mut fcols);
@@ -8454,7 +8442,7 @@ impl QueryExecutor {
         let proj_ref_empty = proj_vec.is_empty();
         let mut fetch_cols = proj_vec.clone();
         let mut added = false;
-        for c in fcols {
+        for c in fcols.iter().cloned() {
             if !fetch_cols.contains(&c) {
                 fetch_cols.push(c);
                 added = true;
@@ -8465,61 +8453,222 @@ impl QueryExecutor {
         let fetch_ref: Option<&[String]> =
             if fetch_cols.is_empty() || proj_ref_empty { None } else { Some(&fetch_cols) };
 
-        Self::fetch_rows_by_pks_stream(
-            engine,
-            &all_pkeys,
-            fetch_ref,
-            Self::STREAM_BATCH_ROWS,
-            &mut |mut rows| {
-                // Optional residual filter (e.g. range pred not covered by index).
-                if let Some(f) = filter {
-                    rows.retain(|row| self.eval_filter_read(engine, row, f));
+        // Selective residual + a projection that pulls more than the filter
+        // needs (e.g. SELECT id, smiles WHERE fp IS NULL): evaluate the filter
+        // on a narrow column set first, and only fetch the wide projection
+        // columns for rows that survive. Avoids reading smiles for every
+        // rejected candidate in a long sparse run.
+        let selective = filter
+            .as_ref()
+            .is_some_and(|f| Self::has_selective_residual(f, order_col));
+        let two_phase = selective
+            && !proj_ref_empty
+            && fetch_cols.iter().any(|c| !fcols.contains(c));
+        let filter_only: Vec<String> = if two_phase {
+            let mut cols = fcols.clone();
+            if cols.is_empty() {
+                // Residual references no columns (e.g. constant) — nothing to
+                // prefetch; fall back to one-phase.
+                Vec::new()
+            } else {
+                cols.dedup();
+                cols
+            }
+        } else {
+            Vec::new()
+        };
+        let two_phase = two_phase && !filter_only.is_empty();
+
+        // How many pkeys to pull per index batch. Small enough to keep the
+        // pk list bounded; large enough that row I/O stays batched. Sparse
+        // selective residuals walk far — use a bigger batch to amortize the
+        // index re-seek and multi_get call overhead.
+        let pk_batch: usize = if selective { 2048 } else { 512 };
+
+        // Process one batch of pkeys (already in emit order). Returns false
+        // when `take` is filled or the sink asked us to stop.
+        let mut process_pkeys = |pkeys: &[Vec<u8>],
+                                 emitted: &mut usize,
+                                 skipped: &mut usize|
+         -> Result<bool> {
+            if pkeys.is_empty() {
+                return Ok(true);
+            }
+            let mut stop = false;
+
+            // Phase 1 (optional): fetch only filter columns, keep matching pks.
+            let eval_pkeys: Vec<Vec<u8>> = if two_phase {
+                let values = engine.multi_get(pkeys)?;
+                let mut matched = Vec::new();
+                for (pk, val) in pkeys.iter().zip(values.into_iter()) {
+                    let Some(val_bytes) = val else { continue };
+                    let Some(row) = simd_parse_row_projected(&val_bytes, &filter_only) else {
+                        continue;
+                    };
+                    let mut tmp = vec![row];
+                    tmp.retain(|r| self.eval_filter_read(engine, r, filter.as_ref().unwrap()));
+                    if !tmp.is_empty() {
+                        matched.push(pk.clone());
+                    }
                 }
-                // Strip helper columns the filter needed (keep __class__).
-                if added && !proj_vec.is_empty() {
-                    rows = rows
-                        .into_iter()
-                        .map(|row| {
-                            let mut out = Map::new();
-                            if let Some(c) = row.get("__class__") {
-                                out.insert("__class__".to_string(), c.clone());
-                            }
-                            for c in &proj_vec {
-                                if let Some(v) = row.get(c) {
-                                    out.insert(c.clone(), v.clone());
+                matched
+            } else {
+                pkeys.to_vec()
+            };
+
+            if eval_pkeys.is_empty() {
+                return Ok(true);
+            }
+
+            Self::fetch_rows_by_pks_stream(
+                engine,
+                &eval_pkeys,
+                fetch_ref,
+                Self::STREAM_BATCH_ROWS,
+                &mut |mut rows| {
+                    if !two_phase {
+                        if let Some(f) = filter {
+                            rows.retain(|row| self.eval_filter_read(engine, row, f));
+                        }
+                    }
+                    if let Some(f) = filter {
+                        rows.retain(|row| self.eval_filter_read(engine, row, f));
+                    }
+                    if added && !proj_vec.is_empty() {
+                        rows = rows
+                            .into_iter()
+                            .map(|row| {
+                                let mut out = Map::new();
+                                if let Some(c) = row.get("__class__") {
+                                    out.insert("__class__".to_string(), c.clone());
                                 }
-                            }
-                            out
-                        })
-                        .collect();
-                }
-                if skipped < skip {
-                    let drop_n = (skip - skipped).min(rows.len());
-                    rows.drain(..drop_n);
-                    skipped += drop_n;
+                                for c in &proj_vec {
+                                    if let Some(v) = row.get(c) {
+                                        out.insert(c.clone(), v.clone());
+                                    }
+                                }
+                                out
+                            })
+                            .collect();
+                    }
+                    if *skipped < skip {
+                        let drop_n = (skip - *skipped).min(rows.len());
+                        rows.drain(..drop_n);
+                        *skipped += drop_n;
+                        if rows.is_empty() {
+                            return true;
+                        }
+                    }
+                    if let Some(lim) = take {
+                        let room = lim.saturating_sub(*emitted);
+                        if room == 0 {
+                            stop = true;
+                            return false;
+                        }
+                        if rows.len() > room {
+                            rows.truncate(room);
+                        }
+                    }
+                    *emitted += rows.len();
+                    if let Some(a) = alias {
+                        Self::apply_alias(&mut rows, a);
+                    }
                     if rows.is_empty() {
                         return true;
                     }
-                }
-                if let Some(lim) = take {
-                    let room = lim.saturating_sub(emitted);
-                    if room == 0 {
+                    if !sink(rows) {
+                        stop = true;
                         return false;
                     }
-                    if rows.len() > room {
-                        rows.truncate(room);
+                    if let Some(lim) = take {
+                        if *emitted >= lim {
+                            stop = true;
+                            return false;
+                        }
+                    }
+                    true
+                },
+            )?;
+            Ok(!stop)
+        };
+
+        // ── ASC: batched walk forward, resume after last (value, pk) ──
+        if ascending {
+            for scan_class in &indexed {
+                let mut resume: Option<(Vec<u8>, Vec<u8>)> = None;
+                loop {
+                    if let Some(lim) = take {
+                        if emitted >= lim {
+                            return Ok(emitted);
+                        }
+                    }
+                    let batch = {
+                        let mgr =
+                            engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+                        mgr.range_pkeys_batch_after(
+                            scan_class,
+                            order_col,
+                            lo_bound.as_deref(),
+                            hi_bound.as_deref(),
+                            resume.as_ref().map(|(v, p)| (v.as_slice(), p.as_slice())),
+                            pk_batch,
+                        )
+                    };
+                    let Some((pkeys, next_resume)) = batch else {
+                        break;
+                    };
+                    let has_more = next_resume.is_some();
+                    if !process_pkeys(&pkeys, &mut emitted, &mut skipped)? {
+                        return Ok(emitted);
+                    }
+                    match next_resume {
+                        Some(r) => resume = Some(r),
+                        None => break,
+                    }
+                    if !has_more {
+                        break;
                     }
                 }
-                emitted += rows.len();
-                if let Some(a) = alias {
-                    Self::apply_alias(&mut rows, a);
+            }
+            return Ok(emitted);
+        }
+
+        // ── DESC: batched reverse walk, resume before last (value, pk) ──
+        for scan_class in &indexed {
+            let mut resume: Option<(Vec<u8>, Vec<u8>)> = None;
+            loop {
+                if let Some(lim) = take {
+                    if emitted >= lim {
+                        return Ok(emitted);
+                    }
                 }
-                if rows.is_empty() {
-                    return true;
+                let batch = {
+                    let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+                    mgr.range_pkeys_batch_before(
+                        scan_class,
+                        order_col,
+                        lo_bound.as_deref(),
+                        hi_bound.as_deref(),
+                        resume.as_ref().map(|(v, p)| (v.as_slice(), p.as_slice())),
+                        pk_batch,
+                    )
+                };
+                let Some((pkeys, next_resume)) = batch else {
+                    break;
+                };
+                let has_more = next_resume.is_some();
+                if !process_pkeys(&pkeys, &mut emitted, &mut skipped)? {
+                    return Ok(emitted);
                 }
-                sink(rows)
-            },
-        )?;
+                match next_resume {
+                    Some(r) => resume = Some(r),
+                    None => break,
+                }
+                if !has_more {
+                    break;
+                }
+            }
+        }
         Ok(emitted)
     }
 
@@ -17237,6 +17386,149 @@ mod tests {
             }
             _ => panic!("expected top 2 by price desc"),
         }
+    }
+
+    /// Regression: a residual filter that rejects long runs of consecutive
+    /// index entries (e.g. `name = 'sparse'` where every early price row is
+    /// `name = 'filled'`) must not under-return when combined with
+    /// ORDER BY + LIMIT. The old fixed 4× over-fetch collected only the first
+    /// ~64 pkeys in index order — all rejected — and returned 0 rows.
+    #[test]
+    fn test_order_by_sparse_residual_returns_matches() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryParser::parse("CREATE INDEX ON Product (price)").unwrap())
+            .unwrap();
+        // 80 rows the residual will reject, in ascending price order.
+        for i in 0..80 {
+            insert_row(&executor, "Product", "filled", 100 + i);
+        }
+        // 3 sparse matches at the END of the price order.
+        insert_row(&executor, "Product", "sparse", 500);
+        insert_row(&executor, "Product", "sparse", 501);
+        insert_row(&executor, "Product", "sparse", 502);
+        executor.engine().flush().unwrap();
+
+        let ast = QueryParser::parse(
+            "SELECT name, price FROM Product WHERE name = 'sparse' ORDER BY price LIMIT 3",
+        )
+        .unwrap();
+        let mut collected: Vec<Map<String, Value>> = Vec::new();
+        executor
+            .execute_read_streaming(&ast, &mut |rows| {
+                collected.extend(rows);
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            collected.len(),
+            3,
+            "sparse residual + ORDER BY + LIMIT must return 3 rows, got {}",
+            collected.len()
+        );
+        let prices: Vec<i64> = collected
+            .iter()
+            .map(|r| r.get("price").unwrap().as_i64().unwrap())
+            .collect();
+        assert_eq!(prices, vec![500, 501, 502], "must be in index (price) order");
+        for r in &collected {
+            assert_eq!(r.get("name").unwrap().as_str().unwrap(), "sparse");
+        }
+
+        // LIMIT smaller than the match count must also return exactly LIMIT.
+        let ast = QueryParser::parse(
+            "SELECT name FROM Product WHERE name = 'sparse' ORDER BY price LIMIT 2",
+        )
+        .unwrap();
+        let mut collected2: Vec<Map<String, Value>> = Vec::new();
+        executor
+            .execute_read_streaming(&ast, &mut |rows| {
+                collected2.extend(rows);
+                true
+            })
+            .unwrap();
+        assert_eq!(collected2.len(), 2, "LIMIT 2 must still return 2 rows");
+    }
+
+    /// DESC twin of the sparse-residual regression: matches live at the
+    /// *end* of the ASC price order (= the *start* of DESC). Must return
+    /// them in descending price, not under-return.
+    #[test]
+    fn test_order_by_sparse_residual_desc() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryParser::parse("CREATE INDEX ON Product (price)").unwrap())
+            .unwrap();
+        for i in 0..80 {
+            insert_row(&executor, "Product", "filled", 100 + i);
+        }
+        insert_row(&executor, "Product", "sparse", 500);
+        insert_row(&executor, "Product", "sparse", 501);
+        insert_row(&executor, "Product", "sparse", 502);
+        executor.engine().flush().unwrap();
+
+        let ast = QueryParser::parse(
+            "SELECT name, price FROM Product WHERE name = 'sparse' ORDER BY price DESC LIMIT 3",
+        )
+        .unwrap();
+        let mut collected: Vec<Map<String, Value>> = Vec::new();
+        executor
+            .execute_read_streaming(&ast, &mut |rows| {
+                collected.extend(rows);
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            collected.len(),
+            3,
+            "sparse residual + ORDER BY DESC + LIMIT must return 3 rows, got {}",
+            collected.len()
+        );
+        let prices: Vec<i64> = collected
+            .iter()
+            .map(|r| r.get("price").unwrap().as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            prices,
+            vec![502, 501, 500],
+            "DESC must walk the index backward"
+        );
+    }
+
+    /// DESC + LIMIT without a residual must return the *largest* keys, not
+    /// the first ASC batch reversed.
+    #[test]
+    fn test_order_by_desc_limit_takes_largest() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryParser::parse("CREATE INDEX ON Product (price)").unwrap())
+            .unwrap();
+        for (name, price) in [
+            ("a", 10),
+            ("b", 20),
+            ("c", 30),
+            ("d", 40),
+            ("e", 50),
+            ("f", 60),
+        ] {
+            insert_row(&executor, "Product", name, price);
+        }
+        executor.engine().flush().unwrap();
+
+        let ast =
+            QueryParser::parse("SELECT name FROM Product ORDER BY price DESC LIMIT 2").unwrap();
+        let mut collected: Vec<Map<String, Value>> = Vec::new();
+        executor
+            .execute_read_streaming(&ast, &mut |rows| {
+                collected.extend(rows);
+                true
+            })
+            .unwrap();
+        let names: Vec<String> = collected
+            .iter()
+            .map(|r| r.get("name").unwrap().as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["f".to_string(), "e".to_string()]);
     }
 
     #[test]

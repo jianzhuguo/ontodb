@@ -265,6 +265,8 @@ pub struct DiskRangeCursor<'a> {
     leaf: DiskPage,
     entry_idx: u16,
     done: bool,
+    /// Walk largest-first (ORDER BY DESC).
+    reverse: bool,
 }
 
 impl<'a> DiskRangeCursor<'a> {
@@ -277,15 +279,22 @@ impl<'a> DiskRangeCursor<'a> {
             }
             let num = self.leaf.num_entries();
             if self.entry_idx >= num {
+                if self.reverse {
+                    // Past the start of this leaf when walking backward is
+                    // signalled by entry_idx wrapping; step to the left leaf.
+                    if !self.step_to_left_leaf()? {
+                        self.finish();
+                        return Ok(());
+                    }
+                    continue;
+                }
                 let right = self
                     .leaf
                     .header()
                     .map(|h| h.right_leaf)
                     .unwrap_or(NULL_PAGE);
                 if right == NULL_PAGE {
-                    self.done = true;
-                    self.cur_val.clear();
-                    self.cur_pk.clear();
+                    self.finish();
                     return Ok(());
                 }
                 self.leaf = self.idx.get_page(right)?;
@@ -295,12 +304,19 @@ impl<'a> DiskRangeCursor<'a> {
             let (full_key, pks) = self.leaf.get_leaf(self.entry_idx).unwrap_or_default();
             let value = key_value_part(&full_key);
             if self.hi.as_ref().is_some_and(|h| value > h.as_slice()) {
-                self.done = true;
-                self.cur_val.clear();
-                self.cur_pk.clear();
+                if self.reverse {
+                    // Past the high bound walking backward — step back.
+                    self.step_back_within_or_left();
+                    continue;
+                }
+                self.finish();
                 return Ok(());
             }
             if self.lo.as_ref().is_some_and(|l| value < l.as_slice()) {
+                if self.reverse {
+                    self.finish();
+                    return Ok(());
+                }
                 self.entry_idx += 1;
                 continue;
             }
@@ -311,6 +327,60 @@ impl<'a> DiskRangeCursor<'a> {
         }
     }
 
+    fn finish(&mut self) {
+        self.done = true;
+        self.cur_val.clear();
+        self.cur_pk.clear();
+    }
+
+    /// Move to the previous slot in this leaf, or the last slot of the left leaf.
+    fn step_back_within_or_left(&mut self) {
+        if self.entry_idx > 0 {
+            self.entry_idx -= 1;
+        } else {
+            // Signalled as "entry_idx >= num" on the next seek_valid pass when
+            // the left leaf is empty; for a clean step we load the left leaf here
+            // and set entry_idx to its last slot (or 0 if empty).
+            let left = self
+                .leaf
+                .header()
+                .map(|h| h.left_leaf)
+                .unwrap_or(NULL_PAGE);
+            if left == NULL_PAGE {
+                self.finish();
+            } else {
+                match self.idx.get_page(left) {
+                    Ok(p) => {
+                        let n = p.num_entries();
+                        self.leaf = p;
+                        self.entry_idx = if n == 0 { 0 } else { n - 1 };
+                    }
+                    Err(_) => self.finish(),
+                }
+            }
+        }
+    }
+
+    /// Walk to the previous non-empty leaf. False when at the start.
+    fn step_to_left_leaf(&mut self) -> Result<bool> {
+        let mut left = self
+            .leaf
+            .header()
+            .map(|h| h.left_leaf)
+            .unwrap_or(NULL_PAGE);
+        while left != NULL_PAGE {
+            let p = self.idx.get_page(left)?;
+            let n = p.num_entries();
+            if n > 0 {
+                self.leaf = p;
+                self.entry_idx = n - 1;
+                return Ok(true);
+            }
+            left = p.header().map(|h| h.left_leaf).unwrap_or(NULL_PAGE);
+        }
+        Ok(false)
+    }
+
     /// Current (value, pk) as refs into the cursor's single-entry buffer.
     pub fn current(&self) -> Option<(&[u8], &[u8])> {
         if self.done {
@@ -319,9 +389,16 @@ impl<'a> DiskRangeCursor<'a> {
         Some((self.cur_val.as_slice(), self.cur_pk.as_slice()))
     }
 
-    /// Move to the next (value, pk).
+    /// Move to the next (value, pk) in walk direction.
     pub fn advance(&mut self) -> Result<()> {
-        self.entry_idx += 1;
+        if self.reverse {
+            self.step_back_within_or_left();
+            if self.done {
+                return Ok(());
+            }
+        } else {
+            self.entry_idx += 1;
+        }
         self.seek_valid()
     }
 }
@@ -1603,6 +1680,91 @@ impl BTreeIndex {
             entry_idx: start_idx,
             lo: lo_owned,
             done: false,
+            reverse: false,
+        };
+        cur.seek_valid()?;
+        Ok(cur)
+    }
+
+    /// Reverse (value, pk) walk: largest-first. Yields entries with
+    /// `lo <= value <= hi`, used by ORDER BY DESC index scans.
+    pub fn range_cursor_rev(
+        &mut self,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+    ) -> Result<DiskRangeCursor<'_>> {
+        let lo_owned = lo.map(|v| v.to_vec());
+        let hi_owned = hi.map(|v| v.to_vec());
+
+        // Start at the last entry with value <= hi (or the overall last entry).
+        let (leaf, start_idx) = match &hi_owned {
+            Some(h) => {
+                // Sentinel just past every `compose_key(h, pk)` entry:
+                // compose_key(h, b"") is `h || 0x00 0x00`, so `h || 0x00 0x01`
+                // sorts after every `h || 0x00 0x00 || pk` and before any
+                // larger value.
+                let mut sentinel = h.to_vec();
+                sentinel.extend_from_slice(&KEY_SEPARATOR);
+                sentinel.push(0x01);
+                let mut leaf = self.find_leaf(&sentinel)?;
+                let mut pos = match leaf.binary_search(&sentinel) {
+                    Ok(i) | Err(i) => i,
+                };
+                // binary_search returns the first slot >= sentinel; step back
+                // to the last entry with value <= h. Cross leaves when needed.
+                loop {
+                    if pos > 0 {
+                        break;
+                    }
+                    let left = leaf.header().map(|hd| hd.left_leaf).unwrap_or(NULL_PAGE);
+                    if left == NULL_PAGE {
+                        return Ok(DiskRangeCursor {
+                            idx: self,
+                            hi: hi_owned,
+                            lo: lo_owned,
+                            cur_val: Vec::new(),
+                            cur_pk: Vec::new(),
+                            leaf,
+                            entry_idx: 0,
+                            done: true,
+                            reverse: true,
+                        });
+                    }
+                    leaf = self.get_page(left)?;
+                    pos = leaf.num_entries();
+                }
+                (leaf, pos - 1)
+            }
+            None => {
+                let leaf = self.find_rightmost_leaf()?;
+                let n = leaf.num_entries();
+                if n == 0 {
+                    return Ok(DiskRangeCursor {
+                        idx: self,
+                        hi: hi_owned,
+                        lo: lo_owned,
+                        cur_val: Vec::new(),
+                        cur_pk: Vec::new(),
+                        leaf,
+                        entry_idx: 0,
+                        done: true,
+                        reverse: true,
+                    });
+                }
+                (leaf, n - 1)
+            }
+        };
+
+        let mut cur = DiskRangeCursor {
+            idx: self,
+            hi: hi_owned,
+            lo: lo_owned,
+            cur_val: Vec::new(),
+            cur_pk: Vec::new(),
+            leaf,
+            entry_idx: start_idx,
+            done: false,
+            reverse: true,
         };
         cur.seek_valid()?;
         Ok(cur)
@@ -2634,6 +2796,27 @@ impl BTreeIndex {
                 PageType::Leaf => return Ok(page),
                 PageType::Internal => {
                     let child_id = page.first_child();
+                    page = self.get_page(child_id)?;
+                }
+                _ => return Err(onto_core::CoreError::Corruption("invalid page type".into())),
+            }
+        }
+    }
+
+    /// Finds the rightmost leaf (for reverse / ORDER BY DESC scans).
+    fn find_rightmost_leaf(&mut self) -> Result<DiskPage> {
+        let mut page = self.get_page(self.meta.root_page)?;
+        loop {
+            match page.page_type() {
+                PageType::Leaf => return Ok(page),
+                PageType::Internal => {
+                    let num = page.num_entries();
+                    let child_id = if num == 0 {
+                        page.first_child()
+                    } else {
+                        let (_, child) = page.get_internal(num - 1).expect("should be valid");
+                        child
+                    };
                     page = self.get_page(child_id)?;
                 }
                 _ => return Err(onto_core::CoreError::Corruption("invalid page type".into())),

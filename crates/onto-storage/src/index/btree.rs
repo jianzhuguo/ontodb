@@ -159,6 +159,130 @@ impl<'a> ValuePkCursor<'a> {
     }
 }
 
+/// Reverse walk over (value, pk): largest-first, used by ORDER BY DESC.
+/// Within a key, pks are visited from last to first (they are kept sorted).
+pub struct ValuePkRevCursor<'a> {
+    tree: &'a BPlusTree,
+    pos: Cursor,
+    /// Inclusive lower bound (`k < low` stops).
+    low: Option<Vec<u8>>,
+    /// Inclusive upper bound (`k > high` never yields).
+    high: Option<Vec<u8>>,
+    /// Index into the current key's pk list, counting downward.
+    pk_idx: usize,
+    /// False until the first (upper-bound) position has been resolved to a pk.
+    started: bool,
+}
+
+impl<'a> ValuePkRevCursor<'a> {
+    /// Position on a valid (value, pk), or mark exhausted.
+    fn seek_valid(&mut self) {
+        loop {
+            if !self.pos.is_valid(self.tree) {
+                return;
+            }
+            let leaf = match self.tree.node(self.pos.leaf_id).expect("node should exist") {
+                Node::Leaf(n) => n,
+                _ => return,
+            };
+            if self.pos.idx >= leaf.keys.len() {
+                // Past the last key of this leaf — step back a key.
+                if self.pos.idx == 0 {
+                    self.move_to_prev_key();
+                    continue;
+                }
+                self.pos.idx -= 1;
+                self.pk_idx = usize::MAX; // resolve to last pk
+                continue;
+            }
+            let k = leaf.keys[self.pos.idx].as_slice();
+            if self.low.as_ref().is_some_and(|l| k < l.as_slice()) {
+                self.pos.leaf_id = u64::MAX;
+                return;
+            }
+            if self.high.as_ref().is_some_and(|h| k > h.as_slice()) {
+                if self.pos.idx == 0 {
+                    self.move_to_prev_key();
+                    continue;
+                }
+                self.pos.idx -= 1;
+                self.pk_idx = usize::MAX;
+                continue;
+            }
+            let vals = &leaf.values[self.pos.idx];
+            if vals.is_empty() {
+                if self.pos.idx == 0 {
+                    self.move_to_prev_key();
+                    continue;
+                }
+                self.pos.idx -= 1;
+                self.pk_idx = usize::MAX;
+                continue;
+            }
+            if !self.started || self.pk_idx == usize::MAX {
+                self.pk_idx = vals.len() - 1;
+                self.started = true;
+            }
+            if self.pk_idx >= vals.len() {
+                self.pk_idx = vals.len() - 1;
+            }
+            return;
+        }
+    }
+
+    /// Step to the previous (value, pk). False at the start of the range.
+    fn move_to_prev_key(&mut self) {
+        if self.pos.idx > 0 {
+            self.pos.idx -= 1;
+            self.pk_idx = usize::MAX;
+            return;
+        }
+        match self.tree.prev_leaf(self.pos.leaf_id) {
+            Some(prev_id) => {
+                let idx = match self.tree.node(prev_id).expect("node should exist") {
+                    Node::Leaf(n) => n.keys.len().saturating_sub(1),
+                    _ => 0,
+                };
+                self.pos.leaf_id = prev_id;
+                self.pos.idx = idx;
+                self.pk_idx = usize::MAX;
+            }
+            None => {
+                self.pos.leaf_id = u64::MAX;
+            }
+        }
+    }
+
+    /// Current (value, pk) as borrowed slices, or None at the start of the range.
+    pub fn current(&self) -> Option<(&'a [u8], &'a [u8])> {
+        if !self.pos.is_valid(self.tree) {
+            return None;
+        }
+        let leaf = match self.tree.node(self.pos.leaf_id).ok()? {
+            Node::Leaf(n) => n,
+            _ => return None,
+        };
+        if self.pos.idx >= leaf.keys.len() {
+            return None;
+        }
+        let vals = &leaf.values[self.pos.idx];
+        if self.pk_idx >= vals.len() {
+            return None;
+        }
+        Some((leaf.keys[self.pos.idx].as_slice(), vals[self.pk_idx].as_slice()))
+    }
+
+    /// Move to the previous (value, pk).
+    pub fn advance(&mut self) {
+        if self.pk_idx > 0 {
+            self.pk_idx -= 1;
+        } else {
+            self.move_to_prev_key();
+        }
+        self.seek_valid();
+    }
+}
+
 /// In-memory B+Tree index for a single indexed column.
 ///
 /// Maps column values to sets of primary keys. The tree supports:
@@ -303,6 +427,8 @@ impl BPlusTree {
                 if let Node::Leaf(n) = self.node_mut(leaf_id).expect("node should exist") {
                     if !n.values[i].contains(&primary_key) {
                         n.values[i].push(primary_key);
+                        // Cursors and mem+disk merge assume (value, pk) order.
+                        n.values[i].sort();
                     }
                 }
                 None
@@ -1231,6 +1357,100 @@ impl BPlusTree {
         } else {
             Cursor { leaf_id, idx: 0 }
         }
+    }
+
+    /// Cursor to the last entry (rightmost leaf, last key).
+    fn cursor_last(&self) -> Option<Cursor> {
+        let mut current = self.root;
+        loop {
+            match self.node(current).ok()? {
+                Node::Leaf(n) => {
+                    if n.keys.is_empty() {
+                        return None;
+                    }
+                    return Some(Cursor {
+                        leaf_id: current,
+                        idx: n.keys.len() - 1,
+                    });
+                }
+                Node::Internal(n) => {
+                    current = *n.children.last()?;
+                }
+            }
+        }
+    }
+
+    /// Cursor to the last entry with key <= target. None when no key qualifies.
+    fn cursor_upper_bound(&self, target: Option<&[u8]>) -> Option<Cursor> {
+        let Some(t) = target else {
+            return self.cursor_last();
+        };
+        let mut leaf_id = self.find_leaf(t);
+        loop {
+            let n = match self.node(leaf_id).ok()? {
+                Node::Leaf(n) => n,
+                _ => return None,
+            };
+            if n.keys.is_empty() {
+                leaf_id = self.prev_leaf(leaf_id)?;
+                continue;
+            }
+            match n.keys.binary_search_by(|k| k.as_slice().cmp(t)) {
+                Ok(i) => return Some(Cursor { leaf_id, idx: i }),
+                Err(0) => {
+                    // All keys in this leaf are > target — step to previous leaf.
+                    leaf_id = self.prev_leaf(leaf_id)?;
+                }
+                Err(i) => return Some(Cursor { leaf_id, idx: i - 1 }),
+            }
+        }
+    }
+
+    /// Previous leaf via parent pointers (mem tree has only a forward `next`).
+    fn prev_leaf(&self, leaf_id: u64) -> Option<u64> {
+        let mut cur = leaf_id;
+        loop {
+            let parent_id = self.node(cur).ok()?.parent_id()?;
+            let parent = self.node(parent_id).ok()?;
+            if let Node::Internal(p) = parent {
+                let pos = p.children.iter().position(|&c| c == cur)?;
+                if pos > 0 {
+                    let mut n = p.children[pos - 1];
+                    loop {
+                        match self.node(n).ok()? {
+                            Node::Leaf(_) => return Some(n),
+                            Node::Internal(i) => n = *i.children.last()?,
+                        }
+                    }
+                }
+                cur = parent_id;
+            } else {
+                return None;
+            }
+        }
+    }
+
+    /// Reverse (value, pk) walk: entries with key <= `high`, keys >= `low`,
+    /// yielded largest-first. Used by ORDER BY DESC index scans.
+    pub fn range_cursor_rev<'a>(
+        &'a self,
+        low: Option<&[u8]>,
+        high: Option<&[u8]>,
+    ) -> ValuePkRevCursor<'a> {
+        let start = self.cursor_upper_bound(high);
+        let mut c = ValuePkRevCursor {
+            tree: self,
+            pos: start.unwrap_or(Cursor {
+                leaf_id: u64::MAX,
+                idx: 0,
+            }),
+            low: low.map(|l| l.to_vec()),
+            high: high.map(|h| h.to_vec()),
+            pk_idx: 0,
+            started: false,
+        };
+        c.seek_valid();
+        c
     }
 }
 

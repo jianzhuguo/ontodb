@@ -14,7 +14,7 @@
 //! On startup, the manager can rebuild in-memory trees from LSM entries or
 //! open existing disk-based index files.
 
-use crate::index::btree::{BPlusTree, ValuePkCursor};
+use crate::index::btree::{BPlusTree, ValuePkCursor, ValuePkRevCursor};
 use crate::index::disk::{BTreeIndex, DiskRangeCursor};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,74 @@ fn collect_pks(mut cur: ValuePkCursor<'_>, limit: Option<usize>) -> Vec<Vec<u8>>
         cur.advance();
     }
     out
+}
+
+/// Skip mem-cursor entries whose (value, pk) <= `after` (exclusive resume).
+fn skip_mem_after<'a>(
+    mut cur: ValuePkCursor<'a>,
+    after: Option<(&[u8], &[u8])>,
+) -> ValuePkCursor<'a> {
+    if let Some((av, ap)) = after {
+        while let Some((v, p)) = cur.current() {
+            if v > av || (v == av && p > ap) {
+                break;
+            }
+            cur.advance();
+        }
+    }
+    cur
+}
+
+/// Skip disk-cursor entries whose (value, pk) <= `after`.
+fn skip_disk_after<'a>(
+    mut cur: DiskRangeCursor<'a>,
+    after: Option<(&[u8], &[u8])>,
+) -> DiskRangeCursor<'a> {
+    if let Some((av, ap)) = after {
+        while let Some((v, p)) = cur.current() {
+            if v > av || (v == av && p > ap) {
+                break;
+            }
+            if cur.advance().is_err() {
+                break;
+            }
+        }
+    }
+    cur
+}
+
+/// Skip reverse-mem-cursor entries whose (value, pk) >= `before` (exclusive).
+fn skip_mem_before<'a>(
+    mut cur: ValuePkRevCursor<'a>,
+    before: Option<(&[u8], &[u8])>,
+) -> ValuePkRevCursor<'a> {
+    if let Some((bv, bp)) = before {
+        while let Some((v, p)) = cur.current() {
+            if v < bv || (v == bv && p < bp) {
+                break;
+            }
+            cur.advance();
+        }
+    }
+    cur
+}
+
+/// Skip reverse-disk-cursor entries whose (value, pk) >= `before`.
+fn skip_disk_before<'a>(
+    mut cur: DiskRangeCursor<'a>,
+    before: Option<(&[u8], &[u8])>,
+) -> DiskRangeCursor<'a> {
+    if let Some((bv, bp)) = before {
+        while let Some((v, p)) = cur.current() {
+            if v < bv || (v == bv && p < bp) {
+                break;
+            }
+            if cur.advance().is_err() {
+                break;
+            }
+        }
+    }
+    cur
 }
 
 /// Collect pks from a disk cursor (one-entry buffer). Stops at `limit`.
@@ -144,6 +212,145 @@ fn merge_cursors(
     }
     out
 }
+
+/// Like [`merge_cursors`], but returns a bounded batch plus the last
+/// `(value, pk)` emitted (the resume token) and whether the merged stream was
+/// exhausted before `limit` was reached. Used by
+/// [`IndexManager::range_pkeys_batch_after`] so callers can fetch-filter-emit
+/// in batches without materializing the whole range.
+fn merge_cursors_batch(
+    mut mem: ValuePkCursor<'_>,
+    mut disk: DiskRangeCursor<'_>,
+    limit: usize,
+) -> (Vec<Vec<u8>>, Option<(Vec<u8>, Vec<u8>)>, bool) {
+    #[derive(Clone, Copy)]
+    enum Side {
+        Mem,
+        Disk,
+        Both,
+    }
+    let mut out = Vec::new();
+    let mut resume: Option<(Vec<u8>, Vec<u8>)> = None;
+    loop {
+        if out.len() >= limit {
+            // Resume is None only when both sides are exhausted.
+            let more = mem.current().is_some() || disk.current().is_some();
+            return (out, resume, !more);
+        }
+        let (side, val, pk): (Side, Vec<u8>, Vec<u8>) = match (mem.current(), disk.current()) {
+            (None, None) => return (out, None, true),
+            (Some((mv, mp)), None) => (Side::Mem, mv.to_vec(), mp.to_vec()),
+            (None, Some((dv, dp))) => (Side::Disk, dv.to_vec(), dp.to_vec()),
+            (Some((mv, mp)), Some((dv, dp))) => match mv.cmp(dv).then_with(|| mp.cmp(dp)) {
+                std::cmp::Ordering::Less => (Side::Mem, mv.to_vec(), mp.to_vec()),
+                std::cmp::Ordering::Greater => (Side::Disk, dv.to_vec(), dp.to_vec()),
+                std::cmp::Ordering::Equal => (Side::Both, mv.to_vec(), mp.to_vec()),
+            },
+        };
+        out.push(pk.clone());
+        resume = Some((val, pk));
+        match side {
+            Side::Mem => mem.advance(),
+            Side::Disk => {
+                if disk.advance().is_err() {
+                    while let Some((mv, mp)) = mem.current() {
+                        if out.len() >= limit {
+                            // Current mem entry is unpushed — more remain.
+                            return (out, resume, false);
+                        }
+                        out.push(mp.to_vec());
+                        resume = Some((mv.to_vec(), mp.to_vec()));
+                        mem.advance();
+                    }
+                    return (out, None, true);
+                }
+            }
+            Side::Both => {
+                mem.advance();
+                if disk.advance().is_err() {
+                    while let Some((mv, mp)) = mem.current() {
+                        if out.len() >= limit {
+                            return (out, resume, false);
+                        }
+                        out.push(mp.to_vec());
+                        resume = Some((mv.to_vec(), mp.to_vec()));
+                        mem.advance();
+                    }
+                    return (out, None, true);
+                }
+            }
+        }
+    }
+}
+
+/// Like [`merge_cursors_batch`], but both cursors yield **descending**
+/// (value, pk) order (ORDER BY DESC). Emits the greater side first and
+/// dedups equal (value, pk) pairs.
+fn merge_cursors_batch_rev(
+    mut mem: ValuePkRevCursor<'_>,
+    mut disk: DiskRangeCursor<'_>,
+    limit: usize,
+) -> (Vec<Vec<u8>>, Option<(Vec<u8>, Vec<u8>)>, bool) {
+    #[derive(Clone, Copy)]
+    enum Side {
+        Mem,
+        Disk,
+        Both,
+    }
+    let mut out = Vec::new();
+    let mut resume: Option<(Vec<u8>, Vec<u8>)> = None;
+    loop {
+        if out.len() >= limit {
+            let more = mem.current().is_some() || disk.current().is_some();
+            return (out, resume, !more);
+        }
+        let (side, val, pk): (Side, Vec<u8>, Vec<u8>) = match (mem.current(), disk.current()) {
+            (None, None) => return (out, None, true),
+            (Some((mv, mp)), None) => (Side::Mem, mv.to_vec(), mp.to_vec()),
+            (None, Some((dv, dp))) => (Side::Disk, dv.to_vec(), dp.to_vec()),
+            (Some((mv, mp)), Some((dv, dp))) => match mv.cmp(dv).then_with(|| mp.cmp(dp)) {
+                std::cmp::Ordering::Greater => (Side::Mem, mv.to_vec(), mp.to_vec()),
+                std::cmp::Ordering::Less => (Side::Disk, dv.to_vec(), dp.to_vec()),
+                std::cmp::Ordering::Equal => (Side::Both, mv.to_vec(), mp.to_vec()),
+            },
+        };
+        out.push(pk.clone());
+        resume = Some((val, pk));
+        match side {
+            Side::Mem => mem.advance(),
+            Side::Disk => {
+                if disk.advance().is_err() {
+                    while let Some((mv, mp)) = mem.current() {
+                        if out.len() >= limit {
+                            return (out, resume, false);
+                        }
+                        out.push(mp.to_vec());
+                        resume = Some((mv.to_vec(), mp.to_vec()));
+                        mem.advance();
+                    }
+                    return (out, None, true);
+                }
+            }
+            Side::Both => {
+                mem.advance();
+                if disk.advance().is_err() {
+                    while let Some((mv, mp)) = mem.current() {
+                        if out.len() >= limit {
+                            return (out, resume, false);
+                        }
+                        out.push(mp.to_vec());
+                        resume = Some((mv.to_vec(), mp.to_vec()));
+                        mem.advance();
+                    }
+                    return (out, None, true);
+                }
+            }
+        }
+    }
+}
+
+/// Skip mem-rev-cursor entries whose (value, pk) >= `before` (exclusive
+/// resume for the descending walk).
 
 /// Like [`merge_cursors`], but drops disk entries whose value == `bound`
 /// (used for LT where disk's high bound is inclusive).
@@ -784,6 +991,242 @@ impl IndexManager {
         let disk_cur = disk_idx.range_cursor(lo, hi).ok()?;
         let mem_cur = tree.range_cursor(lo, hi);
         Some(merge_cursors(mem_cur, disk_cur, limit))
+    }
+
+    /// Walk the merged mem+disk index in (value, pk) order starting **after**
+    /// `after` (exclusive; `None` = from the `lo` bound). Returns up to
+    /// `limit` primary keys plus the last `(value, pk)` seen so the caller can
+    /// resume with the next batch. This is the batched form of
+    /// [`Self::range_pkeys_read_limit`] for execution paths that must keep
+    /// scanning past residual rejects (sparse selective filters) without
+    /// materializing every pk in the range up front.
+    ///
+    /// Returns `None` when no index exists for `(class, column)`.
+    /// Returns `Some((pkeys, resume))` where `resume` is `None` when the walk
+    /// hit the end of the range (no more batches).
+    pub fn range_pkeys_batch_after(
+        &self,
+        class: &str,
+        column: &str,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        after: Option<(&[u8], &[u8])>,
+        limit: usize,
+    ) -> Option<(Vec<Vec<u8>>, Option<(Vec<u8>, Vec<u8>)>)> {
+        if limit == 0 {
+            return Some((Vec::new(), after.map(|(v, p)| (v.to_vec(), p.to_vec()))));
+        }
+        let key = (class.to_string(), column.to_string());
+        let mem_has = self.indexes.contains_key(&key);
+        let disk_has = self.disk_indexes.contains_key(&key);
+        if !mem_has && !disk_has {
+            return None;
+        }
+
+        // Helper: collect a batch from a single cursor and grab the resume
+        // position from the last entry emitted.
+        fn batch_from_mem(
+            mut cur: ValuePkCursor<'_>,
+            limit: usize,
+        ) -> (Vec<Vec<u8>>, Option<(Vec<u8>, Vec<u8>)>) {
+            let mut out = Vec::new();
+            let mut resume: Option<(Vec<u8>, Vec<u8>)> = None;
+            while let Some((v, p)) = cur.current() {
+                out.push(p.to_vec());
+                resume = Some((v.to_vec(), p.to_vec()));
+                if out.len() >= limit {
+                    // Peek past the last collected entry: resume is None iff
+                    // the walk is finished (no more batches needed).
+                    cur.advance();
+                    return if cur.current().is_some() {
+                        (out, resume)
+                    } else {
+                        (out, None)
+                    };
+                }
+                cur.advance();
+            }
+            (out, None)
+        }
+        fn batch_from_disk(
+            mut cur: DiskRangeCursor<'_>,
+            limit: usize,
+        ) -> (Vec<Vec<u8>>, Option<(Vec<u8>, Vec<u8>)>) {
+            let mut out = Vec::new();
+            let mut resume: Option<(Vec<u8>, Vec<u8>)> = None;
+            while let Some((v, p)) = cur.current() {
+                out.push(p.to_vec());
+                resume = Some((v.to_vec(), p.to_vec()));
+                if out.len() >= limit {
+                    if cur.advance().is_err() {
+                        return (out, None);
+                    }
+                    return if cur.current().is_some() {
+                        (out, resume)
+                    } else {
+                        (out, None)
+                    };
+                }
+                if cur.advance().is_err() {
+                    return (out, None);
+                }
+            }
+            (out, None)
+        }
+
+        // Seek with `after` as the effective lower bound so resume is O(log n)
+        // per batch instead of a linear skip from the range start (which made
+        // repeated batches O(n²)). Only pks at the resume *value* need the
+        // exclusive (value, pk) skip.
+        let eff_lo: Option<&[u8]> = match (lo, after) {
+            (Some(l), Some((av, _))) => Some(if av > l { av } else { l }),
+            (None, Some((av, _))) => Some(av),
+            (Some(l), None) => Some(l),
+            (None, None) => None,
+        };
+
+        // Fast path: memory tree is authoritative.
+        if mem_has && self.mem_complete.contains(&key) {
+            let tree = self.indexes.get(&key)?;
+            let cur = skip_mem_after(tree.range_cursor(eff_lo, hi), after);
+            return Some(batch_from_mem(cur, limit));
+        }
+        if mem_has && !disk_has {
+            let tree = self.indexes.get(&key)?;
+            let cur = skip_mem_after(tree.range_cursor(eff_lo, hi), after);
+            return Some(batch_from_mem(cur, limit));
+        }
+        if !mem_has && disk_has {
+            let d = self.disk_indexes.get(&key)?;
+            let mut idx = d.lock().unwrap_or_else(|e| e.into_inner());
+            let cur = idx.range_cursor(eff_lo, hi).ok()?;
+            let cur = skip_disk_after(cur, after);
+            return Some(batch_from_disk(cur, limit));
+        }
+
+        // Both sources — streaming merge by (value, pk), then batch-collect.
+        let tree = self.indexes.get(&key)?;
+        let disk = self.disk_indexes.get(&key)?;
+        let mut disk_idx = disk.lock().unwrap_or_else(|e| e.into_inner());
+        let disk_cur = skip_disk_after(disk_idx.range_cursor(eff_lo, hi).ok()?, after);
+        let mem_cur = skip_mem_after(tree.range_cursor(eff_lo, hi), after);
+        let (out, resume, exhausted) = merge_cursors_batch(mem_cur, disk_cur, limit);
+        let resume = if exhausted { None } else { resume };
+        Some((out, resume))
+    }
+
+    /// Reverse walk of the merged mem+disk index in (value, pk) **descending**
+    /// order starting **before** `before` (exclusive; `None` = from the `hi`
+    /// bound). Returns up to `limit` primary keys plus the last `(value, pk)`
+    /// emitted so the caller can resume the DESC scan with the next batch.
+    ///
+    /// Used by ORDER BY DESC + LIMIT so the walk can stop after `limit` matches
+    /// instead of materializing the whole range and reversing.
+    pub fn range_pkeys_batch_before(
+        &self,
+        class: &str,
+        column: &str,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        before: Option<(&[u8], &[u8])>,
+        limit: usize,
+    ) -> Option<(Vec<Vec<u8>>, Option<(Vec<u8>, Vec<u8>)>)> {
+        if limit == 0 {
+            return Some((Vec::new(), before.map(|(v, p)| (v.to_vec(), p.to_vec()))));
+        }
+        let key = (class.to_string(), column.to_string());
+        let mem_has = self.indexes.contains_key(&key);
+        let disk_has = self.disk_indexes.contains_key(&key);
+        if !mem_has && !disk_has {
+            return None;
+        }
+
+        // Seek with `before` as the effective upper bound (mirror of the ASC
+        // `after` lower-bound seek).
+        let eff_hi: Option<&[u8]> = match (hi, before) {
+            (Some(h), Some((bv, _))) => Some(if bv < h { bv } else { h }),
+            (None, Some((bv, _))) => Some(bv),
+            (Some(h), None) => Some(h),
+            (None, None) => None,
+        };
+
+        fn batch_from_mem_rev(
+            mut cur: ValuePkRevCursor<'_>,
+            limit: usize,
+        ) -> (Vec<Vec<u8>>, Option<(Vec<u8>, Vec<u8>)>) {
+            let mut out = Vec::new();
+            let mut resume: Option<(Vec<u8>, Vec<u8>)> = None;
+            while let Some((v, p)) = cur.current() {
+                out.push(p.to_vec());
+                resume = Some((v.to_vec(), p.to_vec()));
+                if out.len() >= limit {
+                    cur.advance();
+                    return if cur.current().is_some() {
+                        (out, resume)
+                    } else {
+                        (out, None)
+                    };
+                }
+                cur.advance();
+            }
+            (out, None)
+        }
+        fn batch_from_disk_rev(
+            mut cur: DiskRangeCursor<'_>,
+            limit: usize,
+        ) -> (Vec<Vec<u8>>, Option<(Vec<u8>, Vec<u8>)>) {
+            let mut out = Vec::new();
+            let mut resume: Option<(Vec<u8>, Vec<u8>)> = None;
+            while let Some((v, p)) = cur.current() {
+                out.push(p.to_vec());
+                resume = Some((v.to_vec(), p.to_vec()));
+                if out.len() >= limit {
+                    if cur.advance().is_err() {
+                        return (out, None);
+                    }
+                    return if cur.current().is_some() {
+                        (out, resume)
+                    } else {
+                        (out, None)
+                    };
+                }
+                if cur.advance().is_err() {
+                    return (out, None);
+                }
+            }
+            (out, None)
+        }
+
+        // Exclusive-before: drop entries with (value, pk) >= before (see
+        // `skip_mem_before` / `skip_disk_before`).
+
+        if mem_has && self.mem_complete.contains(&key) {
+            let tree = self.indexes.get(&key)?;
+            let cur = skip_mem_before(tree.range_cursor_rev(lo, eff_hi), before);
+            return Some(batch_from_mem_rev(cur, limit));
+        }
+        if mem_has && !disk_has {
+            let tree = self.indexes.get(&key)?;
+            let cur = skip_mem_before(tree.range_cursor_rev(lo, eff_hi), before);
+            return Some(batch_from_mem_rev(cur, limit));
+        }
+        if !mem_has && disk_has {
+            let d = self.disk_indexes.get(&key)?;
+            let mut idx = d.lock().unwrap_or_else(|e| e.into_inner());
+            let cur = idx.range_cursor_rev(lo, eff_hi).ok()?;
+            let cur = skip_disk_before(cur, before);
+            return Some(batch_from_disk_rev(cur, limit));
+        }
+
+        // Both sources — reverse merge by (value, pk).
+        let tree = self.indexes.get(&key)?;
+        let disk = self.disk_indexes.get(&key)?;
+        let mut disk_idx = disk.lock().unwrap_or_else(|e| e.into_inner());
+        let disk_cur = skip_disk_before(disk_idx.range_cursor_rev(lo, eff_hi).ok()?, before);
+        let mem_cur = skip_mem_before(tree.range_cursor_rev(lo, eff_hi), before);
+        let (out, resume, exhausted) = merge_cursors_batch_rev(mem_cur, disk_cur, limit);
+        let resume = if exhausted { None } else { resume };
+        Some((out, resume))
     }
 
     /// Range lookup with JSON values (encoded internally). See
@@ -2080,5 +2523,107 @@ mod tests {
             vec!["pk_xxx", "pk_zzz"],
             "Gt merge path must keep value order, got {got:?}"
         );
+    }
+
+    fn batch_test_mgr() -> IndexManager {
+        let mut mgr = IndexManager::new();
+        mgr.create_index("T", "v");
+        for (val, pk) in [
+            ("a", "p1"),
+            ("a", "p2"),
+            ("b", "p3"),
+            ("c", "p4"),
+            ("c", "p5"),
+            ("d", "p6"),
+        ] {
+            let mut doc = serde_json::Map::new();
+            doc.insert("v".to_string(), json!(val));
+            mgr.index_document("T", pk.as_bytes(), &doc);
+        }
+        mgr
+    }
+
+    #[test]
+    fn test_range_pkeys_batch_after_resume() {
+        let mgr = batch_test_mgr();
+        // Two-entry batches walking the full range.
+        let (b1, r1) = mgr
+            .range_pkeys_batch_after("T", "v", None, None, None, 2)
+            .expect("batch1");
+        assert_eq!(b1.len(), 2);
+        let r1 = r1.expect("must have resume");
+        let (b2, r2) = mgr
+            .range_pkeys_batch_after(
+                "T",
+                "v",
+                None,
+                None,
+                Some((r1.0.as_slice(), r1.1.as_slice())),
+                2,
+            )
+            .expect("batch2");
+        assert_eq!(b2.len(), 2);
+        let r2 = r2.expect("must have resume");
+        let (b3, r3) = mgr
+            .range_pkeys_batch_after(
+                "T",
+                "v",
+                None,
+                None,
+                Some((r2.0.as_slice(), r2.1.as_slice())),
+                2,
+            )
+            .expect("batch3");
+        assert_eq!(b3.len(), 2);
+        assert!(r3.is_none(), "exhausted after last batch");
+
+        let mut all: Vec<String> = [b1, b2, b3]
+            .concat()
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        all.sort();
+        let mut expect = vec![
+            "p1".to_string(),
+            "p2".to_string(),
+            "p3".to_string(),
+            "p4".to_string(),
+            "p5".to_string(),
+            "p6".to_string(),
+        ];
+        expect.sort();
+        assert_eq!(all, expect, "batches must partition the full range");
+    }
+
+    #[test]
+    fn test_range_pkeys_batch_before_desc() {
+        let mgr = batch_test_mgr();
+        let (b1, r1) = mgr
+            .range_pkeys_batch_before("T", "v", None, None, None, 2)
+            .expect("batch1");
+        assert_eq!(b1.len(), 2);
+        let r1 = r1.expect("must have resume");
+        let (b2, _r2) = mgr
+            .range_pkeys_batch_before(
+                "T",
+                "v",
+                None,
+                None,
+                Some((r1.0.as_slice(), r1.1.as_slice())),
+                10,
+            )
+            .expect("batch2");
+        // Descending value order: d, c(c), c(c), b, a, a → first 2 are d/c
+        let first: Vec<String> = b1
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        assert_eq!(first[0], "p6", "DESC must start at the largest value");
+        let all: Vec<String> = [b1, b2]
+            .concat()
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        assert_eq!(all.len(), 6, "DESC walk must see every entry");
     }
 }
