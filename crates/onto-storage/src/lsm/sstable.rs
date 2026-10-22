@@ -2437,6 +2437,107 @@ mod tests {
         assert_eq!(out2, raw);
     }
 
+    /// After a decompress error the thread-local DCtx is discarded, so a
+    /// stale `litBuffer` / `litBufferLocation` from the failed call cannot
+    /// poison the next decompression (zstd 1.5.7 `ZSTD_decompressBegin` does
+    /// not clear those fields).  This is the "mockCase3" regression: the
+    /// `set_basic` fast path sets `litBufferLocation = ZSTD_not_in_dst` but
+    /// does NOT overwrite `litBuffer`, relying on a single-layer defense.
+    /// Discarding the DCtx on error eliminates the stale pointer entirely.
+    #[test]
+    fn test_dctx_discarded_after_error_no_stale_litbuffer() {
+        // 1. Produce a valid compressed frame.
+        let raw = vec![0x42u8; 4096];
+        let good_frame = zstd::bulk::compress(&raw, 3).expect("should be valid");
+
+        // 2. Corrupt the compressed payload (skip magic+header, flip bytes).
+        let mut bad_frame = good_frame.clone();
+        let corrupt_at = 16.min(bad_frame.len().saturating_sub(1));
+        bad_frame[corrupt_at] ^= 0xFF;
+        bad_frame[corrupt_at + 1] ^= 0xFF;
+
+        // 3. First call: corrupt data → decompress error → DCtx discarded.
+        //    Internally ZSTD may set litBuffer / litBufferLocation before
+        //    the HUF_isError check fires (the split-adjustment bug).
+        let r1 = super::decompress_limited(&bad_frame, 64 * 1024);
+        assert!(r1.is_err(), "corrupt frame must return Err");
+
+        // 4. Second call: valid data → must succeed with a clean DCtx.
+        //    If the stale litBuffer (pointing at the freed first-call buffer)
+        //    were reused as `oend`, the wildcopy overshoot would land at
+        //    `stale_dst + 0x20020` (ZSTD_in_dst mode) and crash.
+        let out = super::decompress_limited(&good_frame, 64 * 1024)
+            .expect("valid frame after error must succeed");
+        assert_eq!(out, raw);
+
+        // 5. Interleave more error/success cycles to stress DCtx reuse.
+        for round in 0..8 {
+            let mut bad = good_frame.clone();
+            let pos = (round * 7 + 16).min(bad.len().saturating_sub(1));
+            bad[pos] ^= 0xA5;
+            let _ = super::decompress_limited(&bad, 64 * 1024);
+            let out = super::decompress_limited(&good_frame, 64 * 1024)
+                .expect("valid frame must succeed after interleaved error");
+            assert_eq!(out, raw, "round {round}");
+        }
+    }
+
+    /// Scenario B / mockCase3: the `set_basic` fast path (raw literals
+    /// referenced directly from the compressed stream) does NOT set
+    /// `dctx->litBuffer` — only `litBufferLocation = ZSTD_not_in_dst`.
+    /// Before the zstd patch, safety relied on that single layer.
+    /// After the patch, `ZSTD_decompressBegin` resets `litBuffer = NULL`
+    /// and `litBufferLocation = ZSTD_not_in_dst`, so the `oend` branch
+    /// `oend = ostart + maxDstSize` is taken unconditionally.
+    ///
+    /// This test exercises the `set_basic` fast path after a failed
+    /// decompress left stale litBuffer state.
+    #[test]
+    fn test_set_basic_fastpath_after_error_no_stale_oend() {
+        // Small payload → literals fit in the source block → set_basic fast path
+        // (litBufferLocation = ZSTD_not_in_dst, litPtr points into src).
+        let raw = b"hello set_basic fast path".to_vec();
+        let good_frame = zstd::bulk::compress(&raw, 1).expect("should be valid");
+
+        // Corrupt a larger frame to trigger HUF failure + stale litBuffer.
+        let big_raw: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        let big_frame = zstd::bulk::compress(&big_raw, 3).expect("should be valid");
+        assert!(big_frame.len() > 64, "big_frame too short: {}", big_frame.len());
+        let mut bad_big = big_frame.clone();
+        // Corrupt deep in the payload (past the frame header) so the header
+        // parses but HUF/sequence decoding fails.
+        let corrupt_start = (bad_big.len() / 2).max(24);
+        for b in bad_big.iter_mut().skip(corrupt_start).take(32) {
+            *b ^= 0xFF;
+        }
+        bad_big.truncate(bad_big.len().saturating_sub(8));
+
+        // Error first: DCtx may accumulate stale litBuffer/litBufferLocation.
+        let r = super::decompress_limited(&bad_big, 64 * 1024);
+        assert!(r.is_err(), "corrupt frame must fail");
+
+        // Now decompress the small frame (set_basic fast path).
+        // With the zstd patch, ZSTD_decompressBegin resets litBuffer to NULL
+        // and litBufferLocation to ZSTD_not_in_dst, so oend = dst + dstCapacity.
+        // Without the patch, the set_basic fast path sets litBufferLocation
+        // but NOT litBuffer — a single-layer defense that this test guards.
+        let out = super::decompress_limited(&good_frame, 64 * 1024)
+            .expect("set_basic fast path must succeed after error");
+        assert_eq!(out, raw);
+
+        // Repeat: error → small (set_basic) → error → small.
+        for round in 0..6 {
+            let mut bad = big_frame.clone();
+            for b in bad.iter_mut().skip(10 + round * 4).take(8) {
+                *b ^= 0xA5;
+            }
+            let _ = super::decompress_limited(&bad, 64 * 1024);
+            let out = super::decompress_limited(&good_frame, 64 * 1024)
+                .expect("set_basic must survive interleaved errors");
+            assert_eq!(out, raw, "round {round}");
+        }
+    }
+
     /// Uncompressed blocks (compression_level = 0) still round-trip through
     /// the CRC block format.
     #[test]

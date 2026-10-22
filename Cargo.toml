@@ -91,3 +91,9 @@ opt-level = 3
 lto = "thin"
 codegen-units = 16
 strip = true
+
+# Vendored zstd-sys with patches for two zstd 1.5.7 bugs:
+# 1. ZSTD_decompressBegin: reset litBuffer/litBufferEnd/litBufferLocation/litPtr/litSize
+# 2. HUF_isError check before ZSTD_split adjustment (don't mutate state on error)
+[patch.crates-io]
+zstd-sys = { path = "vendor/zstd-sys" }
