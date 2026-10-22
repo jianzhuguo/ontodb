@@ -29,7 +29,7 @@ OntoDB solves this in one engine:
 
 **Production-verified** (a biomedical knowledge graph, 12 cores / 32GB / NVMe):
 
-- **16.35M records** (8.15M entities + 8.21M relation edges) + 2.45M molecular structures, 7×24 online with zero crashes
+- **28M+ knowledge records** (105 entity/relation tables) + 2.45M molecular structures, 7×24 online with zero crashes
 - GROUP BY over 607K rows **123ms** (90×); large-table scan **2,546 rps** (238×)
 - Querying "EGFR inhibitor" **automatically hits all subclass drugs** — new subclasses need zero code
 
@@ -332,11 +332,11 @@ One OntoDB instance serves N tenants/projects with low ops cost and data securit
 
 ### Production-Verified (a biomedical knowledge graph)
 
-> 12 cores / 32GB RAM / NVMe SSD / **16.35M records** (8.15M entities + 8.21M relation edges) / 14.8GB / 439 SSTables
+> 12 cores / 32GB RAM / NVMe SSD / **28M+ knowledge records** (105 entity/relation tables) / 32GB / 980 SSTables
 
 | Metric | Value |
 |--------|-------|
-| Total records | **16.35M+** (55 entity tables + 21 relation tables) |
+| Total records | **28M+** (105 entity/relation tables; 28.4M hierarchy-expanded) |
 | Molecular structures (SMILES/InChI) | **2.45M** (ChEMBL 35) |
 | **Molecular fingerprint similarity (Tanimoto)** | **21–41ms / 2.45M** |
 | GROUP BY over 607K rows | **123ms** (11s before index pushdown, 90×) |
