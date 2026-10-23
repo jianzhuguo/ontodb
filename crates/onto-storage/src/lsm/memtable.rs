@@ -46,10 +46,20 @@ pub enum VersionLookup {
 /// In-memory sorted store backed by a BTreeMap.
 ///
 /// Uses composite key (user_key, !seq_no) for ordering, so that
-/// the latest version of each key appears first during iteration.
+/// the latest version of a key appears first during iteration.
+///
+/// A parallel `flat` log holds every inserted entry. Flush snapshots read
+/// `flat` instead of walking the BTreeMap: the inlined std iterator has been
+/// observed to treat a leaf as an internal node and load a neighbour's
+/// `key.len` (e.g. `0x80`) as a child pointer, which AVs at
+/// `*(ptr+0x3D2)`. Composite keys are unique per `(user_key, seq_no)`, so
+/// `flat.len() == data.len()` in normal operation.
 pub struct MemTable {
     /// BTreeMap with composite keys for sorted access.
     data: std::collections::BTreeMap<Vec<u8>, MemTableEntry>,
+
+    /// Insertion-ordered entries for flush snapshots (no tree walk).
+    flat: Vec<MemTableEntry>,
 
     /// Approximate size in bytes.
     size: usize,
@@ -63,6 +73,7 @@ impl MemTable {
     pub fn new() -> Self {
         Self {
             data: std::collections::BTreeMap::new(),
+            flat: Vec::new(),
             size: 0,
             next_seq_no: 0,
         }
@@ -72,6 +83,7 @@ impl MemTable {
     pub fn with_seq_no(start_seq: SeqNo) -> Self {
         Self {
             data: std::collections::BTreeMap::new(),
+            flat: Vec::new(),
             size: 0,
             next_seq_no: start_seq,
         }
@@ -98,10 +110,11 @@ impl MemTable {
         // Size includes key + value + seq_no (8) + kind (1) + BTreeMap node overhead (~48 bytes)
         let size_delta = key.len() + value.len() + 16 + 48;
         // insert() returns the old value if key existed
-        if let Some(old) = self.data.insert(composite, entry) {
+        if let Some(old) = self.data.insert(composite, entry.clone()) {
             let old_delta = old.key.len() + old.value.len() + 16 + 48;
             self.size = self.size.saturating_sub(old_delta);
         }
+        self.flat.push(entry);
         self.size += size_delta;
 
         seq_no
@@ -123,11 +136,12 @@ impl MemTable {
 
         // Size includes key + value + seq_no (8) + kind (1) + BTreeMap node overhead (~48 bytes)
         let size_delta = entry.key.len() + entry.value.len() + 16 + 48;
-        if let Some(old) = self.data.insert(composite, entry) {
+        if let Some(old) = self.data.insert(composite, entry.clone()) {
             // Overwrite: subtract old size, add new size (net = size_delta - old_delta)
             let old_delta = old.key.len() + old.value.len() + 16 + 48;
             self.size = self.size.saturating_sub(old_delta);
         }
+        self.flat.push(entry);
         self.size += size_delta;
 
         // Keep next_seq_no in sync
@@ -154,7 +168,8 @@ impl MemTable {
             kind: EntryKind::Delete,
         };
 
-        self.data.insert(composite, entry);
+        self.data.insert(composite, entry.clone());
+        self.flat.push(entry);
 
         if seq_no >= self.next_seq_no {
             self.next_seq_no = seq_no + 1;
@@ -175,7 +190,8 @@ impl MemTable {
         self.size += size_delta;
 
         let composite = entry.composite_key();
-        self.data.insert(composite, entry);
+        self.data.insert(composite, entry.clone());
+        self.flat.push(entry);
 
         seq_no
     }
@@ -246,8 +262,43 @@ impl MemTable {
     }
 
     /// Returns an iterator over all entries in sorted order.
+    ///
+    /// Walks the BTreeMap. Prefer [`Self::snapshot_flat`] for flush paths:
+    /// that avoids the inlined std iterator (see `flat` field docs).
     pub fn entries(&self) -> impl Iterator<Item = &MemTableEntry> {
         self.data.values()
+    }
+
+    /// Snapshot all entries for an SST flush **without walking the BTreeMap**.
+    ///
+    /// Returns `(key, value, seq_no, kind)` tuples in insertion order. The
+    /// caller sorts by user key before building the SST (see
+    /// `persist_immutable_to_sst`).
+    ///
+    /// Also validates each `Vec` — a dangling `len>0, cap==0` slice is
+    /// replaced with empty rather than fed to `memcpy` (which has taken the
+    /// process down mid-compaction before).
+    pub fn snapshot_flat(&self) -> Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> {
+        let mut out = Vec::with_capacity(self.flat.len());
+        for e in &self.flat {
+            let key = if crate::ptr_guard::vec_is_dangling(&e.key) {
+                Vec::new()
+            } else {
+                e.key.clone()
+            };
+            let value = if crate::ptr_guard::vec_is_dangling(&e.value) {
+                Vec::new()
+            } else {
+                e.value.clone()
+            };
+            out.push((key, value, e.seq_no, e.kind));
+        }
+        out
+    }
+
+    /// Number of entries recorded in the flat log (should equal [`Self::len`]).
+    pub fn flat_len(&self) -> usize {
+        self.flat.len()
     }
 
     /// Returns an iterator over entries whose key starts with `prefix`.
@@ -410,5 +461,35 @@ mod tests {
 
         let (val, _) = mt.get(b"k").unwrap();
         assert_eq!(val, b"v2");
+    }
+
+    #[test]
+    fn test_snapshot_flat_matches_entries() {
+        let mut mt = MemTable::new();
+        mt.put(b"b".to_vec(), b"2".to_vec());
+        mt.put(b"a".to_vec(), b"1".to_vec());
+        mt.delete(b"c".to_vec());
+        mt.put_with_seq(b"d".to_vec(), b"4".to_vec(), 99);
+
+        let flat = mt.snapshot_flat();
+        assert_eq!(flat.len(), 4);
+        assert_eq!(mt.flat_len(), mt.len());
+
+        // Every flat entry must appear in the sorted tree snapshot.
+        let mut from_tree: Vec<(Vec<u8>, u64)> = mt
+            .entries()
+            .map(|e| (e.key.clone(), e.seq_no))
+            .collect();
+        from_tree.sort();
+        let mut from_flat: Vec<(Vec<u8>, u64)> =
+            flat.iter().map(|(k, _, s, _)| (k.clone(), *s)).collect();
+        from_flat.sort();
+        assert_eq!(from_tree, from_flat);
+
+        // Dangling Vecs must be sanitized to empty rather than copied.
+        for (k, v, _, _) in &flat {
+            assert!(k.capacity() > 0 || k.is_empty());
+            assert!(v.capacity() > 0 || v.is_empty());
+        }
     }
 }

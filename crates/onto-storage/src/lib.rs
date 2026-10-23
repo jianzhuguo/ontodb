@@ -36,6 +36,7 @@ pub mod iterator;
 pub mod lsm;
 pub mod mvcc;
 pub mod options;
+pub mod ptr_guard;
 pub mod tiered_storage;
 pub mod tsm;
 pub mod value_meta;
@@ -46,6 +47,7 @@ pub use index::{IndexManager, IndexStorageMode};
 pub use iterator::StorageIterator;
 pub use mvcc::{Transaction, TxnManager, TxnStatus, WriteOp};
 pub use options::StorageOptions;
+pub use ptr_guard::{check_node_ptr, check_vec, is_plausible_heap_ptr, vec_is_dangling, vec_is_safe};
 pub use value_meta::{ValueMetadata, ValueScorer, LAMBDA_2Y, LAMBDA_70D, LAMBDA_7H};
 pub use vector::distance;
 pub use vector::{

@@ -501,10 +501,11 @@ impl LsmEngine {
             let _ = handle.join();
         }
 
-        // Persist any dirty HNSW nodes (incremental delta) before exiting so
-        // in-flight vector inserts are not lost between full snapshots.
-        if let Err(e) = self.persist_vector_deltas() {
-            tracing::warn!("Failed to persist vector deltas on shutdown: {}", e);
+        // Persist any dirty HNSW nodes before exiting so in-flight vector
+        // inserts land in the file snapshot (documents remain the recovery
+        // source of truth either way).
+        if let Err(e) = self.persist_vector_deltas(true) {
+            tracing::warn!("Failed to persist vector snapshot on shutdown: {}", e);
         }
 
         // Flush any remaining data
@@ -519,11 +520,18 @@ impl LsmEngine {
         }
     }
 
-    /// Writes incremental HNSW deltas (`__vec_delta__`) for every index that
-    /// has dirty nodes.  Cheap when nothing changed.  Called on flush_memtable
-    /// and graceful shutdown so vector inserts survive restarts without a
-    /// full graph re-save.
-    pub fn persist_vector_deltas(&self) -> Result<()> {
+    /// Persist dirty HNSW nodes to the file snapshot when needed.
+    ///
+    /// Incremental `__vec_delta__` writes are gone: restore never read them
+    /// (file snapshot + document backfill is the only recovery path), and the
+    /// single-key delta was overwritten every flush — a fake backup. New
+    /// vectors stay in memory until the dirty set is large enough to justify
+    /// a full snapshot, or the caller forces one (graceful shutdown).
+    ///
+    /// Whatever is not snapshotted is recovered on the next restart by
+    /// `reconcile_vector_index` + `backfill_vector_missing` from the
+    /// document's vector column (e.g. `fp`) — the source of truth.
+    pub fn persist_vector_deltas(&self, force: bool) -> Result<()> {
         let dirty: Vec<(String, String)> = {
             let mgr = self
                 .vector_index_manager
@@ -539,9 +547,6 @@ impl LsmEngine {
             return Ok(());
         }
         for (class, column) in dirty {
-            // Deltas are for small incremental bursts only.  A bulk rebuild
-            // marks every node dirty — persisting that would write a
-            // multi-hundred-MB LSM value and wedge the next startup.
             let dirty_count = {
                 let mgr = self
                     .vector_index_manager
@@ -549,61 +554,34 @@ impl LsmEngine {
                     .unwrap_or_else(|e| e.into_inner());
                 mgr.dirty_count(&class, &column)
             };
-            if dirty_count > 20_000 {
-                // Bulk insert marked every node dirty. Persisting that as a
-                // delta would write a multi-hundred-MB LSM value. Fall back to
-                // the file snapshot (which captures all nodes) and clear the
-                // dirty set so this warning does not fire every flush.
-                tracing::info!(
-                    table = %class,
-                    column = %column,
-                    dirty = dirty_count,
-                    "large dirty set — writing full HNSW snapshot instead of delta"
-                );
+            // Full snapshot only when it earns its keep: a large dirty set
+            // (bulk insert) or an explicit force (shutdown). Small incremental
+            // bursts are left in memory and rebuilt from documents on restart.
+            if dirty_count > 20_000 || force {
                 if let Err(e) = self.persist_vector_graph(&class, &column) {
                     tracing::warn!(
                         table = %class,
                         column = %column,
+                        dirty = dirty_count,
                         error = %e,
-                        "full snapshot fallback failed; keeping dirty set"
+                        "vector snapshot failed; nodes recover from documents on restart"
                     );
-                }
-                continue;
-            }
-            let blob = self
-                .vector_index_manager
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .save_incremental(&class, &column);
-            if let Some(blob) = blob {
-                if blob.len() > 32 * 1024 * 1024 {
-                    tracing::warn!(
+                } else {
+                    tracing::info!(
                         table = %class,
                         column = %column,
-                        bytes = blob.len(),
-                        "Skipping oversized incremental vector delta"
+                        dirty = dirty_count,
+                        "vector snapshot written"
                     );
-                    continue;
                 }
-                let key = format!("__vec_delta__{}_{}", class, column).into_bytes();
-                let seq = self.next_seq();
-                let entry = Entry::put(key.clone(), blob.clone(), seq);
-                let mut ws = self.write_state.write();
-                ws.wal.append(&entry)?;
-                ws.wal.flush_buf()?;
-                ws.memtable.put_with_seq(key, blob, seq);
-                tracing::info!(
-                    table = %class,
-                    column = %column,
-                    "Persisted incremental vector index delta"
-                );
             }
         }
         Ok(())
     }
 
-    /// Tombstones the incremental delta key after a full snapshot is written,
-    /// so the next restart does not replay stale deltas on top of a fresh graph.
+    /// Tombstones any legacy `__vec_delta__` key after a full snapshot so a
+    /// stale delta left over from the old write-only path cannot confuse
+    /// future tooling. New deltas are no longer written.
     fn clear_vector_delta(&self, class: &str, column: &str) {
         let key = format!("__vec_delta__{}_{}", class, column).into_bytes();
         let seq = self.next_seq();
@@ -2578,9 +2556,11 @@ impl LsmEngine {
             .compaction_sender
             .send(CompactionMsg::Flushed { level: 0 });
 
-        // Persist dirty HNSW nodes as incremental deltas alongside the flush.
-        if let Err(e) = self.persist_vector_deltas() {
-            tracing::warn!("Failed to persist vector deltas on flush: {}", e);
+        // Persist dirty HNSW nodes to the file snapshot when the dirty set
+        // is large. Small bursts stay in memory and are rebuilt from
+        // documents on restart.
+        if let Err(e) = self.persist_vector_deltas(false) {
+            tracing::warn!("Failed to persist vector snapshot on flush: {}", e);
         }
 
         Ok(())
@@ -2596,10 +2576,11 @@ impl LsmEngine {
         let (mut entries_snapshot, _) = {
             let ws = self.write_state.read();
             if let Some(ref imm) = ws.immutable_memtable {
-                let entries: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = imm
-                    .entries()
-                    .map(|e| (e.key.clone(), e.value.clone(), e.seq_no, e.kind))
-                    .collect();
+                // Use the flat log, not BTreeMap::values(): the inlined std
+                // iterator can treat a leaf as an internal node and load a
+                // neighbouring entry's `key.len` (e.g. 0x80) as a child
+                // pointer, then AV at *(ptr+0x3D2). See ptr_guard / memtable.
+                let entries = imm.snapshot_flat();
                 (entries, ())
             } else {
                 return Ok(());

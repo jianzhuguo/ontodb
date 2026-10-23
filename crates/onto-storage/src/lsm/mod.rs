@@ -13,3 +13,5 @@ pub mod memtable;
 pub mod sstable;
 pub mod streaming_merge;
 pub mod wal;
+
+// Re-export at crate root via lib.rs.

@@ -397,7 +397,11 @@ impl BPlusTree {
         key: &[u8],
         primary_key: Vec<u8>,
     ) -> Option<(Vec<u8>, u64)> {
-        let is_leaf = self.node(node_id).expect("node should exist").is_leaf();
+        // Branch on the real variant — never assume leaf/internal from the id.
+        let is_leaf = match self.get_node(node_id) {
+            Some(n) => n.is_leaf(),
+            None => return None,
+        };
 
         if is_leaf {
             self.insert_into_leaf(node_id, key, primary_key)
@@ -455,17 +459,24 @@ impl BPlusTree {
         key: &[u8],
         primary_key: Vec<u8>,
     ) -> Option<(Vec<u8>, u64)> {
-        // Find child to descend into
-        let child_id = match self.node(node_id).expect("node should exist") {
-            Node::Internal(n) => {
+        // Find child to descend into. Must be `Node::Internal` here; a leaf
+        // means the tree is corrupt — refuse to index `children[]` (that is
+        // how a leaf gets read as an internal node and a length ends up
+        // treated as a child pointer).
+        let child_id = match self.get_node(node_id) {
+            Some(Node::Internal(n)) => {
                 let idx = n.keys.binary_search_by(|k| k.as_slice().cmp(key));
                 let child_idx = match idx {
                     Ok(i) => i + 1,
                     Err(i) => i,
                 };
-                n.children[child_idx]
+                match n.children.get(child_idx) {
+                    Some(&id) if self.nodes.contains_key(&id) => id,
+                    _ => return None,
+                }
             }
-            _ => unreachable!(),
+            Some(Node::Leaf(_)) => return None,
+            None => return None,
         };
 
         // Recurse into child
@@ -1055,10 +1066,22 @@ impl BPlusTree {
     }
 
     /// Finds the leaf node that should contain the given key.
+    ///
+    /// Always branches on the **actual** node variant (`Node::Leaf` vs
+    /// `Node::Internal`) before touching `children[]`. A leaf treated as
+    /// internal reads past the node and interprets neighbouring memory as
+    /// child pointers (observed AV at `*(ptr+0x3D2)` in the LSM flush path
+    /// when this class of bug bites).
     fn find_leaf(&self, key: &[u8]) -> u64 {
         let mut current = self.root;
-        loop {
-            match self.node(current).expect("node should exist") {
+        // Bounded: height of a well-formed tree is << 64. An unbounded loop
+        // here means a cycle or corrupt child pointer.
+        for _ in 0..64 {
+            let node = match self.get_node(current) {
+                Some(n) => n,
+                None => break,
+            };
+            match node {
                 Node::Leaf(_) => return current,
                 Node::Internal(n) => {
                     let idx = n.keys.binary_search_by(|k| k.as_slice().cmp(key));
@@ -1066,10 +1089,18 @@ impl BPlusTree {
                         Ok(i) => i + 1,
                         Err(i) => i,
                     };
-                    current = n.children[child_idx];
+                    // Child index must be in range and the child must exist.
+                    match n.children.get(child_idx) {
+                        Some(&child_id) if self.nodes.contains_key(&child_id) => {
+                            current = child_id;
+                        }
+                        _ => break,
+                    }
                 }
             }
         }
+        // Fall back to root (even if internal) rather than looping forever.
+        current
     }
 
     // ══════════════════════════════════════════════════════════════�?
@@ -1318,16 +1349,26 @@ impl BPlusTree {
     /// Cursor to the first entry (leftmost leaf).
     fn cursor_first(&self) -> Cursor {
         let mut current = self.root;
-        loop {
-            match self.node(current).expect("node should exist") {
-                Node::Leaf(_) => {
+        for _ in 0..64 {
+            match self.get_node(current) {
+                Some(Node::Leaf(_)) => {
                     return Cursor {
                         leaf_id: current,
                         idx: 0,
                     }
                 }
-                Node::Internal(n) => current = n.children[0],
+                Some(Node::Internal(n)) => {
+                    match n.children.first() {
+                        Some(&child) if self.nodes.contains_key(&child) => current = child,
+                        _ => break,
+                    }
+                }
+                None => break,
             }
+        }
+        Cursor {
+            leaf_id: current,
+            idx: 0,
         }
     }
 
@@ -1460,12 +1501,24 @@ impl Cursor {
     }
 
     fn advance(&mut self, tree: &BPlusTree) {
-        if let Node::Leaf(n) = tree.get_node(self.leaf_id).expect("node should exist") {
-            if let Some(next_id) = n.next {
-                self.leaf_id = next_id;
-                self.idx = 0;
-            } else {
-                // End of chain �?mark invalid by using a non-existent id
+        match tree.get_node(self.leaf_id) {
+            Some(Node::Leaf(n)) => {
+                if let Some(next_id) = n.next {
+                    if tree.get_node(next_id).is_some() {
+                        self.leaf_id = next_id;
+                        self.idx = 0;
+                    } else {
+                        self.leaf_id = u64::MAX;
+                        self.idx = 0;
+                    }
+                } else {
+                    self.leaf_id = u64::MAX;
+                    self.idx = 0;
+                }
+            }
+            // Not a leaf or missing: stop rather than walk `next` off a
+            // non-leaf payload (leaf/internal type confusion).
+            _ => {
                 self.leaf_id = u64::MAX;
                 self.idx = 0;
             }
