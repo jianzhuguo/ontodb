@@ -1182,25 +1182,35 @@ impl SsTable {
             }
         }
 
-        // Linear scan from the restart point
+        // Linear scan from the restart point. A block may hold multiple
+        // versions of the same user key (memtable flush keeps all versions).
+        // Collect every match and return the highest seq_no — returning the
+        // first hit resurrects stale values when insert order is not
+        // newest-first (observed as lost UPDATEs).
         let start = if lo > 0 { restarts[lo - 1] } else { 0 };
 
         let mut pos = start;
+        let mut best: Option<(Vec<u8>, SeqNo, EntryKind)> = None;
         while pos < restart_start {
             if let Some((k, v, seq, kind)) = self.decode_entry_at(block, pos) {
+                let entry_size = 4 + k.len() + 4 + v.len() + 8 + 1;
                 if k.as_slice() == key {
-                    return Ok(Some((v, seq, kind)));
-                }
-                if k.as_slice() > key {
+                    let is_newer = best.as_ref().map(|(_, s, _)| seq > *s).unwrap_or(true);
+                    if is_newer {
+                        best = Some((v, seq, kind));
+                    }
+                } else if k.as_slice() > key {
+                    // Duplicates of `key` are contiguous; a greater key means
+                    // we passed its range.
                     break;
                 }
-                pos += 4 + k.len() + 4 + v.len() + 8 + 1;
+                pos += entry_size;
             } else {
                 break;
             }
         }
 
-        Ok(None)
+        Ok(best)
     }
 
     fn decode_entry_at(

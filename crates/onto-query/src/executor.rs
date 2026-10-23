@@ -1668,6 +1668,20 @@ impl QueryExecutor {
     /// compaction).
     /// Drops an ontology by name.
     /// Handles both namespaced and non-namespaced ontology keys.
+    /// Remove a class name and its short alias (`sembio.X` → `X`) from the
+    /// row-count cache. DROP paths must call this or SHOW CLASSES keeps
+    /// listing the dead name as an "observed" class.
+    fn drop_row_count_aliases(&self, name: &str) {
+        let mut cache = self
+            .row_count_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.remove(name);
+        if let Some(dot) = name.find('.') {
+            cache.remove(&name[dot + 1..]);
+        }
+    }
+
     pub fn drop_ontology(&self, name: &str) -> Result<()> {
         let engine = &self.engine;
 
@@ -1677,19 +1691,31 @@ impl QueryExecutor {
 
         // Try to find the ontology with various key formats
         let mut found_key: Option<Vec<u8>> = None;
-        for (k, _) in &entries {
+        let mut found_classes: Vec<String> = Vec::new();
+        for (k, val_bytes) in &entries {
             let key_str = String::from_utf8_lossy(k);
             // Match exact name or namespaced name (e.g., "__ontology___default::ValueHub")
             if key_str == format!("__ontology__{}", name)
                 || key_str.ends_with(&format!("::{}", name))
             {
                 found_key = Some(k.clone());
+                if let Ok(ontology) = onto_ontology::Ontology::from_json_slice(val_bytes) {
+                    found_classes.extend(ontology.classes.keys().cloned());
+                }
                 break;
             }
         }
 
         if let Some(key) = found_key {
             engine.delete(key)?;
+            self.drop_row_count_aliases(name);
+            for cls in &found_classes {
+                self.drop_row_count_aliases(cls);
+            }
+            self.inference_cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .invalidate_ontology(name);
             tracing::info!("Dropped ontology '{}'", name);
             Ok(())
         } else {
@@ -3009,6 +3035,12 @@ impl QueryExecutor {
                                 .write()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .invalidate_ontology(&ontology.name);
+                            // Drop cached row counts too (full + short aliases),
+                            // or SHOW CLASSES keeps listing the dead class.
+                            self.drop_row_count_aliases(&ontology.name);
+                            for cls in ontology.classes.keys() {
+                                self.drop_row_count_aliases(cls);
+                            }
                             found = true;
                             break;
                         }

@@ -1080,12 +1080,18 @@ impl LsmEngine {
         }
 
         // 2. Collect candidate SST paths from levels (brief lock).
+        //    The min/max range check is an optimization only. An empty bound
+        //    (unlabeled SST) must not exclude the file — that silently drops
+        //    rows. Be conservative: skip the range check when either bound is
+        //    empty, and treat missing bounds as unbounded.
         let candidates = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let mut cands = Vec::new();
             for level in levels.iter() {
                 for sst_info in level.iter().rev() {
-                    if key < sst_info.min_key.as_slice() || key > sst_info.max_key.as_slice() {
+                    let min_ok = sst_info.min_key.is_empty() || key >= sst_info.min_key.as_slice();
+                    let max_ok = sst_info.max_key.is_empty() || key <= sst_info.max_key.as_slice();
+                    if !(min_ok && max_ok) {
                         continue;
                     }
                     cands.push(sst_info.path.clone());
@@ -1103,15 +1109,23 @@ impl LsmEngine {
         };
 
         // 4. Iterate SST handles outside the lock (I/O-heavy).
+        //    Collect the highest-seq version across all candidates — returning
+        //    the first hit is wrong when an older SST is examined before the
+        //    one holding the newer version (observed as stale UPDATE reads).
+        let mut best: Option<(Vec<u8>, SeqNo, EntryKind)> = None;
         for sst in &sst_handles {
-            match sst.get_full(key)? {
-                Some((value, _, EntryKind::Put)) => return Ok(GetOutcome::Hit(value)),
-                Some((_, _, EntryKind::Delete)) => return Ok(GetOutcome::Deleted),
-                None => continue,
+            if let Some((value, seq, kind)) = sst.get_full(key)? {
+                let is_newer = best.as_ref().map(|(_, s, _)| seq > *s).unwrap_or(true);
+                if is_newer {
+                    best = Some((value, seq, kind));
+                }
             }
         }
-
-        Ok(GetOutcome::Absent)
+        match best {
+            Some((value, _, EntryKind::Put)) => Ok(GetOutcome::Hit(value)),
+            Some((_, _, EntryKind::Delete)) => Ok(GetOutcome::Deleted),
+            None => Ok(GetOutcome::Absent),
+        }
     }
 
     /// Batch point-lookup: fetches values for multiple keys efficiently.
@@ -2579,22 +2593,14 @@ impl LsmEngine {
         // Step 2: Snapshot immutable MemTable entries (brief lock), then build SSTable outside lock
         let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
         let sst_path = self.options.data_dir.join(format!("L0_{}.sst", sst_id));
-        let (entries_snapshot, min_key, max_key) = {
+        let (mut entries_snapshot, _) = {
             let ws = self.write_state.read();
             if let Some(ref imm) = ws.immutable_memtable {
                 let entries: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = imm
                     .entries()
                     .map(|e| (e.key.clone(), e.value.clone(), e.seq_no, e.kind))
                     .collect();
-                let min_key = entries
-                    .first()
-                    .map(|(k, _, _, _)| k.clone())
-                    .unwrap_or_default();
-                let max_key = entries
-                    .last()
-                    .map(|(k, _, _, _)| k.clone())
-                    .unwrap_or_default();
-                (entries, min_key, max_key)
+                (entries, ())
             } else {
                 return Ok(());
             }
@@ -2609,7 +2615,26 @@ impl LsmEngine {
             return Ok(());
         }
 
-        // Build SSTable from snapshot OUTSIDE the lock (disk I/O)
+        // Build SSTable from snapshot OUTSIDE the lock (disk I/O).
+        //
+        // Sort by user key (then seq descending) before adding to the builder.
+        // MemTable stores composite keys `user_key ++ !seq`, which mis-orders
+        // entries when one user key is a prefix of another (e.g. `CHEMBL1`
+        // vs `CHEMBL10`): the inverted-seq suffix of the shorter key sorts
+        // after the longer key's next byte, so `entries()` is not user-key
+        // sorted. The SST builder/lookup assume user-key order and silently
+        // miss keys in the middle (observed as lost rows after flush).
+        entries_snapshot.sort_by(|a, b| {
+            a.0.cmp(&b.0).then(b.2.cmp(&a.2)) // user key asc, seq desc
+        });
+        let min_key = entries_snapshot
+            .first()
+            .map(|(k, _, _, _)| k.clone())
+            .unwrap_or_default();
+        let max_key = entries_snapshot
+            .last()
+            .map(|(k, _, _, _)| k.clone())
+            .unwrap_or_default();
         // Use add_owned + into_iter to avoid cloning key/value a second time.
         let mut builder = SsTableBuilder::with_expected_entries(entries_snapshot.len());
         builder.set_compression_level(self.options.compression_level);
@@ -5241,6 +5266,402 @@ mod tests {
             );
         }
         engine.shutdown();
+    }
+
+    /// Regression: UPDATE-style txn_put/commit must survive shutdown+reopen
+    /// even when the memtable is never flushed. Mirrors the fp-refill pattern
+    /// (one document rewrite per transaction) that lost 86k writes on restart.
+    #[test]
+    fn test_txn_updates_survive_restart_without_flush() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 128 * 1024 * 1024, // never flush
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options.clone()).expect("open");
+
+        // Base docs (original insert path).
+        for i in 0..200u32 {
+            let key = format!("C::{i:04}");
+            let val = format!(r#"{{"id":"{}","smiles":"CCO","fp":null}}"#, key);
+            engine.put(key.into_bytes(), val.into_bytes()).expect("put");
+        }
+
+        // UPDATE-style rewrites: one txn per row (like refill_fp_v3).
+        for i in 0..200u32 {
+            let key = format!("C::{i:04}");
+            let txn = engine.begin_txn();
+            let val = format!(r#"{{"id":"{}","smiles":"CCO","fp":"REFILLED"}}"#, key);
+            engine
+                .txn_put(txn, key.into_bytes(), val.into_bytes())
+                .expect("txn_put");
+            engine.commit_txn(txn).expect("commit");
+        }
+
+        // Simulated crash: WAL synced, memtable NOT flushed.
+        engine.shutdown();
+        drop(engine);
+
+        let engine2 = LsmEngine::open(options).expect("reopen");
+        let mut missing = 0u32;
+        for i in 0..200u32 {
+            let key = format!("C::{i:04}");
+            let got = engine2.get(key.as_bytes()).expect("get");
+            match got {
+                Some(v) => {
+                    let s = String::from_utf8_lossy(&v);
+                    if !s.contains("REFILLED") {
+                        missing += 1;
+                        if missing <= 3 {
+                            eprintln!("LOST update on {key}: {s}");
+                        }
+                    }
+                }
+                None => {
+                    missing += 1;
+                    if missing <= 3 {
+                        eprintln!("LOST row entirely: {key}");
+                    }
+                }
+            }
+        }
+        assert_eq!(missing, 0, "{missing}/200 txn updates lost across restart");
+        engine2.shutdown();
+    }
+
+    /// Same pattern but with concurrent flushes during the update window —
+    /// exercises reset_wal_internal while updates are still landing.
+    #[test]
+    fn test_txn_updates_survive_restart_with_flushes() {
+        use std::sync::Arc;
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 4096, // force frequent flushes
+            ..Default::default()
+        };
+        let engine = Arc::new(LsmEngine::open(options.clone()).expect("open"));
+
+        for i in 0..300u32 {
+            let key = format!("F::{i:04}");
+            let val = format!(r#"{{"id":"{}","fp":null}}"#, key);
+            engine.put(key.into_bytes(), val.into_bytes()).expect("put");
+        }
+
+        let flusher = {
+            let e = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                for _ in 0..40 {
+                    let _ = e.flush();
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        for i in 0..300u32 {
+            let key = format!("F::{i:04}");
+            let txn = engine.begin_txn();
+            let val = format!(r#"{{"id":"{}","fp":"REFILLED"}}"#, key);
+            engine
+                .txn_put(txn, key.into_bytes(), val.into_bytes())
+                .expect("txn_put");
+            engine.commit_txn(txn).expect("commit");
+        }
+
+        flusher.join().expect("join");
+        engine.shutdown();
+        drop(engine);
+
+        let engine2 = LsmEngine::open(options).expect("reopen");
+        let mut missing = 0u32;
+        for i in 0..300u32 {
+            let key = format!("F::{i:04}");
+            let got = engine2.get(key.as_bytes()).expect("get");
+            let ok = got
+                .as_deref()
+                .map(|v| String::from_utf8_lossy(v).contains("REFILLED"))
+                .unwrap_or(false);
+            if !ok {
+                missing += 1;
+                if missing <= 3 {
+                    eprintln!("LOST update on {key}: {got:?}");
+                }
+            }
+        }
+        assert_eq!(missing, 0, "{missing}/300 txn updates lost across restart");
+        engine2.shutdown();
+    }
+
+    /// Explicit single flush then read back — isolates persist_immutable_to_sst.
+    #[test]
+    fn test_explicit_flush_preserves_keys() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 256 * 1024 * 1024, // no auto flush
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("open");
+        let n = 20u32;
+        for i in 0..n {
+            let key = format!("sembio.Compound::CHEMBL{i}");
+            engine
+                .put(key.into_bytes(), format!("value-{i}").into_bytes())
+                .expect("put");
+        }
+        engine.flush().expect("flush");
+        let mut missing = Vec::new();
+        for i in 0..n {
+            let key = format!("sembio.Compound::CHEMBL{i}");
+            match engine.get(key.as_bytes()).expect("get") {
+                Some(v) if v == format!("value-{i}").into_bytes() => {}
+                other => missing.push((i, other.map(|v| v.len()))),
+            }
+        }
+        assert!(missing.is_empty(), "after explicit flush missing {missing:?}");
+        engine.shutdown();
+    }
+
+    /// Same keys as the flush test but with a huge memtable (no flush).
+    #[test]
+    fn test_puts_stay_visible_no_flush() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 256 * 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("open");
+        let n = 200u32;
+        for i in 0..n {
+            let key = format!("sembio.Compound::CHEMBL{i}");
+            engine
+                .put(key.into_bytes(), format!("value-{i}").into_bytes())
+                .expect("put");
+        }
+        let mut missing = Vec::new();
+        for i in 0..n {
+            let key = format!("sembio.Compound::CHEMBL{i}");
+            if engine.get(key.as_bytes()).expect("get").is_none() {
+                missing.push(i);
+            }
+        }
+        assert!(missing.is_empty(), "no-flush missing {missing:?}");
+        engine.shutdown();
+    }
+
+    /// Direct SST round-trip: build an SST with a few known keys and get_full
+    /// each one back. Isolates the block-index / restart-point lookup.
+    /// Keys must be added in sorted order (SST builder contract).
+    #[test]
+    fn test_sst_get_full_roundtrip() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("t.sst");
+        let mut b = crate::lsm::sstable::SsTableBuilder::new();
+        // Sorted order: CHEMBL0, CHEMBL1, CHEMBL10..19, CHEMBL2, CHEMBL20..29, CHEMBL3..
+        let mut keys: Vec<(String, u32)> = (0..30u32).map(|i| (format!("sembio.Compound::CHEMBL{i}"), i)).collect();
+        keys.sort_by(|a, b| a.0.cmp(&b.0));
+        for (key, i) in &keys {
+            b.add_owned(onto_core::Entry::put(
+                key.clone().into_bytes(),
+                format!("value-{i}").into_bytes(),
+                *i as u64 + 1,
+            ));
+        }
+        let sst = b.build(&path).expect("build");
+        let mut missing = Vec::new();
+        for i in 0..30u32 {
+            let key = format!("sembio.Compound::CHEMBL{i}");
+            match sst.get_full(key.as_bytes()).expect("get_full") {
+                Some((v, _, _)) => {
+                    if v != format!("value-{i}").into_bytes() {
+                        missing.push((i, "wrong"));
+                    }
+                }
+                None => missing.push((i, "absent")),
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "SST get_full missing {:?}",
+            &missing[..missing.len().min(10)]
+        );
+    }
+
+    /// Minimal repro: plain put() with frequent flush — every key must stay
+    /// visible while the engine is still open (no restart involved).
+    #[test]
+    fn test_puts_stay_visible_across_flush() {
+        use onto_core::binary_row::map_to_binary;
+        use serde_json::{Map, Value};
+
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 4096,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("open");
+        let n = 200u32;
+        for i in 0..n {
+            let key = format!("sembio.Compound::CHEMBL{i}");
+            let mut m = Map::new();
+            m.insert("id".into(), Value::String(format!("CHEMBL{i}")));
+            m.insert(
+                "smiles".into(),
+                Value::String(
+                    "Nc1nc2ccn(CCCCc3ccc(C(=O)N[C@@H](CCC(=O)O)C(=O)O)cc3)c2c(=O)[nH]1".into(),
+                ),
+            );
+            m.insert("fp".into(), Value::String("null".into()));
+            engine
+                .put(key.into_bytes(), map_to_binary(&m))
+                .expect("put");
+        }
+        let mut missing = Vec::new();
+        for i in 0..n {
+            let key = format!("sembio.Compound::CHEMBL{i}");
+            match engine.get(key.as_bytes()).expect("get") {
+                Some(v) => {
+                    if !v.windows(4).any(|w| w == b"null") {
+                        missing.push((i, "wrong-value"));
+                    }
+                }
+                None => missing.push((i, "absent")),
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} / {} puts invisible after flush: {:?}",
+            missing.len(),
+            n,
+            &missing[..missing.len().min(10)]
+        );
+        engine.shutdown();
+    }
+
+    /// Simulate a hard process kill (no shutdown()): engine is dropped while
+    /// WAL has been flushed to OS cache via commit_txn's flush_buf. Also uses
+    /// BinaryRow-sized documents closer to real Compound rows.
+    #[test]
+    fn test_txn_updates_survive_hard_kill() {
+        use onto_core::binary_row::map_to_binary;
+        use serde_json::{Map, Value};
+
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 256 * 1024, // force frequent flush / reset_wal
+            ..Default::default()
+        };
+
+        let mk_doc = |i: u32, fp: &str| {
+            let mut m = Map::new();
+            m.insert("id".into(), Value::String(format!("CHEMBL{i}")));
+            m.insert(
+                "smiles".into(),
+                Value::String(
+                    "Nc1nc2ccn(CCCCc3ccc(C(=O)N[C@@H](CCC(=O)O)C(=O)O)cc3)c2c(=O)[nH]1".into(),
+                ),
+            );
+            m.insert("fp".into(), Value::String(fp.to_string()));
+            m.insert("molregno".into(), Value::String(format!("{}", 2857819 + i)));
+            map_to_binary(&m)
+        };
+
+        {
+            let engine = LsmEngine::open(options.clone()).expect("open");
+            for i in 0..400u32 {
+                let key = format!("sembio.Compound::CHEMBL{i}");
+                engine
+                    .put(key.into_bytes(), mk_doc(i, "null"))
+                    .expect("put");
+            }
+            // Base puts must all be visible.
+            let mut base_ok = 0u32;
+            for i in 0..400u32 {
+                let key = format!("sembio.Compound::CHEMBL{i}");
+                if engine.get(key.as_bytes()).expect("get").is_some() {
+                    base_ok += 1;
+                }
+            }
+            eprintln!("post-put visible: {base_ok}/400");
+            for i in 0..400u32 {
+                let key = format!("sembio.Compound::CHEMBL{i}");
+                let txn = engine.begin_txn();
+                engine
+                    .txn_put(txn, key.into_bytes(), mk_doc(i, "REFILLED"))
+                    .expect("txn_put");
+                engine.commit_txn(txn).expect("commit");
+            }
+            // Confirm updates are visible before the "crash".
+            let mut live_ok = 0u32;
+            let mut stale = 0u32;
+            let mut gone = 0u32;
+            let mut stale_idx = Vec::new();
+            for i in 0..400u32 {
+                let key = format!("sembio.Compound::CHEMBL{i}");
+                match engine.get(key.as_bytes()).expect("get") {
+                    Some(v) => {
+                        if v.windows(8).any(|w| w == b"REFILLED") {
+                            live_ok += 1;
+                        } else {
+                            stale += 1;
+                            if stale_idx.len() < 10 {
+                                stale_idx.push(i);
+                            }
+                        }
+                    }
+                    None => {
+                        gone += 1;
+                        if stale_idx.len() < 10 {
+                            stale_idx.push(i);
+                        }
+                    }
+                }
+            }
+            eprintln!("pre-crash: ok={live_ok} stale={stale} gone={gone} sample_bad={stale_idx:?}");
+            assert_eq!(live_ok, 400, "updates not even visible before drop");
+            // HARD KILL: no shutdown(), no flush(). Drop the engine.
+            drop(engine);
+        }
+
+        let engine2 = LsmEngine::open(options).expect("reopen");
+        let mut missing = Vec::new();
+        for i in 0..400u32 {
+            let key = format!("sembio.Compound::CHEMBL{i}");
+            let got = engine2.get(key.as_bytes()).expect("get");
+            let ok = got
+                .as_deref()
+                .map(|v| {
+                    v.windows(8).any(|w| w == b"REFILLED")
+                })
+                .unwrap_or(false);
+            if !ok {
+                missing.push((i, got.as_ref().map(|v| v.len())));
+            }
+        }
+        if !missing.is_empty() {
+            let idxs: Vec<u32> = missing.iter().map(|(i, _)| *i).collect();
+            eprintln!("lost {} rows, idxs[:20]={:?} idxs[-10:]={:?}", missing.len(), &idxs[..idxs.len().min(20)], &idxs[idxs.len().saturating_sub(10)..]);
+            for (i, glen) in missing.iter().take(5) {
+                eprintln!("  CHEMBL{i} get_len={glen:?}");
+            }
+            // Count via scan too
+            let mut scan_n = 0usize;
+            let mut scan_refilled = 0usize;
+            let _ = engine2.for_each_live_prefix(b"sembio.Compound::", None, None, |_, v| {
+                scan_n += 1;
+                if v.windows(8).any(|w| w == b"REFILLED") {
+                    scan_refilled += 1;
+                }
+                Ok(())
+            });
+            eprintln!("scan: total={scan_n} refilled={scan_refilled}");
+        }
+        assert_eq!(missing.len(), 0, "{}/400 updates lost after hard kill", missing.len());
+        engine2.shutdown();
     }
 
     /// Regression: reset_wal_internal used to blind-replace wal.log, dropping
