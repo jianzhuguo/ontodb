@@ -3741,10 +3741,36 @@ impl LsmEngine {
     ///  Phase 3 — brief write_state: WAL + memtable writes
     pub fn commit_txn(&self, txn_id: SeqNo) -> Result<()> {
         // ── Phase 1: Take writes, assign sequence numbers, read old values ──
-        // Snapshot SST cache BEFORE acquiring write_state lock to avoid nested lock deadlock.
-        let sst_cache_snapshot: HashMap<PathBuf, Arc<SsTable>> = {
-            let cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
-            cache.clone()
+        // Snapshot live SST handles newest-first BEFORE acquiring write_state
+        // lock (lock order: levels → sst_cache, then release before write_state).
+        // Only paths still listed in `levels` are included — compacted-away
+        // cache leftovers must not be consulted (they can shadow fresher data).
+        let sst_handles: Vec<Arc<SsTable>> = {
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut handles = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for level in levels.iter() {
+                for sst_info in level.iter().rev() {
+                    if !seen.insert(sst_info.path.clone()) {
+                        continue;
+                    }
+                    match cache.get(&sst_info.path) {
+                        Some(sst) => handles.push(Arc::clone(sst)),
+                        None => match SsTable::open(&sst_info.path) {
+                            Ok(sst) => {
+                                let sst = Arc::new(sst);
+                                cache.insert(sst_info.path.clone(), Arc::clone(&sst));
+                                handles.push(sst);
+                            }
+                            // Compacted away between levels snapshot and open.
+                            Err(e) if Self::is_not_found(&e) => continue,
+                            Err(e) => return Err(e),
+                        },
+                    }
+                }
+            }
+            handles
         };
 
         let (writes_with_seq, old_values, index_entries_batch) = {
@@ -3776,10 +3802,10 @@ impl LsmEngine {
                         .has_any_index(c)
                 });
 
-                // Read old value for de-indexing (from locked memtable + SST cache snapshot)
+                // Read old value for de-indexing (from locked memtable + live SSTs)
                 if has_indexes || has_vector_indexes {
                     if let Some(old_val) =
-                        Self::get_from_locked(&ws, &sst_cache_snapshot, key.as_slice())?
+                        Self::get_from_locked(&ws, &sst_handles, key.as_slice())?
                     {
                         old_values.insert(key.clone(), old_val);
                     }
@@ -3916,11 +3942,15 @@ impl LsmEngine {
         }
     }
 
-    /// Gets a value by key from already-locked write state + SST cache.
+    /// Gets a value by key from already-locked write state + live SST handles.
     /// Used by `commit_txn` which holds the write_state write lock.
+    ///
+    /// `sst_handles` must be newest-first (L0 → L6, later flushes first) and
+    /// contain only SSTs still listed in `levels` — first hit wins, matching
+    /// the read path's first-seen-wins contract.
     fn get_from_locked(
         ws: &WriteState,
-        sst_cache: &HashMap<PathBuf, Arc<SsTable>>,
+        sst_handles: &[Arc<SsTable>],
         key: &[u8],
     ) -> Result<Option<Value>> {
         use crate::lsm::memtable::VersionLookup;
@@ -3936,7 +3966,7 @@ impl LsmEngine {
                 None => {}
             }
         }
-        for sst in sst_cache.values() {
+        for sst in sst_handles {
             match sst.get_full(key)? {
                 Some((value, _, EntryKind::Put)) => return Ok(Some(value)),
                 Some((_, _, EntryKind::Delete)) => return Ok(None),

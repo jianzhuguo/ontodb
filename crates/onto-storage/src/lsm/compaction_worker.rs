@@ -203,6 +203,18 @@ impl CompactionWorker {
         }
     }
 
+    /// Tells the engine to drop `sst_cache` entries for paths this worker
+    /// deleted. Without this the engine keeps stale `Arc<SsTable>` handles
+    /// for files that are already gone from disk and from `levels`.
+    fn notify_evicted(&self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        if let Some(ref sender) = self.notif_sender {
+            let _ = sender.send(CompactionNotification::Compacted { evicted_paths: paths });
+        }
+    }
+
     /// Checks all levels and performs compaction on the most urgent one.
     fn try_compact(&mut self) -> Result<()> {
         // Respect cooldown after a timed-out merge — prevents immediately
@@ -456,10 +468,13 @@ impl CompactionWorker {
 
         // Delete empty-shell SSTs outside the levels lock
         if !empty_ssts.is_empty() {
+            let mut evicted = Vec::new();
             for e in &empty_ssts {
                 self.sst_cache.remove(&e.path);
                 self.pending_deletions.push(e.path.clone());
+                evicted.push(e.path.clone());
             }
+            self.notify_evicted(evicted);
             tracing::info!(
                 count = empty_ssts.len(),
                 "Discarded empty-shell SSTs during compaction pickup"
@@ -497,6 +512,9 @@ impl CompactionWorker {
         for e in &empty_next {
             self.sst_cache.remove(&e.path);
             self.pending_deletions.push(e.path.clone());
+        }
+        if !empty_next.is_empty() {
+            self.notify_evicted(empty_next.iter().map(|e| e.path.clone()).collect());
         }
 
         // Step 2.5: Tombstone placement safety. L1+ selection merges the
@@ -1055,6 +1073,7 @@ impl CompactionWorker {
                 self.sst_cache.remove(p);
                 self.pending_deletions.push(p.clone());
             }
+            self.notify_evicted(empties.clone());
             tracing::info!(
                 count = empties.len(),
                 "Discarded empty-shell SSTs in merge_last_level_batch"
@@ -1273,6 +1292,7 @@ impl CompactionWorker {
                 self.sst_cache.remove(&e.path);
                 self.pending_deletions.push(e.path.clone());
             }
+            self.notify_evicted(empty_shells.iter().map(|e| e.path.clone()).collect());
             tracing::info!(
                 count = empty_shells.len(),
                 "Discarded empty-shell SSTs in merge_small_files"
@@ -1398,15 +1418,17 @@ impl CompactionWorker {
         // Replace small files with new larger files and schedule old ones for
         // deletion. Splice in place — never `sort_by(min_key)`, which would
         // destroy the insertion-order-is-age contract the read path needs.
-        {
+        let evicted_small: Vec<PathBuf> = {
             let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
             let small_paths: std::collections::HashSet<PathBuf> =
                 small_files.iter().map(|s| s.path.clone()).collect();
 
             Self::splice_outputs(&mut levels, target_level, &small_files, new_ssts);
 
-            self.pending_deletions.extend(small_paths);
-        }
+            self.pending_deletions.extend(small_paths.iter().cloned());
+            small_paths.into_iter().collect()
+        };
+        self.notify_evicted(evicted_small);
 
         tracing::info!(
             "Small file merge batch complete (L{}): {} small files → {} larger files ({}MB)",
