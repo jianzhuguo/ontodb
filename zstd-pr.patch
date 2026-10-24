@@ -1,0 +1,562 @@
+From: OntoDB Team <dev@ontodb.ai>
+Subject: [PATCH] Fix NULL deref when CCtx workspace reservation fails
+
+ZSTD_resetCCtx_internal() and ZSTD_reset_matchState() call
+ZSTD_cwksp_reserve_*() and store the results without checking
+ZSTD_cwksp_reserve_failed() before using the pointers. When a workspace
+reservation fails (e.g. under memory pressure while the CCtx workspace is
+rebuilt), those pointers stay NULL but the function still returns 0 and
+sets initialized = 1.
+
+The next compression writes through the NULL pointers — most visibly in
+ZSTD_seqToCodes() via seqStore.llCode/mlCode/ofCode — and crashes.
+
+Several reservation sites are immediately followed by ZSTD_memset() on the
+reserved pointer (ldm hashTable, ldm bucketOffsets, CDict tagTable), so
+they crash inside the reset functions before any later check could run.
+
+Note: ZSTD_cwksp_reserve_internal() returns NULL for a zero-byte reserve
+without setting allocFailed. Checks therefore use the sticky
+ZSTD_cwksp_reserve_failed() flag rather than a bare `ptr == NULL` test,
+which would mis-classify legitimate zero-size reserves (e.g. hashTable3
+when hashLog3 == 0) as failures.
+
+Related: https://github.com/facebook/zstd/issues/3950 (same crash site;
+that report covers uninitialized workspace contents. This patch covers
+unchecked reservation failure.)
+
+---
+ lib/compress/zstd_compress.c | 39 +++++++++++++++++++---
+ tests/wksp_alloc_fail_test.c | 403 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 438 insertions(+), 4 deletions(-)
+diff --git a/lib/compress/zstd_compress.c b/lib/compress/zstd_compress.c
+index 8245154..1320fb5 100644
+--- a/lib/compress/zstd_compress.c
++++ b/lib/compress/zstd_compress.c
+@@ -141,8 +141,11 @@ ZSTD_CCtx* ZSTD_initStaticCCtx(void* workspace, size_t workspaceSize)
+     /* statically sized space. tmpWorkspace never moves (but prev/next block swap places) */
+     if (!ZSTD_cwksp_check_available(&cctx->workspace, TMP_WORKSPACE_SIZE + 2 * sizeof(ZSTD_compressedBlockState_t))) return NULL;
+     cctx->blockState.prevCBlock = (ZSTD_compressedBlockState_t*)ZSTD_cwksp_reserve_object(&cctx->workspace, sizeof(ZSTD_compressedBlockState_t));
++    if (cctx->blockState.prevCBlock == NULL) return NULL;
+     cctx->blockState.nextCBlock = (ZSTD_compressedBlockState_t*)ZSTD_cwksp_reserve_object(&cctx->workspace, sizeof(ZSTD_compressedBlockState_t));
++    if (cctx->blockState.nextCBlock == NULL) return NULL;
+     cctx->tmpWorkspace = ZSTD_cwksp_reserve_object(&cctx->workspace, TMP_WORKSPACE_SIZE);
++    if (cctx->tmpWorkspace == NULL) return NULL;
+     cctx->tmpWkspSize = TMP_WORKSPACE_SIZE;
+     cctx->bmi2 = ZSTD_cpuid_bmi2(ZSTD_cpuid());
+     return cctx;
+@@ -2036,10 +2039,14 @@ ZSTD_reset_matchState(ZSTD_MatchState_t* ms,
+          * 0 when we reset a Cdict */
+         if(forWho == ZSTD_resetTarget_CCtx) {
+             ms->tagTable = (BYTE*) ZSTD_cwksp_reserve_aligned_init_once(ws, tagTableSize);
++            RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
++                            "couldn't allocate tagTable");
+             ZSTD_advanceHashSalt(ms);
+         } else {
+             /* When we are not salting we want to always memset the memory */
+             ms->tagTable = (BYTE*) ZSTD_cwksp_reserve_aligned64(ws, tagTableSize);
++            RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
++                            "couldn't allocate tagTable");
+             ZSTD_memset(ms->tagTable, 0, tagTableSize);
+             ms->hashSalt = 0;
+         }
+@@ -2217,14 +2224,20 @@ static size_t ZSTD_resetCCtx_internal(ZSTD_CCtx* zc,
+                 ZSTD_resetTarget_CCtx), "");
+ 
+         zc->seqStore.sequencesStart = (SeqDef*)ZSTD_cwksp_reserve_aligned64(ws, maxNbSeq * sizeof(SeqDef));
++        RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
++                        "couldn't allocate sequencesStart");
+ 
+         /* ldm hash table */
+         if (params->ldmParams.enableLdm == ZSTD_ps_enable) {
+             /* TODO: avoid memset? */
+             size_t const ldmHSize = ((size_t)1) << params->ldmParams.hashLog;
+             zc->ldmState.hashTable = (ldmEntry_t*)ZSTD_cwksp_reserve_aligned64(ws, ldmHSize * sizeof(ldmEntry_t));
++            RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
++                            "couldn't allocate ldm hashTable");
+             ZSTD_memset(zc->ldmState.hashTable, 0, ldmHSize * sizeof(ldmEntry_t));
+             zc->ldmSequences = (rawSeq*)ZSTD_cwksp_reserve_aligned64(ws, maxNbLdmSeq * sizeof(rawSeq));
++            RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
++                            "couldn't allocate ldmSequences");
+             zc->maxNbLdmSequences = maxNbLdmSeq;
+ 
+             ZSTD_window_init(&zc->ldmState.window);
+@@ -2237,6 +2250,8 @@ static size_t ZSTD_resetCCtx_internal(ZSTD_CCtx* zc,
+             zc->extSeqBufCapacity = maxNbExternalSeq;
+             zc->extSeqBuf =
+                 (ZSTD_Sequence*)ZSTD_cwksp_reserve_aligned64(ws, maxNbExternalSeq * sizeof(ZSTD_Sequence));
++            RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
++                            "couldn't allocate extSeqBuf");
+         }
+ 
+         /* buffers */
+@@ -2245,13 +2260,19 @@ static size_t ZSTD_resetCCtx_internal(ZSTD_CCtx* zc,
+          * so we have to oversize the buffer by WILDCOPY_OVERLENGTH bytes.
+          */
+         zc->seqStore.litStart = ZSTD_cwksp_reserve_buffer(ws, blockSize + WILDCOPY_OVERLENGTH);
++        RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
++                        "couldn't allocate litStart");
+         zc->seqStore.maxNbLit = blockSize;
+ 
+         zc->bufferedPolicy = zbuff;
+         zc->inBuffSize = buffInSize;
+         zc->inBuff = (char*)ZSTD_cwksp_reserve_buffer(ws, buffInSize);
++        RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
++                        "couldn't allocate inBuff");
+         zc->outBuffSize = buffOutSize;
+         zc->outBuff = (char*)ZSTD_cwksp_reserve_buffer(ws, buffOutSize);
++        RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
++                        "couldn't allocate outBuff");
+ 
+         /* ldm bucketOffsets table */
+         if (params->ldmParams.enableLdm == ZSTD_ps_enable) {
+@@ -2260,6 +2281,8 @@ static size_t ZSTD_resetCCtx_internal(ZSTD_CCtx* zc,
+                   ((size_t)1) << (params->ldmParams.hashLog -
+                                   params->ldmParams.bucketSizeLog);
+             zc->ldmState.bucketOffsets = ZSTD_cwksp_reserve_buffer(ws, numBuckets);
++            RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
++                            "couldn't allocate ldm bucketOffsets");
+             ZSTD_memset(zc->ldmState.bucketOffsets, 0, numBuckets);
+         }
+ 
+@@ -2267,13 +2290,19 @@ static size_t ZSTD_resetCCtx_internal(ZSTD_CCtx* zc,
+         ZSTD_referenceExternalSequences(zc, NULL, 0);
+         zc->seqStore.maxNbSeq = maxNbSeq;
+         zc->seqStore.llCode = ZSTD_cwksp_reserve_buffer(ws, maxNbSeq * sizeof(BYTE));
++        RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
++                        "couldn't allocate llCode");
+         zc->seqStore.mlCode = ZSTD_cwksp_reserve_buffer(ws, maxNbSeq * sizeof(BYTE));
++        RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
++                        "couldn't allocate mlCode");
+         zc->seqStore.ofCode = ZSTD_cwksp_reserve_buffer(ws, maxNbSeq * sizeof(BYTE));
++        RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
++                        "couldn't allocate ofCode");
+ 
+-        /* All workspace reservations must succeed before marking initialized.
+-         * zstd 1.5.7 omitted this check; a failed reservation leaves NULL
+-         * pointers (e.g. seqStore.llCode) that ZSTD_seqToCodes writes through.
+-         * See OntoDB bug.md for the full crash chain. */
++        /* Catch-all: any sticky reserve failure from ZSTD_reset_matchState or
++         * an unchecked site above. zstd 1.5.7 omitted this check; a failed
++         * reservation leaves NULL pointers (e.g. seqStore.llCode) that
++         * ZSTD_seqToCodes writes through. See OntoDB bug.md. */
+         RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,
+                         "failed a workspace allocation in ZSTD_resetCCtx_internal");
+ 
+@@ -5578,6 +5607,8 @@ static size_t ZSTD_initCDict_internal(
+     cdict->dictContentType = dictContentType;
+ 
+     cdict->entropyWorkspace = (U32*)ZSTD_cwksp_reserve_object(&cdict->workspace, HUF_WORKSPACE_SIZE);
++    RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(&cdict->workspace), memory_allocation,
++                    "couldn't allocate entropyWorkspace");
+ 
+ 
+     /* Reset the state to no dictionary */
+diff --git a/tests/wksp_alloc_fail_test.c b/tests/wksp_alloc_fail_test.c
+new file mode 100644
+--- /dev/null
++++ b/tests/wksp_alloc_fail_test.c
+@@ -0,0 +1,403 @@
++/*
++ * wksp_alloc_fail_test.c
++ *
++ * Regression test: a failed ZSTD_cwksp_reserve_* inside ZSTD_resetCCtx_internal /
++ * ZSTD_reset_matchState must surface as ERROR(memory_allocation) instead of
++ * returning success with NULL pointers (crash in ZSTD_seqToCodes / memset).
++ *
++ * Build (from zstd root, after `make -C lib libzstd.a`):
++ *   cc -O1 -g -Ilib -DZSTD_STATIC_LINKING_ONLY \
++ *      tests/wksp_alloc_fail_test.c lib/libzstd.a -o wksp_alloc_fail_test
++ *   ./wksp_alloc_fail_test
++ *
++ * Related: crash site shared with issue #3950 (seqStore ll/ml/of code tables).
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define ZSTD_STATIC_LINKING_ONLY
++#include "zstd.h"
++#include "zstd_errors.h"
++
++/* ------------------------------------------------------------------------- */
++/* Custom allocator: fail the Nth allocation (1-based), succeed the rest.     */
++/* ------------------------------------------------------------------------- */
++
++typedef struct {
++    size_t allocs_seen;   /* number of alloc calls so far */
++    size_t fail_at;       /* 1-based index to fail; 0 = never fail */
++    size_t budget;        /* remaining bytes; (size_t)-1 = unlimited */
++    size_t total_requested;
++} budget_alloc_t;
++
++static void* budget_alloc(void* opaque, size_t size)
++{
++    budget_alloc_t* st = (budget_alloc_t*)opaque;
++    st->allocs_seen++;
++    st->total_requested += size;
++    if (st->fail_at != 0 && st->allocs_seen == st->fail_at) {
++        return NULL;
++    }
++    if (size > st->budget) {
++        return NULL;
++    }
++    st->budget -= size;
++    /* malloc(0) may return NULL; zstd treats NULL as allocation failure.
++     * Reserve sites can legitimately request 0 bytes (e.g. hashTable3 when
++     * hashLog3 == 0). Always return a non-NULL pointer. */
++    return malloc(size ? size : 1);
++}
++
++static void budget_free(void* opaque, void* address)
++{
++    (void)opaque;
++    free(address);
++}
++
++static ZSTD_customMem budget_mem(budget_alloc_t* st)
++{
++    ZSTD_customMem mem;
++    mem.customAlloc = budget_alloc;
++    mem.customFree = budget_free;
++    mem.opaque = st;
++    return mem;
++}
++
++static void budget_reset(budget_alloc_t* st, size_t fail_at, size_t budget)
++{
++    st->allocs_seen = 0;
++    st->fail_at = fail_at;
++    st->budget = budget;
++    st->total_requested = 0;
++}
++
++/* ------------------------------------------------------------------------- */
++/* Helpers                                                                   */
++/* ------------------------------------------------------------------------- */
++
++static int g_failures = 0;
++
++static void expect(int cond, const char* msg)
++{
++    if (!cond) {
++        fprintf(stderr, "FAIL: %s\n", msg);
++        g_failures++;
++    }
++}
++
++/* Compress `src` with `cctx`. Returns zstd status (0 or error code). */
++static size_t compress_once(ZSTD_CCtx* cctx,
++                            void* dst, size_t dstCapacity,
++                            const void* src, size_t srcSize,
++                            int cLevel,
++                            unsigned long long pledged)
++{
++    size_t err;
++    err = ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
++    if (ZSTD_isError(err)) return err;
++    err = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, cLevel);
++    if (ZSTD_isError(err)) return err;
++    /* Changing pledgedSrcSize changes blockSize / neededSpace and forces
++     * ZSTD_resetCCtx_internal to re-reserve the workspace. */
++    err = ZSTD_CCtx_setPledgedSrcSize(cctx, pledged);
++    if (ZSTD_isError(err)) return err;
++    return ZSTD_compress2(cctx, dst, dstCapacity, src, srcSize);
++}
++
++/*
++ * One scenario under a given fail_at / budget.
++ * Returns 0 on pass (no crash; failure is a clean zstd error), 1 on logic fail.
++ */
++static int run_fail_sweep(size_t fail_at, size_t budget,
++                          int cLevel, unsigned long long pledged,
++                          int strategy)
++{
++    budget_alloc_t st;
++    ZSTD_CCtx* cctx;
++    size_t const srcSize = 64 * 1024;
++    size_t const dstCapacity = ZSTD_compressBound(srcSize);
++    void* src;
++    void* dst;
++    size_t result;
++    int ok = 0;
++
++    src = malloc(srcSize);
++    dst = malloc(dstCapacity);
++    if (!src || !dst) {
++        free(src);
++        free(dst);
++        return 0; /* skip on OOM of the test harness itself */
++    }
++    /* compressible pattern */
++    memset(src, 0xA5, srcSize);
++
++    budget_reset(&st, fail_at, budget);
++    cctx = ZSTD_createCCtx_advanced(budget_mem(&st));
++    if (cctx == NULL) {
++        /* CCtx allocation itself failed — clean failure. */
++        free(src);
++        free(dst);
++        return 0;
++    }
++
++    if (strategy >= 0) {
++        size_t serr = ZSTD_CCtx_setParameter(cctx, ZSTD_c_strategy, strategy);
++        if (ZSTD_isError(serr)) {
++            /* Parameter rejected: still must not crash. */
++            ZSTD_freeCCtx(cctx);
++            free(src);
++            free(dst);
++            return 0;
++        }
++    }
++
++    result = compress_once(cctx, dst, dstCapacity, src, srcSize, cLevel, pledged);
++
++    if (ZSTD_isError(result)) {
++        /* Clean failure is the contract. Prefer memory_allocation, but any
++         * recoverable zstd error is acceptable (e.g. dstSize_error if we
++         * short-circuit early). */
++        if (ZSTD_getErrorCode(result) != ZSTD_error_memory_allocation) {
++            fprintf(stderr,
++                    "note: fail_at=%zu budget=%zu returned %s (wanted memory_allocation)\n",
++                    fail_at, budget, ZSTD_getErrorName(result));
++        }
++        ok = 1;
++    } else {
++        /* Success is fine when the failed allocation was not required. */
++        ok = 1;
++    }
++
++    ZSTD_freeCCtx(cctx);
++    free(src);
++    free(dst);
++    return ok ? 0 : 1;
++}
++
++/* ------------------------------------------------------------------------- */
++/* Test cases                                                                */
++/* ------------------------------------------------------------------------- */
++
++/*
++ * Sweep the allocation index so every ZSTD_cwksp_reserve_* site in
++ * ZSTD_resetCCtx_internal / ZSTD_reset_matchState gets a chance to fail.
++ */
++static void test_sweep_alloc_index(void)
++{
++    size_t fail_at;
++    int levels[] = { 1, 3, 9 };
++    size_t li;
++
++    printf("test_sweep_alloc_index...\n");
++    for (li = 0; li < sizeof(levels) / sizeof(levels[0]); li++) {
++        for (fail_at = 1; fail_at <= 40; fail_at++) {
++            /* Two different pledged sizes: second compress on a reused CCtx
++             * would also rebuild, but we create a fresh CCtx each time and
++             * still vary pledged to cover both small and large workspaces. */
++            g_failures += run_fail_sweep(fail_at, (size_t)-1,
++                                         levels[li], 16 * 1024, -1);
++            g_failures += run_fail_sweep(fail_at, (size_t)-1,
++                                         levels[li], 256 * 1024, -1);
++        }
++    }
++}
++
++/*
++ * Byte budget: simulate allocation pressure rather than a single failed call.
++ * Exercises the sticky ZSTD_cwksp_reserve_failed() path when an intermediate
++ * reserve (e.g. match state tables) fails and a later one is still attempted.
++ */
++static void test_sweep_byte_budget(void)
++{
++    size_t budgets[] = {
++        0, 64, 256, 1024, 4096, 16 * 1024, 64 * 1024,
++        256 * 1024, 1024 * 1024, 2 * 1024 * 1024
++    };
++    size_t i;
++
++    printf("test_sweep_byte_budget...\n");
++    for (i = 0; i < sizeof(budgets) / sizeof(budgets[0]); i++) {
++        g_failures += run_fail_sweep(0, budgets[i], 3, 128 * 1024, -1);
++        g_failures += run_fail_sweep(0, budgets[i], 1, 128 * 1024, -1);
++    }
++}
++
++/*
++ * Row-match-finder path (tagTable). ZSTD_fast / ZSTD_dfast can select the row
++ * match finder; the CDict reset path memsets tagTable immediately after the
++ * reserve. A failure there previously hit ZSTD_memset(NULL, ...).
++ */
++static void test_tag_table_row_match_finder(void)
++{
++    int strategies[] = { (int)ZSTD_fast, (int)ZSTD_dfast, (int)ZSTD_greedy, (int)ZSTD_lazy };
++    size_t si, fail_at;
++
++    printf("test_tag_table_row_match_finder...\n");
++    for (si = 0; si < sizeof(strategies) / sizeof(strategies[0]); si++) {
++        for (fail_at = 1; fail_at <= 40; fail_at++) {
++            g_failures += run_fail_sweep(fail_at, (size_t)-1,
++                                         1, 32 * 1024, strategies[si]);
++        }
++    }
++}
++
++/*
++ * Long-match / large workspace: level 19+ uses large tables and opt parser
++ * allocations (litFreq etc.) in ZSTD_reset_matchState.
++ */
++static void test_opt_parser_workspace(void)
++{
++    size_t fail_at;
++
++    printf("test_opt_parser_workspace...\n");
++    for (fail_at = 1; fail_at <= 50; fail_at++) {
++        g_failures += run_fail_sweep(fail_at, (size_t)-1, 19, 64 * 1024, -1);
++    }
++}
++
++/*
++ * Reuse one CCtx across two compressions with different pledged sizes so the
++ * second call rebuilds the workspace (workspaceTooSmall / wasteful path).
++ * Fail allocations starting mid-way through the second reset.
++ */
++static void test_reuse_rebuild(void)
++{
++    budget_alloc_t st;
++    ZSTD_CCtx* cctx;
++    size_t const srcSize = 32 * 1024;
++    size_t const dstCapacity = ZSTD_compressBound(srcSize);
++    void* src = malloc(srcSize);
++    void* dst = malloc(dstCapacity);
++    size_t fail_at;
++
++    printf("test_reuse_rebuild...\n");
++    if (!src || !dst) {
++        free(src);
++        free(dst);
++        return;
++    }
++    memset(src, 0x5A, srcSize);
++
++    for (fail_at = 1; fail_at <= 60; fail_at++) {
++        size_t r1, r2;
++
++        budget_reset(&st, 0, (size_t)-1); /* first compress must succeed */
++        cctx = ZSTD_createCCtx_advanced(budget_mem(&st));
++        if (!cctx) break;
++
++        r1 = compress_once(cctx, dst, dstCapacity, src, srcSize, 3, srcSize);
++        expect(!ZSTD_isError(r1), "first compress in reuse_rebuild should succeed");
++
++        /* Second compress with a much larger pledged size → workspace rebuild.
++         * Re-arm the allocator to fail the Nth allocation of this second call. */
++        st.allocs_seen = 0;
++        st.fail_at = fail_at;
++
++        r2 = compress_once(cctx, dst, dstCapacity, src, srcSize, 3, 8 * 1024 * 1024);
++        if (ZSTD_isError(r2)) {
++            /* clean error required */
++            if (ZSTD_getErrorCode(r2) != ZSTD_error_memory_allocation) {
++                fprintf(stderr,
++                        "note: reuse rebuild fail_at=%zu → %s\n",
++                        fail_at, ZSTD_getErrorName(r2));
++            }
++        }
++        /* if not an error, the failed alloc was unused — ok */
++        ZSTD_freeCCtx(cctx);
++    }
++
++    free(src);
++    free(dst);
++}
++
++/*
++ * CDict creation with a failing allocator (entropyWorkspace / match-state
++ * reserves). Must return NULL or produce a CDict without crashing.
++ */
++static void test_cdict_alloc_fail(void)
++{
++    budget_alloc_t st;
++    size_t const dictSize = 16 * 1024;
++    void* dict = malloc(dictSize);
++    size_t fail_at;
++
++    printf("test_cdict_alloc_fail...\n");
++    if (!dict) return;
++    memset(dict, 0x11, dictSize);
++
++    for (fail_at = 1; fail_at <= 30; fail_at++) {
++        ZSTD_CDict* cdict;
++        ZSTD_compressionParameters cParams;
++
++        budget_reset(&st, fail_at, (size_t)-1);
++        memset(&cParams, 0, sizeof(cParams));
++        cParams = ZSTD_getCParams(3, dictSize, 0);
++
++        cdict = ZSTD_createCDict_advanced(dict, dictSize,
++                                          ZSTD_dlm_byCopy,
++                                          ZSTD_dct_auto,
++                                          cParams,
++                                          budget_mem(&st));
++        /* Either NULL (clean fail) or a valid CDict. Must not crash. */
++        if (cdict) {
++            ZSTD_freeCDict(cdict);
++        }
++    }
++    free(dict);
++}
++
++/*
++ * Control: with a never-failing allocator, compression must succeed.
++ */
++static void test_control_success(void)
++{
++    budget_alloc_t st;
++    ZSTD_CCtx* cctx;
++    size_t const srcSize = 16 * 1024;
++    size_t const dstCapacity = ZSTD_compressBound(srcSize);
++    void* src = malloc(srcSize);
++    void* dst = malloc(dstCapacity);
++    size_t result;
++
++    printf("test_control_success...\n");
++    if (!src || !dst) {
++        free(src);
++        free(dst);
++        return;
++    }
++    memset(src, 0x3C, srcSize);
++
++    budget_reset(&st, 0, (size_t)-1);
++    cctx = ZSTD_createCCtx_advanced(budget_mem(&st));
++    expect(cctx != NULL, "createCCtx should succeed with unlimited budget");
++    if (cctx) {
++        result = compress_once(cctx, dst, dstCapacity, src, srcSize, 3, srcSize);
++        expect(!ZSTD_isError(result), "control compress should succeed");
++        if (ZSTD_isError(result)) {
++            fprintf(stderr, "  control error: %s\n", ZSTD_getErrorName(result));
++        }
++        ZSTD_freeCCtx(cctx);
++    }
++    free(src);
++    free(dst);
++}
++
++int main(void)
++{
++    test_control_success();
++    test_sweep_alloc_index();
++    test_sweep_byte_budget();
++    test_tag_table_row_match_finder();
++    test_opt_parser_workspace();
++    test_reuse_rebuild();
++    test_cdict_alloc_fail();
++
++    if (g_failures) {
++        printf("FAILED: %d assertion(s)\n", g_failures);
++        return 1;
++    }
++    printf("PASSED: all wksp allocation-failure cases returned cleanly\n");
++    return 0;
++}
