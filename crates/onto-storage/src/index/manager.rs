@@ -451,7 +451,7 @@ pub struct IndexManager {
     /// Base directory for disk-based index files.
     data_dir: Option<PathBuf>,
     /// Storage mode configuration.
-    _storage_mode: IndexStorageMode,
+    storage_mode: IndexStorageMode,
 }
 
 impl IndexManager {
@@ -462,7 +462,7 @@ impl IndexManager {
             disk_indexes: HashMap::new(),
             mem_complete: std::collections::HashSet::new(),
             data_dir: None,
-            _storage_mode: IndexStorageMode::default(),
+            storage_mode: IndexStorageMode::default(),
         }
     }
 
@@ -473,8 +473,49 @@ impl IndexManager {
             disk_indexes: HashMap::new(),
             mem_complete: std::collections::HashSet::new(),
             data_dir: Some(data_dir.to_path_buf()),
-            _storage_mode: mode,
+            storage_mode: mode,
         }
+    }
+
+    /// Whether an index with `entry_count` entries should keep a full in-memory tree.
+    ///
+    /// Hybrid mode keeps only small indexes in RAM; anything above the threshold
+    /// is disk-only so restart/rebuild cannot OOM on multi-million-entry indexes.
+    pub fn keep_in_memory(&self, entry_count: usize) -> bool {
+        match &self.storage_mode {
+            IndexStorageMode::InMemory => true,
+            IndexStorageMode::DiskBased => false,
+            IndexStorageMode::Hybrid { threshold_entries } => entry_count <= *threshold_entries,
+        }
+    }
+
+    /// True when the disk `.idx` already holds exactly `expected` live entries.
+    /// Used to skip the full rewrite on restart when nothing changed.
+    pub fn disk_in_sync(&self, class: &str, column: &str, expected: usize) -> bool {
+        let key = (class.to_string(), column.to_string());
+        let Some(disk) = self.disk_indexes.get(&key) else {
+            return false;
+        };
+        let mut idx = disk.lock().unwrap_or_else(|e| e.into_inner());
+        match idx.count_range(None, None) {
+            Ok(cnt) => !idx.is_empty() && cnt == expected as u64,
+            Err(_) => false,
+        }
+    }
+
+    /// Prefix that matches every `__idx2__` entry for one (class, column).
+    /// Lets the rebuild path scan a single index at a time instead of the
+    /// entire `__idx2__` keyspace in one allocation.
+    pub fn make_index_prefix(class: &str, column: &str) -> Vec<u8> {
+        let cb = class.as_bytes();
+        let kb = column.as_bytes();
+        let mut key = Vec::with_capacity(INDEX_PREFIX.len() + 2 + cb.len() + 2 + kb.len());
+        key.extend_from_slice(INDEX_PREFIX);
+        key.extend_from_slice(&(cb.len() as u16).to_le_bytes());
+        key.extend_from_slice(cb);
+        key.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+        key.extend_from_slice(kb);
+        key
     }
 
     /// Returns the path for a disk-based index file.
@@ -534,16 +575,21 @@ impl IndexManager {
         entries: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), onto_core::CoreError> {
         let key = (class.to_string(), column.to_string());
+        let keep_mem = self.keep_in_memory(entries.len());
 
         // In-memory tree: merge with any entries that landed after the scan
-        // started, then one sort + bottom-up rebuild.
-        if let Some(tree) = self.indexes.get_mut(&key) {
-            if tree.is_empty() {
-                tree.bulk_load(entries.to_vec());
-            } else {
-                let mut all = tree.all_entries();
-                all.extend(entries.iter().cloned());
-                tree.bulk_load(all);
+        // started, then one sort + bottom-up rebuild. Skipped entirely when the
+        // index is over the hybrid threshold — building a multi-GB B+Tree just
+        // to drop it is what OOM'd the restart path.
+        if keep_mem {
+            if let Some(tree) = self.indexes.get_mut(&key) {
+                if tree.is_empty() {
+                    tree.bulk_load(entries.to_vec());
+                } else {
+                    let mut all = tree.all_entries();
+                    all.extend(entries.iter().cloned());
+                    tree.bulk_load(all);
+                }
             }
         }
 
@@ -562,8 +608,15 @@ impl IndexManager {
             idx.flush()?;
         }
 
-        // Memory tree now holds the complete entry set.
-        self.mem_complete.insert(key);
+        if keep_mem {
+            // Memory tree now holds the complete entry set.
+            self.mem_complete.insert(key);
+        } else {
+            // Disk-only index: drop any partial memory tree so lookups take the
+            // disk path and the RAM is returned.
+            self.indexes.remove(&key);
+            self.mem_complete.remove(&key);
+        }
 
         Ok(())
     }
@@ -603,11 +656,11 @@ impl IndexManager {
                         let meta = idx.meta();
                         let key = (meta.class.clone(), meta.column.clone());
                         self.disk_indexes.insert(key.clone(), Mutex::new(idx));
-                        // Also create in-memory index (empty — disk holds the
-                        // history until rebuilt; mark incomplete so lookups merge).
-                        self.indexes
-                            .entry(key.clone())
-                            .or_insert_with(|| BPlusTree::new(&key.0, &key.1));
+                        // Do NOT seed an empty in-memory tree here. Lookups already
+                        // have a disk-only path, and hybrid mode must not hold a
+                        // placeholder that later grows into a full copy of a
+                        // multi-million-entry index. rebuild_from_entries creates
+                        // the memory tree only when the index is under the threshold.
                         self.mem_complete.remove(&key);
                     }
                     Err(e) => {
@@ -667,13 +720,18 @@ impl IndexManager {
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut index_entries = Vec::new();
 
-        // Collect keys to avoid borrow issues
-        let index_keys: Vec<(String, String)> = self
-            .indexes
-            .keys()
-            .filter(|(c, _)| c == class)
-            .cloned()
-            .collect();
+        // Collect keys to avoid borrow issues. Disk-only indexes (hybrid mode
+        // above threshold) have no in-memory tree and must still be updated.
+        let index_keys: Vec<(String, String)> = {
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for key in self.indexes.keys().chain(self.disk_indexes.keys()) {
+                if key.0 == class && seen.insert(key.clone()) {
+                    out.push(key.clone());
+                }
+            }
+            out
+        };
 
         for (idx_class, idx_col) in &index_keys {
             if let Some(val) = doc.get(idx_col.as_str()) {
@@ -745,13 +803,18 @@ impl IndexManager {
     ) -> Vec<Vec<u8>> {
         let mut removed_keys = Vec::new();
 
-        // Collect keys to avoid borrow issues
-        let index_keys: Vec<(String, String)> = self
-            .indexes
-            .keys()
-            .filter(|(c, _)| c == class)
-            .cloned()
-            .collect();
+        // Collect keys to avoid borrow issues. Disk-only indexes must be updated
+        // too — hybrid mode keeps large indexes out of RAM entirely.
+        let index_keys: Vec<(String, String)> = {
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for key in self.indexes.keys().chain(self.disk_indexes.keys()) {
+                if key.0 == class && seen.insert(key.clone()) {
+                    out.push(key.clone());
+                }
+            }
+            out
+        };
 
         for (idx_class, idx_col) in &index_keys {
             if let Some(val) = doc.get(idx_col.as_str()) {
@@ -1788,12 +1851,8 @@ impl IndexManager {
         }
 
         for ((class, column), index_entries) in per_index {
-            // Rebuild disk-based index from the LSM (source of truth).
-            //
-            // Always `bulk_load` (replace) rather than per-row `insert` into a
-            // tree that `open_disk_indexes` just loaded: insert-into-existing
-            // accumulates pages across restarts (the .idx file only grows) and
-            // is O(n log n). bulk_load is O(n), dedups, and truncates the file.
+            let expected = index_entries.len();
+            let keep_mem = self.keep_in_memory(expected);
             let disk_key = (class.clone(), column.clone());
             let path = self.index_path(&class, &column);
             let needs_disk = path.is_some();
@@ -1808,61 +1867,106 @@ impl IndexManager {
                                 "Warning: failed to create disk index {}.{}: {}",
                                 class, column, e
                             );
-                            // Still bulk-load the in-memory index even if disk fails
+                            // Fall back to memory-only even if over the hybrid
+                            // threshold — dropping the index is worse than the RAM.
                             let tree = self
                                 .indexes
                                 .entry((class.clone(), column.clone()))
                                 .or_insert_with(|| BPlusTree::new(&class, &column));
                             tree.bulk_load(index_entries);
+                            self.mem_complete.insert((class.clone(), column.clone()));
                             continue;
                         }
                     }
                 }
             }
             if self.disk_indexes.contains_key(&disk_key) {
-                let bulk_result = {
+                // Skip the full disk rewrite when the .idx already holds exactly
+                // the LSM entry set. Every restart used to re-sort + re-write
+                // multi-hundred-MB index files even when nothing changed, which
+                // both wasted minutes and spiked RAM inside bulk_load.
+                let skip_disk = {
                     let disk_idx = self.disk_indexes.get(&disk_key).expect("just checked");
                     let mut idx = disk_idx.lock().unwrap_or_else(|e| e.into_inner());
-                    idx.bulk_load(&index_entries)
+                    match idx.count_range(None, None) {
+                        Ok(cnt) => !idx.is_empty() && cnt == expected as u64,
+                        Err(_) => false,
+                    }
                 };
-                match bulk_result {
-                    Ok(()) => {
-                        if let Some(disk_idx) = self.disk_indexes.get(&disk_key) {
-                            let mut idx = disk_idx.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Err(e) = idx.flush() {
-                                eprintln!(
-                                    "Warning: disk index {}.{} flush failed: {}",
-                                    class, column, e
-                                );
+
+                let mut disk_failed = false;
+                if skip_disk {
+                    tracing::info!(
+                        table = %class,
+                        column = %column,
+                        entries = expected,
+                        "Disk index already in sync, skipping rebuild"
+                    );
+                } else {
+                    let bulk_result = {
+                        let disk_idx = self.disk_indexes.get(&disk_key).expect("just checked");
+                        let mut idx = disk_idx.lock().unwrap_or_else(|e| e.into_inner());
+                        idx.bulk_load(&index_entries)
+                    };
+                    match bulk_result {
+                        Ok(()) => {
+                            if let Some(disk_idx) = self.disk_indexes.get(&disk_key) {
+                                let mut idx = disk_idx.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Err(e) = idx.flush() {
+                                    eprintln!(
+                                        "Warning: disk index {}.{} flush failed: {}",
+                                        class, column, e
+                                    );
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        // bulk_load is all-or-nothing on a fresh tree; if it
-                        // fails the file is unreliable — drop it and fall back
-                        // to memory-only for this index.
-                        eprintln!(
-                            "Warning: disk index {}.{} bulk_load failed ({}), deleting file",
-                            class, column, e
-                        );
-                        if let Some(ref path) = path {
-                            let _ = std::fs::remove_file(path);
+                        Err(e) => {
+                            // bulk_load is all-or-nothing on a fresh tree; if it
+                            // fails the file is unreliable — drop it and fall back
+                            // to memory-only for this index.
+                            eprintln!(
+                                "Warning: disk index {}.{} bulk_load failed ({}), deleting file",
+                                class, column, e
+                            );
+                            if let Some(ref path) = path {
+                                let _ = std::fs::remove_file(path);
+                            }
+                            self.disk_indexes.remove(&disk_key);
+                            disk_failed = true;
                         }
-                        self.disk_indexes.remove(&disk_key);
                     }
+                }
+
+                if disk_failed {
+                    // Must not drop the entries — load them into memory instead.
+                    let tree = self
+                        .indexes
+                        .entry((class.clone(), column.clone()))
+                        .or_insert_with(|| BPlusTree::new(&class, &column));
+                    tree.bulk_load(index_entries);
+                    self.mem_complete.insert((class.clone(), column.clone()));
+                    continue;
                 }
             }
 
-            // Bulk load in-memory index — O(n) instead of O(n²) with individual inserts
-            tracing::info!(
-                entries = index_entries.len(),
-                "Using O(n) bulk_load for index construction"
-            );
-            let tree = self
-                .indexes
-                .entry((class.clone(), column.clone()))
-                .or_insert_with(|| BPlusTree::new(&class, &column));
-            tree.bulk_load(index_entries);
+            if keep_mem {
+                // Bulk load in-memory index — O(n) instead of O(n²) with individual inserts
+                tracing::info!(
+                    entries = expected,
+                    "Using O(n) bulk_load for index construction"
+                );
+                let tree = self
+                    .indexes
+                    .entry((class.clone(), column.clone()))
+                    .or_insert_with(|| BPlusTree::new(&class, &column));
+                tree.bulk_load(index_entries);
+                self.mem_complete.insert((class.clone(), column.clone()));
+            } else {
+                // Over the hybrid threshold: disk is authoritative. Drop any
+                // placeholder memory tree and return the RAM.
+                self.indexes.remove(&(class.clone(), column.clone()));
+                self.mem_complete.remove(&(class.clone(), column.clone()));
+            }
         }
     }
 
@@ -2231,12 +2335,153 @@ mod tests {
             .unwrap();
         assert_eq!(pks_a.len(), 131); // 0..263 odd = 131
 
-        // After bulk_load, mem_complete should be set (skips disk merge on lookup)
+        // 263 > threshold 100 → disk-backed: no in-memory tree, mem_complete unset
+        let key = ("BioAssay".to_string(), "assay_type".to_string());
+        assert!(
+            !mgr.mem_complete.contains(&key),
+            "mem_complete must NOT be set for disk-only (over-threshold) index"
+        );
+        assert!(
+            mgr.get_index("BioAssay", "assay_type").is_none(),
+            "over-threshold index must not keep an in-memory B+Tree"
+        );
+    }
+
+    #[test]
+    fn test_hybrid_small_index_kept_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("indexes");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let mut mgr = IndexManager::with_disk_storage(
+            &data_dir,
+            IndexStorageMode::Hybrid {
+                threshold_entries: 100,
+            },
+        );
+        mgr.create_index("BioAssay", "assay_type");
+
+        // 50 entries — under threshold → memory + disk
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..50)
+            .map(|i| {
+                let val = if i % 2 == 0 {
+                    IndexManager::encode_value(&json!("B"))
+                } else {
+                    IndexManager::encode_value(&json!("A"))
+                };
+                (val, format!("pk_{}", i).into_bytes())
+            })
+            .collect();
+        mgr.bulk_load_index("BioAssay", "assay_type", &entries).unwrap();
+
         let key = ("BioAssay".to_string(), "assay_type".to_string());
         assert!(
             mgr.mem_complete.contains(&key),
-            "mem_complete should be set after bulk_load"
+            "under-threshold index should be mem_complete"
         );
+        assert!(mgr.get_index("BioAssay", "assay_type").is_some());
+
+        let pks_b = mgr
+            .lookup_eq("BioAssay", "assay_type", &json!("B"))
+            .unwrap();
+        assert_eq!(pks_b.len(), 25);
+    }
+
+    #[test]
+    fn test_rebuild_skips_disk_when_in_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("indexes");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..40)
+            .map(|i| {
+                (
+                    IndexManager::encode_value(&json!(i % 5)),
+                    format!("pk_{}", i).into_bytes(),
+                )
+            })
+            .collect();
+        let lsm_entries: Vec<(Vec<u8>, Vec<u8>)> = entries
+            .iter()
+            .map(|(val, pk)| {
+                (
+                    IndexManager::make_index_key("Item", "score", val, pk),
+                    Vec::new(),
+                )
+            })
+            .collect();
+
+        // Phase 1: build
+        {
+            let mut mgr = IndexManager::with_disk_storage(
+                &data_dir,
+                IndexStorageMode::Hybrid {
+                    threshold_entries: 1000,
+                },
+            );
+            mgr.create_index("Item", "score");
+            mgr.bulk_load_index("Item", "score", &entries).unwrap();
+            mgr.flush_disk_indexes();
+        }
+
+        let idx_path = data_dir.join("Item_score.idx");
+        let mtime_before = std::fs::metadata(&idx_path).unwrap().modified().unwrap();
+
+        // Phase 2: reopen + rebuild with the same LSM entry set
+        {
+            let mut mgr = IndexManager::with_disk_storage(
+                &data_dir,
+                IndexStorageMode::Hybrid {
+                    threshold_entries: 1000,
+                },
+            );
+            mgr.open_disk_indexes().unwrap();
+            mgr.rebuild_from_entries(&lsm_entries);
+
+            // Lookups must still be correct after the skip path
+            let pks = mgr.lookup_eq("Item", "score", &json!(1)).unwrap();
+            assert_eq!(pks.len(), 8);
+        }
+
+        let mtime_after = std::fs::metadata(&idx_path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "in-sync disk index must not be rewritten by rebuild_from_entries"
+        );
+    }
+
+    #[test]
+    fn test_rebuild_disk_only_when_over_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("indexes");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // 30 entries, threshold 10 → disk-only after rebuild
+        let lsm_entries: Vec<(Vec<u8>, Vec<u8>)> = (0..30)
+            .map(|i| {
+                let val = IndexManager::encode_value(&json!(i % 3));
+                (
+                    IndexManager::make_index_key("T", "v", &val, format!("pk_{}", i).as_bytes()),
+                    Vec::new(),
+                )
+            })
+            .collect();
+
+        let mut mgr = IndexManager::with_disk_storage(
+            &data_dir,
+            IndexStorageMode::Hybrid {
+                threshold_entries: 10,
+            },
+        );
+        mgr.create_index("T", "v");
+        mgr.rebuild_from_entries(&lsm_entries);
+
+        let key = ("T".to_string(), "v".to_string());
+        assert!(!mgr.mem_complete.contains(&key));
+        assert!(mgr.get_index("T", "v").is_none(), "must not keep memory tree");
+
+        let pks = mgr.lookup_eq("T", "v", &json!(1)).unwrap();
+        assert_eq!(pks.len(), 10);
     }
 
     #[test]

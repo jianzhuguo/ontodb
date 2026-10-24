@@ -2872,70 +2872,212 @@ impl LsmEngine {
     /// and indexes are rebuilt from the source documents (JSON values are
     /// exact — no heuristic decoding needed).
     pub fn rebuild_indexes(&self) -> Result<()> {
-        let mut index_entries = self.scan_prefix(b"__idx2__")?;
-        if index_entries.is_empty() {
+        // Cheap liveness probe first — avoids materializing the whole keyspace
+        // just to discover there is nothing to do.
+        let (v2_live, _) = self.count_prefix(b"__idx2__")?;
+        if v2_live == 0 {
             // v1 → v2 migration: drop old, rebuild from documents
-            let v1_entries = self.scan_prefix(b"__idx__")?;
-            if !v1_entries.is_empty() {
-                tracing::info!(
-                    "Found {} legacy __idx__ entries, dropping and rebuilding from documents",
-                    v1_entries.len()
-                );
-                self.migrate_v1_drop_and_rebuild(v1_entries)?;
-                index_entries = self.scan_prefix(b"__idx2__")?;
-            }
-        }
-        if !index_entries.is_empty() {
-            let mut mgr = self
-                .index_manager
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            let active_keys: std::collections::HashSet<(String, String)> =
-                mgr.all_index_keys().into_iter().collect();
-
-            // Count entries that don't belong to any active index
-            let mut orphaned = 0usize;
-            for (key, _value) in &index_entries {
-                if let Some((class, column, _, _)) =
-                    crate::index::IndexManager::parse_index_key(key)
-                {
-                    if !active_keys.contains(&(class, column)) {
-                        orphaned += 1;
-                    }
+            let (v1_live, _) = self.count_prefix(b"__idx__")?;
+            if v1_live > 0 {
+                let v1_entries = self.scan_prefix(b"__idx__")?;
+                if !v1_entries.is_empty() {
+                    tracing::info!(
+                        "Found {} legacy __idx__ entries, dropping and rebuilding from documents",
+                        v1_entries.len()
+                    );
+                    self.migrate_v1_drop_and_rebuild(v1_entries)?;
+                    // fall through and rebuild the migrated __idx2__ entries
                 }
             }
+        }
 
-            // Rebuild the actual in-memory index from entries
-            mgr.rebuild_from_entries(&index_entries);
+        // Discover (class, column) pairs from key headers only — never holds
+        // the full entry set. The previous path did scan_prefix(b"__idx2__")
+        // over the entire keyspace and OOM'd at 26M+ entries.
+        let discovered = self.collect_index_columns()?;
+        if discovered.is_empty() {
+            return Ok(());
+        }
 
-            if orphaned > 0 {
+        let active_keys: std::collections::HashSet<(String, String)> = self
+            .index_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .all_index_keys()
+            .into_iter()
+            .collect();
+
+        let mut total_rebuilt = 0usize;
+        let mut orphaned = 0usize;
+
+        for (class, column) in discovered {
+            let prefix = crate::index::IndexManager::make_index_prefix(&class, &column);
+            let is_active = active_keys.contains(&(class.clone(), column.clone()));
+
+            // Count live entries without copying values. Peak RAM is one
+            // index's key set, and it is released before the next index.
+            let (live, _) = self.count_prefix(&prefix)?;
+            if live == 0 {
+                continue;
+            }
+
+            // Large disk-only index whose .idx already matches the LSM count:
+            // skip both the entry scan and the disk rewrite.
+            let keep_mem = self
+                .index_manager
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .keep_in_memory(live);
+            let disk_sync = !keep_mem
+                && self
+                    .index_manager
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .disk_in_sync(&class, &column, live);
+
+            if disk_sync {
+                tracing::info!(
+                    table = %class,
+                    column = %column,
+                    entries = live,
+                    "Disk index already in sync, skipping rebuild"
+                );
+                total_rebuilt += live;
+                if !is_active {
+                    orphaned += live;
+                    let entries = self.scan_prefix(&prefix)?;
+                    self.cleanup_orphaned_index_entries(&entries, &active_keys)?;
+                }
+                continue;
+            }
+
+            // Materialize only this index's entries, rebuild, then release.
+            let entries = self.scan_prefix(&prefix)?;
+            if entries.is_empty() {
+                continue;
+            }
+            self.index_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .rebuild_from_entries(&entries);
+            total_rebuilt += entries.len();
+
+            // Orphan cleanup AFTER rebuild so InMemory restart still sees the
+            // index (LSM `__idx2__` is its only persistence).
+            if !is_active {
+                orphaned += entries.len();
                 tracing::warn!(
-                    orphaned_index_entries = orphaned,
+                    table = %class,
+                    column = %column,
+                    orphaned_index_entries = entries.len(),
                     "Found orphaned index entries from interrupted CREATE INDEX. \
                      Writing tombstones and flushing to reclaim WAL space."
                 );
-                drop(mgr);
-                self.cleanup_orphaned_index_entries(&index_entries, &active_keys)?;
-            } else {
-                drop(mgr);
+                self.cleanup_orphaned_index_entries(&entries, &active_keys)?;
             }
+        }
 
-            tracing::info!(
-                "Rebuilt {} index entries across {} indexes ({} orphaned)",
-                index_entries.len() - orphaned,
-                self.index_manager.read().unwrap_or_else(|e| e.into_inner()).index_count(),
-                orphaned
+        if orphaned > 0 {
+            tracing::warn!(
+                orphaned_index_entries = orphaned,
+                "Orphaned index entries tombstoned"
             );
+        }
 
-            // If the WAL contains stale index entries (from interrupted CREATE INDEX),
-            // flush memtable then reset it. This reclaims the hundreds of MB of WAL space.
-            if index_entries.len() > 10000 {
-                if let Err(e) = self.reset_wal_for_index_cleanup() {
-                    tracing::warn!("Failed to reset WAL after index rebuild: {}", e);
-                }
+        tracing::info!(
+            "Rebuilt {} index entries across {} indexes ({} orphaned)",
+            total_rebuilt,
+            self.index_manager
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .index_count(),
+            orphaned
+        );
+
+        // If the WAL contains stale index entries (from interrupted CREATE INDEX),
+        // flush memtable then reset it. This reclaims the hundreds of MB of WAL space.
+        if total_rebuilt > 10000 {
+            if let Err(e) = self.reset_wal_for_index_cleanup() {
+                tracing::warn!("Failed to reset WAL after index rebuild: {}", e);
             }
         }
         Ok(())
+    }
+
+    /// Collect distinct (class, column) pairs appearing under `__idx2__`.
+    /// Walks keys only — values and entry bodies are never retained.
+    fn collect_index_columns(
+        &self,
+    ) -> Result<std::collections::HashSet<(String, String)>> {
+        self.drain_compaction_notifications();
+        let prefix: &[u8] = b"__idx2__";
+        let mut cols: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+
+        let mut note_key = |key: &[u8]| {
+            if let Some((class, column, _, _)) =
+                crate::index::IndexManager::parse_index_key(key)
+            {
+                cols.insert((class, column));
+            }
+        };
+
+        // MemTables first (newest source).
+        {
+            let ws = self.write_state.read();
+            for entry in ws.memtable.scan_prefix(prefix) {
+                note_key(&entry.key);
+            }
+            if let Some(ref imm) = ws.immutable_memtable {
+                for entry in imm.scan_prefix(prefix) {
+                    note_key(&entry.key);
+                }
+            }
+        }
+
+        // SSTables, newest-first, with the same prefix pruning as scan_prefix.
+        let sst_handles: Vec<Arc<SsTable>> = {
+            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut handles = Vec::new();
+            for level in levels.iter() {
+                for sst_info in level.iter().rev() {
+                    if sst_info.max_key.as_slice() < prefix {
+                        continue;
+                    }
+                    if !Self::prefix_may_overlap(
+                        prefix,
+                        sst_info.min_key.as_slice(),
+                        sst_info.max_key.as_slice(),
+                    ) {
+                        continue;
+                    }
+                    match cache.get(&sst_info.path) {
+                        Some(sst) => handles.push(Arc::clone(sst)),
+                        None => {
+                            let sst = Arc::new(SsTable::open(&sst_info.path)?);
+                            cache.insert(sst_info.path.clone(), Arc::clone(&sst));
+                            handles.push(sst);
+                        }
+                    }
+                }
+            }
+            handles
+        };
+
+        for sst in &sst_handles {
+            let mut iter = sst.iter()?;
+            iter.seek(prefix);
+            while iter.is_valid() {
+                if !iter.key().starts_with(prefix) {
+                    break;
+                }
+                note_key(iter.key());
+                iter.next();
+            }
+        }
+
+        drop(note_key);
+        Ok(cols)
     }
 
     /// Reset the WAL file after index rebuild cleanup.

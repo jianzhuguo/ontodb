@@ -148,6 +148,10 @@ pub struct GraphStore {
     /// Pending edge changes per relation type (for incremental updates).
     /// Each entry tracks edges that were added or removed since last full load.
     pending_changes: RwLock<HashMap<String, Vec<EdgeChange>>>,
+    /// Vertices whose incident edges for a relation have been pulled in
+    /// incrementally (lazy load). Keyed by normalized relation label.
+    /// A full `load_relation_from_lsm` supersedes this (relation becomes Loaded).
+    partial_loaded: RwLock<HashMap<String, HashSet<String>>>,
     /// Runtime caps (vertex count / cache memory).
     limits: GraphLimits,
 }
@@ -203,6 +207,7 @@ impl GraphStore {
             last_invalidation: RwLock::new(HashMap::new()),
             cache_stats: RwLock::new(CacheStats::default()),
             pending_changes: RwLock::new(HashMap::new()),
+            partial_loaded: RwLock::new(HashMap::new()),
             limits,
         }
     }
@@ -236,6 +241,7 @@ impl GraphStore {
             last_invalidation: RwLock::new(HashMap::new()),
             cache_stats: RwLock::new(CacheStats::default()),
             pending_changes: RwLock::new(HashMap::new()),
+            partial_loaded: RwLock::new(HashMap::new()),
             limits,
         }
     }
@@ -725,7 +731,10 @@ impl GraphStore {
         let id = edge.id.clone();
         let from = edge.from.clone();
         let to = edge.to.clone();
-        let label = edge.label.clone();
+        // Normalize so `treats` and `sembio.treats` share one label index entry.
+        let label = normalize_relation_label(&edge.label);
+        let mut edge = edge;
+        edge.label = label.clone();
 
         // Hold vertices read lock for the entire in-memory update phase.
         // This prevents a concurrent delete_vertex from removing the vertex
@@ -929,10 +938,12 @@ impl GraphStore {
 
     /// Get all edge IDs with a given label.
     /// Uses the edge label index for O(1) lookup (P0 optimization).
+    /// Accepts both `treats` and `sembio.treats`.
     pub fn get_edge_ids_by_label(&self, label: &str) -> Vec<String> {
+        let label = normalize_relation_label(label);
         self.edge_label_index
             .read()
-            .get(label)
+            .get(&label)
             .map(|set| set.iter().cloned().collect())
             .unwrap_or_default()
     }
@@ -999,12 +1010,13 @@ impl GraphStore {
     /// identity comes from the adjacency index (`neighbor_idx → id`), so edges
     /// themselves are never materialized.
     pub fn get_out_neighbor_ids_by_label(&self, vertex_id: &str, label: &str) -> Vec<String> {
+        let label = normalize_relation_label(label);
         let idx = match self.id_to_idx.read().get(vertex_id).copied() {
             Some(idx) => idx as usize,
             None => return Vec::new(),
         };
         let eli = self.edge_label_index.read();
-        let Some(label_edges) = eli.get(label) else {
+        let Some(label_edges) = eli.get(&label) else {
             return Vec::new();
         };
         let adj_out = self.adj_out.read();
@@ -1026,12 +1038,13 @@ impl GraphStore {
     /// Neighbor IDs pointing at `vertex_id` via in-edges with `label`.
     /// Same complexity contract as [`Self::get_out_neighbor_ids_by_label`].
     pub fn get_in_neighbor_ids_by_label(&self, vertex_id: &str, label: &str) -> Vec<String> {
+        let label = normalize_relation_label(label);
         let idx = match self.id_to_idx.read().get(vertex_id).copied() {
             Some(idx) => idx as usize,
             None => return Vec::new(),
         };
         let eli = self.edge_label_index.read();
-        let Some(label_edges) = eli.get(label) else {
+        let Some(label_edges) = eli.get(&label) else {
             return Vec::new();
         };
         let adj_in = self.adj_in.read();
@@ -1534,9 +1547,10 @@ impl GraphStore {
             }
         };
 
+        let edge_label = edge_label.map(normalize_relation_label);
         edges
             .iter()
-            .filter(|e| edge_label.is_none_or(|l| e.label == l))
+            .filter(|e| edge_label.as_deref().is_none_or(|l| e.label == l))
             .filter_map(|e| {
                 let target_id = match direction {
                     Direction::In => &e.from,
@@ -1569,8 +1583,9 @@ impl GraphStore {
 
     /// Check if a relationship type is loaded and ready to use.
     pub fn is_relation_loaded(&self, relation_type: &str) -> bool {
+        let relation_type = normalize_relation_label(relation_type);
         self.cache_state.read()
-            .get(relation_type)
+            .get(&relation_type)
             .map(|e| e.status == CacheStatus::Loaded)
             .unwrap_or(false)
     }
@@ -1578,6 +1593,7 @@ impl GraphStore {
     /// Mark a relationship type as invalidated (called on write operations).
     /// Records the invalidation timestamp for debounce.
     pub fn invalidate_relation(&self, relation_type: &str) {
+        let relation_type = normalize_relation_label(relation_type);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1585,13 +1601,14 @@ impl GraphStore {
 
         {
             let mut state = self.cache_state.write();
-            if let Some(entry) = state.get_mut(relation_type) {
+            if let Some(entry) = state.get_mut(&relation_type) {
                 entry.status = CacheStatus::Invalidated;
             }
         }
+        self.partial_loaded.write().remove(&relation_type);
 
         // Record invalidation timestamp for debounce
-        self.last_invalidation.write().insert(relation_type.to_string(), now);
+        self.last_invalidation.write().insert(relation_type.clone(), now);
 
         // Track statistics
         self.cache_stats.write().invalidations += 1;
@@ -1600,21 +1617,23 @@ impl GraphStore {
     /// Check if a relation type is in the cooldown period after invalidation.
     /// Returns true if the relation was recently invalidated and shouldn't be rebuilt yet.
     pub fn is_in_cooldown(&self, relation_type: &str) -> bool {
+        let relation_type = normalize_relation_label(relation_type);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
         self.last_invalidation.read()
-            .get(relation_type)
+            .get(&relation_type)
             .map(|&last| now.saturating_sub(last) < INVALIDATION_COOLDOWN_SECS)
             .unwrap_or(false)
     }
 
     /// Get cache status for a relationship type.
     pub fn cache_status(&self, relation_type: &str) -> CacheEntry {
+        let relation_type = normalize_relation_label(relation_type);
         self.cache_state.read()
-            .get(relation_type)
+            .get(&relation_type)
             .cloned()
             .unwrap_or_else(CacheEntry::not_loaded)
     }
@@ -1685,8 +1704,9 @@ impl GraphStore {
 
     /// Get or create a loading lock for a relation type.
     fn get_loading_lock(&self, relation_type: &str) -> Arc<parking_lot::Mutex<()>> {
+        let relation_type = normalize_relation_label(relation_type);
         let mut locks = self.loading_locks.lock();
-        locks.entry(relation_type.to_string())
+        locks.entry(relation_type)
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone()
     }
@@ -1701,14 +1721,15 @@ impl GraphStore {
     /// 4. Creates edges in the graph
     /// 5. Marks status as Loaded (or Failed on error/timeout/OOM)
     pub fn load_relation_from_lsm(&self, relation_type: &str) -> Result<usize, GraphError> {
+        let relation_type = normalize_relation_label(relation_type);
         let engine = self.engine.as_ref()
             .ok_or_else(|| GraphError::StorageError("No LSM engine configured".to_string()))?;
 
-        let lock = self.get_loading_lock(relation_type);
+        let lock = self.get_loading_lock(&relation_type);
         let _guard = lock.lock();
 
         // Check if already loaded (cache hit)
-        if self.is_relation_loaded(relation_type) {
+        if self.is_relation_loaded(&relation_type) {
             self.record_cache_hit();
             return Ok(0); // Already loaded
         }
@@ -1717,7 +1738,7 @@ impl GraphStore {
         self.record_cache_miss();
 
         // Check cooldown: don't rebuild if recently invalidated
-        if self.is_in_cooldown(relation_type) {
+        if self.is_in_cooldown(&relation_type) {
             tracing::debug!(
                 relation = relation_type,
                 "Skipping rebuild: in cooldown period after invalidation"
@@ -1731,7 +1752,7 @@ impl GraphStore {
         // Mark as loading
         {
             let mut state = self.cache_state.write();
-            state.insert(relation_type.to_string(), CacheEntry {
+            state.insert(relation_type.clone(), CacheEntry {
                 status: CacheStatus::Loading,
                 ..CacheEntry::not_loaded()
             });
@@ -1739,13 +1760,13 @@ impl GraphStore {
 
         // Execute load with timeout protection
         let load_start = std::time::Instant::now();
-        let result = self.do_load_relation(engine, relation_type, &load_start);
+        let result = self.do_load_relation(engine, &relation_type, &load_start);
 
         match result {
             Ok((edge_count, skipped)) => {
                 let elapsed = load_start.elapsed();
                 self.record_load_time(elapsed.as_micros() as u64);
-                self.mark_loaded(relation_type, edge_count);
+                self.mark_loaded(&relation_type, edge_count);
                 tracing::info!(
                     relation = relation_type,
                     edges = edge_count,
@@ -1756,7 +1777,7 @@ impl GraphStore {
                 Ok(edge_count)
             }
             Err(e) => {
-                self.mark_failed(relation_type);
+                self.mark_failed(&relation_type);
                 tracing::error!(
                     relation = relation_type,
                     error = %e,
@@ -1774,8 +1795,10 @@ impl GraphStore {
         relation_type: &str,
         load_start: &std::time::Instant,
     ) -> Result<(usize, usize), GraphError> {
-        // Scan LSM for the relationship table
-        let prefix = format!("sembio.{}::", relation_type);
+        // Scan LSM for the relationship table. Accepts both `treats` and `sembio.treats`.
+        let label = normalize_relation_label(relation_type);
+        let table = relation_table_name(relation_type);
+        let prefix = format!("{}::", table);
         let entries = engine.scan_prefix(prefix.as_bytes())
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
 
@@ -1788,7 +1811,7 @@ impl GraphStore {
             if load_start.elapsed().as_secs() >= LOAD_TIMEOUT_SECS {
                 return Err(GraphError::StorageError(format!(
                     "Loading relation '{}' timed out after {}s (loaded {} edges so far)",
-                    relation_type, LOAD_TIMEOUT_SECS, edge_count
+                    label, LOAD_TIMEOUT_SECS, edge_count
                 )));
             }
 
@@ -1797,7 +1820,7 @@ impl GraphStore {
             if estimated_memory >= self.limits.max_cache_memory_bytes {
                 return Err(GraphError::StorageError(format!(
                     "Loading relation '{}' would exceed memory limit ({} edges, ~{}MB)",
-                    relation_type, edge_count, estimated_memory / (1024 * 1024)
+                    label, edge_count, estimated_memory / (1024 * 1024)
                 )));
             }
 
@@ -1821,9 +1844,9 @@ impl GraphStore {
                     let _ = self.add_vertex(Vertex::new(target, labels));
                 }
 
-                // Create edge
-                let edge_id = format!("{}->{}::{}", source, target, relation_type);
-                let edge = Edge::new(&edge_id, source, target, relation_type);
+                // Create edge (label is always the bare form, e.g. `treats`)
+                let edge_id = format!("{}->{}::{}", source, target, label);
+                let edge = Edge::new(&edge_id, source, target, &label);
                 if self.add_edge(edge).is_ok() {
                     edge_count += 1;
                     batch_count += 1;
@@ -1833,7 +1856,7 @@ impl GraphStore {
                         batch_count = 0;
                         // Brief yield point - in production this would be async yield
                         tracing::debug!(
-                            relation = relation_type,
+                            relation = label,
                             loaded_so_far = edge_count,
                             "Loaded batch"
                         );
@@ -1845,8 +1868,131 @@ impl GraphStore {
         Ok((edge_count, skipped))
     }
 
+    /// True when this vertex's incident edges for `relation_type` are already
+    /// in the store (either via full relation load or a prior lazy load).
+    pub fn is_vertex_edges_loaded(&self, relation_type: &str, vertex_id: &str) -> bool {
+        let label = normalize_relation_label(relation_type);
+        if self.is_relation_loaded(&label) {
+            return true;
+        }
+        self.partial_loaded
+            .read()
+            .get(&label)
+            .map(|s| s.contains(vertex_id))
+            .unwrap_or(false)
+    }
+
+    /// Lazily load only the edges incident to `vertex_id` for `relation_type`.
+    ///
+    /// Unlike [`load_relation_from_lsm`] this does **not** mark the relation as
+    /// fully Loaded — other vertices stay cold until requested. Intended for
+    /// pinned-start MATCH / TRAVERSE / SHORTEST PATH on large relation tables.
+    ///
+    /// Fast path uses secondary indexes on `source`/`target` when present;
+    /// otherwise falls back to a filtered relation scan (no bulk edge inserts).
+    pub fn ensure_vertex_edges(
+        &self,
+        engine: &onto_storage::LsmEngine,
+        relation_type: &str,
+        vertex_id: &str,
+    ) -> Result<usize, GraphError> {
+        let label = normalize_relation_label(relation_type);
+        if self.is_relation_loaded(&label) || self.is_vertex_edges_loaded(&label, vertex_id) {
+            return Ok(0);
+        }
+
+        let lock = self.get_loading_lock(&format!("{}#{}", label, vertex_id));
+        let _guard = lock.lock();
+
+        if self.is_vertex_edges_loaded(&label, vertex_id) {
+            return Ok(0);
+        }
+
+        let table = relation_table_name(relation_type);
+        let mut docs: Vec<std::collections::HashMap<String, serde_json::Value>> = Vec::new();
+        let mut used_index = false;
+
+        // Fast path: index on source or target
+        for col in ["source", "target"] {
+            if !engine.has_index(&table, col) {
+                continue;
+            }
+            let val = serde_json::Value::String(vertex_id.to_string());
+            let pkeys = engine
+                .index_manager()
+                .read()
+                .ok()
+                .and_then(|m| m.lookup_eq_read(&table, col, &val));
+            let Some(pkeys) = pkeys else { continue };
+            used_index = true;
+            for pk in pkeys {
+                if let Ok(Some(bytes)) = engine.get(&pk) {
+                    if let Some(doc) = parse_relation_doc(&bytes) {
+                        docs.push(doc);
+                    }
+                }
+            }
+        }
+
+        // Fallback: filtered scan of the relation table (parse only, no bulk insert)
+        if !used_index {
+            let prefix = format!("{}::", table);
+            let entries = engine
+                .scan_prefix(prefix.as_bytes())
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            for (_key, value) in &entries {
+                if let Some(doc) = parse_relation_doc(value) {
+                    let source = doc.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                    let target = doc.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                    if source == vertex_id || target == vertex_id {
+                        docs.push(doc);
+                    }
+                }
+            }
+        }
+
+        let mut loaded = 0usize;
+        for doc in docs {
+            let source = doc.get("source").and_then(|v| v.as_str()).unwrap_or("");
+            let target = doc.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            if source.is_empty() || target.is_empty() {
+                continue;
+            }
+            if self.get_vertex(source).is_none() {
+                let labels = extract_labels_from_id(source);
+                let _ = self.add_vertex(Vertex::new(source, labels));
+            }
+            if self.get_vertex(target).is_none() {
+                let labels = extract_labels_from_id(target);
+                let _ = self.add_vertex(Vertex::new(target, labels));
+            }
+            let edge_id = format!("{}->{}::{}", source, target, label);
+            let edge = Edge::new(&edge_id, source, target, &label);
+            if self.add_edge(edge).is_ok() {
+                loaded += 1;
+            }
+        }
+
+        self.partial_loaded
+            .write()
+            .entry(label)
+            .or_default()
+            .insert(vertex_id.to_string());
+
+        self.cache_stats.write().misses += 1;
+        tracing::debug!(
+            relation = relation_type,
+            vertex = vertex_id,
+            edges = loaded,
+            indexed = used_index,
+            "Lazy-loaded vertex edges into graph store"
+        );
+        Ok(loaded)
+    }
+
     /// Mark a relation type as successfully loaded.
     pub fn mark_loaded(&self, relation_type: &str, edge_count: usize) {
+        let relation_type = normalize_relation_label(relation_type);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1859,6 +2005,8 @@ impl GraphStore {
             memory_bytes: edge_count * 200,
             loaded_at_secs: now,
         });
+        // Full load supersedes any partial per-vertex tracking.
+        self.partial_loaded.write().remove(&relation_type);
 
         // Track statistics
         self.cache_stats.write().loads += 1;
@@ -1866,6 +2014,7 @@ impl GraphStore {
 
     /// Mark a relation type as failed (timeout, OOM, etc.).
     pub fn mark_failed(&self, relation_type: &str) {
+        let relation_type = normalize_relation_label(relation_type);
         let mut state = self.cache_state.write();
         state.insert(relation_type.to_string(), CacheEntry {
             status: CacheStatus::Failed,
@@ -1878,6 +2027,7 @@ impl GraphStore {
 
     /// Clear all loaded edges for a relationship type.
     pub fn unload_relation(&self, relation_type: &str) {
+        let relation_type = normalize_relation_label(relation_type);
         let edge_ids: Vec<String> = self.edges.read()
             .iter()
             .filter(|(_, e)| e.label == relation_type)
@@ -1888,6 +2038,7 @@ impl GraphStore {
             let _ = self.delete_edge(&id);
         }
 
+        self.partial_loaded.write().remove(&relation_type);
         let mut state = self.cache_state.write();
         state.insert(relation_type.to_string(), CacheEntry::not_loaded());
     }
@@ -1965,8 +2116,9 @@ impl GraphStore {
     /// Record an edge change for incremental cache update.
     /// Called when a relation edge is added or removed.
     pub fn record_edge_change(&self, relation_type: &str, change: EdgeChange) {
+        let relation_type = normalize_relation_label(relation_type);
         let mut changes = self.pending_changes.write();
-        changes.entry(relation_type.to_string())
+        changes.entry(relation_type)
             .or_default()
             .push(change);
     }
@@ -1974,9 +2126,10 @@ impl GraphStore {
     /// Apply pending changes incrementally instead of full reload.
     /// Returns the number of changes applied.
     pub fn apply_pending_changes(&self, relation_type: &str) -> usize {
+        let relation_type = normalize_relation_label(relation_type);
         let changes: Vec<EdgeChange> = {
             let mut pending = self.pending_changes.write();
-            pending.remove(relation_type).unwrap_or_default()
+            pending.remove(&relation_type).unwrap_or_default()
         };
 
         if changes.is_empty() {
@@ -1997,7 +2150,7 @@ impl GraphStore {
                         let _ = self.add_vertex(Vertex::new(target, labels));
                     }
                     // Add edge
-                    let edge = Edge::new(edge_id, source, target, relation_type);
+                    let edge = Edge::new(edge_id, source, target, &relation_type);
                     if self.add_edge(edge).is_ok() {
                         applied += 1;
                     }
@@ -2013,7 +2166,7 @@ impl GraphStore {
         // Update cache entry stats
         if applied > 0 {
             let mut state = self.cache_state.write();
-            if let Some(entry) = state.get_mut(relation_type) {
+            if let Some(entry) = state.get_mut(&relation_type) {
                 entry.edge_count = self.edges.read().values()
                     .filter(|e| e.label == relation_type)
                     .count();
@@ -2032,16 +2185,18 @@ impl GraphStore {
 
     /// Check if there are pending changes for a relation type.
     pub fn has_pending_changes(&self, relation_type: &str) -> bool {
+        let relation_type = normalize_relation_label(relation_type);
         self.pending_changes.read()
-            .get(relation_type)
+            .get(&relation_type)
             .map(|changes| !changes.is_empty())
             .unwrap_or(false)
     }
 
     /// Get the number of pending changes for a relation type.
     pub fn pending_changes_count(&self, relation_type: &str) -> usize {
+        let relation_type = normalize_relation_label(relation_type);
         self.pending_changes.read()
-            .get(relation_type)
+            .get(&relation_type)
             .map(|changes| changes.len())
             .unwrap_or(0)
     }
@@ -2054,6 +2209,27 @@ fn extract_labels_from_id(id: &str) -> Vec<String> {
         vec![parts[1].to_string()]
     } else {
         vec![]
+    }
+}
+
+/// Canonical edge label for a relation type.
+/// Accepts both the bare label (`treats`) and the qualified class (`sembio.treats`)
+/// so callers don't have to know which form the cache uses.
+pub fn normalize_relation_label(relation_type: &str) -> String {
+    relation_type
+        .rsplit_once('.')
+        .map(|(_, tail)| tail.to_string())
+        .unwrap_or_else(|| relation_type.to_string())
+}
+
+/// LSM relation-table name for a relation type.
+/// Bare labels live under the `sembio` namespace (`treats` → `sembio.treats`);
+/// already-qualified names are kept as-is.
+pub fn relation_table_name(relation_type: &str) -> String {
+    if relation_type.contains('.') {
+        relation_type.to_string()
+    } else {
+        format!("sembio.{}", relation_type)
     }
 }
 
@@ -2425,6 +2601,48 @@ mod tests {
 
         let categories = store.get_entities_by_class("Category");
         assert_eq!(categories.len(), 1);
+    }
+
+    #[test]
+    fn test_normalize_relation_label_accepts_both_forms() {
+        assert_eq!(normalize_relation_label("treats"), "treats");
+        assert_eq!(normalize_relation_label("sembio.treats"), "treats");
+        assert_eq!(normalize_relation_label("other.associated_with"), "associated_with");
+        assert_eq!(relation_table_name("treats"), "sembio.treats");
+        assert_eq!(relation_table_name("sembio.treats"), "sembio.treats");
+    }
+
+    #[test]
+    fn test_relation_cache_key_is_form_insensitive() {
+        let store = GraphStore::new();
+        store.mark_loaded("treats", 3);
+        assert!(store.is_relation_loaded("treats"));
+        assert!(store.is_relation_loaded("sembio.treats"));
+
+        store.invalidate_relation("sembio.treats");
+        assert!(!store.is_relation_loaded("treats"));
+        assert!(!store.is_relation_loaded("sembio.treats"));
+        assert!(store.is_in_cooldown("treats"));
+        assert!(store.is_in_cooldown("sembio.treats"));
+    }
+
+    #[test]
+    fn test_edge_label_index_accepts_both_forms() {
+        let store = GraphStore::new();
+        store
+            .add_vertex(Vertex::new("a", vec!["Drug".to_string()]))
+            .unwrap();
+        store
+            .add_vertex(Vertex::new("b", vec!["Disease".to_string()]))
+            .unwrap();
+        store
+            .add_edge(Edge::new("e1", "a", "b", "sembio.treats"))
+            .unwrap();
+
+        assert_eq!(store.get_edge_ids_by_label("treats").len(), 1);
+        assert_eq!(store.get_edge_ids_by_label("sembio.treats").len(), 1);
+        assert_eq!(store.get_out_neighbor_ids_by_label("a", "treats"), vec!["b"]);
+        assert_eq!(store.get_out_neighbor_ids_by_label("a", "sembio.treats"), vec!["b"]);
     }
 
     // ── Persistence Tests ──

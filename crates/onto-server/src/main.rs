@@ -368,10 +368,19 @@ fn main() -> Result<()> {
         .ok();
 
     let ontology_store = OntologyStore::new(Arc::clone(&engine));
-    let graph_store = Arc::new(onto_graph::GraphStore::with_limits(onto_graph::GraphLimits {
-        max_vertices: args.graph_max_vertices,
-        max_cache_memory_bytes: args.graph_max_cache_mb.saturating_mul(1024 * 1024),
-    }));
+    // Wire the LSM engine into GraphStore: without it `load_relation_from_lsm`
+    // fails ("No LSM engine configured") and every GRAPH query sees an empty
+    // cache / degrades to JOIN.
+    let graph_store = Arc::new(onto_graph::GraphStore::with_engine_and_limits(
+        Arc::clone(&engine),
+        onto_graph::GraphLimits {
+            max_vertices: args.graph_max_vertices,
+            max_cache_memory_bytes: args.graph_max_cache_mb.saturating_mul(1024 * 1024),
+        },
+    ));
+    if let Err(e) = graph_store.load_from_engine() {
+        tracing::warn!("graph load_from_engine failed: {}", e);
+    }
     let triple_store = Arc::new(onto_ontology::TripleStore::new(Arc::clone(&engine)));
 
     // Initialize sharding if enabled

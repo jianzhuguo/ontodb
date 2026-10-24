@@ -4432,7 +4432,7 @@ impl QueryParser {
 
     /// Parse GRAPH SHORTEST PATH FROM <id1> TO <id2> [MAX DEPTH <n>]
     fn parse_graph_shortest_path(input: &str) -> Result<QueryAst> {
-        let rest = input[21..].trim(); // Skip "GRAPH SHORTEST PATH"
+        let rest = input[20..].trim(); // Skip "GRAPH SHORTEST PATH"
         let rest = rest
             .strip_prefix("FROM")
             .ok_or_else(|| CoreError::InvalidArgument("expected FROM".to_string()))?

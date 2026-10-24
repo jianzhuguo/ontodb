@@ -95,7 +95,9 @@ pub use analytics::{
 };
 pub use error::GraphError;
 pub use model::{Edge, GraphElement, PropValue, PropertyMap, Vertex};
-pub use store::{CacheStats, EdgeChange, GraphLimits, GraphStore};
+pub use store::{
+    normalize_relation_label, relation_table_name, CacheStats, EdgeChange, GraphLimits, GraphStore,
+};
 pub use traversal::{Direction, TraversalEngine, TraversalPath, TraversalResult};
 
 // Enterprise-only exports

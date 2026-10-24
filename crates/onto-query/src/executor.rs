@@ -9469,6 +9469,22 @@ impl QueryExecutor {
             }
             let real_col = &col[prefix.len()..];
 
+            // `var.id = 'sembio::Drug::X'` — entity id is the vertex key; no
+            // secondary index required.
+            if real_col == "id" {
+                if let LiteralValue::String(s) = val {
+                    if let Some(vertex) = graph.get_vertex(s) {
+                        return Some(vec![vertex]);
+                    }
+                    if let Some(eid) = onto_core::EntityId::from_str(s) {
+                        if let Some(vertex) = graph.get_entity_vertex(&eid) {
+                            return Some(vec![vertex]);
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Check if the relational table has an index on this column
             if !engine.has_index(label, real_col) {
                 continue;
@@ -9514,6 +9530,37 @@ impl QueryExecutor {
         }
     }
 
+    /// Extract `var.id = 'entity-id'` (or `var = 'entity-id'`) from a filter.
+    fn extract_graph_eq_entity_id(filter: &Option<FilterExpr>, var: &str) -> Option<String> {
+        let f = filter.as_ref()?;
+        let mut eq_preds: Vec<(&str, &LiteralValue)> = Vec::new();
+        Self::collect_eq_predicates(f, &mut eq_preds);
+        let prefix = format!("{}.", var);
+        for (col, val) in &eq_preds {
+            let col = *col;
+            let matches_id = col == var
+                || (col.starts_with(&prefix) && &col[prefix.len()..] == "id");
+            if !matches_id {
+                continue;
+            }
+            if let LiteralValue::String(s) = val {
+                if !s.is_empty() {
+                    return Some(s.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// True when the pattern's first node is pinned to a single entity id.
+    fn graph_start_is_pinned(pattern: &crate::parser::GraphPattern, filter: &Option<FilterExpr>) -> bool {
+        pattern
+            .nodes
+            .first()
+            .map(|n| Self::extract_graph_eq_entity_id(filter, &n.variable).is_some())
+            .unwrap_or(false)
+    }
+
     /// Compute a hash for a GRAPH MATCH query (for caching).
     fn hash_graph_match(
         pattern: &crate::parser::GraphPattern,
@@ -9536,6 +9583,23 @@ impl QueryExecutor {
     /// A hop is an edge in the pattern. 0 edges = 0 hops (single node).
     fn count_graph_hops(pattern: &crate::parser::GraphPattern) -> usize {
         pattern.edges.len()
+    }
+
+    /// Default row cap for GRAPH MATCH without an explicit LIMIT.
+    /// Unbounded patterns on million-edge relations would otherwise
+    /// materialize the full result set and hit slow-query / OOM.
+    const MAX_GRAPH_MATCH_ROWS: usize = 10_000;
+
+    /// Truncate a GRAPH MATCH result to the safety cap; warn when hit.
+    fn cap_graph_match_rows(rows: &mut Vec<Map<String, Value>>) {
+        if rows.len() > Self::MAX_GRAPH_MATCH_ROWS {
+            tracing::warn!(
+                rows = rows.len(),
+                cap = Self::MAX_GRAPH_MATCH_ROWS,
+                "GRAPH MATCH result truncated to safety cap; add a filter or lower hop count"
+            );
+            rows.truncate(Self::MAX_GRAPH_MATCH_ROWS);
+        }
     }
 
     /// Extract relation types (edge labels) from a GRAPH MATCH pattern.
@@ -9609,29 +9673,49 @@ impl QueryExecutor {
 
         let hops = Self::count_graph_hops(pattern);
         let relation_types = Self::extract_relation_types(pattern);
+        let start_pinned = Self::graph_start_is_pinned(pattern, filter);
 
         // Routing decision
-        let result = if hops <= 2 {
-            // 1-2 hops: try graph store first (fast if cache loaded), fallback to JOIN
+        // 1. Start vertex pinned (`d.id = X`) → graph hop from that vertex (ms-level).
+        // 2. Relation cache already warm → in-memory graph match.
+        // 3. Otherwise 1-2 hops fall back to the relation-driven LSM JOIN
+        //    (full relation scan; correct but slower).
+        let result = if start_pinned {
             if let Some(ref graph) = self.graph {
-                // Check if all relation types are loaded in graph cache
-                let all_loaded = relation_types.iter()
-                    .all(|rt| graph.is_relation_loaded(rt));
-
-                if all_loaded {
-                    tracing::debug!(hops, "GRAPH MATCH: using graph store (cache hit)");
-                    self.execute_graph_match_on_graph(engine, pattern, filter, returns)
-                } else {
-                    // Cache miss: translate to JOIN via LSM
-                    tracing::debug!(hops, "GRAPH MATCH: degrading to JOIN (LSM)");
-                    if let Some(ref graph) = self.graph {
-                        graph.record_degraded_query();
+                // Lazy: only pull incident edges for the pinned start vertex
+                // (and its pattern hops) — never the full relation table.
+                if let Some(first) = pattern.nodes.first() {
+                    if let Some(vid) = Self::extract_graph_eq_entity_id(filter, &first.variable) {
+                        for rel in &relation_types {
+                            let _ = graph.ensure_vertex_edges(engine, rel, &vid);
+                        }
                     }
-                    self.execute_graph_match_as_join(engine, pattern, filter, returns)
                 }
+                tracing::debug!(hops, "GRAPH MATCH: using graph store (pinned start, lazy)");
+                self.execute_graph_match_on_graph(engine, pattern, filter, returns)
             } else {
-                // No graph store: translate to JOIN via LSM
-                tracing::debug!(hops, "GRAPH MATCH: degrading to JOIN (LSM)");
+                tracing::debug!(hops, "GRAPH MATCH: using LSM JOIN (no graph store)");
+                self.execute_graph_match_as_join(engine, pattern, filter, returns)
+            }
+        } else if hops <= 2 {
+            let cache_ready = self
+                .graph
+                .as_ref()
+                .map(|g| relation_types.iter().all(|rt| g.is_relation_loaded(rt)))
+                .unwrap_or(false);
+
+            if cache_ready {
+                if let Some(ref graph) = self.graph {
+                    // Keep stats honest: this is a graph hit, not a degrade.
+                    let _ = graph;
+                }
+                tracing::debug!(hops, "GRAPH MATCH: using graph store (cache hit)");
+                self.execute_graph_match_on_graph(engine, pattern, filter, returns)
+            } else {
+                if let Some(ref graph) = self.graph {
+                    graph.record_degraded_query();
+                }
+                tracing::debug!(hops, "GRAPH MATCH: using LSM JOIN (cache miss)");
                 self.execute_graph_match_as_join(engine, pattern, filter, returns)
             }
         } else {
@@ -9666,7 +9750,11 @@ impl QueryExecutor {
         tracing::info!(
             hops,
             elapsed_ms = elapsed.as_millis(),
-            route = if hops <= 2 { "join_or_graph" } else { "graph" },
+            route = if start_pinned || hops > 2 {
+                "graph"
+            } else {
+                "join"
+            },
             "GRAPH MATCH completed"
         );
 
@@ -9717,9 +9805,16 @@ impl QueryExecutor {
         let traversal = TraversalEngine::new(graph.as_ref());
         let mut result_rows: Vec<Map<String, Value>> = Vec::new();
 
-        // Get starting vertices �?with subclass expansion if ontology is available
+        // Get starting vertices — with subclass expansion if ontology is available
         let first_node = &nodes[0];
-        let start_vertices = if let Some(label) = &first_node.label {
+        let pinned_start = Self::extract_graph_eq_entity_id(filter, &first_node.variable);
+        let start_vertices = if let Some(vid) = &pinned_start {
+            // Pinned start: never fall back to a full label scan.
+            match graph.get_vertex(vid) {
+                Some(v) => vec![v],
+                None => Vec::new(),
+            }
+        } else if let Some(label) = &first_node.label {
             // #9 optimization: if the filter has an Eq predicate on an indexed column
             // for the first node's variable, use the relational index to narrow the
             // starting set instead of loading all vertices by label.
@@ -9879,6 +9974,15 @@ impl QueryExecutor {
                         // Traverse all effective labels
                         let mut all_neighbors = Vec::new();
                         for (lbl, dir) in effective_labels.iter().zip(effective_directions.iter()) {
+                            // Lazy: pull this vertex's incident edges if not yet cached.
+                            if let Err(e) = graph.ensure_vertex_edges(engine, lbl, &source_id) {
+                                tracing::debug!(
+                                    relation = lbl,
+                                    vertex = source_id,
+                                    error = %e,
+                                    "lazy vertex edge load failed"
+                                );
+                            }
                             let neighbors = traversal
                                 .hop(&source_id, *dir, Some(lbl.as_str()), None, None)
                                 .unwrap_or_default();
@@ -9942,6 +10046,9 @@ impl QueryExecutor {
                 }
 
                 result_rows.extend(current_bindings);
+                if result_rows.len() >= Self::MAX_GRAPH_MATCH_ROWS {
+                    break;
+                }
             }
         }
 
@@ -9949,6 +10056,7 @@ impl QueryExecutor {
         if let Some(f) = filter {
             result_rows.retain(|row| Self::eval_graph_filter(row, f));
         }
+        Self::cap_graph_match_rows(&mut result_rows);
 
         // Apply RETURN projection
         if !returns.is_empty() {
@@ -9976,19 +10084,121 @@ impl QueryExecutor {
         }
     }
 
-    /// Execute 1-2 hop GRAPH MATCH by translating to JOIN queries (LSM path).
+    /// Class label embedded in an entity id: `sembio::Drug::CHEMBL25` → `Drug`.
+    fn graph_entity_id_label(entity_id: &str) -> Option<&str> {
+        let parts: Vec<&str> = entity_id.split("::").collect();
+        if parts.len() >= 3 {
+            Some(parts[1])
+        } else if parts.len() == 2 {
+            Some(parts[0])
+        } else {
+            None
+        }
+    }
+
+    /// True when `entity_id`'s embedded class matches `label` (`Drug` or `sembio.Drug`).
+    fn graph_entity_id_matches_label(entity_id: &str, label: &str) -> bool {
+        if label.is_empty() {
+            return true;
+        }
+        let bare = label.rsplit('.').next().unwrap_or(label);
+        match Self::graph_entity_id_label(entity_id) {
+            Some(l) => l == label || l == bare,
+            None => false,
+        }
+    }
+
+    /// Entity identity used to join relation `source`/`target` columns.
+    /// Relation rows store entity ids (`sembio::Drug::CHEMBL25`), which match
+    /// the entity's `id` column — not the hash `__pk__`.
+    fn graph_entity_key(row: &Map<String, Value>) -> Option<String> {
+        for key in ["id", "__pk__"] {
+            if let Some(Value::String(s)) = row.get(key) {
+                if !s.is_empty() {
+                    return Some(s.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a GRAPH MATCH node/relation label to concrete class table names.
+    /// Bare labels (`Drug`, `treats`) map to the `sembio` namespace used by real data.
+    fn resolve_graph_class_candidates(label: &str) -> Vec<String> {
+        if label.is_empty() {
+            return Vec::new();
+        }
+        if label.contains('.') {
+            return vec![label.to_string()];
+        }
+        vec![format!("sembio.{}", label), label.to_string()]
+    }
+
+    /// Scan relation rows for a label, trying qualified then bare table names.
+    fn scan_graph_relation_rows(
+        &self,
+        engine: &LsmEngine,
+        relation_label: &str,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let mut empty = Vec::new();
+        for rel_class in Self::resolve_graph_class_candidates(relation_label) {
+            let rel_scan_plan = self.build_scan_plan(&rel_class, &None)?;
+            if let QueryResult::Rows(rows) = self.execute_plan(&rel_scan_plan, engine)? {
+                if !rows.is_empty() {
+                    return Ok(rows);
+                }
+                empty = rows;
+            }
+        }
+        Ok(empty)
+    }
+
+    /// Does this pattern need full entity rows (beyond the bound `var.id`)?
+    fn graph_match_needs_entity_props(
+        nodes: &[crate::parser::GraphNode],
+        filter: &Option<FilterExpr>,
+        returns: &[String],
+    ) -> bool {
+        let vars: Vec<&str> = nodes.iter().map(|n| n.variable.as_str()).collect();
+        for ret in returns {
+            let t = ret.trim();
+            // `d.name` / `dis.id` — anything except `var.id` or bare `var`
+            if let Some((var, field)) = t.split_once('.') {
+                if vars.contains(&var) && field != "id" {
+                    return true;
+                }
+            }
+        }
+        fn filter_uses_prop(expr: &FilterExpr, vars: &[&str]) -> bool {
+            match expr {
+                FilterExpr::Eq(col, _) | FilterExpr::Ne(col, _)
+                | FilterExpr::Lt(col, _) | FilterExpr::Gt(col, _)
+                | FilterExpr::Gte(col, _) | FilterExpr::Lte(col, _)
+                | FilterExpr::IsNull(col) | FilterExpr::IsNotNull(col)
+                | FilterExpr::Like(col, _) | FilterExpr::In(col, _)
+                | FilterExpr::Between(col, _, _) => {
+                    if let Some((var, field)) = col.split_once('.') {
+                        return vars.contains(&var) && field != "id";
+                    }
+                    false
+                }
+                FilterExpr::And(l, r) => filter_uses_prop(l, vars) || filter_uses_prop(r, vars),
+                FilterExpr::Or(l, r) => filter_uses_prop(l, vars) || filter_uses_prop(r, vars),
+                FilterExpr::Not(inner) => filter_uses_prop(inner, vars),
+                _ => false,
+            }
+        }
+        if let Some(f) = filter {
+            return filter_uses_prop(f, &vars);
+        }
+        false
+    }
+
+    /// Execute 1-2 hop GRAPH MATCH by translating to a relation-driven JOIN (LSM path).
     ///
-    /// For a pattern like:
-    /// `GRAPH MATCH (d:Drug) -[e:treats]-> (dis:Disease) WHERE d.name = 'Aspirin' RETURN d.name, dis.name`
-    ///
-    /// Translates to:
-    /// ```sql
-    /// SELECT d.*, dis.*
-    /// FROM Drug d
-    /// JOIN treats e ON d.__pk__ = e.source
-    /// JOIN Disease dis ON e.target = dis.__pk__
-    /// WHERE d.name = 'Aspirin'
-    /// ```
+    /// Drives from the relation table (`sembio.treats`) and joins entity ids
+    /// (`source`/`target`) via the class embedded in the id. Avoids full entity
+    /// table scans unless the projection/filter needs non-id properties.
     fn execute_graph_match_as_join(
         &self,
         engine: &LsmEngine,
@@ -10007,112 +10217,169 @@ impl QueryExecutor {
         if edges.is_empty() {
             let first_node = &nodes[0];
             if let Some(label) = &first_node.label {
-                let scan_plan = self.build_scan_plan(label, filter)?;
-                let result = self.execute_plan(&scan_plan, engine)?;
-                return Ok(result);
+                let mut rows = Vec::new();
+                for class in Self::resolve_graph_class_candidates(label) {
+                    let scan_plan = self.build_scan_plan(&class, filter)?;
+                    if let QueryResult::Rows(r) = self.execute_plan(&scan_plan, engine)? {
+                        if !r.is_empty() {
+                            rows = r;
+                            break;
+                        }
+                    }
+                }
+                return Ok(QueryResult::Rows(rows));
             }
             return Ok(QueryResult::Rows(Vec::new()));
         }
 
-        // 1-2 hops: build a chain of JOINs
-        // Start with the first node's table
-        let first_node = &nodes[0];
-        let first_label = first_node.label.as_deref().unwrap_or("");
+        // Optional entity-property enrichment maps (built lazily).
+        let needs_props =
+            Self::graph_match_needs_entity_props(nodes, filter, returns);
+        let mut prop_maps: HashMap<String, HashMap<String, Map<String, Value>>> = HashMap::new();
 
-        // Collect all rows by scanning the first table
-        let mut all_rows: Vec<Map<String, Value>> = Vec::new();
-
-        // Scan first table
-        if !first_label.is_empty() {
-            let scan_plan = self.build_scan_plan(first_label, &None)?;
-            if let QueryResult::Rows(rows) = self.execute_plan(&scan_plan, engine)? {
-                all_rows = rows;
+        if needs_props {
+            let mut labels: Vec<String> = nodes
+                .iter()
+                .filter_map(|n| n.label.clone())
+                .collect();
+            labels.sort();
+            labels.dedup();
+            for label in labels {
+                let mut by_id: HashMap<String, Map<String, Value>> = HashMap::new();
+                for class in Self::resolve_graph_class_candidates(&label) {
+                    let scan_plan = self.build_scan_plan(&class, &None)?;
+                    if let QueryResult::Rows(rows) = self.execute_plan(&scan_plan, engine)? {
+                        for row in rows {
+                            if let Some(id) = Self::graph_entity_key(&row) {
+                                by_id.insert(id, row);
+                            }
+                        }
+                        if !by_id.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                prop_maps.insert(label, by_id);
             }
         }
 
-        // For each edge, JOIN with the relation table and then the target table
-        for edge in edges {
+        // Start with one binding per node[0]; chain through each relation edge.
+        let mut all_rows: Vec<Map<String, Value>> = Vec::new();
+
+        for (edge_idx, edge) in edges.iter().enumerate() {
             let relation_label = edge.label.as_deref().unwrap_or("");
             let target_var = &edge.to;
+            let source_var = &edge.from;
 
-            // Find the target node's label
+            let source_node = nodes.iter().find(|n| n.variable == *source_var);
+            let source_label = source_node.and_then(|n| n.label.as_deref()).unwrap_or("");
             let target_node = nodes.iter().find(|n| n.variable == *target_var);
             let target_label = target_node.and_then(|n| n.label.as_deref()).unwrap_or("");
 
-            if relation_label.is_empty() || target_label.is_empty() {
+            if relation_label.is_empty() {
                 continue;
             }
 
-            // Scan relation table
-            let rel_scan_plan = self.build_scan_plan(relation_label, &None)?;
-            let rel_rows = if let QueryResult::Rows(rows) = self.execute_plan(&rel_scan_plan, engine)? {
-                rows
-            } else {
-                Vec::new()
-            };
+            let rel_rows = self.scan_graph_relation_rows(engine, relation_label)?;
 
-            // Scan target table
-            let target_scan_plan = self.build_scan_plan(target_label, &None)?;
-            let target_rows = if let QueryResult::Rows(rows) = self.execute_plan(&target_scan_plan, engine)? {
-                rows
-            } else {
-                Vec::new()
-            };
-
-            // Build index on target table's __pk__ for fast lookup
-            let mut target_index: HashMap<String, &Map<String, Value>> = HashMap::new();
-            for row in &target_rows {
-                if let Some(Value::String(pk)) = row.get("__pk__") {
-                    target_index.insert(pk.clone(), row);
-                }
-            }
-
-            // Build index on relation table's source for fast lookup
-            let mut rel_source_index: HashMap<String, Vec<&Map<String, Value>>> = HashMap::new();
-            for row in &rel_rows {
-                if let Some(source) = row.get("source") {
-                    let key = match source {
+            if edge_idx == 0 {
+                // Seed from relation endpoints; class match comes from the entity id.
+                for rel_row in &rel_rows {
+                    let Some(src) = rel_row.get("source").map(|v| match v {
                         Value::String(s) => s.clone(),
                         other => other.to_string(),
-                    };
-                    rel_source_index.entry(key).or_default().push(row);
+                    }) else { continue };
+                    let Some(tgt) = rel_row.get("target").map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    }) else { continue };
+
+                    if !Self::graph_entity_id_matches_label(&src, source_label) {
+                        continue;
+                    }
+                    if !Self::graph_entity_id_matches_label(&tgt, target_label) {
+                        continue;
+                    }
+
+                    let mut row = Map::new();
+                    if !source_var.is_empty() {
+                        row.insert(format!("{}.id", source_var), Value::String(src.clone()));
+                        if needs_props {
+                            if let Some(props) = prop_maps
+                                .get(source_label)
+                                .and_then(|m| m.get(&src))
+                            {
+                                for (k, v) in props.iter() {
+                                    if k == "__pk__" || k == "__class__" || k == "id" {
+                                        continue;
+                                    }
+                                    row.insert(format!("{}.{}", source_var, k), v.clone());
+                                }
+                            }
+                        }
+                    }
+                    if !target_var.is_empty() {
+                        row.insert(format!("{}.id", target_var), Value::String(tgt.clone()));
+                        if needs_props {
+                            if let Some(props) = prop_maps
+                                .get(target_label)
+                                .and_then(|m| m.get(&tgt))
+                            {
+                                for (k, v) in props.iter() {
+                                    if k == "__pk__" || k == "__class__" || k == "id" {
+                                        continue;
+                                    }
+                                    row.insert(format!("{}.{}", target_var, k), v.clone());
+                                }
+                            }
+                        }
+                    }
+                    all_rows.push(row);
+                    if all_rows.len() >= Self::MAX_GRAPH_MATCH_ROWS {
+                        break;
+                    }
                 }
-            }
-
-            // JOIN: all_rows �?rel_rows (on source) �?target_rows (on target)
-            let mut joined_rows: Vec<Map<String, Value>> = Vec::new();
-
-            // Find the source variable name (should be the previous node's variable)
-            let source_var = &edge.from;
-
-            for row in &all_rows {
-                // Get the source key from the current row
-                let source_key = row.get("__pk__")
-                    .or_else(|| row.get(&format!("{}.id", source_var)))
-                    .and_then(|v| match v {
-                        Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    });
-
-                if let Some(source_key) = source_key {
-                    // Find matching relation rows
-                    if let Some(rel_matches) = rel_source_index.get(&source_key) {
-                        for rel_row in rel_matches {
-                            // Get target key from relation
-                            if let Some(target_val) = rel_row.get("target") {
-                                let target_key = match target_val {
-                                    Value::String(s) => s.clone(),
-                                    other => other.to_string(),
-                                };
-
-                                // Find matching target row
-                                if let Some(target_row) = target_index.get(&target_key) {
-                                    // Merge: current row + target row properties
-                                    let mut merged = row.clone();
-
-                                    // Add target properties with variable prefix
-                                    for (k, v) in target_row.iter() {
-                                        if k == "__pk__" || k == "__class__" {
+            } else {
+                // Extend existing bindings along the next relation edge.
+                let mut joined: Vec<Map<String, Value>> = Vec::new();
+                for row in &all_rows {
+                    let Some(src_id) = row
+                        .get(&format!("{}.id", source_var))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                    else {
+                        continue;
+                    };
+                    for rel_row in &rel_rows {
+                        let rel_src = match rel_row.get("source") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(other) => other.to_string(),
+                            None => continue,
+                        };
+                        if rel_src != src_id {
+                            continue;
+                        }
+                        let tgt = match rel_row.get("target") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(other) => other.to_string(),
+                            None => continue,
+                        };
+                        if !Self::graph_entity_id_matches_label(&tgt, target_label) {
+                            continue;
+                        }
+                        let mut merged = row.clone();
+                        if !target_var.is_empty() {
+                            merged.insert(
+                                format!("{}.id", target_var),
+                                Value::String(tgt.clone()),
+                            );
+                            if needs_props {
+                                if let Some(props) = prop_maps
+                                    .get(target_label)
+                                    .and_then(|m| m.get(&tgt))
+                                {
+                                    for (k, v) in props.iter() {
+                                        if k == "__pk__" || k == "__class__" || k == "id" {
                                             continue;
                                         }
                                         merged.insert(
@@ -10120,26 +10387,27 @@ impl QueryExecutor {
                                             v.clone(),
                                         );
                                     }
-                                    merged.insert(
-                                        format!("{}.id", target_var),
-                                        Value::String(target_key),
-                                    );
-
-                                    joined_rows.push(merged);
                                 }
                             }
                         }
+                        joined.push(merged);
+                        if joined.len() >= Self::MAX_GRAPH_MATCH_ROWS {
+                            break;
+                        }
+                    }
+                    if joined.len() >= Self::MAX_GRAPH_MATCH_ROWS {
+                        break;
                     }
                 }
+                all_rows = joined;
             }
-
-            all_rows = joined_rows;
         }
 
         // Apply filter
         if let Some(f) = filter {
             all_rows.retain(|row| Self::eval_graph_filter(row, f));
         }
+        Self::cap_graph_match_rows(&mut all_rows);
 
         // Apply RETURN projection
         if !returns.is_empty() {
@@ -10456,11 +10724,6 @@ impl QueryExecutor {
             ));
         };
 
-        // Ensure cache is loaded for the edge label (if specified)
-        if let Some(label) = edge_label {
-            let _ = self.ensure_graph_cache_loaded(&[label.to_string()]);
-        }
-
         let dir = match direction {
             crate::parser::GraphDirection::Out => Direction::Out,
             crate::parser::GraphDirection::In => Direction::In,
@@ -10468,6 +10731,36 @@ impl QueryExecutor {
         };
 
         let traversal = TraversalEngine::new(graph.as_ref());
+
+        // Lazy BFS warm-up: pull only the edges reachable from `start_id` up to
+        // `max_depth` instead of loading the full relation table.
+        if let Some(label) = edge_label {
+            let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut frontier = vec![start_id.to_string()];
+            visited.insert(start_id.to_string());
+            for _depth in 0..max_depth.max(1) {
+                let mut next = Vec::new();
+                for vid in &frontier {
+                    let _ = graph.ensure_vertex_edges(self.engine(), label, vid);
+                    if let Ok(nbrs) = traversal.hop(vid, dir, Some(label), None, None) {
+                        for n in nbrs {
+                            if visited.insert(n.id.clone()) {
+                                next.push(n.id);
+                            }
+                        }
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                frontier = next;
+            }
+        } else {
+            // No edge label: cannot target a relation type for lazy load.
+            // Leave in-memory state as-is (full loads still happen via ANALYZE).
+            tracing::debug!("GRAPH TRAVERSE without LABEL: skipping lazy relation load");
+        }
+
         let result = traversal
             .traverse_bfs(start_id, max_depth, dir, edge_label, None)
             .map_err(|e| CoreError::Custom(format!("graph traversal error: {}", e)))?;
