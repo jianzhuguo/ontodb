@@ -11810,26 +11810,77 @@ impl QueryExecutor {
                 Ok(QueryResult::Rows(rows))
             }
             QueryAst::Delete { class, filter } => {
-                // Plan-driven DELETE: scan + filter via plan, then delete matching rows
-                let scan_plan = self.build_scan_plan(class, filter)?;
-                let plan_result = self.execute_plan(&scan_plan, engine)?;
-                let rows = match plan_result {
-                    QueryResult::Rows(r) => r,
-                    other => return Ok(other),
-                };
+                // Stream the class in key order and delete matches page by page.
+                // The old plan-driven path materialized every matching row via
+                // scan_prefix — on a multi-million-row class that OOMs the
+                // process (and it is the common case, since most classes have
+                // no secondary index for the filter).
+                //
+                // delete_with_deindex (same as TRUNCATE) keeps deletes visible
+                // to the next page; txn_delete buffers them and the loop would
+                // re-scan the same first batch forever.
+                let class_hierarchy = self.get_class_hierarchy(engine, class);
+                let scan_classes = self.narrow_scan_scope(engine, class, filter, &class_hierarchy);
+                let batch_size = 500usize;
                 let mut deleted = 0usize;
-                for row in &rows {
-                    if let Some(Value::String(pk)) = row.get("__pk__") {
-                        // Sync to graph store (unified entity anchor)
-                        if let Some(ref graph) = self.graph {
-                            let entity_id = self.make_entity_id(class, pk);
-                            let _ = graph.delete_vertex_by_entity(&entity_id);
-                            // Invalidate graph cache for relation tables
-                            graph.invalidate_relation(class);
+
+                for scan_class in &scan_classes {
+                    let prefix = format!("{}::", scan_class);
+                    let mut after: Option<Vec<u8>> = None;
+                    loop {
+                        let entries = engine.scan_prefix_after(
+                            prefix.as_bytes(),
+                            after.as_deref(),
+                            batch_size,
+                        )?;
+                        if entries.is_empty() {
+                            break;
                         }
-                        engine.txn_delete(txn_id, pk.as_bytes().to_vec())?;
-                        deleted += 1;
+                        after = Some(entries.last().expect("non-empty").0.clone());
+                        for (key, value) in &entries {
+                            let matched = match filter {
+                                None => true,
+                                Some(expr) => {
+                                    if let Some(brow) = BinaryRow::parse(value) {
+                                        match eval_binary_filter(&brow, expr) {
+                                            Some(b) => b,
+                                            None => match brow.to_map() {
+                                                Some(doc) => {
+                                                    self.eval_filter(engine, &doc, expr)
+                                                }
+                                                None => false,
+                                            },
+                                        }
+                                    } else {
+                                        match storage_bytes_to_doc(value) {
+                                            Some(doc) => self.eval_filter(engine, &doc, expr),
+                                            None => false,
+                                        }
+                                    }
+                                }
+                            };
+                            if !matched {
+                                continue;
+                            }
+                            if let Some(ref graph) = self.graph {
+                                let pk = String::from_utf8_lossy(key).to_string();
+                                let entity_id = self.make_entity_id(class, &pk);
+                                let _ = graph.delete_vertex_by_entity(&entity_id);
+                                graph.invalidate_relation(class);
+                            }
+                            engine.delete_with_deindex(key.clone(), value)?;
+                            deleted += 1;
+                        }
                     }
+                }
+
+                if let Some(ref graph) = self.graph {
+                    graph.invalidate_relation(class);
+                }
+                {
+                    let mut cache =
+                        self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    cache.remove(class);
                 }
                 Ok(QueryResult::Success(format!("{} row(s) deleted", deleted)))
             }
@@ -16859,6 +16910,56 @@ mod tests {
         match &result {
             QueryResult::Rows(rows) => {
                 assert_eq!(rows[0].get("n").unwrap().as_i64().unwrap(), 0);
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    /// Regression: filtered DELETE must stream pages instead of materializing
+    /// the whole class. Larger than one scan batch (500) with matches mixed
+    /// among non-matches — must delete every match, leave the rest, terminate.
+    #[test]
+    fn test_delete_filtered_streams_pages() {
+        let (executor, _dir) = setup();
+        for i in 0..1200 {
+            let ast = QueryAst::Insert {
+                class: "Thing".to_string(),
+                columns: vec!["id".to_string(), "name".to_string(), "price".to_string()],
+                values: vec![
+                    LiteralValue::String(format!("thing-{i:04}")),
+                    // Every 3rd row is a probe-style row we want gone.
+                    LiteralValue::String(if i % 3 == 0 {
+                        format!("probe-{i:04}")
+                    } else {
+                        format!("keep-{i:04}")
+                    }),
+                    LiteralValue::Int(i),
+                ],
+            };
+            executor.execute(&ast).unwrap();
+        }
+        executor.engine().flush().unwrap();
+
+        let start = std::time::Instant::now();
+        let ast = QueryParser::parse("DELETE FROM Thing WHERE name LIKE 'probe-%'").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        let elapsed = start.elapsed();
+        match &result {
+            QueryResult::Success(msg) => {
+                assert!(msg.contains("400 row(s) deleted"), "got: {msg}")
+            }
+            _ => panic!("expected Success"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(120),
+            "streaming delete must terminate promptly, took {elapsed:?}"
+        );
+
+        let ast = QueryParser::parse("SELECT COUNT(*) AS n FROM Thing").unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows[0].get("n").unwrap().as_i64().unwrap(), 800);
             }
             _ => panic!("expected Rows"),
         }

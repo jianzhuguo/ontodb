@@ -1547,6 +1547,181 @@ impl LsmEngine {
             .collect()
     }
 
+    /// Live rows in **user-key order**, strictly after `after`, at most `limit`.
+    ///
+    /// Version selection matches [`Self::for_each_live_prefix`]: sources are
+    /// walked newest → oldest (active memtable, immutable memtable, L0…L6) and
+    /// the first version of a key wins. A winning `Delete` means the key is gone.
+    ///
+    /// Memory is O(memtable snapshot + limit), not O(table) — this is the
+    /// pagination primitive filtered DELETE needs so it can stream instead of
+    /// materializing every row via `scan_prefix`.
+    pub fn scan_prefix_after(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.drain_compaction_notifications();
+
+        // Memtables are small (bounded by memtable_size_limit) and already
+        // ordered by user key then inverted-seq (newest version first).
+        let mut mem_active: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
+        let mut mem_imm: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
+        {
+            let ws = self.write_state.read();
+            for e in ws.memtable.scan_prefix(prefix) {
+                if after.is_some_and(|a| e.key.as_slice() <= a) {
+                    continue;
+                }
+                mem_active.push((e.key.clone(), e.value.clone(), e.seq_no, e.kind));
+            }
+            if let Some(ref imm) = ws.immutable_memtable {
+                for e in imm.scan_prefix(prefix) {
+                    if after.is_some_and(|a| e.key.as_slice() <= a) {
+                        continue;
+                    }
+                    mem_imm.push((e.key.clone(), e.value.clone(), e.seq_no, e.kind));
+                }
+            }
+        }
+
+        // Newest-first SST list with retry on stale paths (compaction can
+        // delete a snapshotted SST before we open it). Same pattern as
+        // for_each_live_prefix_until / scan_prefix_limit_newest.
+        let sst_handles: Vec<Arc<SsTable>> = {
+            let mut handles = None;
+            for _ in 0..3 {
+                let sst_paths: Vec<std::path::PathBuf> = {
+                    let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut paths = Vec::new();
+                    for level in levels.iter() {
+                        for sst_info in level.iter().rev() {
+                            if !prefix.is_empty() {
+                                if sst_info.max_key.as_slice() < prefix {
+                                    continue;
+                                }
+                                if !Self::prefix_may_overlap(
+                                    prefix,
+                                    sst_info.min_key.as_slice(),
+                                    sst_info.max_key.as_slice(),
+                                ) {
+                                    continue;
+                                }
+                            }
+                            paths.push(sst_info.path.clone());
+                        }
+                    }
+                    paths
+                };
+                match self.try_get_or_open_ssts(&sst_paths)? {
+                    Some(h) => {
+                        handles = Some(h);
+                        break;
+                    }
+                    None => continue,
+                }
+            }
+            match handles {
+                Some(h) => h,
+                None => Vec::new(), // nothing readable in the prefix
+            }
+        };
+        let mut sst_iters = Vec::with_capacity(sst_handles.len());
+        for sst in &sst_handles {
+            let mut it = sst.iter()?;
+            match after {
+                Some(a) => it.seek(a),
+                None => it.seek(prefix),
+            }
+            // Drop cursor entries the caller already paged past.
+            while it.is_valid() {
+                if !it.key().starts_with(prefix) {
+                    break;
+                }
+                if after.is_some_and(|a| it.key() <= a) {
+                    it.next();
+                    continue;
+                }
+                break;
+            }
+            sst_iters.push(it);
+        }
+
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(limit.min(4096));
+        let mut mem_a_i = 0usize;
+        let mut mem_i_i = 0usize;
+
+        while out.len() < limit {
+            // Smallest live user key across sources.
+            let mut min_key: Option<Vec<u8>> = None;
+            {
+                let mut consider = |k: &[u8]| {
+                    if !k.starts_with(prefix) {
+                        return;
+                    }
+                    if after.is_some_and(|a| k <= a) {
+                        return;
+                    }
+                    if min_key.as_ref().is_none_or(|m| k < m.as_slice()) {
+                        min_key = Some(k.to_vec());
+                    }
+                };
+                if mem_a_i < mem_active.len() {
+                    consider(mem_active[mem_a_i].0.as_slice());
+                }
+                if mem_i_i < mem_imm.len() {
+                    consider(mem_imm[mem_i_i].0.as_slice());
+                }
+                for it in &sst_iters {
+                    if it.is_valid() {
+                        consider(it.key());
+                    }
+                }
+            }
+
+            let Some(group_key) = min_key else {
+                break;
+            };
+
+            // First-seen wins across sources in priority order.
+            let mut winner: Option<(Vec<u8>, EntryKind)> = None;
+            while mem_a_i < mem_active.len() && mem_active[mem_a_i].0 == group_key {
+                if winner.is_none() {
+                    let e = &mem_active[mem_a_i];
+                    winner = Some((e.1.clone(), e.3));
+                }
+                mem_a_i += 1;
+            }
+            while mem_i_i < mem_imm.len() && mem_imm[mem_i_i].0 == group_key {
+                if winner.is_none() {
+                    let e = &mem_imm[mem_i_i];
+                    winner = Some((e.1.clone(), e.3));
+                }
+                mem_i_i += 1;
+            }
+            for it in sst_iters.iter_mut() {
+                while it.is_valid() && it.key() == group_key.as_slice() {
+                    if winner.is_none() {
+                        winner = Some((it.value().to_vec(), it.kind()));
+                    }
+                    it.next();
+                }
+            }
+
+            if let Some((value, kind)) = winner {
+                if kind == EntryKind::Put {
+                    out.push((group_key, value));
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Internal scan implementation shared by scan_prefix and scan_prefix_with_visibility.
     /// When `vis` is Some, only entries visible to the snapshot are included.
     fn scan_prefix_internal(
