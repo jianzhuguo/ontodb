@@ -632,11 +632,15 @@ impl AggState {
         self.count_star += 1;
     }
 
-    fn update_column(&mut self, col: &str, row: &Map<String, Value>) {
+    fn update_column(&mut self, col: &str, row: &Map<String, Value>, track_distinct: bool) {
         if let Some(val) = Self::extract_value(row, col) {
             *self.count_col.entry(col.to_string()).or_insert(0) += 1;
-            // Track distinct values
-            self.count_distinct.entry(col.to_string()).or_default().insert(val.clone());
+            // Only track distinct values when COUNT(DISTINCT) is actually requested.
+            // Unconditionally inserting every value into a HashSet is the OOM path
+            // on multi-million-row aggregates.
+            if track_distinct {
+                self.count_distinct.entry(col.to_string()).or_default().insert(val.clone());
+            }
             if let Ok(n) = val.parse::<f64>() {
                 let entry = self
                     .numeric
@@ -12428,10 +12432,42 @@ impl QueryExecutor {
         }
         let proj_cols = needed_cols;
 
+        // Columns that must be kept from the first row of each group (for finalize).
+        // Only GROUP BY columns + non-aggregate select columns — NOT the full doc.
+        let mut first_row_cols: Vec<String> = Vec::new();
+        if let Some(gb) = group_by {
+            for col in &gb.columns {
+                let clean = col.trim_matches('"');
+                if !first_row_cols.contains(&clean.to_string()) {
+                    first_row_cols.push(clean.to_string());
+                }
+            }
+        }
+        if let SelectColumns::Columns(items) = columns {
+            for item in items {
+                if let SelectItem::Column(col) = item {
+                    let clean = col.trim_matches('"');
+                    let name = clean.split(" as ").last().unwrap_or(clean);
+                    let name = name.split('.').next_back().unwrap_or(name);
+                    if !first_row_cols.contains(&name.to_string()) {
+                        first_row_cols.push(name.to_string());
+                    }
+                }
+            }
+        }
+
+        // Only track COUNT(DISTINCT) values when the query actually needs them.
+        let need_distinct: bool = match columns {
+            SelectColumns::Columns(items) => items.iter().any(|item| {
+                matches!(item, SelectItem::Aggregate(a) if a.distinct)
+            }),
+            _ => false,
+        };
+
         // Streaming state: one AggState per group key (or single AggState for no GROUP BY)
         let mut groups: std::collections::HashMap<String, AggState> =
             std::collections::HashMap::new();
-        // Store first row per group for GROUP BY column values
+        // Store first row (projected) per group for GROUP BY column values
         let mut group_first_row: std::collections::HashMap<String, Map<String, Value>> =
             std::collections::HashMap::new();
 
@@ -12455,6 +12491,8 @@ impl QueryExecutor {
                     group_by,
                     &proj_cols,
                     &agg_cols,
+                    &first_row_cols,
+                    need_distinct,
                     &mut groups,
                     &mut group_first_row,
                 )
@@ -12472,13 +12510,13 @@ impl QueryExecutor {
         for (group_key, state) in &groups {
             let mut result_row = Map::new();
 
-            // Add GROUP BY columns
+            // Add GROUP BY columns (first_row is projected — keys are bare column names)
             if let Some(gb) = group_by {
                 if let Some(first_row) = group_first_row.get(group_key) {
                     for col in &gb.columns {
                         let clean = col.trim_matches('"');
-                        if let Some(val) = Self::resolve_column_value(first_row, clean) {
-                            result_row.insert(clean.to_string(), Value::String(val));
+                        if let Some(v) = first_row.get(clean) {
+                            result_row.insert(clean.to_string(), Value::String(Self::value_to_sort_key(v)));
                         }
                     }
                 }
@@ -12497,18 +12535,18 @@ impl QueryExecutor {
                             result_row.insert(name, val);
                         }
                         SelectItem::Column(col) => {
-                            // Non-aggregate columns in GROUP BY query �?use first row value
+                            // Non-aggregate columns in GROUP BY query - use first row value.
+                            // first_row is projected with bare column names as keys.
                             if let Some(first_row) = group_first_row.get(group_key) {
+                                let clean = col.trim_matches('"');
                                 let col_name =
-                                    col.split(" as ").last().unwrap_or(col);
+                                    clean.split(" as ").last().unwrap_or(clean);
                                 let col_name =
                                     col_name.split('.').next_back().unwrap_or(col_name);
                                 if !result_row.contains_key(col_name) {
-                                    if let Some(val) =
-                                        Self::resolve_column_value(first_row, col)
-                                    {
+                                    if let Some(v) = first_row.get(col_name) {
                                         result_row
-                                            .insert(col_name.to_string(), Value::String(val));
+                                            .insert(col_name.to_string(), Value::String(Self::value_to_sort_key(v)));
                                     }
                                 }
                             }
@@ -12564,6 +12602,8 @@ impl QueryExecutor {
         group_by: Option<&crate::parser::GroupByClause>,
         proj_cols: &[String],
         agg_cols: &[String],
+        first_row_cols: &[String],
+        need_distinct: bool,
         groups: &mut std::collections::HashMap<String, AggState>,
         group_first_row: &mut std::collections::HashMap<String, Map<String, Value>>,
     ) -> Result<()> {
@@ -12574,6 +12614,8 @@ impl QueryExecutor {
             return Ok(());
         }
 
+        const MAX_GROUPS: usize = 500_000;
+
         let apply_doc = |doc: Map<String, Value>,
                              groups: &mut std::collections::HashMap<String, AggState>,
                              group_first_row: &mut std::collections::HashMap<String, Map<String, Value>>| {
@@ -12581,11 +12623,25 @@ impl QueryExecutor {
             let state = groups.entry(group_key.clone()).or_default();
             state.update(&doc);
             for col in agg_cols {
-                state.update_column(col, &doc);
+                state.update_column(col, &doc, need_distinct);
             }
-            if group_by.is_some() {
-                group_first_row.entry(group_key).or_insert(doc);
+            if group_by.is_some() && !group_first_row.contains_key(&group_key) {
+                if groups.len() > MAX_GROUPS {
+                    return Err(CoreError::custom(
+                        format!("GROUP BY produced > {MAX_GROUPS} groups; aborting to avoid OOM"),
+                    ));
+                }
+                // Only keep the columns needed at finalize time — NOT the full doc.
+                // Storing the full row per group is the OOM path on high-cardinality GROUP BY.
+                let mut projected = Map::new();
+                for col in first_row_cols {
+                    if let Some(val) = doc.get(col) {
+                        projected.insert(col.clone(), val.clone());
+                    }
+                }
+                group_first_row.insert(group_key, projected);
             }
+            Ok(())
         };
 
         // BinaryRow path
@@ -12602,7 +12658,7 @@ impl QueryExecutor {
                             if !self.eval_filter_read(engine, &doc, f) {
                                 return Ok(());
                             }
-                            apply_doc(doc, groups, group_first_row);
+                            apply_doc(doc, groups, group_first_row)?;
                         }
                         return Ok(());
                     }
@@ -12611,7 +12667,7 @@ impl QueryExecutor {
             // Use to_map_projected with empty cols �?falls back to to_map()
             // which now skips fields with unrecognized tags instead of failing.
             if let Some(doc) = brow.to_map_projected(&[]) {
-                apply_doc(doc, groups, group_first_row);
+                apply_doc(doc, groups, group_first_row)?;
             }
             return Ok(());
         }
@@ -12630,7 +12686,7 @@ impl QueryExecutor {
                     return Ok(());
                 }
             }
-            apply_doc(doc, groups, group_first_row);
+            apply_doc(doc, groups, group_first_row)?;
         }
         Ok(())
     }
@@ -13069,8 +13125,6 @@ impl QueryExecutor {
         columns: &[String],
         values: &[LiteralValue],
     ) -> Result<QueryResult> {
-        let key = self.generate_doc_key(class);
-
         let mut doc = Map::new();
         doc.insert("__class__".to_string(), json!(class));
         for (col, val) in columns.iter().zip(values.iter()) {
@@ -13079,6 +13133,10 @@ impl QueryExecutor {
             let json_val = Self::try_parse_vector(json_val);
             doc.insert(col.clone(), json_val);
         }
+
+        // Keyed by caller-supplied `id` when present so a re-insert of the same
+        // logical row overwrites instead of creating a duplicate physical row.
+        let key = self.doc_key_for(class, &doc);
 
         // Validate against ontology schema
         self.validate_document(engine, class, &doc)?;
@@ -13290,7 +13348,7 @@ impl QueryExecutor {
                 }
             }
 
-            let key = self.generate_doc_key(class);
+            let key = self.doc_key_for(class, &doc);
             let value = doc_to_storage_bytes(&doc);
             entries.push((key, value));
         }
@@ -13315,7 +13373,7 @@ impl QueryExecutor {
                     for (key, val) in map {
                         doc.insert(key.clone(), val);
                     }
-                    let key = self.generate_doc_key(class);
+                    let key = self.doc_key_for(class, &doc);
                     let value = doc_to_storage_bytes(&doc);
                     entries.push((key, value));
                 }
@@ -13337,7 +13395,7 @@ impl QueryExecutor {
                     for (key, val) in map {
                         doc.insert(key.clone(), val);
                     }
-                    let key = self.generate_doc_key(class);
+                    let key = self.doc_key_for(class, &doc);
                     let value = doc_to_storage_bytes(&doc);
                     entries.push((key, value));
                 }
@@ -13402,7 +13460,7 @@ impl QueryExecutor {
                 }
             }
 
-            let key = self.generate_doc_key(class);
+            let key = self.doc_key_for(class, &doc);
             let value = doc_to_storage_bytes(&doc);
             batch.push((key, value));
         }
@@ -13500,7 +13558,7 @@ impl QueryExecutor {
                     for (key, val) in map {
                         doc.insert(key.clone(), val.clone());
                     }
-                    let key = self.generate_doc_key(class);
+                    let key = self.doc_key_for(class, &doc);
                     let value = doc_to_storage_bytes(&doc);
                     batch.push((key, value));
                 }
@@ -13551,7 +13609,7 @@ impl QueryExecutor {
                     for (key, val) in map {
                         doc.insert(key.clone(), val.clone());
                     }
-                    let key = self.generate_doc_key(class);
+                    let key = self.doc_key_for(class, &doc);
                     let value = doc_to_storage_bytes(&doc);
                     batch.push((key, value));
                 }
@@ -13811,6 +13869,19 @@ impl QueryExecutor {
         // Combine timestamp + counter for collision-free uniqueness
         let unique = ts << 64 | seq as u128;
         format!("{}::{:040}", class, unique).into_bytes()
+    }
+
+    /// Storage key for a document. When the doc carries a non-empty string `id`,
+    /// that id is mixed into the key (`{class}::{id}`) so re-inserting the same
+    /// logical id overwrites the existing row instead of creating a duplicate.
+    /// Falls back to a unique generated key when `id` is absent or empty.
+    fn doc_key_for(&self, class: &str, doc: &Map<String, Value>) -> Vec<u8> {
+        if let Some(id) = doc.get("id").and_then(|v| v.as_str()) {
+            if !id.is_empty() {
+                return format!("{}::{}", class, id).into_bytes();
+            }
+        }
+        self.generate_doc_key(class)
     }
 
     /// Tries to use a secondary index for the given filter.
