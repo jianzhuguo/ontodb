@@ -1680,50 +1680,87 @@ impl IndexManager {
     /// merge is skipped. Otherwise memory and disk counts are merged (a pk can
     /// appear on both sides after restart, so the count is a union estimate
     /// only when one side is empty — same rule as `lookup_eq_read`).
+    /// Distinct (encoded_value, count) pairs for an indexed column.
+    ///
+    /// `cap` bounds how many distinct values are materialised: a high-cardinality
+    /// column (e.g. a unique id) would otherwise build a multi-million-entry Vec
+    /// and OOM the process. Returns `Err` when the cap is exceeded so the caller
+    /// can abort cleanly; `Ok(None)` means the column is not indexed.
     pub fn distinct_counts_read(
         &self,
         class: &str,
         column: &str,
-    ) -> Option<Vec<(Vec<u8>, u64)>> {
+        cap: usize,
+    ) -> Result<Option<Vec<(Vec<u8>, u64)>>, onto_core::CoreError> {
         let key = (class.to_string(), column.to_string());
         let mem_has = self.indexes.contains_key(&key);
         let disk_has = self.disk_indexes.contains_key(&key);
         if !mem_has && !disk_has {
-            return None;
+            return Ok(None);
         }
 
+        let too_many = || {
+            onto_core::CoreError::custom(format!(
+                "distinct value count exceeds cap {cap}; aborting to avoid OOM"
+            ))
+        };
+
         if mem_has && self.mem_complete.contains(&key) {
-            let mut out = Vec::new();
+            let mut out: Vec<(Vec<u8>, u64)> = Vec::new();
+            let mut overflow = false;
             if let Some(tree) = self.indexes.get(&key) {
                 tree.for_each_key_count(|k, n| {
+                    if out.len() >= cap {
+                        overflow = true;
+                        return false;
+                    }
                     out.push((k.to_vec(), n));
                     true
                 });
             }
-            return Some(out);
+            if overflow {
+                return Err(too_many());
+            }
+            return Ok(Some(out));
         }
 
         // Merge path: prefer whichever side has data. When both have data the
         // union count is unknown without pk materialization — use max() which
         // is exact when one side is empty and a safe lower bound otherwise.
         let mut merged: std::collections::BTreeMap<Vec<u8>, u64> = std::collections::BTreeMap::new();
+        let mut overflow = false;
         if let Some(tree) = self.indexes.get(&key) {
             tree.for_each_key_count(|k, n| {
+                if merged.len() >= cap {
+                    overflow = true;
+                    return false;
+                }
                 *merged.entry(k.to_vec()).or_insert(0) += n;
                 true
             });
         }
+        if overflow {
+            return Err(too_many());
+        }
         if let Some(disk_idx) = self.disk_indexes.get(&key) {
             let mut disk = disk_idx.lock().unwrap_or_else(|e| e.into_inner());
+            let mut disk_overflow = false;
             let _ = disk.for_each_value_count(|v, n| {
+                if merged.len() >= cap {
+                    disk_overflow = true;
+                    return false;
+                }
                 *merged.entry(v.to_vec()).or_insert(0) += n;
                 true
             });
+            if disk_overflow {
+                return Err(too_many());
+            }
         }
         if merged.is_empty() {
-            return None;
+            return Ok(None);
         }
-        Some(merged.into_iter().collect())
+        Ok(Some(merged.into_iter().collect()))
     }
 
     /// Builds the index key format (v2, length-prefixed — no delimiter collision):

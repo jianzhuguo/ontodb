@@ -698,7 +698,7 @@ impl LsmEngine {
         class: &str,
         column: &str,
         dimension: usize,
-        existing: &std::collections::HashSet<Vec<u8>>,
+        existing: std::collections::HashSet<Vec<u8>>,
     ) -> Vec<(Vec<u8>, String, String, crate::vector::hnsw::VecData)> {
         let prefix = format!("{}::", class);
         let mut missing: Vec<(Vec<u8>, String, String, crate::vector::hnsw::VecData)> =
@@ -706,8 +706,12 @@ impl LsmEngine {
         let mut notes: Vec<(Vec<u8>, String, String, crate::vector::hnsw::VecData)> =
             Vec::new();
         let mut ghosts: Vec<Vec<u8>> = Vec::new();
-        let mut seen: std::collections::HashSet<Vec<u8>> =
-            std::collections::HashSet::with_capacity(existing.len());
+        // Remaining graph keys not yet seen in the live scan. Reusing the
+        // existing set (instead of a second `seen` HashSet) halves peak
+        // memory — on a 2.4M-vector index that is the difference between
+        // startup and OOM on a 15GB host.
+        let mut remaining = existing;
+        let existing_len = remaining.len();
         let mut noted = 0usize;
         let mut marked = 0usize;
         const VEC_BATCH: usize = 10_000;
@@ -715,10 +719,10 @@ impl LsmEngine {
         let col = column.to_string();
         {
             let mut sink = |pk: &[u8], val_bytes: &[u8]| -> Result<bool> {
-                let in_graph = existing.contains(pk);
-                if in_graph {
-                    seen.insert(pk.to_vec());
-                }
+                // `remove` returns true iff this pk was still in the graph set
+                // (first live sighting). Equivalent to the old
+                // `existing.contains(pk)` + `seen.insert(pk)`.
+                let in_graph = remaining.remove(pk);
                 let has_vec = match parse_doc_bytes(val_bytes) {
                     Some(doc)
                         if doc.get("__class__").and_then(|v| v.as_str()) == Some(cls.as_str()) =>
@@ -779,8 +783,8 @@ impl LsmEngine {
 
         // Graph nodes whose pk never appeared in the live scan: deleted rows
         // whose tombstone (and thus `deleted_keys`) was lost on restart.
-        for pk in existing.difference(&seen) {
-            ghosts.push(pk.clone());
+        for pk in remaining {
+            ghosts.push(pk);
         }
 
         if !notes.is_empty() {
@@ -815,10 +819,10 @@ impl LsmEngine {
         // documents (deleted_keys was lost across restart). Surface it as a
         // warning so operators know to run COMPACT VECTOR INDEX.
         if marked > 0 {
-            let pct = if existing.is_empty() {
+            let pct = if existing_len == 0 {
                 0.0
             } else {
-                (marked as f64) * 100.0 / (existing.len() as f64)
+                (marked as f64) * 100.0 / (existing_len as f64)
             };
             if marked > 100_000 {
                 tracing::error!(
@@ -2434,14 +2438,14 @@ impl LsmEngine {
     }
 
     /// Visit every live (Put) entry under `prefix` exactly once, latest-version-wins,
-    /// without materializing the full value set.
+    /// without materializing the full key set.
     ///
-    /// Two-pass design:
-    /// 1. Collect `key —(seq, kind)` only (O(keys) memory, no values).
-    /// 2. Re-stream values and invoke `f(key, value)` for each winning Put.
+    /// Streaming merge: memtables + SSTs are walked in a single key-ordered pass
+    /// (active memtable, immutable memtable, L0…L6). First visible version of a
+    /// key wins; a winning `Delete` means the key is gone. Peak memory is
+    /// O(memtable snapshot + open SST iterators), not O(table).
     ///
-    /// `f` sees each key at most once. Values are discarded after the callback —
-    /// peak row memory is one value plus the key map.
+    /// `f` sees each key at most once. Values are discarded after the callback.
     ///
     /// `overlay` (when provided) represents uncommitted write-buffer entries that
     /// win over storage: `Some(value)` is a Put, `None` is a Delete. Overlay keys
@@ -2487,23 +2491,39 @@ impl LsmEngine {
             overlay.is_some_and(|ov| ov.contains_key(key))
         };
 
-        // ---- Pass 1: storage winners = key —(seq, kind), no values ----
+        // ---- Streaming merge: one key-ordered pass, no winners HashMap ----
         //
-        // Version selection: newest-first source order + first-seen-wins.
-        // Do NOT pick the winner by `seq` comparison —`seq` can be 0 when a
-        // file was rewritten by clean_index / migration, and `seq > existing`
-        // then keeps the OLDER level's version. LSM level order is always
-        // trustworthy: new writes enter at the memtable and L0.
-        let mut winners: HashMap<Vec<u8>, (SeqNo, EntryKind)> = HashMap::new();
+        // Sources are walked newest-first (active memtable, immutable memtable,
+        // L0…L6). First *visible* version of a user key wins. A winning Delete
+        // means the key is gone. Peak memory is O(memtable snapshot + open SST
+        // iterators) — O(table) key materialization is exactly the OOM path
+        // that killed multi-million-row GROUP BY on constrained hosts.
+        //
+        // Memtables are small (bounded by memtable_size_limit) and already
+        // ordered by user key then inverted-seq (newest version first).
 
-        // Newest-first SST list: L0 before L1 —; within a level, reverse
-        // insertion order (later flushes are newer).
-        // Retry on stale paths: compaction can delete a snapshotted SST before
-        // we open it. No callback has run yet, so restarting is side-effect-free.
+        // Snapshot memtable entries so callbacks can run without holding the
+        // write-state lock. Active before immutable: immutable is OLDER.
+        let mut mem_active: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
+        let mut mem_imm: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
+        {
+            let ws = self.write_state.read();
+            for e in ws.memtable.scan_prefix(prefix) {
+                mem_active.push((e.key.clone(), e.value.clone(), e.seq_no, e.kind));
+            }
+            if let Some(ref imm) = ws.immutable_memtable {
+                for e in imm.scan_prefix(prefix) {
+                    mem_imm.push((e.key.clone(), e.value.clone(), e.seq_no, e.kind));
+                }
+            }
+        }
+
+        // Newest-first SST list with retry on stale paths (compaction can
+        // delete a snapshotted SST before we open it).
         let sst_handles: Vec<Arc<SsTable>> = {
             let mut handles = None;
             for _ in 0..3 {
-                let sst_paths: Vec<PathBuf> = {
+                let sst_paths: Vec<std::path::PathBuf> = {
                     let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
                     let mut paths = Vec::new();
                     for level in levels.iter() {
@@ -2535,170 +2555,101 @@ impl LsmEngine {
             }
             match handles {
                 Some(h) => h,
-                None => return Ok(()), // give up: nothing readable in the prefix
+                None => Vec::new(),
             }
         };
 
-        {
-            let mut note = |key: Vec<u8>, seq: SeqNo, kind: EntryKind| {
-                if shadowed(&key) {
-                    return;
-                }
-                // First-seen wins: the first source to present a key is the
-                // newest (we walk memtable —L0 ———L6).
-                if !winners.contains_key(&key) {
-                    winners.insert(key, (seq, kind));
-                }
-            };
-
-            // MemTables first (newest source) —active before immutable:
-            // immutable is OLDER; scanning it first let a stale version win
-            // first-seen-wins over a fresher tombstone/Put in the active
-            // memtable (count-path resurrection window).
-            {
-                let ws = self.write_state.read();
-                for entry in ws.memtable.scan_prefix(prefix) {
-                    if is_visible(entry.seq_no) {
-                        note(entry.key.clone(), entry.seq_no, entry.kind);
-                    }
-                }
-                if let Some(ref imm) = ws.immutable_memtable {
-                    for entry in imm.scan_prefix(prefix) {
-                        if is_visible(entry.seq_no) {
-                            note(entry.key.clone(), entry.seq_no, entry.kind);
-                        }
-                    }
-                }
-            }
-
-            // Then SSTs, newest-first.
-            for sst in &sst_handles {
-                let mut iter = sst.iter()?;
-                iter.seek(prefix);
-                while iter.is_valid() {
-                    if !iter.key().starts_with(prefix) {
-                        break;
-                    }
-                    if is_visible(iter.seq_no()) {
-                        note(iter.key().to_vec(), iter.seq_no(), iter.kind());
-                    }
-                    iter.next();
-                }
-            }
+        let mut sst_iters = Vec::with_capacity(sst_handles.len());
+        for sst in &sst_handles {
+            let mut it = sst.iter()?;
+            it.seek(prefix);
+            sst_iters.push(it);
         }
 
-        // ---- Pass 2: re-stream values, emit winning Puts, drop value after f ----
-        // consumed[kind=Delete] is used as a "already emitted" marker for Puts.
-        let mut pending_puts = winners
-            .values()
-            .filter(|(_, kind)| *kind == EntryKind::Put)
-            .count();
+        let mut mem_a_i = 0usize;
+        let mut mem_i_i = 0usize;
 
-        {
-            // fn (not closure) so we can still read `pending_puts` in the loops
-            fn try_emit<F>(
-                winners: &mut HashMap<Vec<u8>, (SeqNo, EntryKind)>,
-                pending_puts: &mut usize,
-                f: &mut F,
-                key: &[u8],
-                _seq: SeqNo,
-                kind: EntryKind,
-                value: &[u8],
-            ) -> Result<bool>
-            where
-                F: FnMut(&[u8], &[u8]) -> Result<bool>,
+        loop {
+            // Smallest in-prefix user key across sources.
+            let mut min_key: Option<Vec<u8>> = None;
             {
-                if kind != EntryKind::Put || *pending_puts == 0 {
-                    return Ok(true);
-                }
-                let Some((_, w_kind)) = winners.get(key).copied() else {
-                    return Ok(true);
+                let mut consider = |k: &[u8]| {
+                    if !k.starts_with(prefix) {
+                        return;
+                    }
+                    if min_key.as_ref().is_none_or(|m| k < m.as_slice()) {
+                        min_key = Some(k.to_vec());
+                    }
                 };
-                // First Put in newest-first order is the pass-1 winner. Do NOT
-                // match on `seq` —`clean_index` zeroes it and collisions then
-                // pick the OLDER level's value (pass-2 used to walk L6→L0).
-                if w_kind == EntryKind::Put {
-                    if let Some(slot) = winners.get_mut(key) {
-                        slot.1 = EntryKind::Delete; // mark emitted
-                    }
-                    *pending_puts -= 1;
-                    return f(key, value);
+                if mem_a_i < mem_active.len() {
+                    consider(mem_active[mem_a_i].0.as_slice());
                 }
-                Ok(true)
-            }
-
-            // Newest-first: memtable before SSTs, so the first Put met for a
-            // key is the same entry pass-1 chose as winner.
-            {
-                let ws = self.write_state.read();
-                if let Some(ref imm) = ws.immutable_memtable {
-                    for entry in imm.scan_prefix(prefix) {
-                        if pending_puts == 0 {
-                            break;
-                        }
-                        if is_visible(entry.seq_no) {
-                            let keep_going = try_emit(
-                                &mut winners,
-                                &mut pending_puts,
-                                &mut f,
-                                &entry.key,
-                                entry.seq_no,
-                                entry.kind,
-                                &entry.value,
-                            )?;
-                            if !keep_going {
-                                return Ok(());
-                            }
-                        }
-                    }
+                if mem_i_i < mem_imm.len() {
+                    consider(mem_imm[mem_i_i].0.as_slice());
                 }
-                for entry in ws.memtable.scan_prefix(prefix) {
-                    if pending_puts == 0 {
-                        break;
-                    }
-                    if is_visible(entry.seq_no) {
-                        let keep_going = try_emit(
-                            &mut winners,
-                            &mut pending_puts,
-                            &mut f,
-                            &entry.key,
-                            entry.seq_no,
-                            entry.kind,
-                            &entry.value,
-                        )?;
-                        if !keep_going {
-                            return Ok(());
-                        }
+                for it in &sst_iters {
+                    if it.is_valid() {
+                        consider(it.key());
                     }
                 }
             }
 
-            let sst_handles = self.snapshot_sst_handles(prefix)?;
-            for sst in &sst_handles {
-                if pending_puts == 0 {
-                    break;
+            let Some(group_key) = min_key else {
+                break;
+            };
+
+            // Overlay wins outright: skip any storage version of this key.
+            if shadowed(&group_key) {
+                while mem_a_i < mem_active.len() && mem_active[mem_a_i].0 == group_key {
+                    mem_a_i += 1;
                 }
-                let mut iter = sst.iter()?;
-                iter.seek(prefix);
-                while iter.is_valid() {
-                    if !iter.key().starts_with(prefix) {
-                        break;
+                while mem_i_i < mem_imm.len() && mem_imm[mem_i_i].0 == group_key {
+                    mem_i_i += 1;
+                }
+                for it in sst_iters.iter_mut() {
+                    while it.is_valid() && it.key() == group_key.as_slice() {
+                        it.next();
                     }
-                    if is_visible(iter.seq_no()) {
-                        let keep_going = try_emit(
-                            &mut winners,
-                            &mut pending_puts,
-                            &mut f,
-                            iter.key(),
-                            iter.seq_no(),
-                            iter.kind(),
-                            iter.value(),
-                        )?;
-                        if !keep_going {
-                            return Ok(());
+                }
+                continue;
+            }
+
+            // First visible version wins across sources in priority order.
+            let mut winner: Option<(Vec<u8>, EntryKind)> = None;
+            while mem_a_i < mem_active.len() && mem_active[mem_a_i].0 == group_key {
+                if winner.is_none() {
+                    let e = &mem_active[mem_a_i];
+                    if is_visible(e.2) {
+                        winner = Some((e.1.clone(), e.3));
+                    }
+                }
+                mem_a_i += 1;
+            }
+            while mem_i_i < mem_imm.len() && mem_imm[mem_i_i].0 == group_key {
+                if winner.is_none() {
+                    let e = &mem_imm[mem_i_i];
+                    if is_visible(e.2) {
+                        winner = Some((e.1.clone(), e.3));
+                    }
+                }
+                mem_i_i += 1;
+            }
+            for it in sst_iters.iter_mut() {
+                while it.is_valid() && it.key() == group_key.as_slice() {
+                    if winner.is_none() {
+                        if is_visible(it.seq_no()) {
+                            winner = Some((it.value().to_vec(), it.kind()));
                         }
                     }
-                    iter.next();
+                    it.next();
+                }
+            }
+
+            if let Some((value, kind)) = winner {
+                if kind == EntryKind::Put {
+                    if !f(&group_key, &value)? {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -3941,18 +3892,19 @@ impl LsmEngine {
                                     existing = existing.len(),
                                     "Vector snapshot reconcile scan starting"
                                 );
+                                let existing_len = existing.len();
                                 let missing = self.reconcile_vector_index(
                                     class,
                                     column,
                                     *dimension,
-                                    &existing,
+                                    existing,
                                 );
                                 if !missing.is_empty() {
                                     tracing::info!(
                                         table = %class,
                                         column = %column,
                                         pending = missing.len(),
-                                        total = existing.len() + missing.len(),
+                                        total = existing_len + missing.len(),
                                         "Vector snapshot reconcile queued missing vectors for backfill"
                                     );
                                     pending_backfill
@@ -6429,6 +6381,75 @@ mod tests {
             Some(&b"overlay-030"[..])
         );
         assert!(!seen2.contains_key(b"T::003".as_slice()));
+    }
+
+    /// Streaming-merge version selection across memtable + SST layers.
+    ///
+    /// Guards the rewrite of `for_each_live_prefix_until`: the winning value
+    /// must come from the *newest* source (active memtable before immutable
+    /// before L0…), a newer tombstone must hide an older Put, and a Put after
+    /// a flush must resurrect the key. Also covers early stop via `Ok(false)`.
+    #[test]
+    fn test_for_each_live_prefix_cross_layer_winners() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 256,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("should be valid");
+
+        // Layer 1 (ends up in SST after flush).
+        engine.put(b"X::a".to_vec(), b"a-old".to_vec()).expect("should be valid");
+        engine.put(b"X::b".to_vec(), b"b-old".to_vec()).expect("should be valid");
+        engine.put(b"X::c".to_vec(), b"c-old".to_vec()).expect("should be valid");
+        engine.put(b"X::d".to_vec(), b"d-old".to_vec()).expect("should be valid");
+        engine.flush().expect("should be valid");
+
+        // Layer 2 (stays in memtable): overwrite, tombstone, resurrect.
+        engine.put(b"X::a".to_vec(), b"a-new".to_vec()).expect("should be valid");
+        engine.delete(b"X::b".to_vec()).expect("should be valid");
+        engine.put(b"X::d".to_vec(), b"d-new".to_vec()).expect("should be valid");
+        engine.delete(b"X::d".to_vec()).expect("should be valid");
+        engine.put(b"X::d".to_vec(), b"d-resurrected".to_vec()).expect("should be valid");
+        engine.put(b"X::e".to_vec(), b"e-only-mem".to_vec()).expect("should be valid");
+
+        let mut seen: std::collections::HashMap<Vec<u8>, Vec<u8>> = std::collections::HashMap::new();
+        engine
+            .for_each_live_prefix(b"X::", None, None, |k, v| {
+                assert!(
+                    seen.insert(k.to_vec(), v.to_vec()).is_none(),
+                    "key {} visited twice",
+                    String::from_utf8_lossy(k)
+                );
+                Ok(())
+            })
+            .expect("should be valid");
+
+        // a: overwritten in memtable — must see the NEW value, not the SST one.
+        assert_eq!(seen.get(b"X::a".as_slice()).map(|v| v.as_slice()), Some(&b"a-new"[..]));
+        // b: tombstone in memtable hides the SST Put.
+        assert!(!seen.contains_key(b"X::b".as_slice()));
+        // c: only in SST, untouched.
+        assert_eq!(seen.get(b"X::c".as_slice()).map(|v| v.as_slice()), Some(&b"c-old"[..]));
+        // d: delete then re-Put in memtable — final Put wins.
+        assert_eq!(
+            seen.get(b"X::d".as_slice()).map(|v| v.as_slice()),
+            Some(&b"d-resurrected"[..])
+        );
+        // e: memtable-only key.
+        assert_eq!(seen.get(b"X::e".as_slice()).map(|v| v.as_slice()), Some(&b"e-only-mem"[..]));
+        assert_eq!(seen.len(), 4);
+
+        // Early stop: callback returns Ok(false) after the first key.
+        let mut count = 0usize;
+        engine
+            .for_each_live_prefix_until(b"X::", None, None, |_k, _v| {
+                count += 1;
+                Ok(false)
+            })
+            .expect("should be valid");
+        assert_eq!(count, 1, "Ok(false) must stop after the first emitted row");
     }
 
     /// count_prefix after SST flush must see the same live rows as before flush.

@@ -282,6 +282,15 @@ fn sanitize_error(err: &str) -> String {
             .to_string();
         return sanitized;
     }
+    // Resource-guard rejections (MAX_GROUPS / DISTINCT caps) are intentional
+    // user-facing messages — the client needs to know the query was rejected
+    // because it would OOM, not that it mysteriously "failed".
+    if lower.contains("aborting to avoid oom")
+        || lower.contains("group by produced")
+        || lower.contains("distinct produced")
+    {
+        return err.to_string();
+    }
     "query execution failed".to_string()
 }
 
@@ -2241,12 +2250,10 @@ async fn hybrid_query(
     };
     let sql_result = match sql_result {
         Ok(r) => r,
-        Err(_) => {
+        Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::<Value>::error(
-                    "query execution failed".to_string(),
-                )),
+                Json(ApiResponse::<Value>::error(sanitize_error(&e.to_string()))),
             );
         }
     };

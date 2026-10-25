@@ -612,7 +612,13 @@ impl InferenceCache {
     }
 }
 
-/// Streaming aggregate state �?tracks running aggregates without materializing rows.
+/// Hard cap on distinct GROUP BY keys. High-cardinality GROUP BY (e.g. GROUP BY
+/// a unique id over millions of rows) materializes one aggregate state per key —
+/// without a cap that is the OOM path. Checked *before* a new key is inserted so
+/// the query fails cleanly instead of killing the process.
+const MAX_GROUPS: usize = 500_000;
+
+/// Streaming aggregate state —tracks running aggregates without materializing rows.
 /// One instance per GROUP BY key (or a single instance for no GROUP BY).
 #[derive(Default)]
 struct AggState {
@@ -7095,6 +7101,9 @@ impl QueryExecutor {
         }
 
         // Accumulate counts per encoded value across the hierarchy.
+        // Guard: GROUP BY on a high-cardinality column (e.g. a unique id) would
+        // otherwise materialize millions of (value, count) pairs and OOM the
+        // process before any result is produced. Bail out cleanly instead.
         let mut counts: std::collections::BTreeMap<Vec<u8>, u64> = std::collections::BTreeMap::new();
         {
             let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
@@ -7108,9 +7117,22 @@ impl QueryExecutor {
                         *counts.entry(enc).or_insert(0) += n;
                     }
                     _ => {
-                        if let Some(pairs) = mgr.distinct_counts_read(scan_class, &group_col) {
-                            for (enc, n) in pairs {
-                                *counts.entry(enc).or_insert(0) += n;
+                        match mgr.distinct_counts_read(scan_class, &group_col, MAX_GROUPS) {
+                            Ok(Some(pairs)) => {
+                                for (enc, n) in pairs {
+                                    *counts.entry(enc).or_insert(0) += n;
+                                    if counts.len() > MAX_GROUPS {
+                                        return Err(CoreError::custom(format!(
+                                            "GROUP BY produced > {MAX_GROUPS} groups; aborting to avoid OOM"
+                                        )));
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(_) => {
+                                return Err(CoreError::custom(format!(
+                                    "GROUP BY produced > {MAX_GROUPS} groups; aborting to avoid OOM"
+                                )));
                             }
                         }
                     }
@@ -7144,6 +7166,11 @@ impl QueryExecutor {
                     None => continue,
                 };
                 *counts.entry(enc).or_insert(0) += 1;
+                if counts.len() > MAX_GROUPS {
+                    return Err(CoreError::custom(format!(
+                        "GROUP BY produced > {MAX_GROUPS} groups; aborting to avoid OOM"
+                    )));
+                }
             }
         }
         if counts.is_empty() && !scanned_any && filter.is_none() {
@@ -7276,9 +7303,17 @@ impl QueryExecutor {
                 used_index = true;
                 let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
                 for scan_class in &indexed {
-                    if let Some(pairs) = mgr.distinct_counts_read(scan_class, first_col) {
-                        for (enc, n) in pairs {
-                            *btree.entry(enc).or_insert(0) += n;
+                    match mgr.distinct_counts_read(scan_class, first_col, MAX_GROUPS) {
+                        Ok(Some(pairs)) => {
+                            for (enc, n) in pairs {
+                                *btree.entry(enc).or_insert(0) += n;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            return Err(CoreError::custom(format!(
+                                "DISTINCT produced > {MAX_GROUPS} values; aborting to avoid OOM"
+                            )));
                         }
                     }
                 }
@@ -12614,23 +12649,27 @@ impl QueryExecutor {
             return Ok(());
         }
 
-        const MAX_GROUPS: usize = 500_000;
-
         let apply_doc = |doc: Map<String, Value>,
                              groups: &mut std::collections::HashMap<String, AggState>,
                              group_first_row: &mut std::collections::HashMap<String, Map<String, Value>>| {
             let group_key = self.make_streaming_group_key(group_by, &doc, proj_cols);
+            // Reject a brand-new group BEFORE allocating its state, so a
+            // high-cardinality GROUP BY fails cleanly instead of OOMing the
+            // process while the maps grow past the cap.
+            if group_by.is_some()
+                && !groups.contains_key(&group_key)
+                && groups.len() >= MAX_GROUPS
+            {
+                return Err(CoreError::custom(
+                    format!("GROUP BY produced > {MAX_GROUPS} groups; aborting to avoid OOM"),
+                ));
+            }
             let state = groups.entry(group_key.clone()).or_default();
             state.update(&doc);
             for col in agg_cols {
                 state.update_column(col, &doc, need_distinct);
             }
             if group_by.is_some() && !group_first_row.contains_key(&group_key) {
-                if groups.len() > MAX_GROUPS {
-                    return Err(CoreError::custom(
-                        format!("GROUP BY produced > {MAX_GROUPS} groups; aborting to avoid OOM"),
-                    ));
-                }
                 // Only keep the columns needed at finalize time — NOT the full doc.
                 // Storing the full row per group is the OOM path on high-cardinality GROUP BY.
                 let mut projected = Map::new();
