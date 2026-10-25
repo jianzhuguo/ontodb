@@ -178,7 +178,13 @@ size_t ZSTD_ldm_getTableSize(ldmParams_t params)
 
 size_t ZSTD_ldm_getMaxNbSeq(ldmParams_t params, size_t maxChunkSize)
 {
-    return params.enableLdm == ZSTD_ps_enable ? (maxChunkSize / params.minMatchLength) : 0;
+    /* ONTODB-PATCH: guard minMatchLength == 0 to avoid integer divide-by-zero.
+     * ZSTD_ldm_adjustParameters() normalizes 0 -> LDM_MIN_MATCH_LENGTH, but
+     * getMaxNbSeq can be reached with unadjusted params (workspace estimate
+     * path, or a corrupted CCtx). A zero divisor raised STATUS_INTEGER_DIVIDE_BY_ZERO
+     * (0xc0000094) in production. */
+    return (params.enableLdm == ZSTD_ps_enable && params.minMatchLength > 0)
+        ? (maxChunkSize / params.minMatchLength) : 0;
 }
 
 /** ZSTD_ldm_getBucket() :
