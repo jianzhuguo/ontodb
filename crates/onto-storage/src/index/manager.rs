@@ -497,10 +497,53 @@ impl IndexManager {
             return false;
         };
         let mut idx = disk.lock().unwrap_or_else(|e| e.into_inner());
-        match idx.count_range(None, None) {
-            Ok(cnt) => !idx.is_empty() && cnt == expected as u64,
-            Err(_) => false,
+        let cnt = match idx.count_range(None, None) {
+            Ok(c) if !idx.is_empty() && c == expected as u64 => c,
+            _ => return false,
+        };
+        // Count alone is not enough: a tree with scrambled internal
+        // separators still counts correctly via the leaf chain but misses
+        // point lookups. Collect probes spread across the whole key space,
+        // then verify each with a point lookup.
+        let n_probes = 16usize;
+        let stride = (cnt as usize / n_probes).max(1);
+        let mut samples: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(n_probes);
+        {
+            let mut cur = match idx.range_cursor(None, None) {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+            let mut seen = 0usize;
+            while samples.len() < n_probes {
+                let Some((val, pk)) = cur.current() else {
+                    break;
+                };
+                if seen % stride == 0 {
+                    samples.push((val.to_vec(), pk.to_vec()));
+                }
+                seen += 1;
+                if cur.advance().is_err() {
+                    break;
+                }
+            }
         }
+        if samples.is_empty() {
+            return false;
+        }
+        for (val, pk) in &samples {
+            match idx.lookup(val) {
+                Ok(hits) if hits.iter().any(|p| p.as_slice() == pk.as_slice()) => {}
+                _ => {
+                    tracing::warn!(
+                        table = %class,
+                        column = %column,
+                        "disk_in_sync probe miss — index corrupt, forcing rebuild"
+                    );
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Prefix that matches every `__idx2__` entry for one (class, column).
@@ -1970,6 +2013,96 @@ impl IndexManager {
         }
     }
 
+    /// Streaming rebuild for one (class, column): absorb `entries` without
+    /// requiring the full set in RAM. Used by startup rebuild which pages the
+    /// LSM instead of `scan_prefix` (that path OOM'd at millions of entries).
+    ///
+    /// First call opens/creates the target index; subsequent calls insert.
+    /// `expected_total` (when > 0) drives the keep-in-memory decision once.
+    pub fn rebuild_index_add_batch(
+        &mut self,
+        class: &str,
+        column: &str,
+        entries: &[(Vec<u8>, Vec<u8>)],
+        expected_total: usize,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        let disk_key = (class.to_string(), column.to_string());
+        let path = self.index_path(class, column);
+        let keep_mem = if expected_total > 0 {
+            self.keep_in_memory(expected_total)
+        } else {
+            // Unknown total: prefer memory only when the index is still small.
+            self.keep_in_memory(self.indexes.get(&disk_key).map(|t| t.len()).unwrap_or(0) + entries.len())
+        };
+
+        // Disk-backed index: create on first batch, then insert incrementally.
+        // `bulk_load` resets the tree, so it cannot be used across batches.
+        if !keep_mem {
+            if !self.disk_indexes.contains_key(&disk_key) {
+                if let Some(ref path) = path {
+                    match BTreeIndex::create(path, class, column) {
+                        Ok(idx) => {
+                            self.disk_indexes.insert(disk_key.clone(), Mutex::new(idx));
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: failed to create disk index {}.{}: {}",
+                                class, column, e
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(disk_idx) = self.disk_indexes.get(&disk_key) {
+                let mut idx = disk_idx.lock().unwrap_or_else(|e| e.into_inner());
+                let mut failed = 0u32;
+                for (val, pk) in entries {
+                    if let Err(e) = idx.insert(val, pk.clone()) {
+                        failed += 1;
+                        if failed <= 3 {
+                            tracing::warn!(
+                                table = %class,
+                                column = %column,
+                                error = %e,
+                                "rebuild_index_add_batch: insert failed"
+                            );
+                        }
+                    }
+                }
+                if failed > 0 {
+                    tracing::error!(
+                        table = %class,
+                        column = %column,
+                        failed,
+                        total = entries.len(),
+                        "rebuild_index_add_batch: inserts failed — index is incomplete"
+                    );
+                }
+                let _ = idx.flush();
+                self.indexes.remove(&disk_key);
+                self.mem_complete.remove(&disk_key);
+                return;
+            }
+            // Disk path unavailable — fall through to memory.
+        }
+
+        let tree = self
+            .indexes
+            .entry(disk_key.clone())
+            .or_insert_with(|| BPlusTree::new(class, column));
+        for (val, pk) in entries {
+            tree.insert(val.clone(), pk.clone());
+        }
+        if keep_mem {
+            self.mem_complete.insert(disk_key);
+        } else {
+            self.mem_complete.remove(&disk_key);
+        }
+    }
+
     /// Parses a v2 length-prefixed index key into its components.
     /// Format: `__idx2__` || class_len:u16 || class || col_len:u16 || col || val_len:u16 || value || pk_len:u16 || pk
     pub fn parse_index_key(key: &[u8]) -> Option<(String, String, Vec<u8>, Vec<u8>)> {
@@ -2447,6 +2580,51 @@ mod tests {
         assert_eq!(
             mtime_before, mtime_after,
             "in-sync disk index must not be rewritten by rebuild_from_entries"
+        );
+    }
+
+    #[test]
+    fn test_disk_in_sync_probe_requires_lookups() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("indexes");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Long keys force frequent splits — the shape that produced the
+        // production corruption. disk_in_sync must accept a healthy tree and
+        // reject a count mismatch.
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..200u32)
+            .map(|i| {
+                let val = format!("long_value_{:040}_pad_{:06}", i % 50, i).into_bytes();
+                (val, format!("pk_{i:06}_padding_to_make_entry_large").into_bytes())
+            })
+            .collect();
+
+        let mut mgr = IndexManager::with_disk_storage(
+            &data_dir,
+            IndexStorageMode::Hybrid {
+                threshold_entries: 10,
+            },
+        );
+        mgr.create_index("LongT", "v");
+        for (val, pk) in &entries {
+            mgr.rebuild_index_add_batch("LongT", "v", &[(val.clone(), pk.clone())], 200);
+        }
+
+        assert!(
+            mgr.disk_in_sync("LongT", "v", 200),
+            "healthy long-key index must pass the probe"
+        );
+        assert!(
+            !mgr.disk_in_sync("LongT", "v", 199),
+            "count mismatch must fail in-sync"
+        );
+        assert!(
+            !mgr.disk_in_sync("LongT", "v", 201),
+            "count mismatch must fail in-sync"
+        );
+        assert!(
+            !mgr.disk_in_sync("NoSuch", "col", 1),
+            "missing index must fail in-sync"
         );
     }
 

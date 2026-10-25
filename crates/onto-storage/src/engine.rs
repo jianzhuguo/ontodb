@@ -96,7 +96,7 @@ struct WriteState {
 enum GetOutcome {
     /// Live Put found.
     Hit(Value),
-    /// Tombstone or memtable delete — key is gone.
+    /// Tombstone or memtable delete —key is gone.
     Deleted,
     /// No version anywhere.
     Absent,
@@ -107,19 +107,19 @@ enum GetOutcome {
 
 /// The main LSM-Tree storage engine with MVCC support.
 ///
-/// All methods take `&self` — the engine is `Sync` and can be shared via
+/// All methods take `&self` —the engine is `Sync` and can be shared via
 /// `Arc<LsmEngine>` without an outer `RwLock`.  Write-path state lives
 /// behind `RwLock<WriteState>` for concurrent read access; SST cache
 /// behind a separate `Mutex` for lazy loading; index managers behind `RwLock`.
 pub struct LsmEngine {
     /// Write-path state (memtable, WAL, txn manager).
     /// Read lock for get/scan, write lock for put/delete/flush.
-    /// Uses parking_lot::RwLock for FIFO fairness — prevents writer starvation
+    /// Uses parking_lot::RwLock for FIFO fairness —prevents writer starvation
     /// when multiple readers hold concurrent read locks.
     /// Wrapped in Arc for sharing with background WAL sync thread.
     write_state: Arc<FairRwLock<WriteState>>,
 
-    /// SSTable handle cache (separate Mutex — read path may lazily open files).
+    /// SSTable handle cache (separate Mutex —read path may lazily open files).
     sst_cache: Mutex<HashMap<PathBuf, Arc<SsTable>>>,
 
     /// SSTables organized by level. Level 0 is newest.
@@ -142,7 +142,7 @@ pub struct LsmEngine {
     /// When no index creation is in progress, total = 0.
     index_progress: Arc<std::sync::Mutex<Option<(String, usize, usize)>>>,
 
-    /// Vector index manager — HNSW (RwLock for concurrent read-path access).
+    /// Vector index manager —HNSW (RwLock for concurrent read-path access).
     vector_index_manager: RwLock<VectorIndexManager>,
 
     /// Channel to send flush notifications to the background compaction worker.
@@ -156,6 +156,14 @@ pub struct LsmEngine {
     /// Cleared after the sst_cache is invalidated.
     /// Allows the common path (no compaction) to skip sst_cache lock acquisition.
     compaction_pending: AtomicBool,
+
+    /// Compaction debt published by the worker: `max_level_score * 100`.
+    /// The write path reads this and sleeps when compaction is behind.
+    compaction_debt: Arc<AtomicU64>,
+
+    /// Set when background index/vector rebuild finishes. Warmup waits on
+    /// this instead of a fixed sleep so COUNT and rebuild do not race the heap.
+    index_rebuild_done: Arc<AtomicBool>,
 
     /// Handle to the background compaction worker thread for graceful shutdown.
     #[allow(dead_code)]
@@ -199,7 +207,7 @@ impl PreLoadEngine {
         let mut max_seq = 0u64;
         let mut skipped_index_entries = 0u64;
         for entry in entries {
-            // Skip index Puts during WAL replay — indexes are rebuilt
+            // Skip index Puts during WAL replay —indexes are rebuilt
             // separately by rebuild_indexes() after the engine is loaded.
             // Delete tombstones for index keys MUST be applied: DROP INDEX
             // relies on them to suppress rebuild from leftover index entries.
@@ -383,7 +391,7 @@ impl LsmEngine {
         }
 
         // Spawn the background compaction worker with the loaded levels
-        let (levels, compaction_sender, compaction_notif_receiver, _worker_handle) =
+        let (levels, compaction_sender, compaction_notif_receiver, _worker_handle, compaction_debt) =
             CompactionWorker::spawn(options.clone(), pre_engine.levels, sst_counter.clone());
 
         // Create index manager with disk storage if configured
@@ -421,6 +429,8 @@ impl LsmEngine {
             compaction_sender,
             compaction_notif_receiver: Mutex::new(compaction_notif_receiver),
             compaction_pending: AtomicBool::new(false),
+            compaction_debt,
+            index_rebuild_done: Arc::new(AtomicBool::new(false)),
             worker_handle: Mutex::new(Some(_worker_handle)),
             group_commit: Arc::new(crate::lsm::group_commit::GroupCommitCoordinator::new()),
             memory_manager,
@@ -524,13 +534,13 @@ impl LsmEngine {
     ///
     /// Incremental `__vec_delta__` writes are gone: restore never read them
     /// (file snapshot + document backfill is the only recovery path), and the
-    /// single-key delta was overwritten every flush — a fake backup. New
+    /// single-key delta was overwritten every flush —a fake backup. New
     /// vectors stay in memory until the dirty set is large enough to justify
     /// a full snapshot, or the caller forces one (graceful shutdown).
     ///
     /// Whatever is not snapshotted is recovered on the next restart by
     /// `reconcile_vector_index` + `backfill_vector_missing` from the
-    /// document's vector column (e.g. `fp`) — the source of truth.
+    /// document's vector column (e.g. `fp`) —the source of truth.
     pub fn persist_vector_deltas(&self, force: bool) -> Result<()> {
         let dirty: Vec<(String, String)> = {
             let mgr = self
@@ -597,7 +607,7 @@ impl LsmEngine {
     /// (`indexes/{class}_{column}.hnsw`) and clears any incremental delta.
     ///
     /// File-based on purpose: a 1024-dim graph for millions of vectors is
-    /// hundreds of MB — far beyond a safe single LSM value (SST block limit),
+    /// hundreds of MB —far beyond a safe single LSM value (SST block limit),
     /// which corrupts the read path.  Must be called after bulk backfill so
     /// the graph survives restarts.
     pub fn persist_vector_graph(&self, class: &str, column: &str) -> Result<()> {
@@ -634,7 +644,7 @@ impl LsmEngine {
                 return Ok(());
             }
             self.clear_vector_delta(class, column);
-            // Snapshot file now holds every node — drop dirty marks so
+            // Snapshot file now holds every node —drop dirty marks so
             // persist_vector_deltas does not re-attempt (and warn) forever.
             self.vector_index_manager
                 .write()
@@ -671,7 +681,7 @@ impl LsmEngine {
     /// `deleted_keys` / `doc_vectors` are in-memory only and do not survive in
     /// the HNSW snapshot. After a restore the graph therefore still contains
     /// nodes for documents whose `fp` was later cleared (or that were deleted)
-    /// — those are the "ghost" vectors. This pass rebuilds `doc_vectors` for
+    /// —those are the "ghost" vectors. This pass rebuilds `doc_vectors` for
     /// live rows and marks every graph node without a live vector as deleted,
     /// so search filters them out again.
     ///
@@ -914,12 +924,28 @@ impl LsmEngine {
         (inserted, skipped)
     }
 
+    /// Write backpressure: when the compaction worker reports debt (max level
+    /// score × 100), slow the write path so merges can catch up. Without this,
+    /// bulk imports outrun compaction, file counts explode, and a single huge
+    /// merge OOMs the process. Sleep is short and stepped — enough to bend the
+    /// curve, not enough to stall a live query path.
+    fn apply_write_backpressure(&self) {
+        let debt = self.compaction_debt.load(Ordering::Relaxed);
+        // debt == score*100. Score 2.0 — soft, 4.0 — hard.
+        if debt >= 400 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        } else if debt >= 200 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// Puts a key-value pair.
     /// Single writes rely on the background WAL sync thread (100ms window).
     ///
     /// Optimized: zero-clone path — WAL serializes directly from key/value
     /// references, then moves originals into MemTable.
     pub fn put(&self, key: Key, value: Value) -> Result<()> {
+        self.apply_write_backpressure();
         let seq = self.next_seq();
 
         let needs_flush = {
@@ -958,6 +984,7 @@ impl LsmEngine {
         if entries.is_empty() {
             return Ok(0);
         }
+        self.apply_write_backpressure();
 
         let count = entries.len();
 
@@ -1008,7 +1035,7 @@ impl LsmEngine {
     pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
         // Retry loop: candidate paths snapshotted from `levels` can be
         // compacted away (and deleted from disk) before we open them. The
-        // data is not lost — it was merged into a newer SST — but that SST
+        // data is not lost — it was merged into a newer SST —but that SST
         // is not in our stale snapshot. Re-collect and retry.
         for _ in 0..3 {
             match self.get_once(key)? {
@@ -1037,7 +1064,7 @@ impl LsmEngine {
         //    is already visible to the candidate collection below. The reverse
         //    order (collect candidates, then check memtables) leaves a window
         //    where a concurrent flush lands the tombstone in `levels` after the
-        //    snapshot and clears the memtable before the check — both sides
+        //    snapshot and clears the memtable before the check —both sides
         //    miss the delete and the stale Put wins. That was the flaky
         //    resurrection in `test_tombstones_survive_compaction_no_resurrect`.
         {
@@ -1059,7 +1086,7 @@ impl LsmEngine {
 
         // 2. Collect candidate SST paths from levels (brief lock).
         //    The min/max range check is an optimization only. An empty bound
-        //    (unlabeled SST) must not exclude the file — that silently drops
+        //    (unlabeled SST) must not exclude the file —that silently drops
         //    rows. Be conservative: skip the range check when either bound is
         //    empty, and treat missing bounds as unbounded.
         let candidates = {
@@ -1080,14 +1107,14 @@ impl LsmEngine {
 
         // 3. Snapshot SST handles from cache (opens happen outside the lock).
         //    A candidate may already be compacted away on disk; that is a
-        //    stale snapshot, not an error — retry against the new layout.
+        //    stale snapshot, not an error —retry against the new layout.
         let sst_handles = match self.try_get_or_open_ssts(&candidates)? {
             Some(h) => h,
             None => return Ok(GetOutcome::StaleSst),
         };
 
         // 4. Iterate SST handles outside the lock (I/O-heavy).
-        //    Collect the highest-seq version across all candidates — returning
+        //    Collect the highest-seq version across all candidates —returning
         //    the first hit is wrong when an older SST is examined before the
         //    one holding the newer version (observed as stale UPDATE reads).
         let mut best: Option<(Vec<u8>, SeqNo, EntryKind)> = None;
@@ -1130,7 +1157,7 @@ impl LsmEngine {
         let mut out: Vec<Option<Value>> = vec![None; keys.len()];
 
         // Phase 1: MemTable lookup under brief read lock.
-        // Memtable tombstones are terminal — a deleted key must not fall
+        // Memtable tombstones are terminal —a deleted key must not fall
         // through to a stale Put in the SSTs below.
         let mut deleted = vec![false; keys.len()];
         {
@@ -1233,7 +1260,7 @@ impl LsmEngine {
 
     /// Fetch an SST handle from the cache, opening the file OUTSIDE the
     /// `sst_cache` lock on a miss. `SsTable::open` reads footer/index/bloom
-    /// from disk — holding the global cache mutex across that serializes
+    /// from disk —holding the global cache mutex across that serializes
     /// every concurrent reader behind one cold open.
     fn get_or_open_sst(&self, path: &std::path::Path) -> Result<Arc<SsTable>> {
         {
@@ -1257,7 +1284,7 @@ impl LsmEngine {
     /// hits, then opens only the misses outside the lock. Preserves input order.
     ///
     /// Returns `Ok(None)` when any path was already compacted away (NotFound)
-    /// — the caller's `levels` snapshot is stale and should re-collect paths
+    /// —the caller's `levels` snapshot is stale and should re-collect paths
     /// and retry. Skipping those files silently would drop their keys.
     fn try_get_or_open_ssts(
         &self,
@@ -1388,10 +1415,10 @@ impl LsmEngine {
 
     /// Scan with prefix, returning at most `limit` live entries.
     ///
-    /// Optimized for LIMIT queries: scans **newest-first** (memtable → L0 → …)
+    /// Optimized for LIMIT queries: scans **newest-first** (memtable —L0 ——
     /// so the first occurrence of each key is the winning version, then stops
     /// once `limit` live Puts are collected. Does **not** walk the entire
-    /// prefix — older SSTs are skipped entirely once the limit is met.
+    /// prefix —older SSTs are skipped entirely once the limit is met.
     pub fn scan_prefix_limit(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         tracing::debug!(prefix = %String::from_utf8_lossy(prefix), "scan_prefix_limit start");
         let result = self.scan_prefix_limit_newest(prefix, limit)?;
@@ -1402,7 +1429,7 @@ impl LsmEngine {
     /// Newest-first limited scan with early exit.
     ///
     /// Visibility rule: first occurrence of a key wins (scan order is
-    /// newest → oldest). Memtables override SSTs; within L0, later-flushed
+    /// newest —oldest). Memtables override SSTs; within L0, later-flushed
     /// (higher path name / max_seq) SSTs are scanned first.
     fn scan_prefix_limit_newest(
         &self,
@@ -1415,7 +1442,7 @@ impl LsmEngine {
             return Ok(Vec::new());
         }
 
-        // Newest-first SST list: L0 before L1 … ; within a level, reverse
+        // Newest-first SST list: L0 before L1 —; within a level, reverse
         // insertion order (later flushes are newer). Collect paths under the
         // brief levels lock, then open outside it. Retry on stale paths —
         // compaction may delete a snapshotted SST before we open it.
@@ -1505,7 +1532,7 @@ impl LsmEngine {
             }
         }
 
-        // 3. SSTs newest → oldest, early-exit on limit.
+        // 3. SSTs newest —oldest, early-exit on limit.
         // Decode whole blocks at once (batch) + block prefetch (in load_block).
         for sst in &sst_handles {
             let mut iter = sst.iter()?;
@@ -1550,10 +1577,10 @@ impl LsmEngine {
     /// Live rows in **user-key order**, strictly after `after`, at most `limit`.
     ///
     /// Version selection matches [`Self::for_each_live_prefix`]: sources are
-    /// walked newest → oldest (active memtable, immutable memtable, L0…L6) and
+    /// walked newest —oldest (active memtable, immutable memtable, L0…L6) and
     /// the first version of a key wins. A winning `Delete` means the key is gone.
     ///
-    /// Memory is O(memtable snapshot + limit), not O(table) — this is the
+    /// Memory is O(memtable snapshot + limit), not O(table) —this is the
     /// pagination primitive filtered DELETE needs so it can stream instead of
     /// materializing every row via `scan_prefix`.
     pub fn scan_prefix_after(
@@ -1722,6 +1749,168 @@ impl LsmEngine {
         Ok(out)
     }
 
+    /// Key-ordered paged scan returning `(key, value, kind)` for every winner,
+    /// including tombstones. Memory is O(page) —safe for multi-million-key
+    /// prefixes where `scan_prefix` / `collect_prefix_winners` OOM.
+    ///
+    /// Version selection matches `scan_prefix_after`: merge sources newest-first,
+    /// first-seen-wins per user key, then emit keys in ascending order.
+    pub fn scan_prefix_page_kind(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>, EntryKind)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.drain_compaction_notifications();
+
+        let mut mem_active: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
+        let mut mem_imm: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
+        {
+            let ws = self.write_state.read();
+            for e in ws.memtable.scan_prefix(prefix) {
+                if after.is_some_and(|a| e.key.as_slice() <= a) {
+                    continue;
+                }
+                mem_active.push((e.key.clone(), e.value.clone(), e.seq_no, e.kind));
+            }
+            if let Some(ref imm) = ws.immutable_memtable {
+                for e in imm.scan_prefix(prefix) {
+                    if after.is_some_and(|a| e.key.as_slice() <= a) {
+                        continue;
+                    }
+                    mem_imm.push((e.key.clone(), e.value.clone(), e.seq_no, e.kind));
+                }
+            }
+        }
+
+        let sst_handles: Vec<Arc<SsTable>> = {
+            let mut handles = None;
+            for _ in 0..3 {
+                let sst_paths: Vec<std::path::PathBuf> = {
+                    let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut paths = Vec::new();
+                    for level in levels.iter() {
+                        for sst_info in level.iter().rev() {
+                            if !prefix.is_empty() {
+                                if sst_info.max_key.as_slice() < prefix {
+                                    continue;
+                                }
+                                if !Self::prefix_may_overlap(
+                                    prefix,
+                                    sst_info.min_key.as_slice(),
+                                    sst_info.max_key.as_slice(),
+                                ) {
+                                    continue;
+                                }
+                            }
+                            paths.push(sst_info.path.clone());
+                        }
+                    }
+                    paths
+                };
+                match self.try_get_or_open_ssts(&sst_paths)? {
+                    Some(h) => {
+                        handles = Some(h);
+                        break;
+                    }
+                    None => continue,
+                }
+            }
+            match handles {
+                Some(h) => h,
+                None => Vec::new(),
+            }
+        };
+        let mut sst_iters = Vec::with_capacity(sst_handles.len());
+        for sst in &sst_handles {
+            let mut it = sst.iter()?;
+            match after {
+                Some(a) => it.seek(a),
+                None => it.seek(prefix),
+            }
+            while it.is_valid() {
+                if !it.key().starts_with(prefix) {
+                    break;
+                }
+                if after.is_some_and(|a| it.key() <= a) {
+                    it.next();
+                    continue;
+                }
+                break;
+            }
+            sst_iters.push(it);
+        }
+
+        let mut out: Vec<(Vec<u8>, Vec<u8>, EntryKind)> = Vec::with_capacity(limit.min(4096));
+        let mut mem_a_i = 0usize;
+        let mut mem_i_i = 0usize;
+
+        while out.len() < limit {
+            let mut min_key: Option<Vec<u8>> = None;
+            {
+                let mut consider = |k: &[u8]| {
+                    if !k.starts_with(prefix) {
+                        return;
+                    }
+                    if after.is_some_and(|a| k <= a) {
+                        return;
+                    }
+                    if min_key.as_ref().is_none_or(|m| k < m.as_slice()) {
+                        min_key = Some(k.to_vec());
+                    }
+                };
+                if mem_a_i < mem_active.len() {
+                    consider(mem_active[mem_a_i].0.as_slice());
+                }
+                if mem_i_i < mem_imm.len() {
+                    consider(mem_imm[mem_i_i].0.as_slice());
+                }
+                for it in &sst_iters {
+                    if it.is_valid() {
+                        consider(it.key());
+                    }
+                }
+            }
+
+            let Some(group_key) = min_key else {
+                break;
+            };
+
+            let mut winner: Option<(Vec<u8>, EntryKind)> = None;
+            while mem_a_i < mem_active.len() && mem_active[mem_a_i].0 == group_key {
+                if winner.is_none() {
+                    let e = &mem_active[mem_a_i];
+                    winner = Some((e.1.clone(), e.3));
+                }
+                mem_a_i += 1;
+            }
+            while mem_i_i < mem_imm.len() && mem_imm[mem_i_i].0 == group_key {
+                if winner.is_none() {
+                    let e = &mem_imm[mem_i_i];
+                    winner = Some((e.1.clone(), e.3));
+                }
+                mem_i_i += 1;
+            }
+            for it in sst_iters.iter_mut() {
+                while it.is_valid() && it.key() == group_key.as_slice() {
+                    if winner.is_none() {
+                        winner = Some((it.value().to_vec(), it.kind()));
+                    }
+                    it.next();
+                }
+            }
+
+            if let Some((value, kind)) = winner {
+                out.push((group_key, value, kind));
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Internal scan implementation shared by scan_prefix and scan_prefix_with_visibility.
     /// When `vis` is Some, only entries visible to the snapshot are included.
     fn scan_prefix_internal(
@@ -1732,7 +1921,7 @@ impl LsmEngine {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.drain_compaction_notifications();
 
-        // Use HashMap instead of BTreeMap — we don't need sorted iteration here;
+        // Use HashMap instead of BTreeMap —we don't need sorted iteration here;
         // callers either iterate in insertion order or re-sort themselves.
         // HashMap avoids O(log n) byte-vector comparisons per insert.
         let mut seen: HashMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = HashMap::new();
@@ -1750,7 +1939,7 @@ impl LsmEngine {
         // duplicated) when a file was rewritten by clean_index / migration,
         // and `seq > existing` then keeps the OLDER level's version. LSM
         // level order is always trustworthy: new writes enter at the memtable
-        // and L0, so scanning memtable → L0 → … → L6 and keeping the first
+        // and L0, so scanning memtable —L0 ———L6 and keeping the first
         // occurrence matches `get()` and `scan_prefix_limit_newest`.
         let mut note = |key: Vec<u8>, value: Vec<u8>, seq: SeqNo, kind: EntryKind,
                         seen: &mut HashMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)>| {
@@ -1761,7 +1950,7 @@ impl LsmEngine {
 
         // Step 1: Snapshot SST handles (cache hits under one brief lock;
         // cold opens happen outside it via get_or_open_sst). Retry on stale
-        // paths — compaction may delete a snapshotted SST before we open it.
+        // paths —compaction may delete a snapshotted SST before we open it.
         let sst_handles: Vec<Arc<SsTable>> = {
             let mut handles = None;
             for _ in 0..3 {
@@ -1865,7 +2054,7 @@ impl LsmEngine {
 
             // NOTE: Do NOT early-exit based on put_count here.
             // A later SST in this newest-first list is older, but a key can
-            // still appear only there (not in a newer SST) — and tombstones
+            // still appear only there (not in a newer SST) —and tombstones
             // already recorded win via first-seen-wins. The SST list is
             // pruned by prefix range, so scanning all of them is cheap.
         }
@@ -1921,24 +2110,49 @@ impl LsmEngine {
         Ok(result)
     }
 
+    /// True when the table has at least one live row. Used to distinguish a
+    /// lost `.idx` file (table alive — index entries must be kept) from an
+    /// interrupted CREATE INDEX on an empty table (entries are truly orphaned).
+    fn table_has_live_rows(&self, class: &str) -> bool {
+        let prefix = format!("{}::", class);
+        self.scan_prefix_after(prefix.as_bytes(), None, 1)
+            .map(|page| !page.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Count live entries matching a prefix. More efficient than scan_prefix().len()
     /// because it never copies values. Returns (live_count, tombstone_count).
     pub fn count_prefix(&self, prefix: &[u8]) -> Result<(usize, usize)> {
-        // Pass 1 only: every winning Put is live. No value predicate → no pass 2.
-        let winners = self.collect_prefix_winners(prefix, None)?;
+        // Paged key-order scan. The old path built a HashMap of every key under
+        // the prefix (`collect_prefix_winners`) —multi-million-row classes
+        // exhausted the heap during startup warmup + rebuild. This keeps only
+        // one page of winners at a time.
+        const PAGE: usize = 50_000;
         let mut live = 0usize;
         let mut tombstones = 0usize;
-        for kind in winners.values().map(|(_, k)| *k) {
-            match kind {
-                EntryKind::Put => live += 1,
-                EntryKind::Delete => tombstones += 1,
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = self.scan_prefix_page_kind(prefix, after.as_deref(), PAGE)?;
+            if page.is_empty() {
+                break;
             }
+            for (_k, _v, kind) in &page {
+                match kind {
+                    EntryKind::Put => live += 1,
+                    EntryKind::Delete => tombstones += 1,
+                }
+            }
+            let last = page.last().expect("non-empty page").0.clone();
+            if page.len() < PAGE {
+                break;
+            }
+            after = Some(last);
         }
         Ok((live, tombstones))
     }
 
-    /// Collect latest-version-wins `key → (seq, kind)` under `prefix`.
-    /// Never copies or retains values — used by COUNT paths.
+    /// Collect latest-version-wins `key —(seq, kind)` under `prefix`.
+    /// Never copies or retains values —used by COUNT paths.
     fn collect_prefix_winners(
         &self,
         prefix: &[u8],
@@ -1955,7 +2169,7 @@ impl LsmEngine {
 
         let mut winners: HashMap<Vec<u8>, (SeqNo, EntryKind)> = HashMap::new();
 
-        // Newest-first SST list: L0 before L1 … ; within a level, reverse
+        // Newest-first SST list: L0 before L1 —; within a level, reverse
         // insertion order (later flushes are newer). First-seen-wins below —
         // do NOT select the winner by `seq` (it can be 0 after clean_index).
         let sst_handles: Vec<Arc<SsTable>> = {
@@ -1997,7 +2211,7 @@ impl LsmEngine {
                 }
             };
 
-            // MemTables first (newest source) — active before immutable:
+            // MemTables first (newest source) —active before immutable:
             // immutable is OLDER; scanning it first let a stale version win
             // first-seen-wins over a fresher tombstone/Put in the active
             // memtable (count-path resurrection window).
@@ -2052,7 +2266,7 @@ impl LsmEngine {
     /// Count live entries matching a prefix whose value passes `passes`.
     ///
     /// Two-pass design (same as [`Self::for_each_live_prefix`]):
-    /// 1. Collect `key → (seq, kind)` only — **no value copies, no filter eval**.
+    /// 1. Collect `key —(seq, kind)` only —**no value copies, no filter eval**.
     /// 2. Re-stream values zero-copy and evaluate `passes` **only on winning Puts**.
     ///
     /// Pass 1 never allocates values. Pass 2 streams one entry at a time via
@@ -2100,7 +2314,7 @@ impl LsmEngine {
                     return Ok(());
                 };
                 // First Put in newest-first order is the pass-1 winner. Do NOT
-                // match on `seq` — `clean_index` zeroes it and collisions then
+                // match on `seq` —`clean_index` zeroes it and collisions then
                 // pick the OLDER level's value (pass-2 used to walk L6→L0).
                 // `EntryKind::Delete` doubles as the "already processed" mark.
                 if w_kind == EntryKind::Put {
@@ -2184,10 +2398,10 @@ impl LsmEngine {
 
     /// Snapshot open SST handles overlapping `prefix` (opens missing files).
     ///
-    /// Order is **newest-first** (L0 → L6, within a level later flushes first),
+    /// Order is **newest-first** (L0 —L6, within a level later flushes first),
     /// matching pass-1's `collect_prefix_winners` walk. Pass-2 relies on this
     /// so the first Put it meets for a key is the same entry pass-1 chose as
-    /// winner — `seq` must not be used for matching (`clean_index` zeroes it).
+    /// winner —`seq` must not be used for matching (`clean_index` zeroes it).
     fn snapshot_sst_handles(&self, prefix: &[u8]) -> Result<Vec<Arc<SsTable>>> {
         let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
         let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -2223,7 +2437,7 @@ impl LsmEngine {
     /// without materializing the full value set.
     ///
     /// Two-pass design:
-    /// 1. Collect `key → (seq, kind)` only (O(keys) memory, no values).
+    /// 1. Collect `key —(seq, kind)` only (O(keys) memory, no values).
     /// 2. Re-stream values and invoke `f(key, value)` for each winning Put.
     ///
     /// `f` sees each key at most once. Values are discarded after the callback —
@@ -2273,16 +2487,16 @@ impl LsmEngine {
             overlay.is_some_and(|ov| ov.contains_key(key))
         };
 
-        // ---- Pass 1: storage winners = key → (seq, kind), no values ----
+        // ---- Pass 1: storage winners = key —(seq, kind), no values ----
         //
         // Version selection: newest-first source order + first-seen-wins.
-        // Do NOT pick the winner by `seq` comparison — `seq` can be 0 when a
+        // Do NOT pick the winner by `seq` comparison —`seq` can be 0 when a
         // file was rewritten by clean_index / migration, and `seq > existing`
         // then keeps the OLDER level's version. LSM level order is always
         // trustworthy: new writes enter at the memtable and L0.
         let mut winners: HashMap<Vec<u8>, (SeqNo, EntryKind)> = HashMap::new();
 
-        // Newest-first SST list: L0 before L1 … ; within a level, reverse
+        // Newest-first SST list: L0 before L1 —; within a level, reverse
         // insertion order (later flushes are newer).
         // Retry on stale paths: compaction can delete a snapshotted SST before
         // we open it. No callback has run yet, so restarting is side-effect-free.
@@ -2331,13 +2545,13 @@ impl LsmEngine {
                     return;
                 }
                 // First-seen wins: the first source to present a key is the
-                // newest (we walk memtable → L0 → … → L6).
+                // newest (we walk memtable —L0 ———L6).
                 if !winners.contains_key(&key) {
                     winners.insert(key, (seq, kind));
                 }
             };
 
-            // MemTables first (newest source) — active before immutable:
+            // MemTables first (newest source) —active before immutable:
             // immutable is OLDER; scanning it first let a stale version win
             // first-seen-wins over a fresher tombstone/Put in the active
             // memtable (count-path resurrection window).
@@ -2401,7 +2615,7 @@ impl LsmEngine {
                     return Ok(true);
                 };
                 // First Put in newest-first order is the pass-1 winner. Do NOT
-                // match on `seq` — `clean_index` zeroes it and collisions then
+                // match on `seq` —`clean_index` zeroes it and collisions then
                 // pick the OLDER level's value (pass-2 used to walk L6→L0).
                 if w_kind == EntryKind::Put {
                     if let Some(slot) = winners.get_mut(key) {
@@ -2559,8 +2773,8 @@ impl LsmEngine {
         let cmp_len = prefix.len().min(max_key.len());
         let cmp = &max_key[..cmp_len].cmp(&prefix[..cmp_len]);
         match cmp {
-            std::cmp::Ordering::Less => false,     // max_key < prefix → no overlap
-            std::cmp::Ordering::Greater => true,   // max_key > prefix → overlap
+            std::cmp::Ordering::Less => false,     // max_key < prefix —no overlap
+            std::cmp::Ordering::Greater => true,   // max_key > prefix —overlap
             std::cmp::Ordering::Equal => {
                 // Equal up to shorter length: overlap if max_key is at least as long as prefix
                 max_key.len() >= prefix.len()
@@ -2596,7 +2810,7 @@ impl LsmEngine {
 
     /// Deletes a row and removes its entries from secondary and vector indexes.
     ///
-    /// [`Self::delete`] only writes an LSM tombstone — index entries survive and
+    /// [`Self::delete`] only writes an LSM tombstone —index entries survive and
     /// later COUNT/SELECT via index return stale pks. TRUNCATE and any bulk
     /// delete path must go through here.
     pub fn delete_with_deindex(&self, key: Key, value: &[u8]) -> Result<()> {
@@ -2631,7 +2845,7 @@ impl LsmEngine {
     // ── Value Metadata (Live Data) ──────────────────────────────
 
     /// Gets value metadata for an entity, computing real-time decay.
-    /// Returns None if no metadata exists (old data without meta → defaults to score 1.0).
+    /// Returns None if no metadata exists (old data without meta —defaults to score 1.0).
     pub fn get_value_meta(
         &self,
         class: &str,
@@ -2706,7 +2920,7 @@ impl LsmEngine {
         let _flush_guard = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
 
         // A previously failed flush may have left an immutable memtable behind.
-        // Persist it instead of overwriting the slot — overwrite loses data.
+        // Persist it instead of overwriting the slot —overwrite loses data.
         if self.write_state.read().immutable_memtable.is_some() {
             tracing::warn!("flush_memtable: persisting leftover immutable memtable");
             self.persist_immutable_to_sst()?;
@@ -2762,7 +2976,7 @@ impl LsmEngine {
             }
         };
 
-        // Empty memtable → nothing to persist. Building a 0-entry SST here
+        // Empty memtable —nothing to persist. Building a 0-entry SST here
         // creates a permanent "old SST" zombie (footer max_seq_no=0) and was
         // observed bursting 6-7 empty L0 files per reset_wal_for_index_cleanup.
         if entries_snapshot.is_empty() {
@@ -2839,8 +3053,8 @@ impl LsmEngine {
     /// Drains compaction notifications from the background worker.
     /// Evicts stale SSTable cache entries when compaction replaces files.
     ///
-    /// Lock ordering: compaction_notif_receiver → sst_cache (never reversed).
-    /// The fast path (no compaction) only checks an atomic flag — no lock acquisition.
+    /// Lock ordering: compaction_notif_receiver —sst_cache (never reversed).
+    /// The fast path (no compaction) only checks an atomic flag —no lock acquisition.
     fn drain_compaction_notifications(&self) {
         // Fast path: skip entirely if no compaction has occurred since last drain.
         if !self.compaction_pending.load(Ordering::Acquire) {
@@ -2923,11 +3137,11 @@ impl LsmEngine {
     /// Uses write-new-then-rename for atomicity:
     /// 1. Archive current WAL (if enabled)
     /// 2. Create a new WAL at a temp path
-    /// 3. Atomically rename temp → wal.log
+    /// 3. Atomically rename temp —wal.log
     fn reset_wal_internal(&self, ws: &mut WriteState) -> Result<()> {
         // Rebuild the WAL so it covers exactly the unpersisted entries (the
         // active memtable). A blind file replace drops records appended during
-        // the SST build window — those writes live in the active memtable and
+        // the SST build window —those writes live in the active memtable and
         // must stay recoverable (observed as post-restart data loss).
         let wal_path = self.options.data_dir.join("wal.log");
         let tmp_path = self.options.data_dir.join("wal.log.tmp");
@@ -3039,19 +3253,29 @@ impl LsmEngine {
             .open_disk_indexes()
     }
 
+    /// True once the background index/vector rebuild thread has finished.
+    pub fn index_rebuild_done(&self) -> bool {
+        self.index_rebuild_done.load(Ordering::Relaxed)
+    }
+
+    /// Mark background index/vector rebuild complete.
+    pub fn mark_index_rebuild_done(&self) {
+        self.index_rebuild_done.store(true, Ordering::Relaxed);
+    }
+
     /// Rebuilds secondary indexes by scanning persisted index entries from SSTables.
     /// Can be called from a background thread after engine startup.
     ///
     /// v1→v2 migration: if no `__idx2__` entries exist but legacy `__idx__`
     /// entries do, the old index entries and `.idx` files are dropped entirely
     /// and indexes are rebuilt from the source documents (JSON values are
-    /// exact — no heuristic decoding needed).
+    /// exact —no heuristic decoding needed).
     pub fn rebuild_indexes(&self) -> Result<()> {
-        // Cheap liveness probe first — avoids materializing the whole keyspace
+        // Cheap liveness probe first —avoids materializing the whole keyspace
         // just to discover there is nothing to do.
         let (v2_live, _) = self.count_prefix(b"__idx2__")?;
         if v2_live == 0 {
-            // v1 → v2 migration: drop old, rebuild from documents
+            // v1 —v2 migration: drop old, rebuild from documents
             let (v1_live, _) = self.count_prefix(b"__idx__")?;
             if v1_live > 0 {
                 let v1_entries = self.scan_prefix(b"__idx__")?;
@@ -3066,7 +3290,7 @@ impl LsmEngine {
             }
         }
 
-        // Discover (class, column) pairs from key headers only — never holds
+        // Discover (class, column) pairs from key headers only —never holds
         // the full entry set. The previous path did scan_prefix(b"__idx2__")
         // over the entire keyspace and OOM'd at 26M+ entries.
         let discovered = self.collect_index_columns()?;
@@ -3096,6 +3320,13 @@ impl LsmEngine {
                 continue;
             }
 
+            // A missing/unregistered index is NOT proof of an interrupted
+            // CREATE INDEX. If the table still has live rows, these `__idx2__`
+            // entries are the index's only persistence (and the .idx file may
+            // have been deleted or lost) — they must be rebuilt, never
+            // tombstoned. Only an empty table makes the entries truly orphaned.
+            let table_alive = self.table_has_live_rows(&class);
+
             // Large disk-only index whose .idx already matches the LSM count:
             // skip both the entry scan and the disk rewrite.
             let keep_mem = self
@@ -3118,37 +3349,74 @@ impl LsmEngine {
                     "Disk index already in sync, skipping rebuild"
                 );
                 total_rebuilt += live;
-                if !is_active {
+                if !is_active && !table_alive {
                     orphaned += live;
-                    let entries = self.scan_prefix(&prefix)?;
-                    self.cleanup_orphaned_index_entries(&entries, &active_keys)?;
+                    self.cleanup_orphaned_index_entries_streaming(&prefix, &active_keys)?;
                 }
                 continue;
             }
 
-            // Materialize only this index's entries, rebuild, then release.
-            let entries = self.scan_prefix(&prefix)?;
-            if entries.is_empty() {
-                continue;
+            // Stream this index's entries in key-order pages. The previous path
+            // did `scan_prefix` (full Vec of every entry) + `rebuild_from_entries`
+            // (second full copy) and OOM'd at millions of entries.
+            const PAGE: usize = 10_000;
+            let mut after: Option<Vec<u8>> = None;
+            let mut streamed = 0usize;
+            loop {
+                let page = self.scan_prefix_after(&prefix, after.as_deref(), PAGE)?;
+                if page.is_empty() {
+                    break;
+                }
+                let last_key = page.last().expect("non-empty page").0.clone();
+                let batch: Vec<(Vec<u8>, Vec<u8>)> = page
+                    .iter()
+                    .map(|(k, v)| {
+                        if let Some((_, _, val, pk)) =
+                            crate::index::IndexManager::parse_index_key(k)
+                        {
+                            (val, pk)
+                        } else {
+                            (k.clone(), v.clone())
+                        }
+                    })
+                    .collect();
+                streamed += batch.len();
+                self.index_manager
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .rebuild_index_add_batch(&class, &column, &batch, live);
+                if batch.len() < PAGE {
+                    break;
+                }
+                after = Some(last_key);
             }
-            self.index_manager
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .rebuild_from_entries(&entries);
-            total_rebuilt += entries.len();
+            total_rebuilt += streamed;
 
             // Orphan cleanup AFTER rebuild so InMemory restart still sees the
-            // index (LSM `__idx2__` is its only persistence).
+            // index (LSM `__idx2__` is its only persistence). Only when the
+            // table itself has no live rows — otherwise we would be deleting
+            // the only copy of a legitimate index (production: lost 60% of
+            // `associated_with` keys after a .idx file was deleted).
             if !is_active {
-                orphaned += entries.len();
-                tracing::warn!(
-                    table = %class,
-                    column = %column,
-                    orphaned_index_entries = entries.len(),
-                    "Found orphaned index entries from interrupted CREATE INDEX. \
-                     Writing tombstones and flushing to reclaim WAL space."
-                );
-                self.cleanup_orphaned_index_entries(&entries, &active_keys)?;
+                if table_alive {
+                    tracing::info!(
+                        table = %class,
+                        column = %column,
+                        entries = streamed,
+                        "Index not registered but table has live rows — kept and rebuilt. \
+                         (A deleted .idx file is not an orphaned CREATE INDEX.)"
+                    );
+                } else {
+                    orphaned += streamed;
+                    tracing::warn!(
+                        table = %class,
+                        column = %column,
+                        orphaned_index_entries = streamed,
+                        "Found orphaned index entries from interrupted CREATE INDEX. \
+                         Writing tombstones and flushing to reclaim WAL space."
+                    );
+                    self.cleanup_orphaned_index_entries_streaming(&prefix, &active_keys)?;
+                }
             }
         }
 
@@ -3180,7 +3448,7 @@ impl LsmEngine {
     }
 
     /// Collect distinct (class, column) pairs appearing under `__idx2__`.
-    /// Walks keys only — values and entry bodies are never retained.
+    /// Walks keys only —values and entry bodies are never retained.
     fn collect_index_columns(
         &self,
     ) -> Result<std::collections::HashSet<(String, String)>> {
@@ -3401,6 +3669,52 @@ impl LsmEngine {
         Ok(())
     }
 
+    /// Paged orphan cleanup: same semantics as [`Self::cleanup_orphaned_index_entries`]
+    /// but never materializes the full prefix.
+    fn cleanup_orphaned_index_entries_streaming(
+        &self,
+        prefix: &[u8],
+        active_keys: &std::collections::HashSet<(String, String)>,
+    ) -> Result<()> {
+        const PAGE: usize = 10_000;
+        let mut after: Option<Vec<u8>> = None;
+        let mut cleaned = 0usize;
+        loop {
+            let page = self.scan_prefix_page_kind(prefix, after.as_deref(), PAGE)?;
+            if page.is_empty() {
+                break;
+            }
+            let last_key = page.last().expect("non-empty page").0.clone();
+            {
+                let mut ws = self.write_state.write();
+                for (key, _v, _kind) in &page {
+                    if let Some((class, column, _, _)) =
+                        crate::index::IndexManager::parse_index_key(key)
+                    {
+                        if !active_keys.contains(&(class, column)) {
+                            let seq = self.next_seq();
+                            let entry = Entry::delete(key.clone(), seq);
+                            ws.wal.append(&entry)?;
+                            ws.memtable.delete_with_seq(key.clone(), seq);
+                            cleaned += 1;
+                        }
+                    }
+                }
+                if cleaned > 0 {
+                    ws.wal.flush_buf()?;
+                }
+            }
+            if page.len() < PAGE {
+                break;
+            }
+            after = Some(last_key);
+        }
+        if cleaned > 0 {
+            tracing::info!(cleaned = cleaned, "Wrote tombstones for orphaned index entries");
+        }
+        Ok(())
+    }
+
     /// Validates all registered indexes by performing a probe (insert + lookup + delete).
     /// Corrupted indexes are logged and removed so they can be rebuilt on demand.
     fn validate_indexes(&self) {
@@ -3451,7 +3765,7 @@ impl LsmEngine {
                     tracing::warn!(
                         table = class.as_str(),
                         column = column.as_str(),
-                        "Index validation failed — marking for removal"
+                        "Index validation failed —marking for removal"
                     );
                     corrupted.push((class.clone(), column.clone()));
                 }
@@ -3469,12 +3783,12 @@ impl LsmEngine {
                 tracing::warn!(
                     table = class.as_str(),
                     column = column.as_str(),
-                    "Removed corrupted index — will be rebuilt on next CREATE INDEX"
+                    "Removed corrupted index —will be rebuilt on next CREATE INDEX"
                 );
             }
             tracing::info!(
                 count = corrupted.len(),
-                "Index validation complete — removed corrupted indexes"
+                "Index validation complete —removed corrupted indexes"
             );
         }
     }
@@ -3709,7 +4023,7 @@ impl LsmEngine {
                 let mut sink = |pk: &[u8], val_bytes: &[u8]| -> Result<bool> {
                     if let Some(doc) = parse_doc_bytes(val_bytes) {
                         if doc.get("__class__").and_then(|v| v.as_str()) == Some(cls.as_str()) {
-                            // base64 Bytes → Packed directly (no f32 round-trip)
+                            // base64 Bytes —Packed directly (no f32 round-trip)
                             if let Some(data) = doc
                                 .get(col.as_str())
                                 .and_then(|v| VecData::from_json(v, dim))
@@ -3763,7 +4077,7 @@ impl LsmEngine {
         }
 
         // Phase 1 done: every restored graph is reconciled (deleted_keys
-        // rebuilt). Ghost safety is complete — safe to serve searches now.
+        // rebuilt). Ghost safety is complete —safe to serve searches now.
         // Backfill is deferred so the gate window does not grow with it.
         {
             let pending_total: usize = pending_backfill.iter().map(|(_, _, m)| m.len()).sum();
@@ -3779,7 +4093,7 @@ impl LsmEngine {
 
         // Phase 2 (post-gate): insert missing vectors with the concurrent-write
         // guard. Search during this window misses these rows (false negatives
-        // only) — see pending_backfill in /api/schema for the remaining count.
+        // only) —see pending_backfill in /api/schema for the remaining count.
         for (class, column, missing) in pending_backfill {
             let (_inserted, _skipped) = self.backfill_vector_missing(&class, &column, missing);
             if let Err(e) = self.persist_vector_graph(&class, &column) {
@@ -3896,8 +4210,8 @@ impl LsmEngine {
         ws.memtable.delete_with_seq(meta_key, seq);
     }
 
-    // ══════════════════════════════════════════════════════════════�?    //  MVCC Transaction API
-    // ══════════════════════════════════════════════════════════════�?
+    // ══════════════════════════════════════════════════════════════—    //  MVCC Transaction API
+    // ══════════════════════════════════════════════════════════════—
     /// Begins a new transaction. Returns the transaction ID.
     /// Snapshot is taken at the last committed data point.
     pub fn begin_txn(&self) -> SeqNo {
@@ -3911,14 +4225,14 @@ impl LsmEngine {
     /// Commits a transaction. Flushes its write buffer to WAL + MemTable.
     ///
     /// Lock strategy (3 phases to avoid nesting write_state inside index locks):
-    ///  Phase 1 — brief write_state: take writes, assign seqs, read old values
+    ///  Phase 1 —brief write_state: take writes, assign seqs, read old values
     ///  Phase 2 — no write_state:    index de/re mutations (independent locks)
-    ///  Phase 3 — brief write_state: WAL + memtable writes
+    ///  Phase 3 —brief write_state: WAL + memtable writes
     pub fn commit_txn(&self, txn_id: SeqNo) -> Result<()> {
         // ── Phase 1: Take writes, assign sequence numbers, read old values ──
         // Snapshot live SST handles newest-first BEFORE acquiring write_state
-        // lock (lock order: levels → sst_cache, then release before write_state).
-        // Only paths still listed in `levels` are included — compacted-away
+        // lock (lock order: levels —sst_cache, then release before write_state).
+        // Only paths still listed in `levels` are included —compacted-away
         // cache leftovers must not be consulted (they can shadow fresher data).
         let sst_handles: Vec<Arc<SsTable>> = {
             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
@@ -4120,8 +4434,8 @@ impl LsmEngine {
     /// Gets a value by key from already-locked write state + live SST handles.
     /// Used by `commit_txn` which holds the write_state write lock.
     ///
-    /// `sst_handles` must be newest-first (L0 → L6, later flushes first) and
-    /// contain only SSTs still listed in `levels` — first hit wins, matching
+    /// `sst_handles` must be newest-first (L0 —L6, later flushes first) and
+    /// contain only SSTs still listed in `levels` —first hit wins, matching
     /// the read path's first-seen-wins contract.
     fn get_from_locked(
         ws: &WriteState,
@@ -4286,7 +4600,7 @@ impl LsmEngine {
         key: &[u8],
         vis: &crate::mvcc::Visibility,
     ) -> Result<Option<Value>> {
-        // Check active MemTable — use range query to find visible version
+        // Check active MemTable —use range query to find visible version
         {
             let ws = self.write_state.read();
             for entry in ws.memtable.get_versions(key) {
@@ -4394,7 +4708,7 @@ impl LsmEngine {
 
         // Backfill: one streaming pass collecting (encoded_value, pk) pairs,
         // then a single bulk_load. The previous per-row path (parse + tree
-        // insert + WAL put per row) ran ~150 rows/s — 40 min for 600k rows.
+        // insert + WAL put per row) ran ~150 rows/s —40 min for 600k rows.
         let prefix = format!("{}::", class);
         let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut lsm_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -4771,7 +5085,7 @@ impl LsmEngine {
     /// Creates a full snapshot backup of the database to `backup_dir`.
     ///
     /// Steps:
-    /// 1. Flush MemTable → SSTable (ensure all data persisted)
+    /// 1. Flush MemTable —SSTable (ensure all data persisted)
     /// 2. Flush disk indexes
     /// 3. Snapshot SSTable paths (after flush, before copy)
     /// 4. Copy all `.sst` files, `wal.log`, and `indexes/*.idx`
@@ -4887,7 +5201,7 @@ impl LsmEngine {
 
     /// Restores the database from a backup created by `backup()`.
     ///
-    /// This is a static method — call it before `LsmEngine::open()`.
+    /// This is a static method —call it before `LsmEngine::open()`.
     /// It copies all backup files into `data_dir`, then the engine's
     /// normal startup (WAL replay + index rebuild) handles recovery.
     pub fn restore(backup_dir: &Path, data_dir: &Path) -> Result<BackupManifest> {
@@ -4929,7 +5243,7 @@ impl LsmEngine {
         Ok(manifest)
     }
 
-    /// Creates an incremental backup — only copies files modified since the given timestamp.
+    /// Creates an incremental backup —only copies files modified since the given timestamp.
     ///
     /// This is much faster than a full backup when only a few SSTables have changed.
     /// The `since` parameter should be the timestamp from a previous full or incremental backup.
@@ -5088,7 +5402,7 @@ impl LsmEngine {
                 continue;
             }
 
-            // Check checksum (skip if 0 — backward compat with old manifests)
+            // Check checksum (skip if 0 —backward compat with old manifests)
             if file.checksum != 0 {
                 let data = fs::read(&path)?;
                 let actual_checksum = crc32fast::hash(&data);
@@ -5241,21 +5555,21 @@ mod tests {
 
     #[test]
     fn test_prefix_may_overlap() {
-        // prefix == min_key �?true
+        // prefix == min_key —true
         assert!(LsmEngine::prefix_may_overlap(b"002", b"002", b"005"));
-        // prefix < min_key, but min_key starts with prefix �?true
+        // prefix < min_key, but min_key starts with prefix —true
         assert!(LsmEngine::prefix_may_overlap(b"00", b"002", b"005"));
-        // prefix < min_key, min_key does NOT start with prefix �?false
+        // prefix < min_key, min_key does NOT start with prefix —false
         assert!(!LsmEngine::prefix_may_overlap(b"001", b"002", b"005"));
-        // prefix in range �?true
+        // prefix in range —true
         assert!(LsmEngine::prefix_may_overlap(b"003", b"002", b"005"));
-        // prefix == max_key �?true
+        // prefix == max_key —true
         assert!(LsmEngine::prefix_may_overlap(b"005", b"002", b"005"));
-        // prefix > max_key �?false
+        // prefix > max_key —false
         assert!(!LsmEngine::prefix_may_overlap(b"006", b"002", b"005"));
-        // prefix much larger �?false
+        // prefix much larger —false
         assert!(!LsmEngine::prefix_may_overlap(b"Z", b"A", b"B"));
-        // empty prefix matches everything �?true
+        // empty prefix matches everything —true
         assert!(LsmEngine::prefix_may_overlap(b"", b"A", b"Z"));
         // prefix entirely before the SST range
         assert!(!LsmEngine::prefix_may_overlap(b"001", b"002", b"005"));
@@ -5338,7 +5652,7 @@ mod tests {
         if let Some((_, v)) = lim.iter().find(|(k, _)| k.as_slice() == b"T::000") {
             assert_eq!(v.as_slice(), b"NEWEST", "must return latest version");
         }
-        // T::001 is deleted — must not appear
+        // T::001 is deleted —must not appear
         assert!(!lim.iter().any(|(k, _)| k.as_slice() == b"T::001"));
 
         // limit=1 returns exactly 1 live entry
@@ -5371,7 +5685,7 @@ mod tests {
             let key = format!("Product::{i:03}");
             engine.delete(key.into_bytes()).expect("should be valid");
         }
-        // Overwrite one odd key to "keep" via a newer Put — filter must see the winner
+        // Overwrite one odd key to "keep" via a newer Put —filter must see the winner
         engine
             .put(b"Product::005".to_vec(), b"keep-overwritten".to_vec())
             .expect("should be valid");
@@ -5429,7 +5743,7 @@ mod tests {
             .count_prefix_with(b"Item::", None, |v| Ok(v == b"a"))
             .expect("should be valid");
         assert_eq!(before.0, after.0, "matched count must survive flush");
-        assert_eq!(after.0, 17, "i%3==0 for 0..50 → 17 items");
+        assert_eq!(after.0, 17, "i%3==0 for 0..50 —17 items");
     }
 
     /// Version selection must follow level order (newest first), never `seq`.
@@ -5488,7 +5802,7 @@ mod tests {
     }
 
     /// Regression: concurrent flush_memtable calls used to race on the single
-    /// `immutable_memtable` slot — the loser's entries vanished from reads
+    /// `immutable_memtable` slot —the loser's entries vanished from reads
     /// (lost UPDATE/DELETE under bulk import). Four writers + two flushers on
     /// a tiny memtable must never lose a write.
     #[test]
@@ -5721,7 +6035,7 @@ mod tests {
         engine2.shutdown();
     }
 
-    /// Explicit single flush then read back — isolates persist_immutable_to_sst.
+    /// Explicit single flush then read back —isolates persist_immutable_to_sst.
     #[test]
     fn test_explicit_flush_preserves_keys() {
         let dir = tempdir().expect("should be valid");
@@ -5817,7 +6131,7 @@ mod tests {
         );
     }
 
-    /// Minimal repro: plain put() with frequent flush — every key must stay
+    /// Minimal repro: plain put() with frequent flush —every key must stay
     /// visible while the engine is still open (no restart involved).
     #[test]
     fn test_puts_stay_visible_across_flush() {
@@ -6332,13 +6646,13 @@ mod tests {
 
     /// File-count hard trigger: a crowded level must drain via bounded merge
     /// batches even when size-score stays under 1.0. Also covers deepest-level
-    /// batched self-merge (L6 path) — previously file count only grew.
+    /// batched self-merge (L6 path) —previously file count only grew.
     #[test]
     fn test_file_count_trigger_merges_crowded_level() {
         let dir = tempdir().expect("should be valid");
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
-            // Tiny memtable → frequent flushes → many SSTs per level.
+            // Tiny memtable —frequent flushes —many SSTs per level.
             memtable_size_limit: 64,
             size_ratio: 2,
             ..Default::default()
@@ -6364,7 +6678,7 @@ mod tests {
 
         let after = engine.stats();
         println!(
-            "file-count trigger: sstables {} → {} (levels {} → {})",
+            "file-count trigger: sstables {} —{} (levels {} —{})",
             before.total_sstables, after.total_sstables, before.num_levels, after.num_levels
         );
 
@@ -6383,7 +6697,7 @@ mod tests {
         // down or at least hold it (never a regression toward more files).
         assert!(
             after.total_sstables <= before.total_sstables,
-            "file-count trigger must not increase SST count ({} → {})",
+            "file-count trigger must not increase SST count ({} —{})",
             before.total_sstables,
             after.total_sstables
         );
@@ -6402,7 +6716,7 @@ mod tests {
         };
         let engine = LsmEngine::open(options).expect("should be valid");
 
-        // Same 20 keys overwritten many times → multi-version SSTs.
+        // Same 20 keys overwritten many times —multi-version SSTs.
         for round in 0..30u32 {
             for i in 0..20u32 {
                 let key = format!("ov{:03}", i);
@@ -6577,8 +6891,8 @@ mod tests {
         assert!(stats.total_sstables > 0, "should have SSTables");
     }
 
-    // ══════════════════════════════════════════════════════════════�?    //  MVCC Transaction Tests
-    // ══════════════════════════════════════════════════════════════�?
+    // ══════════════════════════════════════════════════════════════—    //  MVCC Transaction Tests
+    // ══════════════════════════════════════════════════════════════—
     #[test]
     fn test_txn_basic_commit() {
         let dir = tempdir().expect("should be valid");
@@ -6870,7 +7184,7 @@ mod tests {
             engine.flush().expect("should be valid");
         }
 
-        // Phase 2: Reopen engine — index entries live in SSTs; rebuild the
+        // Phase 2: Reopen engine —index entries live in SSTs; rebuild the
         // in-memory IndexManager from them. `open()` defers this to the caller
         // (the server does it on a background thread) so startup stays fast.
         {
@@ -6910,6 +7224,131 @@ mod tests {
                 );
             assert!(pkeys.is_some());
             assert_eq!(pkeys.expect("should be valid").len(), 2); // both products
+        }
+    }
+
+    /// A deleted `.idx` file must NOT be treated as an interrupted CREATE
+    /// INDEX. If the table still has live rows, the `__idx2__` entries are the
+    /// index's only persistence — rebuild must keep them, never tombstone.
+    #[test]
+    fn test_orphan_cleanup_keeps_index_when_table_alive() {
+        let dir = tempdir().expect("should be valid");
+        let data_dir = dir.path().to_path_buf();
+
+        // Phase 1: hybrid mode with a tiny threshold so the index goes to disk.
+        {
+            let options = StorageOptions {
+                data_dir: data_dir.clone(),
+                memtable_size_limit: 1024 * 1024,
+                index_storage_mode: Some(crate::index::IndexStorageMode::Hybrid {
+                    threshold_entries: 1,
+                }),
+                ..Default::default()
+            };
+            let engine = LsmEngine::open(options).expect("should be valid");
+            engine
+                .create_index("Edge", "src")
+                .expect("should be valid");
+
+            let txn = engine.begin_txn();
+            for i in 0..20u32 {
+                let doc = serde_json::json!({"__class__": "Edge", "src": format!("s{i}"), "dst": i});
+                engine
+                    .txn_put(
+                        txn,
+                        format!("Edge::{i:04}").into_bytes(),
+                        serde_json::to_vec(&doc).expect("should be valid"),
+                    )
+                    .expect("should be valid");
+            }
+            engine.commit_txn(txn).expect("should be valid");
+            engine.flush().expect("should be valid");
+        }
+
+        // Delete the disk index file — the incident that triggered the
+        // production data loss (associated_with lost 60% of its keys).
+        let idx_path = data_dir.join("indexes").join("Edge_src.idx");
+        let alt_idx_path = data_dir.join("Edge_src.idx");
+        for p in [&idx_path, &alt_idx_path] {
+            if p.exists() {
+                std::fs::remove_file(p).expect("should be valid");
+            }
+        }
+        let data_dir2 = data_dir.clone();
+
+        // Phase 2: reopen + rebuild. The table is alive (20 rows) so the
+        // __idx2__ entries must be rebuilt into a fresh index, NOT tombstoned.
+        {
+            let options = StorageOptions {
+                data_dir,
+                memtable_size_limit: 1024 * 1024,
+                index_storage_mode: Some(crate::index::IndexStorageMode::Hybrid {
+                    threshold_entries: 1,
+                }),
+                ..Default::default()
+            };
+            let engine = LsmEngine::open(options).expect("should be valid");
+            engine.rebuild_indexes().expect("should be valid");
+
+            assert!(
+                engine.has_index("Edge", "src"),
+                "index must be rebuilt after .idx file loss"
+            );
+            let pkeys = engine
+                .index_manager()
+                .write()
+                .expect("should be valid")
+                .lookup_eq("Edge", "src", &serde_json::json!("s7"));
+            let pkeys = pkeys.unwrap_or_default();
+            assert_eq!(
+                pkeys.len(),
+                1,
+                "lookup must find the row after rebuild (not tombstoned)"
+            );
+
+            // And the row must still be there.
+            let mut found = false;
+            engine
+                .for_each_live_prefix(b"Edge::", None, None, |_k, _v| {
+                    found = true;
+                    Ok(())
+                })
+                .expect("should be valid");
+            assert!(found, "table rows must survive rebuild");
+        }
+
+        // Phase 3: second restart + rebuild. Without the fix the first
+        // rebuild tombstoned the `__idx2__` LSM entries, so this pass would
+        // see an empty index keyspace and the lookup would silently return 0.
+        // Delete the .idx again so rebuild must reconstruct from the LSM.
+        for p in [&idx_path, &alt_idx_path] {
+            if p.exists() {
+                std::fs::remove_file(p).expect("should be valid");
+            }
+        }
+        {
+            let options = StorageOptions {
+                data_dir: data_dir2,
+                memtable_size_limit: 1024 * 1024,
+                index_storage_mode: Some(crate::index::IndexStorageMode::Hybrid {
+                    threshold_entries: 1,
+                }),
+                ..Default::default()
+            };
+            let engine = LsmEngine::open(options).expect("should be valid");
+            engine.rebuild_indexes().expect("should be valid");
+
+            let pkeys = engine
+                .index_manager()
+                .write()
+                .expect("should be valid")
+                .lookup_eq("Edge", "src", &serde_json::json!("s7"));
+            let pkeys = pkeys.unwrap_or_default();
+            assert_eq!(
+                pkeys.len(),
+                1,
+                "index must survive a second rebuild —__idx2__ entries were tombstoned"
+            );
         }
     }
 
@@ -7278,7 +7717,7 @@ mod tests {
         engine.flush().expect("final flush");
         engine.flush_compaction().expect("final compaction");
 
-        // Deleted keys must stay deleted — point reads, streaming scans AND
+        // Deleted keys must stay deleted —point reads, streaming scans AND
         // scan_prefix (the path SQL SELECT uses).
         for i in 0..40u32 {
             let key = format!("vic{i:03}");

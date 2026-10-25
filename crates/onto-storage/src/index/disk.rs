@@ -659,18 +659,27 @@ impl DiskPage {
         // Collect all live entries and their slot metadata
         let num = header.num_entries;
         let mut entries: Vec<(Vec<u8>, u16)> = Vec::with_capacity(num as usize);
+        let mut skipped = 0u32;
         for i in 0..num {
             if let (Some(entry_data), Some((_, key_len))) = (self.entry_data(i), self.read_slot(i))
             {
                 entries.push((entry_data.to_vec(), key_len));
+            } else {
+                skipped += 1;
             }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                "defrag: {skipped}/{num} slots unreadable and dropped from page {}",
+                self.page_id
+            );
         }
 
         // Rewrite entries contiguously from the end of the page
         let mut write_pos = PAGE_SIZE;
         for (entry_data, _key_len) in entries.iter().rev() {
             write_pos = match write_pos.checked_sub(entry_data.len()) {
-                Some(p) if p >= Self::slot_offset(num) => p,
+                Some(p) if p >= Self::slot_offset(entries.len() as u16) => p,
                 _ => return, // inconsistent page — leave as-is rather than corrupt further
             };
             self.data[write_pos..write_pos + entry_data.len()].copy_from_slice(entry_data);
@@ -683,10 +692,13 @@ impl DiskPage {
             pos += entry_data.len();
         }
 
-        // Update header
+        // Update header. num_entries MUST match the slots we actually rewrote —
+        // leaving the old count points the tail at pre-rewrite offsets, which
+        // later decode as "corrupted entry" during internal splits.
         let mut h = header;
+        h.num_entries = entries.len() as u16;
         h.data_start = write_pos as u16;
-        let used = HEADER_SIZE + (num as usize) * SLOT_SIZE + (PAGE_SIZE - write_pos);
+        let used = HEADER_SIZE + (entries.len() as usize) * SLOT_SIZE + (PAGE_SIZE - write_pos);
         h.free_size = (PAGE_SIZE - used) as u16;
         self.set_header(&h);
     }
@@ -873,11 +885,15 @@ impl DiskPage {
         new_page.set_right_leaf(new_right);
         new_page.set_left_leaf(self.page_id);
 
-        // Truncate self: update num_entries
+        // Truncate self: update num_entries and free the moved half's space.
+        // Leaving data_start pointing into the moved region lets the next
+        // insert allocate over survivors.
         let mut h = header;
         h.num_entries = mid;
         h.right_leaf = new_page.page_id;
+        // Compact survivors to the page end so data_start/free_size stay sane.
         self.set_header(&h);
+        self.defrag();
 
         // The split key is the first key in the new page
         let split_key = new_page.get_leaf(0).map(|(k, _)| k).unwrap_or_default();
@@ -1859,12 +1875,16 @@ impl BTreeIndex {
         }
 
         // Merge with a sibling — the leaf is absorbed and ceases to exist.
+        // `merge_leaves` returns false when the combined node will not fit;
+        // the leaf is still alive in that case and the caller must update the
+        // parent separator (otherwise find_leaf misses the whole leaf).
         if child_idx > 0 {
-            self.merge_leaves(parent_id, child_idx - 1, child_idx)?;
-            Ok(true)
+            // left absorbs right; our leaf is the right one and goes away.
+            self.merge_leaves(parent_id, child_idx - 1, child_idx)
         } else if num_children > 1 {
+            // left (our leaf) absorbs right; our leaf survives.
             self.merge_leaves(parent_id, child_idx, child_idx + 1)?;
-            Ok(true)
+            Ok(false)
         } else {
             Ok(false)
         }
@@ -2148,25 +2168,34 @@ impl BTreeIndex {
         let left_orig = self.get_page(left_id)?;
         let right = self.get_page(right_id)?;
 
-        // Collect all entries: left's first_child + left's entries + separator + right's first_child + right's entries
+        // Collect all entries in key order:
+        // left's entries, then the parent separator (whose child is right's
+        // first_child), then right's entries. The separator MUST sit between
+        // the two halves — pushing it first scrambles the internal key order
+        // and orphans children on the next descent.
         let left_first = left_orig.first_child();
         let right_first = right.first_child();
 
         let mut all_entries: Vec<(Vec<u8>, u32)> = Vec::new();
-        // Separator goes first with right_first as its child
-        all_entries.push((separator_key.clone(), right_first));
 
         // Left's existing entries
         let num_left = left_orig.num_entries();
         for i in 0..num_left {
-            let (key, child) = left_orig.get_internal(i).expect("should be valid");
+            let (key, child) = left_orig.get_internal(i).ok_or_else(|| {
+                onto_core::CoreError::Corruption("merge_internals: unreadable left slot".into())
+            })?;
             all_entries.push((key, child));
         }
+
+        // Separator from parent, adopting right's first child
+        all_entries.push((separator_key.clone(), right_first));
 
         // Right's entries
         let num_right = right.num_entries();
         for i in 0..num_right {
-            let (key, child) = right.get_internal(i).expect("should be valid");
+            let (key, child) = right.get_internal(i).ok_or_else(|| {
+                onto_core::CoreError::Corruption("merge_internals: unreadable right slot".into())
+            })?;
             all_entries.push((key, child));
         }
 
@@ -2539,6 +2568,7 @@ impl BTreeIndex {
         // Save parent before rebuilding
         let parent_id = leaf.header().map(|h| h.parent).unwrap_or(NULL_PAGE);
         let old_right = leaf.header().map(|h| h.right_leaf).unwrap_or(NULL_PAGE);
+        let old_left = leaf.header().map(|h| h.left_leaf).unwrap_or(NULL_PAGE);
         let leaf_page_id = leaf.page_id;
 
         // Collect all entries including the new one
@@ -2547,7 +2577,9 @@ impl BTreeIndex {
         let mut inserted = false;
 
         for i in 0..num {
-            let (k, pks) = leaf.get_leaf(i).unwrap_or_default();
+            let (k, pks) = leaf.get_leaf(i).ok_or_else(|| {
+                onto_core::CoreError::Corruption("insert_and_split_leaf: unreadable leaf slot".into())
+            })?;
             if !inserted && i == insert_pos {
                 all_entries.push((key.to_vec(), vec![pk.clone()]));
                 inserted = true;
@@ -2579,6 +2611,7 @@ impl BTreeIndex {
         }
 
         // Set sibling pointers
+        leaf.set_left_leaf(old_left);
         leaf.set_right_leaf(new_page_id);
         new_leaf_page.set_left_leaf(leaf.page_id);
         new_leaf_page.set_right_leaf(old_right);
@@ -2659,6 +2692,13 @@ impl BTreeIndex {
                 .is_ok()
         {
             self.put_page(&parent)?;
+            // CRITICAL: the newly attached right child must point back at this
+            // parent. Without this, a later split of that child sees parent=0,
+            // creates a brand-new root, and orphans the entire left subtree
+            // (production: `associated_with_source.idx` lost 60% of keys).
+            let mut right = self.get_page(right_child_id)?;
+            right.set_parent(parent_id);
+            self.put_page(&right)?;
         } else {
             self.split_internal_and_insert(parent, insert_pos, key, right_child_id)?;
         }
@@ -3722,5 +3762,306 @@ mod tests {
             .range_scan(None, None)
             .expect("should be valid")
             .is_empty());
+    }
+
+    /// Pinpoint the insert index at which the leftmost key becomes unreachable.
+    #[test]
+    fn test_find_when_leftmost_key_disappears() {
+        let dir = tempfile::tempdir().expect("should be valid");
+        let path = dir.path().join("leftmost.idx");
+        let mut idx = BTreeIndex::create(&path, "T", "c").expect("should be valid");
+
+        let value0 = format!("sembio::ClinVar::{}", 1_000_000);
+        let pk0 = format!("sembio::associated_with::0::Gene::ABC0");
+
+        for i in 0..2000u32 {
+            let value = format!("sembio::ClinVar::{}", 1_000_000 + i);
+            let pk = format!("sembio::associated_with::{}::Gene::ABC{}", i, i % 97);
+            idx.insert(value.as_bytes(), pk.into_bytes()).expect("insert");
+
+            let hits = idx.lookup(value0.as_bytes()).expect("lookup0");
+            let ok = hits.iter().any(|p| p.as_slice() == pk0.as_bytes());
+            if i == 1857 || i == 1858 || !ok {
+                eprintln!("i={i} leftmost_ok={ok}");
+                let mut pid = idx.meta.root_page;
+                for depth in 0..5 {
+                    let page = idx.get_page(pid).expect("get");
+                    let pt = page.page_type();
+                    eprintln!(
+                        "  depth={depth} page={pid} type={pt:?} n={} fc={}",
+                        page.num_entries(),
+                        page.first_child()
+                    );
+                    if pt == PageType::Leaf {
+                        if let Some((k, _)) = page.get_leaf(0) {
+                            eprintln!("    leaf k0={:?}", String::from_utf8_lossy(&k).to_string());
+                        }
+                        // sibling
+                        eprintln!("    right_leaf={}", page.header().unwrap().right_leaf);
+                        break;
+                    }
+                    pid = page.first_child();
+                }
+                // Walk every page, check internal slots readable
+                for pid in 0..idx.meta.num_pages {
+                    let page = match idx.get_page(pid) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    let pt = page.page_type();
+                    let n = page.num_entries();
+                    let mut bad = Vec::new();
+                    if pt == PageType::Internal {
+                        for s in 0..n {
+                            if page.get_internal(s).is_none() {
+                                bad.push(s);
+                            }
+                        }
+                    }
+                    let k0 = if pt == PageType::Leaf {
+                        page.get_leaf(0)
+                            .map(|(k, _)| String::from_utf8_lossy(&k).to_string())
+                    } else {
+                        page.get_internal(0)
+                            .map(|(k, _)| String::from_utf8_lossy(&k).to_string())
+                    };
+                    if !bad.is_empty() || pid <= 3 || pid == 58 || pid == 86 || pid == 115 {
+                        eprintln!(
+                            "  page={pid} type={pt:?} n={n} fc={} parent={} k0={k0:?} bad={bad:?}",
+                            page.first_child(),
+                            page.header().map(|h| h.parent).unwrap_or(0)
+                        );
+                    }
+                }
+            }
+            if !ok {
+                panic!("leftmost lost at i={i}");
+            }
+        }
+    }
+
+    /// Diagnostic: where do inserts start disappearing?
+    #[test]
+    fn test_insert_loss_threshold_debug() {
+        let dir = tempfile::tempdir().expect("should be valid");
+        let path = dir.path().join("thresh.idx");
+        let mut idx = BTreeIndex::create(&path, "T", "c").expect("should be valid");
+
+        for n in [1600u32, 1800, 2000, 2200, 2400, 2600, 2800, 3200] {
+            let path_n = dir.path().join(format!("n{n}.idx"));
+            let mut idx = BTreeIndex::create(&path_n, "T", "c").expect("should be valid");
+            for i in 0..n {
+                let value = format!("sembio::ClinVar::{}", 1_000_000 + i);
+                let pk = format!("sembio::associated_with::{}::Gene::ABC{}", i, i % 97);
+                idx.insert(value.as_bytes(), pk.into_bytes()).expect("insert");
+            }
+            let scanned = idx.range_scan(None, None).expect("scan").len();
+            let mut looked = 0u32;
+            for i in 0..n {
+                let value = format!("sembio::ClinVar::{}", 1_000_000 + i);
+                let pk = format!("sembio::associated_with::{}::Gene::ABC{}", i, i % 97);
+                let hits = idx.lookup(value.as_bytes()).expect("lookup");
+                if hits.iter().any(|p| p.as_slice() == pk.as_bytes()) {
+                    looked += 1;
+                }
+            }
+            eprintln!("n={n} range_scan={scanned} lookup_ok={looked}");
+            if looked < n {
+                let mut missing = Vec::new();
+                for i in 0..n {
+                    let value = format!("sembio::ClinVar::{}", 1_000_000 + i);
+                    let pk = format!("sembio::associated_with::{}::Gene::ABC{}", i, i % 97);
+                    let hits = idx.lookup(value.as_bytes()).expect("lookup");
+                    if !hits.iter().any(|p| p.as_slice() == pk.as_bytes()) {
+                        missing.push(i);
+                    }
+                }
+                eprintln!(
+                    "  missing {} range {}..{} (first10 {:?})",
+                    missing.len(),
+                    missing.first().unwrap_or(&0),
+                    missing.last().unwrap_or(&0),
+                    &missing[..missing.len().min(10)]
+                );
+                // First keys the leaf chain actually yields
+                let pairs = idx.range_scan_pairs(None, None, Some(5)).unwrap_or_default();
+                eprintln!("  first5 pairs on chain: {:?}", pairs);
+
+                // Walk root → first_child chain (private, same module)
+                let mut pid = idx.meta.root_page;
+                let mut depth = 0;
+                while depth < 6 {
+                    let page = idx.get_page(pid).expect("get");
+                    let pt = page.page_type();
+                    let n = page.num_entries();
+                    let fc = page.first_child();
+                    let k0 = page.get_internal(0).map(|(k, _)| k);
+                    let l0 = page.get_leaf(0).map(|(k, _)| k);
+                    eprintln!(
+                        "  depth={depth} page={pid} type={pt:?} n={n} first_child={fc} k0_internal={:?} k0_leaf={:?}",
+                        k0.as_ref().map(|k| String::from_utf8_lossy(k).to_string()),
+                        l0.as_ref().map(|k| String::from_utf8_lossy(k).to_string()),
+                    );
+                    if pt == PageType::Leaf {
+                        break;
+                    }
+                    pid = fc;
+                    depth += 1;
+                }
+            }
+        }
+    }
+
+    /// Production-shaped keys (value || 0x00 0x00 || pk) at scale. Internal
+    /// node splits must not drop slot pointers — a skip in
+    /// `split_internal_and_insert` silently lost subtrees in production
+    /// (`corrupted entry at slot i/41`).
+    #[test]
+    fn test_insert_long_keys_many_internal_splits_no_loss() {
+        let dir = tempfile::tempdir().expect("should be valid");
+        let path = dir.path().join("long_keys.idx");
+        let mut idx = BTreeIndex::create(&path, "sembio.associated_with", "source")
+            .expect("should be valid");
+
+        let n = 8000u32;
+        for i in 0..n {
+            let value = format!("sembio::ClinVar::{}", 1_000_000 + i);
+            let pk = format!("sembio::associated_with::{}::Gene::ABC{}", i, i % 97);
+            idx.insert(value.as_bytes(), pk.into_bytes())
+                .unwrap_or_else(|e| panic!("insert {i} failed: {e}"));
+        }
+
+        let mut missing = 0u32;
+        for i in 0..n {
+            let value = format!("sembio::ClinVar::{}", 1_000_000 + i);
+            let pk = format!("sembio::associated_with::{}::Gene::ABC{}", i, i % 97);
+            let hits = idx
+                .lookup(value.as_bytes())
+                .unwrap_or_else(|e| panic!("lookup {i} failed: {e}"));
+            if !hits.iter().any(|p| p.as_slice() == pk.as_bytes()) {
+                missing += 1;
+            }
+        }
+        assert_eq!(missing, 0, "{missing}/{n} keys lost after internal splits");
+        assert_eq!(
+            idx.count_range(None, None).expect("should be valid"),
+            n as u64
+        );
+    }
+
+    /// `defrag` must never leave `num_entries` above the number of rewritten
+    /// slots. A stale tail slot later reads as a "corrupted entry" during
+    /// `split_internal_and_insert` and is skipped — losing a child pointer.
+    #[test]
+    fn test_defrag_updates_num_entries_when_slots_unreadable() {
+        let mut page = DiskPage::new(1, PageType::Internal);
+        page.set_first_child(10);
+        for i in 0..8u32 {
+            let key = format!("k{i:04}");
+            page.append_internal(key.as_bytes(), 100 + i)
+                .expect("should be valid");
+        }
+        assert_eq!(page.num_entries(), 8);
+
+        // Corrupt slot 3's entry_offset so entry_data/decode fails.
+        let off = DiskPage::slot_offset(3);
+        page.data[off..off + 2].copy_from_slice(&0xFFFEu16.to_le_bytes());
+
+        page.defrag();
+
+        // Every remaining slot must be readable; num_entries must match the
+        // slots defrag actually rewrote. The old code kept num_entries=8 and
+        // left a stale tail.
+        let live = (0..page.num_entries())
+            .filter(|i| page.get_internal(*i).is_some())
+            .count();
+        assert_eq!(
+            live as u16,
+            page.num_entries(),
+            "defrag left unreadable slots under num_entries"
+        );
+        // And no silent hole in the middle of the live range.
+        for i in 0..page.num_entries() {
+            assert!(
+                page.get_internal(i).is_some(),
+                "slot {i}/{} unreadable after defrag",
+                page.num_entries()
+            );
+        }
+    }
+
+    /// split_leaf truncates num_entries but leaves data_start pointing into
+    /// the moved half. Subsequent inserts must not scramble the survivors.
+    /// Also covers remove → underflow → merge_internals, which must not
+    /// scramble internal key order (that orphans whole subtrees).
+    #[test]
+    fn test_split_leaf_then_insert_keeps_survivors() {
+        let dir = tempfile::tempdir().expect("should be valid");
+        let path = dir.path().join("split_leaf.idx");
+        let mut idx = BTreeIndex::create(&path, "T", "c").expect("should be valid");
+
+        // Fill one leaf then force a split, then keep inserting.
+        for i in 0..500u32 {
+            let key = format!("{:0>120}", format!("key_{:05}", i));
+            idx.insert(key.as_bytes(), format!("pk_{i}").into_bytes())
+                .unwrap_or_else(|e| panic!("insert {i}: {e}"));
+        }
+        // Interleave removals to trigger defrag + leaf/internal merges.
+        for i in (0..500u32).step_by(3) {
+            let key = format!("{:0>120}", format!("key_{:05}", i));
+            idx.remove(key.as_bytes(), format!("pk_{i}").as_bytes())
+                .unwrap_or_else(|e| panic!("remove {i}: {e}"));
+        }
+        for i in 500..900u32 {
+            let key = format!("{:0>120}", format!("key_{:05}", i));
+            idx.insert(key.as_bytes(), format!("pk_{i}").into_bytes())
+                .unwrap_or_else(|e| panic!("insert {i}: {e}"));
+        }
+
+        let mut missing = 0u32;
+        for i in 0..900u32 {
+            if i % 3 == 0 && i < 500 {
+                continue; // removed
+            }
+            let key = format!("{:0>120}", format!("key_{:05}", i));
+            let hits = idx.lookup(key.as_bytes()).expect("lookup");
+            if hits.len() != 1 {
+                missing += 1;
+            }
+        }
+        assert_eq!(missing, 0, "{missing} keys missing after split/defrag traffic");
+    }
+
+    /// Internal-page split must not drop entries (the production skip path).
+    #[test]
+    fn test_split_internal_and_insert_keeps_all_children() {
+        let dir = tempfile::tempdir().expect("should be valid");
+        let path = dir.path().join("isplit.idx");
+        let mut idx = BTreeIndex::create(&path, "T", "c").expect("should be valid");
+
+        // Enough keys + long separators to force multiple internal splits
+        // (byte-full internal pages, like 41-entry production pages).
+        for i in 0..3000u32 {
+            let value = format!("v{:040}_suffix_to_grow_key_len_{:06}", i % 500, i);
+            let pk = format!("pk_{i:06}_and_some_padding_bytes_here");
+            idx.insert(value.as_bytes(), pk.into_bytes())
+                .unwrap_or_else(|e| panic!("insert {i}: {e}"));
+        }
+
+        // Range scan must see every live pair — a dropped internal pointer
+        // hides an entire subtree.
+        let all = idx.range_scan(None, None).expect("scan");
+        assert_eq!(all.len(), 3000, "range_scan lost entries after internal splits");
+
+        let mut missing = 0u32;
+        for i in 0..3000u32 {
+            let value = format!("v{:040}_suffix_to_grow_key_len_{:06}", i % 500, i);
+            let pk = format!("pk_{i:06}_and_some_padding_bytes_here");
+            let hits = idx.lookup(value.as_bytes()).expect("lookup");
+            if !hits.iter().any(|p| p.as_slice() == pk.as_bytes()) {
+                missing += 1;
+            }
+        }
+        assert_eq!(missing, 0, "{missing} pairs lost via internal split");
     }
 }

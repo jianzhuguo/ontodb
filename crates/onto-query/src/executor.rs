@@ -827,9 +827,20 @@ impl QueryExecutor {
         std::thread::Builder::new()
             .name("count-warmup".into())
             .spawn(move || {
-                // Wait for engine to finish loading data (index rebuild, compaction, etc.)
-                tracing::info!("Row count cache warmup waiting for engine ready...");
-                std::thread::sleep(std::time::Duration::from_secs(30));
+                // Wait for the background index/vector rebuild to finish.
+                // The old path slept a fixed 30s and then ran count_prefix on
+                // every table WHILE rebuild still held scan buffers — that
+                // race OOM'd the process at multi-million-row classes.
+                tracing::info!("Row count cache warmup waiting for index rebuild...");
+                let mut waited = 0u32;
+                while !engine.index_rebuild_done() {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    waited += 1;
+                    if waited >= 900 {
+                        tracing::warn!("Warmup giving up wait after 30min; counting anyway");
+                        break;
+                    }
+                }
 
                 tracing::info!("Row count cache warmup started");
 
