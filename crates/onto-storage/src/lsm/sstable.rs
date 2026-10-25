@@ -476,11 +476,42 @@ impl SsTableBuilder {
                     }
                 }
                 let compressor = slot.as_mut()?;
-                // Slice WriteBuf: never `Vec::set_len`, same contract as decompress.
+                // Same contract as decompress_limited: allocate slack past
+                // `bound`, hand zstd only `buf[..bound]`. ZSTD_wildcopy may
+                // over-write up to WILDCOPY_OVERLENGTH (32) bytes past the
+                // logical output end; without slack that lands in the heap
+                // header and surfaces later as a corrupted free-list bitmap
+                // inside RtlFreeHeap.
                 let bound = zstd::zstd_safe::compress_bound(self.current_block.len());
-                let mut buf = vec![0u8; bound];
-                match compressor.compress_to_buffer(self.current_block.as_slice(), &mut buf[..]) {
-                    Ok(n) => Some(buf[..n].to_vec()),
+                let canary_start = bound;
+                let alloc = canary_start
+                    .saturating_add(ZSTD_WILDCOPY_MARGIN)
+                    .saturating_add(ZSTD_GUARD_CANARY.len());
+                let mut buf = vec![0u8; alloc];
+                buf[canary_start.saturating_add(ZSTD_WILDCOPY_MARGIN)..]
+                    .copy_from_slice(&ZSTD_GUARD_CANARY);
+                let result =
+                    compressor.compress_to_buffer(self.current_block.as_slice(), &mut buf[..bound]);
+                if buf[canary_start.saturating_add(ZSTD_WILDCOPY_MARGIN)..] != ZSTD_GUARD_CANARY[..]
+                {
+                    // Corrupt compress wrote past bound+slack. Discard the CCtx
+                    // and fall back to the raw block below.
+                    tracing::warn!(
+                        "zstd compress smashed guard canary (src_len={}) — dropping CCtx",
+                        self.current_block.len()
+                    );
+                    *slot = None;
+                    return None;
+                }
+                match result {
+                    Ok(n) => {
+                        if n > bound {
+                            // Belt-and-suspenders; should be impossible.
+                            *slot = None;
+                            return None;
+                        }
+                        Some(buf[..n].to_vec())
+                    }
                     Err(_) => {
                         // Drop the CCtx: a failed compress can leave the
                         // zstd 1.5.7 workspace in a half-reserved state

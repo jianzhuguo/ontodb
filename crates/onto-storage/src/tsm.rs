@@ -319,14 +319,40 @@ pub fn compress_block(data: &[u8]) -> Vec<u8> {
             }
         }
         let compressor = slot.as_mut().expect("just initialized");
+        // Same slack+canary contract as decompress_block / sstable::flush_block:
+        // ZSTD_wildcopy may over-write up to WILDCOPY_OVERLENGTH (32) bytes
+        // past the logical output end. Hand zstd only buf[..bound].
         let bound = zstd::zstd_safe::compress_bound(data.len());
-        let mut buf = vec![0u8; bound];
-        match compressor.compress_to_buffer(data, &mut buf[..]) {
-            Ok(n) => {
+        const MARGIN: usize = 64;
+        const CANARY: [u8; 16] = [
+            0xC5, 0x9A, 0x3B, 0x71, 0xE2, 0x4D, 0x88, 0x16, 0x5F, 0xA3, 0x0C, 0xD7, 0x64, 0x29,
+            0xB1, 0x7E,
+        ];
+        let canary_start = bound;
+        let mut buf = vec![0u8; canary_start.saturating_add(MARGIN).saturating_add(CANARY.len())];
+        buf[canary_start.saturating_add(MARGIN)..].copy_from_slice(&CANARY);
+        let result = compressor.compress_to_buffer(data, &mut buf[..bound]);
+        if buf[canary_start.saturating_add(MARGIN)..] != CANARY[..] {
+            tracing::warn!(
+                "tsm compress smashed guard canary (src_len={}) — dropping CCtx",
+                data.len()
+            );
+            *slot = None;
+            return data.to_vec();
+        }
+        match result {
+            Ok(n) if n <= bound => {
                 buf.truncate(n);
                 buf
             }
-            Err(_) => data.to_vec(),
+            Ok(_) => {
+                *slot = None;
+                data.to_vec()
+            }
+            Err(_) => {
+                *slot = None;
+                data.to_vec()
+            }
         }
     })
 }
