@@ -3264,6 +3264,24 @@ impl LsmEngine {
             let prefix = crate::index::IndexManager::make_index_prefix(&class, &column);
             let is_active = active_keys.contains(&(class.clone(), column.clone()));
 
+            // Intentional DROP INDEX: never resurrect. Any leftover `__idx2__`
+            // entries are orphans from an incomplete tombstone sweep (or a
+            // drop that raced with compaction) — clean them up, don't rebuild.
+            if self.idx_dropped(&class, &column) {
+                let (live, _) = self.count_prefix(&prefix)?;
+                if live > 0 {
+                    orphaned += live;
+                    tracing::warn!(
+                        table = %class,
+                        column = %column,
+                        leftover_index_entries = live,
+                        "Dropped index still has live __idx2__ entries — tombstoning orphans, not rebuilding"
+                    );
+                    self.cleanup_orphaned_index_entries_streaming(&prefix, &active_keys)?;
+                }
+                continue;
+            }
+
             // Count live entries without copying values. Peak RAM is one
             // index's key set, and it is released before the next index.
             let (live, _) = self.count_prefix(&prefix)?;
@@ -4127,6 +4145,55 @@ impl LsmEngine {
         key
     }
 
+    /// Durable marker written on DROP INDEX. `rebuild_indexes` must not
+    /// resurrect an index whose drop marker is live — leftover `__idx2__`
+    /// entries from an incomplete tombstone sweep are treated as orphans,
+    /// not as a lost `.idx` file to rebuild from.
+    fn make_idx_drop_key(class: &str, column: &str) -> Vec<u8> {
+        let mut key = Vec::new();
+        key.extend_from_slice(b"__idx_drop__");
+        key.extend_from_slice(class.as_bytes());
+        key.extend_from_slice(b"__");
+        key.extend_from_slice(column.as_bytes());
+        key
+    }
+
+    /// True when the last durable operation on (class, column) was DROP INDEX.
+    fn idx_dropped(&self, class: &str, column: &str) -> bool {
+        let key = Self::make_idx_drop_key(class, column);
+        matches!(self.get(&key), Ok(Some(_)))
+    }
+
+    fn write_idx_drop_marker(&self, class: &str, column: &str) -> Result<()> {
+        let key = Self::make_idx_drop_key(class, column);
+        let val = b"dropped".to_vec();
+        let seq = self.next_seq();
+        let entry = Entry::put(key.clone(), val.clone(), seq);
+        let mut ws = self.write_state.write();
+        ws.wal.append(&entry)?;
+        ws.wal.flush_buf()?;
+        ws.memtable.put_with_seq(key, val, seq);
+        Ok(())
+    }
+
+    /// Clears the drop marker on CREATE INDEX so a later DROP/rebuild cycle
+    /// starts from a clean slate.
+    fn clear_idx_drop_marker(&self, class: &str, column: &str) {
+        let key = Self::make_idx_drop_key(class, column);
+        if !matches!(self.get(&key), Ok(Some(_))) {
+            return;
+        }
+        let seq = self.next_seq();
+        let entry = Entry::delete(key.clone(), seq);
+        let mut ws = self.write_state.write();
+        if let Err(e) = ws.wal.append(&entry) {
+            tracing::error!("Failed to clear index drop marker: {}", e);
+            return;
+        }
+        let _ = ws.wal.flush_buf();
+        ws.memtable.delete_with_seq(key, seq);
+    }
+
     /// Persists secondary index metadata so schema introspection can list
     /// indexes even before the in-memory index manager is rebuilt.
     fn write_idx_meta(&self, class: &str, column: &str, entries: usize) -> Result<()> {
@@ -4756,6 +4823,9 @@ impl LsmEngine {
                 "Failed to persist index metadata"
             );
         }
+        // A previous DROP INDEX must not block this CREATE (or a later
+        // restart rebuild) — the drop marker is only valid until recreated.
+        self.clear_idx_drop_marker(class, column);
 
         let elapsed_ms = start.elapsed().as_millis();
         tracing::info!(
@@ -4772,8 +4842,18 @@ impl LsmEngine {
 
     /// Drops a secondary index.
     /// Also tombstones all `__idx2__` LSM entries for this index so startup
-    /// rebuild does not resurrect it from leftover index entries.
+    /// rebuild does not resurrect it from leftover index entries, and writes
+    /// a durable drop marker so an incomplete tombstone sweep cannot be
+    /// mistaken for a lost `.idx` file.
     pub fn drop_index(&self, class: &str, column: &str) -> bool {
+        if let Err(e) = self.write_idx_drop_marker(class, column) {
+            tracing::warn!(
+                table = class,
+                column = column,
+                error = %e,
+                "Failed to write index drop marker"
+            );
+        }
         if let Err(e) = self.tombstone_index_entries(class, column) {
             tracing::warn!(
                 table = class,
@@ -7369,6 +7449,94 @@ mod tests {
                 pkeys.len(),
                 1,
                 "index must survive a second rebuild —__idx2__ entries were tombstoned"
+            );
+        }
+    }
+
+    /// DROP INDEX must survive restart. Without a durable drop marker the
+    /// rebuild path treats leftover `__idx2__` entries as a lost `.idx` file
+    /// and resurrects the index the operator explicitly dropped.
+    #[test]
+    fn test_drop_index_is_not_resurrected_on_rebuild() {
+        let dir = tempdir().expect("should be valid");
+        let data_dir = dir.path().to_path_buf();
+
+        // Phase 1: create index, load rows, drop the index.
+        {
+            let options = StorageOptions {
+                data_dir: data_dir.clone(),
+                memtable_size_limit: 1024 * 1024,
+                ..Default::default()
+            };
+            let engine = LsmEngine::open(options).expect("should be valid");
+            engine.create_index("Edge", "src").expect("should be valid");
+            for i in 0..20u32 {
+                let doc = serde_json::json!({"__class__": "Edge", "src": format!("s{i}"), "dst": i});
+                engine
+                    .put(
+                        format!("Edge::{i:04}").into_bytes(),
+                        serde_json::to_vec(&doc).expect("should be valid"),
+                    )
+                    .expect("should be valid");
+            }
+            engine.flush().expect("should be valid");
+            assert!(engine.has_index("Edge", "src"));
+            assert!(engine.drop_index("Edge", "src"), "drop must report success");
+            assert!(
+                !engine.has_index("Edge", "src"),
+                "index must be gone immediately after drop"
+            );
+            engine.flush().expect("should be valid");
+        }
+
+        // Phase 2: reopen + rebuild. The drop marker must keep the index dead.
+        {
+            let options = StorageOptions {
+                data_dir: data_dir.clone(),
+                memtable_size_limit: 1024 * 1024,
+                ..Default::default()
+            };
+            let engine = LsmEngine::open(options).expect("should be valid");
+            engine.rebuild_indexes().expect("should be valid");
+            assert!(
+                !engine.has_index("Edge", "src"),
+                "dropped index must NOT be resurrected by rebuild"
+            );
+
+            // Table rows must be untouched.
+            let mut rows = 0usize;
+            engine
+                .for_each_live_prefix(b"Edge::", None, None, |_k, _v| {
+                    rows += 1;
+                    Ok(())
+                })
+                .expect("should be valid");
+            assert_eq!(rows, 20, "drop must not delete table rows");
+        }
+
+        // Phase 3: CREATE INDEX after DROP must work and then survive rebuild.
+        {
+            let options = StorageOptions {
+                data_dir,
+                memtable_size_limit: 1024 * 1024,
+                ..Default::default()
+            };
+            let engine = LsmEngine::open(options).expect("should be valid");
+            engine.create_index("Edge", "src").expect("should be valid");
+            assert!(engine.has_index("Edge", "src"));
+            engine.flush().expect("should be valid");
+        }
+        {
+            let options = StorageOptions {
+                data_dir: dir.path().to_path_buf(),
+                memtable_size_limit: 1024 * 1024,
+                ..Default::default()
+            };
+            let engine = LsmEngine::open(options).expect("should be valid");
+            engine.rebuild_indexes().expect("should be valid");
+            assert!(
+                engine.has_index("Edge", "src"),
+                "re-CREATEd index must survive rebuild (drop marker cleared)"
             );
         }
     }
