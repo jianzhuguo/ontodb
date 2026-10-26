@@ -785,6 +785,9 @@ typedef struct {
 typedef struct {
     size_t state;
     const ZSTD_seqSymbol* table;
+    /* 1 << validated tableLog, captured at init. 0 means "state invalid":
+     * never index table[state]. Avoids re-reading a possibly corrupt header. */
+    size_t stateBound;
 } ZSTD_fseState;
 
 typedef struct {
@@ -1190,13 +1193,25 @@ size_t ZSTD_execSequenceSplitLitBuffer(BYTE* op,
 
 
 static void
-ZSTD_initFseState(ZSTD_fseState* DStatePtr, BIT_DStream_t* bitD, const ZSTD_seqSymbol* dt)
+ZSTD_initFseState(ZSTD_fseState* DStatePtr, BIT_DStream_t* bitD, const ZSTD_seqSymbol* dt, U32 maxTableLog)
 {
     const void* ptr = dt;
     const ZSTD_seqSymbol_header* const DTableH = (const ZSTD_seqSymbol_header*)ptr;
-    DStatePtr->state = BIT_readBits(bitD, DTableH->tableLog);
+    /* tableLog comes from the frame / decode-table header. A corrupt frame or
+     * heap-damaged header can claim a huge log. Reject anything above the real
+     * table capacity (LLFSELog/MLFSELog/OffFSELog) rather than clamping and
+     * then trusting a state that is still OOB for the allocated body. */
+    U32 tableLog = DTableH->tableLog;
+    if (UNLIKELY(tableLog > maxTableLog)) {
+        DStatePtr->state = 0;
+        DStatePtr->stateBound = 0;   /* invalid: ZSTD_seqStateInBounds fails */
+        DStatePtr->table = dt + 1;
+        return;
+    }
+    DStatePtr->state = BIT_readBits(bitD, tableLog);
+    DStatePtr->stateBound = (size_t)1 << tableLog;
     DEBUGLOG(6, "ZSTD_initFseState : val=%u using %u bits",
-                (U32)DStatePtr->state, DTableH->tableLog);
+                (U32)DStatePtr->state, tableLog);
     BIT_reloadDStream(bitD);
     DStatePtr->table = dt + 1;
 }
@@ -1204,8 +1219,26 @@ ZSTD_initFseState(ZSTD_fseState* DStatePtr, BIT_DStream_t* bitD, const ZSTD_seqS
 FORCE_INLINE_TEMPLATE void
 ZSTD_updateFseStateWithDInfo(ZSTD_fseState* DStatePtr, BIT_DStream_t* bitD, U16 nextState, U32 nbBits)
 {
+    /* nbBits comes from a decode-table cell; a corrupt table can hand us a
+     * huge value and BIT_readBits would over-read the bitstream. Clamp to
+     * the FSE sequence-table maximum (MaxFSELog is 9; 16 is a safe ceiling). */
+    if (UNLIKELY(nbBits > 16)) {
+        nbBits = 16;
+    }
     size_t const lowBits = BIT_readBits(bitD, nbBits);
     DStatePtr->state = nextState + lowBits;
+}
+
+/*! ZSTD_seqStateInBounds() :
+ *  A corrupt frame / heap-damaged decode table can leave `state` past the
+ *  end of the FSE decode table. Indexing `table[state]` is then an OOB read
+ *  that takes the process down (observed: `movzx eax, [r9+rdx*8+2]` with
+ *  rdx=0x8FE247BE491F, AV). stateBound is captured at init from a validated
+ *  tableLog, so a later header corruption cannot widen the range. */
+static int ZSTD_seqStateInBounds(const ZSTD_fseState* s)
+{
+    if (s == NULL || s->table == NULL || s->stateBound == 0) return 0;
+    return s->state < s->stateBound;
 }
 
 /* We need to add at most (ZSTD_WINDOWLOG_MAX_32 - 1) bits to read the maximum
@@ -1230,6 +1263,18 @@ FORCE_INLINE_TEMPLATE seq_t
 ZSTD_decodeSequence(seqState_t* seqState, const ZSTD_longOffset_e longOffsets, const int isLastSeq)
 {
     seq_t seq;
+    /* Bounds-check FSE state before any table[state] dereference. A corrupt
+     * frame can drive `state` past tableSize (1<<tableLog); the subsequent
+     * lookup is an OOB read. Return a sequence with offset=(size_t)-1 so
+     * ZSTD_execSequence reports corruption_detected instead of crashing. */
+    if (UNLIKELY(!ZSTD_seqStateInBounds(&seqState->stateLL)
+              || !ZSTD_seqStateInBounds(&seqState->stateML)
+              || !ZSTD_seqStateInBounds(&seqState->stateOffb))) {
+        seq.litLength = 0;
+        seq.matchLength = 0;
+        seq.offset = (size_t)-1;
+        return seq;
+    }
     /*
      * ZSTD_seqSymbol is a 64 bits wide structure.
      * It can be loaded in one operation
@@ -1426,9 +1471,9 @@ ZSTD_decompressSequences_bodySplitLitBuffer( ZSTD_DCtx* dctx,
         RETURN_ERROR_IF(
             ERR_isError(BIT_initDStream(&seqState.DStream, ip, iend-ip)),
             corruption_detected, "");
-        ZSTD_initFseState(&seqState.stateLL, &seqState.DStream, dctx->LLTptr);
-        ZSTD_initFseState(&seqState.stateOffb, &seqState.DStream, dctx->OFTptr);
-        ZSTD_initFseState(&seqState.stateML, &seqState.DStream, dctx->MLTptr);
+        ZSTD_initFseState(&seqState.stateLL, &seqState.DStream, dctx->LLTptr, LLFSELog);
+        ZSTD_initFseState(&seqState.stateOffb, &seqState.DStream, dctx->OFTptr, OffFSELog);
+        ZSTD_initFseState(&seqState.stateML, &seqState.DStream, dctx->MLTptr, MLFSELog);
         assert(dst != NULL);
 
         ZSTD_STATIC_ASSERT(
@@ -1638,9 +1683,9 @@ ZSTD_decompressSequences_body(ZSTD_DCtx* dctx,
         RETURN_ERROR_IF(
             ERR_isError(BIT_initDStream(&seqState.DStream, ip, iend - ip)),
             corruption_detected, "");
-        ZSTD_initFseState(&seqState.stateLL, &seqState.DStream, dctx->LLTptr);
-        ZSTD_initFseState(&seqState.stateOffb, &seqState.DStream, dctx->OFTptr);
-        ZSTD_initFseState(&seqState.stateML, &seqState.DStream, dctx->MLTptr);
+        ZSTD_initFseState(&seqState.stateLL, &seqState.DStream, dctx->LLTptr, LLFSELog);
+        ZSTD_initFseState(&seqState.stateOffb, &seqState.DStream, dctx->OFTptr, OffFSELog);
+        ZSTD_initFseState(&seqState.stateML, &seqState.DStream, dctx->MLTptr, MLFSELog);
         assert(dst != NULL);
 
 #if defined(__GNUC__) && defined(__x86_64__)
@@ -1766,9 +1811,9 @@ ZSTD_decompressSequencesLong_body(
         RETURN_ERROR_IF(
             ERR_isError(BIT_initDStream(&seqState.DStream, ip, iend-ip)),
             corruption_detected, "");
-        ZSTD_initFseState(&seqState.stateLL, &seqState.DStream, dctx->LLTptr);
-        ZSTD_initFseState(&seqState.stateOffb, &seqState.DStream, dctx->OFTptr);
-        ZSTD_initFseState(&seqState.stateML, &seqState.DStream, dctx->MLTptr);
+        ZSTD_initFseState(&seqState.stateLL, &seqState.DStream, dctx->LLTptr, LLFSELog);
+        ZSTD_initFseState(&seqState.stateOffb, &seqState.DStream, dctx->OFTptr, OffFSELog);
+        ZSTD_initFseState(&seqState.stateML, &seqState.DStream, dctx->MLTptr, MLFSELog);
 
         /* prepare in advance */
         for (seqNb=0; seqNb<seqAdvance; seqNb++) {
@@ -2021,17 +2066,22 @@ ZSTD_getOffsetInfo(const ZSTD_seqSymbol* offTable, int nbSeq)
         const void* ptr = offTable;
         U32 const tableLog = ((const ZSTD_seqSymbol_header*)ptr)[0].tableLog;
         const ZSTD_seqSymbol* table = offTable + 1;
-        U32 const max = 1 << tableLog;
         U32 u;
         DEBUGLOG(5, "ZSTD_getLongOffsetsShare: (tableLog=%u)", tableLog);
 
-        assert(max <= (1 << OffFSELog));  /* max not too large */
-        for (u=0; u<max; u++) {
-            info.maxNbAdditionalBits = MAX(info.maxNbAdditionalBits, table[u].nbAdditionalBits);
-            if (table[u].nbAdditionalBits > 22) info.longOffsetShare += 1;
+        /* OffTable is allocated with OffFSELog body entries. A heap-damaged
+         * header can claim a larger tableLog; walking it would OOB-read
+         * (release builds compile out the old assert). Bail out safely. */
+        if (UNLIKELY(tableLog > OffFSELog)) {
+            return info;   /* {0,0}: treat as no long offsets */
+        }
+        {   U32 const max = 1 << tableLog;
+            for (u=0; u<max; u++) {
+                info.maxNbAdditionalBits = MAX(info.maxNbAdditionalBits, table[u].nbAdditionalBits);
+                if (table[u].nbAdditionalBits > 22) info.longOffsetShare += 1;
+            }
         }
 
-        assert(tableLog <= OffFSELog);
         info.longOffsetShare <<= (OffFSELog - tableLog);  /* scale to OffFSELog */
     }
 
