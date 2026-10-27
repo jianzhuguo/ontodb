@@ -124,18 +124,28 @@ pub(crate) fn zstd_decompress_to(dst: &mut [u8], src: &[u8]) -> std::result::Res
     thread_local! {
         static DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
             std::cell::RefCell::new(None);
+        static DECOMPRESSOR_USES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
     DECOMPRESSOR.with(|cell| {
         let mut slot = cell.borrow_mut();
+        const RECYCLE_AFTER: u32 = 256;
+        if slot.is_some() && DECOMPRESSOR_USES.with(|u| u.get()) >= RECYCLE_AFTER {
+            *slot = None;
+            DECOMPRESSOR_USES.with(|u| u.set(0));
+        }
         if slot.is_none() {
             match zstd::bulk::Decompressor::new() {
-                Ok(d) => *slot = Some(d),
+                Ok(d) => {
+                    *slot = Some(d);
+                    DECOMPRESSOR_USES.with(|u| u.set(0));
+                }
                 Err(_) => {
                     // Fall back to one-shot; still bounded by dst slice.
                     return zstd::zstd_safe::decompress(dst, src).map_err(|e| e as isize);
                 }
             }
         }
+        DECOMPRESSOR_USES.with(|u| u.set(u.get() + 1));
         let dec = slot.as_mut().expect("just initialized");
         match dec.decompress_to_buffer(src, dst) {
             Ok(n) => Ok(n),
@@ -466,15 +476,29 @@ impl SsTableBuilder {
             thread_local! {
                 static COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
                     std::cell::RefCell::new(None);
+                // Recycle the CCtx periodically. Reuse keeps the warm workspace,
+                // but zstd 1.5.7 workspace state can degrade under sustained
+                // compaction and the next ZSTD_compress2 AVs (0xc0000005 in
+                // zstd_compress.c:6619). 64 blocks ≈ 256KB of input per life.
+                static COMPRESSOR_USES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
             }
             let result = COMPRESSOR.with(|cell| {
                 let mut slot = cell.borrow_mut();
+                const RECYCLE_AFTER: u32 = 64;
+                if slot.is_some() && COMPRESSOR_USES.with(|u| u.get()) >= RECYCLE_AFTER {
+                    *slot = None;
+                    COMPRESSOR_USES.with(|u| u.set(0));
+                }
                 if slot.is_none() {
                     match zstd::bulk::Compressor::new(self.compression_level) {
-                        Ok(c) => *slot = Some(c),
+                        Ok(c) => {
+                            *slot = Some(c);
+                            COMPRESSOR_USES.with(|u| u.set(0));
+                        }
                         Err(_) => return None,
                     }
                 }
+                COMPRESSOR_USES.with(|u| u.set(u.get() + 1));
                 let compressor = slot.as_mut()?;
                 // Same contract as decompress_limited: allocate slack past
                 // `bound`, hand zstd only `buf[..bound]`. ZSTD_wildcopy may
