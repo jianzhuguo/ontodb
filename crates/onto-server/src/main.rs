@@ -55,6 +55,73 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
+// ═══════════════════════════════════════════════════════
+//  Allocation sentinel
+//
+//  Crashes have shown bogus allocation sizes from the compaction path
+//  (e.g. a single 610 GiB `vec![0u8; n]` from a corrupted length field).
+//  A system-allocator failure only prints "memory allocation of N bytes
+//  failed" with no site information. This wrapper refuses clearly-absurd
+//  single allocations, logs size + backtrace to stderr (server_err.log),
+//  and then lets the normal alloc-error path abort — so the next crash
+//  identifies the culprit line.
+//
+//  Thresholds:
+//  - > 8 GiB in one request: log backtrace and refuse (bogus sizes die here)
+//  - > 256 MiB: log size only (visibility into legitimate large loads)
+// ═══════════════════════════════════════════════════════
+struct GuardedAllocator;
+
+/// Anything above this is treated as a corrupt length and refused.
+const ALLOC_HARD_CAP: usize = 8 << 30; // 8 GiB
+/// Legitimate-but-large allocations get a size log line (no backtrace).
+const ALLOC_WARN_SIZE: usize = 256 << 20; // 256 MiB
+
+fn sentinel_check(size: usize, what: &str) -> bool {
+    if size > ALLOC_HARD_CAP {
+        eprintln!(
+            "[alloc-sentinel] REFUSED {what} of {size} bytes (cap {ALLOC_HARD_CAP}) — bogus size, capturing backtrace"
+        );
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!("[alloc-sentinel] backtrace:\n{bt}");
+        return false;
+    }
+    if size > ALLOC_WARN_SIZE {
+        eprintln!("[alloc-sentinel] large {what} of {size} bytes");
+    }
+    true
+}
+
+unsafe impl std::alloc::GlobalAlloc for GuardedAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if !sentinel_check(layout.size(), "alloc") {
+            return std::ptr::null_mut();
+        }
+        std::alloc::System.alloc(layout)
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if !sentinel_check(layout.size(), "alloc_zeroed") {
+            return std::ptr::null_mut();
+        }
+        std::alloc::System.alloc_zeroed(layout)
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        if !sentinel_check(new_size, "realloc") {
+            return std::ptr::null_mut();
+        }
+        std::alloc::System.realloc(ptr, layout, new_size)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        std::alloc::System.dealloc(ptr, layout)
+    }
+}
+
+#[global_allocator]
+static GLOBAL_ALLOC: GuardedAllocator = GuardedAllocator;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "ontodb-server",

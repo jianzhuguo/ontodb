@@ -1192,7 +1192,15 @@ impl SsTable {
             return Ok(None);
         }
 
-        let restart_start = block.len() - 4 - num_restarts * 4;
+        // Bounds-check the restart table before trusting it: a corrupt block
+        // can claim more restarts than bytes, and `len - 4 - n*4` underflows.
+        let restart_data_size = num_restarts
+            .checked_mul(4)
+            .filter(|&sz| sz + 4 <= block.len())
+            .ok_or_else(|| {
+                CoreError::corruption("invalid restart count in search block")
+            })?;
+        let restart_start = block.len() - 4 - restart_data_size;
         let mut restarts = Vec::with_capacity(num_restarts);
         for i in 0..num_restarts {
             let off = restart_start + i * 4;

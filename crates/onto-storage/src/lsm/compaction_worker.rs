@@ -85,6 +85,10 @@ pub struct CompactionWorker {
     cooldown_until: Option<std::time::Instant>,
     /// Last successful L6 self-merge, used to rate-limit rewrites.
     last_l6_merge: Option<std::time::Instant>,
+    /// Last time each level was compacted. Drives a starvation boost so a
+    /// permanently-busy deepest level cannot lock mid-levels (L1 sat at
+    /// score 9.9 for 15+ min while L6 held 10.8 and won every round).
+    last_compact: Vec<Option<std::time::Instant>>,
     /// Last memtable flush, used to defer L6 rewrites during write peaks.
     last_flush_at: Option<std::time::Instant>,
     /// Shared write-backpressure signal: `max_level_score * 100`. The engine
@@ -111,6 +115,7 @@ impl CompactionWorker {
         JoinHandle<()>,
         Arc<AtomicU64>,
     ) {
+        let initial_levels_len = initial_levels.len();
         let levels = Arc::new(Mutex::new(initial_levels));
         let levels_clone = levels.clone();
         let debt = Arc::new(AtomicU64::new(0));
@@ -133,6 +138,7 @@ impl CompactionWorker {
                 cooldown_until: None,
                 last_l6_merge: None,
                 last_flush_at: None,
+                last_compact: vec![None; initial_levels_len],
                 debt: debt_clone,
             };
             worker.run();
@@ -164,7 +170,13 @@ impl CompactionWorker {
                     if let Err(e) = self.try_compact() {
                         tracing::error!("Background compaction failed: {}", e);
                     }
-                    // Keep compacting until no more is needed
+                    // Keep compacting until no more is needed — but cap the
+                    // number of consecutive passes to avoid memory buildup.
+                    // Each merge holds SST input in memory; running N passes
+                    // back-to-back can OOM before the allocator reclaims.
+                    const MAX_CONSECUTIVE_COMPACTIONS: u32 = 6;
+                    const PASS_COOLDOWN_MS: u64 = 200;
+                    let mut consecutive: u32 = 0;
                     loop {
                         let (score, excessive) = {
                             let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
@@ -194,10 +206,20 @@ impl CompactionWorker {
                         if score <= 1.0 {
                             break;
                         }
+                        if consecutive >= MAX_CONSECUTIVE_COMPACTIONS {
+                            tracing::debug!(
+                                "FlushAndNotify: reached {} consecutive compactions, yielding",
+                                consecutive
+                            );
+                            break;
+                        }
                         if let Err(e) = self.try_compact() {
                             tracing::error!("Background compaction failed: {}", e);
                             break;
                         }
+                        consecutive += 1;
+                        // Brief pause between passes to let the allocator reclaim.
+                        thread::sleep(Duration::from_millis(PASS_COOLDOWN_MS));
                     }
                     // Signal completion
                     if let Some(ref sender) = self.notif_sender {
@@ -210,7 +232,18 @@ impl CompactionWorker {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     idle_ticks += 1;
-                    if idle_ticks >= periodic_interval {
+                    // Poll faster while any level is critically crowded so a
+                    // deep backlog drains in minutes, not one batch per minute.
+                    let critical = {
+                        let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
+                        levels.iter().any(|l| l.len() > 200)
+                    };
+                    let interval = if critical {
+                        periodic_interval / 4
+                    } else {
+                        periodic_interval
+                    };
+                    if idle_ticks >= interval {
                         idle_ticks = 0;
                         if let Err(e) = self.try_compact() {
                             tracing::error!("Background compaction failed: {}", e);
@@ -260,6 +293,11 @@ impl CompactionWorker {
             tracing::warn!("Small file merge failed (non-fatal): {}", e);
         }
 
+        // Cooldown: pause between compaction passes to let the allocator reclaim.
+        // Without this, back-to-back merges can accumulate memory faster than
+        // the OS returns it, causing OOM even with smaller batch sizes.
+        thread::sleep(Duration::from_millis(100));
+
         // Check if any level has too many files — if so, skip normal compaction
         // and let merge_small_files reduce the count over multiple ticks.
         const MAX_FILES_PER_LEVEL: usize = 1000;
@@ -300,8 +338,11 @@ impl CompactionWorker {
                     nfiles,
                     FILE_COUNT_TRIGGER
                 );
-                self.merge_l0_self_batch()?;
+                self.merge_self_batch_at(0)?;
                 self.compact_level(0)?;
+                if let Some(slot) = self.last_compact.get_mut(0) {
+                    *slot = Some(std::time::Instant::now());
+                }
             } else {
                 tracing::info!(
                     "File-count trigger: L{} has {} files (> {}), merging batch",
@@ -310,6 +351,9 @@ impl CompactionWorker {
                     FILE_COUNT_TRIGGER
                 );
                 self.compact_level(level)?;
+                if let Some(slot) = self.last_compact.get_mut(level) {
+                    *slot = Some(std::time::Instant::now());
+                }
             }
             // Fall through to score-based selection so a crowded mid-level
             // cannot starve the rest of the tree (notably L0 and L6).
@@ -327,8 +371,18 @@ impl CompactionWorker {
 
             for level in 0..levels.len() {
                 let score = self.compaction_score(&levels, level);
-                if score > best_score {
-                    best_score = score;
+                // Starvation boost: a level that keeps losing the scheduler
+                // grows its score until it gets a turn. 2× after 2 min idle.
+                let idle = self
+                    .last_compact
+                    .get(level)
+                    .and_then(|t| *t)
+                    .map(|t| t.elapsed().as_secs_f64())
+                    .unwrap_or(f64::INFINITY);
+                let boost = 1.0 + (idle / 120.0).min(3.0);
+                let boosted = score * boost;
+                if boosted > best_score {
+                    best_score = boosted;
                     best_level = Some(level);
                     best_files = levels[level].len();
                 }
@@ -345,14 +399,41 @@ impl CompactionWorker {
                 };
                 if level == deepest {
                     if self.l6_merge_allowed(best_files) {
-                        tracing::info!(
-                            "Background compaction: L{} self-merge score={:.2} files={}",
-                            level,
-                            best_score,
-                            best_files
-                        );
-                        self.merge_last_level_batch()?;
-                        self.last_l6_merge = Some(std::time::Instant::now());
+                        // One batch nets only -1..-2 files; against a backlog
+                        // of several hundred that never converges and the
+                        // score>1 trigger re-fires forever (observed: score 11
+                        // at 710 files, one 4-file batch per minute). When the
+                        // deepest level is critically crowded, run several
+                        // consecutive bounded batches in this pass instead.
+                        const CRITICAL_FILES: usize = 200;
+                        let passes = if best_files > CRITICAL_FILES { 8 } else { 1 };
+                        for pass in 0..passes {
+                            let files_now = {
+                                let levels =
+                                    self.levels.lock().unwrap_or_else(|e| e.into_inner());
+                                levels.get(deepest).map(|l| l.len()).unwrap_or(0)
+                            };
+                            if files_now <= 64 {
+                                break;
+                            }
+                            tracing::info!(
+                                "Background compaction: L{} self-merge pass {}/{} score={:.2} files={}",
+                                level,
+                                pass + 1,
+                                passes,
+                                best_score,
+                                files_now
+                            );
+                            self.merge_last_level_batch()?;
+                            self.last_l6_merge = Some(std::time::Instant::now());
+                            if let Some(slot) = self.last_compact.get_mut(level) {
+                                *slot = Some(std::time::Instant::now());
+                            }
+                            if pass + 1 < passes {
+                                // Let the allocator reclaim between batches.
+                                thread::sleep(Duration::from_millis(200));
+                            }
+                        }
                     }
                 } else {
                     tracing::info!(
@@ -361,6 +442,9 @@ impl CompactionWorker {
                         best_score
                     );
                     self.compact_level(level)?;
+                    if let Some(slot) = self.last_compact.get_mut(level) {
+                        *slot = Some(std::time::Instant::now());
+                    }
                 }
             }
         }
@@ -447,7 +531,10 @@ impl CompactionWorker {
             score = score.max(1.1);
         }
         // Severely crowded levels get a kick so they win the scheduler.
-        if file_count as f64 > target_files * 3.0 {
+        // Do NOT apply the kick to the deepest level — L6 self-merge is
+        // already expensive (full read + compress + write of large SSTs),
+        // and the multiplier just causes cascading OOM.
+        if file_count as f64 > target_files * 3.0 && level != deepest {
             score *= 1.5;
         }
         score
@@ -662,11 +749,6 @@ impl CompactionWorker {
             // L0 batch (liveness trap) while L1+ has disjoint ranges and needs
             // no scaling.
             const EXPAND_CAP: usize = 40;
-            let expand_cap = if level == 0 {
-                (ssts_to_compact.len() * 4).max(EXPAND_CAP)
-            } else {
-                EXPAND_CAP
-            };
             let mut excluded_inputs: Vec<PathBuf> = Vec::new();
             let mut kept: Vec<SsTableInfo> = Vec::with_capacity(ssts_to_compact.len());
             {
@@ -683,8 +765,22 @@ impl CompactionWorker {
                     .filter(|s| !merged_paths.contains(&s.path))
                     .cloned()
                     .collect();
+                // L0 files mutually overlap, so one L1 tombstone span can be
+                // shadowed by the entire L0 level. A fixed cap of 40 defers
+                // every L1 batch (liveness trap — L1 stuck at score 10.57).
+                // Scale with the shallow population so expansion can actually
+                // pull the shadowers in; hard-capped to bound open SSTs.
+                let expand_cap = if level == 0 {
+                    (ssts_to_compact.len() * 4).max(EXPAND_CAP)
+                } else {
+                    (shallow.len() + ssts_to_compact.len() + next_level_ssts.len())
+                        .max(EXPAND_CAP)
+                        .min(32)
+                };
                 let mut expanded: std::collections::HashSet<PathBuf> =
                     std::collections::HashSet::new();
+                let mut kept_bytes: u64 = 0;
+                let next_level_bytes: u64 = next_level_ssts.iter().map(|s| s.size).sum();
                 for s in &ssts_to_compact {
                     let shadowed = match Self::tombstone_span(&s.path) {
                         Some((lo, hi)) => shallow
@@ -697,6 +793,7 @@ impl CompactionWorker {
                         None => Vec::new(),
                     };
                     if shadowed.is_empty() {
+                        kept_bytes += s.size;
                         kept.push(s.clone());
                         continue;
                     }
@@ -704,15 +801,23 @@ impl CompactionWorker {
                         + next_level_ssts.len()
                         + expanded.len()
                         + shadowed.len();
-                    if projected > expand_cap {
+                    // Byte budget as well as count: expand used to be
+                    // count-only, so dozens of shallow L0 files blew heap
+                    // (observed 897MB alloc / process death mid-merge).
+                    let shadowed_bytes: u64 = shadowed.iter().map(|o| o.size).sum();
+                    let projected_bytes =
+                        kept_bytes + s.size + shadowed_bytes + next_level_bytes;
+                    if projected > expand_cap || projected_bytes > MAX_MERGE_INPUT_BYTES {
                         excluded_inputs.push(s.path.clone());
                         continue;
                     }
                     for o in shadowed {
                         if expanded.insert(o.path.clone()) {
+                            kept_bytes += o.size;
                             kept.push(o);
                         }
                     }
+                    kept_bytes += s.size;
                     kept.push(s.clone());
                 }
             }
@@ -725,7 +830,19 @@ impl CompactionWorker {
             ssts_to_compact = kept;
         }
         if ssts_to_compact.is_empty() {
-            return Ok(());
+            // Every input was deferred by the tombstone guard. Sinking them to
+            // the next level would resurrect rows (shallow puts would win), but
+            // skipping entirely is a liveness trap — L1 was observed stuck at
+            // score 10.57 because every round deferred its whole batch and the
+            // level never drained. Fall back to a same-level self-merge of the
+            // OLDEST files (position-preserving splice): tombstones stay at
+            // this level, so the guard is not needed, and file count still
+            // drops.
+            tracing::info!(
+                level = level,
+                "tombstone guard deferred entire batch — same-level self-merge fallback"
+            );
+            return self.merge_self_batch_at(level);
         }
 
         // Step 3: Streaming merge using min-heap (O(1) memory per SSTable)
@@ -892,10 +1009,15 @@ impl CompactionWorker {
         let evicted_paths = {
             let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
 
-            // Remove compacted SSTables from current level
+            // Remove compacted SSTables from current level AND any expanded
+            // shallow levels (tombstone guard pulls L0/L1 survivors into the
+            // batch; they must leave their own level or the merge duplicates
+            // them into next_level while the original still shadows on read).
             let compact_paths: std::collections::HashSet<PathBuf> =
                 ssts_to_compact.iter().map(|s| s.path.clone()).collect();
-            levels[level].retain(|s| !compact_paths.contains(&s.path));
+            for lvl in levels.iter_mut().take(level + 1) {
+                lvl.retain(|s| !compact_paths.contains(&s.path));
+            }
 
             // Remove overlapping SSTables from next level
             let overlap_paths: std::collections::HashSet<PathBuf> =
@@ -956,20 +1078,23 @@ impl CompactionWorker {
     /// prefix (low indices) and the output must splice back at the same
     /// position. Appending merged output at the end would promote stale
     /// versions over newer non-batched flushes and resurrect deleted rows.
-    fn merge_l0_self_batch(&mut self) -> Result<()> {
-        const L0_SELF_BATCH: usize = 16;
+    fn merge_self_batch_at(&mut self, level: usize) -> Result<()> {
+        // Oldest-prefix batch: list position is the age contract (see the
+        // positional-invariant note above). Non-L0 batches are half the size
+        // to keep the open-SST working set bounded on larger files.
+        let batch_limit: usize = if level == 0 { 16 } else { 8 };
 
         // Snapshot the oldest L0 SSTs (low indices = early flushes = stale).
         // Empty shells (<64 B) are discarded rather than merged.
         let (batch, empty_ssts) = {
             let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-            if levels.is_empty() || levels[0].len() < 2 {
+            if levels.len() <= level || levels[level].len() < 2 {
                 return Ok(());
             }
             let mut ssts: Vec<SsTableInfo> = Vec::new();
             let mut empty: Vec<SsTableInfo> = Vec::new();
-            for s in levels[0].iter() {
-                if ssts.len() + empty.len() >= L0_SELF_BATCH {
+            for s in levels[level].iter() {
+                if ssts.len() + empty.len() >= batch_limit {
                     break;
                 }
                 if s.size < 64 {
@@ -979,7 +1104,7 @@ impl CompactionWorker {
                 }
             }
             for e in &empty {
-                levels[0].retain(|s| s.path != e.path);
+                levels[level].retain(|s| s.path != e.path);
             }
             (ssts, empty)
         };
@@ -1012,17 +1137,24 @@ impl CompactionWorker {
             crate::lsm::streaming_merge::StreamingMergeIterator::new(&paths)
                 .map_err(|e| {
                     onto_core::CoreError::Custom(format!(
-                        "L0 self-merge iterator failed: {}",
+                        "L{} self-merge iterator failed: {}",
+                        level,
                         e
                     ))
                 })?;
 
-        // Output cut size must beat the compression gap. `batch_disk` is
-        // on-disk (compressed) but `current_size` counts raw key+value bytes.
-        // L0 flushes run ~3× compression: 16 × 22 MB ≈ 352 MB disk ≈ 1 GB raw.
-        // A 64 MB cut regurgitates 16+ outputs (no win, merge discarded);
-        // 256 MB yields ~4 outputs — a real 16→4 reduction.
-        let target_sst_size = 256 * 1024 * 1024;
+        // Output cut size must beat the compression gap. `current_size`
+        // counts raw key+value bytes while blocks land zstd-compressed (~3x).
+        // A 64 MB raw cut regurgitates more outputs than inputs (no-win
+        // discard → L1 livelocked at score 10.57: "8 inputs produced 11
+        // outputs"). Cut so estimated outputs < inputs: raw_est ≈ disk*3,
+        // need raw_est/cut < n. Floor 256 MB; ceiling bounds builder.data
+        // (compressed ≈ raw/3, so ≤ ~170 MB resident).
+        let batch_disk: u64 = batch.iter().map(|s| s.size).sum();
+        let est_raw = batch_disk.saturating_mul(3);
+        let max_outputs = (batch.len() as u64).saturating_sub(1).max(1);
+        let target_sst_size: usize = (est_raw / max_outputs)
+            .clamp(256 * 1024 * 1024, 320 * 1024 * 1024) as usize;
         let mut builder =
             SsTableBuilder::with_expected_entries(target_sst_size as usize / 32);
         builder.set_compression_level(self.options.compression_level);
@@ -1072,7 +1204,7 @@ impl CompactionWorker {
                 let sst_path = self
                     .options
                     .data_dir
-                    .join(format!("L0_{}.sst", sst_id));
+                    .join(format!("L{}_{}.sst", level, sst_id));
                 let sst = builder.build(&sst_path)?;
                 let metadata = fs::metadata(&sst_path)?;
                 new_ssts.push(SsTableInfo {
@@ -1091,7 +1223,7 @@ impl CompactionWorker {
             let sst_path = self
                 .options
                 .data_dir
-                .join(format!("L0_{}.sst", sst_id));
+                .join(format!("L{}_{}.sst", level, sst_id));
             let sst = builder.build(&sst_path)?;
             let metadata = fs::metadata(&sst_path)?;
             new_ssts.push(SsTableInfo {
@@ -1102,11 +1234,18 @@ impl CompactionWorker {
             });
         }
 
-        if new_ssts.len() >= batch.len() {
-            // No file-count win (e.g. everything deduped to the same number of
-            // outputs). Drop the outputs — keeping them would churn.
+        let in_bytes: u64 = batch.iter().map(|s| s.size).sum();
+        let out_bytes: u64 = new_ssts.iter().map(|s| s.size).sum();
+        // Win if file count drops OR on-disk size drops ≥10%. Size wins matter
+        // for size-driven scores (L1 was stuck at 10.57 on size_score); a pure
+        // count check discarded real shrinkage and livelocked the level.
+        let count_win = new_ssts.len() < batch.len();
+        let size_win = out_bytes.saturating_mul(10) < in_bytes.saturating_mul(9);
+        if !count_win && !size_win {
+            // No progress. Drop the outputs — keeping them would churn.
             tracing::warn!(
-                "L0 self-merge no-win: {} inputs produced {} outputs (target {} B), discarding",
+                "L{} self-merge no-win: {} inputs produced {} outputs (target {} B), discarding",
+                level,
                 batch.len(),
                 new_ssts.len(),
                 target_sst_size
@@ -1123,7 +1262,7 @@ impl CompactionWorker {
         // so their newer versions keep winning over the merged output.
         let evicted = {
             let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-            Self::splice_outputs(&mut levels, 0, &batch, new_ssts);
+            Self::splice_outputs(&mut levels, level, &batch, new_ssts);
 
             let mut evicted = Vec::new();
             for s in &batch {
@@ -1139,7 +1278,8 @@ impl CompactionWorker {
         }
 
         tracing::info!(
-            "L0 self-merge: {} → {} SSTables ({} entries, {} deduped, {} empty shells dropped)",
+            "L{} self-merge: {} → {} SSTables ({} entries, {} deduped, {} empty shells dropped)",
+            level,
             batch.len(),
             out_count,
             entry_count,
@@ -1171,13 +1311,20 @@ impl CompactionWorker {
         // count by one per pass and re-fired every ~60s — a permanent write
         // hotspot. Instead, absorb a batch of the smallest files and split
         // the output at TARGET_OUTPUT_SIZE so one pass drops several files.
-        const MAX_BATCH_FILES: usize = 8;
-        const MAX_INPUT_BYTES: u64 = MAX_MERGE_INPUT_BYTES;
-        // Uncompressed output target. 256MB matches merge_small_files and
-        // keeps each output near the usual SST band (RocksDB 64MB, Cassandra
-        // 160MB) while still being large enough that a batch of small inputs
-        // collapses into 2–4 files rather than N.
-        const TARGET_OUTPUT_SIZE: u64 = 256 * 1024 * 1024;
+        //
+        // Batch size is capped at 4 to limit peak memory: each input SST is
+        // ~100-140MB and the streaming merge holds block data in memory.
+        // 4 files ≈ 400-560MB peak, vs 8 files ≈ 1GB+ which causes OOM.
+        const MAX_BATCH_FILES: usize = 4;
+        const MAX_INPUT_BYTES: u64 = 128 * 1024 * 1024; // 128MB cap
+        // Uncompressed output target. 128MB keeps each output small enough
+        // that a batch of 4 inputs collapses into 1-2 files while limiting
+        // the builder's in-memory accumulation.
+        // Uncompressed cut must beat the ~3x zstd gap or 4 inputs regenerate
+        // 4 outputs (observed: before=4 after=4 every pass, L6 stuck at 691
+        // files / score 10.8 and starving L1). Size the cut from the batch.
+        const TARGET_OUTPUT_MIN: u64 = 256 * 1024 * 1024;
+        const TARGET_OUTPUT_MAX: u64 = 384 * 1024 * 1024;
         const MIN_FILES: usize = 2;
 
         // Drop 0-entry empty shells first — they pollute the batch budget.
@@ -1244,6 +1391,12 @@ impl CompactionWorker {
             (deepest, picked)
         };
 
+        let batch_disk: u64 = batch.iter().map(|s| s.size).sum();
+        let est_raw = batch_disk.saturating_mul(3);
+        let max_outputs = (batch.len() as u64).saturating_sub(1).max(1);
+        let target_output_size: u64 =
+            (est_raw / max_outputs).clamp(TARGET_OUTPUT_MIN, TARGET_OUTPUT_MAX);
+
         let paths: Vec<PathBuf> = batch.iter().map(|s| s.path.clone()).collect();
         let input_bytes: u64 = batch.iter().map(|s| s.size).sum();
         tracing::info!(
@@ -1299,7 +1452,7 @@ impl CompactionWorker {
             total_entries += 1;
             last_key = Some(dedup_key);
 
-            if current_size >= TARGET_OUTPUT_SIZE {
+            if current_size >= target_output_size {
                 let id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
                 let path = self
                     .options
@@ -1336,6 +1489,22 @@ impl CompactionWorker {
             });
         }
 
+        // No file-count win: drop the outputs instead of splicing. Keeping a
+        // non-reducing rewrite is what churned L6 (before=4 after=4 forever).
+        if new_ssts.len() >= batch.len() {
+            tracing::warn!(
+                level = level_idx,
+                before = batch.len(),
+                after = new_ssts.len(),
+                target = target_output_size,
+                "last-level batch did not reduce file count — discarding outputs"
+            );
+            for sst in &new_ssts {
+                let _ = fs::remove_file(&sst.path);
+            }
+            return Ok(());
+        }
+
         // Swap batch → outputs inside one critical section, keeping age order.
         {
             let mut levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
@@ -1358,15 +1527,6 @@ impl CompactionWorker {
             deduped,
             "Last-level batched self-merge complete"
         );
-        if new_ssts.len() >= batch.len() {
-            // Non-reducing batch would churn forever at FILE_COUNT_TRIGGER.
-            tracing::warn!(
-                level = level_idx,
-                before = batch.len(),
-                after = new_ssts.len(),
-                "last-level batch did not reduce file count — check TARGET_OUTPUT_SIZE"
-            );
-        }
         Ok(())
     }
 
@@ -1378,8 +1538,8 @@ impl CompactionWorker {
         const MIN_FILES_TO_MERGE: usize = 4;
         const MERGE_BATCH_SIZE: usize = 4;
         // Target must be large enough so compressed output exceeds SMALL_FILE_THRESHOLD.
-        // With ~4x compression ratio, 256MB uncompressed → ~64MB compressed output.
-        const TARGET_OUTPUT_SIZE: u64 = 256 * 1024 * 1024; // 256MB uncompressed target
+        // With ~4x compression ratio, 64MB uncompressed → ~16MB compressed output.
+        const TARGET_OUTPUT_SIZE: u64 = 64 * 1024 * 1024; // 64MB uncompressed target
 
         // Find the level with the most small files
         let (target_level, mut small_files) = {
@@ -1858,7 +2018,7 @@ mod tests {
             debt: Arc::new(AtomicU64::new(0)),
         };
 
-        worker.merge_l0_self_batch().expect("self-merge");
+        worker.merge_self_batch_at(0).expect("self-merge");
 
         let after = levels.lock().unwrap()[0].len();
         assert!(
