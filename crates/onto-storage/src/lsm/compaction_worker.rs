@@ -1537,9 +1537,11 @@ impl CompactionWorker {
         const SMALL_FILE_THRESHOLD: u64 = 16 * 1024 * 1024; // 16MB
         const MIN_FILES_TO_MERGE: usize = 4;
         const MERGE_BATCH_SIZE: usize = 4;
-        // Target must be large enough so compressed output exceeds SMALL_FILE_THRESHOLD.
-        // With ~4x compression ratio, 64MB uncompressed → ~16MB compressed output.
-        const TARGET_OUTPUT_SIZE: u64 = 64 * 1024 * 1024; // 64MB uncompressed target
+        // Uncompressed cut must beat the ~3x zstd gap or N small inputs
+        // regenerate N outputs (observed 4→4 churn on L5/L6). Size the cut
+        // from the batch; floor 256MB raw, ceiling bounds builder.data.
+        const TARGET_OUTPUT_MIN: u64 = 256 * 1024 * 1024;
+        const TARGET_OUTPUT_MAX: u64 = 320 * 1024 * 1024;
 
         // Find the level with the most small files
         let (target_level, mut small_files) = {
@@ -1600,6 +1602,11 @@ impl CompactionWorker {
         }
         small_files = picked;
         let batch_size = small_files.len();
+        let batch_disk: u64 = small_files.iter().map(|s| s.size).sum();
+        let est_raw = batch_disk.saturating_mul(3);
+        let max_outputs = (batch_size as u64).saturating_sub(1).max(1);
+        let target_output_size: u64 =
+            (est_raw / max_outputs).clamp(TARGET_OUTPUT_MIN, TARGET_OUTPUT_MAX);
 
         tracing::info!(
             "Merging batch of {} small L{} SSTables (< 32MB each)",
@@ -1629,7 +1636,7 @@ impl CompactionWorker {
         // first for duplicate keys. We keep only the first occurrence of each key.
         let mut new_ssts: Vec<SsTableInfo> = Vec::new();
         let mut builder =
-            SsTableBuilder::with_expected_entries(TARGET_OUTPUT_SIZE as usize / 32);
+            SsTableBuilder::with_expected_entries(target_output_size as usize / 32);
         builder.set_compression_level(self.options.compression_level);
         let mut current_size: u64 = 0;
         let mut batch_min_key: Vec<u8> = Vec::new();
@@ -1663,7 +1670,7 @@ impl CompactionWorker {
             last_key = Some(dedup_key);
 
             // Flush SST when target size reached
-            if current_size >= TARGET_OUTPUT_SIZE {
+            if current_size >= target_output_size {
                 // Throttle: yield between SST flushes to avoid starving queries
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 let id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
@@ -1712,6 +1719,21 @@ impl CompactionWorker {
             new_count,
             total_output_size / 1024 / 1024
         );
+
+        // No file-count win: drop outputs instead of splicing 4→4 forever.
+        if new_count >= batch_size {
+            tracing::warn!(
+                level = target_level,
+                before = batch_size,
+                after = new_count,
+                target = target_output_size,
+                "small-file merge did not reduce file count — discarding outputs"
+            );
+            for sst in &new_ssts {
+                let _ = fs::remove_file(&sst.path);
+            }
+            return Ok(());
+        }
 
         // Replace small files with new larger files and schedule old ones for
         // deletion. Splice in place — never `sort_by(min_key)`, which would
