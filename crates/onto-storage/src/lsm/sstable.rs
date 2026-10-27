@@ -21,7 +21,7 @@ use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Default block cache capacity (number of blocks per SSTable).
 const DEFAULT_BLOCK_CACHE_CAPACITY: usize = 64;
@@ -72,15 +72,25 @@ struct SsTableInner {
 
 /// An SSTable file on disk.
 pub struct SsTable {
-    _path: PathBuf,
+    path: PathBuf,
     /// File handle and block cache, behind a Mutex for `&self` read access.
     inner: Mutex<SsTableInner>,
     /// Size of the data section.
     _data_size: u64,
+    /// Footer offsets retained so index/bloom sections can be re-read lazily.
+    index_offset: u64,
+    bloom_offset: u64,
+    payload_end: u64,
     /// Index: last_key -> (offset, size) of each data block.
-    index: Vec<BlockIndexEntry>,
-    /// Bloom filter for point lookups.
-    bloom: Option<BloomFilter>,
+    ///
+    /// Loaded on first lookup/scan and kept afterwards. `open()` parses the
+    /// index once for validation + key-range extraction and then drops it:
+    /// retaining block indexes (and blooms) for 1000+ SSTs is the multi-GB
+    /// startup materialization this avoids.
+    index: OnceLock<Vec<BlockIndexEntry>>,
+    /// Bloom filter for point lookups, loaded on first lookup.
+    /// `None` inside means "no filter — must check every block".
+    bloom: OnceLock<Option<BloomFilter>>,
     /// Whether data blocks are zstd-compressed (legacy table-level flag).
     /// When `block_crc` is set, per-block flags take precedence.
     compressed: bool,
@@ -89,6 +99,8 @@ pub struct SsTable {
     /// Cached first key (minimum key) in this SSTable.
     /// Loaded once at open() to avoid repeated disk I/O.
     cached_first_key: Vec<u8>,
+    /// Cached last key (maximum key) in this SSTable, from the index.
+    cached_max_key: Vec<u8>,
     /// Maximum sequence number in this SSTable (stored in footer for fast startup).
     max_seq_no: SeqNo,
 }
@@ -668,19 +680,28 @@ impl SsTableBuilder {
 
         // Cache the first key (minimum key) for fast access
         let cached_first_key = self.first_key;
+        let cached_max_key = self
+            .block_entries
+            .last()
+            .map(|e| e.last_key.clone())
+            .unwrap_or_default();
 
         Ok(SsTable {
-            _path: path.as_ref().to_path_buf(),
+            path: path.as_ref().to_path_buf(),
             inner: Mutex::new(SsTableInner {
                 file: read_file,
                 block_cache: BlockCache::new(DEFAULT_BLOCK_CACHE_CAPACITY),
             }),
             _data_size: data_size,
-            index: self.block_entries,
-            bloom: Some(bloom),
+            index_offset,
+            bloom_offset,
+            payload_end: bloom_offset + bloom_data.len() as u64,
+            index: OnceLock::from(self.block_entries),
+            bloom: OnceLock::from(Some(bloom)),
             compressed,
             block_crc: true,
             cached_first_key,
+            cached_max_key,
             max_seq_no: self.max_seq_no,
         })
     }
@@ -798,19 +819,22 @@ impl SsTable {
             )));
         }
 
-        // Read bloom filter
-        file.seek(SeekFrom::Start(bloom_offset))?;
-        let bloom_data_len = (payload_end - bloom_offset) as usize;
-        let mut bloom_data = vec![0u8; bloom_data_len];
-        file.read_exact(&mut bloom_data)?;
-        let bloom = BloomFilter::from_bytes(&bloom_data);
-
-        // Read index
+        // Parse the index once for corruption validation + key-range
+        // extraction, then drop it. The parsed index (and the bloom filter) are
+        // re-read on first lookup/scan via `OnceLock`: retaining them for every
+        // SST at startup is what ballooned commit to tens of GB with 1300+
+        // files. The bloom section is not read here at all.
         file.seek(SeekFrom::Start(index_offset))?;
         let index_data_len = (bloom_offset - index_offset) as usize;
         let mut index_data = vec![0u8; index_data_len];
         file.read_exact(&mut index_data)?;
         let index = Self::decode_index(&index_data, index_offset, block_crc)?;
+        drop(index_data);
+
+        let cached_max_key = index
+            .last()
+            .map(|e| e.last_key.clone())
+            .unwrap_or_default();
 
         // Cache the first key to avoid repeated disk I/O
         let cached_first_key = if index.is_empty() {
@@ -843,21 +867,77 @@ impl SsTable {
                 }
             }
         };
+        drop(index);
 
         Ok(SsTable {
-            _path: path.as_ref().to_path_buf(),
+            path: path.as_ref().to_path_buf(),
             inner: Mutex::new(SsTableInner {
                 file,
                 block_cache: BlockCache::new(DEFAULT_BLOCK_CACHE_CAPACITY),
             }),
             _data_size: index_offset,
-            index,
-            bloom,
+            index_offset,
+            bloom_offset,
+            payload_end,
+            index: OnceLock::new(),
+            bloom: OnceLock::new(),
             compressed,
             block_crc,
             cached_first_key,
+            cached_max_key,
             max_seq_no,
         })
+    }
+
+    /// Block index, loaded (and validated) on first use and kept afterwards.
+    ///
+    /// Lazy load failure degrades to an empty index — lookups then report
+    /// "not found" and scans yield nothing, with an error line in the log.
+    /// `open()` already validated the section once, so this path only fires
+    /// on I/O errors or on-disk mutation after open.
+    fn block_index(&self) -> &[BlockIndexEntry] {
+        self.index.get_or_init(|| {
+            let load = || -> Result<Vec<BlockIndexEntry>> {
+                let mut file = File::open(&self.path)?;
+                file.seek(SeekFrom::Start(self.index_offset))?;
+                let mut buf = vec![0u8; (self.bloom_offset - self.index_offset) as usize];
+                file.read_exact(&mut buf)?;
+                Self::decode_index(&buf, self.index_offset, self.block_crc)
+            };
+            match load() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[sstable] lazy index load failed for {:?}: {}", self.path, e);
+                    Vec::new()
+                }
+            }
+        })
+    }
+
+    /// Bloom filter, loaded on first point lookup. `None` means "no filter".
+    ///
+    /// This mirrors the old eager behavior exactly: `BloomFilter::from_bytes`
+    /// returning `None` (malformed/absent) has always meant "skip the bloom
+    /// fast path and check every block", never an error.
+    fn bloom_filter(&self) -> Option<&BloomFilter> {
+        self.bloom
+            .get_or_init(|| {
+                let load = || -> Result<Option<BloomFilter>> {
+                    let mut file = File::open(&self.path)?;
+                    file.seek(SeekFrom::Start(self.bloom_offset))?;
+                    let mut buf = vec![0u8; (self.payload_end - self.bloom_offset) as usize];
+                    file.read_exact(&mut buf)?;
+                    Ok(BloomFilter::from_bytes(&buf))
+                };
+                match load() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[sstable] lazy bloom load failed for {:?}: {}", self.path, e);
+                        None
+                    }
+                }
+            })
+            .as_ref()
     }
 
     /// Returns the maximum sequence number in this SSTable.
@@ -969,7 +1049,7 @@ impl SsTable {
     /// use `get_full` if it needs to distinguish "not found" from "deleted".
     pub fn get(&self, key: &[u8]) -> Result<Option<(Vec<u8>, SeqNo)>> {
         // Check bloom filter first
-        if let Some(ref bloom) = self.bloom {
+        if let Some(bloom) = self.bloom_filter() {
             if !bloom.might_contain(key) {
                 return Ok(None);
             }
@@ -983,9 +1063,10 @@ impl SsTable {
             Err(e) => return Err(e),
         };
 
-        // Copy offset/size to avoid holding borrow on self.index
-        let block_offset = self.index[block_idx].offset;
-        let block_size = self.index[block_idx].size;
+        // Copy offset/size to avoid holding borrow on the index
+        let index = self.block_index();
+        let block_offset = index[block_idx].offset;
+        let block_size = index[block_idx].size;
 
         // Read the block
         let block_data = self.read_block_at(block_offset, block_size)?;
@@ -998,7 +1079,7 @@ impl SsTable {
     /// Returns `Ok(Some((value, seq_no, kind)))` for both Put and Delete entries.
     /// Returns `Ok(None)` only if the key truly doesn't exist in this SSTable.
     pub fn get_full(&self, key: &[u8]) -> Result<Option<(Vec<u8>, SeqNo, EntryKind)>> {
-        if let Some(ref bloom) = self.bloom {
+        if let Some(bloom) = self.bloom_filter() {
             if !bloom.might_contain(key) {
                 return Ok(None);
             }
@@ -1009,18 +1090,16 @@ impl SsTable {
             Err(CoreError::KeyNotFound { .. }) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let block_offset = self.index[block_idx].offset;
-        let block_size = self.index[block_idx].size;
+        let index = self.block_index();
+        let block_offset = index[block_idx].offset;
+        let block_size = index[block_idx].size;
         let block_data = self.read_block_at(block_offset, block_size)?;
         self.search_block_full(&block_data, key)
     }
 
     /// Returns the maximum (last) key in the SSTable, from the index.
     pub fn max_key(&self) -> &[u8] {
-        self.index
-            .last()
-            .map(|e| e.last_key.as_slice())
-            .unwrap_or(&[])
+        self.cached_max_key.as_slice()
     }
 
     /// Returns the minimum (first) key in the SSTable.
@@ -1031,7 +1110,7 @@ impl SsTable {
 
     /// Returns the number of data blocks.
     pub fn num_blocks(&self) -> usize {
-        self.index.len()
+        self.block_index().len()
     }
 
     /// True if this SSTable uses the per-block CRC format
@@ -1047,19 +1126,20 @@ impl SsTable {
 
     fn find_block(&self, key: &[u8]) -> Result<usize> {
         // Binary search in the index
+        let index = self.block_index();
         let mut lo = 0;
-        let mut hi = self.index.len();
+        let mut hi = index.len();
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if key <= self.index[mid].last_key.as_slice() {
+            if key <= index[mid].last_key.as_slice() {
                 hi = mid;
             } else {
                 lo = mid + 1;
             }
         }
 
-        if lo >= self.index.len() {
+        if lo >= index.len() {
             return Err(CoreError::KeyNotFound { key: key.to_vec() });
         }
 
@@ -1152,7 +1232,8 @@ impl SsTable {
     fn prefetch_after(&self, idx: usize) {
         let n = 2usize;
         let start = idx + 1;
-        let end = (idx + 1 + n).min(self.index.len());
+        let index = self.block_index();
+        let end = (idx + 1 + n).min(index.len());
         if start >= end {
             return;
         }
@@ -1161,8 +1242,8 @@ impl SsTable {
         {
             let mut inner = self.inner.lock();
             for i in start..end {
-                let offset = self.index[i].offset;
-                let size = self.index[i].size;
+                let offset = index[i].offset;
+                let size = index[i].size;
                 if inner.block_cache.contains(offset) {
                     continue;
                 }
@@ -1482,7 +1563,8 @@ impl SsTableIterator {
             valid: false,
         };
 
-        if !iter.table.index.is_empty() {
+        let has_blocks = !iter.table.block_index().is_empty();
+        if has_blocks {
             iter.load_block(0)?;
             iter.advance_to_next_entry();
         }
@@ -1491,9 +1573,10 @@ impl SsTableIterator {
     }
 
     fn load_block(&mut self, idx: usize) -> Result<()> {
-        // Copy offset/size to avoid holding borrow on table.index
-        let block_offset = self.table.index[idx].offset;
-        let block_size = self.table.index[idx].size;
+        // Copy offset/size to avoid holding borrow on the table index
+        let index = self.table.block_index();
+        let block_offset = index[idx].offset;
+        let block_size = index[idx].size;
         self.block_data = self.table.read_block_at(block_offset, block_size)?;
         self.block_idx = idx;
         // Warm the next blocks so sequential scan doesn't wait on disk each hop.
@@ -1533,7 +1616,7 @@ impl SsTableIterator {
     fn advance_to_next_entry(&mut self) {
         if self.pos >= self.restart_start {
             // Try next block
-            if self.block_idx + 1 < self.table.index.len() {
+            if self.block_idx + 1 < self.table.block_index().len() {
                 let next_idx = self.block_idx + 1;
                 if self.load_block(next_idx).is_err() {
                     self.valid = false;
@@ -1776,6 +1859,77 @@ mod tests {
 
         // Missing key
         assert!(sst.get(b"missing_key").expect("should be valid").is_none());
+    }
+
+    #[test]
+    fn test_open_defers_index_and_bloom_materialization() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("lazy.sst");
+
+        // Oversized bloom so eager materialization would show up as a big alloc.
+        let mut builder = SsTableBuilder::with_expected_entries(1_000_000);
+        for i in 0..200u32 {
+            let key = format!("key_{:04}", i);
+            builder.add(&Entry::put(key.into_bytes(), vec![i as u8], i as u64));
+        }
+        builder.build(&path).expect("should be valid");
+
+        let sst = SsTable::open(&path).expect("should be valid");
+
+        // open() must not retain the block index or the bloom filter.
+        assert!(sst.index.get().is_none(), "index materialized at open");
+        assert!(sst.bloom.get().is_none(), "bloom materialized at open");
+
+        // Key-range extraction (what load_sstables needs for every SST at
+        // startup) must not materialize them either.
+        assert_eq!(sst.first_key().expect("should be valid"), b"key_0000".to_vec());
+        assert_eq!(sst.max_key(), b"key_0199");
+        assert!(sst.index.get().is_none(), "first_key/max_key pulled in the index");
+        assert!(sst.bloom.get().is_none(), "first_key/max_key pulled in the bloom");
+
+        // First point lookup materializes both sections and answers correctly.
+        let (val, _) = sst
+            .get(b"key_0123")
+            .expect("should be valid")
+            .expect("should be valid");
+        assert_eq!(val, vec![123u8]);
+        assert!(sst.index.get().is_some());
+        assert!(sst.bloom.get().is_some());
+
+        // Negative lookup still short-circuits on the now-loaded bloom.
+        assert!(sst.get(b"missing_key").expect("should be valid").is_none());
+    }
+
+    #[test]
+    fn test_lazy_index_serves_iteration_and_lookups() {
+        let dir = tempdir().expect("should be valid");
+        let path = dir.path().join("lazy_iter.sst");
+
+        let mut builder = SsTableBuilder::new();
+        for i in 0..300u32 {
+            let key = format!("key_{:04}", i);
+            builder.add(&Entry::put(key.into_bytes(), vec![i as u8], i as u64));
+        }
+        builder.build(&path).expect("should be valid");
+
+        let sst = Arc::new(SsTable::open(&path).expect("should be valid"));
+        assert!(sst.index.get().is_none());
+
+        let mut iter = sst.iter().expect("should be valid");
+        let mut count = 0u32;
+        while iter.is_valid() {
+            count += 1;
+            iter.next();
+        }
+        assert_eq!(count, 300);
+        assert!(sst.index.get().is_some(), "iteration must load the index");
+
+        let (val, _) = sst
+            .get(b"key_0150")
+            .expect("should be valid")
+            .expect("should be valid");
+        assert_eq!(val, vec![150u8]);
+        assert_eq!(sst.num_blocks(), sst.index.get().expect("should be valid").len());
     }
 
     #[test]
