@@ -1934,6 +1934,7 @@ mod tests {
             cooldown_until: None,
             last_l6_merge: None,
             last_flush_at: None,
+            last_compact: vec![None; 8],
             debt: Arc::new(AtomicU64::new(0)),
         };
         worker.compact_level(1).expect("compact");
@@ -2015,6 +2016,7 @@ mod tests {
             cooldown_until: None,
             last_l6_merge: None,
             last_flush_at: None,
+            last_compact: vec![None; 8],
             debt: Arc::new(AtomicU64::new(0)),
         };
 
@@ -2117,6 +2119,7 @@ mod tests {
             cooldown_until: None,
             last_l6_merge: None,
             last_flush_at: None,
+            last_compact: vec![None; 8],
             debt: Arc::new(AtomicU64::new(0)),
         };
 
