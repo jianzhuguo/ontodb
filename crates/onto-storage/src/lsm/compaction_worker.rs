@@ -882,7 +882,12 @@ impl CompactionWorker {
             .map_err(|e| onto_core::CoreError::Custom(format!("Failed to create merge iterator: {}", e)))?;
 
         // Step 4: Stream entries with dedup + tombstone cleanup, write directly to new SSTables
-        let target_sst_size = 64 * 1024 * 1024; // 64MB per output SST
+        // 256MB raw ≈ 64MB compressed at the ~4x ratio this data sees. The old
+        // 64MB raw cut produced ~16MB outputs — smaller than the L5 median
+        // input, so every L5→L6 merge re-seeded L6 with a fresh pile of small
+        // files for the self-merge to digest again. Output size must beat the
+        // inputs or the level never drains.
+        let target_sst_size = 256 * 1024 * 1024; // 256MB raw per output SST
         let merge_start = std::time::Instant::now();
         // 10 minutes: a single L1 merge can legitimately process millions of
         // entries (post-cleanup rebalance); 120s aborted those merges and the
@@ -1292,39 +1297,49 @@ impl CompactionWorker {
 
     /// Bounded self-merge for the deepest level (C).
     ///
-    /// The deepest level is never a size-score compaction source, and a full
-    /// self-merge of ~24M entries OOMs / churns without reducing file count.
+    /// Whether a mid-stream output cut may fire given `outputs_so_far` cuts
+    /// in a batch of `batch_len` inputs. Budget is `batch_len - 2` cuts: the
+    /// tail flush after the loop adds one more output, so a batch of N always
+    /// ends at ≤ N-1 files — a strict win, never a discardable no-win rewrite.
+    /// A batch of 2 therefore never splits at all.
+    fn midstream_cut_allowed(outputs_so_far: usize, batch_len: usize) -> bool {
+        outputs_so_far + 3 <= batch_len
+    }
+
+    /// The deepest level is never a size-score compaction source; file count
+    /// is what drives it. A pass absorbs a batch of the SMALLEST files (the
+    /// small tail is what inflates the count) and rewrites them into fewer,
+    /// larger outputs.
     ///
-    /// **2-in-1-out with a size cap** is the only safe file-count reduction
-    /// once L6 files are large:
-    /// - a bigger batch re-splits into N outputs and churns
-    ///   (observed: 8 in → 8 out, 0 deduped)
-    /// - unlimited 2-in-1-out grows files without bound (multi-GB SSTs:
-    ///   rewrite amplification, huge open handles, latency spikes)
-    ///
-    /// So: merge two of the smallest files *only when their combined size
-    /// stays under `MAX_PAIR_BYTES`*. Output is a single SST (no split), so
-    /// each call nets -1 file. Oversized pairs are left alone — L5→L6
-    /// normal compaction is what absorbs those.
+    /// Two invariants make every pass a strict file-count win:
+    /// - **output budget**: at most `batch.len() - 2` mid-stream cuts, so
+    ///   with the final tail output a batch of N files always ends at
+    ///   ≤ N-1 files. The old fixed cut target could regenerate N outputs
+    ///   (observed: 2→2 and 3→3 passes that were then discarded, ~3.5 min
+    ///   of pure waste each).
+    /// - **cut sizing from the batch**: the raw:size estimate must beat the
+    ///   compression gap or small batches split back into N outputs. This
+    ///   data compresses ≥4x under zstd, so the old ×3 estimate under-shot
+    ///   and the 384MB raw ceiling capped outputs below the ~63MB median
+    ///   input file — outputs that barely shrink the count. The ceiling now
+    ///   allows one output up to ~192MB compressed (the builder only keeps
+    ///   compressed blocks in memory).
     fn merge_last_level_batch(&mut self) -> Result<()> {
-        // Multi-in / few-out rewrite. The old 2-in-1-out loop reduced file
-        // count by one per pass and re-fired every ~60s — a permanent write
-        // hotspot. Instead, absorb a batch of the smallest files and split
-        // the output at TARGET_OUTPUT_SIZE so one pass drops several files.
+        // Multi-in / few-out rewrite. Absorb a batch of the smallest files
+        // and split the output at TARGET_OUTPUT_SIZE so one pass drops
+        // several files.
         //
-        // Batch size is capped at 4 to limit peak memory: each input SST is
-        // ~100-140MB and the streaming merge holds block data in memory.
-        // 4 files ≈ 400-560MB peak, vs 8 files ≈ 1GB+ which causes OOM.
-        const MAX_BATCH_FILES: usize = 4;
-        const MAX_INPUT_BYTES: u64 = 128 * 1024 * 1024; // 128MB cap
-        // Uncompressed output target. 128MB keeps each output small enough
-        // that a batch of 4 inputs collapses into 1-2 files while limiting
-        // the builder's in-memory accumulation.
-        // Uncompressed cut must beat the ~3x zstd gap or 4 inputs regenerate
-        // 4 outputs (observed: before=4 after=4 every pass, L6 stuck at 691
-        // files / score 10.8 and starving L1). Size the cut from the batch.
-        const TARGET_OUTPUT_MIN: u64 = 256 * 1024 * 1024;
-        const TARGET_OUTPUT_MAX: u64 = 384 * 1024 * 1024;
+        // Batch bytes (not file count) bound peak memory: the merge streams
+        // block-by-block and the builder accumulates compressed output of
+        // one cut at a time (~raw/4). 256MB input ≈ one 384-768MB raw cut
+        // ≈ 96-192MB builder data.
+        const MAX_BATCH_FILES: usize = 8;
+        const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024; // 256MB cap
+        // Uncompressed cut target. Must beat the ~4x zstd gap or N inputs
+        // regenerate N outputs (observed: before=2 after=2, before=3 after=3
+        // discards that stalled L6 at 790 files / score ~44).
+        const TARGET_OUTPUT_MIN: u64 = 384 * 1024 * 1024;
+        const TARGET_OUTPUT_MAX: u64 = 768 * 1024 * 1024;
         const MIN_FILES: usize = 2;
 
         // Drop 0-entry empty shells first — they pollute the batch budget.
@@ -1392,7 +1407,11 @@ impl CompactionWorker {
         };
 
         let batch_disk: u64 = batch.iter().map(|s| s.size).sum();
-        let est_raw = batch_disk.saturating_mul(3);
+        // Raw bytes per output: this data compresses ≥4x under zstd, so size
+        // the cut from a conservative 4x estimate of the batch's raw content.
+        let est_raw = batch_disk.saturating_mul(4);
+        // Strict file-count win: with the tail flush that follows, at most
+        // batch.len()-1 outputs can appear — never a no-win rewrite.
         let max_outputs = (batch.len() as u64).saturating_sub(1).max(1);
         let target_output_size: u64 =
             (est_raw / max_outputs).clamp(TARGET_OUTPUT_MIN, TARGET_OUTPUT_MAX);
@@ -1452,7 +1471,13 @@ impl CompactionWorker {
             total_entries += 1;
             last_key = Some(dedup_key);
 
-            if current_size >= target_output_size {
+            // Mid-stream cut, budgeted so the tail flush keeps the total
+            // under batch.len(): at most batch.len()-2 cuts here + 1 tail.
+            // A batch of 2 thus never splits — its whole content becomes
+            // one output, exactly the 2→1 win the old cut target missed.
+            if current_size >= target_output_size
+                && Self::midstream_cut_allowed(new_ssts.len(), batch.len())
+            {
                 let id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
                 let path = self
                     .options
@@ -1877,6 +1902,30 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Output budget invariant: a batch of N inputs must end at ≤ N-1 files
+    /// (the tail flush after the mid-stream cuts adds one output). N=2 must
+    /// never split at all.
+    #[test]
+    fn test_midstream_cut_budget_guarantees_reduction() {
+        for batch in 2..17usize {
+            let mut cuts = 0;
+            while CompactionWorker::midstream_cut_allowed(cuts, batch) {
+                cuts += 1;
+            }
+            // cuts mid-stream + 1 tail output must stay strictly under batch
+            assert!(
+                cuts + 1 < batch,
+                "batch={batch} allows {cuts} cuts + tail = {} outputs (>= input count)",
+                cuts + 1
+            );
+        }
+        // A pair never splits: one output for two inputs.
+        assert!(!CompactionWorker::midstream_cut_allowed(0, 2));
+        // A triple may cut once at most (1 + tail = 2 < 3).
+        assert!(CompactionWorker::midstream_cut_allowed(0, 3));
+        assert!(!CompactionWorker::midstream_cut_allowed(1, 3));
     }
 
     #[test]
