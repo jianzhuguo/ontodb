@@ -891,14 +891,17 @@ impl SsTable {
 
     /// Block index, loaded (and validated) on first use and kept afterwards.
     ///
-    /// Lazy load failure degrades to an empty index — lookups then report
-    /// "not found" and scans yield nothing, with an error line in the log.
-    /// `open()` already validated the section once, so this path only fires
-    /// on I/O errors or on-disk mutation after open.
+    /// Reads through the file handle retained since `open()` — NOT a re-open
+    /// by path. A re-open loses the race with compaction unlinks (Windows
+    /// delete-pending: old handles stay readable, new opens fail), and the
+    /// silent empty-index fallback then hides a tombstone and resurrects
+    /// deleted rows. `open()` already validated the section once, so this
+    /// path only fires on genuine I/O errors.
     fn block_index(&self) -> &[BlockIndexEntry] {
         self.index.get_or_init(|| {
             let load = || -> Result<Vec<BlockIndexEntry>> {
-                let mut file = File::open(&self.path)?;
+                let mut inner = self.inner.lock();
+                let file = &mut inner.file;
                 file.seek(SeekFrom::Start(self.index_offset))?;
                 let mut buf = vec![0u8; (self.bloom_offset - self.index_offset) as usize];
                 file.read_exact(&mut buf)?;
@@ -916,14 +919,16 @@ impl SsTable {
 
     /// Bloom filter, loaded on first point lookup. `None` means "no filter".
     ///
-    /// This mirrors the old eager behavior exactly: `BloomFilter::from_bytes`
-    /// returning `None` (malformed/absent) has always meant "skip the bloom
-    /// fast path and check every block", never an error.
+    /// Same retained-handle rule as `block_index()`: a by-path re-open loses
+    /// the race with compaction unlinks. `BloomFilter::from_bytes` returning
+    /// `None` (malformed/absent) has always meant "skip the bloom fast path
+    /// and check every block", never an error.
     fn bloom_filter(&self) -> Option<&BloomFilter> {
         self.bloom
             .get_or_init(|| {
                 let load = || -> Result<Option<BloomFilter>> {
-                    let mut file = File::open(&self.path)?;
+                    let mut inner = self.inner.lock();
+                    let file = &mut inner.file;
                     file.seek(SeekFrom::Start(self.bloom_offset))?;
                     let mut buf = vec![0u8; (self.payload_end - self.bloom_offset) as usize];
                     file.read_exact(&mut buf)?;
