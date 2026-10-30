@@ -481,6 +481,67 @@ pub struct GraphEdge {
 }
 
 impl QueryAst {
+    /// Rewrites every class/table name through `f` — used by the executor to
+    /// stamp bare class names with the session namespace. Recurses into
+    /// sub-queries (UNION / WITH / INSERT...SELECT / EXPLAIN / MV create).
+    pub fn map_class_names(&mut self, f: &mut impl FnMut(&str) -> String) {
+        use QueryAst::*;
+        match self {
+            Insert { class, .. }
+            | BatchInsert { class, .. }
+            | BatchUpsert { class, .. }
+            | Upsert { class, .. }
+            | Import { class, .. }
+            | Copy { class, .. }
+            | Update { class, .. }
+            | Delete { class, .. }
+            | Match { class, .. }
+            | CreateIndex { class, .. }
+            | CreateCompositeIndex { class, .. }
+            | DropIndex { class, .. }
+            | VacuumTable { class, .. }
+            | TruncateTable { class, .. }
+            | ShowTableStats { class, .. }
+            | Describe { class, .. }
+            | CreateVectorIndex { class, .. }
+            | DropVectorIndex { class, .. }
+            | CompactVectorIndex { class, .. }
+            | VectorSearch { class, .. } => {
+                *class = f(class);
+            }
+            InsertSelect { class, query, .. } => {
+                *class = f(class);
+                query.map_class_names(f);
+            }
+            Select { from, joins, .. } => {
+                *from = f(from);
+                for j in joins.iter_mut() {
+                    j.table = f(&j.table);
+                }
+            }
+            Analyze { table } => {
+                *table = f(table);
+            }
+            Union { left, right, .. } => {
+                left.map_class_names(f);
+                right.map_class_names(f);
+            }
+            Explain { query } | ExplainReasoning { query } => {
+                query.map_class_names(f);
+            }
+            CreateMaterializedView { query, .. } => {
+                query.map_class_names(f);
+            }
+            With { ctes, query, .. } => {
+                for cte in ctes.iter_mut() {
+                    cte.query.map_class_names(f);
+                }
+                query.map_class_names(f);
+            }
+            _ => {}
+        }
+    }
+
     /// Returns true if this query only reads data and has no write side effects.
     /// Used to determine lock type: read lock for read-only, write lock for mutations.
     pub fn is_read_only(&self) -> bool {

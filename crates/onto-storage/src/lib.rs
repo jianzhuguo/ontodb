@@ -47,7 +47,10 @@ pub use index::{IndexManager, IndexStorageMode};
 pub use iterator::StorageIterator;
 pub use mvcc::{Transaction, TxnManager, TxnStatus, WriteOp};
 pub use options::StorageOptions;
-pub use ptr_guard::{check_node_ptr, check_vec, is_plausible_heap_ptr, vec_is_dangling, vec_is_safe};
+pub use ptr_guard::{
+    check_node_ptr, check_vec, checked_slice, checked_vec, is_plausible_heap_ptr, vec_header_coherent,
+    vec_is_dangling, vec_is_safe,
+};
 pub use value_meta::{ValueMetadata, ValueScorer, LAMBDA_2Y, LAMBDA_70D, LAMBDA_7H};
 pub use vector::distance;
 pub use vector::{

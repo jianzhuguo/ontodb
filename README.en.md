@@ -22,7 +22,7 @@ OntoDB solves this in one engine:
 | **Query** | SQL + Cypher + SPARQL + proprietary API (4 languages) | **OntoQL**, one syntax for relational + graph + vector + reasoning |
 | **Semantic Metadata** | Metadata only describes table structure (`pg_catalog`); taxonomy lives in application code | **Ontology IS the metadata**: class inheritance / equivalence / disjointness are inferable; `subClassOf` queries auto-expand subclasses |
 | **Deployment** | 6 independent systems, complex ops | **3-tier edge**, ESP32 to cloud server, unified architecture |
-| **Multi-tenant** | App-layer tenant_id, easy to miss | **Namespace kernel isolation**, key-prefix routing, zero overhead |
+| **Multi-tenant** | App-layer tenant_id, easy to miss | **Namespace scoped isolation**, class-prefix routing, zero overhead |
 | **Data Lifetime** | TTL fixed expiry, no value awareness | **Living Data decay**, data lives or dies based on access |
 | **Reliability** | Luck and restarts | **Block-level CRC + guard canary**; corrupted data deterministically rejected; heap-corruption root cause closed |
 | **Cost** | 6 systems x 6 ops x 6 licenses | **1 system**, 80%+ ops cost reduction |
@@ -300,29 +300,31 @@ Traditional TTL: fixed expiry, no value awareness. Living Data: **data lives lik
 | # | Innovation | One-liner |
 |---|-----------|-----------|
 | 29 | **CDC Change Capture** | Kernel-integrated, WAL real-time extraction, Flink/Spark compatible |
-| 30 | **Namespace Kernel Isolation** | `{namespace}::{class}::{pk}` 5-layer full-stack isolation, key-prefix routing zero overhead |
+| 30 | **Namespace Scoped Isolation** | bare class names stamped per namespace, `ns.Class` cross-namespace addressing, no WHERE needed |
 | 31 | **GB/T 22239 Separation of Duties** | System/Security/Audit admins mutually exclusive, meets China gov/finance compliance |
 | 32 | **Data Masking Engine** | Kernel-level dynamic + static masking, auto-detect ID card/phone/bank card patterns |
 | 33 | **CRC Auto-Repair** | SSTable page-level CRC validation, auto-repair from Raft replicas on corruption |
 
-### Namespace: Kernel-Level Multi-Tenant Isolation
+### Namespace: Scoped Isolation
 
-OntoDB namespaces are **embedded in the storage kernel**, not application-layer tags. Entity ID `{namespace}::{class}::{pk}` IS the storage key.
+OntoDB namespaces live at the storage-key layer as a **dot-prefix on class names**: under `USE NAMESPACE Bioet`, a bare class `Drug` is stored as `Bioet.Drug::{pk}` — a different key domain from `Drug` in the default namespace, so collisions and misreads cannot happen. Dotted names (the shared global catalog, e.g. `Bioet.Compound`) are treated as qualified and stay as-is from any namespace.
 
 ```
 Traditional: App adds tenant_id -> WHERE tenant_id = ? -> easy to miss
-OntoDB:      EntityId = {namespace}::{class}::{pk} -> key-prefix routing -> physical isolation
+OntoDB:      bare class names auto-scope to the session namespace -> key prefix is the scope, no WHERE needed
 ```
 
-| Isolation Layer | Description |
-|----------------|-------------|
-| **Ontology** | Each namespace has independent class definitions, constraints, inheritance |
-| **Data** | Key-prefix `{namespace}::` physical isolation, no cross-contamination |
-| **Query** | Query engine auto-applies namespace context, no WHERE needed |
-| **Index** | Vector/B-Tree/Spatial indexes isolated by namespace |
-| **Reasoning** | OWL reasoning scoped to namespace, no cross-tenant inference |
+| Isolation Layer   | Description                                                                                                                                 |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Data**          | Bare class names are stamped with the namespace (`Bioet.rug::…`); same class name in another namespace is a separate key domain             |
+| **Query**         | Bare names scope to the current namespace; qualified `ns.Class` gives explicit cross-namespace access (how the shared catalog is addressed) |
+| **Introspection** | SHOW CLASSES hides other tenants' classes inside a namespace; `default` is the admin view and sees everything                               |
+| **Ontology**      | Ontology records may declare their owning namespace                                                                                         |
+| **Index**         | B-Tree/vector indexes are isolated per (prefixed) class name, built independently per namespace                                             |
 
-One OntoDB instance serves N tenants/projects with low ops cost and data security.
+**Isolation semantics**: prevents accidents, not explicit access — bare names never collide or leak across namespaces; qualified cross-namespace **reads** are by design (shared catalogs, cross-project references), while writes to the shared catalog require an unscoped key. `default` / `_default` is the default namespace and is always reachable via `USE NAMESPACE default`.
+
+One OntoDB instance serves N tenants/projects: scoped isolation plus explicit sharing, at low ops cost.
 
 ---
 
@@ -451,7 +453,7 @@ SELECT * FROM sensor_data WHERE time > '2024-01-01' LIMIT 100;
 | **LLM / AI Companies** | Vector + knowledge graph + reasoning fused, RAG + built-in ontology |
 | **Biopharma / AI4S** | Molecular structure + graph + vector + ontology unified; structure-similarity → target-pathway → adverse-event in one query (delivered) |
 | **Internet Companies** | 12 data types in 1 system, replace MySQL+Redis+Milvus+ES+Neo4j |
-| **SaaS Platforms** | Namespace kernel isolation, one instance for N tenants, zero overhead |
+| **SaaS Platforms** | Namespace scoped isolation, one instance for N tenants, zero overhead |
 | **Knowledge Graphs** | OWL reasoning embedded, write-on-reason, traceable derivation chains |
 | **Intelligent Search** | Vector + full-text + semantic reasoning fused query |
 | **IoT / Industrial** | Time series + spatial + graph + ontology unified, STTRL engine built-in |
@@ -462,7 +464,7 @@ SELECT * FROM sensor_data WHERE time > '2024-01-01' LIMIT 100;
 | **Financial Risk** | Ontology rules auto-trigger risk controls + stream + CDC + audit chain |
 | **E-Commerce** | Vector similarity + graph relations + living data decay + real-time events |
 | **Smart City** | Spatial + temporal + graph + ontology, geofence + trajectory + device relations |
-| **Multi-Project Data Hub** | One OntoDB instance for N projects, namespace physical isolation |
+| **Multi-Project Data Hub** | One OntoDB instance for N projects, namespace scoped isolation |
 | **Edge Computing** | MCU < 100KB to full server, unified data model and API |
 | **Embodied Intelligence** | Edge reasoning + spatio-temporal rules + ontology-driven rule engine |
 

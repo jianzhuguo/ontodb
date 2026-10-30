@@ -303,21 +303,30 @@ pub fn decode_integers(data: &[u8], count: usize) -> Option<Vec<i64>> {
 
 /// Compress a block using zstd.
 pub fn compress_block(data: &[u8]) -> Vec<u8> {
-    // Thread-local reused CCtx — `zstd::encode_all` builds a fresh CCtx per
-    // call and can NULL-write under memory pressure (same class as the
-    // SSTable compress fix).
+    // CCtx is thread-local and reused (warm workspace) — same rationale and
+    // recycle contract as sstable::flush_block. The DCtx side stays per-call.
     thread_local! {
         static COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
             std::cell::RefCell::new(None);
+        static COMPRESSOR_USES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
     COMPRESSOR.with(|cell| {
         let mut slot = cell.borrow_mut();
+        const RECYCLE_AFTER: u32 = 32;
+        if slot.is_some() && COMPRESSOR_USES.with(|u| u.get()) >= RECYCLE_AFTER {
+            *slot = None;
+            COMPRESSOR_USES.with(|u| u.set(0));
+        }
         if slot.is_none() {
             match zstd::bulk::Compressor::new(3) {
-                Ok(c) => *slot = Some(c),
+                Ok(c) => {
+                    *slot = Some(c);
+                    COMPRESSOR_USES.with(|u| u.set(0));
+                }
                 Err(_) => return data.to_vec(),
             }
         }
+        COMPRESSOR_USES.with(|u| u.set(u.get() + 1));
         let compressor = slot.as_mut().expect("just initialized");
         // Same slack+canary contract as decompress_block / sstable::flush_block:
         // ZSTD_wildcopy may over-write up to WILDCOPY_OVERLENGTH (32) bytes
@@ -345,11 +354,7 @@ pub fn compress_block(data: &[u8]) -> Vec<u8> {
                 buf.truncate(n);
                 buf
             }
-            Ok(_) => {
-                *slot = None;
-                data.to_vec()
-            }
-            Err(_) => {
+            _ => {
                 *slot = None;
                 data.to_vec()
             }
@@ -362,7 +367,7 @@ pub fn compress_block(data: &[u8]) -> Vec<u8> {
 /// Bounded one-shot path — never `zstd::decode_all`. The streaming decoder
 /// can wildcopy-write past the caller buffer on a full/corrupt frame, which
 /// is the heap-corruption class we already fixed in SSTable reads.
-/// DCtx is thread-local and reused (same contract as compress).
+/// DCtx is fresh per call (reuse disabled — see sstable::zstd_decompress_to).
 pub fn decompress_block(data: &[u8]) -> onto_core::Result<Vec<u8>> {
     const MAX_BLOCK: usize = 64 * 1024 * 1024;
     if data.is_empty() {

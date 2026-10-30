@@ -25,7 +25,7 @@ Start-Process -FilePath $exe `
     "--data-dir", "E:\sembio\data\ontodb_clean", `
     "--http", "127.0.0.1:7912", `
     "--memtable-size", "134217728", `
-    "--compression-level", "1", `
+    "--compression-level", "2", `
     "--graph-max-cache-mb", "512", `
     "--index-storage-mode", "hybrid", `
     "--index-hybrid-threshold", "100000", `

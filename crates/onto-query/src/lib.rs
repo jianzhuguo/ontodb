@@ -44,7 +44,7 @@ mod concurrent_bench;
 mod fuzz_tests;
 
 pub use cache::{CacheStats, PlanCache, QueryCache};
-pub use executor::{QueryExecutor, QueryResult};
+pub use executor::{QueryActor, QueryExecutor, QueryResult};
 pub use ontoql::{OntoQLAst, OntoQLParser};
 pub use optimizer::{CostEstimate, CostModel, ExecutionPlan, PlanNode, QueryPlanner};
 pub use parser::{QueryAst, QueryParser};

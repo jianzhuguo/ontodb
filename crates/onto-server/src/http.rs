@@ -685,6 +685,26 @@ fn build_cors_layer(origins: &str) -> CorsLayer {
     }
 }
 
+/// Set by `POST /api/shutdown`; polled by main's graceful-stop sentinel so an
+/// ops stop can take the clean path (persist row counts, drain in-flight work).
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True once `POST /api/shutdown` has been called.
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Requests a graceful process shutdown.
+async fn request_shutdown() -> impl IntoResponse {
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    tracing::info!("Shutdown requested via /api/shutdown");
+    (
+        StatusCode::OK,
+        Json(json!({"status": "shutting down"})),
+    )
+}
+
 /// Builds the HTTP router with all API endpoints (no auth).
 #[allow(dead_code)]
 pub fn build_router(state: AppState, cors_origins: &str) -> Router {
@@ -723,6 +743,8 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/restore", post(restore_endpoint))
         .route("/api/flush", post(flush))
         .route("/api/compact", post(compact))
+        // Graceful shutdown (persists row counts, drains, exits)
+        .route("/api/shutdown", post(request_shutdown))
         // Recovery: export all Put entries (including tombstoned) to JSONL
         .route("/api/recover", post(recover_entries))
         // Living data activation
@@ -890,6 +912,8 @@ pub fn build_router_with_auth(
         .route("/api/restore", post(restore_endpoint))
         .route("/api/flush", post(flush))
         .route("/api/compact", post(compact))
+        // Graceful shutdown (persists row counts, drains, exits)
+        .route("/api/shutdown", post(request_shutdown))
         // Recovery: export all Put entries (including tombstoned) to JSONL
         .route("/api/recover", post(recover_entries))
         // Living data activation
@@ -1174,13 +1198,32 @@ async fn metrics_json(State(state): State<AppState>) -> impl IntoResponse {
 ///     "pretty": false
 /// }
 /// ```
+/// Builds the query-actor identity (namespace scope + audit label) from the
+/// authenticated key info, falling back to "anonymous" when auth is disabled.
+fn actor_of(info: Option<crate::auth::KeyInfo>, client_ip: &str) -> onto_query::QueryActor {
+    match info {
+        Some(k) => onto_query::QueryActor {
+            label: k.description,
+            namespace: k.namespace,
+            client_ip: client_ip.to_string(),
+        },
+        None => onto_query::QueryActor {
+            label: "anonymous".to_string(),
+            namespace: None,
+            client_ip: client_ip.to_string(),
+        },
+    }
+}
+
 async fn execute_query(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::auth::KeyInfo>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<QueryRequest>,
 ) -> axum::response::Response {
     let start = std::time::Instant::now();
     let client_ip = addr.ip().to_string();
+    let actor = actor_of(caller.map(|e| e.0), &client_ip);
 
     let query = req.query.trim_end_matches(';').trim();
     // Try OntoQL parser first, fall back to SQL parser
@@ -1554,10 +1597,18 @@ async fn execute_query(
         let (tx, rx) = std::sync::mpsc::sync_channel::<StreamEvent>(8);
         let executor = state.executor.clone();
         let ast_for_stream = ast.clone();
+        let actor_for_stream = actor.clone();
         std::thread::spawn(move || {
             let send = |ev: StreamEvent| -> bool { tx.send(ev).is_ok() };
             let mut sink = |batch: Vec<serde_json::Map<String, Value>>| -> bool {
                 send(StreamEvent::Batch(batch))
+            };
+            let ast_for_stream = match executor.prepare_as(&ast_for_stream, &actor_for_stream) {
+                Ok(a) => a.into_owned(),
+                Err(e) => {
+                    let _ = send(StreamEvent::Error(e.to_string()));
+                    return;
+                }
             };
             match executor.execute_read_streaming(&ast_for_stream, &mut sink) {
                 Ok(_) => {
@@ -1661,12 +1712,13 @@ async fn execute_query(
     let result = {
         let executor = state.executor.clone();
         let ast_for_exec = ast.clone();
+        let actor = actor.clone();
         let is_read = onto_query::QueryExecutor::is_read_only_query(&ast);
         tokio::task::spawn_blocking(move || {
             if is_read {
-                executor.execute_read(&ast_for_exec)
+                executor.execute_read_as(&ast_for_exec, &actor)
             } else {
-                executor.execute(&ast_for_exec)
+                executor.execute_as(&ast_for_exec, &actor)
             }
         })
         .await
@@ -1792,9 +1844,12 @@ async fn execute_query(
 /// Returns results in W3C SPARQL Results JSON Format.
 async fn sparql_query(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::auth::KeyInfo>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<SparqlRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+    let actor = actor_of(caller.map(|e| e.0), &addr.ip().to_string());
 
     // Parse SPARQL query
     let mut parser = onto_query::SparqlParser::new();
@@ -1841,12 +1896,13 @@ async fn sparql_query(
     let result = {
         let executor = state.executor.clone();
         let ast_for_exec = ast.clone();
+        let actor = actor.clone();
         let is_read = onto_query::QueryExecutor::is_read_only_query(&ast);
         tokio::task::spawn_blocking(move || {
             if is_read {
-                executor.execute_read(&ast_for_exec)
+                executor.execute_read_as(&ast_for_exec, &actor)
             } else {
-                executor.execute(&ast_for_exec)
+                executor.execute_as(&ast_for_exec, &actor)
             }
         })
         .await
@@ -1913,9 +1969,12 @@ async fn sparql_query(
 /// ```
 async fn vector_search(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::auth::KeyInfo>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<VectorSearchRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+    let actor = actor_of(caller.map(|e| e.0), &addr.ip().to_string());
 
     // Validate identifiers to prevent injection
     if let Err(e) = validate_identifier(&req.class) {
@@ -1988,12 +2047,13 @@ async fn vector_search(
     let result = {
         let executor = state.executor.clone();
         let ast_for_exec = ast.clone();
+        let actor = actor.clone();
         let is_read = onto_query::QueryExecutor::is_read_only_query(&ast);
         tokio::task::spawn_blocking(move || {
             if is_read {
-                executor.execute_read(&ast_for_exec)
+                executor.execute_read_as(&ast_for_exec, &actor)
             } else {
-                executor.execute(&ast_for_exec)
+                executor.execute_as(&ast_for_exec, &actor)
             }
         })
         .await
@@ -2064,9 +2124,12 @@ async fn vector_search(
 /// ```
 async fn batch_query(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::auth::KeyInfo>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<BatchRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+    let actor = actor_of(caller.map(|e| e.0), &addr.ip().to_string());
 
     if req.queries.is_empty() {
         return (
@@ -2107,7 +2170,7 @@ async fn batch_query(
 
         // Parse and execute
         let result = match onto_query::QueryParser::parse(trimmed) {
-            Ok(ast) => state.executor.execute(&ast),
+            Ok(ast) => state.executor.execute_as(&ast, &actor),
             Err(e) => Err(e),
         };
 
@@ -2202,9 +2265,12 @@ async fn batch_query(
 /// ```
 async fn hybrid_query(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::auth::KeyInfo>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<HybridQueryRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+    let actor = actor_of(caller.map(|e| e.0), &addr.ip().to_string());
 
     // Validate identifiers to prevent injection
     if let Err(e) = validate_identifier(&req.vector_column) {
@@ -2244,9 +2310,9 @@ async fn hybrid_query(
     };
 
     let sql_result = if onto_query::QueryExecutor::is_read_only_query(&sql_ast) {
-        state.executor.execute_read(&sql_ast)
+        state.executor.execute_read_as(&sql_ast, &actor)
     } else {
-        state.executor.execute(&sql_ast)
+        state.executor.execute_as(&sql_ast, &actor)
     };
     let sql_result = match sql_result {
         Ok(r) => r,
@@ -2337,9 +2403,9 @@ async fn hybrid_query(
     };
 
     let vector_result = if onto_query::QueryExecutor::is_read_only_query(&vector_ast) {
-        state.executor.execute_read(&vector_ast)
+        state.executor.execute_read_as(&vector_ast, &actor)
     } else {
-        state.executor.execute(&vector_ast)
+        state.executor.execute_as(&vector_ast, &actor)
     };
     let vector_result = match vector_result {
         Ok(r) => r,
@@ -2421,9 +2487,12 @@ async fn transaction_begin(
 /// ```
 async fn transaction_execute(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::auth::KeyInfo>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<TransactionExecuteRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+    let actor = actor_of(caller.map(|e| e.0), &addr.ip().to_string());
 
     let query = req.query.trim_end_matches(';').trim();
     if query.is_empty() {
@@ -2447,7 +2516,7 @@ async fn transaction_execute(
     // Check if it's a write query (only write queries can run in transactions)
     if QueryExecutor::is_read_only_query(&ast) {
         // Read queries don't need transaction context, execute normally
-        let result = state.executor.execute_read(&ast);
+        let result = state.executor.execute_read_as(&ast, &actor);
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         return match result {
             Ok(r) => {
@@ -2465,7 +2534,10 @@ async fn transaction_execute(
     }
 
     // Write query — execute within transaction
-    let result = state.executor.execute_in_transaction(req.txn_id, &ast);
+    let result = match state.executor.prepare_as(&ast, &actor) {
+        Ok(prepared) => state.executor.execute_in_transaction(req.txn_id, &prepared),
+        Err(e) => Err(e),
+    };
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     match result {
@@ -2565,9 +2637,12 @@ async fn transaction_rollback(
 /// ```
 async fn cursor_query(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::auth::KeyInfo>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<CursorRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+    let actor = actor_of(caller.map(|e| e.0), &addr.ip().to_string());
 
     let query = req.query.trim_end_matches(';').trim();
     if query.is_empty() {
@@ -2616,9 +2691,9 @@ async fn cursor_query(
     };
 
     let result = if QueryExecutor::is_read_only_query(&ast) {
-        state.executor.execute_read(&ast)
+        state.executor.execute_read_as(&ast, &actor)
     } else {
-        state.executor.execute(&ast)
+        state.executor.execute_as(&ast, &actor)
     };
 
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -2682,9 +2757,12 @@ async fn cursor_query(
 /// ```
 async fn export_data(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::auth::KeyInfo>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<ExportRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+    let actor = actor_of(caller.map(|e| e.0), &addr.ip().to_string());
 
     let query = match &req.class {
         Some(class) => {
@@ -2740,7 +2818,7 @@ async fn export_data(
         }
     };
 
-    let result = state.executor.execute_read(&ast);
+    let result = state.executor.execute_read_as(&ast, &actor);
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     match result {
@@ -2832,9 +2910,12 @@ async fn export_data(
 /// ```
 async fn import_data(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::auth::KeyInfo>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<ImportRequest>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+    let actor = actor_of(caller.map(|e| e.0), &addr.ip().to_string());
 
     // Validate class identifier to prevent SQL injection
     if let Err(e) = validate_identifier(&req.class) {
@@ -2903,7 +2984,7 @@ async fn import_data(
         );
 
         match QueryParser::parse(&insert) {
-            Ok(ast) => match state.executor.execute(&ast) {
+            Ok(ast) => match state.executor.execute_as(&ast, &actor) {
                 Ok(_) => imported += 1,
                 Err(e) => {
                     if req.skip_errors {

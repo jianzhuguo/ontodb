@@ -90,7 +90,14 @@ impl OntologyStore {
     }
 
     /// Loads a namespace by name.
+    ///
+    /// The default namespace always exists implicitly: it has no `__ns__`
+    /// registry record, but `USE NAMESPACE default` / `_default` must be able
+    /// to switch back to it after visiting another namespace.
     pub fn load_namespace(&self, name: &str) -> Result<Option<Namespace>> {
+        if name == DEFAULT_NAMESPACE || name == "default" {
+            return Ok(Some(Namespace::new(DEFAULT_NAMESPACE)));
+        }
         let key = Self::make_namespace_key(name);
         match self.engine.get(&key)? {
             Some(bytes) => {

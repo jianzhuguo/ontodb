@@ -16,6 +16,7 @@ use super::distance::{distance, hamming_packed, tanimoto_packed, DistanceMetric}
 use rand::Rng;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
+use std::sync::Arc;
 
 /// Compact vector storage: bit-packed for binary fingerprints (128B for
 /// 1024 bits) or dense f32 for general embeddings. Keeps the hot graph
@@ -107,6 +108,18 @@ impl VecData {
         }
     }
 
+    /// Tolerant equality against another VecData (same 1e-6 tolerance as
+    /// `matches_f32`, but without expanding either side to f32).
+    pub fn matches_data(&self, other: &VecData) -> bool {
+        match (self, other) {
+            (VecData::Packed(a), VecData::Packed(b)) => a == b,
+            (VecData::Dense(a), VecData::Dense(b)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() <= 1e-6)
+            }
+            _ => false,
+        }
+    }
+
     /// True if this storage holds the same values as the f32 slice
     /// (used for stale-entry detection after updates).
     pub fn matches_f32(&self, vec: &[f32]) -> bool {
@@ -192,13 +205,57 @@ impl HnswConfig {
 }
 
 /// A node in the HNSW graph.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 struct HnswNode {
     id: Vec<u8>,
     /// Compact vector storage (packed bits for binary fingerprints).
+    /// Shared (Arc) with the manager's `doc_vectors` map so the same vector
+    /// body is never stored twice.
+    data: Arc<VecData>,
+    /// Neighbors at each layer (u32 node indices; the node table can never
+    /// approach u32::MAX entries given per-node memory cost).
+    neighbors: Vec<Vec<u32>>,
+}
+
+/// Wire mirror of [`HnswNode`]. The on-disk/snapshot layout must stay
+/// byte-identical to the historical format (`neighbors` as `Vec<Vec<usize>>`,
+/// i.e. u64 per entry in bincode) so old `.hnsw` snapshots and incremental
+/// blobs keep loading.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HnswNodeWire {
+    id: Vec<u8>,
     data: VecData,
-    /// Neighbors at each layer.
-    neighbors: Vec<Vec<usize>>,
+    neighbors: Vec<Vec<u64>>,
+}
+
+impl serde::Serialize for HnswNode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        HnswNodeWire {
+            id: self.id.clone(),
+            data: (*self.data).clone(),
+            neighbors: self
+                .neighbors
+                .iter()
+                .map(|layer| layer.iter().map(|&i| i as u64).collect())
+                .collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for HnswNode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = HnswNodeWire::deserialize(deserializer)?;
+        Ok(HnswNode {
+            id: wire.id,
+            data: Arc::new(wire.data),
+            neighbors: wire
+                .neighbors
+                .into_iter()
+                .map(|layer| layer.into_iter().map(|i| i as u32).collect())
+                .collect(),
+        })
+    }
 }
 
 /// Entry for min-heap (closest first).
@@ -349,6 +406,13 @@ impl HnswIndex {
         self.nodes.iter().map(|n| n.id.clone()).collect()
     }
 
+    /// Iterates (id, shared vector) in node order. Lets the manager seed its
+    /// `doc_vectors` map with the node's `Arc` (zero-copy sharing) after a
+    /// snapshot restore.
+    pub fn iter_id_data(&self) -> impl Iterator<Item = (&[u8], &Arc<VecData>)> {
+        self.nodes.iter().map(|n| (n.id.as_slice(), &n.data))
+    }
+
     /// Removes every node whose id is NOT in `keep`, in place.
     ///
     /// `insert_data` does not dedup, so one id can appear on several nodes
@@ -371,7 +435,7 @@ impl HnswIndex {
     pub fn prune_ids(
         &mut self,
         keep: &std::collections::HashSet<Vec<u8>>,
-        prefer: &std::collections::HashMap<Vec<u8>, VecData>,
+        prefer: &std::collections::HashMap<Vec<u8>, Arc<VecData>>,
     ) -> usize {
         use std::collections::HashMap;
         let n_before = self.nodes.len();
@@ -386,7 +450,7 @@ impl HnswIndex {
                 continue;
             }
             let rank = match prefer.get(&node.id) {
-                Some(want) if *want == node.data => 2u8,
+                Some(want) if want.as_ref() == node.data.as_ref() => 2u8,
                 Some(_) => 0u8,
                 None => 1u8,
             };
@@ -414,8 +478,8 @@ impl HnswIndex {
             for layer in node.neighbors.iter_mut() {
                 let mut out = Vec::with_capacity(layer.len());
                 for &nb in layer.iter() {
-                    match remap.get(nb).copied().flatten() {
-                        Some(new_nb) if new_nb != my_new => out.push(new_nb),
+                    match remap.get(nb as usize).copied().flatten() {
+                        Some(new_nb) if new_nb != my_new => out.push(new_nb as u32),
                         _ => {}
                     }
                 }
@@ -427,12 +491,12 @@ impl HnswIndex {
 
         // ---- Pass 3: enforce bidirectionality on every layer ----
         {
-            let mut lists: Vec<Vec<Vec<usize>>> = survivors
+            let mut lists: Vec<Vec<Vec<u32>>> = survivors
                 .iter()
                 .map(|nd| nd.neighbors.clone())
                 .collect();
 
-            let mut pending: Vec<(usize, usize, usize)> = Vec::new();
+            let mut pending: Vec<(usize, usize, u32)> = Vec::new();
             for (a, layers) in lists.iter().enumerate() {
                 for (l, nbs) in layers.iter().enumerate() {
                     for &b in nbs {
@@ -441,14 +505,14 @@ impl HnswIndex {
                 }
             }
             for (a, l, b) in pending {
-                if b >= lists.len() {
+                if b as usize >= lists.len() {
                     continue;
                 }
-                if l >= lists[b].len() {
-                    lists[b].resize(l + 1, Vec::new());
+                if l >= lists[b as usize].len() {
+                    lists[b as usize].resize(l + 1, Vec::new());
                 }
-                if !lists[b][l].contains(&a) {
-                    lists[b][l].push(a);
+                if !lists[b as usize][l].contains(&(a as u32)) {
+                    lists[b as usize][l].push(a as u32);
                 }
             }
 
@@ -508,8 +572,14 @@ impl HnswIndex {
     }
 
     /// Insert with pre-converted vector data (avoids re-packing on bulk paths).
-    pub fn insert_data(&mut self, id: Vec<u8>, data: VecData) {
+    /// The `Arc` is shared with the caller (manager `doc_vectors`) so the
+    /// vector body lives in exactly one allocation.
+    pub fn insert_data(&mut self, id: Vec<u8>, data: Arc<VecData>) {
         let idx = self.nodes.len();
+        if idx > u32::MAX as usize {
+            // Neighbor lists store u32 indices; refuse to grow past that.
+            return;
+        }
         let level = self.random_level();
         let neighbors = vec![Vec::new(); level + 1];
         self.nodes.push(HnswNode {
@@ -527,7 +597,7 @@ impl HnswIndex {
 
         let Some(ep) = self.entry_point else { return };
 
-        // Reuse the stored node data as the query (Packed clone is 128B).
+        // Reuse the stored node data as the query (Arc clone is one word).
         let query = self.nodes[idx].data.clone();
 
         // === Phase 1: Find entry point at each layer ===
@@ -606,7 +676,7 @@ impl HnswIndex {
             while self.nodes.len() <= id {
                 self.nodes.push(HnswNode {
                     id: Vec::new(),
-                    data: VecData::Packed(Vec::new()),
+                    data: Arc::new(VecData::Packed(Vec::new())),
                     neighbors: Vec::new(),
                 });
             }
@@ -625,7 +695,7 @@ impl HnswIndex {
     /// Insert a vector into the index following the HNSW paper algorithm.
     pub fn insert(&mut self, entry: VectorEntry) {
         debug_assert_eq!(entry.vector.len(), self.config.dimension);
-        let data = VecData::from_f32(&entry.vector);
+        let data = Arc::new(VecData::from_f32(&entry.vector));
         self.insert_data(entry.id, data);
     }
 
@@ -639,7 +709,7 @@ impl HnswIndex {
 
         for &nbr_idx in neighbors {
             // Add edge: idx -> nbr (skip contains check - selected neighbors are unique)
-            self.nodes[idx].neighbors[layer].push(nbr_idx);
+            self.nodes[idx].neighbors[layer].push(nbr_idx as u32);
 
             // Ensure neighbor has this layer allocated
             while self.nodes[nbr_idx].neighbors.len() <= layer {
@@ -647,7 +717,7 @@ impl HnswIndex {
             }
 
             // Add edge: nbr -> idx
-            self.nodes[nbr_idx].neighbors[layer].push(idx);
+            self.nodes[nbr_idx].neighbors[layer].push(idx as u32);
 
             // Prune nbr if it has too many neighbors.
             // `idx` is protected: the reciprocal edge must survive this prune,
@@ -678,14 +748,14 @@ impl HnswIndex {
         protected: Option<usize>,
     ) {
         // Sort neighbors by distance to this node
-        let mut with_dist: Vec<(usize, f32)> = self.nodes[node_idx].neighbors[layer]
+        let mut with_dist: Vec<(u32, f32)> = self.nodes[node_idx].neighbors[layer]
             .iter()
             .map(|&i| {
                 (
                     i,
                     self.nodes[node_idx]
                         .data
-                        .distance_to(&self.nodes[i].data, self.config.metric),
+                        .distance_to(&self.nodes[i as usize].data, self.config.metric),
                 )
             })
             .collect();
@@ -693,16 +763,16 @@ impl HnswIndex {
 
         // Diversity heuristic: keep e only if d(e, node_idx) <= d(e, r) for
         // every already-kept r.  Falls back to nearest-remaining to fill up.
-        let mut keep: Vec<usize> = Vec::with_capacity(max_neighbors);
-        let mut rest: Vec<usize> = Vec::new();
+        let mut keep: Vec<u32> = Vec::with_capacity(max_neighbors);
+        let mut rest: Vec<u32> = Vec::new();
         // Keep the protected neighbor first so it occupies a slot.
         if let Some(p) = protected {
-            if with_dist.iter().any(|(i, _)| *i == p) {
-                keep.push(p);
+            if with_dist.iter().any(|(i, _)| *i as usize == p) {
+                keep.push(p as u32);
             }
         }
         for &(i, dist_self) in &with_dist {
-            if Some(i) == protected {
+            if Some(i as usize) == protected {
                 continue;
             }
             if keep.len() >= max_neighbors {
@@ -710,7 +780,9 @@ impl HnswIndex {
                 continue;
             }
             let diverse = keep.iter().all(|&k| {
-                let d_ik = self.nodes[i].data.distance_to(&self.nodes[k].data, self.config.metric);
+                let d_ik = self.nodes[i as usize]
+                    .data
+                    .distance_to(&self.nodes[k as usize].data, self.config.metric);
                 dist_self <= d_ik
             });
             if diverse {
@@ -726,7 +798,8 @@ impl HnswIndex {
             keep.push(i);
         }
 
-        let remove: Vec<usize> = self.nodes[node_idx].neighbors[layer]
+        let node_idx_u32 = node_idx as u32;
+        let remove: Vec<u32> = self.nodes[node_idx].neighbors[layer]
             .iter()
             .filter(|i| !keep.contains(i))
             .copied()
@@ -734,11 +807,11 @@ impl HnswIndex {
 
         // Remove edges from removed nodes back to this node
         for removed_idx in remove {
-            if let Some(pos) = self.nodes[removed_idx].neighbors[layer]
+            if let Some(pos) = self.nodes[removed_idx as usize].neighbors[layer]
                 .iter()
-                .position(|&x| x == node_idx)
+                .position(|&x| x == node_idx_u32)
             {
-                self.nodes[removed_idx].neighbors[layer].remove(pos);
+                self.nodes[removed_idx as usize].neighbors[layer].remove(pos);
             }
         }
 
@@ -856,6 +929,7 @@ impl HnswIndex {
             changed = false;
             let nbrs = self.get_neighbors(best, layer);
             for &nbr in nbrs {
+                let nbr = nbr as usize;
                 let d = query.distance_to(&self.nodes[nbr].data, self.config.metric);
                 if d < best_dist {
                     best_dist = d;
@@ -912,7 +986,7 @@ impl HnswIndex {
                 0
             };
             for i in 0..nbrs_len {
-                let nbr = self.nodes[curr.idx].neighbors[layer][i];
+                let nbr = self.nodes[curr.idx].neighbors[layer][i] as usize;
                 if !visited.insert(nbr) {
                     continue;
                 }
@@ -985,7 +1059,7 @@ impl HnswIndex {
     }
 
     /// Get neighbors at a layer.
-    fn get_neighbors(&self, idx: usize, layer: usize) -> &[usize] {
+    fn get_neighbors(&self, idx: usize, layer: usize) -> &[u32] {
         if layer < self.nodes[idx].neighbors.len() {
             &self.nodes[idx].neighbors[layer]
         } else {
@@ -1139,12 +1213,15 @@ mod tests {
         for (i, nd) in index.nodes.iter().enumerate() {
             for (l, nbs) in nd.neighbors.iter().enumerate() {
                 for &b in nbs {
-                    assert!(b < n, "dangling index {b} (len {n}) in node {i} layer {l}");
-                    assert_ne!(b, i, "self-loop at node {i} layer {l}");
-                    // bidirectional
-                    let b_layers = &index.nodes[b].neighbors;
                     assert!(
-                        l < b_layers.len() && b_layers[l].contains(&i),
+                        (b as usize) < n,
+                        "dangling index {b} (len {n}) in node {i} layer {l}"
+                    );
+                    assert_ne!(b as usize, i, "self-loop at node {i} layer {l}");
+                    // bidirectional
+                    let b_layers = &index.nodes[b as usize].neighbors;
+                    assert!(
+                        l < b_layers.len() && b_layers[l].contains(&(i as u32)),
                         "missing reverse edge {b} -> {i} at layer {l}"
                     );
                 }
@@ -1325,7 +1402,7 @@ mod tests {
 
         // prefer = the live doc_vectors entry for "dup" (v2).
         let mut prefer = std::collections::HashMap::new();
-        prefer.insert(b"dup".to_vec(), VecData::from_f32(&[0.6, 0.4]));
+        prefer.insert(b"dup".to_vec(), Arc::new(VecData::from_f32(&[0.6, 0.4])));
 
         let removed = index.prune_ids(&keep, &prefer);
         assert_eq!(removed, 2, "two stale dup nodes dropped");
@@ -1335,7 +1412,7 @@ mod tests {
         // The surviving dup node must carry the preferred (v2) vector.
         let survivors: Vec<&HnswNode> = index.nodes.iter().filter(|n| n.id == b"dup").collect();
         assert_eq!(survivors.len(), 1);
-        assert_eq!(survivors[0].data, VecData::from_f32(&[0.6, 0.4]));
+        assert_eq!(*survivors[0].data, VecData::from_f32(&[0.6, 0.4]));
 
         // Without `prefer`, the LAST insert wins (v2 anyway here) — but if we
         // point prefer at v0, the first node must win instead.
@@ -1346,11 +1423,11 @@ mod tests {
         keep2.insert(b"dup".to_vec());
         keep2.insert(b"x".to_vec());
         let mut prefer2 = std::collections::HashMap::new();
-        prefer2.insert(b"dup".to_vec(), VecData::from_f32(&[0.0, 1.0])); // the OLD v0
+        prefer2.insert(b"dup".to_vec(), Arc::new(VecData::from_f32(&[0.0, 1.0]))); // the OLD v0
         let removed2 = index2.prune_ids(&keep2, &prefer2);
         assert_eq!(removed2, 1);
         let s2: Vec<&HnswNode> = index2.nodes.iter().filter(|n| n.id == b"dup").collect();
         assert_eq!(s2.len(), 1);
-        assert_eq!(s2[0].data, VecData::from_f32(&[0.0, 1.0]), "prefer wins over last-insert");
+        assert_eq!(*s2[0].data, VecData::from_f32(&[0.0, 1.0]), "prefer wins over last-insert");
     }
 }

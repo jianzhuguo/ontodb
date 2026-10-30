@@ -384,6 +384,9 @@ fn main() -> Result<()> {
         compression_level: args.compression_level,
         sync_wal_on_commit: !args.no_sync_wal,
         index_storage_mode: Some(index_storage_mode),
+        // Startup quiet: don't let proactive merges compete with the
+        // background index+vector rebuild scan for disk and CPU.
+        defer_compaction_until_rebuild_done: true,
         ..Default::default()
     };
 
@@ -410,6 +413,8 @@ fn main() -> Result<()> {
         println!("Audit retention: ENABLED ({} days)", status.retention_days);
     }
 
+    let counts_path = options.data_dir.join("row_counts.json");
+    let audit_path = options.data_dir.join("audit.log");
     let engine = Arc::new(LsmEngine::open(options)?);
 
     // Open disk indexes synchronously so has_index() sees existing indexes
@@ -464,18 +469,30 @@ fn main() -> Result<()> {
             QueryExecutor::new(Arc::clone(&engine), ontology_store)
                 .with_graph(graph_store.clone())
                 .with_triple_store(triple_store)
-                .with_shard_router(shard_config, local_shards),
+                .with_shard_router(shard_config, local_shards)
+                .with_audit_log(&audit_path),
         )
     } else {
         Arc::new(
             QueryExecutor::new(Arc::clone(&engine), ontology_store)
                 .with_graph(graph_store.clone())
-                .with_triple_store(triple_store),
+                .with_triple_store(triple_store)
+                .with_audit_log(&audit_path),
         )
     };
 
-    // Pre-warm row count cache in background
-    executor.warmup_row_counts();
+    // Restore row counts persisted at clean shutdown; only fall back to the
+    // full background warmup scan when there is nothing to restore (first
+    // start or the previous run did not exit cleanly).
+    let restored_counts = executor.load_row_counts_from(&counts_path);
+    if restored_counts > 0 {
+        println!(
+            "Row counts restored for {} tables (warmup skipped)",
+            restored_counts
+        );
+    } else {
+        executor.warmup_row_counts();
+    }
 
     if args.interactive {
         run_repl(&executor)?;
@@ -622,6 +639,35 @@ fn main() -> Result<()> {
                     }));
                 }
 
+                // Graceful-stop sentinel: Ctrl+C or POST /api/shutdown. Exiting
+                // through this future lets main flush per-ops state (persisted
+                // row counts) before the process goes away.
+                futs.push(Box::pin(async {
+                    let mut tick =
+                        tokio::time::interval(std::time::Duration::from_millis(250));
+                    loop {
+                        tokio::select! {
+                            r = tokio::signal::ctrl_c() => {
+                                if let Err(e) = r {
+                                    return Err(onto_core::CoreError::Custom(format!(
+                                        "ctrl_c handler: {e}"
+                                    )));
+                                }
+                                tracing::info!("Ctrl+C received; shutting down");
+                                return Ok(());
+                            }
+                            _ = tick.tick() => {
+                                if http::shutdown_requested() {
+                                    tracing::info!(
+                                        "Shutdown endpoint hit; draining servers"
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }));
+
                 // Run all servers concurrently. If any server fails, log the error
                 // and initiate graceful shutdown of all servers. This is intentional:
                 // for a database server, it's safer to shut down completely and let
@@ -649,10 +695,13 @@ fn main() -> Result<()> {
                 res
             })?;
         } else {
-            rt.block_on(run_tcp_server(&args.listen, executor, metrics))?;
+            rt.block_on(run_tcp_server(&args.listen, executor.clone(), metrics))?;
         }
     }
 
+    if let Err(e) = executor.save_row_counts_to(&counts_path) {
+        eprintln!("Warning: failed to persist row counts: {e}");
+    }
     println!("Goodbye.");
     Ok(())
 }
@@ -813,15 +862,7 @@ async fn run_http_server(
             // Update AuthState keys in-memory
             let mut keys = std::collections::HashMap::new();
             for k in &config.keys {
-                keys.insert(
-                    k.key.clone(),
-                    (
-                        k.description.clone(),
-                        k.permission.clone(),
-                        k.rate_limit,
-                        k.allowed_ips.clone(),
-                    ),
-                );
+                keys.insert(k.key.clone(), auth::KeyRecord::from(k));
             }
             // AuthState uses parking_lot::RwLock, so we can update it directly
             *auth_for_callback.keys.write() = keys;

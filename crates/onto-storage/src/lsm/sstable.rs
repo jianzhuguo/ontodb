@@ -133,61 +133,45 @@ fn is_dst_size_too_small(err: isize) -> bool {
 /// Recreating the DCtx keeps the warm-workspace benefit on the happy path
 /// while guaranteeing clean state after any failure.
 pub(crate) fn zstd_decompress_to(dst: &mut [u8], src: &[u8]) -> std::result::Result<usize, isize> {
-    thread_local! {
-        static DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
-            std::cell::RefCell::new(None);
-        static DECOMPRESSOR_USES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    // 2026-10-28: thread-local DCtx reuse disabled (fresh context per call).
+    // Dump 15936 forensics: a reused DCtx let zstd write 8 bytes of a compressed
+    // SST block over the in-flight HeapEntry during compaction (BinaryHeap
+    // sift_up -> memcmp AV on a non-canonical key.ptr). A/B on 2026-10-27 proved
+    // reuse-ON crashes x3 while fresh-per-call survives. ZSTD_decompressBegin
+    // resets litBuffer/litBufferLocation, but some other per-session state still
+    // leaks across reuse; until that is pinned, do not carry state between calls.
+    let mut dec = match zstd::bulk::Decompressor::new() {
+        Ok(d) => d,
+        Err(_) => {
+            // Fall back to one-shot; still bounded by dst slice.
+            return zstd::zstd_safe::decompress(dst, src).map_err(|e| e as isize);
+        }
+    };
+    match dec.decompress_to_buffer(src, dst) {
+        Ok(n) => Ok(n),
+        Err(e) => {
+            // zstd-safe maps ZSTD codes onto io::Error. Recover the code
+            // so the dstSize_tooSmall retry loop keeps working.
+            if let Some(code) = e.raw_os_error() {
+                if code != 0 {
+                    return Err(code as isize);
+                }
+            }
+            let s = e.to_string();
+            // Display is often the raw wrapping usize / negative code.
+            if let Ok(n) = s.trim().parse::<i64>() {
+                return Err(n as isize);
+            }
+            // ErrorCode Display variants.
+            if s.contains("Destination buffer is too small") || s.contains("dstSize") {
+                return Err(-70);
+            }
+            if s.contains("prefix") || s.contains("Generic") {
+                return Err(-1);
+            }
+            Err(-1)
+        }
     }
-    DECOMPRESSOR.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        const RECYCLE_AFTER: u32 = 256;
-        if slot.is_some() && DECOMPRESSOR_USES.with(|u| u.get()) >= RECYCLE_AFTER {
-            *slot = None;
-            DECOMPRESSOR_USES.with(|u| u.set(0));
-        }
-        if slot.is_none() {
-            match zstd::bulk::Decompressor::new() {
-                Ok(d) => {
-                    *slot = Some(d);
-                    DECOMPRESSOR_USES.with(|u| u.set(0));
-                }
-                Err(_) => {
-                    // Fall back to one-shot; still bounded by dst slice.
-                    return zstd::zstd_safe::decompress(dst, src).map_err(|e| e as isize);
-                }
-            }
-        }
-        DECOMPRESSOR_USES.with(|u| u.set(u.get() + 1));
-        let dec = slot.as_mut().expect("just initialized");
-        match dec.decompress_to_buffer(src, dst) {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                // Drop the DCtx so stale litBuffer/litBufferLocation cannot
-                // poison the next decompression.
-                *slot = None;
-                // zstd-safe maps ZSTD codes onto io::Error. Recover the code
-                // so the dstSize_tooSmall retry loop keeps working.
-                if let Some(code) = e.raw_os_error() {
-                    if code != 0 {
-                        return Err(code as isize);
-                    }
-                }
-                let s = e.to_string();
-                // Display is often the raw wrapping usize / negative code.
-                if let Ok(n) = s.trim().parse::<i64>() {
-                    return Err(n as isize);
-                }
-                // ErrorCode Display variants.
-                if s.contains("Destination buffer is too small") || s.contains("dstSize") {
-                    return Err(-70);
-                }
-                if s.contains("prefix") || s.contains("Generic") {
-                    return Err(-1);
-                }
-                Err(-1)
-            }
-        }
-    })
 }
 
 /// Decompress a zstd frame, refusing frames that would blow past `max_out`.
@@ -392,13 +376,10 @@ impl SsTableBuilder {
     pub fn add(&mut self, entry: &Entry) {
         self.max_seq_no = self.max_seq_no.max(entry.seq_no);
         self.entry_count += 1;
-        // Dangling empty-allocation Vecs (len > 0, cap == 0) must not be
-        // read — that memcpy takes the process down mid-compaction.
-        let key: &[u8] = if entry.key.capacity() == 0 {
-            &[]
-        } else {
-            entry.key.as_slice()
-        };
+        // A smashed Vec header (dangling ptr like 0x1 with live cap/len) must
+        // panic with a snapshot — silently writing an empty key would corrupt
+        // the SSTable. Legit empty Vecs still read as empty.
+        let key: &[u8] = crate::ptr_guard::checked_vec(&entry.key, "SsTableBuilder::add key", "write path");
         self.bloom.insert(key);
         if self.first_key.is_empty() && !key.is_empty() {
             self.first_key.extend_from_slice(key);
@@ -429,11 +410,7 @@ impl SsTableBuilder {
     pub fn add_owned(&mut self, entry: Entry) {
         self.max_seq_no = self.max_seq_no.max(entry.seq_no);
         self.entry_count += 1;
-        let key: &[u8] = if entry.key.capacity() == 0 {
-            &[]
-        } else {
-            entry.key.as_slice()
-        };
+        let key: &[u8] = crate::ptr_guard::checked_vec(&entry.key, "SsTableBuilder::add_owned key", "write path");
         self.bloom.insert(key);
         if self.first_key.is_empty() && !key.is_empty() {
             self.first_key.extend_from_slice(key);
@@ -478,25 +455,20 @@ impl SsTableBuilder {
         // what was actually stored so the reader never feeds uncompressed
         // bytes to zstd.
         //
-        // Compressor is thread-local and reused: `zstd::bulk::compress` builds
-        // a fresh CCtx (multi-MB workspace) per call, and under heavy compaction
-        // the workspace allocation can fail — zstd 1.5.7 does not check
-        // `cwksp_reserve_failed` after reserving `seqStore.llCode`, so a failed
-        // reservation becomes a NULL write in `ZSTD_seqToCodes`. Reusing the
-        // CCtx keeps the workspace warm and avoids the churn.
+        // CCtx is thread-local and reused (warm workspace): rebuilding the
+        // multi-MB cwksp per block saturates a core and made compaction crawl
+        // (a 100-row SELECT took 157s). Recycled every 32 blocks to bound any
+        // stale-state exposure. The DCtx side (decompress) stays per-call —
+        // that is the A/B-convicted corruption source.
         let (block_flags, payload) = if self.compression_level > 0 {
             thread_local! {
                 static COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
                     std::cell::RefCell::new(None);
-                // Recycle the CCtx periodically. Reuse keeps the warm workspace,
-                // but zstd 1.5.7 workspace state can degrade under sustained
-                // compaction and the next ZSTD_compress2 AVs (0xc0000005 in
-                // zstd_compress.c:6619). 64 blocks ≈ 256KB of input per life.
                 static COMPRESSOR_USES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
             }
             let result = COMPRESSOR.with(|cell| {
                 let mut slot = cell.borrow_mut();
-                const RECYCLE_AFTER: u32 = 64;
+                const RECYCLE_AFTER: u32 = 32;
                 if slot.is_some() && COMPRESSOR_USES.with(|u| u.get()) >= RECYCLE_AFTER {
                     *slot = None;
                     COMPRESSOR_USES.with(|u| u.set(0));
@@ -530,8 +502,8 @@ impl SsTableBuilder {
                     compressor.compress_to_buffer(self.current_block.as_slice(), &mut buf[..bound]);
                 if buf[canary_start.saturating_add(ZSTD_WILDCOPY_MARGIN)..] != ZSTD_GUARD_CANARY[..]
                 {
-                    // Corrupt compress wrote past bound+slack. Discard the CCtx
-                    // and fall back to the raw block below.
+                    // Compress wrote past bound+slack. Drop the CCtx and fall
+                    // back to the raw block below.
                     tracing::warn!(
                         "zstd compress smashed guard canary (src_len={}) — dropping CCtx",
                         self.current_block.len()
@@ -550,9 +522,7 @@ impl SsTableBuilder {
                     }
                     Err(_) => {
                         // Drop the CCtx: a failed compress can leave the
-                        // zstd 1.5.7 workspace in a half-reserved state
-                        // (seqStore.llCode = NULL) that the next call would
-                        // write through.
+                        // zstd 1.5.7 workspace in a half-reserved state.
                         *slot = None;
                         None
                     }
@@ -560,7 +530,15 @@ impl SsTableBuilder {
             });
             match result {
                 Some(compressed) => (BLOCK_FLAG_COMPRESSED, compressed),
-                None => (0u8, self.current_block.clone()),
+                None => {
+                    // Silent raw fallback ballooned the dataset 49G→70G once
+                    // (353 files of plaintext blocks); make every fallback visible.
+                    tracing::warn!(
+                        "zstd compress failed — storing RAW block (len={})",
+                        self.current_block.len()
+                    );
+                    (0u8, self.current_block.clone())
+                }
             }
         } else {
             (0u8, self.current_block.clone())
@@ -707,19 +685,13 @@ impl SsTableBuilder {
     }
 
     fn encode_entry_to(buf: &mut Vec<u8>, entry: &Entry) {
-        // An impossible Vec (len > 0 but no allocation) is always a dangling
-        // pointer (typically 0x1). extend_from_slice would memcpy from it and
-        // take the process down during compaction. Treat it as empty instead.
-        let key: &[u8] = if entry.key.capacity() == 0 {
-            &[]
-        } else {
-            entry.key.as_slice()
-        };
-        let value: &[u8] = if entry.value.capacity() == 0 {
-            &[]
-        } else {
-            entry.value.as_slice()
-        };
+        // A smashed Vec header must panic with a snapshot: encoding an empty
+        // key/value into a block silently corrupts the SSTable (mis-ordering /
+        // wrong dedup during later merges). Legit empty Vecs stay empty.
+        let key: &[u8] =
+            crate::ptr_guard::checked_vec(&entry.key, "encode_entry_to key", "block encode");
+        let value: &[u8] =
+            crate::ptr_guard::checked_vec(&entry.value, "encode_entry_to value", "block encode");
         // key_len (4) + key + value_len (4) + value + seq_no (8) + kind (1)
         buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
         buf.extend_from_slice(key);
@@ -1726,11 +1698,21 @@ impl SsTableIterator {
         self.block_slice(self.current_value_start, self.current_value_end)
     }
 
-    /// Slice `block_data[start..end]`, refusing to build a slice over an
-    /// impossible Vec (len > 0 but no allocation — dangling ptr like 0x1).
+    /// Slice `block_data[start..end]`. Panics with a snapshot when the block
+    /// buffer's `Vec` header is in an impossible state (the 19420 crash shape:
+    /// `ptr=0x1` sentinel with live-looking `cap`/`len`, which passed the old
+    /// `cap == 0` check and fed `memcpy` address 0x1). Out-of-range offsets on
+    /// a coherent buffer still return an empty slice — that is a bounds issue,
+    /// not a corrupt allocation.
     fn block_slice(&self, start: usize, end: usize) -> &[u8] {
-        if self.block_data.capacity() == 0 && !self.block_data.is_empty() {
-            return &[];
+        let data = &self.block_data;
+        let (ptr, cap, len) = (data.as_ptr() as usize, data.capacity(), data.len());
+        if !crate::ptr_guard::vec_header_coherent(ptr, cap, len) {
+            panic!(
+                "SsTableIterator block_data Vec is corrupt (ptr={ptr:#x} cap={cap} len={len}); \
+                 block_idx={} slice=[{start}..{end}]",
+                self.block_idx
+            );
         }
         if start <= end && end <= self.block_data.len() {
             &self.block_data[start..end]

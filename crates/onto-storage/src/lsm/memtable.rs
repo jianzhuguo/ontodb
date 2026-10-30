@@ -275,22 +275,15 @@ impl MemTable {
     /// caller sorts by user key before building the SST (see
     /// `persist_immutable_to_sst`).
     ///
-    /// Also validates each `Vec` — a dangling `len>0, cap==0` slice is
-    /// replaced with empty rather than fed to `memcpy` (which has taken the
-    /// process down mid-compaction before).
+    /// Also validates each `Vec` — a smashed header (dangling `ptr` like
+    /// `0x1` with live-looking `cap`/`len`) panics with a snapshot rather
+    /// than being cloned into the SST flush, which would corrupt the table.
     pub fn snapshot_flat(&self) -> Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> {
         let mut out = Vec::with_capacity(self.flat.len());
         for e in &self.flat {
-            let key = if crate::ptr_guard::vec_is_dangling(&e.key) {
-                Vec::new()
-            } else {
-                e.key.clone()
-            };
-            let value = if crate::ptr_guard::vec_is_dangling(&e.value) {
-                Vec::new()
-            } else {
-                e.value.clone()
-            };
+            let key = crate::ptr_guard::checked_vec(&e.key, "snapshot_flat key", "memtable flush").to_vec();
+            let value =
+                crate::ptr_guard::checked_vec(&e.value, "snapshot_flat value", "memtable flush").to_vec();
             out.push((key, value, e.seq_no, e.kind));
         }
         out

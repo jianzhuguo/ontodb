@@ -488,6 +488,31 @@ pub struct QueryExecutor {
     /// Cached row counts per table: table_name �?(count, last_updated).
     /// Avoids full table scan for COUNT(*) queries.
     row_count_cache: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>>,
+    /// Optional append-only audit log (JSON lines) for cross-namespace access
+    /// and scoped-key denials. None = auditing disabled.
+    audit_log: Option<Mutex<std::fs::File>>,
+}
+
+/// Identity of a query caller, used for namespace scoping and audit records.
+#[derive(Debug, Clone)]
+pub struct QueryActor {
+    /// Key description or "anonymous"/"local".
+    pub label: String,
+    /// Namespace scope of the API key (None = unscoped).
+    pub namespace: Option<String>,
+    /// Client IP for audit records.
+    pub client_ip: String,
+}
+
+impl QueryActor {
+    /// Caller with no key / auth disabled.
+    pub fn anonymous() -> Self {
+        Self {
+            label: "anonymous".to_string(),
+            namespace: None,
+            client_ip: "unknown".to_string(),
+        }
+    }
 }
 
 /// Column-level statistics collected by ANALYZE.
@@ -803,6 +828,7 @@ impl QueryExecutor {
             shard_manager: Mutex::new(None),
             current_namespace: Mutex::new("default".to_string()),
             row_count_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            audit_log: None,
         }
     }
 
@@ -823,6 +849,56 @@ impl QueryExecutor {
     fn set_cached_row_count(&self, table: &str, count: u64) {
         let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.insert(table.to_string(), (count, std::time::Instant::now()));
+    }
+
+    /// Persists the row-count cache to `path` (atomic tmp + rename). Written on
+    /// clean shutdown so the next start can skip the full warmup scan. A crash
+    /// leaves no file and the next start falls back to warmup — the counts are
+    /// never trusted across an unclean stop (WAL replay may have added rows
+    /// that the in-memory increments never saw).
+    pub fn save_row_counts_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let counts: std::collections::BTreeMap<String, u64> = {
+            let cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .iter()
+                .map(|(k, &(v, _))| (k.clone(), v))
+                .collect()
+        };
+        let doc = serde_json::json!({ "version": 1, "counts": counts });
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&doc).map_err(std::io::Error::other)?)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Loads row counts persisted by [`Self::save_row_counts_to`] and consumes
+    /// the file (one-shot: a crash after this load must force a full recount on
+    /// the next start, not re-trust stale numbers). Returns the table count.
+    pub fn load_row_counts_from(&self, path: &std::path::Path) -> usize {
+        let consume = |p: &std::path::Path| {
+            let _ = std::fs::remove_file(p);
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return 0;
+        };
+        let parsed: std::result::Result<serde_json::Value, _> = serde_json::from_slice(&bytes);
+        let Some(counts) = parsed
+            .ok()
+            .and_then(|doc| doc.get("counts").and_then(|c| c.as_object()).cloned())
+        else {
+            consume(path);
+            return 0;
+        };
+        let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut n = 0usize;
+        for (table, count) in &counts {
+            if let Some(c) = count.as_u64() {
+                cache.insert(table.clone(), (c, std::time::Instant::now()));
+                n += 1;
+            }
+        }
+        drop(cache);
+        consume(path);
+        n
     }
 
     /// Pre-warm row count cache for all known tables in the background.
@@ -881,6 +957,7 @@ impl QueryExecutor {
                 }
 
                 tracing::info!("Warmup: found {} tables to count", tables.len());
+                let registered = exec.registered_namespaces();
                 let mut total_rows = 0u64;
                 let mut cached_count = 0;
 
@@ -902,8 +979,16 @@ impl QueryExecutor {
                         let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
                         c.insert(table.clone(), (count, std::time::Instant::now()));
                         if let Some(dot_pos) = table.find('.') {
-                            let short = &table[dot_pos + 1..];
-                            c.insert(short.to_string(), (count, std::time::Instant::now()));
+                            let prefix = &table[..dot_pos];
+                            // Short alias only for global-catalog names
+                            // (`sembio.Compound` -> `Compound`). A namespace-
+                            // stamped name gets its bare lookup via class
+                            // resolution; an alias here would collide across
+                            // namespaces sharing a class name.
+                            if !registered.contains(prefix) {
+                                let short = &table[dot_pos + 1..];
+                                c.insert(short.to_string(), (count, std::time::Instant::now()));
+                            }
                         }
                         total_rows += count;
                         cached_count += 1;
@@ -941,6 +1026,262 @@ impl QueryExecutor {
     fn make_entity_id(&self, class: &str, pk: &str) -> onto_core::EntityId {
         let ns = self.current_namespace.lock().unwrap().clone();
         onto_core::EntityId::new(&ns, class, pk)
+    }
+
+    /// True when the session namespace needs no class-name stamping.
+    fn namespace_is_default(&self) -> bool {
+        let ns = self.current_namespace.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(ns.as_str(), "" | "default" | "_default")
+    }
+
+    /// Namespaces registered via CREATE NAMESPACE, plus the implicit default.
+    /// Used to tell namespace-stamped class names (`vet.PetDrug`) apart from
+    /// global-catalog names (`sembio.Compound`).
+    fn registered_namespaces(&self) -> std::collections::HashSet<String> {
+        let mut set = std::collections::HashSet::new();
+        set.insert("default".to_string());
+        set.insert("_default".to_string());
+        if let Ok(list) = self.ontology_store.list_namespaces() {
+            for ns in list {
+                set.insert(ns.name);
+            }
+        }
+        set
+    }
+
+    /// Storage class name for the session namespace.
+    ///
+    /// A name containing a dot is already namespace-qualified (the shared
+    /// global catalog, e.g. `sembio.Compound`) and is used as-is. A bare name
+    /// is stamped with the current namespace (`USE NAMESPACE vet` +
+    /// `INSERT INTO PetDrug` -> `vet.PetDrug`) so writes stay isolated and
+    /// visible to later queries through either the bare or dotted form.
+    fn resolve_class_name(&self, class: &str) -> String {
+        self.resolve_class_name_in(class, None)
+    }
+
+    /// Like [`Self::resolve_class_name`] but with an explicit namespace
+    /// (the caller's key scope) overriding the session namespace.
+    fn resolve_class_name_in(&self, class: &str, ns: Option<&str>) -> String {
+        if class.contains('.') {
+            return class.to_string();
+        }
+        let ns = match ns {
+            Some(n) => n.to_string(),
+            None => self
+                .current_namespace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        };
+        if matches!(ns.as_str(), "" | "default" | "_default") {
+            class.to_string()
+        } else {
+            format!("{}.{}", ns, class)
+        }
+    }
+
+    /// Enables the append-only audit log at `path` (JSON lines).
+    pub fn with_audit_log(mut self, path: &std::path::Path) -> Self {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(f) => self.audit_log = Some(Mutex::new(f)),
+            Err(e) => tracing::warn!("audit log open failed for {:?}: {}", path, e),
+        }
+        self
+    }
+
+    /// Appends one audit record (cross-namespace access or scoped-key denial).
+    fn audit(&self, actor: Option<&QueryActor>, action: &str, classes: &[String], detail: &str) {
+        let Some(log) = &self.audit_log else { return };
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let (label, ns, ip) = match actor {
+            Some(a) => (a.label.as_str(), a.namespace.as_deref(), a.client_ip.as_str()),
+            None => ("local", None, "local"),
+        };
+        let line = serde_json::json!({
+            "ts_unix_ms": ts_ms,
+            "actor": label,
+            "namespace": ns,
+            "ip": ip,
+            "action": action,
+            "classes": classes,
+            "detail": detail,
+        });
+        if let Ok(mut f) = log.lock() {
+            use std::io::Write as _;
+            let _ = writeln!(f, "{}", line);
+            let _ = f.flush();
+        }
+    }
+
+    /// Collects every class/table name referenced by the statement.
+    fn collect_class_names(ast: &QueryAst) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut a = ast.clone();
+        a.map_class_names(&mut |c| {
+            names.push(c.to_string());
+            c.to_string()
+        });
+        names
+    }
+
+    /// Executes a statement on behalf of `actor` (API-key identity).
+    ///
+    /// Namespace-scoped keys get their bare class names stamped with the key's
+    /// namespace (not the session one), cannot issue namespace DDL, and cannot
+    /// reach classes of other registered namespaces. Unscoped callers keep full
+    /// access but qualified cross-namespace touches are audited.
+    pub fn execute_as(&self, ast: &QueryAst, actor: &QueryActor) -> Result<QueryResult> {
+        self.run_as(ast, actor, false)
+    }
+
+    /// Read-only variant of [`Self::execute_as`].
+    pub fn execute_read_as(&self, ast: &QueryAst, actor: &QueryActor) -> Result<QueryResult> {
+        self.run_as(ast, actor, true)
+    }
+
+    /// Namespace enforcement + audit + class-name resolution for one
+    /// statement, without executing it. Used by streaming paths that bypass
+    /// [`Self::execute_as`]. The returned AST is ready to execute as-is.
+    pub fn prepare_as<'a>(
+        &self,
+        ast: &'a QueryAst,
+        actor: &QueryActor,
+    ) -> Result<std::borrow::Cow<'a, QueryAst>> {
+        use QueryAst as A;
+        let scope = actor.namespace.as_deref();
+        let names = Self::collect_class_names(ast);
+
+        // A scoped key's namespace is fixed by its key, not by SQL.
+        if scope.is_some()
+            && matches!(
+                ast,
+                A::UseNamespace { .. } | A::CreateNamespace { .. } | A::DropNamespace { .. }
+            )
+        {
+            self.audit(
+                Some(actor),
+                "denied",
+                &names,
+                "namespace DDL not allowed for scoped key",
+            );
+            return Err(CoreError::InvalidArgument(
+                "namespace DDL not allowed for a namespace-scoped API key".to_string(),
+            ));
+        }
+
+        // Qualified names stamped by another REGISTERED namespace are
+        // cross-namespace access. Scoped keys are confined; unscoped callers
+        // pass but leave an audit trail.
+        let registered = self.registered_namespaces();
+        let mut crossing: Vec<String> = Vec::new();
+        for n in &names {
+            if let Some((prefix, _)) = n.split_once('.') {
+                if registered.contains(prefix) && scope != Some(prefix) {
+                    crossing.push(n.clone());
+                }
+            }
+        }
+        if !crossing.is_empty() {
+            if scope.is_some() {
+                self.audit(
+                    Some(actor),
+                    "denied",
+                    &crossing,
+                    "cross-namespace access denied for scoped key",
+                );
+                return Err(CoreError::InvalidArgument(format!(
+                    "cross-namespace access denied: {}",
+                    crossing.join(", ")
+                )));
+            }
+            self.audit(
+                Some(actor),
+                "cross_ns_access",
+                &crossing,
+                "qualified cross-namespace access",
+            );
+        }
+
+        // Scoped keys may READ the shared global catalog (qualified names
+        // outside every registered namespace, e.g. `sembio.Compound`) but not
+        // WRITE it — the catalog is shared infrastructure maintained through
+        // unscoped/admin callers. Bare names are not affected: they stamp into
+        // the key's own namespace below.
+        if scope.is_some() && !ast.is_read_only() {
+            let catalog_writes: Vec<String> = names
+                .iter()
+                .filter(|n| n.split_once('.').is_some_and(|(p, _)| !registered.contains(p)))
+                .cloned()
+                .collect();
+            if !catalog_writes.is_empty() {
+                self.audit(
+                    Some(actor),
+                    "denied",
+                    &catalog_writes,
+                    "global-catalog write denied for scoped key",
+                );
+                return Err(CoreError::InvalidArgument(format!(
+                    "global-catalog write denied for a namespace-scoped API key: {}",
+                    catalog_writes.join(", ")
+                )));
+            }
+        }
+
+        // Resolve class names against the key scope (session namespace when
+        // unscoped). Subsequent passes on the resolved AST are no-ops.
+        let mut a = ast.clone();
+        let mut changed = false;
+        a.map_class_names(&mut |c| {
+            let r = self.resolve_class_name_in(c, scope);
+            if r != c {
+                changed = true;
+            }
+            r
+        });
+        Ok(if changed {
+            std::borrow::Cow::Owned(a)
+        } else {
+            std::borrow::Cow::Borrowed(ast)
+        })
+    }
+
+    fn run_as(&self, ast: &QueryAst, actor: &QueryActor, read: bool) -> Result<QueryResult> {
+        use QueryAst as A;
+        let resolved = self.prepare_as(ast, actor)?;
+        let result = if read {
+            self.execute_read(&resolved)
+        } else {
+            self.execute(&resolved)
+        };
+
+        // Scoped introspection: SHOW CLASSES listings follow the key scope.
+        if actor.namespace.is_some() && matches!(ast, A::ShowClasses) {
+            if let Ok(QueryResult::Rows(rows)) = &result {
+                let reg = self.registered_namespaces();
+                let scope = actor.namespace.as_deref().unwrap_or_default();
+                let filtered: Vec<_> = rows
+                    .iter()
+                    .filter(|row| {
+                        let name = row.get("class").and_then(|v| v.as_str()).unwrap_or("");
+                        match name.split_once('.') {
+                            Some((prefix, _)) => prefix == scope || !reg.contains(prefix),
+                            None => true,
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                return Ok(QueryResult::Rows(filtered));
+            }
+        }
+        result
     }
 
     /// Set the graph store for unified entity anchor (relational �?graph sync).
@@ -1897,6 +2238,17 @@ impl QueryExecutor {
     /// expressions, and transactions.
     pub fn execute(&self, ast: &QueryAst) -> Result<QueryResult> {
         self.arm_timeout();
+        // Namespace resolution: bare class names are stamped with the session
+        // namespace (no-op under the default namespace).
+        let resolved;
+        let ast = if self.namespace_is_default() {
+            ast
+        } else {
+            let mut a = ast.clone();
+            a.map_class_names(&mut |c| self.resolve_class_name(c));
+            resolved = a;
+            &resolved
+        };
         // For simple DML (INSERT/UPDATE/DELETE) without an active multi-statement txn,
         // use a short write lock that's only held during the commit phase.
         // This allows concurrent reads to proceed during query planning and execution.
@@ -1979,6 +2331,17 @@ impl QueryExecutor {
                             .or_insert((0, std::time::Instant::now()));
                         entry.0 += rows.len() as u64;
                     }
+                    QueryAst::Delete { class, .. }
+                    | QueryAst::Update { class, .. }
+                    | QueryAst::TruncateTable { class }
+                    | QueryAst::Upsert { class, .. }
+                    | QueryAst::BatchUpsert { class, .. } => {
+                        // Invalidate (full name + short alias): these either
+                        // change the row count by an unknown amount or may
+                        // insert; a stale alias would keep serving pre-change
+                        // numbers for bare-name COUNT queries.
+                        self.drop_row_count_aliases(class);
+                    }
                     _ => {}
                 }
             }
@@ -2012,6 +2375,17 @@ impl QueryExecutor {
     /// to ensure uncommitted writes are visible.
     pub fn execute_read(&self, ast: &QueryAst) -> Result<QueryResult> {
         self.arm_timeout();
+        // Namespace resolution: bare class names are stamped with the session
+        // namespace (no-op under the default namespace).
+        let resolved;
+        let ast = if self.namespace_is_default() {
+            ast
+        } else {
+            let mut a = ast.clone();
+            a.map_class_names(&mut |c| self.resolve_class_name(c));
+            resolved = a;
+            &resolved
+        };
         let engine = &self.engine;
 
         // Fast path: no active transaction (the common case) skips the Mutex.
@@ -2079,22 +2453,21 @@ impl QueryExecutor {
                 }
                 QueryAst::BatchUpsert { class, .. } => {
                     // Upsert might insert or update; invalidate to be safe
-                    let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
-                    cache.remove(class);
+                    self.drop_row_count_aliases(class);
                     Some(class.as_str())
                 }
                 QueryAst::InsertSelect { class, .. } => {
                     // INSERT...SELECT: invalidate (unknown count)
-                    let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
-                    cache.remove(class);
+                    self.drop_row_count_aliases(class);
                     Some(class.as_str())
                 }
                 QueryAst::Delete { class, .. }
                 | QueryAst::Update { class, .. }
                 | QueryAst::TruncateTable { class } => {
-                    // DELETE/UPDATE/TRUNCATE: invalidate cache
-                    let mut cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
-                    cache.remove(class);
+                    // DELETE/UPDATE/TRUNCATE: invalidate cache (full name and
+                    // any short alias — a stale alias would keep serving the
+                    // pre-delete count for bare-name COUNT queries)
+                    self.drop_row_count_aliases(class);
                     Some(class.as_str())
                 }
                 _ => None,
@@ -2454,26 +2827,27 @@ impl QueryExecutor {
                     .ontology_store
                     .merge_namespace_ontologies(engine, namespace)?;
 
-                // Add classes from new ontology to merged for validation
+                // Add classes from new ontology to merged for validation.
+                // All new classes must be in the context at once: properties
+                // may span several of them, and validating per-class (one
+                // insert per iteration) rejects every domain except the one
+                // just added.
+                let mut validation_ontology = merged_for_validation.clone();
                 for (name, class) in &ontology.classes {
-                    if !merged_for_validation.classes.contains_key(name) {
-                        // We need to add to a mutable copy
-                        let mut validation_ontology = merged_for_validation.clone();
-                        validation_ontology
-                            .classes
-                            .insert(name.clone(), class.clone());
-                        validation_ontology.rebuild_indexes();
+                    validation_ontology
+                        .classes
+                        .insert(name.clone(), class.clone());
+                }
+                validation_ontology.rebuild_indexes();
 
-                        // Validate only the new ontology against the merged context
-                        let validation_errors =
-                            self.validate_ontology_with_context(&ontology, &validation_ontology);
-                        if !validation_errors.is_empty() {
-                            return Err(CoreError::InvalidArgument(format!(
-                                "Ontology validation failed:\n  - {}",
-                                validation_errors.join("\n  - ")
-                            )));
-                        }
-                    }
+                // Validate only the new ontology against the merged context
+                let validation_errors =
+                    self.validate_ontology_with_context(&ontology, &validation_ontology);
+                if !validation_errors.is_empty() {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "Ontology validation failed:\n  - {}",
+                        validation_errors.join("\n  - ")
+                    )));
                 }
 
                 self.ontology_store.save_with_engine(engine, &ontology)?;
@@ -5916,6 +6290,26 @@ impl QueryExecutor {
         let mut rows: Vec<Map<String, Value>> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+        // Namespace scoping for introspection: inside a namespace, hide classes
+        // stamped by OTHER registered namespaces (e.g. `vet.PetDrug` while in
+        // `other`). Global-catalog prefixes (`sembio.`) are not registered and
+        // stay visible everywhere; the default namespace sees everything.
+        let current_ns = self
+            .current_namespace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let registered = self.registered_namespaces();
+        let hide = |name: &str| -> bool {
+            if matches!(current_ns.as_str(), "" | "default" | "_default") {
+                return false;
+            }
+            match name.split_once('.') {
+                Some((prefix, _)) => prefix != current_ns && registered.contains(prefix),
+                None => false,
+            }
+        };
+
         // Namespace per class: scan ontology entries (merged drops namespace info)
         let mut class_ns: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
@@ -5935,6 +6329,9 @@ impl QueryExecutor {
         names.sort();
 
         for name in names {
+            if hide(&name) {
+                continue;
+            }
             let class = match merged.classes.get(&name) {
                 Some(c) => c,
                 None => continue,
@@ -5977,7 +6374,7 @@ impl QueryExecutor {
             let cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
             let mut extras: Vec<String> = cache
                 .keys()
-                .filter(|k| !seen.contains(*k) && !k.starts_with('_'))
+                .filter(|k| !seen.contains(*k) && !k.starts_with('_') && !hide(k))
                 .cloned()
                 .collect();
             extras.sort();
@@ -16299,6 +16696,442 @@ mod tests {
             ],
         };
         executor.execute(&ast).unwrap();
+    }
+
+    fn test_actor(ns: Option<&str>) -> QueryActor {
+        QueryActor {
+            label: "test-key".to_string(),
+            namespace: ns.map(String::from),
+            client_ip: "127.0.0.1".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_scoped_key_stamps_its_own_namespace() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryAst::CreateNamespace {
+                name: "vet".to_string(),
+            })
+            .unwrap();
+        let vet = test_actor(Some("vet"));
+
+        // Bare class under a scoped key lands in the KEY's namespace even
+        // though the session namespace is still the default one.
+        let ast = QueryParser::parse("INSERT INTO PetDrug (id, name) VALUES ('d1', 'x')").unwrap();
+        executor.execute_as(&ast, &vet).unwrap();
+
+        let r = executor
+            .execute_read(&QueryParser::parse("SELECT id FROM vet.PetDrug").unwrap())
+            .unwrap();
+        assert_eq!(row_count(&r), 1);
+        let r = executor
+            .execute_read(&QueryParser::parse("SELECT id FROM PetDrug").unwrap())
+            .unwrap();
+        assert_eq!(row_count(&r), 0, "bare name under default must not see vet rows");
+
+        // Scoped reads resolve bare names to the key namespace.
+        let r = executor
+            .execute_read_as(&QueryParser::parse("SELECT id FROM PetDrug").unwrap(), &vet)
+            .unwrap();
+        assert_eq!(row_count(&r), 1);
+    }
+
+    #[test]
+    fn test_scoped_key_denied_cross_namespace_and_audited() {
+        let (dir) = tempfile::tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
+        let ontology_store = OntologyStore::new(engine.clone());
+        let audit_path = dir.path().join("audit.log");
+        let executor =
+            QueryExecutor::new(engine, ontology_store).with_audit_log(&audit_path);
+
+        for ns in ["vet", "other"] {
+            executor
+                .execute(&QueryAst::CreateNamespace {
+                    name: ns.to_string(),
+                })
+                .unwrap();
+        }
+        let other = test_actor(Some("other"));
+        let ast = QueryParser::parse("INSERT INTO Secret (id) VALUES ('s1')").unwrap();
+        executor.execute_as(&ast, &other).unwrap();
+
+        let vet = test_actor(Some("vet"));
+        let err = executor
+            .execute_read_as(
+                &QueryParser::parse("SELECT id FROM other.Secret").unwrap(),
+                &vet,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("cross-namespace"), "{err}");
+
+        // Namespace DDL is off-limits for scoped keys.
+        let err = executor
+            .execute_as(
+                &QueryAst::UseNamespace {
+                    name: "other".to_string(),
+                },
+                &vet,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("namespace DDL"), "{err}");
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(log.contains("cross-namespace access denied"), "{log}");
+        assert!(log.contains("namespace DDL not allowed"), "{log}");
+        assert!(log.contains("test-key"), "{log}");
+    }
+
+    #[test]
+    fn test_scoped_key_cannot_write_global_catalog() {
+        let (dir) = tempfile::tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
+        let ontology_store = OntologyStore::new(engine.clone());
+        let audit_path = dir.path().join("audit.log");
+        let executor =
+            QueryExecutor::new(engine, ontology_store).with_audit_log(&audit_path);
+
+        // Unscoped caller seeds a global-catalog class.
+        let admin = test_actor(None);
+        let ast = QueryParser::parse("INSERT INTO glob.Thing (id) VALUES ('g1')").unwrap();
+        executor.execute_as(&ast, &admin).unwrap();
+
+        executor
+            .execute(&QueryAst::CreateNamespace {
+                name: "sempet".to_string(),
+            })
+            .unwrap();
+        let pet = test_actor(Some("sempet"));
+
+        // Reads of the shared catalog stay open for scoped keys...
+        let r = executor
+            .execute_read_as(&QueryParser::parse("SELECT id FROM glob.Thing").unwrap(), &pet)
+            .unwrap();
+        assert_eq!(row_count(&r), 1);
+
+        // ...but catalog writes are denied.
+        let err = executor
+            .execute_as(
+                &QueryParser::parse("DELETE FROM glob.Thing WHERE id = 'g1'").unwrap(),
+                &pet,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("global-catalog write"), "{err}");
+
+        // Own-namespace writes still work.
+        let ast = QueryParser::parse("INSERT INTO Drug (id) VALUES ('d1')").unwrap();
+        executor.execute_as(&ast, &pet).unwrap();
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(log.contains("global-catalog write denied"), "{log}");
+    }
+
+    #[test]
+    fn test_unscoped_cross_namespace_access_is_audited() {
+        let (dir) = tempfile::tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = Arc::new(LsmEngine::open(options).unwrap());
+        let ontology_store = OntologyStore::new(engine.clone());
+        let audit_path = dir.path().join("audit.log");
+        let executor =
+            QueryExecutor::new(engine, ontology_store).with_audit_log(&audit_path);
+
+        executor
+            .execute(&QueryAst::CreateNamespace {
+                name: "vet".to_string(),
+            })
+            .unwrap();
+        let vet = test_actor(Some("vet"));
+        let ast = QueryParser::parse("INSERT INTO PetDrug (id) VALUES ('d1')").unwrap();
+        executor.execute_as(&ast, &vet).unwrap();
+
+        // Unscoped caller reaches the qualified name (allowed) but audited.
+        let admin = test_actor(None);
+        let r = executor
+            .execute_read_as(
+                &QueryParser::parse("SELECT id FROM vet.PetDrug").unwrap(),
+                &admin,
+            )
+            .unwrap();
+        assert_eq!(row_count(&r), 1);
+
+        let log = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(log.contains("cross_ns_access"), "{log}");
+        assert!(log.contains("vet.PetDrug"), "{log}");
+    }
+
+    #[test]
+    fn test_create_multi_class_ontology_with_cross_class_properties() {
+        // Regression: validation used to insert ONE new class into the context
+        // per iteration while validating ALL properties — any property whose
+        // domain was another new class was rejected.
+        let (executor, _dir) = setup();
+        let ast = QueryParser::parse(
+            "CREATE ONTOLOGY petvet (CLASS Species, CLASS Drug, \
+             PROPERTY species_name DOMAIN Species RANGE STRING, \
+             PROPERTY drug_name DOMAIN Drug RANGE STRING, \
+             PROPERTY mg_per_kg DOMAIN Drug RANGE FLOAT64)",
+        )
+        .unwrap();
+        executor.execute(&ast).unwrap();
+    }
+
+    #[test]
+    fn test_default_namespace_always_switchable() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryAst::CreateNamespace {
+                name: "tenant_x".to_string(),
+            })
+            .unwrap();
+        executor
+            .execute(&QueryAst::UseNamespace {
+                name: "tenant_x".to_string(),
+            })
+            .unwrap();
+        // Both spellings of the default namespace must switch back even
+        // though no `__ns__` registry record was ever written for it.
+        executor
+            .execute(&QueryAst::UseNamespace {
+                name: "default".to_string(),
+            })
+            .unwrap();
+        assert_eq!(executor.current_namespace(), "default");
+        executor
+            .execute(&QueryAst::UseNamespace {
+                name: "tenant_x".to_string(),
+            })
+            .unwrap();
+        executor
+            .execute(&QueryAst::UseNamespace {
+                name: "_default".to_string(),
+            })
+            .unwrap();
+    }
+
+    fn row_count(result: &QueryResult) -> usize {
+        match result {
+            QueryResult::Rows(rows) => rows.len(),
+            other => panic!("expected Rows, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_namespaced_insert_is_isolated_and_visible() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryAst::CreateNamespace {
+                name: "vet".to_string(),
+            })
+            .unwrap();
+        executor
+            .execute(&QueryAst::UseNamespace {
+                name: "vet".to_string(),
+            })
+            .unwrap();
+        insert_row(&executor, "PetDrug", "d1", 10);
+
+        // Inside the namespace the row is visible via bare and dotted names.
+        let r = executor
+            .execute_read(&QueryParser::parse("SELECT name FROM PetDrug").unwrap())
+            .unwrap();
+        assert_eq!(row_count(&r), 1);
+        let r = executor
+            .execute_read(&QueryParser::parse("SELECT name FROM vet.PetDrug").unwrap())
+            .unwrap();
+        assert_eq!(row_count(&r), 1);
+
+        // Back in default the bare name is a different class...
+        executor
+            .execute(&QueryAst::UseNamespace {
+                name: "default".to_string(),
+            })
+            .unwrap();
+        let r = executor
+            .execute_read(&QueryParser::parse("SELECT name FROM PetDrug").unwrap())
+            .unwrap();
+        assert_eq!(row_count(&r), 0);
+        // ...but the qualified name sees the namespaced rows from anywhere.
+        let r = executor
+            .execute_read(&QueryParser::parse("SELECT name FROM vet.PetDrug").unwrap())
+            .unwrap();
+        assert_eq!(row_count(&r), 1);
+
+        // Dotted names are global: writes under a namespace do not stamp them.
+        insert_row(&executor, "glob.Thing", "g1", 1);
+        let r = executor
+            .execute_read(&QueryParser::parse("SELECT name FROM glob.Thing").unwrap())
+            .unwrap();
+        assert_eq!(row_count(&r), 1);
+    }
+
+    #[test]
+    fn test_show_classes_scoped_to_namespace() {
+        let (executor, _dir) = setup();
+        for ns in ["vet", "other"] {
+            executor
+                .execute(&QueryAst::CreateNamespace {
+                    name: ns.to_string(),
+                })
+                .unwrap();
+        }
+        executor
+            .execute(&QueryAst::UseNamespace {
+                name: "vet".to_string(),
+            })
+            .unwrap();
+        insert_row(&executor, "PetDrug", "d1", 1);
+        executor
+            .execute(&QueryAst::UseNamespace {
+                name: "other".to_string(),
+            })
+            .unwrap();
+        insert_row(&executor, "PetDrug", "d2", 2);
+        insert_row(&executor, "glob.Thing", "g1", 3);
+
+        // Inside "other": own class + global catalog visible, vet's hidden.
+        let r = executor
+            .execute_read(&QueryParser::parse("SHOW CLASSES").unwrap())
+            .unwrap();
+        let names: Vec<String> = match &r {
+            QueryResult::Rows(rows) => rows
+                .iter()
+                .filter_map(|row| {
+                    row.get("class")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .collect(),
+            other => panic!("expected Rows, got {:?}", other),
+        };
+        assert!(names.contains(&"other.PetDrug".to_string()), "{:?}", names);
+        assert!(names.contains(&"glob.Thing".to_string()), "{:?}", names);
+        assert!(!names.contains(&"vet.PetDrug".to_string()), "{:?}", names);
+
+        // The default namespace (admin view) sees everything.
+        executor
+            .execute(&QueryAst::UseNamespace {
+                name: "default".to_string(),
+            })
+            .unwrap();
+        let r = executor
+            .execute_read(&QueryParser::parse("SHOW CLASSES").unwrap())
+            .unwrap();
+        let names: Vec<String> = match &r {
+            QueryResult::Rows(rows) => rows
+                .iter()
+                .filter_map(|row| {
+                    row.get("class")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .collect(),
+            other => panic!("expected Rows, got {:?}", other),
+        };
+        assert!(names.contains(&"vet.PetDrug".to_string()), "{:?}", names);
+        assert!(names.contains(&"other.PetDrug".to_string()), "{:?}", names);
+    }
+
+    #[test]
+    fn test_delete_scoped_to_namespace_and_invalidates_alias() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryAst::CreateNamespace {
+                name: "vet".to_string(),
+            })
+            .unwrap();
+        executor
+            .execute(&QueryAst::UseNamespace {
+                name: "vet".to_string(),
+            })
+            .unwrap();
+        insert_row(&executor, "PetDrug", "d1", 1);
+        executor
+            .execute(&QueryAst::UseNamespace {
+                name: "default".to_string(),
+            })
+            .unwrap();
+        insert_row(&executor, "PetDrug", "d1", 9);
+
+        // DELETE under vet touches only the vet rows.
+        executor
+            .execute(&QueryAst::UseNamespace {
+                name: "vet".to_string(),
+            })
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("DELETE FROM PetDrug").unwrap())
+            .unwrap();
+        let r = executor
+            .execute_read(&QueryParser::parse("SELECT name FROM PetDrug").unwrap())
+            .unwrap();
+        assert_eq!(row_count(&r), 0);
+        executor
+            .execute(&QueryAst::UseNamespace {
+                name: "default".to_string(),
+            })
+            .unwrap();
+        let r = executor
+            .execute_read(&QueryParser::parse("SELECT name FROM PetDrug").unwrap())
+            .unwrap();
+        assert_eq!(row_count(&r), 1);
+
+        // DELETE/UPDATE invalidation must also drop the short cache alias,
+        // or a bare-name COUNT keeps serving the pre-delete number.
+        executor.set_cached_row_count("glob.Thing", 42);
+        executor.set_cached_row_count("Thing", 42);
+        executor
+            .execute(&QueryParser::parse("DELETE FROM glob.Thing").unwrap())
+            .unwrap();
+        let cache = executor.row_count_cache.lock().unwrap();
+        assert!(!cache.contains_key("glob.Thing"));
+        assert!(!cache.contains_key("Thing"), "stale short alias survived DELETE");
+    }
+
+    #[test]
+    fn test_row_count_persistence_roundtrip() {
+        let (executor, dir) = setup();
+        let path = dir.path().join("row_counts.json");
+        insert_row(&executor, "Product", "a", 1);
+        insert_row(&executor, "Product", "b", 2);
+        assert_eq!(executor.get_cached_row_count(&executor.engine, "Product"), Some(2));
+
+        executor.save_row_counts_to(&path).unwrap();
+        assert!(path.exists());
+
+        // Simulate a fresh start: cache empty, file left by clean shutdown.
+        executor.row_count_cache.lock().unwrap().clear();
+        let loaded = executor.load_row_counts_from(&path);
+        assert!(loaded >= 1);
+        assert_eq!(executor.get_cached_row_count(&executor.engine, "Product"), Some(2));
+
+        // One-shot: the file is consumed, a later crash cannot re-trust it.
+        assert!(!path.exists());
+        assert_eq!(executor.load_row_counts_from(&path), 0);
+    }
+
+    #[test]
+    fn test_row_count_persistence_ignores_corrupt_file() {
+        let (executor, dir) = setup();
+        let path = dir.path().join("row_counts.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        assert_eq!(executor.load_row_counts_from(&path), 0);
+        assert!(!path.exists(), "corrupt file must be consumed too");
     }
 
     #[test]

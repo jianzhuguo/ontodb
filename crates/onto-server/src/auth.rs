@@ -70,6 +70,33 @@ pub struct ApiKeyConfig {
     /// Empty or absent = no IP restriction.
     #[serde(default)]
     pub allowed_ips: Option<Vec<String>>,
+    /// Optional namespace scope. When set, this key can only read/write
+    /// classes of its own namespace (plus the shared global catalog) and
+    /// cannot issue namespace DDL. Absent = unscoped (subject to audit).
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+/// Validated API key record (hot-reloadable).
+#[derive(Debug, Clone)]
+pub struct KeyRecord {
+    pub description: String,
+    pub permission: Permission,
+    pub rate_limit: Option<u32>,
+    pub allowed_ips: Option<Vec<String>>,
+    pub namespace: Option<String>,
+}
+
+impl From<&ApiKeyConfig> for KeyRecord {
+    fn from(c: &ApiKeyConfig) -> Self {
+        Self {
+            description: c.description.clone(),
+            permission: c.permission.clone(),
+            rate_limit: c.rate_limit,
+            allowed_ips: c.allowed_ips.clone(),
+            namespace: c.namespace.clone(),
+        }
+    }
 }
 
 /// Authentication configuration.
@@ -124,13 +151,9 @@ impl Default for IpWhitelistConfig {
 /// Shared authentication state with hot-reload support.
 #[derive(Clone)]
 pub struct AuthState {
-    /// Map of API key -> (description, permission, rate_limit, allowed_ips)
-    /// Wrapped in RwLock for hot-reload without server restart.
-    pub keys: Arc<
-        parking_lot::RwLock<
-            HashMap<String, (String, Permission, Option<u32>, Option<Vec<String>>)>,
-        >,
-    >,
+    /// Map of API key -> validated record. Wrapped in RwLock for hot-reload
+    /// without server restart.
+    pub keys: Arc<parking_lot::RwLock<HashMap<String, KeyRecord>>>,
     /// Whether auth is enabled.
     pub enabled: bool,
     /// Metrics counters for auth events.
@@ -148,15 +171,7 @@ impl AuthState {
     pub fn new(config: &AuthConfig) -> Self {
         let mut keys = HashMap::new();
         for key_config in &config.keys {
-            keys.insert(
-                key_config.key.clone(),
-                (
-                    key_config.description.clone(),
-                    key_config.permission.clone(),
-                    key_config.rate_limit,
-                    key_config.allowed_ips.clone(),
-                ),
-            );
+            keys.insert(key_config.key.clone(), KeyRecord::from(key_config));
         }
         Self {
             keys: Arc::new(parking_lot::RwLock::new(keys)),
@@ -227,15 +242,7 @@ impl AuthState {
         // Update keys
         let mut new_keys = HashMap::new();
         for key_config in &config.keys {
-            new_keys.insert(
-                key_config.key.clone(),
-                (
-                    key_config.description.clone(),
-                    key_config.permission.clone(),
-                    key_config.rate_limit,
-                    key_config.allowed_ips.clone(),
-                ),
-            );
+            new_keys.insert(key_config.key.clone(), KeyRecord::from(key_config));
         }
 
         *self.keys.write() = new_keys;
@@ -279,15 +286,7 @@ impl AuthState {
 
         let mut new_keys = HashMap::new();
         for key_config in &config.keys {
-            new_keys.insert(
-                key_config.key.clone(),
-                (
-                    key_config.description.clone(),
-                    key_config.permission.clone(),
-                    key_config.rate_limit,
-                    key_config.allowed_ips.clone(),
-                ),
-            );
+            new_keys.insert(key_config.key.clone(), KeyRecord::from(key_config));
         }
 
         *self.keys.write() = new_keys;
@@ -325,12 +324,9 @@ impl AuthState {
         self
     }
 
-    /// Validate an API key and return its permission level.
+    /// Validate an API key and return its record.
     /// Uses constant-time comparison to prevent timing attacks.
-    pub fn validate(
-        &self,
-        key: &str,
-    ) -> Option<(String, Permission, Option<u32>, Option<Vec<String>>)> {
+    pub fn validate(&self, key: &str) -> Option<KeyRecord> {
         let keys = self.keys.read();
         for (stored_key, value) in keys.iter() {
             if constant_time_eq(stored_key.as_bytes(), key.as_bytes()) {
@@ -350,7 +346,7 @@ impl AuthState {
         client_hash: &str,
         username: &str,
         salt: &[u8; 4],
-    ) -> Option<(String, Permission, Option<u32>, Option<Vec<String>>)> {
+    ) -> Option<KeyRecord> {
         let hash_hex = client_hash.strip_prefix("md5").unwrap_or(client_hash);
         if hash_hex.len() != 32 {
             return None;
@@ -397,7 +393,11 @@ impl AuthState {
     /// Check if a client IP is allowed for a specific API key.
     pub fn is_ip_allowed_for_key(&self, key: &str, client_ip: &str) -> bool {
         let keys = self.keys.read();
-        if let Some((_, _, _, Some(ref allowed_ips))) = keys.get(key) {
+        if let Some(KeyRecord {
+            allowed_ips: Some(ref allowed_ips),
+            ..
+        }) = keys.get(key)
+        {
             if allowed_ips.is_empty() {
                 return true;
             }
@@ -414,10 +414,7 @@ impl AuthState {
     /// Get the rate limit for a specific key, or None if not configured.
     #[allow(dead_code)]
     pub fn get_rate_limit(&self, key: &str) -> Option<u32> {
-        self.keys
-            .read()
-            .get(key)
-            .and_then(|(_, _, limit, _)| *limit)
+        self.keys.read().get(key).and_then(|r| r.rate_limit)
     }
 }
 
@@ -482,7 +479,7 @@ pub async fn auth_middleware(
     };
 
     // Validate the key
-    let (description, permission, rate_limit, _allowed_ips) = match auth.validate(&key) {
+    let record = match auth.validate(&key) {
         Some(info) => info,
         None => {
             if let Some(ref metrics) = auth.metrics {
@@ -518,7 +515,7 @@ pub async fn auth_middleware(
     let method = request.method().as_str();
     let path = request.uri().path();
 
-    if !permission.allows(method, path) {
+    if !record.permission.allows(method, path) {
         if let Some(ref metrics) = auth.metrics {
             metrics.auth_failures.inc();
         }
@@ -526,7 +523,7 @@ pub async fn auth_middleware(
             StatusCode::FORBIDDEN,
             Json(json!({
                 "success": false,
-                "error": format!("Insufficient permissions. Required: {:?}, your key: '{}'", permission, description)
+                "error": format!("Insufficient permissions. Required: {:?}, your key: '{}'", record.permission, record.description)
             })),
         )
             .into_response();
@@ -541,9 +538,11 @@ pub async fn auth_middleware(
     let mut request = request;
     request.extensions_mut().insert(KeyInfo {
         key: key.clone(),
-        description,
-        permission,
-        rate_limit,
+        description: record.description,
+        permission: record.permission,
+        rate_limit: record.rate_limit,
+        namespace: record.namespace,
+        client_ip,
     });
 
     next.run(request).await
@@ -632,6 +631,10 @@ pub struct KeyInfo {
     pub description: String,
     pub permission: Permission,
     pub rate_limit: Option<u32>,
+    /// Namespace scope of the key (None = unscoped).
+    pub namespace: Option<String>,
+    /// Client IP captured by the auth middleware (for audit records).
+    pub client_ip: String,
 }
 
 /// Check if a client IP matches an allowed entry (exact match or CIDR).

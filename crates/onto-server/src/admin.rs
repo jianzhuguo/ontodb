@@ -51,6 +51,9 @@ pub struct KeyRequest {
     pub rate_limit: Option<u32>,
     #[serde(default)]
     pub allowed_ips: Option<Vec<String>>,
+    /// Optional namespace scope for this key (None = unscoped).
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 /// Request body for adding IPs.
@@ -67,6 +70,8 @@ pub struct KeyInfo {
     pub permission: String,
     pub rate_limit: Option<u32>,
     pub allowed_ips: Vec<String>,
+    /// Namespace scope of the key (None = unscoped).
+    pub namespace: Option<String>,
 }
 
 /// Build the admin API router.
@@ -112,6 +117,7 @@ pub async fn list_keys(
                 permission: format!("{:?}", k.permission),
                 rate_limit: k.rate_limit,
                 allowed_ips: k.allowed_ips.clone().unwrap_or_default(),
+                namespace: k.namespace.clone(),
             }
         })
         .collect();
@@ -179,6 +185,7 @@ pub async fn add_key(
         permission: permission.clone(),
         rate_limit: req.rate_limit,
         allowed_ips: req.allowed_ips.clone(),
+        namespace: req.namespace.clone(),
     });
 
     if let Err(e) = save_config(&state, &config) {
@@ -249,6 +256,7 @@ pub async fn update_key(
         permission: permission.clone(),
         rate_limit: req.rate_limit,
         allowed_ips: req.allowed_ips.clone(),
+        namespace: req.namespace.clone(),
     };
 
     if let Err(e) = save_config(&state, &config) {

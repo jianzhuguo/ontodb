@@ -1,1 +1,66 @@
-err 根因：zstd 1.5.7 硬 bug，不是你们的 SQL/数据问题崩溃链路（已用 dump 符号确认）zstd_compress.c:2783 stats.longOffsets = ZSTD_seqToCodes(seqStorePtr);zstd_compress.c:2707 llCodeTable[u] = (BYTE)ZSTD_LLcode(llv); ← 写 NULL上游代码 ZSTD_resetCCtx_internal（zstd 1.5.7）里有一段只分配、不检查：// zstd_compress.c:2269-2276zc->seqStore.llCode = ZSTD_cwksp_reserve_buffer(ws, maxNbSeq * sizeof(BYTE));zc->seqStore.mlCode = ZSTD_cwksp_reserve_buffer(ws, maxNbSeq * sizeof(BYTE));zc->seqStore.ofCode = ZSTD_cwksp_reserve_buffer(ws, maxNbSeq * sizeof(BYTE));// ← 这里没有 RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), ...)zc->initialized = 1;return 0;而 ZSTD_cwksp_reserve_buffer 失败时只做两件事：allocFailed=1，返回 NULL（zstd_cwksp.h:299-302）。于是带着 NULL 的 llCode 标记 initialized=1 返回成功，下一次 ZSTD_seqToCodes 就是 0xc0000005。同函数里 sequencesStart(:2219)、litStart(:2247)、inBuff/outBuff(:2252-2254) 也都没检查——只有 prevCBlock/tmpWorkspace 少数几处有 RETURN_ERROR_IF。为什么 thread-local 复用 CCtx 仍然崩sstable.rs:427-432 的注释已经预判过这个 bug，缓解手段是复用 CCtx 避免每次 malloc。但复用挡不住这条路径：1. compress_to_buffer → ZSTD_compress2（:6568）每次都会 ZSTD_CCtx_reset(session_only)，参数/块大小一变就重新进 ZSTD_resetCCtx_internal2. 块大小不一致时触发 workspaceTooSmall || workspaceWasteful（:2157-2159）→ free 旧 workspace + 按 neededSpace 重建（:2172-2173）3. neededSpace 是估算值；release 下 assert(ZSTD_cwksp_estimated_space_within_bounds) 被编译掉（:2274）。估算比实际少几个对齐字节，后面的 llCode/mlCode/ofCode 就吃 NULL4. 触发条件正好是本次负载：evidence_link 3 worker + treats 2 worker 并发 INSERT + LSM compaction 多线程同时 flush_block，每个线程一个 CCtx，内存压力下 workspace 缩放路径被频繁走到结论：err=801/501 本身只是 server 死后 urllib 异常被计为失败；真根因是 zstd 在 workspace 预留失败后不报错继续用 NULL 指针。---修复方案（按优先级）1. 根因修复：给 zstd 打补丁（必做）在 ZSTD_resetCCtx_internal 里补上缺失的检查——把崩溃变成可恢复的 memory_allocation 错误，你们 flush_block 的 Err → 回退裸块 路径（sstable.rs:455-458）本来就能接住：// zstd_compress.c, 在 2271 行之后、initialized=1 之前RETURN_ERROR_IF(ZSTD_cwksp_reserve_failed(ws), memory_allocation,                "wksp reserve failed (seqStore)");最好把 :2219 sequencesStart、:2247 litStart、:2252-2254 inBuff/outBuff 后面也各加一句同样检查。落地方式：- vendor 一份 zstd-sys，改掉这个文件，然后 Cargo.toml 里 [patch.crates-io] zstd-sys = { path = "vendor/zstd-sys" }- 或 build.rs 里对 zstd-sys 源码打 patch 文件- 若上游 1.5.8+ 已修，直接升 zstd-sys（现在锁的是 2.1.0+zstd.1.5.7）2. 应用层加固（防御纵深，onto-storage 内）措施 位置 作用预热 CCtx 到最大块尺寸 flush_block / compress_block 首次创建后 一次性把 workspace 扩到位，之后避免 resize 路径固定 pledged_src_size 或锁定 workspace Compressor::new 后调 set_parameter 让 neededSpace 估算稳定，不走 wasteful-shrink压缩并发限流（全局信号量 2–4） flush_block 入口 减少同时存活的 CCtx，降低 malloc 压力静态 workspace（ZSTD_initStaticCCtx） 可选 完全不 malloc，预留失败也不可能3. 运维止血（立刻可做）- 大批量 rebuild 期间用 --compression-level 0 或 1（server 启动参数），跑完再压紧- 双 rebuild 不要并行满 workers（3+2 再叠加 compaction 太狠）- 注意 dump 已 9GB——--memtable-size 128MB + compaction 256MB target 在重写下内存很紧
+两条都拿到了。结论比预期更清楚，但也留下一个必须如实说明的矛盾点。
+一、grow（b3002d50）= RawVec::grow_one，是正确的
+b3002d56  mov  rsi, rcx                 ; rsi = &mut RawVec
+b3002d59  mov  rdx, [rcx]               ; rdx = 当前 cap
+b3002d5c  lea  rax, [rdx+rdx]           ; 2*cap
+b3002d60  cmp  rax, 5
+b3002d64  mov  edi, 4
+b3002d69  cmovae rdi, rax               ; new_cap = max(2*cap, 4)
+b3002d6d  mov  r8, [rcx+8]              ; r8 = 旧 ptr
+b3002d71  mov  qword ptr [rsp+28h], 48h ; elem_size = 72
+b3002d7a  mov  qword ptr [rsp+20h], 8   ; align = 8
+b3002d8b  call b30009a0                 ; 分配/重分配（传 old_ptr+old_cap → realloc 语义，保留内容）
+b3002d90  cmp  dword ptr [rsp+30h], 1
+b3002d95  je   b3002daa                 ; 失败 → handle_alloc_error → ud2
+b3002d97  mov  rax, [rsp+38h]           ; 新 ptr
+b3002d9c  mov  [rsi+8], rax             ; ptr 更新 ✓
+b3002da0  mov  [rsi], rdi               ; cap 更新 ✓
+b3002da9  ret
+b30009a0 收到 old_ptr + old_cap，是 realloc 语义（保留旧内容）；OOM 直接 ud2 中止。grow 不丢数据、不残留旧指针 —— 排除"重分配后指针没同步"这条假设。 同一函数后面 b3002dc0 / b3002e30 是同模板的 elem_size=4 / elem_size=2 版本（Vec<u32>/Vec<u16>），互为旁证。
+二、0x1c34c9e8a70 不是缓冲区基址，是 slot 2
+活的 Vec 头（caller 的 lea rdx,[rbp+420h] @ b2d0f2fb → self = 0x96dfe680，由 push 的 push rdi 槽位 0x96dfe078=0x96dfe680 双重证实）：
+0x96dfe680:  cap=8   ptr=0x1c34c9e89e0   len=6    ← heap.data
+0x96dfe690:  cap=8   ptr=0x1c2a3911eb0   len=7    ← sources
+0x96dfe6b0:  current.key.cap = -1（None 标记）
+真实基址 0x1c34c9e89e0，0x1c34c9e8a70 = base + 2×72 = slot 2。它在栈上出现 3 次（0x96dfd8a8、0x96dfd968、0x96dfe688），前两个在 rsp 之下（死栈槽），只有 0x96dfe688 是活的 Vec 头 —— 本线程没有第二个持有者。
+⚠️ 必须撤回我上一条的"slot 5 未初始化"结论 —— 那是按 bug.md 的地址当基址造成的对齐错觉。按正确基址重排，6 个 live entry 全部自洽：
+slot	addr	key.cap	key.ptr	key.len
+0	89e0	0x51	0x1c2b56a6740	0x51
+1	8a28	0x70	0x1c2a8c86570	0x70
+2	8a70	0x57	0x1c255430690	0x57
+3	8ab8	0x60	0x1c2b7099680	0x60
+4	8b00	0x85	0x1c2a386d7f0	0x85
+5	8b48	0x5e	0x1c260f60fa0	0x5e
+6	8b90	—	陈旧残留（len 从没到过 7）	 
+7	8bd8	—	从未写入（cap=8 的空位）	 
+三、真正的崩溃原因：key.ptr 是垃圾，而 safe_vec_bytes 拦不住
+sift_up 保存的 item（rsp=0x96dfdff0）：
+[rsp+30h] key.cap   = 0x5e                     ✓
+[rsp+28h] key.ptr   = 0xb78d20964436c2b5       ✗ 垃圾
+[rsp+20h] key.len   = 0x5e                     ✓
+[rsp+40h] value     = cap 0 / ptr 1            ✓
+[rsp+38h] seq_no    = 0x1152b226               ✓
+r15                 = 4  (= source_idx)        ✓
+三条独立证据咬合：
+1. 寄存器：rsi=0x1c34c9e89e0（数组基址）、r14=5（idx）、r12=0x5e（item.len）、r15=4（source_idx）、r8=0x57=min(0x57,0x5e)、rbp=-7=0x57-0x5e、r13=0x12=2×9（parent=slot 2）、rcx=0x1c255430690=slot 2 的 key.ptr。
+2. memcmp 内部算术：rcx=s1=0x1c255430690，rdx=0xb78d1ed3eef3bc25=s2-s1，rcx+rdx=0xb78d20964436c2b5 = AV 地址 = s2 = item.key.ptr。
+3. 栈上第二份寄存器快照（0x96dfd940起）逐字等于 .ecxr，0x96dfd950 = 同一个垃圾值。
+safe_vec_bytes（crates/onto-storage/src/lsm/streaming_merge.rs:33）只挡 capacity()==0：
+fn safe_vec_bytes(v: &Vec<u8>) -> &[u8] {
+    if v.capacity() == 0 { &[] } else { v.as_slice() }
+}
+slot 5 的 cap = 0x5e ≠ 0 → 走 as_slice() → memcmp(合法指针, 垃圾指针, 0x57) → AV。这个守卫只覆盖了"cap==0 的空分配"，对"非零 cap + 垃圾/悬垂 ptr"完全不设防，而注释里写的正是为了防止 memcmp 吃到 dangling pointer。
+四、必须如实说明的残留矛盾
+array[5].key.ptr（0x1c34c9e8b50）字节级确认是 a0 0f f6 60 c2 01 00 00 = 0x1c260f60fa0（合法）。而且这条 entry 在另外两处副本里也都合法：
+- iter.next() 的 out 槽 [rbp-60h] = 0x96dfe0d0 → key.ptr=0x1c260f60fa0
+- push 的 staging [rbp+30h] = 0x96dfe160 → key.ptr=0x1c260f60fa0
+8 个字段里 7 个和 slot 5 完全吻合，唯独 key.ptr 在 ptr::read 出来的副本里是垃圾。 x86 TSO 不允许本线程的 load 看不到自己先前对同地址的 store，所以剩下三种可能：
+- (a) 那条 movups [rcx+rax*8], xmm0（写 key.cap|key.ptr，是 5 条 store 里的最后一条）落到了别处或丢失；
+- (b) 有第二个 writer 在 ptr::read 到 AV 之间的约 20 条指令窗口里改写了 0x1c34c9e8b50（本线程栈上没有第二个持有者，但别的线程可能有）；
+- (c) 我算的 index 有偏差（但 r14=5、r13=2×9、min_len=0x57 三者互相印证，不像）。
+顺带：self.current 的 None 被编码成 key.cap = -1，take() 写这个标记 —— 而 safe_vec_bytes 对 cap = u64::MAX 同样放行（!= 0），会拿残留的旧 key.ptr/len 去 memcmp。这是同一类漏洞的第二个人口。
+建议下一步
+1. 先堵安全阀（治标但立刻止血）：safe_vec_bytes 改成同时校验 cap == 0 || cap < len、以及指针非规范（ptr >> 48 不是 0 或 0xffff）时返回空切片；None 状态也别用 cap = -1 这种会被误判成合法 cap 的编码。
+2. *查 (b)*：我可以把 dump 里所有线程的栈扫一遍 0x1c34c9e89e0，看有没有别的 StreamingMergeIterator 共享这块缓冲区 —— compaction 如果并发跑多个 merge，而它们的 Vec 因为 free/realloc 撞到同一块内存，就会出现这种"单字段瞬时脏"。
+3. *查 (a)*：在 Vec::push 的最后一条 store 后加一条 debug 断言（读回 key.ptr 比对），跑压测复现。
+要我先做 2（扫全 dump 的共享者），还是直接按 1 把守卫补上？

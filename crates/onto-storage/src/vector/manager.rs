@@ -11,9 +11,10 @@
 //! - Persistence of vector index metadata
 
 use crate::vector::normalize::{l2_normalize, should_normalize};
-use crate::vector::{DistanceMetric, HnswConfig, HnswIndex, SearchResult, VecData, VectorEntry};
+use crate::vector::{DistanceMetric, HnswConfig, HnswIndex, SearchResult, VecData};
 use onto_core::{CoreError, Result};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Metadata about a vector index.
 #[derive(Debug, Clone)]
@@ -47,10 +48,12 @@ pub struct VectorIndexManager {
     indexes: HashMap<IndexKey, HnswIndex>,
     /// Metadata for each index.
     metadata: HashMap<IndexKey, VectorIndexMeta>,
-    /// Mapping from document key -> (class, column, vector data) for
-    /// re-indexing and stale detection.  Bit-packed form keeps 1024-bit
-    /// fingerprints at 128B instead of 4KB f32.
-    doc_vectors: HashMap<Vec<u8>, Vec<(String, String, VecData)>>,
+    /// Mapping from (class, column) -> document key -> current vector, used
+    /// for re-indexing and stale detection. The `Arc<VecData>` payload is
+    /// shared with the HNSW node holding the same vector, so each vector body
+    /// lives in exactly one allocation (previously both the graph node and
+    /// this map kept a full copy).
+    doc_vectors: HashMap<(String, String), HashMap<Vec<u8>, Arc<VecData>>>,
     /// Document keys that have been deleted (filtered out during search).
     /// HNSW doesn't support native deletion, so we track tombstones here.
     deleted_keys: HashSet<Vec<u8>>,
@@ -126,7 +129,19 @@ impl VectorIndexManager {
     /// in doc_vectors (i.e., the document has been fully removed).
     pub fn compact_deleted_keys(&mut self) {
         self.deleted_keys
-            .retain(|k| self.doc_vectors.contains_key(k));
+            .retain(|k| self.doc_vectors.values().any(|m| m.contains_key(k)));
+    }
+
+    /// True when any indexed column of this document is tracked.
+    fn doc_tracked(&self, doc_key: &[u8]) -> bool {
+        self.doc_vectors.values().any(|m| m.contains_key(doc_key))
+    }
+
+    /// Drops the document from every per-index map (DELETE / ghost marking).
+    fn remove_doc(&mut self, doc_key: &[u8]) {
+        for m in self.doc_vectors.values_mut() {
+            m.remove(doc_key);
+        }
     }
 
     /// Returns the number of tombstoned keys.
@@ -192,10 +207,8 @@ impl VectorIndexManager {
         };
         let removed_index = self.indexes.remove(&key).is_some();
         let removed_meta = self.metadata.remove(&key).is_some();
-        self.doc_vectors.retain(|_, entries| {
-            entries.retain(|(c, col, _)| !(c == class && col == column));
-            !entries.is_empty()
-        });
+        self.doc_vectors
+            .remove(&(class.to_string(), column.to_string()));
         removed_index || removed_meta
     }
 
@@ -387,9 +400,9 @@ impl VectorIndexManager {
     /// Indexes a batch of pre-converted vector data (base64→Packed fast path).
     /// Consumes the batch — no f32 conversion, no clones on the bulk path.
     pub fn index_vector_data_owned(&mut self, vectors: Vec<(Vec<u8>, String, String, VecData)>) {
-        let mut by_index: HashMap<IndexKey, Vec<(Vec<u8>, VecData)>> = HashMap::new();
+        let mut by_index: HashMap<IndexKey, Vec<(Vec<u8>, Arc<VecData>)>> = HashMap::new();
         for (doc_key, class, column, data) in vectors {
-            if !self.doc_vectors.contains_key(&doc_key) {
+            if !self.doc_tracked(&doc_key) {
                 self.deleted_keys.remove(&doc_key);
             }
 
@@ -412,15 +425,15 @@ impl VectorIndexManager {
                 packed => packed,
             };
 
+            let data = Arc::new(data);
             by_index
                 .entry(key)
                 .or_default()
-                .push((doc_key.clone(), data.clone()));
-            self.doc_vectors.entry(doc_key).or_default().push((
-                class,
-                column,
-                data,
-            ));
+                .push((doc_key.clone(), Arc::clone(&data)));
+            self.doc_vectors
+                .entry((class, column))
+                .or_default()
+                .insert(doc_key, data);
         }
 
         for (idx_key, vecs) in by_index {
@@ -446,7 +459,7 @@ impl VectorIndexManager {
     ) -> (usize, usize) {
         let mut inserted = 0usize;
         let mut skipped = 0usize;
-        let mut by_index: HashMap<IndexKey, Vec<(Vec<u8>, VecData)>> = HashMap::new();
+        let mut by_index: HashMap<IndexKey, Vec<(Vec<u8>, Arc<VecData>)>> = HashMap::new();
         for (doc_key, class, column, data) in vectors {
             if self.deleted_keys.contains(&doc_key) {
                 skipped += 1;
@@ -454,12 +467,8 @@ impl VectorIndexManager {
             }
             let already = self
                 .doc_vectors
-                .get(&doc_key)
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .any(|(c, co, _)| c == &class && co == &column)
-                })
+                .get(&(class.clone(), column.clone()))
+                .map(|m| m.contains_key(&doc_key))
                 .unwrap_or(false);
             if already {
                 skipped += 1;
@@ -486,15 +495,15 @@ impl VectorIndexManager {
             };
 
             self.deleted_keys.remove(&doc_key);
+            let data = Arc::new(data);
             by_index
                 .entry(key)
                 .or_default()
-                .push((doc_key.clone(), data.clone()));
-            self.doc_vectors.entry(doc_key).or_default().push((
-                class,
-                column,
-                data,
-            ));
+                .push((doc_key.clone(), Arc::clone(&data)));
+            self.doc_vectors
+                .entry((class, column))
+                .or_default()
+                .insert(doc_key, data);
             inserted += 1;
         }
 
@@ -511,9 +520,9 @@ impl VectorIndexManager {
     /// Indexes a batch of vectors under a single lock acquisition.
     /// Consumes the batch (no extra clones on the bulk-load path).
     pub fn index_vector_batch_owned(&mut self, vectors: Vec<(Vec<u8>, String, String, Vec<f32>)>) {
-        let mut by_index: HashMap<IndexKey, Vec<(Vec<u8>, VecData)>> = HashMap::new();
+        let mut by_index: HashMap<IndexKey, Vec<(Vec<u8>, Arc<VecData>)>> = HashMap::new();
         for (doc_key, class, column, mut vector) in vectors {
-            if !self.doc_vectors.contains_key(&doc_key) {
+            if !self.doc_tracked(&doc_key) {
                 self.deleted_keys.remove(&doc_key);
             }
 
@@ -528,16 +537,15 @@ impl VectorIndexManager {
                 }
             }
 
-            let data = VecData::from_f32(&vector);
+            let data = Arc::new(VecData::from_f32(&vector));
             by_index
                 .entry(key)
                 .or_default()
-                .push((doc_key.clone(), data.clone()));
-            self.doc_vectors.entry(doc_key).or_default().push((
-                class,
-                column,
-                data,
-            ));
+                .push((doc_key.clone(), Arc::clone(&data)));
+            self.doc_vectors
+                .entry((class, column))
+                .or_default()
+                .insert(doc_key, data);
         }
 
         for (idx_key, vecs) in by_index {
@@ -582,23 +590,19 @@ impl VectorIndexManager {
         // If this key was previously deleted AND is being re-inserted (not updated),
         // un-delete it. For UPDATE, deindex_vectors already removed doc_vectors,
         // so we keep deleted_keys to filter stale HNSW entries until the next compaction.
-        if !self.doc_vectors.contains_key(doc_key) {
+        if !self.doc_tracked(doc_key) {
             self.deleted_keys.remove(doc_key);
         }
 
-        // Track the vector for this document (compact form)
-        self.doc_vectors.entry(doc_key.to_vec()).or_default().push((
-            class.to_string(),
-            column.to_string(),
-            VecData::from_f32(&vector),
-        ));
+        // Track the vector for this document; share the payload with the node.
+        let data = Arc::new(VecData::from_f32(&vector));
+        self.doc_vectors
+            .entry((class.to_string(), column.to_string()))
+            .or_default()
+            .insert(doc_key.to_vec(), Arc::clone(&data));
 
         if let Some(index) = self.indexes.get_mut(&key) {
-            let entry = VectorEntry {
-                id: doc_key.to_vec(),
-                vector,
-            };
-            index.insert(entry);
+            index.insert_data(doc_key.to_vec(), data);
         }
     }
 
@@ -633,19 +637,52 @@ impl VectorIndexManager {
     /// Removes a document's vectors from all indexes. Called during DELETE.
     pub fn deindex_vectors(&mut self, doc_key: &[u8]) {
         self.deleted_keys.insert(doc_key.to_vec());
-        self.doc_vectors.remove(doc_key);
+        self.remove_doc(doc_key);
     }
 
     /// Records that `doc_key` currently owns this vector WITHOUT inserting a
     /// new HNSW node. Used by snapshot-restore reconciliation: the node is
     /// already in the restored graph, but `doc_vectors` (in-memory only) was
     /// lost across restart and must be rebuilt so stale-entry filtering works.
+    ///
+    /// When the graph node already holds an equal vector, its `Arc` is reused
+    /// (zero-copy) instead of storing a second payload.
     pub fn note_doc_vector(&mut self, doc_key: Vec<u8>, class: String, column: String, data: VecData) {
         self.deleted_keys.remove(&doc_key);
-        self.doc_vectors
-            .entry(doc_key)
-            .or_default()
-            .push((class, column, data));
+        let map = self
+            .doc_vectors
+            .entry((class, column))
+            .or_default();
+        match map.entry(doc_key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if !e.get().matches_data(&data) {
+                    e.insert(Arc::new(data));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(Arc::new(data));
+            }
+        }
+    }
+
+    /// Seeds the `doc_vectors` map from the restored graph's nodes so the
+    /// vector payloads are shared (one allocation each) instead of duplicated
+    /// during the post-restore reconcile. Last node per id wins (most recent).
+    pub fn seed_doc_vectors_from_graph(&mut self, class: &str, column: &str) {
+        let key = IndexKey {
+            class: class.to_string(),
+            column: column.to_string(),
+        };
+        let Some(index) = self.indexes.get(&key) else {
+            return;
+        };
+        let map = self
+            .doc_vectors
+            .entry((class.to_string(), column.to_string()))
+            .or_default();
+        for (id, data) in index.iter_id_data() {
+            map.insert(id.to_vec(), Arc::clone(data));
+        }
     }
 
     /// Marks `doc_key` as deleted without touching the HNSW graph.
@@ -653,7 +690,7 @@ impl VectorIndexManager {
     /// document's fp was cleared, or the row was deleted while `deleted_keys`
     /// was still in-memory-only and therefore lost on restart).
     pub fn mark_deleted(&mut self, doc_key: Vec<u8>) {
-        self.doc_vectors.remove(&doc_key);
+        self.remove_doc(&doc_key);
         self.deleted_keys.insert(doc_key);
     }
 
@@ -672,17 +709,17 @@ impl VectorIndexManager {
             column: column.to_string(),
         };
         let mut keep: HashSet<Vec<u8>> = HashSet::new();
-        let mut prefer: HashMap<Vec<u8>, VecData> = HashMap::new();
-        for (dk, entries) in self.doc_vectors.iter() {
-            if self.deleted_keys.contains(dk) {
-                continue;
-            }
-            if let Some((_, _, data)) = entries
-                .iter()
-                .find(|(c, col, _)| c == class && col == column)
-            {
+        let mut prefer: HashMap<Vec<u8>, Arc<VecData>> = HashMap::new();
+        if let Some(map) = self
+            .doc_vectors
+            .get(&(class.to_string(), column.to_string()))
+        {
+            for (dk, data) in map.iter() {
+                if self.deleted_keys.contains(dk) {
+                    continue;
+                }
                 keep.insert(dk.clone());
-                prefer.insert(dk.clone(), data.clone());
+                prefer.insert(dk.clone(), Arc::clone(data));
             }
         }
 
@@ -776,6 +813,7 @@ impl VectorIndexManager {
         };
 
         // Filter deleted keys, stale entries, and deduplicate
+        let dv_key = (class.to_string(), column.to_string());
         let mut seen: HashMap<Vec<u8>, usize> = HashMap::new(); // id -> index in filtered
         let mut filtered = Vec::new();
         for r in results {
@@ -784,12 +822,11 @@ impl VectorIndexManager {
             }
             // Skip stale entries: if the stored vector differs from the result,
             // the entry is from a previous version (HNSW can't update in place)
-            if let Some(stored_vec) = self.doc_vectors.get(&r.entry.id).and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|(c, col, _)| c == class && col == column)
-                    .map(|(_, _, v)| v)
-            }) {
+            if let Some(stored_vec) = self
+                .doc_vectors
+                .get(&dv_key)
+                .and_then(|m| m.get(&r.entry.id))
+            {
                 let is_stale = !stored_vec.matches_f32(&r.entry.vector);
                 if is_stale {
                     continue; // Stale entry from old vector
@@ -857,15 +894,15 @@ impl VectorIndexManager {
         let results = index.search_filtered(&actual_query, over_fetch, &effective_ids);
 
         // Filter stale entries and deduplicate
+        let dv_key = (class.to_string(), column.to_string());
         let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
         let mut filtered = Vec::new();
         for r in results {
-            if let Some(stored_vec) = self.doc_vectors.get(&r.entry.id).and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|(c, col, _)| c == class && col == column)
-                    .map(|(_, _, v)| v)
-            }) {
+            if let Some(stored_vec) = self
+                .doc_vectors
+                .get(&dv_key)
+                .and_then(|m| m.get(&r.entry.id))
+            {
                 if !stored_vec.matches_f32(&r.entry.vector) {
                     continue;
                 }
@@ -950,14 +987,9 @@ impl VectorIndexManager {
             .unwrap_or(0);
         let vectors: Vec<Vec<f32>> = self
             .doc_vectors
-            .values()
-            .flat_map(|entries| {
-                entries
-                    .iter()
-                    .filter(|(c, col, _)| c == class && col == column)
-                    .map(|(_, _, v)| v.to_f32(dim))
-            })
-            .collect();
+            .get(&(class.to_string(), column.to_string()))
+            .map(|m| m.values().map(|v| v.to_f32(dim)).collect())
+            .unwrap_or_default();
 
         if vectors.is_empty() {
             return Ok(crate::vector::cluster::ClusteringResult {

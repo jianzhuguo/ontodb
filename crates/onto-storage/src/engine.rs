@@ -391,8 +391,14 @@ impl LsmEngine {
         }
 
         // Spawn the background compaction worker with the loaded levels
+        let index_rebuild_done = Arc::new(AtomicBool::new(false));
         let (levels, compaction_sender, compaction_notif_receiver, _worker_handle, compaction_debt) =
-            CompactionWorker::spawn(options.clone(), pre_engine.levels, sst_counter.clone());
+            CompactionWorker::spawn(
+                options.clone(),
+                pre_engine.levels,
+                sst_counter.clone(),
+                index_rebuild_done.clone(),
+            );
 
         // Create index manager with disk storage if configured
         // NOTE: disk indexes are opened in the background to avoid blocking startup
@@ -430,7 +436,7 @@ impl LsmEngine {
             compaction_notif_receiver: Mutex::new(compaction_notif_receiver),
             compaction_pending: AtomicBool::new(false),
             compaction_debt,
-            index_rebuild_done: Arc::new(AtomicBool::new(false)),
+            index_rebuild_done,
             worker_handle: Mutex::new(Some(_worker_handle)),
             group_commit: Arc::new(crate::lsm::group_commit::GroupCommitCoordinator::new()),
             memory_manager,
@@ -1686,8 +1692,23 @@ impl LsmEngine {
         let mut mem_a_i = 0usize;
         let mut mem_i_i = 0usize;
 
+        // Min-heap over SST heads: entries are Reverse<(key, sst_idx)>. With
+        // 400+ overlapping SSTs the old per-entry scan over every iterator
+        // head was O(entries x sources) and dominated startup scans; the heap
+        // makes it O(entries x log sources). At most one heap entry per SST
+        // exists at a time (push after pop), so same-key versions from one
+        // SST keep iterator order naturally and sst_idx breaks ties across
+        // SSTs in priority (vec) order. First-seen-wins is unchanged.
+        let mut sst_heap: std::collections::BinaryHeap<std::cmp::Reverse<(Vec<u8>, usize)>> =
+            std::collections::BinaryHeap::new();
+        for (i, it) in sst_iters.iter().enumerate() {
+            if it.is_valid() {
+                sst_heap.push(std::cmp::Reverse((it.key().to_vec(), i)));
+            }
+        }
+
         while out.len() < limit {
-            // Smallest live user key across sources.
+            // Smallest live user key across sources: two memtable heads + heap top.
             let mut min_key: Option<Vec<u8>> = None;
             {
                 let mut consider = |k: &[u8]| {
@@ -1707,10 +1728,8 @@ impl LsmEngine {
                 if mem_i_i < mem_imm.len() {
                     consider(mem_imm[mem_i_i].0.as_slice());
                 }
-                for it in &sst_iters {
-                    if it.is_valid() {
-                        consider(it.key());
-                    }
+                if let Some(std::cmp::Reverse((k, _))) = sst_heap.peek() {
+                    consider(k.as_slice());
                 }
             }
 
@@ -1734,12 +1753,36 @@ impl LsmEngine {
                 }
                 mem_i_i += 1;
             }
-            for it in sst_iters.iter_mut() {
-                while it.is_valid() && it.key() == group_key.as_slice() {
+            // Pop every SST entry equal to group_key, in priority order.
+            while let Some(std::cmp::Reverse((k, _))) = sst_heap.peek() {
+                if k.as_slice() != group_key.as_slice() {
+                    break;
+                }
+                let idx = sst_heap
+                    .pop()
+                    .expect("just peeked")
+                    .0
+                     .1;
+                {
+                    let it = &mut sst_iters[idx];
                     if winner.is_none() {
                         winner = Some((it.value().to_vec(), it.kind()));
                     }
                     it.next();
+                    while it.is_valid() {
+                        if !it.key().starts_with(prefix) {
+                            break;
+                        }
+                        if after.is_some_and(|a| it.key() <= a) {
+                            it.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                let it = &sst_iters[idx];
+                if it.is_valid() {
+                    sst_heap.push(std::cmp::Reverse((it.key().to_vec(), idx)));
                 }
             }
 
@@ -1852,6 +1895,17 @@ impl LsmEngine {
         let mut mem_a_i = 0usize;
         let mut mem_i_i = 0usize;
 
+        // Min-heap over SST heads — same merge as scan_prefix_after; see the
+        // comment there. O(entries x log sources) instead of the old
+        // per-entry scan over every iterator head.
+        let mut sst_heap: std::collections::BinaryHeap<std::cmp::Reverse<(Vec<u8>, usize)>> =
+            std::collections::BinaryHeap::new();
+        for (i, it) in sst_iters.iter().enumerate() {
+            if it.is_valid() {
+                sst_heap.push(std::cmp::Reverse((it.key().to_vec(), i)));
+            }
+        }
+
         while out.len() < limit {
             let mut min_key: Option<Vec<u8>> = None;
             {
@@ -1872,10 +1926,8 @@ impl LsmEngine {
                 if mem_i_i < mem_imm.len() {
                     consider(mem_imm[mem_i_i].0.as_slice());
                 }
-                for it in &sst_iters {
-                    if it.is_valid() {
-                        consider(it.key());
-                    }
+                if let Some(std::cmp::Reverse((k, _))) = sst_heap.peek() {
+                    consider(k.as_slice());
                 }
             }
 
@@ -1898,12 +1950,35 @@ impl LsmEngine {
                 }
                 mem_i_i += 1;
             }
-            for it in sst_iters.iter_mut() {
-                while it.is_valid() && it.key() == group_key.as_slice() {
+            while let Some(std::cmp::Reverse((k, _))) = sst_heap.peek() {
+                if k.as_slice() != group_key.as_slice() {
+                    break;
+                }
+                let idx = sst_heap
+                    .pop()
+                    .expect("just peeked")
+                    .0
+                     .1;
+                {
+                    let it = &mut sst_iters[idx];
                     if winner.is_none() {
                         winner = Some((it.value().to_vec(), it.kind()));
                     }
                     it.next();
+                    while it.is_valid() {
+                        if !it.key().starts_with(prefix) {
+                            break;
+                        }
+                        if after.is_some_and(|a| it.key() <= a) {
+                            it.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                let it = &sst_iters[idx];
+                if it.is_valid() {
+                    sst_heap.push(std::cmp::Reverse((it.key().to_vec(), idx)));
                 }
             }
 
@@ -3224,8 +3299,8 @@ impl LsmEngine {
     pub fn rebuild_indexes(&self) -> Result<()> {
         // Cheap liveness probe first —avoids materializing the whole keyspace
         // just to discover there is nothing to do.
-        let (v2_live, _) = self.count_prefix(b"__idx2__")?;
-        if v2_live == 0 {
+        let mut counts = self.count_index_winners_by_column()?;
+        if counts.is_empty() {
             // v1 —v2 migration: drop old, rebuild from documents
             let (v1_live, _) = self.count_prefix(b"__idx__")?;
             if v1_live > 0 {
@@ -3236,6 +3311,7 @@ impl LsmEngine {
                         v1_entries.len()
                     );
                     self.migrate_v1_drop_and_rebuild(v1_entries)?;
+                    counts = self.count_index_winners_by_column()?;
                     // fall through and rebuild the migrated __idx2__ entries
                 }
             }
@@ -3244,8 +3320,7 @@ impl LsmEngine {
         // Discover (class, column) pairs from key headers only —never holds
         // the full entry set. The previous path did scan_prefix(b"__idx2__")
         // over the entire keyspace and OOM'd at 26M+ entries.
-        let discovered = self.collect_index_columns()?;
-        if discovered.is_empty() {
+        if counts.is_empty() {
             return Ok(());
         }
 
@@ -3260,7 +3335,10 @@ impl LsmEngine {
         let mut total_rebuilt = 0usize;
         let mut orphaned = 0usize;
 
-        for (class, column) in discovered {
+        for ((class, column), live) in counts {
+            if live == 0 {
+                continue;
+            }
             let prefix = crate::index::IndexManager::make_index_prefix(&class, &column);
             let is_active = active_keys.contains(&(class.clone(), column.clone()));
 
@@ -3268,7 +3346,6 @@ impl LsmEngine {
             // entries are orphans from an incomplete tombstone sweep (or a
             // drop that raced with compaction) — clean them up, don't rebuild.
             if self.idx_dropped(&class, &column) {
-                let (live, _) = self.count_prefix(&prefix)?;
                 if live > 0 {
                     orphaned += live;
                     tracing::warn!(
@@ -3284,7 +3361,6 @@ impl LsmEngine {
 
             // Count live entries without copying values. Peak RAM is one
             // index's key set, and it is released before the next index.
-            let (live, _) = self.count_prefix(&prefix)?;
             if live == 0 {
                 continue;
             }
@@ -3416,80 +3492,40 @@ impl LsmEngine {
         Ok(())
     }
 
-    /// Collect distinct (class, column) pairs appearing under `__idx2__`.
-    /// Walks keys only —values and entry bodies are never retained.
-    fn collect_index_columns(
+    /// Live-entry count per (class, column) under `__idx2__`, produced in one
+    /// winner-resolved paged pass. Tombstone winners are not counted (matches
+    /// count_prefix's `live`), so an all-tombstoned index is simply absent from
+    /// the map — same effect as the old per-index `live == 0` skip. Replaces
+    /// collect_index_columns + one count_prefix per index: 2+N full keyspace
+    /// scans become 1.
+    fn count_index_winners_by_column(
         &self,
-    ) -> Result<std::collections::HashSet<(String, String)>> {
-        self.drain_compaction_notifications();
-        let prefix: &[u8] = b"__idx2__";
-        let mut cols: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-
-        let mut note_key = |key: &[u8]| {
-            if let Some((class, column, _, _)) =
-                crate::index::IndexManager::parse_index_key(key)
-            {
-                cols.insert((class, column));
+    ) -> Result<std::collections::HashMap<(String, String), usize>> {
+        let mut counts: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+        const PAGE: usize = 50_000;
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = self.scan_prefix_page_kind(b"__idx2__", after.as_deref(), PAGE)?;
+            if page.is_empty() {
+                break;
             }
-        };
-
-        // MemTables first (newest source).
-        {
-            let ws = self.write_state.read();
-            for entry in ws.memtable.scan_prefix(prefix) {
-                note_key(&entry.key);
-            }
-            if let Some(ref imm) = ws.immutable_memtable {
-                for entry in imm.scan_prefix(prefix) {
-                    note_key(&entry.key);
+            for (k, _v, kind) in &page {
+                if *kind != EntryKind::Put {
+                    continue;
+                }
+                if let Some((class, column, _, _)) = crate::index::IndexManager::parse_index_key(k)
+                {
+                    *counts.entry((class, column)).or_insert(0usize) += 1;
                 }
             }
+            let last = page.last().expect("non-empty page").0.clone();
+            if page.len() < PAGE {
+                break;
+            }
+            after = Some(last);
         }
-
-        // SSTables, newest-first, with the same prefix pruning as scan_prefix.
-        let sst_handles: Vec<Arc<SsTable>> = {
-            let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-            let mut cache = self.sst_cache.lock().unwrap_or_else(|e| e.into_inner());
-            let mut handles = Vec::new();
-            for level in levels.iter() {
-                for sst_info in level.iter().rev() {
-                    if sst_info.max_key.as_slice() < prefix {
-                        continue;
-                    }
-                    if !Self::prefix_may_overlap(
-                        prefix,
-                        sst_info.min_key.as_slice(),
-                        sst_info.max_key.as_slice(),
-                    ) {
-                        continue;
-                    }
-                    match cache.get(&sst_info.path) {
-                        Some(sst) => handles.push(Arc::clone(sst)),
-                        None => {
-                            let sst = Arc::new(SsTable::open(&sst_info.path)?);
-                            cache.insert(sst_info.path.clone(), Arc::clone(&sst));
-                            handles.push(sst);
-                        }
-                    }
-                }
-            }
-            handles
-        };
-
-        for sst in &sst_handles {
-            let mut iter = sst.iter()?;
-            iter.seek(prefix);
-            while iter.is_valid() {
-                if !iter.key().starts_with(prefix) {
-                    break;
-                }
-                note_key(iter.key());
-                iter.next();
-            }
-        }
-
-        drop(note_key);
-        Ok(cols)
+        Ok(counts)
     }
 
     /// Reset the WAL file after index rebuild cleanup.
@@ -3895,6 +3931,13 @@ impl LsmEngine {
                                     column,
                                     n
                                 );
+                                // Share node payloads into doc_vectors so the
+                                // reconcile below reuses the node Arcs instead
+                                // of storing a second copy of every vector.
+                                self.vector_index_manager
+                                    .write()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .seed_doc_vectors_from_graph(class, column);
                                 // Snapshot may be stale (written before a
                                 // scan-visibility fix revealed more fp rows).
                                 // Backfill only the missing pks so we do not

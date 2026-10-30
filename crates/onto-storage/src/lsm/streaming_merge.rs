@@ -24,24 +24,54 @@ pub struct HeapEntry {
     pub source_idx: usize,
 }
 
-/// Bytes of a Vec, treating an impossible allocation (len > 0, cap == 0)
-/// as empty so `cmp` never feeds a dangling pointer to `memcmp`.
-fn safe_vec_bytes(v: &Vec<u8>) -> &[u8] {
-    if v.capacity() == 0 {
-        &[]
-    } else {
+impl HeapEntry {
+    /// Key bytes for `memcmp`, panicking when the entry is incoherent.
+    ///
+    /// `cmp` must never hand `memcmp` a dangling or garbage pointer. The two
+    /// crash shapes this guards: `key.cap == key.len == 0x5e` with a
+    /// non-canonical `key.ptr` (dump 15936), and a smashed header like
+    /// `(ptr=0x1, cap=8, len=6)` (dump 19420) — both passed the old
+    /// `cap == 0` check and went straight into `memcmp`/`memcpy`. Fail fast
+    /// with a snapshot instead of degrading to an empty slice: treating a
+    /// corrupt entry as empty would reorder or wrongly dedup the compaction
+    /// output, which corrupts SSTables - worse for a database than a crash.
+    ///
+    /// Detects gross corruption only; a stale pointer to freed memory that
+    /// still looks canonical is indistinguishable here.
+    #[track_caller]
+    fn key_bytes(&self) -> &[u8] {
+        let v = &self.key;
+        let (cap, len) = (v.capacity(), v.len());
+        let ptr = v.as_ptr() as usize;
+        if !crate::ptr_guard::vec_header_coherent(ptr, cap, len) {
+            // x86-64 canonical: bits 63:48 must sign-extend bit 47.
+            let canonical = matches!(ptr >> 47, 0 | 0x1ffff);
+            panic!(
+                "HeapEntry key Vec is corrupt (ptr={ptr:#x} cap={cap} len={len} canonical={canonical}); \
+                 seq_no={:?} source_idx={} kind={:?}",
+                self.seq_no, self.source_idx, self.kind
+            );
+        }
+
         v.as_slice()
     }
 }
 
 /// Owned copy of a slice; never reuses a dangling/empty-allocation Vec.
+///
+/// The 19420 crash landed exactly here: `to_vec` on a slice parked at the
+/// `Vec::new()` sentinel (`ptr=0x1, len=105`) — a smashed buffer header the
+/// `cap == 0` guards could not see. Check the slice's pointer before the
+/// copy so the failure is a snapshot, not a bare AV inside `memcpy`.
+#[track_caller]
 fn owned_bytes(s: &[u8]) -> Vec<u8> {
+    crate::ptr_guard::checked_slice(s, "owned_bytes", "streaming merge source");
     s.to_vec()
 }
 
 impl PartialEq for HeapEntry {
     fn eq(&self, other: &Self) -> bool {
-        safe_vec_bytes(&self.key) == safe_vec_bytes(&other.key)
+        self.key_bytes() == other.key_bytes()
             && self.seq_no == other.seq_no
             && self.source_idx == other.source_idx
     }
@@ -61,8 +91,8 @@ impl Ord for HeapEntry {
     /// For same key, we want LARGER seq_no to come out FIRST from max-heap.
     fn cmp(&self, other: &Self) -> Ordering {
         // Key: smaller key = higher priority -> reverse for max-heap
-        safe_vec_bytes(&other.key)
-            .cmp(safe_vec_bytes(&self.key))
+        other.key_bytes()
+            .cmp(self.key_bytes())
             // Seq_no: larger seq_no = higher priority -> keep ascending for max-heap
             // (max-heap pops the largest, so larger seq_no comes first)
             .then(self.seq_no.cmp(&other.seq_no))
@@ -193,6 +223,33 @@ impl Iterator for SstEntryIterator {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    /// The 19420 crash shape: a smashed Vec header `(ptr=0x1, cap=8, len=6)`
+    /// passing every `cap == 0` guard. `key_bytes` must panic with a snapshot
+    /// instead of feeding `memcmp` the sentinel pointer.
+    #[test]
+    #[should_panic(expected = "HeapEntry key Vec is corrupt")]
+    fn test_key_bytes_rejects_sentinel_ptr_header() {
+        // Fake the smashed header without owning a real allocation.
+        let key: Vec<u8> = unsafe { Vec::from_raw_parts(0x1 as *mut u8, 6, 8) };
+        let entry = std::mem::ManuallyDrop::new(HeapEntry {
+            key,
+            value: Vec::new(),
+            seq_no: 7,
+            kind: EntryKind::Put,
+            source_idx: 0,
+        });
+        let _ = entry.key_bytes();
+    }
+
+    /// `owned_bytes` is the exact crash site of 19420 (`to_vec` on a slice
+    /// parked at the `Vec::new()` sentinel with nonzero length).
+    #[test]
+    #[should_panic(expected = "owned_bytes: corrupt slice")]
+    fn test_owned_bytes_rejects_sentinel_ptr_slice() {
+        let s: &[u8] = unsafe { std::slice::from_raw_parts(0x1 as *const u8, 105) };
+        let _ = owned_bytes(s);
+    }
 
     #[test]
     fn test_heap_entry_ordering() {

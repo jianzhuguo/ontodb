@@ -64,6 +64,14 @@ pub struct StorageOptions {
     /// When true, each INSERT writes a `__val_meta__` key with a score.
     /// When false (default), no meta keys are written — zero overhead.
     pub value_scorer_enabled: bool,
+
+    /// Defer proactive compaction (small-file merge, file-count trigger,
+    /// score-driven self-merge / last-level rewrite) until the background
+    /// index+vector rebuild has completed. Flush-driven L0 emergency
+    /// compaction still runs so write bursts cannot stall. The server opts
+    /// in at startup: rebuild scans the whole keyspace for tens of minutes
+    /// and must not compete with merge churn for disk and CPU.
+    pub defer_compaction_until_rebuild_done: bool,
 }
 
 impl Default for StorageOptions {
@@ -83,6 +91,7 @@ impl Default for StorageOptions {
             wal_archive_max_files: 100,                   // Keep last 100 archives
             default_lambda: crate::value_meta::LAMBDA_2Y, // 2-year half-life by default
             value_scorer_enabled: false,                  // Disabled by default, must opt-in
+            defer_compaction_until_rebuild_done: false,   // Server opts in; tests keep immediate compaction
         }
     }
 }
