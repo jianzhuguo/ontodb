@@ -24,7 +24,7 @@ members = [
 [workspace.package]
 version = "0.6.2"
 edition = "2021"
-license = "BUSL-1.1"
+license = "Apache-2.0"
 authors = ["OntoDB Team"]
 repository = "https://gitee.com/ontovalue/ontodb"
 description = "OntoDB - An ontology-driven semantic multi-modal database"

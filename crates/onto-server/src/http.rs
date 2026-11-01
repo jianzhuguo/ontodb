@@ -1,7 +1,6 @@
-// Copyright (c) 2024-2026 OntoDB Team
-// Licensed under the Business Source License 1.1 (BUSL-1.1).
-// See LICENSE for details. Change Date: 2031-09-15.
-// On the Change Date, this file will be licensed under Apache License 2.0.
+// Copyright (c) 2024-2026 Guo Jianzhu (郭建筑)
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE for details.
 //! HTTP API for OntoDB.
 //!
 //! Provides RESTful endpoints for SQL queries, vector search, hybrid queries,

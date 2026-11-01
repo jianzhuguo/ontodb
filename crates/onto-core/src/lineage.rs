@@ -1,6 +1,6 @@
-// Copyright (c) 2024-2026 OntoDB Team
-// Licensed under the Business Source License 1.1 (BUSL-1.1).
-// See LICENSE for details. Change Date: 2031-09-15.
+// Copyright (c) 2024-2026 Guo Jianzhu (郭建筑)
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE for details.
 
 //! Data lineage tracing — track where data came from and how it was derived.
 //!

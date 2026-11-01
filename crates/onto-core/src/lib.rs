@@ -17,10 +17,9 @@
 #![allow(clippy::unnecessary_unwrap)]
 #![allow(clippy::result_large_err)]
 #![allow(clippy::doc_lazy_continuation)]
-// Copyright (c) 2024-2026 OntoDB Team
-// Licensed under the Business Source License 1.1 (BUSL-1.1).
-// See LICENSE for details. Change Date: 2031-09-15.
-// On the Change Date, this file will be licensed under Apache License 2.0.
+// Copyright (c) 2024-2026 Guo Jianzhu (郭建筑)
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE for details.
 //! onto-core: Core types, traits, and error definitions for OntoDB.
 //!
 //! This crate provides the foundational abstractions used across all OntoDB components:
@@ -51,8 +50,8 @@ pub use types::{Bytes, Entry, EntryKind, Key, SeqNo, Timestamp, Value};
 pub use value::OntoValue;
 
 /// OntoDB version and copyright — embedded in all binaries.
-/// Removing this notice violates BUSL-1.1 license terms.
+/// Removing this notice violates Apache-2.0 license terms.
 pub const ONTODB_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const ONTODB_COPYRIGHT: &str = "Copyright (c) 2024-2026 OntoDB Team. Licensed under BUSL-1.1.";
+pub const ONTODB_COPYRIGHT: &str = "Copyright (c) 2024-2026 Guo Jianzhu (郭建筑). Licensed under Apache-2.0.";
 pub const ONTODB_LICENSE_URL: &str = "https://ontovalue.com";
 

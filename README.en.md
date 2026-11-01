@@ -561,16 +561,14 @@ OntoDB uses a dual licensing model:
 
 | Edition | License | Description |
 |---------|---------|-------------|
-| **Community** | BUSL-1.1 | Free to use, DBaaS hosting prohibited, converts to Apache-2.0 on 2031-09-15 |
+| **Community** | Apache-2.0 | Free and open source, free to use, modify and distribute |
 | **Enterprise** | Commercial | Full features, requires purchased license |
 
-**Community (BUSL-1.1):**
-- Allowed: organizations with annual revenue below RMB 20M (~USD 2.8M) use for free
-- Allowed: internal use, local deployment, secondary development, non-commercial distribution
+**Community (Apache-2.0):**
+- Allowed: free use by any individual or organization, no revenue threshold
+- Allowed: internal use, local deployment, secondary development, commercial distribution
 - Allowed: enterprise self-hosting, embedding in SaaS products
-- Prohibited: offering OntoDB as a cloud database service (DBaaS)
-- Organizations exceeding RMB 20M annual revenue must purchase a commercial license
-- Auto-converts to Apache License 2.0 on 2031-09-15
+- Required: retain copyright notices and the NOTICE file (Apache-2.0 Section 4)
 - See [LICENSE](LICENSE)
 
 **Enterprise (Commercial):**
@@ -580,7 +578,7 @@ OntoDB uses a dual licensing model:
 - See [LICENSE.COMMERCIAL](LICENSE.COMMERCIAL)
 - Contact: license@ontovalue.com
 
-**Compliance Notice:** Using OntoDB in violation of BUSL-1.1 terms (including but not limited to: removing copyright notices, providing DBaaS hosting services) will result in legal liability. Report violations to: license@ontovalue.com
+**Note:** Enterprise features (the `onto-enterprise` crate) are licensed under a proprietary commercial license and may not be copied, distributed, or used in production without authorization. Contact: license@ontovalue.com
 
 ---
 

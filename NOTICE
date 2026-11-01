@@ -1,8 +1,18 @@
 OntoDB
-Copyright (c) 2024-2026 OntoDB Team
+Copyright (c) 2024-2026 Guo Jianzhu (郭建筑)
 
-This product includes software developed by the OntoDB Team.
+This product includes software developed by Guo Jianzhu (郭建筑).
 Website: https://ontovalue.com
 
-Licensed under the Business Source License 1.1 (BUSL-1.1).
-See LICENSE for details. Change Date: 2031-09-15.
+Licensing
+---------
+The community edition of OntoDB (all crates in this workspace, including
+onto-core, onto-storage, onto-ontology, onto-query, onto-graph,
+onto-server, onto-cli, onto-plugin, onto-edge, onto-sharding, onto-raft
+and ontodb-rules) is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text.
+
+The enterprise edition (the onto-enterprise crate and enterprise-only
+features gated behind the "enterprise" feature flags) is proprietary
+and licensed under a separate commercial license. See LICENSE.COMMERCIAL
+or contact license@ontovalue.com for details.

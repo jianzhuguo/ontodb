@@ -1,7 +1,6 @@
-// Copyright (c) 2024-2026 OntoDB Team
-// Licensed under the Business Source License 1.1 (BUSL-1.1).
-// See LICENSE for details. Change Date: 2031-09-15.
-// On the Change Date, this file will be licensed under Apache License 2.0.
+// Copyright (c) 2024-2026 Guo Jianzhu (郭建筑)
+// Licensed under the Apache License, Version 2.0.
+// See LICENSE for details.
 //! SemEBL Rules API Server
 //!
 //! 独立的规则引擎REST API服务器，端口7912。
@@ -611,8 +610,8 @@ async fn main() {
 
     println!("============================================================");
     println!("OntoDB Rules API v0.1.0");
-    println!("Copyright (c) 2024-2026 OntoDB Team. All rights reserved.");
-    println!("Licensed under BUSL-1.1 | https://ontovalue.com");
+    println!("Copyright (c) 2024-2026 Guo Jianzhu (郭建筑). All rights reserved.");
+    println!("Licensed under Apache-2.0 | https://ontovalue.com");
     println!("============================================================");
     println!("Rules API server listening on 0.0.0.0:{}", port);
     println!("Endpoints:");

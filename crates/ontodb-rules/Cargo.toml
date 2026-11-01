@@ -2,7 +2,7 @@
 name = "ontodb-rules"
 version = "0.1.0"
 edition = "2021"
-license = "BUSL-1.1"
+license = "Apache-2.0"
 description = "OntoDB Rules API Server — basic DSL rule management with hot reload"
 
 [[bin]]

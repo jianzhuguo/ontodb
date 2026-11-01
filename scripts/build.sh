@@ -1,6 +1,6 @@
 #!/bin/bash
 # OntoDB Build Script
-# Supports building community (BUSL-1.1) and enterprise editions
+# Supports building community (Apache-2.0) and enterprise editions
 
 set -e
 
@@ -15,11 +15,11 @@ echo "========================================"
 
 case "$EDITION" in
     community)
-        echo "Building Community Edition (BUSL-1.1)..."
+        echo "Building Community Edition (Apache-2.0)..."
         cargo build --release
         echo ""
         echo "Build complete: target/release/ontodb-server"
-        echo "License: BUSL-1.1"
+        echo "License: Apache-2.0"
         ;;
     enterprise-standard)
         echo "Building Enterprise Standard Edition..."
