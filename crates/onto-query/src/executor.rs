@@ -12211,9 +12211,7 @@ impl QueryExecutor {
                     let entries = engine.txn_scan_prefix(txn_id, prefix.as_bytes())?;
                     let mut existing_key: Option<Vec<u8>> = None;
                     for (key, val_bytes) in &entries {
-                        if let Ok(serde_json::Value::Object(doc)) =
-                            serde_json::from_slice::<serde_json::Value>(val_bytes)
-                        {
+                        if let Some(doc) = storage_bytes_to_doc(val_bytes) {
                             if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
                                 if let Some(existing_val) = doc.get(conflict_column) {
                                     let matches = match (existing_val, val) {
@@ -12238,12 +12236,11 @@ impl QueryExecutor {
                     if let Some(key) = existing_key {
                         // Update existing row
                         if let Ok(Some(val_bytes)) = engine.txn_get(txn_id, &key) {
-                            if let Ok(serde_json::Value::Object(mut doc)) =
-                                serde_json::from_slice::<serde_json::Value>(&val_bytes)
-                            {
+                            if let Some(mut doc) = storage_bytes_to_doc(&val_bytes) {
                                 for (col, assign_val) in assignments {
                                     doc.insert(col.clone(), self.literal_to_json(assign_val));
                                 }
+                                self.validate_document(engine, class, &doc)?;
                                 let new_value = doc_to_storage_bytes(&doc);
                                 engine.txn_put(txn_id, key, new_value)?;
                                 return Ok(QueryResult::Success(
@@ -12308,6 +12305,7 @@ impl QueryExecutor {
                                     for (col, assign_val) in assignments {
                                         doc.insert(col.clone(), self.literal_to_json(assign_val));
                                     }
+                                    self.validate_document(engine, class, &doc)?;
                                     let new_value = doc_to_storage_bytes(&doc);
                                     engine.txn_put(txn_id, key, new_value)?;
                                     total += 1;
@@ -13903,6 +13901,7 @@ impl QueryExecutor {
             ImportFormat::Csv => self.parse_csv_to_entries(class, &content)?,
             ImportFormat::Json => self.parse_json_to_entries(class, &content)?,
         };
+        self.validate_rows(engine, class, &entries)?;
 
         // Use transaction for atomic COPY with crash recovery
         let txn_id = engine.begin_txn();
@@ -14109,6 +14108,7 @@ impl QueryExecutor {
         }
 
         // Batch insert into transaction buffer
+        self.validate_rows(engine, class, &batch)?;
         let imported = engine
             .txn_put_batch(txn_id, batch)
             .map_err(|e| CoreError::InvalidArgument(format!("batch insert error: {}", e)))?
@@ -14211,6 +14211,7 @@ impl QueryExecutor {
             }
         }
 
+        self.validate_rows(engine, class, &batch)?;
         let imported = engine
             .txn_put_batch(txn_id, batch)
             .map_err(|e| CoreError::InvalidArgument(format!("batch insert error: {}", e)))?
@@ -14262,6 +14263,7 @@ impl QueryExecutor {
             }
         }
 
+        self.validate_rows(engine, class, &batch)?;
         let imported = engine
             .txn_put_batch(txn_id, batch)
             .map_err(|e| CoreError::InvalidArgument(format!("batch insert error: {}", e)))?
@@ -16022,6 +16024,33 @@ impl QueryExecutor {
     // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
 
     /// Validates a document against the ontology schema.
+    /// Validates serialized rows against the class schema before a bulk write
+    /// (COPY/IMPORT). The class's ontology is resolved once and applied to
+    /// every row; a violation fails the whole batch with its row number —
+    /// matching INSERT/UPDATE strictness, so bad source data is fixed instead
+    /// of silently dropped.
+    fn validate_rows(
+        &self,
+        engine: &LsmEngine,
+        class: &str,
+        rows: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let ontology = self
+            .ontology_store
+            .find_ontology_for_class_global(engine, class)?;
+        for (i, (_key, value)) in rows.iter().enumerate() {
+            let Some(doc) = storage_bytes_to_doc(value) else {
+                continue;
+            };
+            self.validate_document_with(engine, class, &doc, ontology.as_ref())
+                .map_err(|e| CoreError::InvalidArgument(format!("row {}: {}", i + 1, e)))?;
+        }
+        Ok(())
+    }
+
     /// Checks: class exists, required fields present, type compatibility.
     /// Returns Ok(()) if valid, Err with a descriptive message if not.
     fn validate_document(
@@ -16030,13 +16059,25 @@ impl QueryExecutor {
         class: &str,
         doc: &Map<String, Value>,
     ) -> Result<()> {
-        // Find the ontology containing this class
-        let ontology = match self
+        let ontology = self
             .ontology_store
-            .find_ontology_for_class_global(engine, class)?
-        {
-            Some(o) => o,
-            None => return Ok(()), // No ontology defined �?skip validation
+            .find_ontology_for_class_global(engine, class)?;
+        self.validate_document_with(engine, class, doc, ontology.as_ref())
+    }
+
+    /// [`Self::validate_document`] with a pre-resolved ontology. Bulk write
+    /// paths (COPY/IMPORT) resolve the class's ontology once and validate
+    /// every row against it instead of re-scanning the ontology catalog.
+    fn validate_document_with(
+        &self,
+        engine: &LsmEngine,
+        class: &str,
+        doc: &Map<String, Value>,
+        ontology: Option<&onto_ontology::Ontology>,
+    ) -> Result<()> {
+        let Some(ontology) = ontology else {
+            // no ontology defines the class: skip validation
+            return Ok(());
         };
 
         let class_def = match ontology.classes.get(class) {
@@ -21300,6 +21341,98 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════�?
     //  Import tests
     // ══════════════════════════════════════════════════════════════════�?
+
+    #[test]
+    fn test_import_csv_validates_required_fields() {
+        let (executor, dir) = setup();
+        let csv_path = dir.path().join("missing_required.csv");
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING REQUIRED, PROPERTY price DOMAIN Product RANGE INT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        // Row lacks the required 'name' column entirely.
+        std::fs::write(&csv_path, "price\n100\n").unwrap();
+        let err = executor
+            .execute(
+                &QueryParser::parse(&format!(
+                    "IMPORT INTO Product FROM CSV '{}'",
+                    csv_path.display()
+                ))
+                .unwrap(),
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("row 1"), "unexpected error: {msg}");
+        assert!(msg.contains("required property 'name'"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_import_json_validates_each_row() {
+        let (executor, dir) = setup();
+        let json_path = dir.path().join("missing_required.json");
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING REQUIRED)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        // Second row lacks the required 'name' property.
+        std::fs::write(&json_path, r#"[{"name": "ok"}, {"price": 5}]"#).unwrap();
+        let err = executor
+            .execute(
+                &QueryParser::parse(&format!(
+                    "IMPORT INTO Product FROM JSON '{}'",
+                    json_path.display()
+                ))
+                .unwrap(),
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("row 2"), "unexpected error: {msg}");
+        assert!(msg.contains("required property 'name'"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_upsert_update_validates() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let insert = QueryAst::Insert {
+            class: "Product".to_string(),
+            columns: vec!["name".to_string(), "price".to_string()],
+            values: vec![LiteralValue::String("Widget".to_string()), LiteralValue::Int(100)],
+        };
+        executor.execute(&insert).unwrap();
+
+        // Upsert matches the existing row and updates it to an invalid type.
+        let upsert = QueryAst::Upsert {
+            class: "Product".to_string(),
+            columns: vec!["name".to_string()],
+            values: vec![LiteralValue::String("Widget".to_string())],
+            conflict_column: "name".to_string(),
+            assignments: vec![(
+                "price".to_string(),
+                LiteralValue::String("not-an-int".to_string()),
+            )],
+        };
+        let err = executor.execute(&upsert).unwrap_err();
+        assert!(
+            err.to_string().contains("price"),
+            "type violation must reject the upsert update: {err}"
+        );
+    }
 
     #[test]
     fn test_import_csv_basic() {
