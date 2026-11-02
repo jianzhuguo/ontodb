@@ -28,8 +28,10 @@ fn setup() -> (Arc<QueryExecutor>, tempfile::TempDir) {
         memtable_size_limit: 64 * 1024 * 1024,
         ..Default::default()
     };
-    let engine = Arc::new(onto_storage::LsmEngine::open(options).unwrap());
-    let ontology_store = onto_ontology::OntologyStore::new(engine.clone());
+    let engine = Arc::new(onto_storage::EngineSet::new(Arc::new(
+        onto_storage::LsmEngine::open(options).unwrap(),
+    )));
+    let ontology_store = onto_ontology::OntologyStore::new(engine.default_engine());
     let executor = Arc::new(QueryExecutor::new(engine, ontology_store));
 
     for i in 0..ROW_COUNT {

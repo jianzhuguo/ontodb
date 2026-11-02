@@ -30,6 +30,7 @@
 //! - Vector: HNSW vector index for similarity search
 
 pub mod engine;
+pub mod engine_set;
 pub mod index;
 pub mod iterator;
 pub mod lsm;
@@ -42,6 +43,7 @@ pub mod value_meta;
 pub mod vector;
 
 pub use engine::{BackupFile, BackupFileType, BackupManifest, LsmEngine};
+pub use engine_set::EngineSet;
 pub use index::{IndexManager, IndexStorageMode};
 pub use iterator::StorageIterator;
 pub use mvcc::{Transaction, TxnManager, TxnStatus, WriteOp};

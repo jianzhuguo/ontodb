@@ -46,7 +46,7 @@ use onto_core::Result;
 use onto_enterprise::ProductTier;
 use onto_ontology::OntologyStore;
 use onto_query::{QueryExecutor, QueryParser};
-use onto_storage::{LsmEngine, StorageOptions};
+use onto_storage::StorageOptions;
 use rate_limit::{RateLimitConfig, RateLimiter};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -414,33 +414,46 @@ fn main() -> Result<()> {
 
     let counts_path = options.data_dir.join("row_counts.json");
     let audit_path = options.data_dir.join("audit.log");
-    let engine = Arc::new(LsmEngine::open(options)?);
+    // One engine per namespace directory (auto-discovered under the data root)
+    // plus the default engine at the root. Before namespace data migration no
+    // subdirectories exist, so every key routes to the default engine — the
+    // historical single-engine layout.
+    let engine = Arc::new(onto_storage::EngineSet::open_with_discovery(options)?);
+    for ns in engine.namespaces() {
+        println!("Namespace engine: {}", ns);
+    }
 
     // Open disk indexes synchronously so has_index() sees existing indexes
     // before background index rebuild (avoids full re-backfill on restart).
-    if let Err(e) = engine.open_disk_indexes() {
-        tracing::warn!("open_disk_indexes failed: {}", e);
+    for ns_engine in engine.all_engines() {
+        if let Err(e) = ns_engine.open_disk_indexes() {
+            tracing::warn!("open_disk_indexes failed: {}", e);
+        }
     }
 
     // Rebuild in-memory index content in background to avoid blocking startup
-    let rebuild_engine = Arc::clone(&engine);
+    let rebuild_set = Arc::clone(&engine);
     std::thread::Builder::new()
         .name("index-rebuild".into())
         .spawn(move || {
             tracing::info!("Background index rebuild started");
-            if let Err(e) = rebuild_engine.rebuild_indexes() {
-                tracing::warn!("Index rebuild failed: {}", e);
+            for ns_engine in rebuild_set.all_engines() {
+                if let Err(e) = ns_engine.rebuild_indexes() {
+                    tracing::warn!("Index rebuild failed: {}", e);
+                }
+                if let Err(e) = ns_engine.rebuild_vector_indexes() {
+                    tracing::warn!("Vector index rebuild failed: {}", e);
+                }
+                ns_engine.mark_index_rebuild_done();
             }
-            if let Err(e) = rebuild_engine.rebuild_vector_indexes() {
-                tracing::warn!("Vector index rebuild failed: {}", e);
-            }
-            rebuild_engine.mark_index_rebuild_done();
             tracing::info!("Background index rebuild complete");
         })
         .ok();
 
-    let ontology_store = OntologyStore::new(Arc::clone(&engine));
-    // Wire the LSM engine into GraphStore: without it `load_relation_from_lsm`
+    // DDL / catalog keys (`__ontology__`, `__ns__`) and triples live in the
+    // default engine; document writes are routed per namespace.
+    let ontology_store = OntologyStore::new(engine.default_engine());
+    // Wire the LSM engine set into GraphStore: without it `load_relation_from_lsm`
     // fails ("No LSM engine configured") and every GRAPH query sees an empty
     // cache / degrades to JOIN.
     let graph_store = Arc::new(onto_graph::GraphStore::with_engine_and_limits(
@@ -453,7 +466,7 @@ fn main() -> Result<()> {
     if let Err(e) = graph_store.load_from_engine() {
         tracing::warn!("graph load_from_engine failed: {}", e);
     }
-    let triple_store = Arc::new(onto_ontology::TripleStore::new(Arc::clone(&engine)));
+    let triple_store = Arc::new(onto_ontology::TripleStore::new(engine.default_engine()));
 
     // Initialize sharding if enabled
     let executor = if args.sharding_enabled {

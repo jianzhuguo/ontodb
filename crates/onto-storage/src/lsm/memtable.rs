@@ -310,7 +310,16 @@ impl MemTable {
         // This captures all keys starting with prefix, regardless of seq_no.
         let upper = Self::prefix_upper_bound(prefix);
 
-        self.data.range(lower..upper).map(|(_, e)| e)
+        // An empty prefix has no incrementable byte, so prefix_upper_bound
+        // degenerates below `lower`; scan to the end of the map instead.
+        let end = if prefix.is_empty() {
+            std::ops::Bound::Unbounded
+        } else {
+            std::ops::Bound::Excluded(upper.as_slice())
+        };
+        self.data
+            .range::<[u8], _>((std::ops::Bound::Included(lower.as_slice()), end))
+            .map(|(_, e)| e)
     }
 
     /// Compute the exclusive upper bound for a prefix range scan.

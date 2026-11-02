@@ -4450,7 +4450,7 @@ async fn compact(State(state): State<AppState>) -> impl IntoResponse {
     let _ = state.executor.flush();
 
     let compact_result = tokio::task::block_in_place(|| {
-        state.executor.engine().flush_compaction()
+        state.executor.engine().flush_compaction_all()
     });
 
     let after_stats = state.executor.engine_stats();

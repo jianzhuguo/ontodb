@@ -123,8 +123,9 @@ pub struct GraphStore {
     /// [LOCK 5] Edge property index: prop_key -> prop_value -> set of edge IDs.
     /// Enables O(1) lookup for Eq queries on edge properties.
     edge_prop_index: RwLock<HashMap<String, HashMap<String, HashSet<String>>>>,
-    /// Optional LSM engine for persistence.
-    engine: Option<Arc<onto_storage::LsmEngine>>,
+    /// Optional LSM engine set for persistence (`__graph_*` cache keys route
+    /// to the default engine; relation tables route to their namespace).
+    engine: Option<Arc<onto_storage::EngineSet>>,
     /// [LOCK 6] Internal integer ID mapping for fast traversal.
     id_to_idx: RwLock<HashMap<String, u32>>,
     /// [LOCK 7a] Maps integer index -> string ID.
@@ -211,17 +212,17 @@ impl GraphStore {
         }
     }
 
-    /// Create a new persistent graph store backed by an LSM engine.
+    /// Create a new persistent graph store backed by an LSM engine set.
     ///
     /// Data is persisted to the engine with `__graph_v__` and `__graph_e__` prefixes.
     /// Call `load_from_engine()` after creation to restore data from disk.
-    pub fn with_engine(engine: Arc<onto_storage::LsmEngine>) -> Self {
+    pub fn with_engine(engine: Arc<onto_storage::EngineSet>) -> Self {
         Self::with_engine_and_limits(engine, GraphLimits::default())
     }
 
     /// Create a persistent store with custom vertex/cache limits.
     pub fn with_engine_and_limits(
-        engine: Arc<onto_storage::LsmEngine>,
+        engine: Arc<onto_storage::EngineSet>,
         limits: GraphLimits,
     ) -> Self {
         Self {
@@ -1757,9 +1758,13 @@ impl GraphStore {
             });
         }
 
-        // Execute load with timeout protection
+        // Execute load with timeout protection. Relation rows live in the
+        // namespace engine of their table name — resolve it, helpers keep
+        // taking a concrete `&LsmEngine`.
         let load_start = std::time::Instant::now();
-        let result = self.do_load_relation(engine, &relation_type, &load_start);
+        let table = relation_table_name(&relation_type);
+        let table_engine = engine.engine_for_class(&table);
+        let result = self.do_load_relation(&table_engine, &relation_type, &load_start);
 
         match result {
             Ok((edge_count, skipped)) => {
@@ -2657,7 +2662,9 @@ mod tests {
             memtable_size_limit: 4 * 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(LsmEngine::open(options).unwrap());
+        let engine = Arc::new(onto_storage::EngineSet::new(Arc::new(
+            LsmEngine::open(options).unwrap(),
+        )));
 
         // Create graph and add data
         {
@@ -2705,7 +2712,9 @@ mod tests {
             memtable_size_limit: 4 * 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(LsmEngine::open(options).unwrap());
+        let engine = Arc::new(onto_storage::EngineSet::new(Arc::new(
+            LsmEngine::open(options).unwrap(),
+        )));
 
         let product = EntityId::new("default", "Product", "001");
         let category = EntityId::new("default", "Category", "electronics");
@@ -2746,7 +2755,9 @@ mod tests {
             memtable_size_limit: 4 * 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(LsmEngine::open(options).unwrap());
+        let engine = Arc::new(onto_storage::EngineSet::new(Arc::new(
+            LsmEngine::open(options).unwrap(),
+        )));
 
         // Create, then delete
         {
