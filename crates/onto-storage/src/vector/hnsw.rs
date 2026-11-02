@@ -369,11 +369,14 @@ impl HnswIndex {
         bincode::serialize(&snapshot).map_err(|e| format!("Failed to serialize HNSW index: {}", e))
     }
 
-    /// Load an HNSW index from bytes.
+    /// Load an HNSW index by streaming deserialization from a reader.
     ///
-    /// Restores the full graph structure, avoiding the need to re-insert vectors.
-    pub fn load_from_bytes(data: &[u8]) -> Result<Self, String> {
-        let snapshot: HnswSnapshot = bincode::deserialize(data)
+    /// `bincode::deserialize_from` shares the exact wire format of
+    /// [`Self::load_from_bytes`] (fixint + trailing bytes), but never
+    /// materializes the whole snapshot file in memory — a multi-hundred-MB
+    /// `fs::read` buffer used to double the restore peak.
+    pub fn load_from_reader<R: std::io::Read>(reader: R) -> Result<Self, String> {
+        let snapshot: HnswSnapshot = bincode::deserialize_from(reader)
             .map_err(|e| format!("Failed to deserialize HNSW index: {}", e))?;
 
         Ok(Self {
@@ -385,6 +388,13 @@ impl HnswIndex {
             visited_gen: std::sync::atomic::AtomicU64::new(0),
             dirty: super::incremental_persist::DirtyTracker::new(),
         })
+    }
+
+    /// Load an HNSW index from bytes.
+    ///
+    /// Restores the full graph structure, avoiding the need to re-insert vectors.
+    pub fn load_from_bytes(data: &[u8]) -> Result<Self, String> {
+        Self::load_from_reader(data)
     }
 
     pub fn config(&self) -> &HnswConfig {

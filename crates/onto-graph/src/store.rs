@@ -266,28 +266,85 @@ impl GraphStore {
             None => return Ok(()), // No persistence, nothing to load
         };
 
-        // ── Pass 1: scan vertices into local Vec (no locks) ──
-        let vertex_entries = engine
-            .scan_prefix(GRAPH_VERTEX_PREFIX.as_bytes())
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        // Streamed restore under a hard memory budget. The old path ran two
+        // full `scan_prefix` passes that materialized every (key, value) into
+        // one Vec before parsing: a 2.6M-edge graph peaked at ~2.5GB with a
+        // single 708MB HashMap alloc and OOM'd startup. Pages are parsed as
+        // they arrive; the running estimate is capped at
+        // `max_cache_memory_bytes`, and whatever does not fit stays cold for
+        // the lazy per-relation path (`load_relation_from_lsm`).
+        const PAGE: usize = 10_000;
+        let mut mem_estimate = 0usize;
+        let mut budget_exhausted = false;
 
+        // ── Pass 1: scan vertices into local Vec (no locks) ──
         let mut vertices_vec: Vec<Vertex> = Vec::new();
-        for (_key, value) in &vertex_entries {
-            if let Ok(vertex) = serde_json::from_slice::<Vertex>(value) {
-                vertices_vec.push(vertex);
+        let mut after: Option<Vec<u8>> = None;
+        while !budget_exhausted {
+            let page = engine
+                .scan_prefix_after(GRAPH_VERTEX_PREFIX.as_bytes(), after.as_deref(), PAGE)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            if page.is_empty() {
+                break;
             }
+            let last_key = page.last().expect("non-empty page").0.clone();
+            for (key, value) in &page {
+                mem_estimate += key.len() + value.len() + 320;
+                if let Ok(vertex) = serde_json::from_slice::<Vertex>(value) {
+                    vertices_vec.push(vertex);
+                }
+            }
+            if vertices_vec.len() >= self.limits.max_vertices {
+                tracing::warn!(
+                    loaded = vertices_vec.len(),
+                    limit = self.limits.max_vertices,
+                    "load_from_engine hit max_vertices; remaining graph stays cold"
+                );
+                budget_exhausted = true;
+            } else if mem_estimate >= self.limits.max_cache_memory_bytes {
+                tracing::warn!(
+                    estimate_mb = mem_estimate / (1024 * 1024),
+                    limit_mb = self.limits.max_cache_memory_bytes / (1024 * 1024),
+                    "load_from_engine hit memory budget; remaining graph stays cold"
+                );
+                budget_exhausted = true;
+            }
+            if page.len() < PAGE {
+                break;
+            }
+            after = Some(last_key);
         }
 
         // ── Pass 2: scan edges into local Vec (no locks) ──
-        let edge_entries = engine
-            .scan_prefix(GRAPH_EDGE_PREFIX.as_bytes())
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
         let mut edges_vec: Vec<Edge> = Vec::new();
-        for (_key, value) in &edge_entries {
-            if let Ok(edge) = serde_json::from_slice::<Edge>(value) {
-                edges_vec.push(edge);
+        let mut after: Option<Vec<u8>> = None;
+        while !budget_exhausted {
+            let page = engine
+                .scan_prefix_after(GRAPH_EDGE_PREFIX.as_bytes(), after.as_deref(), PAGE)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            if page.is_empty() {
+                break;
             }
+            let last_key = page.last().expect("non-empty page").0.clone();
+            for (key, value) in &page {
+                mem_estimate += key.len() + value.len() + 512;
+                if let Ok(edge) = serde_json::from_slice::<Edge>(value) {
+                    edges_vec.push(edge);
+                }
+            }
+            if mem_estimate >= self.limits.max_cache_memory_bytes {
+                tracing::warn!(
+                    estimate_mb = mem_estimate / (1024 * 1024),
+                    limit_mb = self.limits.max_cache_memory_bytes / (1024 * 1024),
+                    edges = edges_vec.len(),
+                    "load_from_engine hit memory budget during edge scan; remaining edges stay cold"
+                );
+                budget_exhausted = true;
+            }
+            if page.len() < PAGE {
+                break;
+            }
+            after = Some(last_key);
         }
 
         // ── Build all indexes locally (no locks) ──
@@ -1803,13 +1860,21 @@ impl GraphStore {
         let label = normalize_relation_label(relation_type);
         let table = relation_table_name(relation_type);
         let prefix = format!("{}::", table);
-        let entries = engine.scan_prefix(prefix.as_bytes())
-            .map_err(|e| GraphError::StorageError(e.to_string()))?;
-
+        // Page the relation scan: the old `scan_prefix` materialized every row
+        // of the relation table before parsing (multi-GB on large tables).
+        const PAGE: usize = 10_000;
+        let mut after: Option<Vec<u8>> = None;
         let mut edge_count = 0usize;
         let mut skipped = 0usize;
         let mut batch_count = 0usize;
-
+        loop {
+            let entries = engine
+                .scan_prefix_after(prefix.as_bytes(), after.as_deref(), PAGE)
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            if entries.is_empty() {
+                break;
+            }
+            let last_key = entries.last().expect("non-empty page").0.clone();
         for (_key, value) in &entries {
             // Timeout check
             if load_start.elapsed().as_secs() >= LOAD_TIMEOUT_SECS {
@@ -1867,6 +1932,11 @@ impl GraphStore {
                     }
                 }
             }
+        }
+        if entries.len() < PAGE {
+            break;
+        }
+        after = Some(last_key);
         }
 
         Ok((edge_count, skipped))

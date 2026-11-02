@@ -666,14 +666,20 @@ impl LsmEngine {
         Ok(())
     }
 
-    /// Loads a persisted HNSW snapshot file if present.
-    pub fn load_vector_graph_file(&self, class: &str, column: &str) -> Option<Vec<u8>> {
+    /// Opens a persisted HNSW snapshot file if present.
+    ///
+    /// Returns the file handle and its size so the caller can stream the
+    /// deserialize (`HnswIndex::load_from_reader`) instead of materializing
+    /// the whole snapshot as one byte buffer.
+    pub fn open_vector_graph_file(&self, class: &str, column: &str) -> Option<(std::fs::File, u64)> {
         let path = self
             .options
             .data_dir
             .join("indexes")
             .join(format!("{}_{}.hnsw", class, column));
-        std::fs::read(&path).ok()
+        let file = std::fs::File::open(&path).ok()?;
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Some((file, len))
     }
 
     /// Adds document `column` vectors that are not already in the HNSW graph.
@@ -1795,39 +1801,38 @@ impl LsmEngine {
         Ok(out)
     }
 
-    /// Key-ordered paged scan returning `(key, value, kind)` for every winner,
-    /// including tombstones. Memory is O(page) —safe for multi-million-key
-    /// prefixes where `scan_prefix` / `collect_prefix_winners` OOM.
-    ///
-    /// Version selection matches `scan_prefix_after`: merge sources newest-first,
-    /// first-seen-wins per user key, then emit keys in ascending order.
+    /// Paged key-order scan returning the winning `(key, kind)` per key.
+    /// Never copies values — every caller (COUNT / index bookkeeping) only
+    /// needs liveness, and value materialization OOM'd multi-million-row
+    /// classes at 50k entries per page. Winner rule matches scan_prefix_after:
+    /// first-seen across memtable -> immutable -> SSTs (newest source first).
     pub fn scan_prefix_page_kind(
         &self,
         prefix: &[u8],
         after: Option<&[u8]>,
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>, EntryKind)>> {
+    ) -> Result<Vec<(Vec<u8>, EntryKind)>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         self.drain_compaction_notifications();
 
-        let mut mem_active: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
-        let mut mem_imm: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::new();
+        let mut mem_active: Vec<(Vec<u8>, SeqNo, EntryKind)> = Vec::new();
+        let mut mem_imm: Vec<(Vec<u8>, SeqNo, EntryKind)> = Vec::new();
         {
             let ws = self.write_state.read();
             for e in ws.memtable.scan_prefix(prefix) {
                 if after.is_some_and(|a| e.key.as_slice() <= a) {
                     continue;
                 }
-                mem_active.push((e.key.clone(), e.value.clone(), e.seq_no, e.kind));
+                mem_active.push((e.key.clone(), e.seq_no, e.kind));
             }
             if let Some(ref imm) = ws.immutable_memtable {
                 for e in imm.scan_prefix(prefix) {
                     if after.is_some_and(|a| e.key.as_slice() <= a) {
                         continue;
                     }
-                    mem_imm.push((e.key.clone(), e.value.clone(), e.seq_no, e.kind));
+                    mem_imm.push((e.key.clone(), e.seq_no, e.kind));
                 }
             }
         }
@@ -1890,7 +1895,7 @@ impl LsmEngine {
             sst_iters.push(it);
         }
 
-        let mut out: Vec<(Vec<u8>, Vec<u8>, EntryKind)> = Vec::with_capacity(limit.min(4096));
+        let mut out: Vec<(Vec<u8>, EntryKind)> = Vec::with_capacity(limit.min(4096));
         let mut mem_a_i = 0usize;
         let mut mem_i_i = 0usize;
 
@@ -1934,18 +1939,16 @@ impl LsmEngine {
                 break;
             };
 
-            let mut winner: Option<(Vec<u8>, EntryKind)> = None;
+            let mut winner: Option<EntryKind> = None;
             while mem_a_i < mem_active.len() && mem_active[mem_a_i].0 == group_key {
                 if winner.is_none() {
-                    let e = &mem_active[mem_a_i];
-                    winner = Some((e.1.clone(), e.3));
+                    winner = Some(mem_active[mem_a_i].2);
                 }
                 mem_a_i += 1;
             }
             while mem_i_i < mem_imm.len() && mem_imm[mem_i_i].0 == group_key {
                 if winner.is_none() {
-                    let e = &mem_imm[mem_i_i];
-                    winner = Some((e.1.clone(), e.3));
+                    winner = Some(mem_imm[mem_i_i].2);
                 }
                 mem_i_i += 1;
             }
@@ -1961,7 +1964,7 @@ impl LsmEngine {
                 {
                     let it = &mut sst_iters[idx];
                     if winner.is_none() {
-                        winner = Some((it.value().to_vec(), it.kind()));
+                        winner = Some(it.kind());
                     }
                     it.next();
                     while it.is_valid() {
@@ -1981,8 +1984,8 @@ impl LsmEngine {
                 }
             }
 
-            if let Some((value, kind)) = winner {
-                out.push((group_key, value, kind));
+            if let Some(kind) = winner {
+                out.push((group_key, kind));
             }
         }
 
@@ -2214,7 +2217,7 @@ impl LsmEngine {
             if page.is_empty() {
                 break;
             }
-            for (_k, _v, kind) in &page {
+            for (_k, kind) in &page {
                 match kind {
                     EntryKind::Put => live += 1,
                     EntryKind::Delete => tombstones += 1,
@@ -3509,7 +3512,7 @@ impl LsmEngine {
             if page.is_empty() {
                 break;
             }
-            for (k, _v, kind) in &page {
+            for (k, kind) in &page {
                 if *kind != EntryKind::Put {
                     continue;
                 }
@@ -3691,7 +3694,7 @@ impl LsmEngine {
             let last_key = page.last().expect("non-empty page").0.clone();
             {
                 let mut ws = self.write_state.write();
-                for (key, _v, _kind) in &page {
+                for (key, _kind) in &page {
                     if let Some((class, column, _, _)) =
                         crate::index::IndexManager::parse_index_key(key)
                     {
@@ -3880,8 +3883,8 @@ impl LsmEngine {
         for (class, column, dimension, metric, m, ef_construction, ef_search) in &index_configs {
             let graph_key = format!("{}_{}", class, column);
 
-            let graph_data = self.load_vector_graph_file(class, column);
-            if graph_data.is_none() {
+            let graph_file = self.open_vector_graph_file(class, column);
+            if graph_file.is_none() {
                 tracing::info!(
                     table = %class,
                     column = %column,
@@ -3889,7 +3892,7 @@ impl LsmEngine {
                 );
             }
 
-            if let Some(graph_data) = graph_data {
+            if let Some((graph_file, graph_len)) = graph_file {
                 // Fast path: load HNSW graph structure directly.
                 // load_graph rejects empty snapshots (written at CREATE INDEX
                 // before any vectors) so we fall through to rebuild.
@@ -3900,11 +3903,11 @@ impl LsmEngine {
                 tracing::info!(
                     table = %class,
                     column = %column,
-                    bytes = graph_data.len(),
+                    bytes = graph_len,
                     "Deserializing vector index snapshot (outside lock)"
                 );
                 let deserialize_started = std::time::Instant::now();
-                let loaded = crate::vector::hnsw::HnswIndex::load_from_bytes(&graph_data);
+                let loaded = crate::vector::hnsw::HnswIndex::load_from_reader(graph_file);
                 tracing::info!(
                     table = %class,
                     column = %column,
