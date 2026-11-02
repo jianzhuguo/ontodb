@@ -21,6 +21,33 @@ use crate::parser_util::{
     find_ignore_ascii_case, safe_slice, safe_slice_from, starts_with_ignore_ascii_case,
 };
 
+/// Finds the index of the `)` matching the `(` at position 0, skipping quoted spans.
+fn find_matching_paren(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_quote: Option<u8> = None;
+    for (i, &c) in b.iter().enumerate() {
+        if let Some(q) = in_quote {
+            if c == q {
+                in_quote = None;
+            }
+        } else if c == b'\'' || c == b'"' {
+            in_quote = Some(c);
+        } else if c == b'(' {
+            depth += 1;
+        } else if c == b')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
 /// Find unquoted substring (skips content inside single/double quotes).
 fn find_unquoted(haystack: &str, needle: &str) -> Option<usize> {
     let nlen = needle.len();
@@ -285,7 +312,10 @@ pub enum JoinType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OntoFromClause {
     Class { name: String, alias: Option<String> },
-    Subquery(Box<OntoQLAst>),
+    Subquery {
+        query: Box<OntoQLAst>,
+        alias: Option<String>,
+    },
 }
 
 /// OntoQL JOIN clause.
@@ -1014,7 +1044,17 @@ impl OntoQLParser {
                         let (rules_str, new_rest, _) = consume_until_keywords(rest, &["REMOTE"]);
                         rules = split_quoted(rules_str, ',')
                             .iter()
-                            .map(|s| s.trim().to_string())
+                            .map(|s| {
+                                let t = s.trim();
+                                let t = t
+                                    .strip_prefix('"')
+                                    .and_then(|r| r.strip_suffix('"'))
+                                    .or_else(|| {
+                                        t.strip_prefix('\'').and_then(|r| r.strip_suffix('\''))
+                                    })
+                                    .unwrap_or(t);
+                                t.to_string()
+                            })
                             .collect();
                         let remaining = new_rest.trim();
                         if starts_with_ignore_ascii_case(remaining, "REMOTE") {
@@ -1051,10 +1091,27 @@ impl OntoQLParser {
             }
         }
 
-        // INFER <subquery> — not yet fully supported in Phase 1
-        Err(CoreError::InvalidArgument(
-            "INFER with subquery not yet supported. Use SELECT ... INFER @onto(scope=...)".into(),
-        ))
+        // INFER <subquery> / INFER ( <subquery> ) — scoped inference over an inner query
+        let sub_src = if rest.starts_with('(') {
+            let end = find_matching_paren(rest)
+                .ok_or_else(|| CoreError::InvalidArgument("unmatched '(' in INFER subquery".into()))?;
+            let trailing = rest[end + 1..].trim();
+            if !trailing.is_empty() {
+                return Err(CoreError::InvalidArgument(format!(
+                    "unexpected trailing input after INFER subquery: {}",
+                    trailing
+                )));
+            }
+            rest[1..end].trim()
+        } else {
+            rest
+        };
+        let sub = OntoQLParser::parse(sub_src)?;
+        return Ok(OntoQLAst::Infer {
+            query: Box::new(sub),
+            mode: InferMode::Local,
+            rules: Vec::new(),
+        });
     }
 
     // ── EXPLAIN ───────────────────────────────────────────────────
@@ -1116,9 +1173,42 @@ impl OntoQLParser {
     fn parse_from_clause(input: &str) -> Result<(OntoFromClause, &str)> {
         let input = input.trim_start();
         if input.starts_with('(') {
-            // Subquery
-            return Err(CoreError::InvalidArgument(
-                "Subquery in FROM not yet supported".into(),
+            // Subquery: `( SELECT ... ) [alias]`
+            let end = find_matching_paren(input)
+                .ok_or_else(|| {
+                    CoreError::InvalidArgument("unmatched '(' in FROM subquery".to_string())
+                })?;
+            let inner = input[1..end].trim();
+            let mut rest = input[end + 1..].trim_start();
+            let sub = Self::parse(inner)?;
+            let mut alias = None;
+            if starts_with_ignore_ascii_case(rest, "AS ") {
+                rest = safe_slice_from(rest, 3).trim_start();
+                let (a, after) = Self::extract_identifier(rest);
+                alias = Some(a);
+                rest = after.trim_start();
+            } else if !rest.is_empty() {
+                let stops = [
+                    "WHERE", "JOIN", "LEFT", "RIGHT", "FULL", "INNER", "ON", "GROUP",
+                    "ORDER", "LIMIT", "HAVING", "INFER",
+                ];
+                let first = rest.as_bytes().first().copied().unwrap_or(0);
+                if !stops
+                    .iter()
+                    .any(|k| starts_with_ignore_ascii_case(rest, k))
+                    && (first.is_ascii_alphabetic() || first == b'_')
+                {
+                    let (a, after) = Self::extract_identifier(rest);
+                    alias = Some(a);
+                    rest = after.trim_start();
+                }
+            }
+            return Ok((
+                OntoFromClause::Subquery {
+                    query: Box::new(sub),
+                    alias,
+                },
+                rest,
             ));
         }
 
@@ -1919,6 +2009,41 @@ impl OntoQLAst {
             OntoQLAst::UseNamespace { name } => Ok(QueryAst::UseNamespace { name: name.clone() }),
             // Ontology drop operations — convert directly
             OntoQLAst::DropOntology { name } => Ok(QueryAst::DropOntology { name: name.clone() }),
+            // SELECT ... INFER @onto(scope=...) — wrap the plain SELECT in an
+            // Infer node so the clause is executed instead of silently dropped.
+            OntoQLAst::Select {
+                infer: Some(inf), ..
+            } => {
+                let mut inner = self.clone();
+                if let OntoQLAst::Select { infer, .. } = &mut inner {
+                    *infer = None;
+                }
+                Ok(QueryAst::Infer {
+                    query: Box::new(inner.to_query_ast()?),
+                    scope: inf.scope.clone(),
+                    rules: inf.rules.clone(),
+                    materialize: false,
+                })
+            }
+            // INFER <query> — materialize inferred triples as rows
+            OntoQLAst::Infer { query, mode, rules } => {
+                if let InferMode::Remote { endpoint } = mode {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "INFER REMOTE @{} not supported (local reasoning only)",
+                        endpoint
+                    )));
+                }
+                Ok(QueryAst::Infer {
+                    query: Box::new(query.to_query_ast()?),
+                    scope: "ALL".to_string(),
+                    rules: rules.clone(),
+                    materialize: true,
+                })
+            }
+            // EXPLAIN recurses so an inner SELECT ... INFER keeps its clause
+            OntoQLAst::Explain { query } => Ok(QueryAst::Explain {
+                query: Box::new(query.to_query_ast()?),
+            }),
             _ => {
                 let sql = self.to_sql()?;
                 parser::QueryParser::parse(&sql)
@@ -1965,7 +2090,7 @@ impl OntoQLAst {
                 ))
             }
 
-            OntoQLAst::Select { distinct, projections, from, joins, filter, group_by, having, order_by, limit, offset, .. } => {
+            OntoQLAst::Select { distinct, projections, from, joins, filter, infer, group_by, having, order_by, limit, offset, .. } => {
                 let mut sql = String::from("SELECT ");
                 if *distinct { sql.push_str("DISTINCT "); }
 
@@ -1994,8 +2119,13 @@ impl OntoQLAst {
                             sql.push_str(&format!(" AS {}", a));
                         }
                     }
-                    OntoFromClause::Subquery(_) => {
-                        return Err(CoreError::InvalidArgument("Subquery in FROM not yet supported".into()));
+                    OntoFromClause::Subquery { query, alias } => {
+                        sql.push('(');
+                        sql.push_str(&query.to_sql()?);
+                        sql.push(')');
+                        if let Some(a) = alias {
+                            sql.push_str(&format!(" AS {}", a));
+                        }
                     }
                 }
 
@@ -2014,7 +2144,14 @@ impl OntoQLAst {
                                 sql.push_str(&format!(" AS {}", a));
                             }
                         }
-                        _ => return Err(CoreError::InvalidArgument("Subquery in JOIN not yet supported".into())),
+                        OntoFromClause::Subquery { query, alias } => {
+                            sql.push('(');
+                            sql.push_str(&query.to_sql()?);
+                            sql.push(')');
+                            if let Some(a) = alias {
+                                sql.push_str(&format!(" AS {}", a));
+                            }
+                        }
                     }
                     sql.push_str(&format!(" ON {}", Self::filter_to_sql(&join.on_condition)?));
                 }
@@ -2052,6 +2189,11 @@ impl OntoQLAst {
                 }
                 if let Some(o) = offset {
                     sql.push_str(&format!(" OFFSET {}", o));
+                }
+
+                // INFER clause (kept for display; to_query_ast wraps the query)
+                if let Some(inf) = infer {
+                    sql.push_str(&format!(" INFER @onto(scope=\"{}\")", inf.scope));
                 }
 
                 Ok(sql)
@@ -2118,8 +2260,18 @@ impl OntoQLAst {
                 Err(CoreError::InvalidArgument("SELECT TRIPLE is handled directly".into()))
             }
 
-            OntoQLAst::Infer { .. } => {
-                Err(CoreError::InvalidArgument("INFER standalone not yet supported in Phase 1".into()))
+            OntoQLAst::Infer { query, rules, .. } => {
+                let mut sql = format!("INFER ({})", query.to_sql()?);
+                if !rules.is_empty() {
+                    sql.push_str(&format!(
+                        " LOCAL USING {}",
+                        rules.iter()
+                            .map(|r| format!("\"{}\"", r))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                Ok(sql)
             }
 
             // Namespace operations don't have SQL representation
@@ -2529,6 +2681,82 @@ mod tests {
             }
             _ => panic!("Expected Select"),
         }
+    }
+
+    #[test]
+    fn test_parse_infer_subquery() {
+        let ast = OntoQLParser::parse("INFER ( SELECT name FROM Person )").unwrap();
+        match ast {
+            OntoQLAst::Infer { query, mode, rules } => {
+                assert!(matches!(*query, OntoQLAst::Select { .. }));
+                assert_eq!(mode, InferMode::Local);
+                assert!(rules.is_empty());
+            }
+            _ => panic!("Expected Infer"),
+        }
+    }
+
+    #[test]
+    fn test_parse_infer_chained_reasoning() {
+        let ast =
+            OntoQLParser::parse("INFER CHAINED REASONING LOCAL USING \"Cax-sco\"").unwrap();
+        match ast {
+            OntoQLAst::Infer { rules, .. } => {
+                assert_eq!(rules, vec!["Cax-sco".to_string()]);
+            }
+            _ => panic!("Expected Infer"),
+        }
+    }
+
+    #[test]
+    fn test_to_query_ast_select_with_infer_wraps() {
+        // The INFER clause must not be silently dropped on translation.
+        let ast =
+            OntoQLParser::parse("SELECT name FROM Person INFER @onto(scope=\"SUBCLASS\")").unwrap();
+        match ast.to_query_ast().unwrap() {
+            QueryAst::Infer {
+                scope,
+                materialize,
+                query,
+                ..
+            } => {
+                assert_eq!(scope, "SUBCLASS");
+                assert!(!materialize);
+                assert!(matches!(*query, QueryAst::Select { .. }));
+            }
+            other => panic!("Expected Infer wrapper, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_to_query_ast_infer_materializes() {
+        let ast =
+            OntoQLParser::parse("INFER CHAINED REASONING LOCAL USING \"Cax-sco\"").unwrap();
+        match ast.to_query_ast().unwrap() {
+            QueryAst::Infer {
+                rules,
+                materialize,
+                scope,
+                ..
+            } => {
+                assert!(materialize);
+                assert_eq!(scope, "ALL");
+                assert_eq!(rules, vec!["Cax-sco".to_string()]);
+            }
+            other => panic!("Expected Infer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_to_sql_select_keeps_infer_clause() {
+        let ast =
+            OntoQLParser::parse("SELECT name FROM Person INFER @onto(scope=\"SUBCLASS\")").unwrap();
+        let sql = ast.to_sql().unwrap();
+        assert!(
+            sql.contains("INFER @onto(scope=\"SUBCLASS\")"),
+            "INFER clause missing from SQL: {}",
+            sql
+        );
     }
 
     #[test]

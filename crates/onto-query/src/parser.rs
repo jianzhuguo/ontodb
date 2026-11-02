@@ -296,6 +296,17 @@ pub enum QueryAst {
     /// EXPLAIN REASONING <query> - Show ontology reasoning derivation chain
     ExplainReasoning { query: Box<QueryAst> },
 
+    /// INFER <query> / SELECT ... INFER @onto(scope=...) - run ontology
+    /// reasoning scoped by the inner query. `materialize` returns inferred
+    /// triples as rows; otherwise the inner query's rows are augmented with
+    /// `__types__` / `__inferred__` columns.
+    Infer {
+        query: Box<QueryAst>,
+        scope: String,
+        rules: Vec<String>,
+        materialize: bool,
+    },
+
     /// WITH <cte_name> AS (<query>) <main_query> - Common Table Expression
     With {
         ctes: Vec<CteDefinition>,
@@ -525,7 +536,7 @@ impl QueryAst {
                 left.map_class_names(f);
                 right.map_class_names(f);
             }
-            Explain { query } | ExplainReasoning { query } => {
+            Explain { query } | ExplainReasoning { query } | Infer { query, .. } => {
                 query.map_class_names(f);
             }
             CreateMaterializedView { query, .. } => {
@@ -551,6 +562,7 @@ impl QueryAst {
             QueryAst::VectorSearch { .. } => true,
             QueryAst::Explain { .. } => true,
             QueryAst::ExplainReasoning { .. } => true,
+            QueryAst::Infer { .. } => true,
 
             // Writes
             QueryAst::Insert { .. } => false,

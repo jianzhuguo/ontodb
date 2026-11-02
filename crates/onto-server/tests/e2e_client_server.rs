@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use onto_ontology::OntologyStore;
 use onto_query::QueryExecutor;
-use onto_storage::{LsmEngine, StorageOptions};
+use onto_storage::{EngineSet, LsmEngine, StorageOptions};
 
 /// Helper: sends a query to the server and reads the response.
 fn send_query(stream: &mut TcpStream, query: &str) -> String {
@@ -52,8 +52,8 @@ fn start_test_server() -> (u16, thread::JoinHandle<()>) {
         ..Default::default()
     };
 
-    let engine = Arc::new(LsmEngine::open(options).unwrap());
-    let ontology_store = OntologyStore::new(Arc::clone(&engine));
+    let engine = Arc::new(EngineSet::new(Arc::new(LsmEngine::open(options).unwrap())));
+    let ontology_store = OntologyStore::new(engine.default_engine());
     let executor = Arc::new(QueryExecutor::new(Arc::clone(&engine), ontology_store));
 
     // Bind to port 0 for a random available port

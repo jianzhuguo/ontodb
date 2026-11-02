@@ -2852,6 +2852,12 @@ impl QueryExecutor {
             }
             QueryAst::Explain { query } => self.execute_explain_read(query, engine),
             QueryAst::ExplainReasoning { query } => self.execute_explain_reasoning(query, engine),
+            QueryAst::Infer {
+                query,
+                scope,
+                rules,
+                materialize,
+            } => self.execute_infer(query, scope, rules, *materialize, engine),
             QueryAst::Analyze { table } => self.execute_analyze_read(table, engine),
             QueryAst::Match {
                 variable,
@@ -2945,6 +2951,12 @@ impl QueryExecutor {
                 self.execute_explain(query, engine)
             }
             QueryAst::ExplainReasoning { query } => self.execute_explain_reasoning(query, engine),
+            QueryAst::Infer {
+                query,
+                scope,
+                rules,
+                materialize,
+            } => self.execute_infer(query, scope, rules, *materialize, engine),
             QueryAst::Analyze { table } => {
                 // ANALYZE: collect table statistics
                 self.execute_analyze(table, engine)
@@ -4112,6 +4124,13 @@ impl QueryExecutor {
         filter: &Option<FilterExpr>,
         projected_columns: Option<&SelectColumns>,
     ) -> Result<Vec<Map<String, Value>>> {
+        // Subquery tables materialize instead of scanning a class.
+        if let Some(mut rows) = self.subquery_rows(table, filter)? {
+            if let Some(a) = alias {
+                Self::apply_alias(&mut rows, a);
+            }
+            return Ok(rows);
+        }
         // Auto-collect statistics if not already done
         self.ensure_statistics(table, engine);
 
@@ -4509,6 +4528,18 @@ impl QueryExecutor {
         skip: usize,
         take: Option<usize>,
     ) -> Result<Vec<Map<String, Value>>> {
+        // Subquery tables materialize instead of scanning a class; the
+        // window (skip/take) is applied on the materialized rows.
+        if let Some(mut rows) = self.subquery_rows(table, filter)? {
+            rows = rows.into_iter().skip(skip).collect();
+            if let Some(t) = take {
+                rows.truncate(t);
+            }
+            if let Some(a) = alias {
+                Self::apply_alias(&mut rows, a);
+            }
+            return Ok(rows);
+        }
         let active_txn_id = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
         let class_hierarchy = self.get_class_hierarchy(engine, table);
         let scan_classes = self.narrow_scan_scope(engine, table, filter, &class_hierarchy);
@@ -4676,6 +4707,13 @@ impl QueryExecutor {
         index_column: &str,
         filter: &Option<FilterExpr>,
     ) -> Result<Vec<Map<String, Value>>> {
+        // Subquery tables materialize instead of scanning a class.
+        if let Some(mut rows) = self.subquery_rows(table, filter)? {
+            if let Some(a) = alias {
+                Self::apply_alias(&mut rows, a);
+            }
+            return Ok(rows);
+        }
         let class_hierarchy = self.get_class_hierarchy(engine, table);
 
         // Try to use the index for the primary lookup across the class hierarchy.
@@ -5277,6 +5315,15 @@ impl QueryExecutor {
         join: &crate::parser::JoinClause,
         index_column: &str,
     ) -> Result<Vec<Map<String, Value>>> {
+        // Subquery right side has no index to probe; materialize rows and use
+        // the row-based nested-loop join instead.
+        if right_table.starts_with("__subquery__:") {
+            let mut rows = self.subquery_rows(right_table, &None)?.unwrap_or_default();
+            if let Some(a) = join.alias.as_deref().or(right_alias) {
+                Self::apply_alias(&mut rows, a);
+            }
+            return Self::execute_nested_loop_join(left_rows, rows, join);
+        }
         let alias = right_alias.unwrap_or(right_table);
         let (left_col_raw, right_col_raw) = Self::resolve_join_columns(&join.on)?;
         let left_col = left_col_raw.split('.').next_back().unwrap_or(&left_col_raw);
@@ -6000,6 +6047,139 @@ impl QueryExecutor {
     }
 
     /// Collects all relevant facts (triples) for reasoning from the database.
+    /// Executes QueryAst::Infer: runs ontology reasoning scoped by the inner
+    /// query. With `materialize`, inferred triples are returned as rows;
+    /// otherwise the inner query's rows are augmented with `__types__`
+    /// (inferred rdf:type facts) and `__inferred__` (other inferred facts).
+    fn execute_infer(
+        &self,
+        query: &QueryAst,
+        scope: &str,
+        rules: &[String],
+        materialize: bool,
+        engine: &LsmEngine,
+    ) -> Result<QueryResult> {
+        let facts = self.collect_facts_for_reasoning(query, engine)?;
+        let class_name = Self::infer_target_class(query);
+
+        let ontology = match class_name {
+            Some("*") | None => self.get_merged_ontology(engine),
+            Some(c) => match self.ontology_store.find_ontology_for_class_global(engine, c)? {
+                Some(o) => o,
+                None => {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "INFER: no ontology defines class {}",
+                        c
+                    )))
+                }
+            },
+        };
+
+        let reasoner = onto_ontology::Reasoner::new(ontology);
+        let result = reasoner.reason(&facts);
+
+        let wanted: Option<std::collections::HashSet<String>> = if rules.is_empty() {
+            None
+        } else {
+            Some(
+                rules
+                    .iter()
+                    .map(|r| Self::normalize_rule_name(r))
+                    .collect(),
+            )
+        };
+        let matches_rules = |fact: &onto_ontology::Triple| -> bool {
+            match &wanted {
+                None => true,
+                Some(w) => reasoner
+                    .explain(&facts, fact)
+                    .iter()
+                    .any(|s| w.contains(&Self::normalize_rule_name(&format!("{:?}", s.rule)))),
+            }
+        };
+
+        if materialize {
+            let mut rows = Vec::new();
+            for fact in &result.inferred {
+                if !matches_rules(fact) {
+                    continue;
+                }
+                let mut row = Map::new();
+                row.insert("subject".to_string(), Value::String(fact.subject.clone()));
+                row.insert("predicate".to_string(), Value::String(fact.predicate.clone()));
+                row.insert("object".to_string(), Value::String(fact.object.clone()));
+                if let Some(step) = reasoner.explain(&facts, fact).first() {
+                    row.insert("rule".to_string(), Value::String(format!("{:?}", step.rule)));
+                }
+                rows.push(row);
+            }
+            return Ok(QueryResult::Rows(rows));
+        }
+
+        // Augment mode: run the inner query, then attach reasoning results.
+        let inner = self.execute_with_engine_inner(query, engine)?;
+        let mut rows = match inner {
+            QueryResult::Rows(r) => r,
+            other => return Ok(other),
+        };
+        let scope_upper = scope.to_ascii_uppercase();
+        let add_types = scope_upper == "SUBCLASS" || scope_upper == "ALL";
+        let add_inferred = scope_upper == "ALL" || wanted.is_some();
+        for row in &mut rows {
+            let pk = row
+                .get("__pk__")
+                .or_else(|| row.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let Some(pk) = pk else { continue };
+            let mut types: Vec<Value> = Vec::new();
+            let mut inferred: Vec<Value> = Vec::new();
+            for fact in &result.inferred {
+                if fact.subject != pk || !matches_rules(fact) {
+                    continue;
+                }
+                if fact.predicate == "rdf:type" {
+                    if add_types {
+                        types.push(Value::String(fact.object.clone()));
+                    }
+                } else if add_inferred {
+                    inferred.push(Value::Object(Map::from_iter(vec![
+                        (
+                            "predicate".to_string(),
+                            Value::String(fact.predicate.clone()),
+                        ),
+                        ("object".to_string(), Value::String(fact.object.clone())),
+                    ])));
+                }
+            }
+            if add_types && !types.is_empty() {
+                row.insert("__types__".to_string(), Value::Array(types));
+            }
+            if add_inferred && !inferred.is_empty() {
+                row.insert("__inferred__".to_string(), Value::Array(inferred));
+            }
+        }
+        Ok(QueryResult::Rows(rows))
+    }
+
+    /// Target class of an Infer-scoped query (`*` = all classes).
+    fn infer_target_class(query: &QueryAst) -> Option<&str> {
+        match query {
+            QueryAst::Match { class, .. } => Some(class.as_str()),
+            QueryAst::Select { from, .. } => Some(from.as_str()),
+            QueryAst::Infer { query, .. } => Self::infer_target_class(query),
+            _ => None,
+        }
+    }
+
+    /// Normalizes rule names: "Cax-sco" / "CaxSco" / "cax_sco" → "caxsco".
+    fn normalize_rule_name(name: &str) -> String {
+        name.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
+    }
+
     fn collect_facts_for_reasoning(
         &self,
         query: &QueryAst,
@@ -6008,14 +6188,36 @@ impl QueryExecutor {
         let class_name = match query {
             QueryAst::Match { class, .. } => class.as_str(),
             QueryAst::Select { from, .. } => from.as_str(),
+            QueryAst::Infer { query, .. } => {
+                return self.collect_facts_for_reasoning(query, engine);
+            }
             _ => return Ok(Vec::new()),
         };
+        self.collect_facts_for_class(engine, class_name)
+    }
 
-        let class_hierarchy = self.get_class_hierarchy(engine, class_name);
+    /// Collects rdf:type and property facts for a class hierarchy as triples.
+    /// `class_name == "*"` collects facts for every class in the merged ontology.
+    fn collect_facts_for_class(
+        &self,
+        engine: &LsmEngine,
+        class_name: &str,
+    ) -> Result<Vec<onto_ontology::Triple>> {
+        let scan_classes: Vec<String> = if class_name == "*" {
+            let merged = self.get_merged_ontology(engine);
+            let mut names: Vec<String> = merged.classes.keys().cloned().collect();
+            names.sort();
+            names
+        } else {
+            let mut names: Vec<String> =
+                self.get_class_hierarchy(engine, class_name).into_iter().collect();
+            names.sort();
+            names
+        };
         let mut facts = Vec::new();
 
         // Collect rdf:type facts from all classes in the hierarchy
-        for scan_class in &class_hierarchy {
+        for scan_class in &scan_classes {
             let prefix = format!("{}::", scan_class);
             let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
             for (key, _) in &entries {
@@ -6025,11 +6227,14 @@ impl QueryExecutor {
         }
 
         // Collect property facts
-        let ontology = self
-            .ontology_store
-            .find_ontology_for_class_global(engine, class_name)?;
+        let ontology = if class_name == "*" {
+            Some(self.get_merged_ontology(engine))
+        } else {
+            self.ontology_store
+                .find_ontology_for_class_global(engine, class_name)?
+        };
         if let Some(onto) = ontology {
-            for scan_class in &class_hierarchy {
+            for scan_class in &scan_classes {
                 let prefix = format!("{}::", scan_class);
                 let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
                 for (key, val_bytes) in &entries {
@@ -6038,7 +6243,7 @@ impl QueryExecutor {
                         if let Some(obj) = doc.as_object() {
                             for (prop_name, prop_def) in &onto.properties {
                                 if prop_def.domain == *scan_class
-                                    || class_hierarchy.contains(&prop_def.domain)
+                                    || scan_classes.contains(&prop_def.domain)
                                 {
                                     if let Some(val) = obj.get(prop_name) {
                                         let val_str = match val {
@@ -7163,6 +7368,13 @@ impl QueryExecutor {
         projected_columns: Option<&SelectColumns>,
         scan_limit: Option<usize>,
     ) -> Result<Vec<Map<String, Value>>> {
+        // Subquery tables materialize instead of scanning a class.
+        if let Some(mut rows) = self.subquery_rows(table, filter)? {
+            if let Some(a) = alias {
+                Self::apply_alias(&mut rows, a);
+            }
+            return Ok(rows);
+        }
         // If the filter is a simple indexed-column predicate, use the index
         // directly. The planner may still choose SeqScan (stale/absent stats),
         // which is fatal for low-selectivity filters where LIMIT early-exit
@@ -7516,6 +7728,24 @@ impl QueryExecutor {
         filter: &Option<FilterExpr>,
         columns: &SelectColumns,
     ) -> Result<Vec<Map<String, Value>>> {
+        // Subquery tables: count the materialized rows.
+        if let Some(rows) = self.subquery_rows(table, filter)? {
+            let alias = match columns {
+                SelectColumns::Columns(items) => {
+                    items.first().and_then(|item| {
+                        if let SelectItem::Aggregate(a) = item {
+                            Some(a.alias.clone().unwrap_or_else(|| "COUNT(*)".to_string()))
+                        } else {
+                            None
+                        }
+                    }).unwrap_or_else(|| "COUNT(*)".to_string())
+                }
+                _ => "COUNT(*)".to_string(),
+            };
+            let mut row = Map::new();
+            row.insert(alias, Value::Number(serde_json::Number::from(rows.len() as u64)));
+            return Ok(vec![row]);
+        }
         // Fast path: unfiltered COUNT(*) with cached row count
         if filter.is_none() {
             if let Some(cached) = self.get_cached_row_count(engine, table) {
@@ -11133,6 +11363,30 @@ impl QueryExecutor {
     /// The FROM clause contains a subquery (GRAPH MATCH). This method:
     /// 1. Executes the subquery to get rows
     /// 2. Applies outer WHERE, GROUP BY, ORDER BY, LIMIT on the results
+    /// Executes a `__subquery__:{json}` table reference into rows, applying the
+    /// scan's filter. Returns `None` for regular class tables.
+    fn subquery_rows(
+        &self,
+        table: &str,
+        filter: &Option<FilterExpr>,
+    ) -> Result<Option<Vec<Map<String, Value>>>> {
+        let Some(subquery_json) = table.strip_prefix("__subquery__:") else {
+            return Ok(None);
+        };
+        let subquery: QueryAst = serde_json::from_str(subquery_json)
+            .map_err(|e| CoreError::InvalidArgument(format!("failed to parse subquery: {}", e)))?;
+        let result = self.execute_read(&subquery)?;
+        let mut rows = match result {
+            QueryResult::Rows(r) => r,
+            _ => Vec::new(),
+        };
+        if let Some(f) = filter {
+            let engine = self.engine.default_engine();
+            rows.retain(|row| self.eval_filter(&engine, row, f));
+        }
+        Ok(Some(rows))
+    }
+
     fn execute_hybrid_query(
         &self,
         engine: &LsmEngine,
@@ -12338,7 +12592,7 @@ impl QueryExecutor {
                 columns,
                 from,
                 from_alias: _,
-                joins: _,
+                joins,
                 filter,
                 group_by,
                 having,
@@ -12347,8 +12601,11 @@ impl QueryExecutor {
                 offset,
                 ..
             } => {
-                // Check if FROM clause contains a subquery
-                if from.starts_with("__subquery__:") {
+                // Check if FROM clause contains a subquery and no JOINs must be
+                // applied: the hybrid path drops joins, so join-bearing queries
+                // fall through to plan-driven execution where the subquery
+                // materializes via plan_seq_scan.
+                if joins.is_empty() && from.starts_with("__subquery__:") {
                     return self.execute_hybrid_query(
                         engine,
                         ast,
@@ -19932,6 +20189,100 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_from_subquery_with_join_in_txn() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPad", 5);
+        insert_order(&executor, "iPhone", 1);
+        executor.engine().flush_all().unwrap();
+
+        // FROM (subquery) + JOIN inside a txn: the hybrid path drops joins, so
+        // this must fall through to plan-driven execution and actually join.
+        executor
+            .execute(&QueryParser::parse("BEGIN").unwrap())
+            .unwrap();
+        let ast = QueryParser::parse(
+            "SELECT s.name, o.quantity FROM (SELECT name FROM Product WHERE price > 800) s JOIN Order o ON s.name = o.product_id",
+        )
+        .unwrap();
+        let result = executor.execute(&ast).unwrap();
+        executor
+            .execute(&QueryParser::parse("COMMIT").unwrap())
+            .unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // iPhone (999) matches 2 orders
+            }
+            _ => panic!("expected 2 rows from subquery JOIN"),
+        }
+    }
+
+    #[test]
+    fn test_join_subquery_right_side() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPad", 5);
+        insert_order(&executor, "iPhone", 1);
+        executor.engine().flush_all().unwrap();
+
+        // JOIN (subquery) on the right side: rows materialize and carry the
+        // join alias keys used by ON-column resolution.
+        let ast = QueryParser::parse(
+            "SELECT p.name, o.quantity FROM Product p JOIN (SELECT product_id, quantity FROM Order WHERE quantity > 2) o ON p.name = o.product_id",
+        )
+        .unwrap();
+        let result = executor.execute(&ast).unwrap();
+        match &result {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2); // iPhone qty=3, iPad qty=5
+            }
+            _ => panic!("expected 2 rows from JOIN with subquery right side"),
+        }
+    }
+
+    #[test]
+    fn test_inlj_subquery_right_short_circuit() {
+        let (executor, _dir) = setup();
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPad", 5);
+        insert_order(&executor, "iPhone", 1);
+        executor.engine().flush_all().unwrap();
+
+        // Build a __subquery__:{json} right table the way parse_from_clause does.
+        let inner = QueryParser::parse("SELECT product_id, quantity FROM Order").unwrap();
+        let right_table = format!("__subquery__:{}", serde_json::to_string(&inner).unwrap());
+        let join = crate::parser::JoinClause {
+            table: right_table.clone(),
+            alias: Some("o".to_string()),
+            on: crate::parser::JoinOn {
+                left: "p.name".to_string(),
+                right: "o.product_id".to_string(),
+            },
+            join_type: crate::parser::JoinType::Inner,
+        };
+        let mut left = Map::new();
+        left.insert("name".to_string(), Value::String("iPhone".to_string()));
+        left.insert("p.name".to_string(), Value::String("iPhone".to_string()));
+        let engine = executor.engine().default_engine();
+
+        let rows = executor
+            .execute_index_nested_loop_join(
+                &engine,
+                vec![left],
+                &right_table,
+                Some("o"),
+                &join,
+                "product_id",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2); // iPhone matches 2 orders
+    }
+
     // 鈹€鈹€ Index-accelerated range query tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
     #[test]
@@ -21341,6 +21692,114 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════�?
     //  Import tests
     // ══════════════════════════════════════════════════════════════════�?
+
+    #[test]
+    fn test_infer_materialize_returns_inferred_triples() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY zoo (CLASS Animal, CLASS Dog SUBCLASS OF Animal, PROPERTY name DOMAIN Dog RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Dog (name) VALUES ('Rex')").unwrap())
+            .unwrap();
+
+        let infer = QueryAst::Infer {
+            query: Box::new(QueryParser::parse("SELECT * FROM Dog").unwrap()),
+            scope: "ALL".to_string(),
+            rules: vec![],
+            materialize: true,
+        };
+        let rows = match executor.execute(&infer).unwrap() {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected rows, got {:?}", other),
+        };
+        // Cax-sco: instance of Dog -> instance of Animal
+        assert!(
+            rows.iter().any(|r| {
+                r.get("predicate").and_then(|v| v.as_str()) == Some("rdf:type")
+                    && r.get("object").and_then(|v| v.as_str()) == Some("Animal")
+            }),
+            "expected inferred rdf:type Animal fact, got: {:?}",
+            rows
+        );
+    }
+
+    #[test]
+    fn test_infer_materialize_rules_filter() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY zoo (CLASS Animal, CLASS Dog SUBCLASS OF Animal, PROPERTY name DOMAIN Dog RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Dog (name) VALUES ('Rex')").unwrap())
+            .unwrap();
+
+        // Prp-inv cannot produce the Cax-sco type fact -> filtered out
+        let infer = QueryAst::Infer {
+            query: Box::new(QueryParser::parse("SELECT * FROM Dog").unwrap()),
+            scope: "ALL".to_string(),
+            rules: vec!["Prp-inv".to_string()],
+            materialize: true,
+        };
+        let rows = match executor.execute(&infer).unwrap() {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected rows, got {:?}", other),
+        };
+        assert!(
+            !rows.iter().any(|r| {
+                r.get("object").and_then(|v| v.as_str()) == Some("Animal")
+            }),
+            "Cax-sco fact should be excluded by rules filter: {:?}",
+            rows
+        );
+    }
+
+    #[test]
+    fn test_infer_augment_adds_types() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY zoo (CLASS Animal, CLASS Dog SUBCLASS OF Animal, PROPERTY name DOMAIN Dog RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Dog (name) VALUES ('Rex')").unwrap())
+            .unwrap();
+
+        let infer = QueryAst::Infer {
+            query: Box::new(QueryParser::parse("SELECT * FROM Dog").unwrap()),
+            scope: "SUBCLASS".to_string(),
+            rules: vec![],
+            materialize: false,
+        };
+        let rows = match executor.execute(&infer).unwrap() {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected rows, got {:?}", other),
+        };
+        assert_eq!(rows.len(), 1);
+        let types = rows[0]
+            .get("__types__")
+            .and_then(|v| v.as_array())
+            .expect("expected __types__ on augmented row");
+        assert!(
+            types.iter().any(|t| t.as_str() == Some("Animal")),
+            "expected inferred supertype Animal in __types__: {:?}",
+            rows[0]
+        );
+    }
 
     #[test]
     fn test_import_csv_validates_required_fields() {
