@@ -2363,6 +2363,58 @@ impl QueryExecutor {
         Ok(())
     }
 
+    /// Removes a property definition from the ontology that owns `domain`.
+    ///
+    /// The DDL surface was add-only before this (ALTER could change range and
+    /// toggle characteristics but never remove). Used to retire the legacy
+    /// stub properties that duplicate reified relation classes.
+    pub fn drop_ontology_property(&self, name: &str, domain: &str) -> Result<()> {
+        let engine = &self.engine.default_engine();
+        let mut ontology = self
+            .ontology_store
+            .find_ontology_for_class_global(engine, domain)?
+            .ok_or_else(|| {
+                onto_core::CoreError::InvalidArgument(format!(
+                    "No ontology contains class '{}'",
+                    domain
+                ))
+            })?;
+
+        if !ontology.properties.contains_key(name) {
+            return Err(onto_core::CoreError::InvalidArgument(format!(
+                "Property '{}' not found in ontology '{}'",
+                name, ontology.name
+            )));
+        }
+        ontology.properties.remove(name);
+        // Also drop from the class's property list when the class exists.
+        if let Some(class) = ontology.classes.get_mut(domain) {
+            class.properties.retain(|p| p != name);
+        }
+
+        // Delete old entry then save new (same persistence shape as add/alter)
+        let key = {
+            let mut k = Vec::new();
+            if let Some(ref ns) = ontology.namespace {
+                k.extend_from_slice(b"__ontology__");
+                k.extend_from_slice(ns.as_bytes());
+                k.extend_from_slice(b"::");
+            } else {
+                k.extend_from_slice(b"__ontology__");
+            }
+            k.extend_from_slice(ontology.name.as_bytes());
+            k
+        };
+        engine.delete(key)?;
+        self.ontology_store.save_with_engine(engine, &ontology)?;
+        engine.flush()?;
+        self.inference_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate_ontology(&ontology.name);
+        Ok(())
+    }
+
     /// Changes the range (data type) of an existing property definition.
     /// Updates an existing property definition. `range`/`required`/
     /// `inverse_of`/the characteristic flags are applied only when supplied;
@@ -3817,6 +3869,13 @@ impl QueryExecutor {
                         name
                     )))
                 }
+            }
+            QueryAst::DropOntologyProperty { name, domain } => {
+                self.drop_ontology_property(name, domain)?;
+                Ok(QueryResult::Success(format!(
+                    "Property '{}' dropped from '{}'",
+                    name, domain
+                )))
             }
             QueryAst::CreateOntologyProperty {
                 name,
@@ -23587,6 +23646,66 @@ mod tests {
             LiteralValue::String(ref s) if s == "hello" => {}
             other => panic!("expected String(\"hello\"), got {:?}", other),
         }
+    }
+
+    /// DROP PROPERTY removes the definition - the DDL was add-only before.
+    #[test]
+    fn test_drop_ontology_property_removes_definition() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY legacy DOMAIN Product RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Property present in schema
+        let schema = executor.schema_info().unwrap().to_string();
+        assert!(schema.contains("legacy"), "legacy should be present: {}", schema);
+
+        executor
+            .execute(
+                &crate::ontoql::OntoQLParser::parse("DROP PROPERTY legacy DOMAIN Product")
+                    .unwrap()
+                    .to_query_ast()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let schema = executor.schema_info().unwrap().to_string();
+        assert!(
+            !schema.contains("\"legacy\""),
+            "legacy should be gone: {}",
+            schema
+        );
+        // The kept property survives
+        assert!(schema.contains("name"), "name should survive: {}", schema);
+    }
+
+    #[test]
+    fn test_drop_ontology_property_missing_is_error() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            executor
+                .execute(
+                    &crate::ontoql::OntoQLParser::parse("DROP PROPERTY nope DOMAIN Product")
+                        .unwrap()
+                        .to_query_ast()
+                        .unwrap(),
+                )
+                .is_err(),
+            "dropping a missing property must error"
+        );
     }
 
     #[test]

@@ -1404,6 +1404,35 @@ async fn execute_query(
                         }
                     }
                 }
+                onto_query::OntoQLAst::DropProperty { name, domain } => {
+                    match state.executor.drop_ontology_property(&name, &domain) {
+                        Ok(()) => {
+                            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                            state
+                                .metrics
+                                .record_query("DROP_PROPERTY", elapsed_ms / 1000.0, true);
+                            return (
+                                StatusCode::OK,
+                                PrettyJson(
+                                    ApiResponse::success(
+                                        json!({"message": format!(
+                                            "Property '{}' dropped from '{}'",
+                                            name, domain
+                                        )}),
+                                        elapsed_ms,
+                                    ),
+                                    req.pretty,
+                                ),
+                            ).into_response();
+                        }
+                        Err(e) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                PrettyJson(ApiResponse::<Value>::error(e.to_string()), false),
+                            ).into_response();
+                        }
+                    }
+                }
                 onto_query::OntoQLAst::DropOntology { name } => {
                     match state.executor.drop_ontology(name) {
                         Ok(()) => {

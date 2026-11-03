@@ -342,6 +342,12 @@ pub enum OntoQLAst {
     DropOntology {
         name: String,
     },
+    /// DROP PROPERTY <name> DOMAIN <class> — remove a property definition
+    /// from the ontology that owns the class (DDL was add-only before).
+    DropProperty {
+        name: String,
+        domain: String,
+    },
     CreateProperty {
         name: String,
         kind: PropertyKind,
@@ -499,6 +505,9 @@ impl OntoQLParser {
         if starts_with_ignore_ascii_case(input, "DROP CLASS") {
             return Self::parse_drop_class(input);
         }
+        if starts_with_ignore_ascii_case(input, "DROP PROPERTY") {
+            return Self::parse_drop_property(input);
+        }
         if starts_with_ignore_ascii_case(input, "DROP ONTOLOGY") {
             return Self::parse_drop_ontology(input);
         }
@@ -601,6 +610,32 @@ impl OntoQLParser {
             ));
         }
         Ok(OntoQLAst::DropClass { name })
+    }
+
+    // ── DROP PROPERTY ────────────────────────────────────────────
+
+    fn parse_drop_property(input: &str) -> Result<OntoQLAst> {
+        let rest = safe_slice_from(input, "DROP PROPERTY".len()).trim_start();
+        let (name, rest) = Self::extract_identifier(rest);
+        if name.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "Missing property name in DROP PROPERTY".into(),
+            ));
+        }
+        let rest = rest.trim_start();
+        if !starts_with_ignore_ascii_case(rest, "DOMAIN") {
+            return Err(CoreError::InvalidArgument(
+                "DROP PROPERTY requires DOMAIN <class>".into(),
+            ));
+        }
+        let rest = safe_slice_from(rest, "DOMAIN".len()).trim_start();
+        let (domain, _) = Self::extract_identifier(rest);
+        if domain.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "Missing domain class in DROP PROPERTY".into(),
+            ));
+        }
+        Ok(OntoQLAst::DropProperty { name, domain })
     }
 
     // ── DROP ONTOLOGY ─────────────────────────────────────────────
@@ -2076,6 +2111,12 @@ impl OntoQLAst {
             OntoQLAst::UseNamespace { name } => Ok(QueryAst::UseNamespace { name: name.clone() }),
             // Ontology drop operations — convert directly
             OntoQLAst::DropOntology { name } => Ok(QueryAst::DropOntology { name: name.clone() }),
+            OntoQLAst::DropProperty { name, domain } => {
+                Ok(QueryAst::DropOntologyProperty {
+                    name: name.clone(),
+                    domain: domain.clone(),
+                })
+            }
             // SELECT ... INFER @onto(scope=...) — wrap the plain SELECT in an
             // Infer node so the clause is executed instead of silently dropped.
             OntoQLAst::Select {
@@ -2216,6 +2257,10 @@ impl OntoQLAst {
 
             OntoQLAst::DropOntology { name } => {
                 Ok(format!("DELETE FROM \"__ontology__{}\"", name))
+            }
+
+            OntoQLAst::DropProperty { name, domain } => {
+                Ok(format!("DROP PROPERTY {} DOMAIN {}", name, domain))
             }
 
             OntoQLAst::CreateProperty { name, kind, domain, range, required, .. } => {

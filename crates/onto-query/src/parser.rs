@@ -417,6 +417,10 @@ pub enum QueryAst {
     /// DROP ONTOLOGY <name>
     DropOntology { name: String },
 
+    /// DROP PROPERTY <name> DOMAIN <class> — remove a property definition
+    /// from the ontology that owns the class.
+    DropOntologyProperty { name: String, domain: String },
+
     /// CREATE PROPERTY <name> DOMAIN <class> RANGE <type> [REQUIRED] [MULTI_VALUED]
     /// Adds a property definition to an existing ontology.
     CreateOntologyProperty {
@@ -695,6 +699,7 @@ impl QueryAst {
 
             // Ontology operations
             QueryAst::DropOntology { .. } => false,
+            QueryAst::DropOntologyProperty { .. } => false,
         }
     }
 
