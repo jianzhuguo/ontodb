@@ -6694,18 +6694,17 @@ impl QueryExecutor {
                         // Relation classes (go_is_a etc.) store edges as rows with
                         // source/target columns; emitting them as triples lets
                         // Prp-trp/Prp-inv chain them without a data migration.
-                        // interacts_with stores endpoints as protein_a/protein_b
-                        // (source mirrors protein_a), so fall back to those.
+                        // Only the canonical source/target pair is recognized -
+                        // domain-specific endpoint aliases (protein_a/protein_b)
+                        // were migrated out so the kernel stays domain-neutral.
                         let src = obj
                             .get("source")
                             .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .or_else(|| obj.get("protein_a").and_then(|v| v.as_str()));
+                            .filter(|s| !s.is_empty());
                         let tgt = obj
                             .get("target")
                             .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .or_else(|| obj.get("protein_b").and_then(|v| v.as_str()));
+                            .filter(|s| !s.is_empty());
                         if let (Some(src), Some(tgt)) = (src, tgt) {
                             let rel =
                                 scan_class.rsplit('.').next().unwrap_or(scan_class.as_str());
