@@ -160,6 +160,14 @@ pub struct Property {
     pub domain: String,
     /// The data type of this property's values.
     pub range: DataType,
+    /// OWL-lite object property range: the class whose instances this
+    /// property's values reference (e.g. `treats: Drug -> Disease`).
+    ///
+    /// `range` keeps the storage type (class references are stored as
+    /// string ids, so `range` stays `DataType::String`); `range_class`
+    /// records the semantic target class. `None` for datatype properties.
+    #[serde(default)]
+    pub range_class: Option<String>,
     /// Whether this property is required.
     pub required: bool,
     /// Whether this property can have multiple values.
@@ -777,6 +785,7 @@ impl Property {
             description: None,
             domain: domain.into(),
             range,
+            range_class: None,
             required: false,
             multi_valued: false,
             equivalent_properties: Vec::new(),
@@ -786,6 +795,14 @@ impl Property {
             is_functional: false,
             subproperty_of: Vec::new(),
         }
+    }
+
+    /// Marks this as an object property whose values reference instances of
+    /// `class` (e.g. `treats: Drug -> Disease`). `range` stays `String`
+    /// because class references are stored as string ids.
+    pub fn with_range_class(mut self, class: impl Into<String>) -> Self {
+        self.range_class = Some(class.into());
+        self
     }
 
     pub fn required(mut self) -> Self {
@@ -1048,6 +1065,18 @@ mod tests {
         let prop = Property::new("ancestor", "Person", DataType::String).transitive();
         assert!(prop.is_transitive);
         assert!(!prop.is_symmetric);
+    }
+
+    #[test]
+    fn test_object_property_range_class() {
+        let prop = Property::new("treats", "Drug", DataType::String)
+            .with_range_class("Disease");
+        assert_eq!(prop.range_class.as_deref(), Some("Disease"));
+        // Storage type stays String - class refs are stored as string ids.
+        assert_eq!(prop.range, DataType::String);
+
+        let plain = Property::new("name", "Drug", DataType::String);
+        assert!(plain.range_class.is_none());
     }
 
     #[test]

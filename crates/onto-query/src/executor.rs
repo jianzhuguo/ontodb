@@ -2005,6 +2005,9 @@ impl QueryExecutor {
                     let mut prop_info = serde_json::Map::new();
                     prop_info.insert("domain".to_string(), serde_json::json!(prop.domain));
                     prop_info.insert("range".to_string(), serde_json::json!(prop.range.as_str()));
+                    if let Some(ref rc) = prop.range_class {
+                        prop_info.insert("range_class".to_string(), serde_json::json!(rc));
+                    }
                     prop_info.insert("required".to_string(), serde_json::json!(prop.required));
                     prop_info.insert(
                         "multi_valued".to_string(),
@@ -2307,12 +2310,13 @@ impl QueryExecutor {
                 ))
             })?;
 
-        let data_type = match onto_ontology::DataType::from_str(range) {
-            Some(dt) => dt,
-            None => {
-                // For object properties, range is a class name �?default to String
-                onto_ontology::DataType::String
-            }
+        // A range that is a known DataType stays a datatype property; anything
+        // else is treated as a class reference (object property range) whose
+        // instances the values point at. Storage type stays String because
+        // class references are stored as string ids.
+        let (data_type, range_class) = match onto_ontology::DataType::from_str(range) {
+            Some(dt) => (dt, None),
+            None => (onto_ontology::DataType::String, Some(range.to_string())),
         };
 
         let property = onto_ontology::Property {
@@ -2320,6 +2324,7 @@ impl QueryExecutor {
             description: None,
             domain: domain.to_string(),
             range: data_type,
+            range_class,
             required,
             multi_valued,
             equivalent_properties: vec![],
@@ -2449,16 +2454,19 @@ impl QueryExecutor {
             ))
         })?;
         if let Some(r) = range {
-            let data_type = match onto_ontology::DataType::from_str(r) {
-                Some(dt) => dt,
-                None => {
-                    return Err(onto_core::CoreError::InvalidArgument(format!(
-                        "Unknown property range type '{}'",
-                        r
-                    )))
+            match onto_ontology::DataType::from_str(r) {
+                Some(dt) => {
+                    property.range = dt;
+                    // A plain datatype range clears any previous class reference.
+                    property.range_class = None;
                 }
-            };
-            property.range = data_type;
+                None => {
+                    // Not a datatype - treat as a class reference (object
+                    // property range). Storage type stays String.
+                    property.range = onto_ontology::DataType::String;
+                    property.range_class = Some(r.to_string());
+                }
+            }
         }
         if required {
             property.required = true;
@@ -17272,6 +17280,13 @@ impl QueryExecutor {
     }
 
     /// Checks if a document with the given ID is an instance of the specified class.
+    ///
+    /// Two reference idioms are recognized:
+    /// 1. Storage-key form `class::<id>` - direct key lookup in the class hierarchy.
+    /// 2. Qualified-name form `ns::Class::name` (the `id` field convention used
+    ///    by relation edges like `sembio::Disease::Pain`) - the embedded class
+    ///    segment is matched against the hierarchy directly, which answers the
+    ///    "is an instance of class" question at the type level without a scan.
     fn is_instance_of_class(
         &self,
         engine: &LsmEngine,
@@ -17297,7 +17312,54 @@ impl QueryExecutor {
             }
         }
 
+        // Qualified-name form: `ns::Class::name` or `ns.Class::name` - the
+        // embedded class segment tells us the type without a storage lookup.
+        if let Some(candidates) = Self::class_segments_of_ref(doc_id) {
+            for class_name in &hierarchy {
+                for cand in &candidates {
+                    if class_name == cand {
+                        return Ok(true);
+                    }
+                }
+                // Short-name comparison covers `Disease` hierarchy entries
+                // against a `sembio::Disease::x` reference.
+                let short = class_name.rsplit('.').next().unwrap_or(class_name);
+                for cand in &candidates {
+                    let cand_short = cand.rsplit('.').next().unwrap_or(cand);
+                    if short == cand_short {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
         Ok(false)
+    }
+
+    /// Extracts candidate class segments from a qualified reference id.
+    /// `sembio::Disease::Pain` -> ["sembio::Disease", "sembio.Disease", "Disease"].
+    /// Returns `None` when the value has no class segment (plain scalar ids).
+    fn class_segments_of_ref(doc_id: &str) -> Option<Vec<String>> {
+        // `ns::Class::name` has at least two `::` separators.
+        let parts: Vec<&str> = doc_id.split("::").collect();
+        if parts.len() >= 3 {
+            let ns = parts[0];
+            let cls = parts[1];
+            return Some(vec![
+                format!("{}::{}", ns, cls),
+                format!("{}.{}", ns, cls),
+                cls.to_string(),
+            ]);
+        }
+        // `dotted.Class::id` form is handled by direct key lookup above, but a
+        // dotted class before `::` also carries a class segment.
+        if let Some((cls, _)) = doc_id.split_once("::") {
+            if cls.contains('.') {
+                let short = cls.rsplit('.').next().unwrap_or(cls).to_string();
+                return Some(vec![cls.to_string(), short]);
+            }
+        }
+        None
     }
 
     /// Validates class disjointness constraints during INSERT.
@@ -23645,6 +23707,100 @@ mod tests {
             LiteralValue::String(ref s) if s == "hello" => {}
             other => panic!("expected String(\"hello\"), got {:?}", other),
         }
+    }
+
+    /// Object property range: a class name as RANGE records the target class
+    /// in range_class while storage type stays String.
+    #[test]
+    fn test_object_property_range_class_via_ddl() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY clinic (CLASS Drug, CLASS Disease, PROPERTY name DOMAIN Drug RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // CREATE with a class-name range -> object property
+        executor
+            .execute(
+                &QueryParser::parse("CREATE DATATYPE PROPERTY treats DOMAIN Drug RANGE Disease")
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let schema = executor.schema_info().unwrap().to_string();
+        assert!(
+            schema.contains("range_class"),
+            "range_class should be serialized: {}",
+            schema
+        );
+        assert!(
+            schema.contains("Disease"),
+            "target class should appear in schema: {}",
+            schema
+        );
+
+        // ALTER with a class-name range -> object property
+        executor
+            .execute(
+                &QueryParser::parse("CREATE DATATYPE PROPERTY indicated_for DOMAIN Drug RANGE STRING")
+                    .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("ALTER PROPERTY indicated_for DOMAIN Drug RANGE Disease")
+                    .unwrap(),
+            )
+            .unwrap();
+        let schema = executor.schema_info().unwrap().to_string();
+        // Both object properties now carry class references
+        assert_eq!(
+            schema.matches("range_class").count() >= 2,
+            true,
+            "both object props should carry range_class: {}",
+            schema
+        );
+    }
+
+    /// Reference id resolution: `ns::Class::name` form must type-check without
+    /// a storage lookup, `class::id` form keeps the direct key lookup.
+    #[test]
+    fn test_is_instance_of_class_dual_id_forms() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY clinic (CLASS Drug, CLASS Disease, PROPERTY name DOMAIN Disease RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Disease (id, name) VALUES ('Pain', 'Pain')")
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let engine = executor.engine().default_engine();
+        // Qualified-name form (the relation-edge id convention)
+        assert!(
+            executor
+                .is_instance_of_class(&engine, "clinic::Disease::Pain", "Disease")
+                .unwrap(),
+            "qualified-name form must resolve"
+        );
+        // Wrong class embedded in the reference
+        assert!(
+            !executor
+                .is_instance_of_class(&engine, "clinic::Drug::Aspirin", "Disease")
+                .unwrap(),
+            "qualified-name with wrong class must fail"
+        );
     }
 
     /// DROP PROPERTY removes the definition - the DDL was add-only before.
