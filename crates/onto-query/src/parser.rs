@@ -13,6 +13,7 @@ use crate::parser_util::{
     starts_with_ignore_ascii_case,
 };
 use onto_core::{CoreError, Result};
+use onto_ontology::{Literal as OntoLiteral, Restriction};
 use serde::{Deserialize, Serialize};
 
 /// Case-insensitive (ASCII) version of `find_unquoted`.
@@ -430,12 +431,20 @@ pub enum QueryAst {
         is_transitive: bool,
     },
 
-    /// ALTER PROPERTY <name> DOMAIN <class> RANGE <type>
-    /// Changes the range (data type) of an existing property definition.
+    /// ALTER PROPERTY <name> DOMAIN <class> [RANGE <type>] [REQUIRED]
+    /// [CHARACTERISTICS] [FUNCTIONAL] [SYMMETRIC] [TRANSITIVE] [INVERSE OF <name>]
+    /// Updates an existing property definition. RANGE and the modifiers are
+    /// each optional, but at least one change must be present. Modifiers are
+    /// additive: they set a characteristic / attach an inverse.
     AlterOntologyProperty {
         name: String,
         domain: String,
-        range: String,
+        range: Option<String>,
+        required: bool,
+        inverse_of: Option<String>,
+        is_functional: bool,
+        is_symmetric: bool,
+        is_transitive: bool,
     },
 
     /// ALTER CLASS <name> EXTENDS <parent>
@@ -443,6 +452,30 @@ pub enum QueryAst {
     AlterClassExtends {
         class_name: String,
         parent_name: String,
+    },
+
+    /// ALTER CLASS <name> DISJOINT WITH <other>
+    /// Adds an owl:disjointWith axiom to an existing class.
+    AlterClassDisjoint {
+        class_name: String,
+        disjoint_with: String,
+    },
+
+    /// ALTER CLASS <name> UNIQUE (col1, col2, ...)
+    /// Adds a uniqueness constraint to an existing class.
+    AlterClassUnique {
+        class_name: String,
+        columns: Vec<String>,
+    },
+
+    /// ALTER CLASS <name> RESTRICT <axiom>
+    /// Axiom forms:
+    ///   SOMEVALUESFROM <prop> <class> | ALLVALUESFROM <prop> <class>
+    ///   | HASVALUE <prop> <literal> | MINCARDINALITY <prop> <n>
+    ///   | MAXCARDINALITY <prop> <n> | EXACTCARDINALITY <prop> <n>
+    AlterClassRestriction {
+        class_name: String,
+        restriction: Restriction,
     },
 }
 
@@ -534,6 +567,18 @@ impl QueryAst {
             CreateOntologyProperty { domain, .. } | AlterOntologyProperty { domain, .. } => {
                 *domain = f(domain);
             }
+            AlterClassDisjoint {
+                class_name,
+                disjoint_with,
+            } => {
+                *class_name = f(class_name);
+                *disjoint_with = f(disjoint_with);
+            }
+            AlterClassUnique { class_name, .. }
+            | AlterClassRestriction { class_name, .. }
+            | AlterClassExtends { class_name, .. } => {
+                *class_name = f(class_name);
+            }
             InsertSelect { class, query, .. } => {
                 *class = f(class);
                 query.map_class_names(f);
@@ -610,6 +655,9 @@ impl QueryAst {
             QueryAst::CreateOntologyProperty { .. } => false,
             QueryAst::AlterOntologyProperty { .. } => false,
             QueryAst::AlterClassExtends { .. } => false,
+            QueryAst::AlterClassDisjoint { .. } => false,
+            QueryAst::AlterClassUnique { .. } => false,
+            QueryAst::AlterClassRestriction { .. } => false,
 
             // Transaction control
             QueryAst::Begin => false,
@@ -1165,6 +1213,8 @@ impl QueryParser {
             Self::parse_create_ontology_property(input)
         } else if starts_with("ALTER PROPERTY") {
             Self::parse_alter_ontology_property(input)
+        } else if starts_with("ALTER CLASS") {
+            Self::parse_alter_class(input)
         } else if starts_with("CREATE ONTOLOGY") {
             Ok(QueryAst::CreateOntology {
                 sql: input.to_string(),
@@ -3754,22 +3804,30 @@ impl QueryParser {
             ));
         }
         let (domain, range, tail) = Self::parse_property_domain_range(&rest)?;
+        let range = range.ok_or_else(|| {
+            CoreError::InvalidArgument("expected RANGE <type> in CREATE PROPERTY".to_string())
+        })?;
         let required = find_ignore_ascii_case(&tail, "REQUIRED").is_some();
         let multi_valued = find_ignore_ascii_case(&tail, "MULTI_VALUED").is_some();
+        let is_functional = find_ignore_ascii_case(&tail, "FUNCTIONAL").is_some();
+        let is_symmetric = find_ignore_ascii_case(&tail, "SYMMETRIC").is_some();
+        let is_transitive = find_ignore_ascii_case(&tail, "TRANSITIVE").is_some();
+        let inverse_of = Self::extract_inverse_of(&tail);
         Ok(QueryAst::CreateOntologyProperty {
             name,
             domain,
             range,
             required,
             multi_valued,
-            inverse_of: None,
-            is_functional: false,
-            is_symmetric: false,
-            is_transitive: false,
+            inverse_of,
+            is_functional,
+            is_symmetric,
+            is_transitive,
         })
     }
 
-    /// Parse ALTER PROPERTY <name> DOMAIN <class> RANGE <type>
+    /// Parse ALTER PROPERTY <name> DOMAIN <class> [RANGE <type>] [REQUIRED]
+    /// [CHARACTERISTICS] [FUNCTIONAL] [SYMMETRIC] [TRANSITIVE] [INVERSE OF <name>]
     fn parse_alter_ontology_property(input: &str) -> Result<QueryAst> {
         let rest = input["ALTER PROPERTY".len()..].trim_start();
         let (name, rest) = Self::extract_quoted_or_word(rest);
@@ -3778,13 +3836,57 @@ impl QueryParser {
                 "missing property name in ALTER PROPERTY".to_string(),
             ));
         }
-        let (domain, range, _) = Self::parse_property_domain_range(&rest)?;
-        Ok(QueryAst::AlterOntologyProperty { name, domain, range })
+        let (domain, range, tail) = Self::parse_property_domain_range(&rest)?;
+        // Optional readability marker; the bare keywords are accepted either way.
+        let tail = tail.trim_start();
+        let tail = if find_ignore_ascii_case(tail, "CHARACTERISTICS") == Some(0) {
+            safe_slice_from(tail, "CHARACTERISTICS".len()).trim_start().to_string()
+        } else {
+            tail.to_string()
+        };
+        let required = find_ignore_ascii_case(&tail, "REQUIRED").is_some();
+        let is_functional = find_ignore_ascii_case(&tail, "FUNCTIONAL").is_some();
+        let is_symmetric = find_ignore_ascii_case(&tail, "SYMMETRIC").is_some();
+        let is_transitive = find_ignore_ascii_case(&tail, "TRANSITIVE").is_some();
+        let inverse_of = Self::extract_inverse_of(&tail);
+        if range.is_none()
+            && !required
+            && !is_functional
+            && !is_symmetric
+            && !is_transitive
+            && inverse_of.is_none()
+        {
+            return Err(CoreError::InvalidArgument(
+                "ALTER PROPERTY requires RANGE and/or a characteristic change".to_string(),
+            ));
+        }
+        Ok(QueryAst::AlterOntologyProperty {
+            name,
+            domain,
+            range,
+            required,
+            inverse_of,
+            is_functional,
+            is_symmetric,
+            is_transitive,
+        })
     }
 
-    /// Extract the `DOMAIN <class> RANGE <type>` tail shared by property DDL.
-    /// Returns (domain, range, remaining_input).
-    fn parse_property_domain_range(input: &str) -> Result<(String, String, String)> {
+    /// Extracts the identifier following an `INVERSE OF <name>` clause.
+    fn extract_inverse_of(input: &str) -> Option<String> {
+        let pos = find_ignore_ascii_case(input, "INVERSE OF")?;
+        let after = safe_slice_from(input, pos + "INVERSE OF".len()).trim_start();
+        let (name, _) = Self::extract_quoted_or_word(after);
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
+    /// Extracts the `DOMAIN <class> [RANGE <type>]` tail shared by property DDL.
+    /// Returns (domain, range, remaining_input); range is None when absent.
+    fn parse_property_domain_range(input: &str) -> Result<(String, Option<String>, String)> {
         let input = input.trim_start();
         if find_ignore_ascii_case(input, "DOMAIN") != Some(0) {
             return Err(CoreError::InvalidArgument(
@@ -3800,9 +3902,7 @@ impl QueryParser {
         }
         let input = input.trim_start();
         if find_ignore_ascii_case(input, "RANGE") != Some(0) {
-            return Err(CoreError::InvalidArgument(
-                "expected RANGE <type> in property DDL".to_string(),
-            ));
+            return Ok((domain, None, input.to_string()));
         }
         let input = input[5..].trim_start();
         let (range, rest) = Self::extract_quoted_or_word(input);
@@ -3811,7 +3911,176 @@ impl QueryParser {
                 "missing RANGE type in property DDL".to_string(),
             ));
         }
-        Ok((domain, range, rest))
+        Ok((domain, Some(range), rest))
+    }
+
+    /// Parse ALTER CLASS <name> DISJOINT WITH <other>
+    ///              | ALTER CLASS <name> UNIQUE (col1, col2, ...)
+    ///              | ALTER CLASS <name> RESTRICT <axiom>
+    fn parse_alter_class(input: &str) -> Result<QueryAst> {
+        let rest = input["ALTER CLASS".len()..].trim_start();
+        let (class_name, rest) = Self::extract_quoted_or_word(rest);
+        if class_name.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "missing class name in ALTER CLASS".to_string(),
+            ));
+        }
+        let rest = rest.trim_start();
+        if find_ignore_ascii_case(rest, "DISJOINT WITH") == Some(0) {
+            let after = safe_slice_from(rest, "DISJOINT WITH".len()).trim_start();
+            let (other, _) = Self::extract_quoted_or_word(after);
+            if other.is_empty() {
+                return Err(CoreError::InvalidArgument(
+                    "missing class after DISJOINT WITH".to_string(),
+                ));
+            }
+            return Ok(QueryAst::AlterClassDisjoint {
+                class_name,
+                disjoint_with: other,
+            });
+        }
+        if find_ignore_ascii_case(rest, "UNIQUE") == Some(0) {
+            let after = safe_slice_from(rest, "UNIQUE".len()).trim_start();
+            let inner = after
+                .strip_prefix('(')
+                .and_then(|s| s.split(')').next())
+                .ok_or_else(|| {
+                    CoreError::InvalidArgument(
+                        "expected UNIQUE (col1, col2, ...) in ALTER CLASS".to_string(),
+                    )
+                })?;
+            let columns: Vec<String> = inner
+                .split(',')
+                .map(|c| Self::strip_identifier_quotes(c.trim()).to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            if columns.is_empty() {
+                return Err(CoreError::InvalidArgument(
+                    "UNIQUE constraint must specify at least one column".to_string(),
+                ));
+            }
+            return Ok(QueryAst::AlterClassUnique {
+                class_name,
+                columns,
+            });
+        }
+        if find_ignore_ascii_case(rest, "RESTRICT") == Some(0) {
+            let after = safe_slice_from(rest, "RESTRICT".len()).trim_start();
+            let restriction = Self::parse_restriction(after)?;
+            return Ok(QueryAst::AlterClassRestriction {
+                class_name,
+                restriction,
+            });
+        }
+        Err(CoreError::InvalidArgument(
+            "ALTER CLASS requires DISJOINT WITH <class>, UNIQUE (cols), or RESTRICT <axiom>"
+                .to_string(),
+        ))
+    }
+
+    /// Parse one restriction axiom:
+    ///   SOMEVALUESFROM <prop> <class> | ALLVALUESFROM <prop> <class>
+    ///   | HASVALUE <prop> <literal> | MINCARDINALITY <prop> <n>
+    ///   | MAXCARDINALITY <prop> <n> | EXACTCARDINALITY <prop> <n>
+    fn parse_restriction(input: &str) -> Result<Restriction> {
+        let input = input.trim_start();
+        let (kw_len, parse_args): (usize, fn(&str) -> Result<Restriction>) = if find_ignore_ascii_case(input, "SOMEVALUESFROM") == Some(0) {
+            ("SOMEVALUESFROM".len(), |rest| {
+                let (prop, rest) = Self::extract_quoted_or_word(rest);
+                let (class, _) = Self::extract_quoted_or_word(&rest);
+                if prop.is_empty() || class.is_empty() {
+                    return Err(CoreError::InvalidArgument(
+                        "SOMEVALUESFROM needs <property> <class>".to_string(),
+                    ));
+                }
+                Ok(Restriction::SomeValuesFrom {
+                    property: prop,
+                    class,
+                })
+            })
+        } else if find_ignore_ascii_case(input, "ALLVALUESFROM") == Some(0) {
+            ("ALLVALUESFROM".len(), |rest| {
+                let (prop, rest) = Self::extract_quoted_or_word(rest);
+                let (class, _) = Self::extract_quoted_or_word(&rest);
+                if prop.is_empty() || class.is_empty() {
+                    return Err(CoreError::InvalidArgument(
+                        "ALLVALUESFROM needs <property> <class>".to_string(),
+                    ));
+                }
+                Ok(Restriction::AllValuesFrom {
+                    property: prop,
+                    class,
+                })
+            })
+        } else if find_ignore_ascii_case(input, "HASVALUE") == Some(0) {
+            ("HASVALUE".len(), |rest| {
+                let (prop, rest) = Self::extract_quoted_or_word(rest);
+                let (val, _) = Self::extract_quoted_or_word(&rest);
+                if prop.is_empty() || val.is_empty() {
+                    return Err(CoreError::InvalidArgument(
+                        "HASVALUE needs <property> <literal>".to_string(),
+                    ));
+                }
+                let literal = match Self::parse_literal(&val)? {
+                    LiteralValue::String(s) => OntoLiteral::String(s),
+                    LiteralValue::Int(i) => OntoLiteral::Int(i),
+                    LiteralValue::Float(f) => OntoLiteral::Float(f),
+                    LiteralValue::Bool(b) => OntoLiteral::Bool(b),
+                    other => {
+                        return Err(CoreError::InvalidArgument(format!(
+                            "unsupported HASVALUE literal: {:?}",
+                            other
+                        )))
+                    }
+                };
+                Ok(Restriction::HasValue {
+                    property: prop,
+                    value: literal,
+                })
+            })
+        } else if find_ignore_ascii_case(input, "MINCARDINALITY") == Some(0) {
+            ("MINCARDINALITY".len(), |rest| {
+                let (prop, rest) = Self::extract_quoted_or_word(rest);
+                let (n, _) = Self::extract_quoted_or_word(&rest);
+                let min = n.parse::<usize>().map_err(|_| {
+                    CoreError::InvalidArgument("MINCARDINALITY needs <property> <n>".to_string())
+                })?;
+                Ok(Restriction::MinCardinality {
+                    property: prop,
+                    min,
+                })
+            })
+        } else if find_ignore_ascii_case(input, "MAXCARDINALITY") == Some(0) {
+            ("MAXCARDINALITY".len(), |rest| {
+                let (prop, rest) = Self::extract_quoted_or_word(rest);
+                let (n, _) = Self::extract_quoted_or_word(&rest);
+                let max = n.parse::<usize>().map_err(|_| {
+                    CoreError::InvalidArgument("MAXCARDINALITY needs <property> <n>".to_string())
+                })?;
+                Ok(Restriction::MaxCardinality {
+                    property: prop,
+                    max,
+                })
+            })
+        } else if find_ignore_ascii_case(input, "EXACTCARDINALITY") == Some(0) {
+            ("EXACTCARDINALITY".len(), |rest| {
+                let (prop, rest) = Self::extract_quoted_or_word(rest);
+                let (n, _) = Self::extract_quoted_or_word(&rest);
+                let count = n.parse::<usize>().map_err(|_| {
+                    CoreError::InvalidArgument("EXACTCARDINALITY needs <property> <n>".to_string())
+                })?;
+                Ok(Restriction::ExactCardinality {
+                    property: prop,
+                    count,
+                })
+            })
+        } else {
+            return Err(CoreError::InvalidArgument(format!(
+                "unknown restriction axiom: {}",
+                input
+            )));
+        };
+        parse_args(safe_slice_from(input, kw_len).trim_start())
     }
 
     /// Parse CREATE MATERIALIZED VIEW <name> AS <query>
@@ -4984,18 +5253,150 @@ mod tests {
                 name,
                 domain,
                 range,
+                required,
+                inverse_of,
+                is_functional,
+                is_symmetric,
+                is_transitive,
             } => {
                 assert_eq!(name, "mw_freebase");
                 assert_eq!(domain, "sembio.CompoundProperty");
-                assert_eq!(range, "FLOAT64");
+                assert_eq!(range.as_deref(), Some("FLOAT64"));
+                assert!(!required);
+                assert!(inverse_of.is_none());
+                assert!(!is_functional && !is_symmetric && !is_transitive);
             }
             other => panic!("expected AlterOntologyProperty, got {:?}", other),
         }
 
-        // Missing DOMAIN/RANGE must error
+        // Missing DOMAIN and a total absence of changes must error
         assert!(QueryParser::parse("ALTER PROPERTY p DOMAIN C").is_err());
         assert!(QueryParser::parse("ALTER PROPERTY p RANGE FLOAT64").is_err());
         assert!(QueryParser::parse("ALTER PROPERTY").is_err());
+    }
+
+    #[test]
+    fn test_parse_alter_ontology_property_characteristics() {
+        // Characteristics only, with the optional CHARACTERISTICS marker.
+        let ast = QueryParser::parse(
+            "ALTER PROPERTY interacts_with DOMAIN Protein CHARACTERISTICS SYMMETRIC",
+        )
+        .unwrap();
+        match ast {
+            QueryAst::AlterOntologyProperty {
+                name,
+                domain,
+                range,
+                is_symmetric,
+                is_functional,
+                is_transitive,
+                ..
+            } => {
+                assert_eq!(name, "interacts_with");
+                assert_eq!(domain, "Protein");
+                assert!(range.is_none(), "range must stay untouched");
+                assert!(is_symmetric);
+                assert!(!is_functional && !is_transitive);
+            }
+            other => panic!("expected AlterOntologyProperty, got {:?}", other),
+        }
+
+        // Bare keywords without the marker + INVERSE OF.
+        let ast = QueryParser::parse(
+            "ALTER PROPERTY catalyzed_by DOMAIN Protein INVERSE OF catalyzes TRANSITIVE FUNCTIONAL",
+        )
+        .unwrap();
+        match ast {
+            QueryAst::AlterOntologyProperty {
+                inverse_of,
+                is_functional,
+                is_transitive,
+                is_symmetric,
+                required,
+                ..
+            } => {
+                assert_eq!(inverse_of.as_deref(), Some("catalyzes"));
+                assert!(is_functional && is_transitive);
+                assert!(!is_symmetric && !required);
+            }
+            other => panic!("expected AlterOntologyProperty, got {:?}", other),
+        }
+
+        // REQUIRED-only change is valid.
+        let ast =
+            QueryParser::parse("ALTER PROPERTY name DOMAIN Drug REQUIRED").unwrap();
+        match ast {
+            QueryAst::AlterOntologyProperty { required, range, .. } => {
+                assert!(required);
+                assert!(range.is_none());
+            }
+            other => panic!("expected AlterOntologyProperty, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_class_axioms() {
+        let ast = QueryParser::parse("ALTER CLASS Drug DISJOINT WITH Disease").unwrap();
+        match ast {
+            QueryAst::AlterClassDisjoint {
+                class_name,
+                disjoint_with,
+            } => {
+                assert_eq!(class_name, "Drug");
+                assert_eq!(disjoint_with, "Disease");
+            }
+            other => panic!("expected AlterClassDisjoint, got {:?}", other),
+        }
+
+        let ast = QueryParser::parse("ALTER CLASS Drug UNIQUE (drug_id, atc_code)").unwrap();
+        match ast {
+            QueryAst::AlterClassUnique {
+                class_name,
+                columns,
+            } => {
+                assert_eq!(class_name, "Drug");
+                assert_eq!(columns, vec!["drug_id".to_string(), "atc_code".to_string()]);
+            }
+            other => panic!("expected AlterClassUnique, got {:?}", other),
+        }
+
+        let ast =
+            QueryParser::parse("ALTER CLASS Protein RESTRICT MINCARDINALITY has_structure 1").unwrap();
+        match ast {
+            QueryAst::AlterClassRestriction {
+                class_name,
+                restriction,
+            } => {
+                assert_eq!(class_name, "Protein");
+                assert_eq!(
+                    restriction,
+                    Restriction::MinCardinality {
+                        property: "has_structure".into(),
+                        min: 1
+                    }
+                );
+            }
+            other => panic!("expected AlterClassRestriction, got {:?}", other),
+        }
+
+        let ast =
+            QueryParser::parse("ALTER CLASS Drug RESTRICT SOMEVALUESFROM treats Disease").unwrap();
+        match ast {
+            QueryAst::AlterClassRestriction { restriction, .. } => {
+                assert_eq!(
+                    restriction,
+                    Restriction::SomeValuesFrom {
+                        property: "treats".into(),
+                        class: "Disease".into()
+                    }
+                );
+            }
+            other => panic!("expected AlterClassRestriction, got {:?}", other),
+        }
+
+        assert!(QueryParser::parse("ALTER CLASS X RESTRICT BOGUS a b").is_err());
+        assert!(QueryParser::parse("ALTER CLASS X").is_err());
+        assert!(QueryParser::parse("ALTER CLASS X UNIQUE ()").is_err());
     }
 
     // ===== AND/OR Precedence Tests =====

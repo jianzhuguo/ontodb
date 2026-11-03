@@ -2356,7 +2356,20 @@ impl QueryExecutor {
     }
 
     /// Changes the range (data type) of an existing property definition.
-    pub fn alter_ontology_property(&self, name: &str, domain: &str, range: &str) -> Result<()> {
+    /// Updates an existing property definition. `range`/`required`/
+    /// `inverse_of`/the characteristic flags are applied only when supplied;
+    /// the flags are additive (they set the characteristic to true).
+    pub fn alter_ontology_property(
+        &self,
+        name: &str,
+        domain: &str,
+        range: Option<&str>,
+        required: bool,
+        inverse_of: Option<&str>,
+        is_functional: bool,
+        is_symmetric: bool,
+        is_transitive: bool,
+    ) -> Result<()> {
         let engine = &self.engine.default_engine();
         let ontology_name = domain; // ontology named after class
         let mut ontology = self
@@ -2369,23 +2382,39 @@ impl QueryExecutor {
                 ))
             })?;
 
-        let data_type = match onto_ontology::DataType::from_str(range) {
-            Some(dt) => dt,
-            None => {
-                return Err(onto_core::CoreError::InvalidArgument(format!(
-                    "Unknown property range type '{}'",
-                    range
-                )))
-            }
-        };
-
         let property = ontology.properties.get_mut(name).ok_or_else(|| {
             onto_core::CoreError::InvalidArgument(format!(
                 "Property '{}' not found on domain '{}'",
                 name, domain
             ))
         })?;
-        property.range = data_type;
+        if let Some(r) = range {
+            let data_type = match onto_ontology::DataType::from_str(r) {
+                Some(dt) => dt,
+                None => {
+                    return Err(onto_core::CoreError::InvalidArgument(format!(
+                        "Unknown property range type '{}'",
+                        r
+                    )))
+                }
+            };
+            property.range = data_type;
+        }
+        if required {
+            property.required = true;
+        }
+        if let Some(inv) = inverse_of {
+            property.inverse_of = Some(inv.to_string());
+        }
+        if is_functional {
+            property.is_functional = true;
+        }
+        if is_symmetric {
+            property.is_symmetric = true;
+        }
+        if is_transitive {
+            property.is_transitive = true;
+        }
 
         // Delete old entry then save new
         let key = {
@@ -2408,6 +2437,103 @@ impl QueryExecutor {
             .unwrap_or_else(|e| e.into_inner())
             .invalidate_ontology(&ontology.name);
         Ok(())
+    }
+
+    /// Persists an ontology mutation (delete + save + flush + cache invalidate).
+    fn persist_ontology(
+        &self,
+        engine: &LsmEngine,
+        ontology: &onto_ontology::Ontology,
+    ) -> Result<()> {
+        let key = {
+            let mut k = Vec::new();
+            if let Some(ref ns) = ontology.namespace {
+                k.extend_from_slice(b"__ontology__");
+                k.extend_from_slice(ns.as_bytes());
+                k.extend_from_slice(b"::");
+            } else {
+                k.extend_from_slice(b"__ontology__");
+            }
+            k.extend_from_slice(ontology.name.as_bytes());
+            k
+        };
+        engine.delete(key)?;
+        self.ontology_store.save_with_engine(engine, ontology)?;
+        engine.flush()?;
+        self.inference_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate_ontology(&ontology.name);
+        Ok(())
+    }
+
+    /// Loads the ontology owning `class_name`, erroring when absent.
+    fn load_ontology_for_class(
+        &self,
+        engine: &LsmEngine,
+        class_name: &str,
+    ) -> Result<onto_ontology::Ontology> {
+        self.ontology_store
+            .find_ontology_for_class_global(engine, class_name)?
+            .ok_or_else(|| {
+                onto_core::CoreError::InvalidArgument(format!(
+                    "Ontology not found for class '{}'",
+                    class_name
+                ))
+            })
+    }
+
+    /// Adds an owl:disjointWith axiom to an existing class.
+    pub fn add_class_disjoint(&self, class_name: &str, disjoint_with: &str) -> Result<()> {
+        let engine = &self.engine.default_engine();
+        let mut ontology = self.load_ontology_for_class(engine, class_name)?;
+        let class = ontology.classes.get_mut(class_name).ok_or_else(|| {
+            onto_core::CoreError::InvalidArgument(format!(
+                "Class '{}' not found in ontology '{}'",
+                class_name, ontology.name
+            ))
+        })?;
+        if !class.disjoint_with.contains(&disjoint_with.to_string()) {
+            class.disjoint_with.push(disjoint_with.to_string());
+        }
+        self.persist_ontology(engine, &ontology)
+    }
+
+    /// Adds a uniqueness constraint to an existing class.
+    pub fn add_class_unique(&self, class_name: &str, columns: &[String]) -> Result<()> {
+        let engine = &self.engine.default_engine();
+        let mut ontology = self.load_ontology_for_class(engine, class_name)?;
+        let class = ontology.classes.get_mut(class_name).ok_or_else(|| {
+            onto_core::CoreError::InvalidArgument(format!(
+                "Class '{}' not found in ontology '{}'",
+                class_name, ontology.name
+            ))
+        })?;
+        let cols: Vec<String> = columns.to_vec();
+        if !class.unique_columns.contains(&cols) {
+            class.unique_columns.push(cols);
+        }
+        self.persist_ontology(engine, &ontology)
+    }
+
+    /// Adds a property restriction to an existing class.
+    pub fn add_class_restriction(
+        &self,
+        class_name: &str,
+        restriction: &onto_ontology::Restriction,
+    ) -> Result<()> {
+        let engine = &self.engine.default_engine();
+        let mut ontology = self.load_ontology_for_class(engine, class_name)?;
+        let class = ontology.classes.get_mut(class_name).ok_or_else(|| {
+            onto_core::CoreError::InvalidArgument(format!(
+                "Class '{}' not found in ontology '{}'",
+                class_name, ontology.name
+            ))
+        })?;
+        if !class.restrictions.contains(restriction) {
+            class.restrictions.push(restriction.clone());
+        }
+        self.persist_ontology(engine, &ontology)
     }
 
     /// Returns the active transaction ID, if any.
@@ -3711,11 +3837,57 @@ impl QueryExecutor {
                     name, domain
                 )))
             }
-            QueryAst::AlterOntologyProperty { name, domain, range } => {
-                self.alter_ontology_property(name, domain, range)?;
+            QueryAst::AlterOntologyProperty {
+                name,
+                domain,
+                range,
+                required,
+                inverse_of,
+                is_functional,
+                is_symmetric,
+                is_transitive,
+            } => {
+                self.alter_ontology_property(
+                    name,
+                    domain,
+                    range.as_deref(),
+                    *required,
+                    inverse_of.as_deref(),
+                    *is_functional,
+                    *is_symmetric,
+                    *is_transitive,
+                )?;
                 Ok(QueryResult::Success(format!(
-                    "Property '{}' on '{}' range changed to '{}'",
-                    name, domain, range
+                    "Property '{}' on '{}' updated",
+                    name, domain
+                )))
+            }
+            QueryAst::AlterClassDisjoint {
+                class_name,
+                disjoint_with,
+            } => {
+                self.add_class_disjoint(class_name, disjoint_with)?;
+                Ok(QueryResult::Success(format!(
+                    "Class '{}' now disjoint with '{}'",
+                    class_name, disjoint_with
+                )))
+            }
+            QueryAst::AlterClassUnique { class_name, columns } => {
+                self.add_class_unique(class_name, columns)?;
+                Ok(QueryResult::Success(format!(
+                    "Class '{}' now unique on ({})",
+                    class_name,
+                    columns.join(", ")
+                )))
+            }
+            QueryAst::AlterClassRestriction {
+                class_name,
+                restriction,
+            } => {
+                self.add_class_restriction(class_name, restriction)?;
+                Ok(QueryResult::Success(format!(
+                    "Class '{}' restriction added",
+                    class_name
                 )))
             }
             QueryAst::Copy {
@@ -6348,21 +6520,34 @@ impl QueryExecutor {
                 let entries = engine.scan_prefix(prefix.as_bytes()).unwrap_or_default();
                 for (key, val_bytes) in &entries {
                     let pk = String::from_utf8_lossy(key).to_string();
-                    if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(val_bytes) {
-                        if let Some(obj) = doc.as_object() {
-                            for (prop_name, prop_def) in &onto.properties {
-                                if prop_def.domain == *scan_class
-                                    || scan_classes.contains(&prop_def.domain)
-                                {
-                                    if let Some(val) = obj.get(prop_name) {
-                                        let val_str = match val {
-                                            serde_json::Value::String(s) => s.clone(),
-                                            other => other.to_string(),
-                                        };
-                                        facts.push(onto_ontology::Triple::new(
-                                            &pk, prop_name, &val_str,
-                                        ));
-                                    }
+                    // BinaryRow first (simd_parse_row) — a bare serde_json parse
+                    // silently drops every binary-stored row, which left INFER
+                    // with only key-derived rdf:type facts and never ran Prp-trp.
+                    if let Some(obj) = simd_parse_row(val_bytes) {
+                        // Reified edge -> (source, <short class name>, target).
+                        // Relation classes (go_is_a etc.) store edges as rows with
+                        // source/target columns; emitting them as triples lets
+                        // Prp-trp/Prp-inv chain them without a data migration.
+                        if let (Some(src), Some(tgt)) = (
+                            obj.get("source").and_then(|v| v.as_str()),
+                            obj.get("target").and_then(|v| v.as_str()),
+                        ) {
+                            let rel =
+                                scan_class.rsplit('.').next().unwrap_or(scan_class.as_str());
+                            facts.push(onto_ontology::Triple::new(src, rel, tgt));
+                        }
+                        for (prop_name, prop_def) in &onto.properties {
+                            if prop_def.domain == *scan_class
+                                || scan_classes.contains(&prop_def.domain)
+                            {
+                                if let Some(val) = obj.get(prop_name) {
+                                    let val_str = match val {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        other => other.to_string(),
+                                    };
+                                    facts.push(onto_ontology::Triple::new(
+                                        &pk, prop_name, &val_str,
+                                    ));
                                 }
                             }
                         }
@@ -18137,6 +18322,201 @@ mod tests {
     }
 
     #[test]
+    fn test_alter_ontology_property_characteristics() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY alias DOMAIN Product RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // SQL CREATE PROPERTY wires characteristic keywords.
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE OBJECT PROPERTY relatesTo DOMAIN Product RANGE STRING SYMMETRIC INVERSE OF relatedFrom",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Characteristics-only ALTER (range untouched).
+        executor
+            .execute(
+                &QueryParser::parse("ALTER PROPERTY alias DOMAIN Product CHARACTERISTICS FUNCTIONAL")
+                    .unwrap(),
+            )
+            .unwrap();
+
+        // Characteristics + inverse + a later REQUIRED-only pass (additive).
+        executor
+            .execute(
+                &QueryParser::parse("ALTER PROPERTY name DOMAIN Product TRANSITIVE INVERSE OF titled")
+                    .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("ALTER PROPERTY name DOMAIN Product REQUIRED").unwrap())
+            .unwrap();
+
+        let engine = executor.engine.default_engine();
+        let onto = executor
+            .ontology_store
+            .find_ontology_for_class_global(&engine, "Product")
+            .unwrap()
+            .expect("ontology for Product");
+        let alias = &onto.properties["alias"];
+        assert!(alias.is_functional, "FUNCTIONAL must be set");
+        assert!(!alias.is_symmetric && !alias.is_transitive);
+        assert_eq!(alias.range, onto_ontology::DataType::String, "range untouched");
+        let name = &onto.properties["name"];
+        assert!(name.is_transitive && name.required);
+        assert_eq!(name.inverse_of.as_deref(), Some("titled"));
+        let rel = &onto.properties["relatesTo"];
+        assert!(rel.is_symmetric);
+        assert_eq!(rel.inverse_of.as_deref(), Some("relatedFrom"));
+    }
+
+    #[test]
+    fn test_alter_class_axioms() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Item, PROPERTY code DOMAIN Item RANGE STRING, PROPERTY part DOMAIN Item RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        executor
+            .execute(&QueryParser::parse("ALTER CLASS Item DISJOINT WITH Product").unwrap())
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("ALTER CLASS Item UNIQUE (code)").unwrap())
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("ALTER CLASS Item RESTRICT MINCARDINALITY part 1").unwrap(),
+            )
+            .unwrap();
+
+        // UNIQUE enforced on write: duplicate value rejected.
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Item (code, part) VALUES ('x', 'y')").unwrap())
+            .unwrap();
+        let dup = executor
+            .execute(&QueryParser::parse("INSERT INTO Item (code, part) VALUES ('x', 'z')").unwrap());
+        assert!(dup.is_err(), "duplicate unique column must be rejected");
+
+        // Missing restricted property rejected (minCardinality 1).
+        let missing = executor.execute(
+            &QueryParser::parse("INSERT INTO Item (code) VALUES ('w')").unwrap(),
+        );
+        assert!(missing.is_err(), "minCardinality violation must be rejected");
+
+        // someValuesFrom requires instance references — declared last so the
+        // plain-string inserts above stay valid.
+        executor
+            .execute(
+                &QueryParser::parse("ALTER CLASS Item RESTRICT SOMEVALUESFROM part Item").unwrap(),
+            )
+            .unwrap();
+
+        let engine = executor.engine.default_engine();
+        let onto = executor
+            .ontology_store
+            .find_ontology_for_class_global(&engine, "Item")
+            .unwrap()
+            .expect("ontology for Item");
+        let cls = &onto.classes["Item"];
+        assert_eq!(cls.disjoint_with, vec!["Product".to_string()]);
+        assert_eq!(cls.unique_columns, vec![vec!["code".to_string()]]);
+        assert!(cls.restrictions.contains(
+            &onto_ontology::Restriction::MinCardinality {
+                property: "part".into(),
+                min: 1
+            }
+        ));
+        assert!(cls.restrictions.contains(
+            &onto_ontology::Restriction::SomeValuesFrom {
+                property: "part".into(),
+                class: "Item".into()
+            }
+        ));
+
+        // Unknown class errors.
+        assert!(executor
+            .execute(&QueryParser::parse("ALTER CLASS NoSuch DISJOINT WITH X").unwrap())
+            .is_err());
+    }
+
+    /// Regression: `SELECT * LIMIT n` and `SELECT <col> LIMIT n` must return
+    /// rows in the same order. Production saw `SELECT *` emit newest-first
+    /// rows while projected selects were key-ordered — same query shape, two
+    /// execution chains, silently different data.
+    #[test]
+    fn test_select_star_and_projection_same_limit_order() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        for i in 0..8u32 {
+            executor
+                .execute(
+                    &QueryParser::parse(&format!(
+                        "INSERT INTO Product (id, name) VALUES ('p{}', 'n{}')",
+                        i, i
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let first_pk = |sql: &str| -> String {
+            let rows = match executor.execute_read(&QueryParser::parse(sql).unwrap()).unwrap() {
+                QueryResult::Rows(r) => r,
+                _ => panic!("expected Rows for {}", sql),
+            };
+            rows.first()
+                .and_then(|r| r.get("__pk__"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let star = first_pk("SELECT * FROM Product LIMIT 1");
+        let proj = first_pk("SELECT __pk__, name FROM Product LIMIT 1");
+        assert!(!star.is_empty() && !proj.is_empty());
+        assert_eq!(star, proj, "SELECT * and projected SELECT must agree on LIMIT 1 row");
+        // Streaming chain too.
+        let stream_first = |sql: &str| -> String {
+            let ast = QueryParser::parse(sql).unwrap();
+            let mut out: Vec<Map<String, Value>> = Vec::new();
+            executor
+                .execute_read_streaming(&ast, |batch| {
+                    out.extend(batch);
+                    false // stop after first batch
+                })
+                .unwrap();
+            out.first()
+                .and_then(|r| r.get("__pk__"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let s_star = stream_first("SELECT * FROM Product LIMIT 1");
+        let s_proj = stream_first("SELECT __pk__, name FROM Product LIMIT 1");
+        assert_eq!(s_star, s_proj, "streaming chain must agree too");
+    }
+
+    #[test]
     fn test_describe_same_name_property_not_shadowed() {
         let (executor, _dir) = setup();
         executor
@@ -22467,6 +22847,131 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════�?
     //  Import tests
     // ══════════════════════════════════════════════════════════════════�?
+
+    /// Regression: collect_facts_for_class must read BinaryRow-stored docs.
+    /// A bare serde_json parse silently dropped every binary row, so INFER
+    /// only ever saw key-derived rdf:type facts and Prp-trp never fired.
+    /// Reified relation rows (source/target columns) must be emitted as
+    /// (source, <short class name>, target) triples so Prp-trp can chain them.
+    #[test]
+    fn test_infer_prp_trp_on_reified_edges() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY fam (CLASS go_is_a, PROPERTY source DOMAIN go_is_a RANGE STRING, PROPERTY target DOMAIN go_is_a RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("CREATE DATATYPE PROPERTY go_is_a DOMAIN go_is_a RANGE STRING")
+                    .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "ALTER PROPERTY go_is_a DOMAIN go_is_a CHARACTERISTICS TRANSITIVE",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "INSERT INTO go_is_a (id, source, target) VALUES ('e1', 'GO:a', 'GO:b')",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "INSERT INTO go_is_a (id, source, target) VALUES ('e2', 'GO:b', 'GO:c')",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let infer = QueryAst::Infer {
+            query: Box::new(QueryParser::parse("SELECT * FROM go_is_a").unwrap()),
+            scope: "ALL".to_string(),
+            rules: vec![],
+            materialize: true,
+        };
+        let rows = match executor.execute(&infer).unwrap() {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected rows, got {:?}", other),
+        };
+        assert!(
+            rows.iter().any(|r| {
+                r.get("subject").and_then(|v| v.as_str()) == Some("GO:a")
+                    && r.get("predicate").and_then(|v| v.as_str()) == Some("go_is_a")
+                    && r.get("object").and_then(|v| v.as_str()) == Some("GO:c")
+            }),
+            "Prp-trp must chain reified edges GO:a->GO:b->GO:c, got: {:?}",
+            rows
+        );
+    }
+
+    #[test]
+    fn test_infer_prp_trp_transitive_on_binary_rows() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY fam (CLASS Node, PROPERTY ancestor DOMAIN Node RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "ALTER PROPERTY ancestor DOMAIN Node CHARACTERISTICS TRANSITIVE",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        // INSERT writes BinaryRow; pk = Node::{id} so ancestor values chain.
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Node (id, ancestor) VALUES ('alice', 'Node::bob')")
+                    .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Node (id, ancestor) VALUES ('bob', 'Node::charlie')")
+                    .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Node (id) VALUES ('charlie')").unwrap())
+            .unwrap();
+
+        let infer = QueryAst::Infer {
+            query: Box::new(QueryParser::parse("SELECT * FROM Node").unwrap()),
+            scope: "ALL".to_string(),
+            rules: vec![],
+            materialize: true,
+        };
+        let rows = match executor.execute(&infer).unwrap() {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected rows, got {:?}", other),
+        };
+        assert!(
+            rows.iter().any(|r| {
+                r.get("subject").and_then(|v| v.as_str()) == Some("Node::alice")
+                    && r.get("predicate").and_then(|v| v.as_str()) == Some("ancestor")
+                    && r.get("object").and_then(|v| v.as_str()) == Some("Node::charlie")
+            }),
+            "Prp-trp must infer alice ancestor charlie across BinaryRow docs, got: {:?}",
+            rows
+        );
+    }
 
     #[test]
     fn test_infer_materialize_returns_inferred_triples() {

@@ -352,11 +352,15 @@ pub enum OntoQLAst {
         required: bool,
         multi_valued: bool,
     },
-    /// ALTER PROPERTY <name> DOMAIN <domain> RANGE <type>
+    /// ALTER PROPERTY <name> DOMAIN <domain> [RANGE <type>] [REQUIRED]
+    /// [INVERSE OF <prop>] [CHARACTERISTICS (...)]
     AlterProperty {
         name: String,
         domain: String,
-        range: String,
+        range: Option<String>,
+        inverse_of: Option<String>,
+        characteristics: Vec<Characteristic>,
+        required: bool,
     },
 
     // ── Data Manipulation ──
@@ -710,7 +714,8 @@ impl OntoQLParser {
         })
     }
 
-    // ALTER PROPERTY <name> DOMAIN <domain> RANGE <type>
+    // ALTER PROPERTY <name> DOMAIN <domain> [RANGE <type>] [REQUIRED]
+    // [INVERSE OF <prop>] [CHARACTERISTICS (...)]
 
     fn parse_alter_property(input: &str) -> Result<OntoQLAst> {
         let rest = safe_slice_from(input, "ALTER PROPERTY".len()).trim_start();
@@ -721,14 +726,46 @@ impl OntoQLParser {
         let rest = rest.trim();
         let domain = Self::extract_keyword_value(rest, "DOMAIN");
         let range = Self::extract_keyword_value(rest, "RANGE");
-        match (domain, range) {
-            (Some(domain), Some(range)) if !domain.is_empty() && !range.is_empty() => {
-                Ok(OntoQLAst::AlterProperty { name, domain, range })
-            }
-            _ => Err(CoreError::InvalidArgument(
-                "ALTER PROPERTY requires DOMAIN <class> RANGE <type>".into(),
-            )),
+        let inverse_of = Self::extract_keyword_value(rest, "INVERSE OF");
+        let required = find_ignore_ascii_case(rest, "REQUIRED").is_some();
+
+        let mut characteristics = Vec::new();
+        if find_ignore_ascii_case(rest, "TRANSITIVE").is_some() {
+            characteristics.push(Characteristic::Transitive);
         }
+        if find_ignore_ascii_case(rest, "SYMMETRIC").is_some() {
+            characteristics.push(Characteristic::Symmetric);
+        }
+        if find_ignore_ascii_case(rest, "FUNCTIONAL").is_some() {
+            characteristics.push(Characteristic::Functional);
+        }
+
+        let domain = match domain {
+            Some(d) if !d.is_empty() => d,
+            _ => {
+                return Err(CoreError::InvalidArgument(
+                    "ALTER PROPERTY requires DOMAIN <class>".into(),
+                ))
+            }
+        };
+        let range = range.filter(|r| !r.is_empty());
+        let has_change = range.is_some()
+            || inverse_of.is_some()
+            || required
+            || !characteristics.is_empty();
+        if !has_change {
+            return Err(CoreError::InvalidArgument(
+                "ALTER PROPERTY requires RANGE and/or a characteristic change".into(),
+            ));
+        }
+        Ok(OntoQLAst::AlterProperty {
+            name,
+            domain,
+            range,
+            inverse_of,
+            characteristics,
+            required,
+        })
     }
 
     // ── SELECT ────────────────────────────────────────────────────
@@ -2113,11 +2150,40 @@ impl OntoQLAst {
                     is_transitive,
                 })
             }
-            OntoQLAst::AlterProperty { name, domain, range } => Ok(QueryAst::AlterOntologyProperty {
-                name: name.clone(),
-                domain: domain.clone(),
-                range: range.clone(),
-            }),
+            OntoQLAst::AlterProperty {
+                name,
+                domain,
+                range,
+                inverse_of,
+                characteristics,
+                required,
+            } => {
+                let mut is_functional = false;
+                let mut is_symmetric = false;
+                let mut is_transitive = false;
+                for c in characteristics {
+                    match c {
+                        Characteristic::Functional => is_functional = true,
+                        Characteristic::Symmetric => is_symmetric = true,
+                        Characteristic::Transitive => is_transitive = true,
+                        Characteristic::InverseFunctional => {
+                            return Err(CoreError::InvalidArgument(
+                                "INVERSE FUNCTIONAL characteristic is not supported".into(),
+                            ));
+                        }
+                    }
+                }
+                Ok(QueryAst::AlterOntologyProperty {
+                    name: name.clone(),
+                    domain: domain.clone(),
+                    range: range.clone(),
+                    required: *required,
+                    inverse_of: inverse_of.clone(),
+                    is_functional,
+                    is_symmetric,
+                    is_transitive,
+                })
+            }
             _ => {
                 let sql = self.to_sql()?;
                 parser::QueryParser::parse(&sql)
@@ -2164,10 +2230,22 @@ impl OntoQLAst {
                 ))
             }
 
-            OntoQLAst::AlterProperty { name, domain, range } => Ok(format!(
-                "ALTER PROPERTY \"{}\" DOMAIN \"{}\" RANGE \"{}\"",
-                name, domain, range
-            )),
+            OntoQLAst::AlterProperty {
+                name,
+                domain,
+                range,
+                required,
+                ..
+            } => {
+                let mut sql = format!("ALTER PROPERTY \"{}\" DOMAIN \"{}\"", name, domain);
+                if let Some(r) = range {
+                    sql.push_str(&format!(" RANGE \"{}\"", r));
+                }
+                if *required {
+                    sql.push_str(" REQUIRED");
+                }
+                Ok(sql)
+            }
 
             OntoQLAst::Select { distinct, projections, from, joins, filter, infer, group_by, having, order_by, limit, offset, .. } => {
                 let mut sql = String::from("SELECT ");
@@ -2964,14 +3042,15 @@ mod tests {
                 name,
                 domain,
                 range,
+                ..
             } => {
                 assert_eq!(name, "price");
                 assert_eq!(domain, "Product");
-                assert_eq!(range, "FLOAT64");
+                assert_eq!(range.as_deref(), Some("FLOAT64"));
             }
             _ => panic!("Expected AlterProperty"),
         }
-        // DOMAIN and RANGE are both mandatory
+        // DOMAIN is mandatory and at least one change must be present
         assert!(OntoQLParser::parse("ALTER PROPERTY price DOMAIN Product").is_err());
         assert!(OntoQLParser::parse("ALTER PROPERTY price RANGE FLOAT64").is_err());
 
@@ -2981,10 +3060,55 @@ mod tests {
                 name,
                 domain,
                 range,
+                ..
             } => {
                 assert_eq!(name, "price");
                 assert_eq!(domain, "Product");
-                assert_eq!(range, "FLOAT64");
+                assert_eq!(range.as_deref(), Some("FLOAT64"));
+            }
+            other => panic!("expected QueryAst::AlterOntologyProperty, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_property_characteristics() {
+        let ast = OntoQLParser::parse(
+            "ALTER PROPERTY catalyzed_by DOMAIN Protein INVERSE OF catalyzes TRANSITIVE",
+        )
+        .unwrap();
+        match &ast {
+            OntoQLAst::AlterProperty {
+                name,
+                range,
+                inverse_of,
+                characteristics,
+                required,
+                ..
+            } => {
+                assert_eq!(name, "catalyzed_by");
+                assert!(range.is_none());
+                assert_eq!(inverse_of.as_deref(), Some("catalyzes"));
+                assert!(!*required);
+                assert!(characteristics
+                    .iter()
+                    .any(|c| matches!(c, Characteristic::Transitive)));
+                assert!(!characteristics
+                    .iter()
+                    .any(|c| matches!(c, Characteristic::Functional)));
+            }
+            _ => panic!("Expected AlterProperty"),
+        }
+        let q = ast.to_query_ast().unwrap();
+        match q {
+            crate::parser::QueryAst::AlterOntologyProperty {
+                inverse_of,
+                is_transitive,
+                is_functional,
+                ..
+            } => {
+                assert_eq!(inverse_of.as_deref(), Some("catalyzes"));
+                assert!(is_transitive);
+                assert!(!is_functional);
             }
             other => panic!("expected QueryAst::AlterOntologyProperty, got {:?}", other),
         }

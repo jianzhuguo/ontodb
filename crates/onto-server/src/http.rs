@@ -1520,8 +1520,48 @@ async fn execute_query(
                         }
                     }
                 }
-                onto_query::OntoQLAst::AlterProperty { name, domain, range } => {
-                    match state.executor.alter_ontology_property(name, domain, range) {
+                onto_query::OntoQLAst::AlterProperty {
+                    name,
+                    domain,
+                    range,
+                    inverse_of,
+                    characteristics,
+                    required,
+                } => {
+                    use onto_query::ontoql::Characteristic;
+                    let is_functional = characteristics
+                        .iter()
+                        .any(|c| matches!(c, Characteristic::Functional));
+                    let is_symmetric = characteristics
+                        .iter()
+                        .any(|c| matches!(c, Characteristic::Symmetric));
+                    let is_transitive = characteristics
+                        .iter()
+                        .any(|c| matches!(c, Characteristic::Transitive));
+                    if characteristics
+                        .iter()
+                        .any(|c| matches!(c, Characteristic::InverseFunctional))
+                    {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            PrettyJson(
+                                ApiResponse::<Value>::error(
+                                    "INVERSE FUNCTIONAL characteristic is not supported",
+                                ),
+                                false,
+                            ),
+                        ).into_response();
+                    }
+                    match state.executor.alter_ontology_property(
+                        name,
+                        domain,
+                        range.as_deref(),
+                        *required,
+                        inverse_of.as_deref(),
+                        is_functional,
+                        is_symmetric,
+                        is_transitive,
+                    ) {
                         Ok(()) => {
                             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
                             state.metrics.record_query("ALTER_PROPERTY", elapsed_ms / 1000.0, true);
@@ -1529,7 +1569,7 @@ async fn execute_query(
                                 StatusCode::OK,
                                 PrettyJson(
                                     ApiResponse::success(
-                                        json!({"message": format!("Property '{}' on '{}' range changed to '{}'", name, domain, range)}),
+                                        json!({"message": format!("Property '{}' on '{}' updated", name, domain)}),
                                         elapsed_ms,
                                     ),
                                     req.pretty,

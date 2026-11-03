@@ -251,9 +251,17 @@ impl PreLoadEngine {
             }
         }
         sst_files.sort();
-        // Use max_seq from WAL replay AND scan SST entries for their max seq_no
+        // Collect (max_seq, level, path, size, min_key, max_key) so levels load
+        // in TRUE age order. The read path does first-seen-wins over
+        // `level.iter().rev()` and treats list position as age; sorting by file
+        // NAME (as this used to) breaks that at digit boundaries - L0_9 sorts
+        // after L0_10 lexicographically, so after a restart the older file was
+        // visited first and stale versions won (lost metadata ALTER chains).
+        // Per-file max_seq is the real age: flush seq ranges are monotonic and
+        // compaction outputs keep their inputs' max.
         let mut max_seq = self.seq_counter.load(Ordering::Relaxed);
         let mut old_ssts: Vec<PathBuf> = Vec::new();
+        let mut loaded: Vec<(u64, usize, PathBuf, u64, Vec<u8>, Vec<u8>)> = Vec::new();
         for path in sst_files {
             let fname = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             let level = fname
@@ -267,13 +275,14 @@ impl PreLoadEngine {
             let sst = Arc::new(SsTable::open(&path)?);
             // Use max_seq_no from SST footer (O(1)) for new files,
             // fall back to scanning for old files without the footer.
-            let sst_max_seq = sst.max_seq_no();
+            let mut sst_max_seq = sst.max_seq_no();
             if sst_max_seq == 0 {
                 // Old format: scan entries to find max seq_no
                 old_ssts.push(path.clone());
                 if let Ok(iter) = sst.iter() {
                     let mut sst_iter = iter;
                     while sst_iter.is_valid() {
+                        sst_max_seq = sst_max_seq.max(sst_iter.seq_no());
                         max_seq = max_seq.max(sst_iter.seq_no());
                         sst_iter.next();
                     }
@@ -293,9 +302,14 @@ impl PreLoadEngine {
                 }
             }
             self.sst_cache.insert(path.clone(), sst);
+            loaded.push((sst_max_seq, level, path, metadata.len(), min_key, max_key));
+        }
+        // Oldest first (stable: equal seqs keep name order), so rev() = newest first.
+        loaded.sort_by_key(|(seq, _, _, _, _, _)| *seq);
+        for (_, level, path, size, min_key, max_key) in loaded {
             self.levels[level].push(SsTableInfo {
                 path,
-                size: metadata.len(),
+                size,
                 min_key,
                 max_key,
             });
@@ -1428,165 +1442,27 @@ impl LsmEngine {
         Ok(results)
     }
 
-    /// Scan with prefix, returning at most `limit` live entries.
+    /// Scan with prefix, returning at most `limit` live entries **in user-key
+    /// order** (ascending), matching [`Self::for_each_live_prefix_until`].
+    /// Early-exits after `limit` live Puts: only the head blocks of the
+    /// sources are touched, so the cost is O(limit), not O(prefix).
     ///
-    /// Optimized for LIMIT queries: scans **newest-first** (memtable —L0 ——
-    /// so the first occurrence of each key is the winning version, then stops
-    /// once `limit` live Puts are collected. Does **not** walk the entire
-    /// prefix —older SSTs are skipped entirely once the limit is met.
+    /// This used to scan newest-first and return HashMap discovery order —
+    /// `SELECT * LIMIT n` then disagreed with the key-ordered streaming path
+    /// on which rows (and which shape of row) came back. Key order is the one
+    /// order every scan path can share.
     pub fn scan_prefix_limit(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         tracing::debug!(prefix = %String::from_utf8_lossy(prefix), "scan_prefix_limit start");
-        let result = self.scan_prefix_limit_newest(prefix, limit)?;
-        tracing::debug!(prefix = %String::from_utf8_lossy(prefix), count = result.len(), "scan_prefix_limit done");
-        Ok(result)
-    }
-
-    /// Newest-first limited scan with early exit.
-    ///
-    /// Visibility rule: first occurrence of a key wins (scan order is
-    /// newest —oldest). Memtables override SSTs; within L0, later-flushed
-    /// (higher path name / max_seq) SSTs are scanned first.
-    fn scan_prefix_limit_newest(
-        &self,
-        prefix: &[u8],
-        limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.drain_compaction_notifications();
-
         if limit == 0 {
             return Ok(Vec::new());
         }
-
-        // Newest-first SST list: L0 before L1 —; within a level, reverse
-        // insertion order (later flushes are newer). Collect paths under the
-        // brief levels lock, then open outside it. Retry on stale paths —
-        // compaction may delete a snapshotted SST before we open it.
-        let sst_handles: Vec<Arc<SsTable>> = {
-            let mut handles = None;
-            for _ in 0..3 {
-                let sst_paths: Vec<std::path::PathBuf> = {
-                    let levels = self.levels.lock().unwrap_or_else(|e| e.into_inner());
-                    let mut paths = Vec::new();
-                    for level in levels.iter() {
-                        // Reverse so later-pushed (newer) SSTs come first
-                        for sst_info in level.iter().rev() {
-                            if !prefix.is_empty() {
-                                if sst_info.max_key.as_slice() < prefix {
-                                    continue;
-                                }
-                                if !Self::prefix_may_overlap(
-                                    prefix,
-                                    sst_info.min_key.as_slice(),
-                                    sst_info.max_key.as_slice(),
-                                ) {
-                                    continue;
-                                }
-                            }
-                            paths.push(sst_info.path.clone());
-                        }
-                    }
-                    paths
-                };
-                match self.try_get_or_open_ssts(&sst_paths)? {
-                    Some(h) => {
-                        handles = Some(h);
-                        break;
-                    }
-                    None => continue,
-                }
-            }
-            handles.unwrap_or_default()
-        };
-
-        let mut seen: HashMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)> = HashMap::new();
-        let mut live_puts = 0usize;
-
-        let mut note = |key: Vec<u8>, value: Vec<u8>, seq: SeqNo, kind: EntryKind, seen: &mut HashMap<_, _>, live_puts: &mut usize| -> bool {
-            // returns true if caller should stop (limit reached)
-            if seen.contains_key(&key) {
-                return false; // first-seen wins (newest already recorded)
-            }
-            let is_live = kind == EntryKind::Put;
-            seen.insert(key, (value, seq, kind));
-            if is_live {
-                *live_puts += 1;
-                return *live_puts >= limit;
-            }
-            false
-        };
-
-        // 1. Active memtable (newest)
-        {
-            let ws = self.write_state.read();
-            for entry in ws.memtable.scan_prefix(prefix) {
-                if note(
-                    entry.key.clone(),
-                    entry.value.clone(),
-                    entry.seq_no,
-                    entry.kind,
-                    &mut seen,
-                    &mut live_puts,
-                ) {
-                    return Ok(Self::collect_live(seen, limit));
-                }
-            }
-            // 2. Immutable memtable
-            if let Some(ref imm) = ws.immutable_memtable {
-                for entry in imm.scan_prefix(prefix) {
-                    if note(
-                        entry.key.clone(),
-                        entry.value.clone(),
-                        entry.seq_no,
-                        entry.kind,
-                        &mut seen,
-                        &mut live_puts,
-                    ) {
-                        return Ok(Self::collect_live(seen, limit));
-                    }
-                }
-            }
-        }
-
-        // 3. SSTs newest —oldest, early-exit on limit.
-        // Decode whole blocks at once (batch) + block prefetch (in load_block).
-        for sst in &sst_handles {
-            let mut iter = sst.iter()?;
-            iter.seek(prefix);
-            let mut batch: Vec<(Vec<u8>, Vec<u8>, SeqNo, EntryKind)> = Vec::with_capacity(64);
-            loop {
-                if !iter.is_valid() || !iter.key().starts_with(prefix) {
-                    break;
-                }
-                batch.clear();
-                iter.drain_current_block(&mut batch);
-                let mut past_prefix = false;
-                for (key, value, seq, kind) in batch.drain(..) {
-                    if !key.starts_with(prefix) {
-                        past_prefix = true;
-                        break;
-                    }
-                    if note(key, value, seq, kind, &mut seen, &mut live_puts) {
-                        return Ok(Self::collect_live(seen, limit));
-                    }
-                }
-                if past_prefix {
-                    break;
-                }
-            }
-        }
-
-        Ok(Self::collect_live(seen, limit))
-    }
-
-    fn collect_live(
-        seen: HashMap<Vec<u8>, (Vec<u8>, SeqNo, EntryKind)>,
-        limit: usize,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
-        seen.into_iter()
-            .filter(|(_, (_, _, kind))| *kind == EntryKind::Put)
-            .take(limit)
-            .map(|(key, (value, _, _))| (key, value))
-            .collect()
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(limit.min(4096));
+        self.for_each_live_prefix_until(prefix, None, None, |k, v| {
+            out.push((k.to_vec(), v.to_vec()));
+            Ok(out.len() < limit)
+        })?;
+        tracing::debug!(prefix = %String::from_utf8_lossy(prefix), count = out.len(), "scan_prefix_limit done");
+        Ok(out)
     }
 
     /// Live rows in **user-key order**, strictly after `after`, at most `limit`.
@@ -6294,6 +6170,41 @@ mod tests {
             missing.is_empty(),
             "SST get_full missing {:?}",
             &missing[..missing.len().min(10)]
+        );
+    }
+
+    /// Regression: load_sstables must restore levels in AGE order (per-file
+    /// max_seq), not file-name order. Names cross digit boundaries (L0_9 vs
+    /// L0_10) and lexicographic order put the OLDER file last — `iter().rev()`
+    /// then visited it first and first-seen-wins resurrected stale versions
+    /// after restart (silently lost metadata ALTER chains).
+    #[test]
+    fn test_reload_respects_version_age_across_sst_id_boundaries() {
+        let dir = tempdir().expect("should be valid");
+        // Older version lives in L0_9, which sorts AFTER L0_10 by name.
+        let build = |name: &str, value: &[u8], seq: u64| {
+            let mut b = SsTableBuilder::new();
+            b.add_owned(onto_core::types::Entry {
+                key: b"K".to_vec(),
+                value: value.to_vec(),
+                seq_no: seq,
+                kind: EntryKind::Put,
+            });
+            b.build(&dir.path().join(name)).expect("build sst");
+        };
+        build("L0_9.sst", b"old", 1);
+        build("L0_10.sst", b"new", 2);
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("open");
+        let rows = engine.scan_prefix(b"K").expect("scan");
+        assert_eq!(rows.len(), 1, "exactly one live version");
+        assert_eq!(
+            rows[0].1, b"new",
+            "newest version must win after reload, got {:?}",
+            rows[0].1
         );
     }
 
