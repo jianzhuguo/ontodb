@@ -35,13 +35,34 @@ impl std::fmt::Display for InferenceError {
 
 impl std::error::Error for InferenceError {}
 
+/// A single inferred fact with the rule that produced it.
+/// Recorded at inference time so callers never need to re-run
+/// [`Reasoner::explain`] per fact (which re-reasons from scratch).
+#[derive(Debug, Clone)]
+pub struct InferredFact {
+    pub triple: Triple,
+    pub rule: RuleId,
+    /// Premises that produced this fact (may be empty for fast paths).
+    pub premises: Vec<Triple>,
+}
+
+/// Diagnostics returned by [`Reasoner::reason_streaming`].
+#[derive(Debug, Clone, Default)]
+pub struct ReasoningStats {
+    pub rule_counts: HashMap<RuleId, usize>,
+    pub iterations: usize,
+    pub budget_exceeded: bool,
+    /// Sink returned false (LIMIT reached / client gone) — closure walk stopped early.
+    pub stopped_early: bool,
+}
+
 /// The result of a reasoning pass.
 #[derive(Debug, Clone)]
 pub struct ReasoningResult {
     /// All triples after reasoning (original + inferred).
     pub all_facts: HashSet<Triple>,
     /// Only the newly inferred triples.
-    pub inferred: Vec<Triple>,
+    pub inferred: Vec<InferredFact>,
     /// Per-rule inference counts for diagnostics.
     pub rule_counts: HashMap<RuleId, usize>,
     /// Number of iterations until convergence.
@@ -102,6 +123,202 @@ impl Reasoner {
         self.reason_inner(facts, false)
     }
 
+    /// Streaming reasoning: emits inferred facts to `sink` as they are derived.
+    ///
+    /// `sink` returns `false` to stop early (LIMIT reached / client gone), which
+    /// bounds memory to the facts seen so far instead of the full closure.
+    /// Used for full-closure walks (e.g. go_is_a over 48k edges) where
+    /// materializing every inferred triple would be huge.
+    pub fn reason_streaming(
+        &self,
+        facts: &[Triple],
+        sink: &mut dyn FnMut(&InferredFact) -> bool,
+    ) -> ReasoningStats {
+        let mut all_facts: HashSet<Triple> = facts.iter().cloned().collect();
+        let mut rule_counts: HashMap<RuleId, usize> = HashMap::new();
+        let mut iterations = 0;
+        let mut budget_exceeded = false;
+        let mut stopped_early = false;
+
+        // Fast path: transitive closure using adjacency BFS
+        let mut transitive_handled: HashSet<String> = HashSet::new();
+        for (prop_name, prop_def) in &self.ontology.properties {
+            if !prop_def.is_transitive {
+                continue;
+            }
+            if all_facts.len() >= self.max_facts {
+                budget_exceeded = true;
+                break;
+            }
+            transitive_handled.insert(prop_name.clone());
+
+            let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+            for fact in &all_facts {
+                if fact.predicate == *prop_name {
+                    adj.entry(fact.subject.clone())
+                        .or_default()
+                        .push(fact.object.clone());
+                }
+            }
+            if adj.is_empty() {
+                continue;
+            }
+
+            for (start, targets) in &adj {
+                if budget_exceeded || stopped_early {
+                    break;
+                }
+                let mut visited: HashSet<String> = HashSet::new();
+                let mut queue: VecDeque<String> = VecDeque::new();
+                for t in targets {
+                    visited.insert(t.clone());
+                    queue.push_back(t.clone());
+                }
+                while let Some(node) = queue.pop_front() {
+                    if all_facts.len() >= self.max_facts {
+                        budget_exceeded = true;
+                        break;
+                    }
+                    let t = Triple::new(start, prop_name.as_str(), &node);
+                    if !all_facts.contains(&t) {
+                        let inf = InferredFact {
+                            triple: t.clone(),
+                            rule: RuleId::PrpTrp,
+                            premises: Vec::new(),
+                        };
+                        if !sink(&inf) {
+                            stopped_early = true;
+                            break;
+                        }
+                        all_facts.insert(t);
+                        *rule_counts.entry(RuleId::PrpTrp).or_insert(0) += 1;
+                    }
+                    if let Some(neighbors) = adj.get(&node) {
+                        for n in neighbors {
+                            if visited.insert(n.clone()) {
+                                queue.push_back(n.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if stopped_early {
+            return ReasoningStats {
+                rule_counts,
+                iterations,
+                budget_exceeded,
+                stopped_early,
+            };
+        }
+
+        // Fast path: Cax-sco / Cax-eqc
+        {
+            let superclass_cache = self.ontology.build_superclass_cache();
+            let mut class_subjects: HashMap<String, Vec<String>> = HashMap::new();
+            for fact in &all_facts {
+                if fact.predicate == "rdf:type" {
+                    class_subjects
+                        .entry(fact.object.clone())
+                        .or_default()
+                        .push(fact.subject.clone());
+                }
+            }
+            for (class_name, subjects) in &class_subjects {
+                if budget_exceeded || stopped_early {
+                    break;
+                }
+                let mut cax_new: Vec<Triple> = Vec::new();
+                if let Some(supers) = superclass_cache.get(class_name.as_str()) {
+                    for sup in supers {
+                        for subj in subjects {
+                            cax_new.push(Triple::type_of(subj, sup));
+                        }
+                    }
+                }
+                if let Some(class_def) = self.ontology.classes.get(class_name.as_str()) {
+                    for equiv in &class_def.equivalent_classes {
+                        for subj in subjects {
+                            cax_new.push(Triple::type_of(subj, equiv));
+                        }
+                    }
+                }
+                for t in cax_new {
+                    if all_facts.insert(t.clone()) {
+                        let inf = InferredFact {
+                            triple: t,
+                            rule: RuleId::CaxSco,
+                            premises: Vec::new(),
+                        };
+                        if !sink(&inf) {
+                            stopped_early = true;
+                            break;
+                        }
+                        *rule_counts.entry(RuleId::CaxSco).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        if stopped_early {
+            return ReasoningStats {
+                rule_counts,
+                iterations,
+                budget_exceeded,
+                stopped_early,
+            };
+        }
+
+        // Iterative rules (PrpInv/PrpSymp/PrpSpo/PrpEqp)
+        let mut new_facts: Vec<Triple> = facts
+            .iter()
+            .filter(|t| t.predicate != "rdf:type")
+            .cloned()
+            .collect();
+
+        for _iter in 0..self.max_iterations {
+            iterations += 1;
+            let mut new_this_round: Vec<(RuleId, Triple)> = Vec::new();
+            for rule in &self.rules {
+                match rule.id() {
+                    RuleId::CaxSco | RuleId::CaxEqc | RuleId::PrpTrp => continue,
+                    _ => {}
+                }
+                let inferred = rule.apply(&self.ontology, &all_facts, &new_facts);
+                *rule_counts.entry(rule.id()).or_insert(0) += inferred.len();
+                new_this_round.extend(inferred.into_iter().map(|t| (rule.id(), t)));
+            }
+
+            new_facts.clear();
+            let before = all_facts.len();
+            for (rule_id, t) in new_this_round {
+                if all_facts.insert(t.clone()) {
+                    let inf = InferredFact {
+                        triple: t.clone(),
+                        rule: rule_id,
+                        premises: Vec::new(),
+                    };
+                    if !sink(&inf) {
+                        stopped_early = true;
+                        break;
+                    }
+                    new_facts.push(t);
+                }
+            }
+            if stopped_early || all_facts.len() == before {
+                break;
+            }
+        }
+
+        ReasoningStats {
+            rule_counts,
+            iterations,
+            budget_exceeded,
+            stopped_early,
+        }
+    }
+
     /// Performs reasoning with parallel rule application.
     ///
     /// Independent rules (e.g., Prp-symp and Prp-inv) are applied concurrently.
@@ -112,7 +329,7 @@ impl Reasoner {
     #[allow(unused_assignments)]
     fn reason_inner(&self, facts: &[Triple], parallel: bool) -> ReasoningResult {
         let mut all_facts: HashSet<Triple> = facts.iter().cloned().collect();
-        let mut all_inferred: Vec<Triple> = Vec::new();
+        let mut all_inferred: Vec<InferredFact> = Vec::new();
         let mut rule_counts: HashMap<RuleId, usize> = HashMap::new();
         let mut iterations = 0;
         let mut new_facts: Vec<Triple> = Vec::new();
@@ -193,7 +410,11 @@ impl Reasoner {
                     rule_counts.insert(RuleId::PrpTrp, count);
                     for t in new_transitive {
                         all_facts.insert(t.clone());
-                        all_inferred.push(t);
+                        all_inferred.push(InferredFact {
+                            triple: t,
+                            rule: RuleId::PrpTrp,
+                            premises: Vec::new(),
+                        });
                     }
                 }
             }
@@ -238,7 +459,11 @@ impl Reasoner {
             let mut count = 0;
             for t in cax_new {
                 if all_facts.insert(t.clone()) {
-                    all_inferred.push(t);
+                    all_inferred.push(InferredFact {
+                        triple: t,
+                        rule: RuleId::CaxSco,
+                        premises: Vec::new(),
+                    });
                     count += 1;
                 }
             }
@@ -258,7 +483,7 @@ impl Reasoner {
 
         for _iter in 0..self.max_iterations {
             iterations += 1;
-            let mut new_this_round: Vec<Triple> = Vec::new();
+            let mut new_this_round: Vec<(RuleId, Triple)> = Vec::new();
 
             if parallel && self.rules.len() > 1 {
                 let rule_results: Vec<(RuleId, Vec<Triple>)> = std::thread::scope(|s| {
@@ -276,7 +501,7 @@ impl Reasoner {
                 });
                 for (rule_id, inferred) in rule_results {
                     *rule_counts.entry(rule_id).or_insert(0) += inferred.len();
-                    new_this_round.extend(inferred);
+                    new_this_round.extend(inferred.into_iter().map(|t| (rule_id, t)));
                 }
             } else {
                 for rule in &self.rules {
@@ -287,17 +512,21 @@ impl Reasoner {
                     }
                     let inferred = rule.apply(&self.ontology, &all_facts, &new_facts);
                     *rule_counts.entry(rule.id()).or_insert(0) += inferred.len();
-                    new_this_round.extend(inferred);
+                    new_this_round.extend(inferred.into_iter().map(|t| (rule.id(), t)));
                 }
             }
 
             // Deduplicate: only add triples not already known
             new_facts.clear();
             let before = all_facts.len();
-            for t in new_this_round {
+            for (rule_id, t) in new_this_round {
                 if all_facts.insert(t.clone()) {
                     new_facts.push(t.clone());
-                    all_inferred.push(t);
+                    all_inferred.push(InferredFact {
+                        triple: t,
+                        rule: rule_id,
+                        premises: Vec::new(),
+                    });
                 }
             }
 
@@ -370,7 +599,7 @@ impl Reasoner {
         // For additions only, we can be more efficient:
         // Only run rules that could produce new inferences from the added facts
         let mut all_facts: HashSet<Triple> = existing_facts.iter().cloned().collect();
-        let mut all_inferred: Vec<Triple> = Vec::new();
+        let mut all_inferred: Vec<InferredFact> = Vec::new();
         let mut rule_counts: HashMap<RuleId, usize> = HashMap::new();
 
         // Separate added facts by type
@@ -410,7 +639,11 @@ impl Reasoner {
             // Insert new inferences
             for t in cax_new {
                 if all_facts.insert(t.clone()) {
-                    all_inferred.push(t);
+                    all_inferred.push(InferredFact {
+                        triple: t,
+                        rule: RuleId::CaxSco,
+                        premises: Vec::new(),
+                    });
                     *rule_counts.entry(RuleId::CaxSco).or_insert(0) += 1;
                 }
             }
@@ -433,7 +666,11 @@ impl Reasoner {
                 *rule_counts.entry(rule.id()).or_insert(0) += inferred.len();
                 for t in inferred {
                     if all_facts.insert(t.clone()) {
-                        all_inferred.push(t);
+                        all_inferred.push(InferredFact {
+                            triple: t,
+                            rule: rule.id(),
+                            premises: Vec::new(),
+                        });
                     }
                 }
             }
@@ -441,13 +678,18 @@ impl Reasoner {
 
         // Run one more iteration to catch transitive closures from new facts
         if !all_inferred.is_empty() {
-            let inferred_clone = all_inferred.clone();
+            let inferred_clone: Vec<Triple> =
+                all_inferred.iter().map(|f| f.triple.clone()).collect();
             for rule in &self.rules {
                 let inferred = rule.apply(&self.ontology, &all_facts, &inferred_clone);
                 *rule_counts.entry(rule.id()).or_insert(0) += inferred.len();
                 for t in inferred {
                     if all_facts.insert(t.clone()) {
-                        all_inferred.push(t);
+                        all_inferred.push(InferredFact {
+                            triple: t,
+                            rule: rule.id(),
+                            premises: Vec::new(),
+                        });
                     }
                 }
             }

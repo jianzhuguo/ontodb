@@ -6290,29 +6290,27 @@ impl QueryExecutor {
         for fact in &result.inferred {
             let mut row = Map::new();
             row.insert("type".to_string(), Value::String("inferred".to_string()));
-            row.insert("subject".to_string(), Value::String(fact.subject.clone()));
+            row.insert(
+                "subject".to_string(),
+                Value::String(fact.triple.subject.clone()),
+            );
             row.insert(
                 "predicate".to_string(),
-                Value::String(fact.predicate.clone()),
+                Value::String(fact.triple.predicate.clone()),
             );
-            row.insert("object".to_string(), Value::String(fact.object.clone()));
-
-            // Find which rule produced this fact
-            let steps = reasoner.explain(&facts, fact);
-            if let Some(step) = steps.first() {
-                row.insert(
-                    "rule".to_string(),
-                    Value::String(format!("{:?}", step.rule)),
-                );
-                let premises: Vec<Value> = step
-                    .premises
-                    .iter()
-                    .map(|p| {
-                        Value::String(format!("({}, {}, {})", p.subject, p.predicate, p.object))
-                    })
-                    .collect();
-                row.insert("premises".to_string(), Value::Array(premises));
-            }
+            row.insert(
+                "object".to_string(),
+                Value::String(fact.triple.object.clone()),
+            );
+            row.insert("rule".to_string(), Value::String(format!("{:?}", fact.rule)));
+            let premises: Vec<Value> = fact
+                .premises
+                .iter()
+                .map(|p| {
+                    Value::String(format!("({}, {}, {})", p.subject, p.predicate, p.object))
+                })
+                .collect();
+            row.insert("premises".to_string(), Value::Array(premises));
             rows.push(row);
         }
 
@@ -6369,13 +6367,10 @@ impl QueryExecutor {
                     .collect(),
             )
         };
-        let matches_rules = |fact: &onto_ontology::Triple| -> bool {
+        let matches_rules = |fact: &onto_ontology::InferredFact| -> bool {
             match &wanted {
                 None => true,
-                Some(w) => reasoner
-                    .explain(&facts, fact)
-                    .iter()
-                    .any(|s| w.contains(&Self::normalize_rule_name(&format!("{:?}", s.rule)))),
+                Some(w) => w.contains(&Self::normalize_rule_name(&format!("{:?}", fact.rule))),
             }
         };
 
@@ -6386,12 +6381,19 @@ impl QueryExecutor {
                     continue;
                 }
                 let mut row = Map::new();
-                row.insert("subject".to_string(), Value::String(fact.subject.clone()));
-                row.insert("predicate".to_string(), Value::String(fact.predicate.clone()));
-                row.insert("object".to_string(), Value::String(fact.object.clone()));
-                if let Some(step) = reasoner.explain(&facts, fact).first() {
-                    row.insert("rule".to_string(), Value::String(format!("{:?}", step.rule)));
-                }
+                row.insert(
+                    "subject".to_string(),
+                    Value::String(fact.triple.subject.clone()),
+                );
+                row.insert(
+                    "predicate".to_string(),
+                    Value::String(fact.triple.predicate.clone()),
+                );
+                row.insert(
+                    "object".to_string(),
+                    Value::String(fact.triple.object.clone()),
+                );
+                row.insert("rule".to_string(), Value::String(format!("{:?}", fact.rule)));
                 rows.push(row);
             }
             return Ok(QueryResult::Rows(rows));
@@ -6416,20 +6418,23 @@ impl QueryExecutor {
             let mut types: Vec<Value> = Vec::new();
             let mut inferred: Vec<Value> = Vec::new();
             for fact in &result.inferred {
-                if fact.subject != pk || !matches_rules(fact) {
+                if fact.triple.subject != pk || !matches_rules(fact) {
                     continue;
                 }
-                if fact.predicate == "rdf:type" {
+                if fact.triple.predicate == "rdf:type" {
                     if add_types {
-                        types.push(Value::String(fact.object.clone()));
+                        types.push(Value::String(fact.triple.object.clone()));
                     }
                 } else if add_inferred {
                     inferred.push(Value::Object(Map::from_iter(vec![
                         (
                             "predicate".to_string(),
-                            Value::String(fact.predicate.clone()),
+                            Value::String(fact.triple.predicate.clone()),
                         ),
-                        ("object".to_string(), Value::String(fact.object.clone())),
+                        (
+                            "object".to_string(),
+                            Value::String(fact.triple.object.clone()),
+                        ),
                     ])));
                 }
             }
@@ -6441,6 +6446,100 @@ impl QueryExecutor {
             }
         }
         Ok(QueryResult::Rows(rows))
+    }
+
+    /// Stream inferred triples in batches to `sink` without materializing the
+    /// full closure in memory. `limit` caps the number of emitted rows and
+    /// stops the closure walk early.
+    ///
+    /// This is the streaming counterpart of `execute_infer(materialize=true)`:
+    /// `reason_streaming` emits each inferred fact as it is derived, we batch
+    /// them into row maps, and forward to the sink in
+    /// [`Self::STREAM_BATCH_ROWS`] chunks.
+    pub fn execute_infer_streaming(
+        &self,
+        query: &QueryAst,
+        rules: &[String],
+        limit: Option<usize>,
+        engine: &LsmEngine,
+        mut sink: impl FnMut(Vec<Map<String, Value>>) -> bool,
+    ) -> Result<usize> {
+        self.arm_timeout();
+        let facts = self.collect_facts_for_reasoning(query, engine)?;
+        let class_name = Self::infer_target_class(query);
+
+        let ontology = match class_name {
+            Some("*") | None => self.get_merged_ontology(engine),
+            Some(c) => match self.ontology_store.find_ontology_for_class_global(engine, c)? {
+                Some(o) => o,
+                None => {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "INFER: no ontology defines class {}",
+                        c
+                    )))
+                }
+            },
+        };
+
+        let reasoner = onto_ontology::Reasoner::new(ontology);
+        let wanted: Option<std::collections::HashSet<String>> = if rules.is_empty() {
+            None
+        } else {
+            Some(
+                rules
+                    .iter()
+                    .map(|r| Self::normalize_rule_name(r))
+                    .collect(),
+            )
+        };
+
+        let mut batch: Vec<Map<String, Value>> = Vec::with_capacity(Self::STREAM_BATCH_ROWS);
+        let mut emitted = 0usize;
+        let mut sink_open = true;
+
+        {
+            let mut emit = |inf: &onto_ontology::InferredFact| -> bool {
+                if let Some(w) = &wanted {
+                    if !w.contains(&Self::normalize_rule_name(&format!("{:?}", inf.rule))) {
+                        return true;
+                    }
+                }
+                let mut row = Map::new();
+                row.insert(
+                    "subject".to_string(),
+                    Value::String(inf.triple.subject.clone()),
+                );
+                row.insert(
+                    "predicate".to_string(),
+                    Value::String(inf.triple.predicate.clone()),
+                );
+                row.insert(
+                    "object".to_string(),
+                    Value::String(inf.triple.object.clone()),
+                );
+                row.insert("rule".to_string(), Value::String(format!("{:?}", inf.rule)));
+                batch.push(row);
+                emitted += 1;
+                if batch.len() >= Self::STREAM_BATCH_ROWS {
+                    let out = std::mem::take(&mut batch);
+                    if !sink(out) {
+                        sink_open = false;
+                        return false;
+                    }
+                }
+                match limit {
+                    Some(l) if emitted >= l => false,
+                    _ => true,
+                }
+            };
+
+            let _stats = reasoner.reason_streaming(&facts, &mut emit);
+        }
+
+        if sink_open && !batch.is_empty() {
+            let _ = sink(batch);
+        }
+        Ok(emitted)
     }
 
     /// Target class of an Infer-scoped query (`*` = all classes).

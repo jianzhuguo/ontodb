@@ -1693,10 +1693,20 @@ async fn execute_query(
         QueryAst::Select { limit: Some(l), .. } => *l <= 100,
         _ => false,
     };
+    // INFER materialize streams inferred triples as they are derived —
+    // full-closure walks (go_is_a over 48k edges) must not materialize.
+    let infer_stream = matches!(
+        &ast,
+        QueryAst::Infer {
+            materialize: true,
+            ..
+        }
+    );
     let streamable = !req.pretty
-        && (!small_limit || has_order_by)
-        && onto_query::QueryExecutor::is_read_only_query(&ast)
-        && onto_query::QueryExecutor::is_streamable_select(&ast);
+        && (infer_stream
+            || ((!small_limit || has_order_by)
+                && onto_query::QueryExecutor::is_read_only_query(&ast)
+                && onto_query::QueryExecutor::is_streamable_select(&ast)));
 
     if streamable {
         let (tx, rx) = std::sync::mpsc::sync_channel::<StreamEvent>(8);
@@ -1715,7 +1725,21 @@ async fn execute_query(
                     return;
                 }
             };
-            match executor.execute_read_streaming(&ast_for_stream, &mut sink) {
+            let result = match &ast_for_stream {
+                QueryAst::Infer { query, rules, .. } => {
+                    // Bound the walk so a full-closure INFER cannot buffer
+                    // unbounded memory server-side; the cap is generous.
+                    executor.execute_infer_streaming(
+                        query.as_ref(),
+                        rules,
+                        Some(1_000_000usize),
+                        &executor.engine().default_engine(),
+                        &mut sink,
+                    )
+                }
+                _ => executor.execute_read_streaming(&ast_for_stream, &mut sink),
+            };
+            match result {
                 Ok(_) => {
                     let _ = send(StreamEvent::Done);
                 }
