@@ -1989,6 +1989,14 @@ impl QueryExecutor {
                         "properties".to_string(),
                         serde_json::json!(class.properties),
                     );
+                    class_info.insert(
+                        "restrictions".to_string(),
+                        serde_json::json!(class.restrictions),
+                    );
+                    class_info.insert(
+                        "unique_columns".to_string(),
+                        serde_json::json!(class.unique_columns),
+                    );
                     classes.insert(name.clone(), serde_json::Value::Object(class_info));
                 }
 
@@ -16986,12 +16994,6 @@ impl QueryExecutor {
         let prefix = format!("{}::", class);
         let entries = engine.scan_prefix(prefix.as_bytes())?;
 
-        // Parse existing documents
-        let existing_docs: Vec<Map<String, Value>> = entries
-            .iter()
-            .filter_map(|(_, val_bytes)| Self::parse_doc_bytes(val_bytes))
-            .collect();
-
         // Check each unique constraint
         for unique_cols in &class_def.unique_columns {
             // Extract the values for the unique columns from the new document
@@ -17005,8 +17007,13 @@ impl QueryExecutor {
                 continue;
             }
 
-            // Compare with existing documents
-            for existing in &existing_docs {
+            // Compare with existing documents. Stream-parse each entry and
+            // compare immediately - collecting every row into a Vec allocated
+            // ~1.2GB on the 2.45M-row Compound class and froze the insert.
+            for (_key, val_bytes) in &entries {
+                let Some(existing) = Self::parse_doc_bytes(val_bytes) else {
+                    continue;
+                };
                 let existing_values: Vec<Option<&Value>> = unique_cols
                     .iter()
                     .map(|col| existing.get(col.as_str()))
