@@ -5737,6 +5737,95 @@ mod tests {
         assert_eq!(one.len(), 1);
     }
 
+    /// Regression: prefix-parent user keys (`T::1` vs `T::10`) mis-order in
+    /// MemTable's composite key (`user_key ++ !seq`). The streaming merge scans
+    /// assume user-key order per source; with versions split across memtable
+    /// and SST the key group was visited twice and emitted duplicate rows
+    /// (observed as 28 duplicate pks on a sembio.Target pilot+full re-import,
+    /// and 2x vector-index nodes on CREATE backfill).
+    #[test]
+    fn test_prefix_parent_keys_emitted_once_across_memtable_and_sst() {
+        let dir = tempdir().expect("should be valid");
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            memtable_size_limit: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).expect("should be valid");
+
+        // Round 1 -> flushed to an SST.
+        engine
+            .put(b"T::1".to_vec(), b"old-1".to_vec())
+            .expect("should be valid");
+        engine
+            .put(b"T::10".to_vec(), b"old-10".to_vec())
+            .expect("should be valid");
+        engine
+            .put(b"T::100".to_vec(), b"old-100".to_vec())
+            .expect("should be valid");
+        engine.flush().expect("should be valid");
+
+        // Round 2 stays in the memtable: same keys (newer versions). T::1 is a
+        // byte-prefix of T::10 and T::100; T::10 of T::100.
+        engine
+            .put(b"T::10".to_vec(), b"new-10".to_vec())
+            .expect("should be valid");
+        engine
+            .put(b"T::1".to_vec(), b"new-1".to_vec())
+            .expect("should be valid");
+        engine
+            .put(b"T::100".to_vec(), b"new-100".to_vec())
+            .expect("should be valid");
+
+        let expected = vec![
+            (b"T::1".to_vec(), b"new-1".to_vec()),
+            (b"T::10".to_vec(), b"new-10".to_vec()),
+            (b"T::100".to_vec(), b"new-100".to_vec()),
+        ];
+
+        // for_each_live_prefix_until: each key exactly once, latest version.
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        engine
+            .for_each_live_prefix_until(b"T::", None, None, |k, v| {
+                got.push((k.to_vec(), v.to_vec()));
+                Ok(true)
+            })
+            .expect("should be valid");
+        let mut sorted = got.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted, expected,
+            "for_each_live_prefix_until must emit each key once; got {:?}",
+            got
+        );
+
+        // scan_prefix_after: same contract.
+        let paged = engine
+            .scan_prefix_after(b"T::", None, 100)
+            .expect("should be valid");
+        let mut sorted = paged.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted, expected,
+            "scan_prefix_after must emit each key once; got {:?}",
+            paged
+        );
+
+        // scan_prefix_page_kind: one entry per key.
+        let kinds = engine
+            .scan_prefix_page_kind(b"T::", None, 100)
+            .expect("should be valid");
+        let mut keys: Vec<Vec<u8>> = kinds.iter().map(|(k, _)| k.clone()).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            3,
+            "scan_prefix_page_kind must emit each key once; got {:?}",
+            kinds
+        );
+    }
+
     /// count_prefix_with applies a per-value predicate without materializing
     /// values into the dedup map, and only evaluates the winning version.
     #[test]

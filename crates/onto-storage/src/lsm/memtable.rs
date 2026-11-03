@@ -297,7 +297,16 @@ impl MemTable {
     /// Uses BTreeMap range query to skip non-matching entries — O(log n + matches)
     /// instead of O(total_entries) for full iteration + filter.
     ///
-    /// Note: returns ALL versions (including tombstones and older versions).
+    /// Yields ALL versions (including tombstones and older versions) in
+    /// **user-key ascending order, newest version first within a key**. The
+    /// BTreeMap composite key (`user_key ++ !seq`) is NOT user-key ordered when
+    /// one user key is a byte-prefix of another (e.g. `K::1` vs `K::10`: the
+    /// inverted-seq suffix of the shorter key sorts after the longer key's next
+    /// byte), so the range output is re-sorted here. Streaming-merge callers
+    /// (`for_each_live_prefix_until`, `scan_prefix_after`,
+    /// `scan_prefix_page_kind`) k-way merge this against key-sorted SSTs and
+    /// emit a key group twice if a source deviates from user-key order.
+    ///
     /// The caller is responsible for deduplication and tombstone filtering.
     pub fn scan_prefix(&self, prefix: &[u8]) -> impl Iterator<Item = &MemTableEntry> {
         // Composite key lower bound: prefix ++ 0x00*8 (smallest seq part)
@@ -317,9 +326,15 @@ impl MemTable {
         } else {
             std::ops::Bound::Excluded(upper.as_slice())
         };
-        self.data
+        let mut matched: Vec<&MemTableEntry> = self
+            .data
             .range::<[u8], _>((std::ops::Bound::Included(lower.as_slice()), end))
             .map(|(_, e)| e)
+            .collect();
+        // Restore user-key order (see doc comment): composite-key order can
+        // interleave prefix-parent keys, which double-emits in merge scans.
+        matched.sort_by(|a, b| a.key.cmp(&b.key).then(b.seq_no.cmp(&a.seq_no)));
+        matched.into_iter()
     }
 
     /// Compute the exclusive upper bound for a prefix range scan.
@@ -462,6 +477,35 @@ mod tests {
 
         let (val, _) = mt.get(b"k").unwrap();
         assert_eq!(val, b"v2");
+    }
+
+    #[test]
+    fn test_scan_prefix_user_key_order_with_prefix_parents() {
+        // The BTreeMap composite key (user_key ++ !seq) mis-orders entries when
+        // one user key is a byte-prefix of another (`K::1` vs `K::10`). The
+        // streaming merge scans assume user-key order per source and emit a
+        // key group twice when it is violated. scan_prefix must re-sort to
+        // (user-key asc, seq desc) — that is the contract its consumers rely on.
+        let mut mt = MemTable::new();
+        mt.put(b"K::10".to_vec(), b"b".to_vec());
+        mt.put(b"K::1".to_vec(), b"a1".to_vec());
+        mt.put(b"K::100".to_vec(), b"c".to_vec());
+        mt.put(b"K::1".to_vec(), b"a2".to_vec()); // newer version of K::1
+
+        let got: Vec<(&[u8], &[u8])> = mt
+            .scan_prefix(b"K::")
+            .map(|e| (e.key.as_slice(), e.value.as_slice()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (b"K::1".as_slice(), b"a2".as_slice()),
+                (b"K::1".as_slice(), b"a1".as_slice()),
+                (b"K::10".as_slice(), b"b".as_slice()),
+                (b"K::100".as_slice(), b"c".as_slice()),
+            ],
+            "user-key ascending, newest version first within a key"
+        );
     }
 
     #[test]
