@@ -1861,12 +1861,35 @@ impl QueryParser {
         {
             return Self::parse_literal(s);
         }
-        // Bare identifier (possibly quoted with double quotes) → column reference.
+        // Bare identifier (possibly quoted with double quotes) -> column reference.
+        //
+        // Anything that is not a plain identifier (e.g. a function call like
+        // `REPLACE(id, 'x', '')`) must be rejected: previously it fell through
+        // to Column(), the executor looked up a column named "REPLACE(id,...)"
+        // (which never exists) and wrote Null - silently destroying data while
+        // reporting rows-updated success.
         let ident = Self::strip_surrounding_quotes(s);
         if ident.is_empty() {
             return Ok(LiteralValue::String(String::new()));
         }
+        if !Self::is_plain_identifier(&ident) {
+            return Err(CoreError::InvalidArgument(format!(
+                "unsupported expression in SET: '{}' - only literals and plain column references are supported",
+                s
+            )));
+        }
         Ok(LiteralValue::Column(ident.to_string()))
+    }
+
+    /// True when `s` is a plain identifier: letters, digits, underscore,
+    /// and `.`/`:` separators for qualified names like `sembio.Protein`.
+    fn is_plain_identifier(s: &str) -> bool {
+        let mut chars = s.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':')
     }
 
     /// Simple matching paren finder (no quote handling needed for values).
@@ -5707,6 +5730,25 @@ mod tests {
             },
             _ => panic!("expected Update"),
         }
+    }
+
+    /// Function-call expressions on SET RHS must be rejected, not silently
+    /// coerced to a column name (which made the executor write Null).
+    #[test]
+    fn test_update_set_expression_rejected() {
+        let err = QueryParser::parse(
+            "UPDATE T SET uniprot_id = REPLACE(id, 'sembio::Protein::', '') WHERE id = 'x'",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported expression"),
+            "expected expression rejection, got: {}",
+            err
+        );
+
+        // Other punctuation-bearing RHS forms must also be rejected.
+        assert!(QueryParser::parse("UPDATE T SET a = b + c").is_err());
+        assert!(QueryParser::parse("UPDATE T SET a = f(b)").is_err());
     }
 
     // ===== LIKE Pattern Quote Escaping Tests =====
