@@ -273,13 +273,26 @@ fn sanitize_error(err: &str) -> String {
     // Keep user-facing parse/validation errors, strip internal paths
     if lower.contains("parse error") || lower.contains("syntax error") || lower.contains("invalid")
     {
-        // Sanitize: remove any Windows/Unix path patterns
-        let sanitized: String = err
-            .split(['\\', '/'])
-            .next_back()
-            .unwrap_or(err)
-            .to_string();
-        return sanitized;
+        // Redact path-like whitespace tokens (contain '\' or '/'). The old
+        // split(sep).next_back() kept only the last path segment — it replaced
+        // the whole message with a bare filename and returned "" when the
+        // message ended with a separator.
+        let sanitized = err
+            .split_whitespace()
+            .map(|tok| {
+                if tok.contains('\\') || tok.contains('/') {
+                    "<path>"
+                } else {
+                    tok
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        return if sanitized.trim().is_empty() {
+            "query execution failed".to_string()
+        } else {
+            sanitized
+        };
     }
     // Resource-guard rejections (MAX_GROUPS / DISTINCT caps) are intentional
     // user-facing messages — the client needs to know the query was rejected
@@ -1454,8 +1467,37 @@ async fn execute_query(
                         }
                     }
                 }
-                onto_query::OntoQLAst::CreateProperty { name, domain, range, required, multi_valued, .. } => {
-                    match state.executor.add_ontology_property(name, domain, range, *required, *multi_valued) {
+                onto_query::OntoQLAst::CreateProperty {
+                    name,
+                    domain,
+                    range,
+                    required,
+                    multi_valued,
+                    inverse_of,
+                    characteristics,
+                    ..
+                } => {
+                    use onto_query::ontoql::Characteristic;
+                    let is_functional = characteristics
+                        .iter()
+                        .any(|c| matches!(c, Characteristic::Functional));
+                    let is_symmetric = characteristics
+                        .iter()
+                        .any(|c| matches!(c, Characteristic::Symmetric));
+                    let is_transitive = characteristics
+                        .iter()
+                        .any(|c| matches!(c, Characteristic::Transitive));
+                    match state.executor.add_ontology_property(
+                        name,
+                        domain,
+                        range,
+                        *required,
+                        *multi_valued,
+                        inverse_of.as_deref(),
+                        is_functional,
+                        is_symmetric,
+                        is_transitive,
+                    ) {
                         Ok(()) => {
                             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
                             state.metrics.record_query("CREATE_PROPERTY", elapsed_ms / 1000.0, true);
@@ -1464,6 +1506,30 @@ async fn execute_query(
                                 PrettyJson(
                                     ApiResponse::success(
                                         json!({"message": format!("Property '{}' added to '{}'", name, domain)}),
+                                        elapsed_ms,
+                                    ),
+                                    req.pretty,
+                                ),
+                            ).into_response();
+                        }
+                        Err(e) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                PrettyJson(ApiResponse::<Value>::error(e.to_string()), false),
+                            ).into_response();
+                        }
+                    }
+                }
+                onto_query::OntoQLAst::AlterProperty { name, domain, range } => {
+                    match state.executor.alter_ontology_property(name, domain, range) {
+                        Ok(()) => {
+                            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                            state.metrics.record_query("ALTER_PROPERTY", elapsed_ms / 1000.0, true);
+                            return (
+                                StatusCode::OK,
+                                PrettyJson(
+                                    ApiResponse::success(
+                                        json!({"message": format!("Property '{}' on '{}' range changed to '{}'", name, domain, range)}),
                                         elapsed_ms,
                                     ),
                                     req.pretty,
@@ -5582,5 +5648,38 @@ async fn split_shard(
                 e
             ))),
         ),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_error;
+
+    #[test]
+    fn test_sanitize_error_message_ending_with_path() {
+        // A message ending in a path used to collapse to "" (next_back of the
+        // split is the empty trailing segment).
+        let out = sanitize_error("invalid value in E:\\sembio\\data\\");
+        assert!(!out.trim().is_empty(), "must not return an empty string");
+        assert!(out.contains("invalid value in"), "message text must survive: {}", out);
+        assert!(!out.contains("sembio"), "path must be redacted: {}", out);
+    }
+
+    #[test]
+    fn test_sanitize_error_redacts_internal_paths() {
+        let out = sanitize_error("parse error at C:\\ontodb\\src\\main.rs");
+        assert!(out.contains("parse error at"), "message text must survive: {}", out);
+        assert!(!out.contains("ontodb"), "path must be redacted: {}", out);
+        assert!(out.contains("<path>"), "path token becomes <path>: {}", out);
+
+        let out = sanitize_error("syntax error near /var/lib/ontodb/file.sst");
+        assert!(out.contains("syntax error near"), "message text must survive: {}", out);
+        assert!(!out.contains("lib/ontodb"), "path must be redacted: {}", out);
+    }
+
+    #[test]
+    fn test_sanitize_error_keeps_plain_messages() {
+        assert_eq!(sanitize_error("parse error: unexpected token 'foo'"), "parse error: unexpected token 'foo'");
     }
 }

@@ -195,6 +195,16 @@ impl OntologyStore {
                 for (name, prop) in &ontology.properties {
                     if !merged.properties.contains_key(name) {
                         merged.properties.insert(name.clone(), prop.clone());
+                    } else {
+                        // Same property name from another class: keep the
+                        // shadowed entry under a `domain::name` key so
+                        // class-scoped lookups (DESCRIBE, resolve_property)
+                        // can still find this class's own definition.
+                        let qualified = format!("{}::{}", prop.domain, name);
+                        merged
+                            .properties
+                            .entry(qualified)
+                            .or_insert_with(|| prop.clone());
                     }
                 }
             }

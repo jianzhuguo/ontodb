@@ -311,6 +311,24 @@ impl Ontology {
         props
     }
 
+    /// Resolves a property definition for a class.
+    ///
+    /// Merged ontology views key properties by bare name, which shadows
+    /// same-named properties from other classes; the shadowed entries survive
+    /// under `domain::name` keys (see `OntologyStore::merge_namespace_ontologies`).
+    /// This prefers the class-scoped entry over a bare entry owned by a
+    /// different domain.
+    pub fn resolve_property(&self, class_name: &str, prop_name: &str) -> Option<&Property> {
+        self.properties
+            .get(&format!("{}::{}", class_name, prop_name))
+            .or_else(|| {
+                self.properties
+                    .get(prop_name)
+                    .filter(|p| p.domain == class_name)
+            })
+            .or_else(|| self.properties.get(prop_name))
+    }
+
     /// Checks if a class is a subclass of another (directly or indirectly).
     pub fn is_subclass_of(&self, child: &str, parent: &str) -> bool {
         if child == parent {
@@ -355,7 +373,7 @@ impl Ontology {
         if let Some(class) = self.classes.get(class_name) {
             // Collect own properties
             for prop_name in &class.properties {
-                if let Some(prop) = self.properties.get(prop_name) {
+                if let Some(prop) = self.resolve_property(class_name, prop_name) {
                     props.push(prop);
                 }
             }

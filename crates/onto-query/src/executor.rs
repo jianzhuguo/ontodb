@@ -2282,20 +2282,20 @@ impl QueryExecutor {
         range: &str,
         required: bool,
         multi_valued: bool,
+        inverse_of: Option<&str>,
+        is_functional: bool,
+        is_symmetric: bool,
+        is_transitive: bool,
     ) -> Result<()> {
         let engine = &self.engine.default_engine();
         // Find ontology that contains this class
-        let ontology_name = domain; // ontology named after class
         let mut ontology = self
             .ontology_store
-            .load(Some(onto_ontology::store::DEFAULT_NAMESPACE), ontology_name)
-            .ok()
-            .flatten()
-            .or_else(|| self.ontology_store.load(None, ontology_name).ok().flatten())
+            .find_ontology_for_class_global(engine, domain)?
             .ok_or_else(|| {
                 onto_core::CoreError::InvalidArgument(format!(
-                    "Ontology '{}' not found for domain '{}'",
-                    ontology_name, domain
+                    "No ontology contains class '{}'",
+                    domain
                 ))
             })?;
 
@@ -2315,10 +2315,10 @@ impl QueryExecutor {
             required,
             multi_valued,
             equivalent_properties: vec![],
-            inverse_of: None,
-            is_transitive: false,
-            is_symmetric: false,
-            is_functional: false,
+            inverse_of: inverse_of.map(|s| s.to_string()),
+            is_transitive,
+            is_symmetric,
+            is_functional,
             subproperty_of: vec![],
         };
 
@@ -2331,6 +2331,61 @@ impl QueryExecutor {
                 class.properties.push(name.to_string());
             }
         }
+
+        // Delete old entry then save new
+        let key = {
+            let mut k = Vec::new();
+            if let Some(ref ns) = ontology.namespace {
+                k.extend_from_slice(b"__ontology__");
+                k.extend_from_slice(ns.as_bytes());
+                k.extend_from_slice(b"::");
+            } else {
+                k.extend_from_slice(b"__ontology__");
+            }
+            k.extend_from_slice(ontology.name.as_bytes());
+            k
+        };
+        engine.delete(key)?;
+        self.ontology_store.save_with_engine(engine, &ontology)?;
+        engine.flush()?;
+        self.inference_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate_ontology(&ontology.name);
+        Ok(())
+    }
+
+    /// Changes the range (data type) of an existing property definition.
+    pub fn alter_ontology_property(&self, name: &str, domain: &str, range: &str) -> Result<()> {
+        let engine = &self.engine.default_engine();
+        let ontology_name = domain; // ontology named after class
+        let mut ontology = self
+            .ontology_store
+            .find_ontology_for_class_global(engine, domain)?
+            .ok_or_else(|| {
+                onto_core::CoreError::InvalidArgument(format!(
+                    "Ontology '{}' not found for domain '{}'",
+                    ontology_name, domain
+                ))
+            })?;
+
+        let data_type = match onto_ontology::DataType::from_str(range) {
+            Some(dt) => dt,
+            None => {
+                return Err(onto_core::CoreError::InvalidArgument(format!(
+                    "Unknown property range type '{}'",
+                    range
+                )))
+            }
+        };
+
+        let property = ontology.properties.get_mut(name).ok_or_else(|| {
+            onto_core::CoreError::InvalidArgument(format!(
+                "Property '{}' not found on domain '{}'",
+                name, domain
+            ))
+        })?;
+        property.range = data_type;
 
         // Delete old entry then save new
         let key = {
@@ -3629,6 +3684,40 @@ impl QueryExecutor {
                     )))
                 }
             }
+            QueryAst::CreateOntologyProperty {
+                name,
+                domain,
+                range,
+                required,
+                multi_valued,
+                inverse_of,
+                is_functional,
+                is_symmetric,
+                is_transitive,
+            } => {
+                self.add_ontology_property(
+                    name,
+                    domain,
+                    range,
+                    *required,
+                    *multi_valued,
+                    inverse_of.as_deref(),
+                    *is_functional,
+                    *is_symmetric,
+                    *is_transitive,
+                )?;
+                Ok(QueryResult::Success(format!(
+                    "Property '{}' added to '{}'",
+                    name, domain
+                )))
+            }
+            QueryAst::AlterOntologyProperty { name, domain, range } => {
+                self.alter_ontology_property(name, domain, range)?;
+                Ok(QueryResult::Success(format!(
+                    "Property '{}' on '{}' range changed to '{}'",
+                    name, domain, range
+                )))
+            }
             QueryAst::Copy {
                 class,
                 file_path,
@@ -3916,6 +4005,9 @@ impl QueryExecutor {
             PlanNode::Filter {
                 input, predicate, ..
             } => {
+                if let Some(rows) = self.plan_pk_point_lookup(predicate, input)? {
+                    return Ok(rows);
+                }
                 let mut rows = self.execute_plan_node(input, engine)?;
                 let filter_expr = Some(predicate.clone());
                 rows.retain(|row| self.matches_filter(engine, row, &filter_expr));
@@ -4209,6 +4301,13 @@ impl QueryExecutor {
         }
 
         // Regular table scan �?expand class hierarchy via ontology reasoning
+        // Point-lookup fast path: `__pk__ = '<key>'` (bare or ANDed) resolves
+        // via direct engine get instead of a full multi-million-row scan.
+        if let Some(f) = filter.as_ref() {
+            if let Some(rows) = self.pk_lookup_filtered(engine, table, f)? {
+                return Ok(rows);
+            }
+        }
         let class_hierarchy = self.get_class_hierarchy(engine, table);
         tracing::debug!(
             "plan_seq_scan: table='{}', class_hierarchy={:?}",
@@ -5540,6 +5639,16 @@ impl QueryExecutor {
                 for (name, prop) in &ontology.properties {
                     if !merged.properties.contains_key(name) {
                         merged.properties.insert(name.clone(), prop.clone());
+                    } else {
+                        // Same property name from another class: keep the
+                        // shadowed entry under a `domain::name` key so
+                        // class-scoped lookups (DESCRIBE, resolve_property)
+                        // can still find this class's own definition.
+                        let qualified = format!("{}::{}", prop.domain, name);
+                        merged
+                            .properties
+                            .entry(qualified)
+                            .or_insert_with(|| prop.clone());
                     }
                 }
             }
@@ -6876,7 +6985,7 @@ impl QueryExecutor {
                 known.insert(prop_name.clone());
                 let mut row = Map::new();
                 row.insert("column".to_string(), Value::String(prop_name.clone()));
-                if let Some(prop) = merged.properties.get(prop_name) {
+                if let Some(prop) = merged.resolve_property(class, prop_name) {
                     row.insert(
                         "type".to_string(),
                         Value::String(prop.range.as_str().to_string()),
@@ -7079,6 +7188,9 @@ impl QueryExecutor {
             PlanNode::Filter {
                 input, predicate, ..
             } => {
+                if let Some(rows) = self.plan_pk_point_lookup(predicate, input)? {
+                    return Ok(rows);
+                }
                 let mut rows = self.execute_plan_node_read(input, engine)?;
                 rows.retain(|row| self.eval_filter_read(engine, row, predicate));
                 Ok(rows)
@@ -7375,6 +7487,13 @@ impl QueryExecutor {
             }
             return Ok(rows);
         }
+        // Point-lookup fast path: `__pk__ = '<key>'` (bare or ANDed) resolves
+        // via a narrow key-prefix scan instead of a full multi-million-row scan.
+        if let Some(f) = filter.as_ref() {
+            if let Some(rows) = self.pk_lookup_filtered(engine, table, f)? {
+                return Ok(rows);
+            }
+        }
         // If the filter is a simple indexed-column predicate, use the index
         // directly. The planner may still choose SeqScan (stale/absent stats),
         // which is fatal for low-selectivity filters where LIMIT early-exit
@@ -7433,6 +7552,13 @@ impl QueryExecutor {
             }
         }
 
+        // Point-lookup fast path: `__pk__ = '<key>'` (bare or ANDed) resolves
+        // via direct engine get instead of a full multi-million-row scan.
+        if let Some(f) = filter.as_ref() {
+            if let Some(rows) = self.pk_lookup_filtered(engine, table, f)? {
+                return Ok(rows);
+            }
+        }
         let class_hierarchy = self.get_class_hierarchy_read(engine, table);
 
         // Pre-extract simple filter column names for fast byte-level rejection.
@@ -7624,6 +7750,133 @@ impl QueryExecutor {
 
         tracing::debug!(table = %table, scanned = scan_count, returned = rows.len(), "seq_scan done");
         Ok(rows)
+    }
+
+    /// Flattens nested `And` conjunctions into `out`.
+    fn flatten_and(filter: &FilterExpr, out: &mut Vec<FilterExpr>) {
+        match filter {
+            FilterExpr::And(l, r) => {
+                Self::flatten_and(l, out);
+                Self::flatten_and(r, out);
+            }
+            other => out.push(other.clone()),
+        }
+    }
+
+    /// Splits a filter into the pk named by a `__pk__ = '<key>'` conjunct and
+    /// the residual predicate (AND of the remaining conjuncts, `None` when the
+    /// filter is a bare pk equality). Returns `None` when no pk conjunct
+    /// exists or when several do (ambiguous).
+    fn pk_and_split(filter: &FilterExpr) -> Option<(String, Option<FilterExpr>)> {
+        let mut conjuncts = Vec::new();
+        Self::flatten_and(filter, &mut conjuncts);
+        let mut pk: Option<String> = None;
+        let mut rest: Vec<FilterExpr> = Vec::new();
+        for c in conjuncts {
+            match c {
+                FilterExpr::Eq(col, LiteralValue::String(k)) if col == "__pk__" => {
+                    if pk.is_some() {
+                        return None;
+                    }
+                    pk = Some(k);
+                }
+                other => rest.push(other),
+            }
+        }
+        let pk = pk?;
+        let residual = rest
+            .into_iter()
+            .reduce(|a, b| FilterExpr::And(Box::new(a), Box::new(b)));
+        Some((pk, residual))
+    }
+
+    /// Point-lookup fast path for filters containing `__pk__ = '<key>'` as a
+    /// conjunct — bare or ANDed with residual predicates. Returns `Ok(None)`
+    /// when no pk conjunct is present so callers fall back to the generic
+    /// scan path. Residual predicates are evaluated on the fetched row: the
+    /// scan-side BinaryRow filter cannot evaluate the virtual `__pk__` column,
+    /// so AND forms must not fall through to a full-table filter pass.
+    fn pk_lookup_filtered(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        filter: &FilterExpr,
+    ) -> Result<Option<Vec<Map<String, Value>>>> {
+        let Some((pk, residual)) = Self::pk_and_split(filter) else {
+            return Ok(None);
+        };
+        let rows = self.pk_point_lookup_rows(table, &pk)?;
+        let rows = match residual {
+            None => rows,
+            Some(expr) => rows
+                .into_iter()
+                .filter(|doc| self.eval_filter(engine, doc, &expr))
+                .collect(),
+        };
+        Ok(Some(rows))
+    }
+
+    /// Resolves a pk to its row via a narrow engine scan.
+    ///
+    /// The storage key IS the pk, so a pk equality match is effectively a
+    /// point lookup. Without this, every row targeted by pk pays a full
+    /// multi-million-row scan (observed ~40s per UPDATE on
+    /// sembio.CompoundProperty). Keys outside the class-hierarchy prefix are
+    /// rejected: scan_prefix would never have returned them, and a
+    /// caller-supplied pk can name any key in the engine.
+    ///
+    /// Lookup uses `scan_prefix` (prefix = full key, then exact-key match)
+    /// instead of `engine.get`: `get` can miss rows that `scan_prefix` still
+    /// surfaces after flush/compaction (known tombstone view inconsistency —
+    /// same reason `drop_ontology` switched its existence check to scans).
+    fn pk_point_lookup_rows(&self, table: &str, pk: &str) -> Result<Vec<Map<String, Value>>> {
+        let engine = self.engine.engine_for_class(table);
+        let hierarchy = self.get_class_hierarchy(&engine, table);
+        if !hierarchy
+            .iter()
+            .any(|c| pk.starts_with(&format!("{}::", c)))
+        {
+            return Ok(Vec::new());
+        }
+        let pk_bytes = pk.as_bytes();
+        let mut found: Option<Vec<u8>> = None;
+        for (key, val_bytes) in engine.scan_prefix(pk_bytes)? {
+            if key == pk_bytes {
+                found = Some(val_bytes);
+                break;
+            }
+        }
+        let Some(val_bytes) = found else {
+            return Ok(Vec::new());
+        };
+        if val_bytes == b"__deleted__" {
+            return Ok(Vec::new());
+        }
+        let Some(mut doc) = simd_parse_row(&val_bytes) else {
+            return Ok(Vec::new());
+        };
+        self.annotate_scanned_row(table, pk_bytes, &mut doc);
+        Ok(vec![doc])
+    }
+
+    /// Point-lookup fast path for `WHERE __pk__ = '<key>'` over a class scan.
+    /// Also fires for AND forms (`__pk__ = '<key>' AND …`), applying the
+    /// residual predicate on the fetched row. Returns `Ok(None)` when the
+    /// plan shape isn't a pk equality (or pk conjunct) over a plain SeqScan,
+    /// so callers fall back to the generic scan path.
+    fn plan_pk_point_lookup(
+        &self,
+        predicate: &FilterExpr,
+        input: &PlanNode,
+    ) -> Result<Option<Vec<Map<String, Value>>>> {
+        let table = match input {
+            PlanNode::SeqScan {
+                table, filter: None, ..
+            } => table.clone(),
+            _ => return Ok(None),
+        };
+        let engine = self.engine.engine_for_class(&table);
+        self.pk_lookup_filtered(&engine, &table, predicate)
     }
 
     /// Attach `__pk__` and optional `__shard__` routing info to a scanned row.
@@ -10091,6 +10344,16 @@ impl QueryExecutor {
         projected_columns: Option<&[String]>,
         sink: &mut dyn FnMut(Vec<Map<String, Value>>) -> bool,
     ) -> Result<()> {
+        // Point-lookup fast path: `__pk__ = '<key>'` (bare or ANDed) resolves
+        // via a narrow key-prefix scan instead of a full multi-million-row scan.
+        if let Some(f) = filter.as_ref() {
+            if let Some(rows) = self.pk_lookup_filtered(engine, table, f)? {
+                if !rows.is_empty() {
+                    sink(rows);
+                }
+                return Ok(());
+            }
+        }
         let class_hierarchy = self.get_class_hierarchy_read(engine, table);
         let proj_cols: Vec<String> = projected_columns.unwrap_or(&[]).to_vec();
         let fast_filter_cols = Self::extract_fast_filter_columns(filter);
@@ -14034,7 +14297,7 @@ impl QueryExecutor {
 
         // Keyed by caller-supplied `id` when present so a re-insert of the same
         // logical row overwrites instead of creating a duplicate physical row.
-        let key = self.doc_key_for(class, &doc);
+        let key = self.doc_key_for(class, &doc)?;
 
         // Validate against ontology schema
         self.validate_document(engine, class, &doc)?;
@@ -14042,6 +14305,7 @@ impl QueryExecutor {
         // Validate unique constraints
         self.validate_unique_constraints(engine, class, &doc)?;
 
+        doc.remove("__pk__"); // Don't persist the virtual pk column
         let value = doc_to_storage_bytes(&doc);
 
         // Sync to graph store (unified entity anchor)
@@ -14247,7 +14511,8 @@ impl QueryExecutor {
                 }
             }
 
-            let key = self.doc_key_for(class, &doc);
+            let key = self.doc_key_for(class, &doc)?;
+            doc.remove("__pk__"); // Don't persist the virtual pk column
             let value = doc_to_storage_bytes(&doc);
             entries.push((key, value));
         }
@@ -14272,7 +14537,8 @@ impl QueryExecutor {
                     for (key, val) in map {
                         doc.insert(key.clone(), val);
                     }
-                    let key = self.doc_key_for(class, &doc);
+                    let key = self.doc_key_for(class, &doc)?;
+                    doc.remove("__pk__"); // Don't persist the virtual pk column
                     let value = doc_to_storage_bytes(&doc);
                     entries.push((key, value));
                 }
@@ -14294,7 +14560,8 @@ impl QueryExecutor {
                     for (key, val) in map {
                         doc.insert(key.clone(), val);
                     }
-                    let key = self.doc_key_for(class, &doc);
+                    let key = self.doc_key_for(class, &doc)?;
+                    doc.remove("__pk__"); // Don't persist the virtual pk column
                     let value = doc_to_storage_bytes(&doc);
                     entries.push((key, value));
                 }
@@ -14359,7 +14626,8 @@ impl QueryExecutor {
                 }
             }
 
-            let key = self.doc_key_for(class, &doc);
+            let key = self.doc_key_for(class, &doc)?;
+            doc.remove("__pk__"); // Don't persist the virtual pk column
             let value = doc_to_storage_bytes(&doc);
             batch.push((key, value));
         }
@@ -14458,7 +14726,8 @@ impl QueryExecutor {
                     for (key, val) in map {
                         doc.insert(key.clone(), val.clone());
                     }
-                    let key = self.doc_key_for(class, &doc);
+                    let key = self.doc_key_for(class, &doc)?;
+                    doc.remove("__pk__"); // Don't persist the virtual pk column
                     let value = doc_to_storage_bytes(&doc);
                     batch.push((key, value));
                 }
@@ -14510,7 +14779,8 @@ impl QueryExecutor {
                     for (key, val) in map {
                         doc.insert(key.clone(), val.clone());
                     }
-                    let key = self.doc_key_for(class, &doc);
+                    let key = self.doc_key_for(class, &doc)?;
+                    doc.remove("__pk__"); // Don't persist the virtual pk column
                     let value = doc_to_storage_bytes(&doc);
                     batch.push((key, value));
                 }
@@ -14773,17 +15043,31 @@ impl QueryExecutor {
         format!("{}::{:040}", class, unique).into_bytes()
     }
 
-    /// Storage key for a document. When the doc carries a non-empty string `id`,
-    /// that id is mixed into the key (`{class}::{id}`) so re-inserting the same
-    /// logical id overwrites the existing row instead of creating a duplicate.
-    /// Falls back to a unique generated key when `id` is absent or empty.
-    fn doc_key_for(&self, class: &str, doc: &Map<String, Value>) -> Vec<u8> {
-        if let Some(id) = doc.get("id").and_then(|v| v.as_str()) {
-            if !id.is_empty() {
-                return format!("{}::{}", class, id).into_bytes();
+    /// Storage key for a document. An explicit `__pk__` (when present) wins and
+    /// must carry the `{class}::` prefix so one class cannot write into
+    /// another's key range. Otherwise, when the doc carries a non-empty string
+    /// `id`, that id is mixed into the key (`{class}::{id}`) so re-inserting the
+    /// same logical id overwrites the existing row instead of creating a
+    /// duplicate. Falls back to a unique generated key when neither is present.
+    fn doc_key_for(&self, class: &str, doc: &Map<String, Value>) -> Result<Vec<u8>> {
+        if let Some(pk) = doc.get("__pk__").and_then(|v| v.as_str()) {
+            if !pk.is_empty() {
+                let prefix = format!("{}::", class);
+                if !pk.starts_with(&prefix) {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "__pk__ '{}' does not belong to class '{}'",
+                        pk, class
+                    )));
+                }
+                return Ok(pk.as_bytes().to_vec());
             }
         }
-        self.generate_doc_key(class)
+        if let Some(id) = doc.get("id").and_then(|v| v.as_str()) {
+            if !id.is_empty() {
+                return Ok(format!("{}::{}", class, id).into_bytes());
+            }
+        }
+        Ok(self.generate_doc_key(class))
     }
 
     /// Tries to use a secondary index for the given filter.
@@ -16710,6 +16994,7 @@ impl QueryExecutor {
             (DataType::Array, Value::Array(_)) => true,
             (DataType::Object, Value::Object(_)) => true,
             (DataType::Bytes, Value::String(_)) => true, // bytes stored as base64 string
+            (DataType::Bytes, Value::Array(_)) => true,  // vector columns hold unpacked arrays too (try_parse_vector)
             _ => false,
         };
         if !valid {
@@ -17798,6 +18083,496 @@ mod tests {
         assert!(rows
             .iter()
             .any(|r| r.get("source").and_then(|v| v.as_str()) == Some("inferred")));
+    }
+
+    #[test]
+    fn test_create_and_alter_ontology_property_range() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // SQL-level CREATE PROPERTY adds a typed property
+        executor
+            .execute(
+                &QueryParser::parse("CREATE DATATYPE PROPERTY weight DOMAIN Product RANGE FLOAT64")
+                    .unwrap(),
+            )
+            .unwrap();
+
+        // ALTER PROPERTY changes the declared range
+        executor
+            .execute(
+                &QueryParser::parse("ALTER PROPERTY price DOMAIN Product RANGE FLOAT64").unwrap(),
+            )
+            .unwrap();
+
+        let result = executor
+            .execute_read(&QueryParser::parse("DESCRIBE Product").unwrap())
+            .unwrap();
+        let rows = match result {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        let type_of = |col: &str| {
+            rows.iter()
+                .find(|r| r.get("column").and_then(|v| v.as_str()) == Some(col))
+                .and_then(|r| r.get("type").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+        };
+        assert_eq!(type_of("price").as_deref(), Some("FLOAT64"));
+        assert_eq!(type_of("weight").as_deref(), Some("FLOAT64"));
+        assert_eq!(type_of("name").as_deref(), Some("STRING"));
+
+        // Altering an unknown property errors
+        let bad = executor.execute(
+            &QueryParser::parse("ALTER PROPERTY nope DOMAIN Product RANGE INT64").unwrap(),
+        );
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn test_describe_same_name_property_not_shadowed() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY a1 (CLASS Alpha, PROPERTY code DOMAIN Alpha RANGE STRING REQUIRED)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("CREATE ONTOLOGY a2 (CLASS Beta, PROPERTY code DOMAIN Beta RANGE INT64)")
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let describe_row = |cls: &str| {
+            let result = executor
+                .execute_read(&QueryParser::parse(&format!("DESCRIBE {}", cls)).unwrap())
+                .unwrap();
+            match result {
+                QueryResult::Rows(rows) => rows
+                    .into_iter()
+                    .find(|r| r.get("column").and_then(|v| v.as_str()) == Some("code"))
+                    .unwrap_or_else(|| panic!("no code column for {}", cls)),
+                _ => panic!("expected Rows"),
+            }
+        };
+
+        // Each class must see its own property definition, not the
+        // first-merged same-named one from the other class.
+        let alpha = describe_row("Alpha");
+        assert_eq!(alpha.get("type").and_then(|v| v.as_str()), Some("STRING"));
+        assert_eq!(alpha.get("required").and_then(|v| v.as_bool()), Some(true));
+        let beta = describe_row("Beta");
+        assert_eq!(beta.get("type").and_then(|v| v.as_str()), Some("INT64"));
+        assert_eq!(beta.get("required").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    #[test]
+    fn test_pk_point_lookup_by_pk() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        insert_row(&executor, "Product", "iPhone", 999);
+
+        let rows = match executor
+            .execute_read(&QueryParser::parse("SELECT __pk__, name FROM Product").unwrap())
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        assert_eq!(rows.len(), 1);
+        let pk = rows[0]
+            .get("__pk__")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        // Read path: point lookup by pk
+        let q = format!("SELECT name FROM Product WHERE __pk__ = '{}'", pk);
+        let rows = match executor
+            .execute_read(&QueryParser::parse(&q).unwrap())
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get("name").and_then(|v| v.as_str()),
+            Some("iPhone")
+        );
+
+        // Unknown pk returns empty
+        let rows = match executor
+            .execute_read(
+                &QueryParser::parse("SELECT name FROM Product WHERE __pk__ = 'Product::nope'")
+                    .unwrap(),
+            )
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        assert!(rows.is_empty());
+
+        // Write path: UPDATE by pk
+        let q = format!("UPDATE Product SET name = 'iPhone 15' WHERE __pk__ = '{}'", pk);
+        match executor.execute(&QueryParser::parse(&q).unwrap()).unwrap() {
+            QueryResult::Success(msg) => assert!(msg.contains("1 row"), "msg: {}", msg),
+            other => panic!("expected Success, got {:?}", other),
+        }
+        let q2 = format!("SELECT name FROM Product WHERE __pk__ = '{}'", pk);
+        let rows = match executor
+            .execute_read(&QueryParser::parse(&q2).unwrap())
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        assert_eq!(
+            rows[0].get("name").and_then(|v| v.as_str()),
+            Some("iPhone 15")
+        );
+    }
+
+    #[test]
+    fn test_explicit_pk_key_overwrite() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY id DOMAIN Product RANGE STRING, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        // Row keyed by a generated key (no id at insert time), like legacy imports.
+        insert_row(&executor, "Product", "A", 10);
+        let rows = match executor
+            .execute_read(&QueryParser::parse("SELECT __pk__ FROM Product").unwrap())
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        assert_eq!(rows.len(), 1);
+        let pk = rows[0]
+            .get("__pk__")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        // Re-put with explicit __pk__ + business id: same key, in-place overwrite.
+        let ast = QueryAst::Insert {
+            class: "Product".to_string(),
+            columns: vec![
+                "__pk__".to_string(),
+                "id".to_string(),
+                "name".to_string(),
+                "price".to_string(),
+            ],
+            values: vec![
+                LiteralValue::String(pk.clone()),
+                LiteralValue::String("CHEMBL1".to_string()),
+                LiteralValue::String("B".to_string()),
+                LiteralValue::Int(20),
+            ],
+        };
+        executor.execute(&ast).unwrap();
+
+        let rows = match executor
+            .execute_read(
+                &QueryParser::parse("SELECT __pk__, id, name, price FROM Product").unwrap(),
+            )
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        assert_eq!(
+            rows.len(),
+            1,
+            "explicit __pk__ must overwrite, not duplicate"
+        );
+        assert_eq!(
+            rows[0].get("__pk__").and_then(|v| v.as_str()),
+            Some(pk.as_str())
+        );
+        assert_eq!(rows[0].get("id").and_then(|v| v.as_str()), Some("CHEMBL1"));
+        assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("B"));
+        assert_eq!(rows[0].get("price").and_then(|v| v.as_i64()), Some(20));
+
+        // Cross-class __pk__ must be rejected.
+        let ast = QueryAst::Insert {
+            class: "Product".to_string(),
+            columns: vec!["__pk__".to_string(), "name".to_string()],
+            values: vec![
+                LiteralValue::String("Other::x".to_string()),
+                LiteralValue::String("C".to_string()),
+            ],
+        };
+        assert!(
+            executor.execute(&ast).is_err(),
+            "cross-class __pk__ must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_bytes_column_accepts_vector_array() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY fp DOMAIN Product RANGE BYTES)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        // INSERT auto-parses "[..]" strings into arrays (try_parse_vector); the
+        // array form must pass Bytes validation like the base64 string form.
+        let ast = QueryAst::Insert {
+            class: "Product".to_string(),
+            columns: vec!["name".to_string(), "fp".to_string()],
+            values: vec![
+                LiteralValue::String("A".to_string()),
+                LiteralValue::String("[0.0, 1.0]".to_string()),
+            ],
+        };
+        executor.execute(&ast).unwrap();
+        let ast = QueryAst::Insert {
+            class: "Product".to_string(),
+            columns: vec!["name".to_string(), "fp".to_string()],
+            values: vec![
+                LiteralValue::String("B".to_string()),
+                LiteralValue::String("AAAA".to_string()),
+            ],
+        };
+        executor.execute(&ast).unwrap();
+
+        let rows = match executor
+            .execute_read(&QueryParser::parse("SELECT name, fp FROM Product").unwrap())
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_pk_point_lookup_after_flush() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        insert_row(&executor, "Product", "iPhone", 999);
+        // Push the row into an SST: production rows live in SSTs, and
+        // lookup behavior can differ from memtable-resident rows.
+        executor
+            .execute(&QueryParser::parse("FLUSH").unwrap())
+            .unwrap();
+
+        let rows = match executor
+            .execute_read(&QueryParser::parse("SELECT __pk__, name FROM Product").unwrap())
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        assert_eq!(rows.len(), 1);
+        let pk = rows[0]
+            .get("__pk__")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let q = format!("SELECT name FROM Product WHERE __pk__ = '{}'", pk);
+        let rows = match executor
+            .execute_read(&QueryParser::parse(&q).unwrap())
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        assert_eq!(
+            rows.len(),
+            1,
+            "post-flush point lookup missed row with pk {}",
+            pk
+        );
+    }
+
+    #[test]
+    fn test_pk_point_lookup_dotted_class() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY ns1.Thing (CLASS ns1.Thing, PROPERTY name DOMAIN ns1.Thing RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO ns1.Thing (id, name) VALUES ('t1', 'hello')")
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let rows = match executor
+            .execute_read(&QueryParser::parse("SELECT __pk__, name FROM ns1.Thing").unwrap())
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        assert_eq!(rows.len(), 1);
+        let pk = rows[0]
+            .get("__pk__")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let q = format!("SELECT name FROM ns1.Thing WHERE __pk__ = '{}'", pk);
+        let rows = match executor
+            .execute_read(&QueryParser::parse(&q).unwrap())
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        assert_eq!(rows.len(), 1, "point lookup missed row with pk {}", pk);
+        assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("hello"));
+    }
+
+    #[test]
+    fn test_pk_and_form_point_lookup() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        insert_row(&executor, "Product", "iPhone", 999);
+
+        let rows = match executor
+            .execute_read(&QueryParser::parse("SELECT __pk__, name FROM Product").unwrap())
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            _ => panic!("expected Rows"),
+        };
+        assert_eq!(rows.len(), 1);
+        let pk = rows[0]
+            .get("__pk__")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let run = |sql: &str| -> Vec<Map<String, Value>> {
+            match executor.execute_read(&QueryParser::parse(sql).unwrap()).unwrap() {
+                QueryResult::Rows(r) => r,
+                _ => panic!("expected Rows for {}", sql),
+            }
+        };
+
+        // AND form: pk conjunct plus matching residual.
+        let q = format!("SELECT name FROM Product WHERE __pk__ = '{}' AND name = 'iPhone'", pk);
+        let rows = run(&q);
+        assert_eq!(rows.len(), 1, "AND form with matching residual must hit");
+        assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("iPhone"));
+
+        // AND form: residual rejects the row.
+        let q = format!("SELECT name FROM Product WHERE __pk__ = '{}' AND name = 'Nope'", pk);
+        let rows = run(&q);
+        assert_eq!(rows.len(), 0, "non-matching residual must filter the row out");
+
+        // AND form with a range residual.
+        let q = format!("SELECT name FROM Product WHERE __pk__ = '{}' AND price > 100", pk);
+        let rows = run(&q);
+        assert_eq!(rows.len(), 1, "range residual must pass");
+
+        // Residual-first order (pk on the right of AND).
+        let q = format!("SELECT name FROM Product WHERE name = 'iPhone' AND __pk__ = '{}'", pk);
+        let rows = run(&q);
+        assert_eq!(rows.len(), 1, "pk conjunct order must not matter");
+
+        // Unknown pk with AND residual stays empty.
+        let rows = run("SELECT name FROM Product WHERE __pk__ = 'Product::nope' AND name = 'iPhone'");
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_pk_and_form_point_lookup_streaming() {
+        // HTTP /api/query SELECT runs through execute_read_streaming, whose
+        // BinaryRow filter cannot evaluate the virtual __pk__ column. The AND
+        // form must hit the same point-lookup hook on this chain too.
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        insert_row(&executor, "Product", "iPhone", 999);
+
+        let stream = |sql: &str| -> Vec<Map<String, Value>> {
+            let ast = QueryParser::parse(sql).unwrap();
+            assert!(QueryExecutor::is_streamable_select(&ast), "not streamable: {}", sql);
+            let mut out: Vec<Map<String, Value>> = Vec::new();
+            executor
+                .execute_read_streaming(&ast, |batch| {
+                    out.extend(batch);
+                    true
+                })
+                .unwrap();
+            out
+        };
+
+        let rows = stream("SELECT __pk__, name FROM Product");
+        assert_eq!(rows.len(), 1);
+        let pk = rows[0]
+            .get("__pk__")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .to_string();
+
+        let q = format!("SELECT name FROM Product WHERE __pk__ = '{}' AND name = 'iPhone'", pk);
+        let rows = stream(&q);
+        assert_eq!(rows.len(), 1, "streaming AND form with matching residual must hit");
+        assert_eq!(rows[0].get("name").and_then(|v| v.as_str()), Some("iPhone"));
+
+        let q = format!("SELECT name FROM Product WHERE __pk__ = '{}' AND name = 'Nope'", pk);
+        let rows = stream(&q);
+        assert_eq!(rows.len(), 0, "streaming non-matching residual must filter out");
     }
 
     #[test]

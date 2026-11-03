@@ -352,6 +352,12 @@ pub enum OntoQLAst {
         required: bool,
         multi_valued: bool,
     },
+    /// ALTER PROPERTY <name> DOMAIN <domain> RANGE <type>
+    AlterProperty {
+        name: String,
+        domain: String,
+        range: String,
+    },
 
     // ── Data Manipulation ──
     Insert {
@@ -479,6 +485,9 @@ impl OntoQLParser {
             || starts_with_ignore_ascii_case(input, "CREATE PROPERTY")
         {
             return Self::parse_create_property(input);
+        }
+        if starts_with_ignore_ascii_case(input, "ALTER PROPERTY") {
+            return Self::parse_alter_property(input);
         }
         if starts_with_ignore_ascii_case(input, "DROP NAMESPACE") {
             return Self::parse_drop_namespace(input);
@@ -699,6 +708,27 @@ impl OntoQLParser {
             required,
             multi_valued,
         })
+    }
+
+    // ALTER PROPERTY <name> DOMAIN <domain> RANGE <type>
+
+    fn parse_alter_property(input: &str) -> Result<OntoQLAst> {
+        let rest = safe_slice_from(input, "ALTER PROPERTY".len()).trim_start();
+        let (name, rest) = Self::extract_identifier(rest);
+        if name.is_empty() {
+            return Err(CoreError::InvalidArgument("Missing property name".into()));
+        }
+        let rest = rest.trim();
+        let domain = Self::extract_keyword_value(rest, "DOMAIN");
+        let range = Self::extract_keyword_value(rest, "RANGE");
+        match (domain, range) {
+            (Some(domain), Some(range)) if !domain.is_empty() && !range.is_empty() => {
+                Ok(OntoQLAst::AlterProperty { name, domain, range })
+            }
+            _ => Err(CoreError::InvalidArgument(
+                "ALTER PROPERTY requires DOMAIN <class> RANGE <type>".into(),
+            )),
+        }
     }
 
     // ── SELECT ────────────────────────────────────────────────────
@@ -2044,6 +2074,50 @@ impl OntoQLAst {
             OntoQLAst::Explain { query } => Ok(QueryAst::Explain {
                 query: Box::new(query.to_query_ast()?),
             }),
+            // Property DDL — direct conversion; the SQL round-trip has no
+            // CREATE/ALTER PROPERTY syntax to reparse into.
+            OntoQLAst::CreateProperty {
+                name,
+                kind: _,
+                domain,
+                range,
+                inverse_of,
+                characteristics,
+                required,
+                multi_valued,
+            } => {
+                let mut is_functional = false;
+                let mut is_symmetric = false;
+                let mut is_transitive = false;
+                for c in characteristics {
+                    match c {
+                        Characteristic::Functional => is_functional = true,
+                        Characteristic::Symmetric => is_symmetric = true,
+                        Characteristic::Transitive => is_transitive = true,
+                        Characteristic::InverseFunctional => {
+                            return Err(CoreError::InvalidArgument(
+                                "INVERSE FUNCTIONAL characteristic is not supported".into(),
+                            ));
+                        }
+                    }
+                }
+                Ok(QueryAst::CreateOntologyProperty {
+                    name: name.clone(),
+                    domain: domain.clone(),
+                    range: range.clone(),
+                    required: *required,
+                    multi_valued: *multi_valued,
+                    inverse_of: inverse_of.clone(),
+                    is_functional,
+                    is_symmetric,
+                    is_transitive,
+                })
+            }
+            OntoQLAst::AlterProperty { name, domain, range } => Ok(QueryAst::AlterOntologyProperty {
+                name: name.clone(),
+                domain: domain.clone(),
+                range: range.clone(),
+            }),
             _ => {
                 let sql = self.to_sql()?;
                 parser::QueryParser::parse(&sql)
@@ -2089,6 +2163,11 @@ impl OntoQLAst {
                     if *required { " REQUIRED" } else { "" }
                 ))
             }
+
+            OntoQLAst::AlterProperty { name, domain, range } => Ok(format!(
+                "ALTER PROPERTY \"{}\" DOMAIN \"{}\" RANGE \"{}\"",
+                name, domain, range
+            )),
 
             OntoQLAst::Select { distinct, projections, from, joins, filter, infer, group_by, having, order_by, limit, offset, .. } => {
                 let mut sql = String::from("SELECT ");
@@ -2874,6 +2953,68 @@ mod tests {
                 assert_eq!(inverse_of, Some("hasParent".into()));
             }
             _ => panic!("Expected CreateProperty"),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_property() {
+        let ast = OntoQLParser::parse("ALTER PROPERTY price DOMAIN Product RANGE FLOAT64").unwrap();
+        match &ast {
+            OntoQLAst::AlterProperty {
+                name,
+                domain,
+                range,
+            } => {
+                assert_eq!(name, "price");
+                assert_eq!(domain, "Product");
+                assert_eq!(range, "FLOAT64");
+            }
+            _ => panic!("Expected AlterProperty"),
+        }
+        // DOMAIN and RANGE are both mandatory
+        assert!(OntoQLParser::parse("ALTER PROPERTY price DOMAIN Product").is_err());
+        assert!(OntoQLParser::parse("ALTER PROPERTY price RANGE FLOAT64").is_err());
+
+        let q = ast.to_query_ast().unwrap();
+        match q {
+            crate::parser::QueryAst::AlterOntologyProperty {
+                name,
+                domain,
+                range,
+            } => {
+                assert_eq!(name, "price");
+                assert_eq!(domain, "Product");
+                assert_eq!(range, "FLOAT64");
+            }
+            other => panic!("expected QueryAst::AlterOntologyProperty, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_property_to_query_ast_maps_characteristics() {
+        let ast = OntoQLParser::parse(
+            "CREATE DATATYPE PROPERTY ancestor DOMAIN Person RANGE STRING TRANSITIVE FUNCTIONAL",
+        )
+        .unwrap();
+        let q = ast.to_query_ast().unwrap();
+        match q {
+            crate::parser::QueryAst::CreateOntologyProperty {
+                name,
+                domain,
+                range,
+                is_functional,
+                is_symmetric,
+                is_transitive,
+                ..
+            } => {
+                assert_eq!(name, "ancestor");
+                assert_eq!(domain, "Person");
+                assert_eq!(range, "STRING");
+                assert!(is_functional);
+                assert!(is_transitive);
+                assert!(!is_symmetric);
+            }
+            other => panic!("expected QueryAst::CreateOntologyProperty, got {:?}", other),
         }
     }
 

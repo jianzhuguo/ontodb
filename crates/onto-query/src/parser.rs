@@ -424,6 +424,18 @@ pub enum QueryAst {
         range: String,
         required: bool,
         multi_valued: bool,
+        inverse_of: Option<String>,
+        is_functional: bool,
+        is_symmetric: bool,
+        is_transitive: bool,
+    },
+
+    /// ALTER PROPERTY <name> DOMAIN <class> RANGE <type>
+    /// Changes the range (data type) of an existing property definition.
+    AlterOntologyProperty {
+        name: String,
+        domain: String,
+        range: String,
     },
 
     /// ALTER CLASS <name> EXTENDS <parent>
@@ -519,6 +531,9 @@ impl QueryAst {
             | VectorSearch { class, .. } => {
                 *class = f(class);
             }
+            CreateOntologyProperty { domain, .. } | AlterOntologyProperty { domain, .. } => {
+                *domain = f(domain);
+            }
             InsertSelect { class, query, .. } => {
                 *class = f(class);
                 query.map_class_names(f);
@@ -593,6 +608,7 @@ impl QueryAst {
             QueryAst::ShowSchemas => true,
             QueryAst::Describe { .. } => true,
             QueryAst::CreateOntologyProperty { .. } => false,
+            QueryAst::AlterOntologyProperty { .. } => false,
             QueryAst::AlterClassExtends { .. } => false,
 
             // Transaction control
@@ -1142,6 +1158,13 @@ impl QueryParser {
             Self::parse_explain(input)
         } else if starts_with("WITH") {
             Self::parse_with(input)
+        } else if starts_with("CREATE DATATYPE PROPERTY")
+            || starts_with("CREATE OBJECT PROPERTY")
+            || starts_with("CREATE PROPERTY")
+        {
+            Self::parse_create_ontology_property(input)
+        } else if starts_with("ALTER PROPERTY") {
+            Self::parse_alter_ontology_property(input)
         } else if starts_with("CREATE ONTOLOGY") {
             Ok(QueryAst::CreateOntology {
                 sql: input.to_string(),
@@ -3714,6 +3737,83 @@ impl QueryParser {
         )
     }
 
+    /// Parse CREATE [DATATYPE|OBJECT] PROPERTY <name> DOMAIN <class> RANGE <type> [REQUIRED] [MULTI_VALUED]
+    fn parse_create_ontology_property(input: &str) -> Result<QueryAst> {
+        let rest = if starts_with_ignore_ascii_case(input, "CREATE DATATYPE PROPERTY") {
+            &input["CREATE DATATYPE PROPERTY".len()..]
+        } else if starts_with_ignore_ascii_case(input, "CREATE OBJECT PROPERTY") {
+            &input["CREATE OBJECT PROPERTY".len()..]
+        } else {
+            &input["CREATE PROPERTY".len()..]
+        };
+        let rest = rest.trim_start();
+        let (name, rest) = Self::extract_quoted_or_word(rest);
+        if name.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "missing property name in CREATE PROPERTY".to_string(),
+            ));
+        }
+        let (domain, range, tail) = Self::parse_property_domain_range(&rest)?;
+        let required = find_ignore_ascii_case(&tail, "REQUIRED").is_some();
+        let multi_valued = find_ignore_ascii_case(&tail, "MULTI_VALUED").is_some();
+        Ok(QueryAst::CreateOntologyProperty {
+            name,
+            domain,
+            range,
+            required,
+            multi_valued,
+            inverse_of: None,
+            is_functional: false,
+            is_symmetric: false,
+            is_transitive: false,
+        })
+    }
+
+    /// Parse ALTER PROPERTY <name> DOMAIN <class> RANGE <type>
+    fn parse_alter_ontology_property(input: &str) -> Result<QueryAst> {
+        let rest = input["ALTER PROPERTY".len()..].trim_start();
+        let (name, rest) = Self::extract_quoted_or_word(rest);
+        if name.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "missing property name in ALTER PROPERTY".to_string(),
+            ));
+        }
+        let (domain, range, _) = Self::parse_property_domain_range(&rest)?;
+        Ok(QueryAst::AlterOntologyProperty { name, domain, range })
+    }
+
+    /// Extract the `DOMAIN <class> RANGE <type>` tail shared by property DDL.
+    /// Returns (domain, range, remaining_input).
+    fn parse_property_domain_range(input: &str) -> Result<(String, String, String)> {
+        let input = input.trim_start();
+        if find_ignore_ascii_case(input, "DOMAIN") != Some(0) {
+            return Err(CoreError::InvalidArgument(
+                "expected DOMAIN <class> in property DDL".to_string(),
+            ));
+        }
+        let input = input[6..].trim_start();
+        let (domain, input) = Self::extract_quoted_or_word(input);
+        if domain.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "missing DOMAIN class in property DDL".to_string(),
+            ));
+        }
+        let input = input.trim_start();
+        if find_ignore_ascii_case(input, "RANGE") != Some(0) {
+            return Err(CoreError::InvalidArgument(
+                "expected RANGE <type> in property DDL".to_string(),
+            ));
+        }
+        let input = input[5..].trim_start();
+        let (range, rest) = Self::extract_quoted_or_word(input);
+        if range.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "missing RANGE type in property DDL".to_string(),
+            ));
+        }
+        Ok((domain, range, rest))
+    }
+
     /// Parse CREATE MATERIALIZED VIEW <name> AS <query>
     fn parse_create_materialized_view(input: &str) -> Result<QueryAst> {
         if !starts_with_ignore_ascii_case(input, "CREATE MATERIALIZED VIEW") {
@@ -4846,6 +4946,56 @@ mod tests {
     fn test_parse_flush() {
         let ast = QueryParser::parse("FLUSH").unwrap();
         assert!(matches!(ast, QueryAst::Flush));
+    }
+
+    #[test]
+    fn test_parse_create_ontology_property() {
+        let ast = QueryParser::parse(
+            "CREATE DATATYPE PROPERTY \"mw_freebase\" DOMAIN \"sembio.CompoundProperty\" RANGE \"FLOAT64\" REQUIRED",
+        )
+        .unwrap();
+        match ast {
+            QueryAst::CreateOntologyProperty {
+                name,
+                domain,
+                range,
+                required,
+                multi_valued,
+                ..
+            } => {
+                assert_eq!(name, "mw_freebase");
+                assert_eq!(domain, "sembio.CompoundProperty");
+                assert_eq!(range, "FLOAT64");
+                assert!(required);
+                assert!(!multi_valued);
+            }
+            other => panic!("expected CreateOntologyProperty, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_ontology_property() {
+        let ast = QueryParser::parse(
+            "ALTER PROPERTY mw_freebase DOMAIN sembio.CompoundProperty RANGE FLOAT64",
+        )
+        .unwrap();
+        match ast {
+            QueryAst::AlterOntologyProperty {
+                name,
+                domain,
+                range,
+            } => {
+                assert_eq!(name, "mw_freebase");
+                assert_eq!(domain, "sembio.CompoundProperty");
+                assert_eq!(range, "FLOAT64");
+            }
+            other => panic!("expected AlterOntologyProperty, got {:?}", other),
+        }
+
+        // Missing DOMAIN/RANGE must error
+        assert!(QueryParser::parse("ALTER PROPERTY p DOMAIN C").is_err());
+        assert!(QueryParser::parse("ALTER PROPERTY p RANGE FLOAT64").is_err());
+        assert!(QueryParser::parse("ALTER PROPERTY").is_err());
     }
 
     // ===== AND/OR Precedence Tests =====
