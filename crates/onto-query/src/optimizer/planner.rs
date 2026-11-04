@@ -118,6 +118,10 @@ pub enum PlanNode {
     Limit {
         input: Box<PlanNode>,
         count: usize,
+        /// When true, LIMIT must NOT truncate raw rows at this node: post-
+        /// processing (aggregation / DISTINCT) will apply it after grouping.
+        /// Set when the query has GROUP BY, aggregates, or SELECT DISTINCT.
+        defer: bool,
         estimated_rows: u64,
     },
 
@@ -451,7 +455,7 @@ impl QueryPlanner {
     pub fn plan(&self, ast: &QueryAst) -> Result<ExecutionPlan> {
         match ast {
             QueryAst::Select {
-                distinct: _,
+                distinct,
                 columns,
                 from,
                 from_alias,
@@ -472,6 +476,7 @@ impl QueryPlanner {
                 having,
                 order_by,
                 *limit,
+                *distinct,
             ),
             QueryAst::VectorSearch {
                 class,
@@ -646,10 +651,12 @@ impl QueryPlanner {
             PlanNode::Limit {
                 input,
                 count,
+                defer,
                 estimated_rows,
             } => PlanNode::Limit {
                 input: Box::new(Self::merge_filter_under_limit(*input, pred)),
                 count,
+                defer,
                 estimated_rows,
             },
             PlanNode::SeqScan {
@@ -717,6 +724,7 @@ impl QueryPlanner {
         having: &Option<FilterExpr>,
         order_by: &[OrderBy],
         limit: Option<usize>,
+        distinct: bool,
     ) -> Result<ExecutionPlan> {
         // Resolve cross joins: extract join conditions from WHERE for comma-separated tables
         let (resolved_joins, resolved_filter) =
@@ -755,6 +763,7 @@ impl QueryPlanner {
             having,
             order_by,
             limit,
+            distinct,
             columns,
             &pushed_filters,
         );
@@ -781,6 +790,7 @@ impl QueryPlanner {
                             having,
                             order_by,
                             limit,
+                            distinct,
                             columns,
                             &pushed_filters,
                         );
@@ -815,6 +825,7 @@ impl QueryPlanner {
                     having,
                     order_by,
                     limit,
+                    distinct,
                     columns,
                     &pushed_filters,
                 );
@@ -937,6 +948,13 @@ impl QueryPlanner {
         let mut remaining_predicates = Vec::new();
 
         for pred in predicates {
+            // Cross-table predicates (`WHERE tp.source = ca.source`) carry a
+            // column reference on the literal side: they cannot be evaluated by
+            // a single-table scan, so keep them as residual join-level filters.
+            if Self::filter_has_column_ref(&pred) {
+                remaining_predicates.push(pred);
+                continue;
+            }
             let table = Self::determine_table_for_predicate(&pred, main_table, main_alias, joins);
 
             if let Some(tbl) = table {
@@ -966,6 +984,24 @@ impl QueryPlanner {
         };
 
         (pushed_filters, remaining)
+    }
+
+    /// True when any literal operand in the expression is a column reference
+    /// (cross-table predicate) — those must not be pushed into a single scan.
+    fn filter_has_column_ref(expr: &FilterExpr) -> bool {
+        use crate::parser::LiteralValue;
+        let lit_has = |l: &LiteralValue| matches!(l, LiteralValue::Column(_));
+        match expr {
+            FilterExpr::Eq(_, v) | FilterExpr::Ne(_, v) | FilterExpr::Gt(_, v)
+            | FilterExpr::Lt(_, v) | FilterExpr::Gte(_, v) | FilterExpr::Lte(_, v) => lit_has(v),
+            FilterExpr::Between(_, lo, hi) => lit_has(lo) || lit_has(hi),
+            FilterExpr::In(_, vals) => vals.iter().any(lit_has),
+            FilterExpr::And(l, r) | FilterExpr::Or(l, r) => {
+                Self::filter_has_column_ref(l) || Self::filter_has_column_ref(r)
+            }
+            FilterExpr::Not(e) => Self::filter_has_column_ref(e),
+            _ => false,
+        }
     }
 
     /// Strip table prefix from column names in a filter expression.
@@ -1066,6 +1102,7 @@ impl QueryPlanner {
         _having: &Option<FilterExpr>,
         order_by: &[OrderBy],
         limit: Option<usize>,
+        distinct: bool,
         columns: &SelectColumns,
         pushed_filters: &HashMap<String, Option<FilterExpr>>,
     ) -> ExecutionPlan {
@@ -1096,7 +1133,7 @@ impl QueryPlanner {
         // Apply joins - choose between HashJoin and SortMergeJoin
         // If we have a LIMIT and no GROUP BY, we can push it into the right side of joins
         let can_push_limit = limit.is_some() && group_by.is_none();
-        let ordered_joins = self.reorder_joins(joins);
+        let ordered_joins = self.reorder_joins(joins, table, alias);
         for join in &ordered_joins {
             let right_stats = self
                 .stats
@@ -1112,13 +1149,9 @@ impl QueryPlanner {
                     histograms: Vec::new(),
                 });
 
-            // Check if join column has an index for potential index scan
-            let right_col = join
-                .on
-                .right
-                .split('.')
-                .next_back()
-                .unwrap_or(&join.on.right);
+            // Check if join column has an index for potential index scan.
+            // Resolve by alias ownership so both ON operand orders agree.
+            let right_col = Self::join_right_column(join);
             let has_join_index = right_stats
                 .secondary_indexes
                 .iter()
@@ -1326,6 +1359,9 @@ impl QueryPlanner {
             current_node = PlanNode::Limit {
                 input: Box::new(current_node),
                 count: limit_count,
+                defer: group_by.is_some()
+                    || distinct
+                    || !Self::extract_aggregates(columns).is_empty(),
                 estimated_rows: limited_rows,
             };
             current_cost =
@@ -1335,6 +1371,29 @@ impl QueryPlanner {
         // Note: Projection is added in plan_select after remaining filter
 
         ExecutionPlan::new(current_node, current_cost)
+    }
+
+    /// Pick the join-column operand that belongs to the joined (right) table,
+    /// so `ON a.x = b.y` and `ON b.y = a.x` resolve identically. Without this,
+    /// the textual right operand was used blindly and `ON ca.target = ar.id`
+    /// probed the right table's index on the wrong column.
+    fn join_right_column(join: &JoinClause) -> &str {
+        let mut right_owner: Vec<&str> = Vec::with_capacity(4);
+        let table_seg = join.table.rsplit('.').next().unwrap_or(join.table.as_str());
+        right_owner.push(table_seg);
+        right_owner.push(join.table.as_str());
+        if let Some(a) = join.alias.as_deref() {
+            right_owner.push(a);
+            right_owner.push(a.rsplit('.').next().unwrap_or(a));
+        }
+        for operand in [&join.on.left, &join.on.right] {
+            if let Some((prefix, col)) = operand.rsplit_once('.') {
+                if right_owner.contains(&prefix) {
+                    return col;
+                }
+            }
+        }
+        join.on.right.split('.').next_back().unwrap_or(&join.on.right)
     }
 
     /// Create an index scan plan.
@@ -1350,6 +1409,7 @@ impl QueryPlanner {
         _having: &Option<FilterExpr>,
         order_by: &[OrderBy],
         limit: Option<usize>,
+        distinct: bool,
         columns: &SelectColumns,
         pushed_filters: &HashMap<String, Option<FilterExpr>>,
     ) -> ExecutionPlan {
@@ -1375,7 +1435,7 @@ impl QueryPlanner {
         let mut current_cost = index_cost;
 
         // Apply joins - use hash join for better performance
-        let ordered_joins = self.reorder_joins(joins);
+        let ordered_joins = self.reorder_joins(joins, table, alias);
         for join in &ordered_joins {
             let right_stats = self
                 .stats
@@ -1391,12 +1451,7 @@ impl QueryPlanner {
                     histograms: Vec::new(),
                 });
 
-            let right_col = join
-                .on
-                .right
-                .split('.')
-                .next_back()
-                .unwrap_or(&join.on.right);
+            let right_col = Self::join_right_column(join);
             let has_join_index = right_stats
                 .secondary_indexes
                 .iter()
@@ -1551,6 +1606,9 @@ impl QueryPlanner {
             current_node = PlanNode::Limit {
                 input: Box::new(current_node),
                 count: limit_count,
+                defer: group_by.is_some()
+                    || distinct
+                    || !Self::extract_aggregates(columns).is_empty(),
                 estimated_rows: limited_rows,
             };
             if current_cost.is_sorted && (current_cost.rows as usize) > limit_count {
@@ -1631,25 +1689,75 @@ impl QueryPlanner {
     /// Reorder joins for optimal execution.
     /// Strategy: smallest tables first (left-deep tree).
     /// This minimizes the size of the hash table built in hash joins.
-    fn reorder_joins(&self, joins: &[JoinClause]) -> Vec<JoinClause> {
+    fn reorder_joins(
+        &self,
+        joins: &[JoinClause],
+        main_table: &str,
+        main_alias: Option<&str>,
+    ) -> Vec<JoinClause> {
         if joins.len() <= 1 {
             return joins.to_vec();
         }
 
-        // Sort joins by estimated table size (smallest first)
-        let mut ordered: Vec<(usize, &JoinClause, u64)> = joins
-            .iter()
-            .enumerate()
-            .map(|(i, j)| {
-                let stats = self.stats.get(&j.table);
-                let row_count = stats.map(|s| s.row_count).unwrap_or(100);
-                (i, j, row_count)
-            })
-            .collect();
+        // Greedy smallest-first, but a join may only be scheduled once every
+        // table its ON clause references is already in the joined set —
+        // reordering across ON dependencies made chained joins silently
+        // produce zero rows (e.g. dx before dp broke `ON dx.omim_id = dp.disease_id`).
+        let mut joined: std::collections::HashSet<String> = std::collections::HashSet::new();
+        joined.insert(main_table.to_string());
+        joined.insert(main_table.rsplit('.').next().unwrap_or(main_table).to_string());
+        if let Some(a) = main_alias {
+            joined.insert(a.to_string());
+        }
+        let mut pending: Vec<&JoinClause> = joins.iter().collect();
+        let mut ordered: Vec<JoinClause> = Vec::with_capacity(joins.len());
 
-        ordered.sort_by_key(|&(_, _, rows)| rows);
+        let rows_of = |j: &JoinClause| -> u64 {
+            self.stats.get(&j.table).map(|s| s.row_count).unwrap_or(100)
+        };
 
-        ordered.into_iter().map(|(_, j, _)| j.clone()).collect()
+        while !pending.is_empty() {
+            // Among the dependency-satisfied joins, take the smallest.
+            let mut best: Option<usize> = None;
+            for (i, j) in pending.iter().enumerate() {
+                let deps_ok = [&j.on.left, &j.on.right].iter().all(|operand| {
+                    match operand.rsplit_once('.') {
+                        // Qualified operand: its prefix must already be joined
+                        // (or be the join's own alias/table, self-reference).
+                        Some((prefix, _)) => {
+                            joined.contains(prefix)
+                                || Some(prefix) == j.alias.as_deref()
+                                || prefix == j.table
+                                || prefix == j.table.rsplit('.').next().unwrap_or(&j.table)
+                        }
+                        // Bare column: assume resolvable (legacy behavior).
+                        None => true,
+                    }
+                });
+                if !deps_ok {
+                    continue;
+                }
+                match best {
+                    Some(b) if rows_of(pending[b]) <= rows_of(j) => {}
+                    _ => best = Some(i),
+                }
+            }
+            let idx = match best {
+                Some(i) => i,
+                // Dependency cycle or unresolvable operand: fall back to
+                // original order for the rest to avoid deadlock.
+                None => 0,
+            };
+            let j = pending.remove(idx);
+            let alias = j.alias.clone().unwrap_or_else(|| j.table.clone());
+            let seg = j.table.rsplit('.').next().unwrap_or(&j.table).to_string();
+            joined.insert(alias);
+            joined.insert(seg);
+            joined.insert(j.table.clone());
+            ordered.push(j.clone());
+        }
+
+        ordered
     }
 
     /// Plan a UNION query.

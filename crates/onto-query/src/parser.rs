@@ -1892,6 +1892,27 @@ impl QueryParser {
         chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':')
     }
 
+    /// Promote a bare dotted identifier (e.g. `ca.source`) used as a WHERE RHS
+    /// into a column reference so cross-table predicates compare columns instead
+    /// of the literal text "ca.source". Single-quoted strings stay strings even
+    /// when they contain dots; double-quoted names are SQL identifiers and are
+    /// promoted too (the OntoQL layer round-trips column refs as `"a.b"`).
+    /// Values without a dot (e.g. `GO:0005575`) stay strings.
+    /// `value_src` is the pre-extraction RHS text (quotes are stripped before
+    /// parsing, so quote detection must happen on this raw source).
+    fn lit_to_col_ref(value_src: &str, lit: LiteralValue) -> LiteralValue {
+        let src = value_src.trim_start();
+        if src.starts_with('\'') || src.starts_with('[') {
+            return lit;
+        }
+        if let LiteralValue::String(s) = &lit {
+            if s.contains('.') && Self::is_plain_identifier(s) {
+                return LiteralValue::Column(s.clone());
+            }
+        }
+        lit
+    }
+
     /// Simple matching paren finder (no quote handling needed for values).
     fn find_matching_paren_simple(input: &str) -> Result<usize> {
         let mut depth = 0;
@@ -3489,7 +3510,7 @@ impl QueryParser {
             let rest = safe_slice_from(input, pos + op_str.len()).trim();
 
             let (val_str, remaining) = Self::extract_quoted_or_word(rest);
-            let val = Self::parse_literal(&val_str)?;
+            let val = Self::lit_to_col_ref(rest, Self::parse_literal(&val_str)?);
             let expr = op_fn(col, val);
             return Self::wrap_chain(expr, &remaining);
         }
@@ -3782,7 +3803,7 @@ impl QueryParser {
             let rest = safe_slice_from(input, pos + op_str.len()).trim();
 
             let (val_str, remaining) = Self::extract_quoted_or_word(rest);
-            let val = Self::parse_literal(&val_str)?;
+            let val = Self::lit_to_col_ref(rest, Self::parse_literal(&val_str)?);
             let expr = op_fn(col, val);
             return Ok((Some(expr), remaining));
         }
@@ -5749,6 +5770,54 @@ mod tests {
         // Other punctuation-bearing RHS forms must also be rejected.
         assert!(QueryParser::parse("UPDATE T SET a = b + c").is_err());
         assert!(QueryParser::parse("UPDATE T SET a = f(b)").is_err());
+    }
+
+    #[test]
+    fn test_where_rhs_dotted_identifier_is_column_ref() {
+        // Cross-table predicate: rhs must become a column reference, not the
+        // literal string "a.y".
+        let ast = QueryParser::parse("SELECT * FROM a JOIN b ON b.id = a.id WHERE b.x = a.y").unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => match filter.as_ref().unwrap() {
+                FilterExpr::Eq(col, LiteralValue::Column(name)) => {
+                    assert_eq!(col, "b.x");
+                    assert_eq!(name, "a.y");
+                }
+                other => panic!("expected Eq with Column rhs, got {:?}", other),
+            },
+            _ => panic!("expected select"),
+        }
+
+        // Quoted strings stay strings even when they contain a dot.
+        let ast = QueryParser::parse("SELECT * FROM a WHERE b.x = 'a.y'").unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => match filter.as_ref().unwrap() {
+                FilterExpr::Eq(_, LiteralValue::String(s)) => assert_eq!(s, "a.y"),
+                other => panic!("expected Eq with String rhs, got {:?}", other),
+            },
+            _ => panic!("expected select"),
+        }
+
+        // Double-quoted names are identifiers (OntoQL round-trips column refs
+        // as `"a.b"`), so they must promote to column references too.
+        let ast = QueryParser::parse("SELECT * FROM a WHERE b.x = \"a.y\"").unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => match filter.as_ref().unwrap() {
+                FilterExpr::Eq(_, LiteralValue::Column(name)) => assert_eq!(name, "a.y"),
+                other => panic!("expected Eq with Column rhs, got {:?}", other),
+            },
+            _ => panic!("expected select"),
+        }
+
+        // Bare words without a dot stay strings (e.g. GO ids as values).
+        let ast = QueryParser::parse("SELECT * FROM a WHERE b.x = GO:0005575").unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => match filter.as_ref().unwrap() {
+                FilterExpr::Eq(_, LiteralValue::String(s)) => assert_eq!(s, "GO:0005575"),
+                other => panic!("expected Eq with String rhs, got {:?}", other),
+            },
+            _ => panic!("expected select"),
+        }
     }
 
     // ===== LIKE Pattern Quote Escaping Tests =====

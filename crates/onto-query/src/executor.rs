@@ -108,6 +108,27 @@ fn simd_val_to_serde(val: simd_json::OwnedValue) -> Value {
 /// Returns Some(true/false) if the filter could be fully evaluated,
 /// or None if it requires full deserialization (e.g., Like, subqueries).
 fn eval_binary_filter(row: &BinaryRow, expr: &FilterExpr) -> Option<bool> {
+    // Column-reference literals (cross-table predicates) need the joined row
+    // for resolution — bail out to the map-based evaluator.
+    fn has_col_lit(expr: &FilterExpr) -> bool {
+        let lit_has = |l: &LiteralValue| matches!(l, LiteralValue::Column(_));
+        match expr {
+            FilterExpr::Eq(_, v)
+            | FilterExpr::Ne(_, v)
+            | FilterExpr::Gt(_, v)
+            | FilterExpr::Lt(_, v)
+            | FilterExpr::Gte(_, v)
+            | FilterExpr::Lte(_, v) => lit_has(v),
+            FilterExpr::Between(_, lo, hi) => lit_has(lo) || lit_has(hi),
+            FilterExpr::In(_, vals) => vals.iter().any(lit_has),
+            FilterExpr::And(l, r) | FilterExpr::Or(l, r) => has_col_lit(l) || has_col_lit(r),
+            FilterExpr::Not(e) => has_col_lit(e),
+            _ => false,
+        }
+    }
+    if has_col_lit(expr) {
+        return None;
+    }
     match expr {
         FilterExpr::Eq(col, lit) => {
             let idx = row.find_field(col)?;
@@ -5671,20 +5692,45 @@ impl QueryExecutor {
             return Self::execute_nested_loop_join(left_rows, rows, join);
         }
         let alias = right_alias.unwrap_or(right_table);
-        let (left_col_raw, right_col_raw) = Self::resolve_join_columns(&join.on)?;
+        let (on_left, on_right) = Self::resolve_join_columns(&join.on)?;
+        // Determine which ON operand belongs to the right table so both operand
+        // orders pick the same left/probe columns (mirrors planner::join_right_column).
+        let right_segs = {
+            let seg = right_table.rsplit('.').next().unwrap_or(right_table);
+            [alias, right_table, seg]
+        };
+        let (left_col_raw, _right_col_raw) = if on_left
+            .rsplit_once('.')
+            .map(|(p, _)| right_segs.contains(&p))
+            .unwrap_or(false)
+        {
+            (on_right.clone(), on_left.clone())
+        } else {
+            (on_left.clone(), on_right.clone())
+        };
         let left_col = left_col_raw.split('.').next_back().unwrap_or(&left_col_raw);
 
         let has_idx = engine.has_index(right_table, index_column);
+        if !has_idx {
+            // No usable index on the probe column: fall back to a row-based
+            // nested-loop join instead of silently returning zero rows.
+            let rows = self.plan_seq_scan(engine, right_table, Some(alias), &None, None)?;
+            return Self::execute_nested_loop_join(left_rows, rows, join);
+        }
         let class_hierarchy = self.get_class_hierarchy_read(engine, right_table);
         let mut result = Vec::new();
 
         for left_row in &left_rows {
-            let join_val = Self::resolve_column_value(left_row, left_col);
-            let Some(ref val_str) = join_val else { continue };
+            // Probe with the left value's original type: index keys are
+            // type-tagged (TAG_INT vs TAG_STRING), so a forced String probe
+            // silently misses numeric columns.
+            let Some(val) = Self::resolve_column_value_raw(left_row, left_col) else {
+                continue;
+            };
+            let json_val = val.clone();
 
-            let right_rows = if has_idx {
+            let right_rows = {
                 // Index lookup: find primary keys, then fetch rows
-                let json_val = serde_json::Value::String(val_str.clone());
                 let pkeys = {
                     let index_mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
                     index_mgr.lookup_eq_read(right_table, index_column, &json_val).unwrap_or_default()
@@ -5703,9 +5749,6 @@ impl QueryExecutor {
                     }
                 }
                 rows
-            } else {
-                // No index: fallback to full scan (shouldn't happen for INLJ plan)
-                Vec::new()
             };
 
             // Merge left row with each matching right row
@@ -7755,7 +7798,13 @@ impl QueryExecutor {
                 Ok(rows)
             }
             PlanNode::Aggregation { input, .. } => self.execute_plan_node_read(input, engine),
-            PlanNode::Limit { input, count, .. } => {
+            PlanNode::Limit { input, count, defer, .. } => {
+                // With GROUP BY / aggregates / SELECT DISTINCT, post-processing
+                // applies LIMIT after grouping — truncating raw rows here would
+                // aggregate only the first `count` rows (group keys lost).
+                if *defer {
+                    return self.execute_plan_node_read(input, engine);
+                }
                 // Push the limit to SeqScan even with a filter: we only need
                 // `count` *matching* rows, not all matches. plan_seq_scan_read_limit
                 // keeps filtering until it has collected enough (or the scan ends).
@@ -12535,11 +12584,19 @@ impl QueryExecutor {
                             result_row.insert(name, val);
                         }
                         SelectItem::Column(col) => {
-                            let col_name = col.split(" as ").last().unwrap_or(col);
-                            let col_name = col_name.split('.').next_back().unwrap_or(col_name);
-                            if !result_row.contains_key(col_name) {
-                                if let Some(val) = Self::resolve_column_value(group_rows[0], col) {
-                                    result_row.insert(col_name.to_string(), Value::String(val));
+                            // Resolve with the real column (before " as ") but
+                            // emit under the alias name — resolving the raw
+                            // "ca.source as drug" string matched no key and the
+                            // group key was silently dropped.
+                            let (real_col, alias_part) = match col.find(" as ") {
+                                Some(p) => (&col[..p], Some(col[p + 4..].trim())),
+                                None => (col.as_str(), None),
+                            };
+                            let out_name = alias_part.unwrap_or(real_col);
+                            let out_name = out_name.split('.').next_back().unwrap_or(out_name);
+                            if !result_row.contains_key(out_name) {
+                                if let Some(val) = Self::resolve_column_value(group_rows[0], real_col) {
+                                    result_row.insert(out_name.to_string(), Value::String(val));
                                 }
                             }
                         }
@@ -12635,6 +12692,17 @@ impl QueryExecutor {
         doc: &Map<String, Value>,
         expr: &FilterExpr,
     ) -> bool {
+        // Cross-table predicates: resolve column-ref literals against the row.
+        let sub;
+        let expr = if Self::filter_has_col_ref(expr) {
+            sub = Self::substitute_column_refs(
+                &|n| Self::resolve_column_value_raw(doc, n).cloned(),
+                expr,
+            );
+            &sub
+        } else {
+            expr
+        };
         match expr {
             FilterExpr::Eq(col, val) => doc.get(col).is_some_and(|v| {
                 if col == "__class__" {
@@ -13716,11 +13784,15 @@ impl QueryExecutor {
                             // For non-aggregate columns in GROUP BY result,
                             // the value comes from the first row (already added above)
                             // Only add if not already added by GROUP BY
-                            let col_name = col.split(" as ").last().unwrap_or(col);
-                            let col_name = col_name.split('.').next_back().unwrap_or(col_name);
-                            if !result_row.contains_key(col_name) {
-                                if let Some(val) = Self::resolve_column_value(group_rows[0], col) {
-                                    result_row.insert(col_name.to_string(), Value::String(val));
+                            let (real_col, alias_part) = match col.find(" as ") {
+                                Some(p) => (&col[..p], Some(col[p + 4..].trim())),
+                                None => (col.as_str(), None),
+                            };
+                            let out_name = alias_part.unwrap_or(real_col);
+                            let out_name = out_name.split('.').next_back().unwrap_or(out_name);
+                            if !result_row.contains_key(out_name) {
+                                if let Some(val) = Self::resolve_column_value(group_rows[0], real_col) {
+                                    result_row.insert(out_name.to_string(), Value::String(val));
                                 }
                             }
                         }
@@ -14537,7 +14609,21 @@ impl QueryExecutor {
         left_col: &str,
         right_col: &str,
     ) -> (String, String) {
-        // Check if left_col exists in left rows and right_col in right rows
+        // Pick the pairing where BOTH columns resolve against their own side.
+        // The old heuristic only consulted the FIRST row's keys, which flipped
+        // with the ON operand order on heterogeneous row sets (some rows carry
+        // the join column, some don't) and silently produced zero rows.
+        let resolves = |rows: &[Map<String, Value>], col: &str| -> bool {
+            rows.iter()
+                .any(|r| Self::resolve_column_value(r, col).is_some())
+        };
+        if resolves(left_rows, left_col) && resolves(right_rows, right_col) {
+            return (left_col.to_string(), right_col.to_string());
+        }
+        if resolves(left_rows, right_col) && resolves(right_rows, left_col) {
+            return (right_col.to_string(), left_col.to_string());
+        }
+        // Fallback: legacy first-row key presence.
         let left_has_left = left_rows
             .first()
             .map(|r| r.contains_key(left_col))
@@ -14568,6 +14654,94 @@ impl QueryExecutor {
             }
         }
         None
+    }
+
+    /// Like [`Self::resolve_column_value`] but returns the original typed value
+    /// (index probes are type-tagged; stringifying breaks numeric lookups).
+    fn resolve_column_value_raw<'a>(row: &'a Map<String, Value>, col: &str) -> Option<&'a Value> {
+        if let Some(v) = row.get(col) {
+            return Some(v);
+        }
+        for (k, v) in row {
+            if k.ends_with(&format!(".{}", col)) || k == col {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// True when any literal operand in the expression is a column reference
+    /// (cross-table predicate like `WHERE tp.source = ca.source`).
+    fn filter_has_col_ref(expr: &FilterExpr) -> bool {
+        let lit_has = |l: &LiteralValue| matches!(l, LiteralValue::Column(_));
+        match expr {
+            FilterExpr::Eq(_, v)
+            | FilterExpr::Ne(_, v)
+            | FilterExpr::Gt(_, v)
+            | FilterExpr::Lt(_, v)
+            | FilterExpr::Gte(_, v)
+            | FilterExpr::Lte(_, v) => lit_has(v),
+            FilterExpr::Between(_, lo, hi) => lit_has(lo) || lit_has(hi),
+            FilterExpr::In(_, vals) => vals.iter().any(lit_has),
+            FilterExpr::And(l, r) | FilterExpr::Or(l, r) => {
+                Self::filter_has_col_ref(l) || Self::filter_has_col_ref(r)
+            }
+            FilterExpr::Not(e) => Self::filter_has_col_ref(e),
+            _ => false,
+        }
+    }
+
+    /// Replace column-reference literals with the referenced column's value
+    /// from the row so cross-table predicates compare values, not literal text.
+    /// Unresolvable references become Null (comparisons evaluate to false).
+    fn substitute_column_refs(
+        resolve: &dyn Fn(&str) -> Option<Value>,
+        expr: &FilterExpr,
+    ) -> FilterExpr {
+        let sub = |l: &LiteralValue| -> LiteralValue {
+            match l {
+                LiteralValue::Column(name) => match resolve(name) {
+                    Some(Value::String(s)) => LiteralValue::String(s),
+                    Some(Value::Number(n)) => {
+                        if let Some(i) = n.as_i64() {
+                            LiteralValue::Int(i)
+                        } else {
+                            LiteralValue::Float(n.as_f64().unwrap_or(0.0))
+                        }
+                    }
+                    Some(Value::Bool(b)) => LiteralValue::Bool(b),
+                    Some(other) => LiteralValue::String(other.to_string()),
+                    None => LiteralValue::Null,
+                },
+                other => other.clone(),
+            }
+        };
+        match expr {
+            FilterExpr::Eq(c, v) => FilterExpr::Eq(c.clone(), sub(v)),
+            FilterExpr::Ne(c, v) => FilterExpr::Ne(c.clone(), sub(v)),
+            FilterExpr::Gt(c, v) => FilterExpr::Gt(c.clone(), sub(v)),
+            FilterExpr::Lt(c, v) => FilterExpr::Lt(c.clone(), sub(v)),
+            FilterExpr::Gte(c, v) => FilterExpr::Gte(c.clone(), sub(v)),
+            FilterExpr::Lte(c, v) => FilterExpr::Lte(c.clone(), sub(v)),
+            FilterExpr::Between(c, lo, hi) => {
+                FilterExpr::Between(c.clone(), sub(lo), sub(hi))
+            }
+            FilterExpr::In(c, vals) => {
+                FilterExpr::In(c.clone(), vals.iter().map(&sub).collect())
+            }
+            FilterExpr::And(l, r) => FilterExpr::And(
+                Box::new(Self::substitute_column_refs(resolve, l)),
+                Box::new(Self::substitute_column_refs(resolve, r)),
+            ),
+            FilterExpr::Or(l, r) => FilterExpr::Or(
+                Box::new(Self::substitute_column_refs(resolve, l)),
+                Box::new(Self::substitute_column_refs(resolve, r)),
+            ),
+            FilterExpr::Not(e) => {
+                FilterExpr::Not(Box::new(Self::substitute_column_refs(resolve, e)))
+            }
+            other => other.clone(),
+        }
     }
 
     /// Converts a JSON value to a string key for comparison.
@@ -15567,6 +15741,17 @@ impl QueryExecutor {
             }
             None
         };
+        // Cross-table predicates: resolve column-ref literals against the row.
+        let sub;
+        let filter = if Self::filter_has_col_ref(filter) {
+            sub = Self::substitute_column_refs(
+                &|n| resolve_val(n).cloned(),
+                filter,
+            );
+            &sub
+        } else {
+            filter
+        };
         match filter {
             FilterExpr::Eq(col, val) => resolve_val(col).is_some_and(|v| {
                 if col == "__class__" && !class_hierarchy.is_empty() {
@@ -15757,6 +15942,18 @@ impl QueryExecutor {
     }
 
     fn eval_filter(&self, engine: &LsmEngine, doc: &Map<String, Value>, expr: &FilterExpr) -> bool {
+        // Cross-table predicates: resolve column-ref literals against the row
+        // before evaluating (otherwise `= ca.source` compares the literal text).
+        let sub;
+        let expr = if Self::filter_has_col_ref(expr) {
+            sub = Self::substitute_column_refs(
+                &|n| Self::resolve_column_value_raw(doc, n).cloned(),
+                expr,
+            );
+            &sub
+        } else {
+            expr
+        };
         match expr {
             FilterExpr::Eq(col, val) => doc.get(col).is_some_and(|v| {
                 if col == "__class__" {
@@ -20407,6 +20604,178 @@ mod tests {
                 assert_eq!(rows.len(), 3); // 2 iPhone orders + 1 iPad order
             }
             _ => panic!("expected 3 rows from JOIN"),
+        }
+    }
+
+    #[test]
+    fn test_join_on_both_operand_orders_agree() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPad", 5);
+        executor.engine().flush_all().unwrap();
+
+        for sql in [
+            "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id",
+            "SELECT p.name, o.quantity FROM Product p JOIN Order o ON o.product_id = p.name",
+        ] {
+            let ast = QueryParser::parse(sql).unwrap();
+            match executor.execute(&ast).unwrap() {
+                QueryResult::Rows(rows) => assert_eq!(rows.len(), 2, "sql: {sql}"),
+                _ => panic!("expected rows"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_join_on_both_orders_with_index() {
+        // With an index on the probe column the planner may choose an index
+        // nested-loop join - both ON operand orders must still return rows.
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryParser::parse("CREATE INDEX ON Order (product_id)").unwrap())
+            .unwrap();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPhone", 4);
+        executor.engine().flush_all().unwrap();
+
+        for sql in [
+            "SELECT o.quantity FROM Product p JOIN Order o ON p.name = o.product_id",
+            "SELECT o.quantity FROM Product p JOIN Order o ON o.product_id = p.name",
+        ] {
+            let ast = QueryParser::parse(sql).unwrap();
+            match executor.execute(&ast).unwrap() {
+                QueryResult::Rows(rows) => assert_eq!(rows.len(), 2, "sql: {sql}"),
+                _ => panic!("expected rows"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_group_by_over_join_keeps_alias_and_limit() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPhone", 4);
+        insert_order(&executor, "iPad", 5);
+        executor.engine().flush_all().unwrap();
+
+        let ast = QueryParser::parse(
+            "SELECT p.name AS product, COUNT(*) AS n FROM Product p \
+             JOIN Order o ON p.name = o.product_id GROUP BY p.name ORDER BY n DESC LIMIT 1",
+        )
+        .unwrap();
+        match executor.execute(&ast).unwrap() {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                let r = &rows[0];
+                assert_eq!(
+                    r.get("product").and_then(|v| v.as_str()),
+                    Some("iPhone"),
+                    "group key alias must be emitted"
+                );
+                let n = r.get("n").unwrap();
+                let n = n.as_i64().or_else(|| n.as_str().and_then(|s| s.parse().ok()));
+                assert_eq!(n, Some(2), "LIMIT must apply after aggregation");
+            }
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_select_distinct_over_join_with_limit() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPhone", 4);
+        insert_order(&executor, "iPad", 5);
+        executor.engine().flush_all().unwrap();
+
+        // 3 raw join rows -> 2 distinct names; LIMIT 2 must dedup first.
+        let ast = QueryParser::parse(
+            "SELECT DISTINCT p.name FROM Product p JOIN Order o ON p.name = o.product_id LIMIT 2",
+        )
+        .unwrap();
+        match executor.execute(&ast).unwrap() {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 2),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_where_cross_table_column_equality() {
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_order(&executor, "iPhone", 3);
+        executor.engine().flush_all().unwrap();
+
+        // WHERE rhs is a column reference on the other joined table - must
+        // compare values, not the literal text "p.name".
+        let ast = QueryParser::parse(
+            "SELECT o.quantity FROM Product p JOIN Order o ON p.name = o.product_id \
+             WHERE o.product_id = p.name",
+        )
+        .unwrap();
+        match executor.execute(&ast).unwrap() {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            _ => panic!("expected rows"),
+        }
+    }
+
+    #[test]
+    fn test_join_on_both_operand_orders_execute_read() {
+        // The live server serves SELECTs through execute_read - ON operand
+        // order must not matter on that path either.
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPad", 5);
+        executor.engine().flush_all().unwrap();
+
+        for sql in [
+            "SELECT p.name, o.quantity FROM Product p JOIN Order o ON p.name = o.product_id",
+            "SELECT p.name, o.quantity FROM Product p JOIN Order o ON o.product_id = p.name",
+        ] {
+            let ast = QueryParser::parse(sql).unwrap();
+            match executor.execute_read(&ast).unwrap() {
+                QueryResult::Rows(rows) => assert_eq!(rows.len(), 2, "sql: {sql}"),
+                other => panic!("expected rows, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_join_on_orders_with_heterogeneous_right_rows() {
+        // Right-side rows where only SOME carry the join column: the old
+        // first-row-key heuristic flipped with the ON operand order (one order
+        // returned rows, the swapped order returned zero).
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        for i in 0..6 {
+            let ast = QueryAst::Insert {
+                class: "Order".to_string(),
+                columns: vec!["note".to_string()],
+                values: vec![LiteralValue::String(format!("n{i}"))],
+            };
+            executor.execute(&ast).unwrap();
+        }
+        insert_order(&executor, "iPhone", 3);
+        executor.engine().flush_all().unwrap();
+
+        for sql in [
+            "SELECT o.quantity FROM Product p JOIN Order o ON p.name = o.product_id",
+            "SELECT o.quantity FROM Product p JOIN Order o ON o.product_id = p.name",
+        ] {
+            let ast = QueryParser::parse(sql).unwrap();
+            match executor.execute(&ast).unwrap() {
+                QueryResult::Rows(rows) => assert_eq!(rows.len(), 1, "sql: {sql}"),
+                _ => panic!("expected rows"),
+            }
         }
     }
 
