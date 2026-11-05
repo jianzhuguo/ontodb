@@ -4870,6 +4870,7 @@ impl QueryExecutor {
         node: &PlanNode,
         engine: &LsmEngine,
         read_mode: bool,
+        needed: Option<&HashSet<String>>,
         sink: &mut dyn FnMut(Map<String, Value>) -> Result<bool>,
     ) -> Result<()> {
         match node {
@@ -4887,9 +4888,25 @@ impl QueryExecutor {
                 read_mode,
                 sink,
             ),
+            // Stream a nested hash join through the sink so `take` early-stop
+            // propagates into its probe scan instead of materializing it first.
+            PlanNode::HashJoin {
+                left,
+                right,
+                join_clause,
+                ..
+            } => self.execute_hash_join_build_probe(
+                left,
+                right,
+                join_clause,
+                engine,
+                read_mode,
+                needed,
+                sink,
+            ),
             other => {
                 let rows = if read_mode {
-                    self.execute_plan_node_read(other, engine)?
+                    self.execute_plan_node_read_with(other, engine, needed, None)?
                 } else {
                     self.execute_plan_node(other, engine)?
                 };
@@ -5719,6 +5736,128 @@ impl QueryExecutor {
         Ok(result)
     }
 
+    /// Max rows a flipped build side may hold. Larger right inputs fall back to
+    /// the normal build-left path (their capture is abandoned at this bound).
+    const SWAP_MAX_BUILD_ROWS: usize = 50_000;
+
+    /// True when the node is a single-table scan that can be captured or
+    /// streamed as one unit.
+    fn is_leaf_scan(node: &PlanNode) -> bool {
+        matches!(
+            node,
+            PlanNode::SeqScan { .. }
+                | PlanNode::IndexScan { .. }
+                | PlanNode::IndexLookup { .. }
+                | PlanNode::VectorSearch { .. }
+        )
+    }
+
+    /// ON operands paired by table ownership: `(joined_table_col, other_col)`.
+    /// Mirrors the planner's `join_right_column` ownership rule so `ON a.x = b.y`
+    /// and `ON b.y = a.x` pair identically. `None` when exactly one operand is
+    /// not owned by the joined table (bare columns, self-join shapes) — the
+    /// caller then keeps the row-sniffing orientation instead.
+    fn on_columns_by_ownership(join: &crate::parser::JoinClause) -> Option<(String, String)> {
+        let mut right_owner: Vec<&str> = Vec::with_capacity(4);
+        let table_seg = join.table.rsplit('.').next().unwrap_or(join.table.as_str());
+        right_owner.push(table_seg);
+        right_owner.push(join.table.as_str());
+        if let Some(a) = join.alias.as_deref() {
+            right_owner.push(a);
+            right_owner.push(a.rsplit('.').next().unwrap_or(a));
+        }
+        let owned = |operand: &str| -> Option<bool> {
+            let (prefix, _) = operand.rsplit_once('.')?;
+            Some(right_owner.contains(&prefix))
+        };
+        match (owned(&join.on.left), owned(&join.on.right)) {
+            (Some(true), Some(false)) => Some((join.on.left.clone(), join.on.right.clone())),
+            (Some(false), Some(true)) => Some((join.on.right.clone(), join.on.left.clone())),
+            _ => None,
+        }
+    }
+
+    /// Collect up to `cap` rows from a scan subtree. `Ok(None)` when the input
+    /// holds more than `cap` rows (the capture is abandoned and the caller runs
+    /// another plan).
+    fn capture_rows_capped(
+        &self,
+        node: &PlanNode,
+        engine: &LsmEngine,
+        read_mode: bool,
+        needed: Option<&HashSet<String>>,
+        cap: usize,
+    ) -> Result<Option<Vec<Map<String, Value>>>> {
+        let mut rows: Vec<Map<String, Value>> = Vec::new();
+        let mut overflow = false;
+        self.for_each_plan_node_row(node, engine, read_mode, needed, &mut |row| {
+            if rows.len() >= cap {
+                overflow = true;
+                return Ok(false);
+            }
+            rows.push(row);
+            Ok(true)
+        })?;
+        if overflow {
+            return Ok(None);
+        }
+        Ok(Some(Self::slim_rows(rows, needed)))
+    }
+
+    /// Hash join with the roles flipped: `build_rows` (the joined input, small)
+    /// is hashed while the other input streams as probe. Used when that input is
+    /// a join subtree whose full materialization dominates the query — the
+    /// streamed probe then lets a `take` sink stop the whole chain early.
+    /// INNER only: the unmatched-row emission in [`Self::execute_hash_join_build_probe`]
+    /// assumes build = left.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_hash_join_swapped(
+        &self,
+        build_rows: Vec<Map<String, Value>>,
+        probe: &PlanNode,
+        join: &crate::parser::JoinClause,
+        engine: &LsmEngine,
+        read_mode: bool,
+        needed: Option<&HashSet<String>>,
+        build_col: &str,
+        probe_col: &str,
+        sink: &mut dyn FnMut(Map<String, Value>) -> Result<bool>,
+    ) -> Result<()> {
+        let right_alias = join.alias.as_deref().unwrap_or(&join.table);
+        // The streamed probe rows keep the consumer's needs plus both ON keys —
+        // slimming below that would drop the probe key before the lookup.
+        let mut child_needed_owned = needed.cloned();
+        if let Some(s) = child_needed_owned.as_mut() {
+            s.insert(Self::col_tail(build_col));
+            s.insert(Self::col_tail(probe_col));
+        }
+        let child_needed = child_needed_owned.as_ref();
+        let mut hash_table: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (idx, row) in build_rows.iter().enumerate() {
+            if let Some(val) = Self::resolve_column_value(row, build_col) {
+                hash_table.entry(val).or_default().push(idx);
+            }
+        }
+        self.for_each_plan_node_row(probe, engine, read_mode, child_needed, &mut |probe_row| {
+            if let Some(probe_val) = Self::resolve_column_value(&probe_row, probe_col) {
+                if let Some(indices) = hash_table.get(&probe_val) {
+                    for &idx in indices {
+                        let row = Self::merge_join_row(&probe_row, &build_rows[idx], right_alias);
+                        let row = match needed {
+                            Some(n) => Self::slim_row(row, n),
+                            None => row,
+                        };
+                        if !sink(row)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+            Ok(true)
+        })
+    }
+
     /// Build-probe hash join: only the build (left) side is materialized —
     /// into a hash table of row indices — while the probe (right) side is
     /// streamed row by row. Peak memory is build + output instead of
@@ -5761,6 +5900,42 @@ impl QueryExecutor {
             s.insert(Self::col_tail(&right_col_raw));
         }
         let child_needed = child_needed_owned.as_ref();
+        // Build-side flip: a small leaf right input is hashed and the left join
+        // subtree streams as probe, so the chain is never materialized and a
+        // `take` sink stops it early. INNER only — the unmatched-row emission
+        // below assumes build = left — and the ON pairing must be attributable
+        // to table ownership (the row-sniffing orientation below reads the other
+        // way round once the sides flip).
+        if matches!(join.join_type, crate::parser::JoinType::Inner)
+            && !Self::is_leaf_scan(left)
+            && Self::is_leaf_scan(right)
+            && !self
+                .get_cached_row_count(engine, &join.table)
+                .map(|n| n as usize > Self::SWAP_MAX_BUILD_ROWS)
+                .unwrap_or(false)
+        {
+            if let Some((build_col, probe_col)) = Self::on_columns_by_ownership(join) {
+                if let Some(build_rows) = self.capture_rows_capped(
+                    right,
+                    engine,
+                    read_mode,
+                    child_needed,
+                    Self::SWAP_MAX_BUILD_ROWS,
+                )? {
+                    return self.execute_hash_join_swapped(
+                        build_rows,
+                        left,
+                        join,
+                        engine,
+                        read_mode,
+                        needed,
+                        &build_col,
+                        &probe_col,
+                        sink,
+                    );
+                }
+            }
+        }
         // Build side: hash lookup needs random access, so it is materialized.
         let left_rows = if read_mode {
             self.execute_plan_node_read_with(left, engine, child_needed, None)?
@@ -5794,7 +5969,7 @@ impl QueryExecutor {
         let mut right_sample: Option<Map<String, Value>> = None;
         let mut stopped = false;
 
-        self.for_each_plan_node_row(right, engine, read_mode, &mut |right_row| {
+        self.for_each_plan_node_row(right, engine, read_mode, child_needed, &mut |right_row| {
             if !keys_ready {
                 let probe_has_left =
                     Self::resolve_column_value_raw(&right_row, &left_col_raw).is_some();
@@ -21446,6 +21621,52 @@ mod tests {
                 QueryResult::Rows(rows) => assert_eq!(rows.len(), 1, "sql: {sql}"),
                 _ => panic!("expected rows"),
             }
+        }
+    }
+
+    #[test]
+    fn test_hash_join_build_side_flip_small_right() {
+        // The joined input is a tiny leaf while the left side is a join
+        // subtree: the right rows are hashed and the chain streams as probe
+        // (build-side flip). Both ON operand orders must agree, and LIMIT must
+        // still return matches from the streamed chain.
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPhone", 1);
+        insert_order(&executor, "iPad", 5);
+        for (name, code) in [("iPhone", "S1"), ("iPad", "S2")] {
+            let ast = QueryAst::Insert {
+                class: "Ship".to_string(),
+                columns: vec!["ship_ref".to_string(), "code".to_string()],
+                values: vec![
+                    LiteralValue::String(name.to_string()),
+                    LiteralValue::String(code.to_string()),
+                ],
+            };
+            executor.execute(&ast).unwrap();
+        }
+        executor.engine().flush_all().unwrap();
+
+        for sql in [
+            "SELECT p.name FROM Product p JOIN Order o ON p.name = o.product_id JOIN Ship s ON s.ship_ref = p.name",
+            "SELECT p.name FROM Product p JOIN Order o ON p.name = o.product_id JOIN Ship s ON p.name = s.ship_ref",
+        ] {
+            let ast = QueryParser::parse(sql).unwrap();
+            match executor.execute(&ast).unwrap() {
+                QueryResult::Rows(rows) => assert_eq!(rows.len(), 3, "sql: {sql}"),
+                _ => panic!("expected rows"),
+            }
+        }
+
+        let ast = QueryParser::parse(
+            "SELECT p.name FROM Product p JOIN Order o ON p.name = o.product_id JOIN Ship s ON s.ship_ref = p.name LIMIT 2",
+        )
+        .unwrap();
+        match executor.execute(&ast).unwrap() {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 2),
+            _ => panic!("expected rows"),
         }
     }
 
