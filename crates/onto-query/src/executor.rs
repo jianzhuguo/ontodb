@@ -4396,9 +4396,20 @@ impl QueryExecutor {
                 join_clause,
                 ..
             } => {
-                let left_rows = self.execute_plan_node(left, engine)?;
-                let right_rows = self.execute_plan_node(right, engine)?;
-                Self::execute_hash_join_rows(left_rows, right_rows, join_clause)
+                let mut rows: Vec<Map<String, Value>> = Vec::new();
+                self.execute_hash_join_build_probe(
+                    left,
+                    right,
+                    join_clause,
+                    engine,
+                    false,
+                    None,
+                    &mut |row| {
+                        rows.push(row);
+                        Ok(true)
+                    },
+                )?;
+                Ok(rows)
             }
             PlanNode::SortMergeJoin {
                 left,
@@ -4475,24 +4486,82 @@ impl QueryExecutor {
         }
     }
 
-    /// Plan-driven sequential scan with optional filter.
-    fn plan_seq_scan(
+    /// Stream sequential-scan rows into `sink` one at a time instead of
+    /// collecting them.
+    ///
+    /// Row semantics match [`Self::plan_seq_scan`] for `read_mode == false`
+    /// and [`Self::plan_seq_scan_read_limit`] for `read_mode == true` — only
+    /// the delivery differs. The raw key/value walk is the streaming merge
+    /// (`for_each_live_prefix_until`) rather than `scan_prefix`'s
+    /// full-materialization HashMap: that O(table) buffer is what OOMs
+    /// multi-hundred-thousand-row joins. Alias prefixing is applied per row
+    /// ([`Self::apply_alias_row`]) so a caller may stop at any point.
+    ///
+    /// `sink` returns `Ok(false)` to stop the scan early.
+    fn scan_rows_sink(
         &self,
         engine: &LsmEngine,
         table: &str,
         alias: Option<&str>,
         filter: &Option<FilterExpr>,
         projected_columns: Option<&SelectColumns>,
-    ) -> Result<Vec<Map<String, Value>>> {
+        read_mode: bool,
+        sink: &mut dyn FnMut(Map<String, Value>) -> Result<bool>,
+    ) -> Result<()> {
         // Subquery tables materialize instead of scanning a class.
-        if let Some(mut rows) = self.subquery_rows(table, filter)? {
-            if let Some(a) = alias {
-                Self::apply_alias(&mut rows, a);
+        if let Some(rows) = self.subquery_rows(table, filter)? {
+            for mut row in rows {
+                if let Some(a) = alias {
+                    Self::apply_alias_row(&mut row, a);
+                }
+                if !sink(row)? {
+                    return Ok(());
+                }
             }
-            return Ok(rows);
+            return Ok(());
         }
-        // Auto-collect statistics if not already done
-        self.ensure_statistics(table, engine);
+
+        if read_mode {
+            // Point-lookup fast path: `__pk__ = '<key>'` (bare or ANDed).
+            if let Some(f) = filter.as_ref() {
+                if let Some(rows) = self.pk_lookup_filtered(engine, table, f)? {
+                    for mut row in rows {
+                        if let Some(a) = alias {
+                            Self::apply_alias_row(&mut row, a);
+                        }
+                        if !sink(row)? {
+                            return Ok(());
+                        }
+                    }
+                    return Ok(());
+                }
+                // A simple indexed-column predicate goes straight to the index
+                // instead of scanning millions of rows for one match.
+                if Self::filter_is_indexable(f) {
+                    let idx_col = Self::filter_column(f).unwrap_or_default();
+                    if engine.has_index(table, &idx_col) {
+                        let rows = self.plan_index_scan_read_limit(
+                            engine,
+                            table,
+                            alias,
+                            &idx_col,
+                            filter,
+                            None,
+                            projected_columns,
+                        )?;
+                        for row in rows {
+                            if !sink(row)? {
+                                return Ok(());
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        } else {
+            // Auto-collect statistics if not already done
+            self.ensure_statistics(table, engine);
+        }
 
         // Check for active transaction for snapshot-aware scanning
         let active_txn_id = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
@@ -4511,7 +4580,7 @@ impl QueryExecutor {
                                 shard = shard,
                                 "shard not local, skipping scan"
                             );
-                            return Ok(Vec::new());
+                            return Ok(());
                         }
                     }
                     ShardTarget::Multi(shards) => {
@@ -4519,7 +4588,7 @@ impl QueryExecutor {
                             shards.into_iter().filter(|s| router.is_local(*s)).collect();
                         if local_shards.is_empty() {
                             tracing::debug!(table = table, "no local shards for multi-shard scan");
-                            return Ok(Vec::new());
+                            return Ok(());
                         }
                         tracing::debug!(table = table, shards = ?local_shards, "scanning local shards");
                     }
@@ -4530,62 +4599,106 @@ impl QueryExecutor {
             }
         }
 
-        // Check CTE tables first
-        let cte_prefix = format!("__cte_{}::", table.to_lowercase());
-        let cte_entries = engine
-            .scan_prefix(cte_prefix.as_bytes())
-            .unwrap_or_default();
-        if !cte_entries.is_empty() {
-            let mut rows = Vec::new();
-            for (_key, val_bytes) in &cte_entries {
-                if val_bytes == b"__deleted__" {
-                    continue;
-                }
-                if let Some(doc) = storage_bytes_to_doc(val_bytes) {
-                    rows.push(doc);
+        if read_mode {
+            // Point-lookup fast path again — `plan_seq_scan_read_limit` probes
+            // it both before and after shard routing; keep that ordering.
+            if let Some(f) = filter.as_ref() {
+                if let Some(rows) = self.pk_lookup_filtered(engine, table, f)? {
+                    for mut row in rows {
+                        if let Some(a) = alias {
+                            Self::apply_alias_row(&mut row, a);
+                        }
+                        if !sink(row)? {
+                            return Ok(());
+                        }
+                    }
+                    return Ok(());
                 }
             }
-            if !rows.is_empty() {
-                return Ok(rows);
+        } else {
+            // Check CTE tables first
+            let cte_prefix = format!("__cte_{}::", table.to_lowercase());
+            let cte_entries = engine
+                .scan_prefix(cte_prefix.as_bytes())
+                .unwrap_or_default();
+            if !cte_entries.is_empty() {
+                let mut emitted_any = false;
+                for (_key, val_bytes) in &cte_entries {
+                    if val_bytes == b"__deleted__" {
+                        continue;
+                    }
+                    if let Some(mut doc) = storage_bytes_to_doc(val_bytes) {
+                        emitted_any = true;
+                        if let Some(a) = alias {
+                            Self::apply_alias_row(&mut doc, a);
+                        }
+                        if !sink(doc)? {
+                            return Ok(());
+                        }
+                    }
+                }
+                if emitted_any {
+                    return Ok(());
+                }
+            }
+
+            // Check materialized views
+            let mv_prefix = format!("__mv_{}::", table.to_lowercase());
+            let mv_entries = engine.scan_prefix(mv_prefix.as_bytes()).unwrap_or_default();
+            if !mv_entries.is_empty() {
+                let mut emitted_any = false;
+                for (_key, val_bytes) in &mv_entries {
+                    if val_bytes == b"__deleted__" {
+                        continue;
+                    }
+                    if let Some(mut doc) = storage_bytes_to_doc(val_bytes) {
+                        emitted_any = true;
+                        if let Some(a) = alias {
+                            Self::apply_alias_row(&mut doc, a);
+                        }
+                        if !sink(doc)? {
+                            return Ok(());
+                        }
+                    }
+                }
+                if emitted_any {
+                    return Ok(());
+                }
+            }
+
+            // Point-lookup fast path: `__pk__ = '<key>'` (bare or ANDed)
+            // resolves via direct engine get instead of a full multi-million-row scan.
+            if let Some(f) = filter.as_ref() {
+                if let Some(rows) = self.pk_lookup_filtered(engine, table, f)? {
+                    for mut row in rows {
+                        if let Some(a) = alias {
+                            Self::apply_alias_row(&mut row, a);
+                        }
+                        if !sink(row)? {
+                            return Ok(());
+                        }
+                    }
+                    return Ok(());
+                }
             }
         }
 
-        // Check materialized views
-        let mv_prefix = format!("__mv_{}::", table.to_lowercase());
-        let mv_entries = engine.scan_prefix(mv_prefix.as_bytes()).unwrap_or_default();
-        if !mv_entries.is_empty() {
-            let mut rows = Vec::new();
-            for (_key, val_bytes) in &mv_entries {
-                if val_bytes == b"__deleted__" {
-                    continue;
-                }
-                if let Some(doc) = storage_bytes_to_doc(val_bytes) {
-                    rows.push(doc);
-                }
-            }
-            if !rows.is_empty() {
-                return Ok(rows);
-            }
-        }
-
-        // Regular table scan �?expand class hierarchy via ontology reasoning
-        // Point-lookup fast path: `__pk__ = '<key>'` (bare or ANDed) resolves
-        // via direct engine get instead of a full multi-million-row scan.
-        if let Some(f) = filter.as_ref() {
-            if let Some(rows) = self.pk_lookup_filtered(engine, table, f)? {
-                return Ok(rows);
-            }
-        }
-        let class_hierarchy = self.get_class_hierarchy(engine, table);
-        tracing::debug!(
-            "plan_seq_scan: table='{}', class_hierarchy={:?}",
-            table,
-            class_hierarchy
-        );
-
-        // Semantic optimization: narrow scan scope using __class__ filter and disjoint constraints
-        let scan_classes = self.narrow_scan_scope(engine, table, filter, &class_hierarchy);
-        tracing::debug!("plan_seq_scan: scan_classes={:?}", scan_classes);
+        // Regular table scan: expand class hierarchy via ontology reasoning.
+        // Non-read mode additionally narrows the scan scope using the
+        // `__class__` filter and disjoint-class constraints.
+        let scan_classes: HashSet<String> = if read_mode {
+            self.get_class_hierarchy_read(engine, table)
+        } else {
+            let class_hierarchy = self.get_class_hierarchy(engine, table);
+            tracing::debug!(
+                "plan_seq_scan: table='{}', class_hierarchy={:?}",
+                table,
+                class_hierarchy
+            );
+            let scan_classes = self.narrow_scan_scope(engine, table, filter, &class_hierarchy);
+            tracing::debug!("plan_seq_scan: scan_classes={:?}", scan_classes);
+            scan_classes
+        };
 
         // Pre-extract simple filter column names for fast byte-level rejection.
         let fast_filter_cols = Self::extract_fast_filter_columns(filter);
@@ -4622,147 +4735,172 @@ impl QueryExecutor {
             _ => Vec::new(),
         };
 
-        let mut rows = Vec::new();
         let mut scan_count: u64 = 0;
-
-        // Note: Parallel scan could be implemented here using std::thread::scope
-        // when scan_classes.len() > 1. Each class would be scanned in parallel.
-        // For now, use sequential scan which is simpler and correct.
 
         for scan_class in &scan_classes {
             let prefix = format!("{}::", scan_class);
-            // Use transaction-aware scan if there's an active transaction
-            let entries = if let Some(txn_id) = active_txn_id {
-                self.engine.txn_scan_prefix(txn_id, prefix.as_bytes())?
-            } else {
-                engine.scan_prefix(prefix.as_bytes())?
-            };
-            for (key, val_bytes) in &entries {
+            let mut on_row = |key: &[u8], val_bytes: &[u8]| -> Result<bool> {
                 // Check query timeout every 1024 rows (cheap: one atomic load)
                 scan_count += 1;
                 if scan_count & 0x3FF == 0 {
                     self.check_timeout()?;
                 }
-                // Tier 1: fast byte-level rejection (definitely doesn't match �?skip)
+                // Tier 1: fast byte-level rejection (definitely doesn't match — skip)
                 if !fast_filter_cols.is_empty()
                     && Self::fast_filter_reject(val_bytes, filter, &fast_filter_cols)
                 {
-                    continue;
+                    return Ok(true);
                 }
-                // Tier 2: BinaryRow path (for binary-stored data) �?no JSON parsing
+                // Tier 2: BinaryRow path (for binary-stored data) — no JSON parsing
                 if let Some(brow) = BinaryRow::parse(val_bytes) {
                     if !brow.class_in_hierarchy(&scan_classes) {
-                        continue;
+                        return Ok(true);
                     }
                     if let Some(f) = filter {
                         match eval_binary_filter(&brow, f) {
                             Some(true) => {}
-                            Some(false) => continue,
+                            Some(false) => return Ok(true),
                             None => {
                                 if let Some(mut doc) = brow.to_map() {
-                                    if !self.eval_filter(engine, &doc, f) {
-                                        continue;
+                                    let keep = if read_mode {
+                                        self.eval_filter_read(engine, &doc, f)
+                                    } else {
+                                        self.eval_filter(engine, &doc, f)
+                                    };
+                                    if !keep {
+                                        return Ok(true);
                                     }
-                                    doc.insert(
-                                        "__pk__".to_string(),
-                                        Value::String(String::from_utf8_lossy(key).to_string()),
-                                    );
-                                    // Add shard routing info for debugging
-                                    if let Some(router) = self
-                                        .shard_router
-                                        .read()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .as_ref()
-                                    {
-                                        let pk = String::from_utf8_lossy(key);
-                                        let target = router.route_key(table, pk.as_bytes());
-                                        doc.insert(
-                                            "__shard__".to_string(),
-                                            Value::String(format!("{:?}", target)),
-                                        );
+                                    self.annotate_scanned_row(table, key, &mut doc);
+                                    if let Some(a) = alias {
+                                        Self::apply_alias_row(&mut doc, a);
                                     }
-                                    rows.push(doc);
+                                    return sink(doc);
                                 }
-                                continue;
+                                return Ok(true);
                             }
                         }
                     }
                     if let Some(mut doc) = brow.to_map_projected(&proj_cols) {
-                        doc.insert(
-                            "__pk__".to_string(),
-                            Value::String(String::from_utf8_lossy(key).to_string()),
-                        );
-                        // Add shard routing info for debugging
-                        if let Some(router) = self
-                            .shard_router
-                            .read()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .as_ref()
-                        {
-                            let pk = String::from_utf8_lossy(key);
-                            let target = router.route_key(table, pk.as_bytes());
-                            doc.insert(
-                                "__shard__".to_string(),
-                                Value::String(format!("{:?}", target)),
-                            );
+                        self.annotate_scanned_row(table, key, &mut doc);
+                        if let Some(a) = alias {
+                            Self::apply_alias_row(&mut doc, a);
                         }
-                        rows.push(doc);
+                        return sink(doc);
                     }
-                    continue;
+                    return Ok(true);
                 }
                 // Tier 3: JSON fallback (legacy data stored as JSON)
                 if let Ok(serde_json::Value::Object(mut doc)) =
                     serde_json::from_slice::<serde_json::Value>(val_bytes)
                 {
-                    if !scan_classes
-                        .contains(doc.get("__class__").and_then(|v| v.as_str()).unwrap_or(""))
-                    {
-                        continue;
+                    let cls = doc
+                        .get("__class__")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !scan_classes.contains(cls) {
+                        return Ok(true);
                     }
                     if let Some(f) = filter {
-                        if !self.eval_filter(engine, &doc, f) {
-                            continue;
+                        let keep = if read_mode {
+                            self.eval_filter_read(engine, &doc, f)
+                        } else {
+                            self.eval_filter(engine, &doc, f)
+                        };
+                        if !keep {
+                            return Ok(true);
                         }
                     }
-                    doc.insert(
-                        "__pk__".to_string(),
-                        Value::String(String::from_utf8_lossy(key).to_string()),
-                    );
-                    // Add shard routing info for debugging
-                    if let Some(router) = self
-                        .shard_router
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                    {
-                        let pk = String::from_utf8_lossy(key);
-                        let target = router.route_key(table, pk.as_bytes());
-                        doc.insert(
-                            "__shard__".to_string(),
-                            Value::String(format!("{:?}", target)),
-                        );
+                    self.annotate_scanned_row(table, key, &mut doc);
+                    if let Some(a) = alias {
+                        Self::apply_alias_row(&mut doc, a);
                     }
-                    rows.push(doc);
+                    return sink(doc);
                 }
+                Ok(true)
+            };
+
+            // Key-ordered streaming merge over memtable + SSTs: no O(table)
+            // key/value materialization.
+            if let Some(txn_id) = active_txn_id {
+                self.engine.txn_for_each_live_prefix(txn_id, prefix.as_bytes(), |k, v| {
+                    on_row(k, v)?;
+                    Ok(())
+                })?;
+            } else {
+                engine.for_each_live_prefix_until(prefix.as_bytes(), None, None, &mut on_row)?;
             }
         }
 
-        // Apply alias to column names if specified
-        if let Some(a) = alias {
-            for row in &mut rows {
-                let keys: Vec<String> = row.keys().cloned().collect();
-                for key in keys {
-                    if key != "__class__" {
-                        if let Some(val) = row.remove(&key) {
-                            row.insert(format!("{}.{}", a, key), val.clone());
-                            row.insert(key, val);
-                        }
-                    }
-                }
-            }
-        }
+        Ok(())
+    }
 
+    /// Plan-driven sequential scan with optional filter.
+    fn plan_seq_scan(
+        &self,
+        engine: &LsmEngine,
+        table: &str,
+        alias: Option<&str>,
+        filter: &Option<FilterExpr>,
+        projected_columns: Option<&SelectColumns>,
+    ) -> Result<Vec<Map<String, Value>>> {
+        let mut rows = Vec::new();
+        self.scan_rows_sink(
+            engine,
+            table,
+            alias,
+            filter,
+            projected_columns,
+            false,
+            &mut |row| {
+                rows.push(row);
+                Ok(true)
+            },
+        )?;
         Ok(rows)
+    }
+
+    /// Stream the rows a plan node produces into `sink`, without materializing
+    /// the whole result when the node is a plain scan: `SeqScan` goes through
+    /// [`Self::scan_rows_sink`], every other node falls back to full
+    /// materialization and is then handed over row by row.
+    ///
+    /// `sink` returns `Ok(false)` to stop early.
+    fn for_each_plan_node_row(
+        &self,
+        node: &PlanNode,
+        engine: &LsmEngine,
+        read_mode: bool,
+        sink: &mut dyn FnMut(Map<String, Value>) -> Result<bool>,
+    ) -> Result<()> {
+        match node {
+            PlanNode::SeqScan {
+                table,
+                alias,
+                filter,
+                ..
+            } => self.scan_rows_sink(
+                &self.engine.engine_for_class(table),
+                table,
+                alias.as_deref(),
+                filter,
+                None,
+                read_mode,
+                sink,
+            ),
+            other => {
+                let rows = if read_mode {
+                    self.execute_plan_node_read(other, engine)?
+                } else {
+                    self.execute_plan_node(other, engine)?
+                };
+                for row in rows {
+                    if !sink(row)? {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     /// True when a SELECT can push OFFSET/LIMIT into the scan window:
@@ -5350,21 +5488,134 @@ impl QueryExecutor {
         }
     }
 
+    /// Merge one left and one right join row: left keys as-is, right keys under
+    /// both `alias.key` and bare `key` (bare loses to an existing left key).
+    /// Last dot segment of a column name ("dt.target" -> "target"), quoted
+    /// forms trimmed. Join rows are pruned by this tail.
+    fn col_tail(col: &str) -> String {
+        let col = col.trim_matches('"');
+        col.rsplit('.').next().unwrap_or(col).to_string()
+    }
+
+    /// Keep only keys whose tail names a column the consumer will read. Every
+    /// spelling of a needed column survives (bare / `alias.col` / double-alias
+    /// garbage), so `resolve_column_value_raw` and `project_columns` see the
+    /// same forms they would on a full row.
+    fn slim_row(row: Map<String, Value>, needed: &HashSet<String>) -> Map<String, Value> {
+        row.into_iter()
+            .filter(|(k, _)| needed.contains(k.rsplit('.').next().unwrap_or(k)))
+            .collect()
+    }
+
+    fn slim_rows(
+        rows: Vec<Map<String, Value>>,
+        needed: Option<&HashSet<String>>,
+    ) -> Vec<Map<String, Value>> {
+        match needed {
+            Some(n) => rows.into_iter().map(|r| Self::slim_row(r, n)).collect(),
+            None => rows,
+        }
+    }
+
+    /// Needed tails for a filter predicate, or None when the expression
+    /// references columns that can't be enumerated (subquery forms).
+    fn filter_needed_tails(expr: &FilterExpr, out: &mut HashSet<String>) -> bool {
+        match expr {
+            FilterExpr::Eq(c, _)
+            | FilterExpr::Ne(c, _)
+            | FilterExpr::Gt(c, _)
+            | FilterExpr::Lt(c, _)
+            | FilterExpr::Gte(c, _)
+            | FilterExpr::Lte(c, _)
+            | FilterExpr::Like(c, _)
+            | FilterExpr::IsNull(c)
+            | FilterExpr::IsNotNull(c)
+            | FilterExpr::Between(c, _, _)
+            | FilterExpr::In(c, _) => {
+                out.insert(Self::col_tail(c));
+                true
+            }
+            FilterExpr::And(l, r) | FilterExpr::Or(l, r) => {
+                Self::filter_needed_tails(l, out) && Self::filter_needed_tails(r, out)
+            }
+            FilterExpr::Not(e) => Self::filter_needed_tails(e, out),
+            _ => false,
+        }
+    }
+
+    fn merge_join_row(
+        left_row: &Map<String, Value>,
+        right_row: &Map<String, Value>,
+        right_alias: &str,
+    ) -> Map<String, Value> {
+        let mut merged = Map::new();
+        for (k, v) in left_row {
+            merged.insert(k.clone(), v.clone());
+        }
+        for (k, v) in right_row {
+            merged.insert(format!("{}.{}", right_alias, k), v.clone());
+            if !merged.contains_key(k) {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+        merged
+    }
+
+    /// Unmatched left row with NULLed right columns (LEFT/FULL JOIN).
+    fn merge_join_row_null_right(
+        left_row: &Map<String, Value>,
+        right_sample: Option<&Map<String, Value>>,
+        right_alias: &str,
+    ) -> Map<String, Value> {
+        let mut merged = Map::new();
+        for (k, v) in left_row {
+            merged.insert(k.clone(), v.clone());
+        }
+        if let Some(right_sample) = right_sample {
+            for k in right_sample.keys() {
+                merged.insert(format!("{}.{}", right_alias, k), Value::Null);
+                if !merged.contains_key(k) {
+                    merged.insert(k.clone(), Value::Null);
+                }
+            }
+        }
+        merged
+    }
+
+    /// Unmatched right row with NULLed left columns (RIGHT/FULL JOIN).
+    fn merge_join_row_null_left(
+        right_row: &Map<String, Value>,
+        left_sample: Option<&Map<String, Value>>,
+        right_alias: &str,
+    ) -> Map<String, Value> {
+        let mut merged = Map::new();
+        if let Some(left_sample) = left_sample {
+            for k in left_sample.keys() {
+                merged.insert(k.clone(), Value::Null);
+            }
+        }
+        for (k, v) in right_row {
+            merged.insert(format!("{}.{}", right_alias, k), v.clone());
+            if !merged.contains_key(k) {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+        merged
+    }
+
     /// Nested loop join on pre-fetched rows.
     fn execute_nested_loop_join(
         left_rows: Vec<Map<String, Value>>,
         right_rows: Vec<Map<String, Value>>,
         join: &crate::parser::JoinClause,
     ) -> Result<Vec<Map<String, Value>>> {
-        let _left_alias = None::<&str>;
         let right_alias = join.alias.as_deref().unwrap_or(&join.table);
         let (left_col_raw, right_col_raw) = Self::resolve_join_columns(&join.on)?;
         let (left_col, right_col) = Self::fix_join_columns(&left_rows, &right_rows, &left_col_raw, &right_col_raw);
         let join_type = join.join_type;
 
-        let mut matched_left: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut result = Vec::new();
-        for (li, left_row) in left_rows.iter().enumerate() {
+        for left_row in left_rows.iter() {
             let left_val = Self::resolve_column_value(left_row, &left_col);
             let mut matched = false;
 
@@ -5372,38 +5623,13 @@ impl QueryExecutor {
                 let right_val = Self::resolve_column_value(right_row, &right_col);
                 if left_val.is_some() && right_val.is_some() && left_val == right_val {
                     matched = true;
-                    matched_left.insert(li);
-                    let mut merged = Map::new();
-                    for (k, v) in left_row {
-                        merged.insert(k.clone(), v.clone());
-                    }
-                    for (k, v) in right_row {
-                        let key = format!("{}.{}", right_alias, k);
-                        merged.insert(key, v.clone());
-                        if !merged.contains_key(k) {
-                            merged.insert(k.clone(), v.clone());
-                        }
-                    }
-                    result.push(merged);
+                    result.push(Self::merge_join_row(left_row, right_row, right_alias));
                 }
             }
 
             // For LEFT/FULL JOIN: emit left row with NULLs for right columns if no match
             if !matched && matches!(join_type, crate::parser::JoinType::Left | crate::parser::JoinType::Full) {
-                let mut merged = Map::new();
-                for (k, v) in left_row {
-                    merged.insert(k.clone(), v.clone());
-                }
-                if let Some(right_sample) = right_rows.first() {
-                    for k in right_sample.keys() {
-                        let key = format!("{}.{}", right_alias, k);
-                        merged.insert(key, Value::Null);
-                        if !merged.contains_key(k) {
-                            merged.insert(k.clone(), Value::Null);
-                        }
-                    }
-                }
-                result.push(merged);
+                result.push(Self::merge_join_row_null_right(left_row, right_rows.first(), right_alias));
             }
         }
 
@@ -5420,20 +5646,7 @@ impl QueryExecutor {
                     }
                 }
                 if !matched {
-                    let mut merged = Map::new();
-                    if let Some(left_sample) = left_rows.first() {
-                        for k in left_sample.keys() {
-                            merged.insert(k.clone(), Value::Null);
-                        }
-                    }
-                    for (k, v) in right_row {
-                        let key = format!("{}.{}", right_alias, k);
-                        merged.insert(key, v.clone());
-                        if !merged.contains_key(k) {
-                            merged.insert(k.clone(), v.clone());
-                        }
-                    }
-                    result.push(merged);
+                    result.push(Self::merge_join_row_null_left(right_row, left_rows.first(), right_alias));
                 }
             }
         }
@@ -5451,89 +5664,54 @@ impl QueryExecutor {
         let (left_col_raw, right_col_raw) = Self::resolve_join_columns(&join.on)?;
         let (left_col, right_col) = Self::fix_join_columns(&left_rows, &right_rows, &left_col_raw, &right_col_raw);
         let join_type = join.join_type;
+        let track_right_unmatched =
+            matches!(join_type, crate::parser::JoinType::Right | crate::parser::JoinType::Full);
 
-        // Build hash table on right side
-        let mut hash_table: std::collections::HashMap<String, Vec<&Map<String, Value>>> =
+        // Build hash table on right side, carrying each row's position so
+        // RIGHT/FULL match marking is O(1) per pair. (Looking the position up
+        // by linear scan per matched pair made large joins quadratic.)
+        let mut hash_table: std::collections::HashMap<String, Vec<(usize, &Map<String, Value>)>> =
             std::collections::HashMap::new();
-        for right_row in &right_rows {
+        for (idx, right_row) in right_rows.iter().enumerate() {
             if let Some(val) = Self::resolve_column_value(right_row, &right_col) {
-                hash_table.entry(val).or_default().push(right_row);
+                hash_table.entry(val).or_default().push((idx, right_row));
             }
         }
-
-        // Track which right/left rows were matched (for outer joins)
-        let mut matched_left: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut matched_right: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut matched_right: Vec<bool> = if track_right_unmatched {
+            vec![false; right_rows.len()]
+        } else {
+            Vec::new()
+        };
 
         // Probe with left rows
         let mut result = Vec::new();
-        for (li, left_row) in left_rows.iter().enumerate() {
+        for left_row in left_rows.iter() {
             let left_val = Self::resolve_column_value(left_row, &left_col);
             let mut matched = false;
 
             if let Some(left_val) = &left_val {
                 if let Some(matching_rights) = hash_table.get(left_val) {
-                    for right_row in matching_rights {
+                    for (idx, right_row) in matching_rights {
                         matched = true;
-                        matched_left.insert(li);
-                        if let Some(idx) =
-                            right_rows.iter().position(|r| std::ptr::eq(r, *right_row))
-                        {
-                            matched_right.insert(idx);
+                        if track_right_unmatched {
+                            matched_right[*idx] = true;
                         }
-                        let mut merged = Map::new();
-                        for (k, v) in left_row {
-                            merged.insert(k.clone(), v.clone());
-                        }
-                        for (k, v) in *right_row {
-                            let key = format!("{}.{}", right_alias, k);
-                            merged.insert(key, v.clone());
-                            if !merged.contains_key(k) {
-                                merged.insert(k.clone(), v.clone());
-                            }
-                        }
-                        result.push(merged);
+                        result.push(Self::merge_join_row(left_row, right_row, right_alias));
                     }
                 }
             }
 
             // For LEFT/FULL JOIN: emit left row with NULLs if no match
             if !matched && matches!(join_type, crate::parser::JoinType::Left | crate::parser::JoinType::Full) {
-                let mut merged = Map::new();
-                for (k, v) in left_row {
-                    merged.insert(k.clone(), v.clone());
-                }
-                if let Some(right_sample) = right_rows.first() {
-                    for k in right_sample.keys() {
-                        let key = format!("{}.{}", right_alias, k);
-                        merged.insert(key, Value::Null);
-                        if !merged.contains_key(k) {
-                            merged.insert(k.clone(), Value::Null);
-                        }
-                    }
-                }
-                result.push(merged);
+                result.push(Self::merge_join_row_null_right(left_row, right_rows.first(), right_alias));
             }
         }
 
         // For RIGHT/FULL JOIN: emit unmatched right rows with NULLs for left
-        if matches!(join_type, crate::parser::JoinType::Right | crate::parser::JoinType::Full) {
+        if track_right_unmatched {
             for (idx, right_row) in right_rows.iter().enumerate() {
-                if !matched_right.contains(&idx) {
-                    let mut merged = Map::new();
-                    if let Some(left_sample) = left_rows.first() {
-                        for k in left_sample.keys() {
-                            merged.insert(k.clone(), Value::Null);
-                        }
-                    }
-                    for (k, v) in right_row {
-                        let key = format!("{}.{}", right_alias, k);
-                        merged.insert(key, v.clone());
-                        if !merged.contains_key(k) {
-                            merged.insert(k.clone(), v.clone());
-                        }
-                    }
-                    result.push(merged);
+                if !matched_right[idx] {
+                    result.push(Self::merge_join_row_null_left(right_row, left_rows.first(), right_alias));
                 }
             }
         }
@@ -5541,10 +5719,178 @@ impl QueryExecutor {
         Ok(result)
     }
 
+    /// Build-probe hash join: only the build (left) side is materialized —
+    /// into a hash table of row indices — while the probe (right) side is
+    /// streamed row by row. Peak memory is build + output instead of
+    /// build + probe + output, which is what OOMs the no-WHERE multi-hop
+    /// ladders (hop2 73k rows and `annotated_with` 559k rows used to be held
+    /// at the same time).
+    ///
+    /// Outer-join bookkeeping mirrors [`Self::execute_hash_join_rows`]:
+    /// unmatched build rows come out after the probe finishes (LEFT/FULL) and
+    /// unmatched probe rows at the moment they are seen (RIGHT/FULL).
+    ///
+    /// ON-operand orientation is settled on the first probe row. The build
+    /// side is fully scanned, so when it resolves exactly one of the two ON
+    /// operands the pairing is decided from it alone — a probe row that lacks
+    /// the join column must not flip it (that is the heterogeneous-right-rows
+    /// case [`Self::fix_join_columns`] exists for). Only when the build side
+    /// is ambiguous does the first probe row break the tie.
+    /// Build-probe hash join. The (left) build side is materialized — hash
+    /// lookup needs random access — while the (right) probe side streams
+    /// through [`Self::for_each_plan_node_row`]. Output rows leave through
+    /// `sink` as they are produced; nothing accumulates here. When `needed`
+    /// is set, emitted rows keep only those column tails, which bounds the
+    /// merged-row key bloat (every join level doubles the right side's keys).
+    fn execute_hash_join_build_probe(
+        &self,
+        left: &PlanNode,
+        right: &PlanNode,
+        join: &crate::parser::JoinClause,
+        engine: &LsmEngine,
+        read_mode: bool,
+        needed: Option<&HashSet<String>>,
+        sink: &mut dyn FnMut(Map<String, Value>) -> Result<bool>,
+    ) -> Result<()> {
+        let (left_col_raw, right_col_raw) = Self::resolve_join_columns(&join.on)?;
+        // Build/probe rows must carry the join keys on top of the consumer's
+        // needs, and each child's own joins need their keys kept through.
+        let mut child_needed_owned = needed.cloned();
+        if let Some(s) = child_needed_owned.as_mut() {
+            s.insert(Self::col_tail(&left_col_raw));
+            s.insert(Self::col_tail(&right_col_raw));
+        }
+        let child_needed = child_needed_owned.as_ref();
+        // Build side: hash lookup needs random access, so it is materialized.
+        let left_rows = if read_mode {
+            self.execute_plan_node_read_with(left, engine, child_needed, None)?
+        } else {
+            self.execute_plan_node(left, engine)?
+        };
+        let right_alias = join.alias.as_deref().unwrap_or(&join.table);
+        let join_type = join.join_type;
+        let track_left_unmatched =
+            matches!(join_type, crate::parser::JoinType::Left | crate::parser::JoinType::Full);
+        let track_right_unmatched =
+            matches!(join_type, crate::parser::JoinType::Right | crate::parser::JoinType::Full);
+
+        // Which ON operand resolves against the fully-scanned build side.
+        let build_has_left = left_rows
+            .iter()
+            .any(|r| Self::resolve_column_value_raw(r, &left_col_raw).is_some());
+        let build_has_right = left_rows
+            .iter()
+            .any(|r| Self::resolve_column_value_raw(r, &right_col_raw).is_some());
+
+        // Build-side join key -> row indices; rows stay owned by `left_rows`.
+        let mut hash_table: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut matched_left: Vec<bool> = vec![false; left_rows.len()];
+        let left_sample = left_rows.first();
+        // Columns are oriented and the hash table built on the first probe row.
+        let mut keys_ready = false;
+        let mut left_col = left_col_raw.clone();
+        let mut right_col = right_col_raw.clone();
+        let mut right_sample: Option<Map<String, Value>> = None;
+        let mut stopped = false;
+
+        self.for_each_plan_node_row(right, engine, read_mode, &mut |right_row| {
+            if !keys_ready {
+                let probe_has_left =
+                    Self::resolve_column_value_raw(&right_row, &left_col_raw).is_some();
+                let probe_has_right =
+                    Self::resolve_column_value_raw(&right_row, &right_col_raw).is_some();
+                if build_has_left && (probe_has_right || !build_has_right) {
+                    left_col = left_col_raw.clone();
+                    right_col = right_col_raw.clone();
+                } else if build_has_right && (probe_has_left || !build_has_left) {
+                    left_col = right_col_raw.clone();
+                    right_col = left_col_raw.clone();
+                } else {
+                    let (l, r) = Self::fix_join_columns(
+                        &left_rows,
+                        std::slice::from_ref(&right_row),
+                        &left_col_raw,
+                        &right_col_raw,
+                    );
+                    left_col = l;
+                    right_col = r;
+                }
+                for (idx, left_row) in left_rows.iter().enumerate() {
+                    if let Some(val) = Self::resolve_column_value(left_row, &left_col) {
+                        hash_table.entry(val).or_default().push(idx);
+                    }
+                }
+                right_sample = Some(right_row.clone());
+                keys_ready = true;
+            }
+
+            let mut matched = false;
+            if let Some(right_val) = Self::resolve_column_value(&right_row, &right_col) {
+                if let Some(indices) = hash_table.get(&right_val) {
+                    for &idx in indices {
+                        matched = true;
+                        if track_left_unmatched {
+                            matched_left[idx] = true;
+                        }
+                        let row = Self::merge_join_row(&left_rows[idx], &right_row, right_alias);
+                        let row = match needed {
+                            Some(n) => Self::slim_row(row, n),
+                            None => row,
+                        };
+                        if !sink(row)? {
+                            stopped = true;
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+            // For RIGHT/FULL JOIN: emit the unmatched probe row with NULLs
+            if !matched && track_right_unmatched {
+                let row = Self::merge_join_row_null_left(&right_row, left_sample, right_alias);
+                let row = match needed {
+                    Some(n) => Self::slim_row(row, n),
+                    None => row,
+                };
+                if !sink(row)? {
+                    stopped = true;
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })?;
+
+        // Early stop (LIMIT): unmatched-left emission would be truncated anyway.
+        if stopped {
+            return Ok(());
+        }
+
+        // For LEFT/FULL JOIN: emit unmatched build rows with NULLs. An empty
+        // probe side means `keys_ready` never latched and every build row is
+        // unmatched — same shape as `right_rows.first() == None` above.
+        if track_left_unmatched {
+            for (idx, left_row) in left_rows.iter().enumerate() {
+                if !matched_left[idx] {
+                    let row =
+                        Self::merge_join_row_null_right(left_row, right_sample.as_ref(), right_alias);
+                    let row = match needed {
+                        Some(n) => Self::slim_row(row, n),
+                        None => row,
+                    };
+                    if !sink(row)? {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Sort-merge join on pre-fetched rows.
     fn execute_sort_merge_join_rows(
-        mut left_rows: Vec<Map<String, Value>>,
-        mut right_rows: Vec<Map<String, Value>>,
+        left_rows: Vec<Map<String, Value>>,
+        right_rows: Vec<Map<String, Value>>,
         join: &crate::parser::JoinClause,
     ) -> Result<Vec<Map<String, Value>>> {
         let right_alias = join.alias.as_deref().unwrap_or(&join.table);
@@ -5552,17 +5898,25 @@ impl QueryExecutor {
         let (left_col, right_col) = Self::fix_join_columns(&left_rows, &right_rows, &left_col_raw, &right_col_raw);
         let join_type = join.join_type;
 
-        // Sort both sides
-        left_rows.sort_by(|a, b| {
-            let a_val = Self::resolve_column_value(a, &left_col).unwrap_or_default();
-            let b_val = Self::resolve_column_value(b, &left_col).unwrap_or_default();
-            Self::compare_values(&a_val, &b_val)
-        });
-        right_rows.sort_by(|a, b| {
-            let a_val = Self::resolve_column_value(a, &right_col).unwrap_or_default();
-            let b_val = Self::resolve_column_value(b, &right_col).unwrap_or_default();
-            Self::compare_values(&a_val, &b_val)
-        });
+        // Resolve each row's sort key ONCE. The previous comparator re-resolved
+        // and stringified both keys on every comparison (two allocations per
+        // comparison), which dominated sort time on large join sides.
+        let mut left: Vec<(String, Map<String, Value>)> = left_rows
+            .into_iter()
+            .map(|r| {
+                let k = Self::resolve_column_value(&r, &left_col).unwrap_or_default();
+                (k, r)
+            })
+            .collect();
+        let mut right: Vec<(String, Map<String, Value>)> = right_rows
+            .into_iter()
+            .map(|r| {
+                let k = Self::resolve_column_value(&r, &right_col).unwrap_or_default();
+                (k, r)
+            })
+            .collect();
+        left.sort_by(|a, b| Self::compare_values(&a.0, &b.0));
+        right.sort_by(|a, b| Self::compare_values(&a.0, &b.0));
 
         // Track matched rows for outer joins
         let mut matched_left: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -5572,49 +5926,38 @@ impl QueryExecutor {
         let mut result = Vec::new();
         let mut li = 0;
         let mut ri = 0;
-        while li < left_rows.len() && ri < right_rows.len() {
-            let lv = Self::resolve_column_value(&left_rows[li], &left_col).unwrap_or_default();
-            let rv = Self::resolve_column_value(&right_rows[ri], &right_col).unwrap_or_default();
-            match Self::compare_values(&lv, &rv) {
+        while li < left.len() && ri < right.len() {
+            match Self::compare_values(&left[li].0, &right[ri].0) {
                 std::cmp::Ordering::Less => li += 1,
                 std::cmp::Ordering::Greater => ri += 1,
                 std::cmp::Ordering::Equal => {
-                    // Handle duplicate keys
-                    while ri < right_rows.len() {
-                        let rv2 = Self::resolve_column_value(&right_rows[ri], &right_col)
-                            .unwrap_or_default();
-                        if Self::compare_values(&rv2, &rv) != std::cmp::Ordering::Equal {
+                    // Handle duplicate keys (group anchors: first row of each side's group)
+                    let l_anchor = li;
+                    let r_anchor = ri;
+                    while ri < right.len() {
+                        if Self::compare_values(&right[ri].0, &right[r_anchor].0)
+                            != std::cmp::Ordering::Equal
+                        {
                             break;
                         }
                         let mut li2 = li;
-                        while li2 < left_rows.len() {
-                            let lv2 = Self::resolve_column_value(&left_rows[li2], &left_col)
-                                .unwrap_or_default();
-                            if Self::compare_values(&lv2, &lv) != std::cmp::Ordering::Equal {
+                        while li2 < left.len() {
+                            if Self::compare_values(&left[li2].0, &left[l_anchor].0)
+                                != std::cmp::Ordering::Equal
+                            {
                                 break;
                             }
                             matched_left.insert(li2);
                             matched_right.insert(ri);
-                            let mut merged = Map::new();
-                            for (k, v) in &left_rows[li2] {
-                                merged.insert(k.clone(), v.clone());
-                            }
-                            for (k, v) in &right_rows[ri] {
-                                let key = format!("{}.{}", right_alias, k);
-                                merged.insert(key, v.clone());
-                                if !merged.contains_key(k) {
-                                    merged.insert(k.clone(), v.clone());
-                                }
-                            }
-                            result.push(merged);
+                            result.push(Self::merge_join_row(&left[li2].1, &right[ri].1, right_alias));
                             li2 += 1;
                         }
                         ri += 1;
                     }
-                    while li < left_rows.len() {
-                        let lv2 = Self::resolve_column_value(&left_rows[li], &left_col)
-                            .unwrap_or_default();
-                        if Self::compare_values(&lv2, &lv) != std::cmp::Ordering::Equal {
+                    while li < left.len() {
+                        if Self::compare_values(&left[li].0, &left[l_anchor].0)
+                            != std::cmp::Ordering::Equal
+                        {
                             break;
                         }
                         li += 1;
@@ -5625,44 +5968,26 @@ impl QueryExecutor {
 
         // For LEFT/FULL JOIN: emit unmatched left rows with NULLs
         if matches!(join_type, crate::parser::JoinType::Left | crate::parser::JoinType::Full) {
-            for (idx, left_row) in left_rows.iter().enumerate() {
+            for (idx, (_, left_row)) in left.iter().enumerate() {
                 if !matched_left.contains(&idx) {
-                    let mut merged = Map::new();
-                    for (k, v) in left_row {
-                        merged.insert(k.clone(), v.clone());
-                    }
-                    if let Some(right_sample) = right_rows.first() {
-                        for k in right_sample.keys() {
-                            let key = format!("{}.{}", right_alias, k);
-                            merged.insert(key, Value::Null);
-                            if !merged.contains_key(k) {
-                                merged.insert(k.clone(), Value::Null);
-                            }
-                        }
-                    }
-                    result.push(merged);
+                    result.push(Self::merge_join_row_null_right(
+                        left_row,
+                        right.first().map(|(_, r)| r),
+                        right_alias,
+                    ));
                 }
             }
         }
 
         // For RIGHT/FULL JOIN: emit unmatched right rows with NULLs
         if matches!(join_type, crate::parser::JoinType::Right | crate::parser::JoinType::Full) {
-            for (idx, right_row) in right_rows.iter().enumerate() {
+            for (idx, (_, right_row)) in right.iter().enumerate() {
                 if !matched_right.contains(&idx) {
-                    let mut merged = Map::new();
-                    if let Some(left_sample) = left_rows.first() {
-                        for k in left_sample.keys() {
-                            merged.insert(k.clone(), Value::Null);
-                        }
-                    }
-                    for (k, v) in right_row {
-                        let key = format!("{}.{}", right_alias, k);
-                        merged.insert(key, v.clone());
-                        if !merged.contains_key(k) {
-                            merged.insert(k.clone(), v.clone());
-                        }
-                    }
-                    result.push(merged);
+                    result.push(Self::merge_join_row_null_left(
+                        right_row,
+                        left.first().map(|(_, r)| r),
+                        right_alias,
+                    ));
                 }
             }
         }
@@ -5682,14 +6007,14 @@ impl QueryExecutor {
         join: &crate::parser::JoinClause,
         index_column: &str,
     ) -> Result<Vec<Map<String, Value>>> {
-        // Subquery right side has no index to probe; materialize rows and use
-        // the row-based nested-loop join instead.
+        // Subquery right side has no index to probe; materialize rows and fall
+        // back to the hash join instead of O(n×m) nested-loop pairing.
         if right_table.starts_with("__subquery__:") {
             let mut rows = self.subquery_rows(right_table, &None)?.unwrap_or_default();
             if let Some(a) = join.alias.as_deref().or(right_alias) {
                 Self::apply_alias(&mut rows, a);
             }
-            return Self::execute_nested_loop_join(left_rows, rows, join);
+            return Self::execute_hash_join_rows(left_rows, rows, join);
         }
         let alias = right_alias.unwrap_or(right_table);
         let (on_left, on_right) = Self::resolve_join_columns(&join.on)?;
@@ -5712,13 +6037,20 @@ impl QueryExecutor {
 
         let has_idx = engine.has_index(right_table, index_column);
         if !has_idx {
-            // No usable index on the probe column: fall back to a row-based
-            // nested-loop join instead of silently returning zero rows.
+            // No usable index on the probe column: fall back to a hash join over
+            // a full scan instead of silently returning zero rows / O(n×m) pairing.
             let rows = self.plan_seq_scan(engine, right_table, Some(alias), &None, None)?;
-            return Self::execute_nested_loop_join(left_rows, rows, join);
+            return Self::execute_hash_join_rows(left_rows, rows, join);
         }
         let class_hierarchy = self.get_class_hierarchy_read(engine, right_table);
         let mut result = Vec::new();
+
+        // Multi-hop chains probe with heavily duplicated keys (many left rows
+        // per protein/disease): cache lookups per distinct probe value so each
+        // index lookup and row fetch runs once. Capped so a fully-distinct left
+        // side cannot balloon into materializing the whole right side.
+        let mut probe_cache: std::collections::HashMap<String, Vec<Map<String, Value>>> =
+            std::collections::HashMap::new();
 
         for left_row in &left_rows {
             // Probe with the left value's original type: index keys are
@@ -5727,48 +6059,55 @@ impl QueryExecutor {
             let Some(val) = Self::resolve_column_value_raw(left_row, left_col) else {
                 continue;
             };
-            let json_val = val.clone();
+            // Debug-format key keeps probe types distinct ("1" vs 1).
+            let cache_key = format!("{:?}", val);
+            if !probe_cache.contains_key(&cache_key) && probe_cache.len() < 8192 {
+                probe_cache.insert(cache_key.clone(), self.inlj_lookup_rows(engine, right_table, index_column, val, &class_hierarchy));
+            }
 
-            let right_rows = {
-                // Index lookup: find primary keys, then fetch rows
-                let pkeys = {
-                    let index_mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
-                    index_mgr.lookup_eq_read(right_table, index_column, &json_val).unwrap_or_default()
-                };
-                let mut rows = Vec::new();
-                for pk in &pkeys {
-                    if let Ok(Some(val_bytes)) = engine.get(pk) {
-                        if let Some(brow) = onto_core::binary_row::BinaryRow::parse(&val_bytes) {
-                            if brow.class_in_hierarchy(&class_hierarchy) {
-                                if let Some(mut doc) = brow.to_map() {
-                                    doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(pk).to_string()));
-                                    rows.push(doc);
-                                }
-                            }
-                        }
-                    }
+            if let Some(right_rows) = probe_cache.get(&cache_key) {
+                for right_row in right_rows {
+                    result.push(Self::merge_join_row(left_row, right_row, alias));
                 }
-                rows
-            };
-
-            // Merge left row with each matching right row
-            for right_row in &right_rows {
-                let mut merged = Map::new();
-                for (k, v) in left_row {
-                    merged.insert(k.clone(), v.clone());
+            } else {
+                // Cache saturated: probe directly without caching.
+                for right_row in self.inlj_lookup_rows(engine, right_table, index_column, val, &class_hierarchy) {
+                    result.push(Self::merge_join_row(left_row, &right_row, alias));
                 }
-                for (k, v) in right_row {
-                    let key = format!("{}.{}", alias, k);
-                    merged.insert(key, v.clone());
-                    if !merged.contains_key(k) {
-                        merged.insert(k.clone(), v.clone());
-                    }
-                }
-                result.push(merged);
             }
         }
 
         Ok(result)
+    }
+
+    /// Index lookup + row fetch for one probe value (INLJ inner loop).
+    fn inlj_lookup_rows(
+        &self,
+        engine: &LsmEngine,
+        right_table: &str,
+        index_column: &str,
+        json_val: &Value,
+        class_hierarchy: &HashSet<String>,
+    ) -> Vec<Map<String, Value>> {
+        // Index lookup: find primary keys, then fetch rows
+        let pkeys = {
+            let index_mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
+            index_mgr.lookup_eq_read(right_table, index_column, json_val).unwrap_or_default()
+        };
+        let mut rows = Vec::new();
+        for pk in &pkeys {
+            if let Ok(Some(val_bytes)) = engine.get(pk) {
+                if let Some(brow) = onto_core::binary_row::BinaryRow::parse(&val_bytes) {
+                    if brow.class_in_hierarchy(class_hierarchy) {
+                        if let Some(mut doc) = brow.to_map() {
+                            doc.insert("__pk__".to_string(), Value::String(String::from_utf8_lossy(pk).to_string()));
+                            rows.push(doc);
+                        }
+                    }
+                }
+            }
+        }
+        rows
     }
 
     /// Returns the set of classes to scan for a given table name,
@@ -6068,18 +6407,25 @@ impl QueryExecutor {
         }
     }
 
+    /// Apply alias prefix to one row's column names. `__class__` and keys that
+    /// are already alias-qualified are left alone; the bare key is kept
+    /// alongside the prefixed one so both lookup shapes still resolve.
+    fn apply_alias_row(row: &mut Map<String, Value>, alias: &str) {
+        let keys: Vec<String> = row.keys().cloned().collect();
+        for key in keys {
+            if key != "__class__" && !key.contains('.') {
+                if let Some(val) = row.remove(&key) {
+                    row.insert(format!("{}.{}", alias, key), val.clone());
+                    row.insert(key, val);
+                }
+            }
+        }
+    }
+
     /// Apply alias prefix to row column names.
     fn apply_alias(rows: &mut Vec<Map<String, Value>>, alias: &str) {
         for row in rows {
-            let keys: Vec<String> = row.keys().cloned().collect();
-            for key in keys {
-                if key != "__class__" && !key.contains('.') {
-                    if let Some(val) = row.remove(&key) {
-                        row.insert(format!("{}.{}", alias, key), val.clone());
-                        row.insert(key, val);
-                    }
-                }
-            }
+            Self::apply_alias_row(row, alias);
         }
     }
 
@@ -7565,27 +7911,66 @@ impl QueryExecutor {
         node: &PlanNode,
         engine: &LsmEngine,
     ) -> Result<Vec<Map<String, Value>>> {
+        self.execute_plan_node_read_with(node, engine, None, None)
+    }
+
+    /// [`Self::execute_plan_node_read`] with join-output pruning and early
+    /// stop. `needed` = column tails the consumer will read; scan leaves and
+    /// the hash-join sink prune rows to them (every spelling of a tail is
+    /// kept, so column resolution is unchanged). `take` = stop after N rows.
+    /// Arms that cannot enumerate their column surface (sort, aggregation,
+    /// window) drop both and materialize as before.
+    fn execute_plan_node_read_with(
+        &self,
+        node: &PlanNode,
+        engine: &LsmEngine,
+        needed: Option<&HashSet<String>>,
+        take: Option<usize>,
+    ) -> Result<Vec<Map<String, Value>>> {
         match node {
             PlanNode::SeqScan {
                 table,
                 alias,
                 filter,
                 ..
-            } => self.plan_seq_scan_read(&self.engine.engine_for_class(table), table, alias.as_deref(), filter, None),
+            } => {
+                let rows = self.plan_seq_scan_read(
+                    &self.engine.engine_for_class(table),
+                    table,
+                    alias.as_deref(),
+                    filter,
+                    None,
+                )?;
+                Ok(Self::slim_rows(rows, needed))
+            }
             PlanNode::IndexScan {
                 table,
                 alias,
                 index_column,
                 filter,
                 ..
-            } => self.plan_index_scan_read(engine, table, alias.as_deref(), index_column, filter, None),
+            } => {
+                let rows = self.plan_index_scan_read(
+                    engine,
+                    table,
+                    alias.as_deref(),
+                    index_column,
+                    filter,
+                    None,
+                )?;
+                Ok(Self::slim_rows(rows, needed))
+            }
             PlanNode::IndexLookup {
                 table,
                 alias,
                 index_column,
                 key,
                 ..
-            } => self.plan_index_lookup_read(engine, table, alias.as_deref(), index_column, key),
+            } => {
+                let rows =
+                    self.plan_index_lookup_read(engine, table, alias.as_deref(), index_column, key)?;
+                Ok(Self::slim_rows(rows, needed))
+            }
             PlanNode::VectorSearch {
                 table,
                 column,
@@ -7594,15 +7979,39 @@ impl QueryExecutor {
                 ef_search,
                 filter,
                 ..
-            } => self.plan_vector_search_read(engine, table, column, query_vector, *top_k, *ef_search, filter),
+            } => {
+                let rows = self.plan_vector_search_read(
+                    engine,
+                    table,
+                    column,
+                    query_vector,
+                    *top_k,
+                    *ef_search,
+                    filter,
+                )?;
+                Ok(Self::slim_rows(rows, needed))
+            }
             PlanNode::Filter {
                 input, predicate, ..
             } => {
                 if let Some(rows) = self.plan_pk_point_lookup(predicate, input)? {
-                    return Ok(rows);
+                    return Ok(Self::slim_rows(rows, needed));
                 }
-                let mut rows = self.execute_plan_node_read(input, engine)?;
+                // The filter reads its own columns on top of the consumer's.
+                let child_needed = needed.and_then(|n| {
+                    let mut s = n.clone();
+                    if Self::filter_needed_tails(predicate, &mut s) {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                });
+                let mut rows =
+                    self.execute_plan_node_read_with(input, engine, child_needed.as_ref(), None)?;
                 rows.retain(|row| self.eval_filter_read(engine, row, predicate));
+                if let Some(n) = take {
+                    rows.truncate(n);
+                }
                 Ok(rows)
             }
             PlanNode::Projection { input, columns, .. } => {
@@ -7670,6 +8079,31 @@ impl QueryExecutor {
                     }
                 }
 
+                // Join-output pruning: keep the column tails this projection
+                // reads (plus the parent consumer's, when it asked for some).
+                let child_needed: Option<HashSet<String>> = if !has_aggregates && !has_expr {
+                    match columns {
+                        SelectColumns::Columns(items)
+                            if items.iter().all(|i| matches!(i, SelectItem::Column(_))) =>
+                        {
+                            let mut s = needed.cloned().unwrap_or_default();
+                            for item in items {
+                                if let SelectItem::Column(col) = item {
+                                    let real = match col.find(" as ") {
+                                        Some(p) => &col[..p],
+                                        None => col.as_str(),
+                                    };
+                                    s.insert(Self::col_tail(real));
+                                }
+                            }
+                            Some(s)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
                 // Only push column projection down when there are no aggregates/expressions
                 let raw_rows = if !has_aggregates && !has_expr {
                     if let PlanNode::SeqScan {
@@ -7704,10 +8138,15 @@ impl QueryExecutor {
                             Some(columns),
                         )?
                     } else {
-                        self.execute_plan_node_read(input, engine)?
+                        self.execute_plan_node_read_with(
+                            input,
+                            engine,
+                            child_needed.as_ref(),
+                            take,
+                        )?
                     }
                 } else {
-                    self.execute_plan_node_read(input, engine)?
+                    self.execute_plan_node_read_with(input, engine, child_needed.as_ref(), take)?
                 };
                 if has_aggregates {
                     Ok(raw_rows)
@@ -7760,9 +8199,30 @@ impl QueryExecutor {
                 join_clause,
                 ..
             } => {
-                let left_rows = self.execute_plan_node_read(left, engine)?;
-                let right_rows = self.execute_plan_node_read(right, engine)?;
-                Self::execute_hash_join_rows(left_rows, right_rows, join_clause)
+                if take == Some(0) {
+                    return Ok(Vec::new());
+                }
+                let mut rows: Vec<Map<String, Value>> = Vec::new();
+                let mut remaining = take;
+                self.execute_hash_join_build_probe(
+                    left,
+                    right,
+                    join_clause,
+                    engine,
+                    true,
+                    needed,
+                    &mut |row| {
+                        rows.push(row);
+                        if let Some(n) = remaining.as_mut() {
+                            if *n <= 1 {
+                                return Ok(false);
+                            }
+                            *n -= 1;
+                        }
+                        Ok(true)
+                    },
+                )?;
+                Ok(rows)
             }
             PlanNode::SortMergeJoin {
                 left,
@@ -7837,7 +8297,11 @@ impl QueryExecutor {
                         None,
                     );
                 }
-                let mut rows = self.execute_plan_node_read(input, engine)?;
+                let want = Some(match take {
+                    Some(t) => t.min(*count),
+                    None => *count,
+                });
+                let mut rows = self.execute_plan_node_read_with(input, engine, needed, want)?;
                 rows.truncate(*count);
                 Ok(rows)
             }
@@ -12567,7 +13031,8 @@ impl QueryExecutor {
             if let Some(gb) = group_by {
                 for col in &gb.columns {
                     if let Some(val) = Self::resolve_column_value(group_rows[0], col) {
-                        result_row.insert(col.clone(), Value::String(val));
+                        result_row
+                            .insert(col.trim_matches('"').to_string(), Value::String(val));
                     }
                 }
             }
@@ -13763,7 +14228,8 @@ impl QueryExecutor {
             if let Some(gb) = group_by {
                 for col in &gb.columns {
                     if let Some(val) = Self::resolve_column_value(group_rows[0], col) {
-                        result_row.insert(col.clone(), Value::String(val));
+                        result_row
+                            .insert(col.trim_matches('"').to_string(), Value::String(val));
                     }
                 }
             }
@@ -14132,17 +14598,26 @@ impl QueryExecutor {
                         }
                         SelectItem::Column(col) => {
                             // Non-aggregate columns in GROUP BY query - use first row value.
-                            // first_row is projected with bare column names as keys.
                             if let Some(first_row) = group_first_row.get(group_key) {
                                 let clean = col.trim_matches('"');
-                                let col_name =
-                                    clean.split(" as ").last().unwrap_or(clean);
-                                let col_name =
-                                    col_name.split('.').next_back().unwrap_or(col_name);
-                                if !result_row.contains_key(col_name) {
-                                    if let Some(v) = first_row.get(col_name) {
-                                        result_row
-                                            .insert(col_name.to_string(), Value::String(Self::value_to_sort_key(v)));
+                                let (real_col, alias_part) = match clean.find(" as ") {
+                                    Some(p) => (&clean[..p], Some(clean[p + 4..].trim())),
+                                    None => (clean, None),
+                                };
+                                let out_name = alias_part.unwrap_or(real_col);
+                                let out_name =
+                                    out_name.split('.').next_back().unwrap_or(out_name);
+                                if !result_row.contains_key(out_name) {
+                                    // Resolve the SOURCE column first so
+                                    // `t.col AS alias` finds the value under the
+                                    // source name the projection stored.
+                                    let v = Self::resolve_column_value_raw(first_row, real_col)
+                                        .or_else(|| first_row.get(out_name));
+                                    if let Some(v) = v {
+                                        result_row.insert(
+                                            out_name.to_string(),
+                                            Value::String(Self::value_to_sort_key(v)),
+                                        );
                                     }
                                 }
                             }
@@ -14233,10 +14708,17 @@ impl QueryExecutor {
             if group_by.is_some() && !group_first_row.contains_key(&group_key) {
                 // Only keep the columns needed at finalize time — NOT the full doc.
                 // Storing the full row per group is the OOM path on high-cardinality GROUP BY.
+                // Resolve (not plain get) so alias-qualified names land in the
+                // projection; also key under the bare tail so finalize lookups
+                // by either form hit.
                 let mut projected = Map::new();
                 for col in first_row_cols {
-                    if let Some(val) = doc.get(col) {
+                    if let Some(val) = Self::resolve_column_value_raw(&doc, col) {
                         projected.insert(col.clone(), val.clone());
+                        let trimmed = col.trim_matches('"');
+                        if let Some(tail) = trimmed.rsplit('.').next() {
+                            projected.insert(tail.to_string(), val.clone());
+                        }
                     }
                 }
                 group_first_row.insert(group_key, projected);
@@ -14301,9 +14783,10 @@ impl QueryExecutor {
             gb.columns
                 .iter()
                 .map(|col| {
-                    // Strip surrounding quotes that the parser may include
-                    let clean = col.trim_matches('"');
-                    Self::value_to_group_key(row.get(clean))
+                    // Full resolution (quotes / alias-qualified col vs bare keys):
+                    // a plain `row.get` collapsed every GROUP BY over a qualified
+                    // column into one "NULL" group.
+                    Self::value_to_group_key(Self::resolve_column_value_raw(row, col))
                 })
                 .collect::<Vec<_>>()
                 .join("\x00")
@@ -14615,7 +15098,7 @@ impl QueryExecutor {
         // the join column, some don't) and silently produced zero rows.
         let resolves = |rows: &[Map<String, Value>], col: &str| -> bool {
             rows.iter()
-                .any(|r| Self::resolve_column_value(r, col).is_some())
+                .any(|r| Self::resolve_column_value_raw(r, col).is_some())
         };
         if resolves(left_rows, left_col) && resolves(right_rows, right_col) {
             return (left_col.to_string(), right_col.to_string());
@@ -14643,29 +15126,41 @@ impl QueryExecutor {
 
     /// Gets a value from a row, trying both aliased and unaliased column names.
     fn resolve_column_value(row: &Map<String, Value>, col: &str) -> Option<String> {
-        // Try exact match first
-        if let Some(v) = row.get(col) {
-            return Some(Self::value_to_sort_key(v));
-        }
-        // Try matching by suffix (strip alias prefix)
-        for (k, v) in row {
-            if k.ends_with(&format!(".{}", col)) || k == col {
-                return Some(Self::value_to_sort_key(v));
-            }
-        }
-        None
+        Self::resolve_column_value_raw(row, col).map(|v| Self::value_to_sort_key(v))
     }
 
     /// Like [`Self::resolve_column_value`] but returns the original typed value
     /// (index probes are type-tagged; stringifying breaks numeric lookups).
+    ///
+    /// Column/key shapes that must all resolve: quoted cols (`"dx.dt_id"` from
+    /// the OntoQL SQL round-trip), qualified cols against bare keys (`dx.dt_id`
+    /// -> `dt_id`, what BinaryRow maps carry), and bare cols against
+    /// alias-qualified keys (`target` -> `ca.target`, join merges).
     fn resolve_column_value_raw<'a>(row: &'a Map<String, Value>, col: &str) -> Option<&'a Value> {
+        let col = col.trim_matches('"');
         if let Some(v) = row.get(col) {
             return Some(v);
         }
-        for (k, v) in row {
-            if k.ends_with(&format!(".{}", col)) || k == col {
-                return Some(v);
+        // Key qualified with an alias while col is bare (or col carries another
+        // prefix): `k` ending in ".{col}" matches "ca.target" for col "target".
+        // Zero-alloc form: this runs inside join hot loops over wide rows.
+        if !col.is_empty() {
+            let col_len = col.len();
+            for (k, v) in row {
+                if k.len() > col_len
+                    && k.ends_with(col)
+                    && k.as_bytes()[k.len() - col_len - 1] == b'.'
+                {
+                    return Some(v);
+                }
             }
+        }
+        // Col qualified while keys are bare: strip the alias prefix and retry.
+        // Only bare-tail lookup, never suffix - a key qualified with a DIFFERENT
+        // alias ("dp.dt_id" for col "dx.dt_id") must not match.
+        if col.contains('.') {
+            let tail = col.rsplit('.').next().unwrap_or(col);
+            return row.get(tail);
         }
         None
     }
@@ -20749,6 +21244,181 @@ mod tests {
         }
     }
 
+    /// Group-count assertion helper: rows must carry `key_col`/`cnt_col` and
+    /// match `expected` (group value -> count), order-insensitive.
+    fn assert_groups(rows: &[Map<String, Value>], key_col: &str, cnt_col: &str, expected: &[(&str, i64)], sql: &str) {
+        assert_eq!(rows.len(), expected.len(), "group count for `{sql}`: {rows:?}");
+        for (want_key, want_n) in expected {
+            let hit = rows.iter().find(|r| {
+                r.get(key_col)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == *want_key)
+                    .unwrap_or(false)
+            });
+            let Some(r) = hit else {
+                panic!("missing group `{want_key}` for `{sql}`: {rows:?}");
+            };
+            let n = r.get(cnt_col).unwrap();
+            let n = n.as_i64().or_else(|| n.as_str().and_then(|s| s.parse().ok())).unwrap();
+            assert_eq!(n, *want_n, "count for group `{want_key}` in `{sql}`");
+        }
+    }
+
+    #[test]
+    fn test_group_by_qualified_col_single_table_execute_read() {
+        // Alias-qualified GROUP BY on a single table: the group key must
+        // resolve against bare-keyed scan rows (`p.name` -> `name`), not
+        // collapse every row into one group.
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPhone", 998);
+        insert_row(&executor, "Product", "iPhone", 997);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "iPad", 798);
+        insert_row(&executor, "Product", "Watch", 499);
+        executor.engine().flush_all().unwrap();
+
+        for (sql, key_col) in [
+            (
+                "SELECT p.name AS product, COUNT(*) AS n FROM Product p GROUP BY p.name",
+                "product",
+            ),
+            (
+                "SELECT p.name, COUNT(*) AS n FROM Product p GROUP BY p.name",
+                "name",
+            ),
+            ("SELECT name, COUNT(*) AS n FROM Product p GROUP BY name", "name"),
+            // Quoted identifier form (the OntoQL to_sql round-trip emits GROUP
+            // BY columns quoted) must resolve identically.
+            (
+                "SELECT p.name AS product, COUNT(*) AS n FROM Product p GROUP BY \"p.name\"",
+                "product",
+            ),
+            (
+                "SELECT name, COUNT(*) AS n FROM Product p GROUP BY \"name\"",
+                "name",
+            ),
+        ] {
+            let ast = QueryParser::parse(sql).unwrap();
+            match executor.execute_read(&ast).unwrap() {
+                QueryResult::Rows(rows) => assert_groups(
+                    &rows,
+                    key_col,
+                    "n",
+                    &[("iPhone", 3), ("iPad", 2), ("Watch", 1)],
+                    sql,
+                ),
+                other => panic!("expected rows for `{sql}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_group_by_qualified_col_single_table_execute_read_streaming() {
+        // Same shape through the HTTP streaming path (execute_read_streaming),
+        // where the aggregate feed holds bare-keyed row maps only.
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPhone", 998);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "Watch", 499);
+        executor.engine().flush_all().unwrap();
+
+        let ast = QueryParser::parse(
+            "SELECT p.name AS product, COUNT(*) AS n FROM Product p GROUP BY p.name",
+        )
+        .unwrap();
+        let mut collected: Vec<Map<String, Value>> = Vec::new();
+        executor
+            .execute_read_streaming(&ast, &mut |rows| {
+                collected.extend(rows);
+                true
+            })
+            .unwrap();
+        assert_groups(
+            &collected,
+            "product",
+            "n",
+            &[("iPhone", 2), ("iPad", 1), ("Watch", 1)],
+            "streaming GROUP BY p.name",
+        );
+    }
+
+    #[test]
+    fn test_group_by_over_join_execute_read() {
+        // GROUP BY over a join on the execute_read path (what the HTTP server
+        // serves): grouping must not collapse to a single group, and LIMIT
+        // must apply to groups, not raw join rows.
+        let (executor, _dir) = setup();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "Watch", 499);
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPhone", 4);
+        insert_order(&executor, "iPhone", 5);
+        insert_order(&executor, "iPad", 6);
+        insert_order(&executor, "iPad", 7);
+        insert_order(&executor, "Watch", 8);
+        executor.engine().flush_all().unwrap();
+
+        let expected = [("iPhone", 3), ("iPad", 2), ("Watch", 1)];
+        for sql in [
+            "SELECT p.name AS product, COUNT(*) AS n FROM Product p \
+             JOIN Order o ON p.name = o.product_id GROUP BY p.name",
+            "SELECT p.name AS product, COUNT(*) AS n FROM Product p \
+             JOIN Order o ON o.product_id = p.name GROUP BY p.name",
+            "SELECT o.product_id AS product, COUNT(*) AS n FROM Product p \
+             JOIN Order o ON p.name = o.product_id GROUP BY o.product_id",
+            "SELECT p.name AS product, COUNT(*) AS n FROM Product p \
+             JOIN Order o ON p.name = o.product_id GROUP BY \"p.name\"",
+        ] {
+            let ast = QueryParser::parse(sql).unwrap();
+            match executor.execute_read(&ast).unwrap() {
+                QueryResult::Rows(rows) => assert_groups(&rows, "product", "n", &expected, sql),
+                other => panic!("expected rows for `{sql}`, got {other:?}"),
+            }
+        }
+
+        // GROUP BY + LIMIT returns that many GROUPS (not one collapsed group,
+        // not raw-row truncation).
+        let sql = "SELECT p.name AS product, COUNT(*) AS n FROM Product p \
+                   JOIN Order o ON p.name = o.product_id GROUP BY p.name LIMIT 2";
+        let ast = QueryParser::parse(sql).unwrap();
+        match executor.execute_read(&ast).unwrap() {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2, "LIMIT 2 must yield 2 groups for `{sql}`: {rows:?}");
+                for r in &rows {
+                    let n = r.get("n").unwrap();
+                    let n = n.as_i64().or_else(|| n.as_str().and_then(|s| s.parse().ok())).unwrap();
+                    // Each group keeps its own count - if grouping collapsed,
+                    // n would be 6 (all join rows) in a single row.
+                    assert!(n < 6, "group count must not be a full collapse: {rows:?}");
+                }
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // The HTTP path parses via OntoQL and re-serializes to SQL, quoting
+        // every GROUP BY column - the quoted name used to resolve against zero
+        // row keys and collapse all join rows into one group.
+        let ontql = crate::ontoql::OntoQLParser::parse(
+            "SELECT p.name AS product, COUNT(*) AS n FROM Product p \
+             JOIN Order o ON p.name = o.product_id GROUP BY p.name",
+        )
+        .unwrap();
+        let ast = ontql.to_query_ast().unwrap();
+        match executor.execute_read(&ast).unwrap() {
+            QueryResult::Rows(rows) => assert_groups(
+                &rows,
+                "product",
+                "n",
+                &[("iPhone", 3), ("iPad", 2), ("Watch", 1)],
+                "ontql round-trip GROUP BY over join",
+            ),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_join_on_orders_with_heterogeneous_right_rows() {
         // Right-side rows where only SOME carry the join column: the old
@@ -20905,6 +21575,135 @@ mod tests {
             }
             _ => panic!("expected 4 rows from FULL JOIN"),
         }
+    }
+
+    #[test]
+    fn test_full_join_with_index_still_emits_unmatched() {
+        // INLJ only emits matched pairs, so outer joins must not be planned as
+        // INLJ even when the join column is indexed.
+        let (executor, _dir) = setup();
+        executor
+            .execute(&QueryParser::parse("CREATE INDEX ON Order (product_id)").unwrap())
+            .unwrap();
+        insert_row(&executor, "Product", "iPhone", 999);
+        insert_row(&executor, "Product", "iPad", 799);
+        insert_row(&executor, "Product", "MacBook", 1999);
+        insert_order(&executor, "iPhone", 3);
+        insert_order(&executor, "iPad", 5);
+        insert_order(&executor, "Galaxy", 1);
+        executor.engine().flush_all().unwrap();
+
+        let ast = QueryParser::parse(
+            "SELECT p.name, o.quantity FROM Product p FULL JOIN Order o ON p.name = o.product_id",
+        )
+        .unwrap();
+        match executor.execute(&ast).unwrap() {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 4, "FULL JOIN must emit unmatched rows on both sides");
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    /// Join-side rows for the row-level join fns: `key` is the join key.
+    fn join_side_rows(keys: &[&str]) -> Vec<Map<String, Value>> {
+        keys.iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let mut m = Map::new();
+                m.insert("id".to_string(), Value::String(format!("r{i}")));
+                m.insert("key".to_string(), Value::String((*k).to_string()));
+                m
+            })
+            .collect()
+    }
+
+    fn row_join_clause(join_type: crate::parser::JoinType) -> crate::parser::JoinClause {
+        crate::parser::JoinClause {
+            table: "Right".to_string(),
+            alias: Some("rt".to_string()),
+            on: crate::parser::JoinOn {
+                left: "lt.key".to_string(),
+                right: "rt.key".to_string(),
+            },
+            join_type,
+        }
+    }
+
+    #[test]
+    fn test_hash_and_sort_merge_join_rows_agree_on_outer_semantics() {
+        // Duplicate keys on both sides plus unmatched rows on both sides.
+        let left = join_side_rows(&["a", "a", "b", "c"]);
+        let right = join_side_rows(&["a", "b", "b", "d"]);
+
+        let norm = |rows: &[Map<String, Value>]| {
+            let mut v: Vec<String> = rows.iter().map(|r| format!("{:?}", r)).collect();
+            v.sort();
+            v
+        };
+
+        let run = |jt: crate::parser::JoinType| {
+            let j = row_join_clause(jt);
+            let h = QueryExecutor::execute_hash_join_rows(left.clone(), right.clone(), &j).unwrap();
+            let s =
+                QueryExecutor::execute_sort_merge_join_rows(left.clone(), right.clone(), &j).unwrap();
+            assert_eq!(norm(&h), norm(&s), "hash vs sort-merge diverge for {jt:?}");
+            (h, s)
+        };
+
+        for (jt, want) in [
+            (crate::parser::JoinType::Inner, 4), // a×1 + b×2
+            (crate::parser::JoinType::Left, 5),  // + unmatched left c
+            (crate::parser::JoinType::Right, 5), // + unmatched right d
+            (crate::parser::JoinType::Full, 6),  // + both unmatched
+        ] {
+            let (h, s) = run(jt);
+            assert_eq!(h.len(), want, "row count for {jt:?}");
+            assert_eq!(s.len(), want, "row count for {jt:?}");
+        }
+
+        // Unmatched rows carry NULLs on the opposite side.
+        let j = row_join_clause(crate::parser::JoinType::Full);
+        let rows = QueryExecutor::execute_hash_join_rows(left, right, &j).unwrap();
+        let unmatched_left = rows
+            .iter()
+            .find(|r| r.get("id").and_then(|v| v.as_str()) == Some("r3"))
+            .expect("unmatched left row c");
+        assert_eq!(unmatched_left.get("key").and_then(|v| v.as_str()), Some("c"));
+        assert_eq!(unmatched_left.get("rt.key"), Some(&Value::Null));
+        let unmatched_right = rows
+            .iter()
+            .find(|r| r.get("rt.id").and_then(|v| v.as_str()) == Some("r3"))
+            .expect("unmatched right row d");
+        assert_eq!(unmatched_right.get("rt.key").and_then(|v| v.as_str()), Some("d"));
+        assert_eq!(unmatched_right.get("key"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn test_hash_join_many_matches_linear() {
+        // 50 left rows × 1,000 right rows per key over 50 keys = 50,000 pairs.
+        // Match marking must not scan the right side per pair (was quadratic).
+        let right: Vec<Map<String, Value>> = (0..50)
+            .flat_map(|k| {
+                (0..1000).map(move |i| {
+                    let mut m = Map::new();
+                    m.insert("id".to_string(), Value::String(format!("r{k}_{i}")));
+                    m.insert("key".to_string(), Value::String(format!("k{k}")));
+                    m
+                })
+            })
+            .collect();
+        let left: Vec<Map<String, Value>> = (0..50)
+            .map(|k| {
+                let mut m = Map::new();
+                m.insert("id".to_string(), Value::String(format!("l{k}")));
+                m.insert("key".to_string(), Value::String(format!("k{k}")));
+                m
+            })
+            .collect();
+        let j = row_join_clause(crate::parser::JoinType::Inner);
+        let rows = QueryExecutor::execute_hash_join_rows(left, right, &j).unwrap();
+        assert_eq!(rows.len(), 50_000);
     }
 
     // 鈹€鈹€ GROUP BY and aggregate tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€

@@ -1291,8 +1291,14 @@ impl QueryPlanner {
                 CostEstimate::new(u64::MAX, f64::MAX, f64::MAX)
             };
 
-            // Choose join strategy: INLJ > SortMerge > Hash (by cost)
-            if has_join_index && current_cost.rows < 100000 && inlj_cost.total_cost < hash_cost.total_cost {
+            // Choose join strategy: INLJ > SortMerge > Hash (by cost).
+            // INLJ only emits matched pairs, so it is inner-join-only; outer
+            // joins must use the hash/sort-merge paths that emit unmatched rows.
+            if join.join_type == crate::parser::JoinType::Inner
+                && has_join_index
+                && current_cost.rows < 100000
+                && inlj_cost.total_cost < hash_cost.total_cost
+            {
                 // Index Nested Loop Join: small left side + indexed right side
                 current_node = PlanNode::IndexNestedLoopJoin {
                     left: Box::new(current_node),
@@ -1304,9 +1310,15 @@ impl QueryPlanner {
                 };
                 current_cost = inlj_cost;
             } else {
-                // Prefer SortMergeJoin for large tables or when data is already sorted
-                let use_sort_merge = current_cost.rows > 10000
-                    || right_cost.rows > 10000
+                // HashJoin is preferred for large joins: the build-probe path
+                // holds only the build side (and `reorder_joins` keeps that the
+                // small one), while sort-merge buffers both sides plus sort
+                // scratch. The cost model doesn't price that peak-memory
+                // difference, so the old `rows > 10000` bias routed exactly the
+                // biggest joins — the ones that OOM — to sort-merge. Sort-merge
+                // stays for small inputs and for already-sorted ones, where the
+                // merge is linear and its output order can pay for itself.
+                let use_sort_merge = (current_cost.rows <= 10000 && right_cost.rows <= 10000)
                     || (current_cost.is_sorted && right_cost.is_sorted);
 
                 if use_sort_merge && sort_merge_cost.total_cost < hash_cost.total_cost {
