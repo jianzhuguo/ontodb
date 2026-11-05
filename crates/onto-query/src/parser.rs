@@ -1986,9 +1986,12 @@ impl QueryParser {
             let rest = safe_slice_from(&rest, pos + 8).trim();
             let (cols_str, rest) =
                 Self::consume_until_keywords(rest, &["HAVING", "ORDER BY", "LIMIT"]);
+            // Quoted identifiers ("col") are identifier quoting, not part of the
+            // name - the OntoQL round-trip emits GROUP BY cols quoted, and the
+            // executor resolves against unquoted row keys.
             let columns: Vec<String> = cols_str
                 .split(',')
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim().trim_matches('"').to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
             (Some(GroupByClause { columns }), rest.to_string())
@@ -2028,6 +2031,8 @@ impl QueryParser {
                 } else {
                     (part.to_string(), true)
                 };
+                // Same identifier-quoting rule as GROUP BY columns.
+                let col = col.trim_matches('"').to_string();
                 if !col.is_empty() {
                     order_cols.push(OrderBy {
                         column: col,
