@@ -33,7 +33,12 @@ fn find_unquoted_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize
         let c = hay_bytes[i];
         if let Some(q) = in_quote {
             if c == q {
-                in_quote = None;
+                // SQL-92: '' inside single-quoted string is an escaped quote
+                if q == b'\'' && i + 1 < hay_bytes.len() && hay_bytes[i + 1] == b'\'' {
+                    i += 1;
+                } else {
+                    in_quote = None;
+                }
             }
         } else if c == b'\'' || c == b'"' {
             in_quote = Some(c);
@@ -1917,10 +1922,15 @@ impl QueryParser {
     fn find_matching_paren_simple(input: &str) -> Result<usize> {
         let mut depth = 0;
         let mut in_quote: Option<char> = None;
-        for (i, c) in input.char_indices() {
+        let mut iter = input.char_indices().peekable();
+        while let Some((i, c)) = iter.next() {
             if let Some(q) = in_quote {
                 if c == q {
-                    in_quote = None;
+                    if q == '\'' && iter.peek().map_or(false, |&(_, nc)| nc == '\'') {
+                        iter.next();
+                    } else {
+                        in_quote = None;
+                    }
                 }
             } else {
                 match c {
@@ -2684,10 +2694,16 @@ impl QueryParser {
     fn find_matching_paren(input: &str) -> Result<usize> {
         let mut depth = 0;
         let mut in_quote: Option<char> = None;
-        for (i, c) in input.char_indices() {
+        let mut iter = input.char_indices().peekable();
+        while let Some((i, c)) = iter.next() {
             if let Some(q) = in_quote {
                 if c == q {
-                    in_quote = None;
+                    // SQL-92: '' inside single-quoted string is an escaped quote
+                    if q == '\'' && iter.peek().map_or(false, |&(_, nc)| nc == '\'') {
+                        iter.next();
+                    } else {
+                        in_quote = None;
+                    }
                 }
             } else {
                 match c {
@@ -3102,11 +3118,20 @@ impl QueryParser {
         let mut paren_depth = 0i32;
         let mut bracket_depth = 0i32; // Track square brackets for arrays
 
-        for c in input.chars() {
+        let chars: Vec<char> = input.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
             if let Some(q) = in_quote {
                 current.push(c);
                 if c == q {
-                    in_quote = None;
+                    // SQL-92 escaping: '' inside a single-quoted string is a literal quote
+                    if q == '\'' && i + 1 < chars.len() && chars[i + 1] == '\'' {
+                        current.push(chars[i + 1]);
+                        i += 1;
+                    } else {
+                        in_quote = None;
+                    }
                 }
             } else if c == '\'' || c == '"' {
                 in_quote = Some(c);
@@ -3129,6 +3154,7 @@ impl QueryParser {
             } else {
                 current.push(c);
             }
+            i += 1;
         }
 
         if !current.is_empty() {
@@ -3225,7 +3251,11 @@ impl QueryParser {
 
             if let Some(q) = in_quote {
                 if c == q {
-                    in_quote = None;
+                    if q == '\'' && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 1;
+                    } else {
+                        in_quote = None;
+                    }
                 }
             } else if c == '\'' || c == '"' {
                 in_quote = Some(c);
@@ -4402,10 +4432,10 @@ impl QueryParser {
         }
 
         // String literal (single quotes only - double quotes are identifiers in SQL)
+        // SQL-92 escaping: '' inside a single-quoted string is a literal single quote.
         if s.starts_with('\'') && s.ends_with('\'') {
-            return Ok(LiteralValue::String(
-                safe_slice(s, 1, s.len() - 1).to_string(),
-            ));
+            let inner = safe_slice(s, 1, s.len() - 1);
+            return Ok(LiteralValue::String(inner.replace("''", "'")));
         }
 
         // Array literal: [1.0, 2.0, 3.0]

@@ -29,10 +29,16 @@ fn find_matching_paren(s: &str) -> Option<usize> {
     }
     let mut depth = 0usize;
     let mut in_quote: Option<u8> = None;
-    for (i, &c) in b.iter().enumerate() {
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
         if let Some(q) = in_quote {
             if c == q {
-                in_quote = None;
+                if q == b'\'' && i + 1 < b.len() && b[i + 1] == b'\'' {
+                    i += 1;
+                } else {
+                    in_quote = None;
+                }
             }
         } else if c == b'\'' || c == b'"' {
             in_quote = Some(c);
@@ -44,6 +50,7 @@ fn find_matching_paren(s: &str) -> Option<usize> {
                 return Some(i);
             }
         }
+        i += 1;
     }
     None
 }
@@ -61,7 +68,11 @@ fn find_unquoted(haystack: &str, needle: &str) -> Option<usize> {
         let c = hay_bytes[i];
         if let Some(q) = in_quote {
             if c == q {
-                in_quote = None;
+                if q == b'\'' && i + 1 < hay_bytes.len() && hay_bytes[i + 1] == b'\'' {
+                    i += 1;
+                } else {
+                    in_quote = None;
+                }
             }
         } else if c == b'\'' || c == b'"' {
             in_quote = Some(c);
@@ -110,15 +121,25 @@ fn split_quoted(input: &str, delim: char) -> Vec<String> {
     let mut in_quote: Option<char> = None;
     let mut depth = 0u32;
 
-    for c in input.chars() {
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
         match c {
             '\'' | '"' if in_quote.is_none() => {
                 in_quote = Some(c);
                 current.push(c);
             }
             c if Some(c) == in_quote => {
-                in_quote = None;
-                current.push(c);
+                // SQL-92: '' inside single-quoted string is an escaped quote
+                if c == '\'' && i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    current.push('\'');
+                    current.push('\'');
+                    i += 1;
+                } else {
+                    in_quote = None;
+                    current.push(c);
+                }
             }
             _ if in_quote.is_some() => current.push(c),
             '(' => {
@@ -138,6 +159,7 @@ fn split_quoted(input: &str, delim: char) -> Vec<String> {
             }
             _ => current.push(c),
         }
+        i += 1;
     }
     let trimmed = current.trim().to_string();
     if !trimmed.is_empty() {
@@ -1448,10 +1470,15 @@ impl OntoQLParser {
             let combined = OntoFilterExpr::And(Box::new(expr), Box::new(right));
             Self::chain_and_or(combined, after2)
         } else if starts_with_ignore_ascii_case(rest, "OR ") {
-            // OR: parse the right side as a full AND-chain (higher precedence)
+            // OR: parse the right side as a full AND-chain (higher precedence),
+            // then CONTINUE chaining left-to-right — a OR b OR c must fold to
+            // (a OR b) OR c. The previous one-shot return silently dropped every
+            // condition after the first OR pair (parser.rs::wrap_chain already
+            // continued; this arm did not).
             let after = safe_slice_from(rest, 3).trim_start();
             let (right, after2) = Self::parse_filter_and(after)?;
-            Ok((OntoFilterExpr::Or(Box::new(expr), Box::new(right)), after2))
+            let combined = OntoFilterExpr::Or(Box::new(expr), Box::new(right));
+            Self::chain_and_or(combined, after2)
         } else {
             Ok((expr, rest))
         }
@@ -1618,11 +1645,28 @@ impl OntoQLParser {
 
         // String literal
         if input.starts_with('\'') {
-            if let Some(end) = input[1..].find('\'') {
-                let val = &input[1..1 + end];
+            // Find the closing quote, skipping SQL-92 escaped '' pairs
+            let inner = &input[1..];
+            let mut end = None;
+            let mut ci = 0;
+            let inner_bytes = inner.as_bytes();
+            while ci < inner_bytes.len() {
+                if inner_bytes[ci] == b'\'' {
+                    if ci + 1 < inner_bytes.len() && inner_bytes[ci + 1] == b'\'' {
+                        ci += 2; // skip escaped quote
+                    } else {
+                        end = Some(ci);
+                        break;
+                    }
+                } else {
+                    ci += 1;
+                }
+            }
+            if let Some(end) = end {
+                let val = &inner[..end];
                 let rest = safe_slice_from(input, 1 + end + 1).trim_start();
                 return Ok((
-                    OntoValueExpr::Literal(OntoLiteral::String(val.to_string())),
+                    OntoValueExpr::Literal(OntoLiteral::String(val.replace("''", "'"))),
                     rest,
                 ));
             }
@@ -1945,7 +1989,11 @@ impl OntoQLParser {
             let b = bytes[i];
             if let Some(q) = in_quote {
                 if b == q {
-                    in_quote = None;
+                    if q == b'\'' && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 1;
+                    } else {
+                        in_quote = None;
+                    }
                 }
             } else {
                 match b {
@@ -2571,6 +2619,49 @@ impl OntoQLAst {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_where_or_chain_keeps_all_conditions() {
+        // Regression: chain_and_or's OR arm used to return after the first OR
+        // pair, silently dropping `OR a = 3` and beyond.
+        let ast = OntoQLParser::parse("SELECT * FROM t WHERE a = 1 OR a = 2 OR a = 3").unwrap();
+        let filter = match ast {
+            OntoQLAst::Select { filter, .. } => filter.expect("filter expected"),
+            _ => panic!("Expected Select"),
+        };
+        fn atoms(e: &OntoFilterExpr) -> usize {
+            match e {
+                OntoFilterExpr::Or(l, r) | OntoFilterExpr::And(l, r) => atoms(l) + atoms(r),
+                _ => 1,
+            }
+        }
+        fn or_nodes(e: &OntoFilterExpr) -> usize {
+            match e {
+                OntoFilterExpr::Or(l, r) => 1 + or_nodes(l) + or_nodes(r),
+                OntoFilterExpr::And(l, r) => or_nodes(l) + or_nodes(r),
+                _ => 0,
+            }
+        }
+        assert_eq!(atoms(&filter), 3, "all three OR operands must survive");
+        assert_eq!(or_nodes(&filter), 2, "a OR b OR c folds to (a OR b) OR c");
+    }
+
+    #[test]
+    fn test_where_or_and_precedence() {
+        // a = 1 OR a = 2 AND a = 3  ->  a=1 OR (a=2 AND a=3)
+        let ast = OntoQLParser::parse("SELECT * FROM t WHERE a = 1 OR a = 2 AND a = 3").unwrap();
+        let filter = match ast {
+            OntoQLAst::Select { filter, .. } => filter.expect("filter expected"),
+            _ => panic!("Expected Select"),
+        };
+        match filter {
+            OntoFilterExpr::Or(l, r) => {
+                assert!(matches!(*l, OntoFilterExpr::Eq(..)), "left = atom");
+                assert!(matches!(*r, OntoFilterExpr::And(..)), "right = AND-chain");
+            }
+            _ => panic!("expected top-level Or"),
+        }
+    }
 
     #[test]
     fn test_parse_create_class_basic() {
