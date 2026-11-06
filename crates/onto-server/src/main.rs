@@ -37,6 +37,7 @@ pub mod mysqlwire;
 pub mod pgwire;
 mod rate_limit;
 pub mod security_audit;
+mod semantic;
 pub mod tls;
 
 use auth::{AuthConfig, AuthState, Permission};
