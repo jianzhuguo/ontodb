@@ -1219,43 +1219,7 @@ fn expand_frontier(
 ) -> Res<Option<String>> {
     let mut next_queue = std::collections::VecDeque::new();
     while let Some(key) = queue.pop_front() {
-        // Find edges where key is source (forward) or target (backward)
-        let (col, opp_col) = if forward { ("source", "target") } else { ("target", "source") };
-        let sql = format!(
-            "SELECT source, target, __class__ FROM {} WHERE {} = '{}'{} LIMIT {}",
-            "sembio._relation_edges", // will be replaced by actual query below
-            col,
-            esc(&key),
-            rel_filter,
-            limit
-        );
-        // Actually query all relation tables that match
-        // For simplicity, use __graph__ edges or query each known relation
-        // Better: query the ontology relation classes
-        let _ = (sql, opp_col); // suppress warnings — real impl below
-
-        // Query edges via a generic approach: look up relations from __ontology__
-        let rel_sql = format!(
-            "SELECT target, __class__ FROM sembio.treats WHERE source = '{}' LIMIT {}",
-            esc(&key),
-            limit
-        );
-        // We need a generic relation lookup. Use the fact that edges have __class__
-        // Let's query with a UNION approach or iterate known relations.
-        // For production, this would use the engine's relation index.
-        let _ = rel_sql;
-
-        // Simplified: use a direct query on the triple/graph store
-        // The executor has execute_read_streaming which can scan all edges
-        // For now, use a pragmatic approach: query __graph_ edges
-        let graph_sql = format!(
-            "SELECT source, target FROM {} WHERE {} = '{}' LIMIT {}",
-            "sembio._edges", col, esc(&key), limit
-        );
-        let _ = graph_sql;
-
-        // Real implementation: iterate relation tables from ontology
-        // Use a helper that lists relation classes
+        let edges = query_relation_edges(executor, actor, &key, forward, rel_filter, limit)?;
         let edges = query_relation_edges(executor, actor, &key, forward, rel_filter, limit)?;
         for (rel, other_key) in edges {
             if visited.contains_key(&other_key) {
@@ -1272,27 +1236,52 @@ fn expand_frontier(
     Ok(None)
 }
 
-/// Lists relation class names (classes with source/target edge semantics).
+/// Lists relation class names dynamically from the ontology.
+/// Discovers classes that have both `source` and `target` properties.
 fn list_relation_classes(
     executor: &Arc<QueryExecutor>,
     actor: &onto_query::QueryActor,
 ) -> Res<Vec<String>> {
-    // Use the known relation tables — fast and deterministic.
-    // The ontology query for source/target properties is too slow at scale.
-    let candidates = [
-        "sembio.treats", "sembio.indicated_for", "sembio.has_phenotype",
-        "sembio.causes_adverse", "sembio.targets_protein", "sembio.disease_target",
-        "sembio.has_bioactivity", "sembio.has_structure", "sembio.member_of",
-        "sembio.metabolizes", "sembio.regulates", "sembio.structure_disease",
-        "sembio.structure_drug", "sembio.metabolite_disease", "sembio.go_is_a",
-        "sembio.treats_evidence", "sembio.associated_with",
-    ];
+    // Discover relation classes from ontology metadata:
+    // classes where both 'source' and 'target' properties are declared.
+    let rows = query_rows(
+        executor,
+        actor,
+        "SELECT DISTINCT class FROM __ontology__ WHERE property IN ('source', 'target')",
+    )?;
+    let mut candidates: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.get("class").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+
+    // Filter: keep only classes where both source and target exist
+    // by probing each candidate with a LIMIT 1 query.
     let mut names = Vec::new();
-    for c in candidates {
+    for c in &candidates {
         if query_rows(executor, actor, &format!("SELECT 1 FROM {} LIMIT 1", c)).is_ok() {
-            names.push(c.to_string());
+            names.push(c.clone());
         }
     }
+
+    // If ontology discovery returns nothing (e.g. __ontology__ schema differs),
+    // fall back to probing known namespaces.
+    if names.is_empty() {
+        let ns_rows = query_rows(executor, actor, "SELECT name FROM __ns__")?;
+        for ns in &ns_rows {
+            let ns_name = ns.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if ns_name.is_empty() {
+                continue;
+            }
+            // Probe common relation suffixes within this namespace
+            for suffix in ["treats", "indicated_for", "has_phenotype", "causes_adverse", "targets_protein"] {
+                let full = format!("{}.{}", ns_name, suffix);
+                if query_rows(executor, actor, &format!("SELECT 1 FROM {} LIMIT 1", full)).is_ok() {
+                    names.push(full);
+                }
+            }
+        }
+    }
+
     Ok(names)
 }
 
@@ -1867,10 +1856,11 @@ fn collect_facts_for_explain(
             }
         }
     } else {
-        // Default: collect from known relation tables
-        for rel in ["sembio.treats", "sembio.causes_adverse", "sembio.has_phenotype", "sembio.targets_protein"] {
+        // Default: discover relation tables dynamically
+        let relations = list_relation_classes(executor, actor)?;
+        for rel in &relations {
+            let pred_short = rel.rsplit('.').next().unwrap_or("related_to");
             if let Ok(rows) = query_rows(executor, actor, &format!("SELECT source, target FROM {} LIMIT 50000", rel)) {
-                let pred_short = rel.rsplit('.').next().unwrap_or("related_to");
                 for row in rows {
                     if let (Some(s), Some(t)) = (row.get("source").and_then(|v| v.as_str()), row.get("target").and_then(|v| v.as_str())) {
                         facts.push(onto_ontology::Triple {
