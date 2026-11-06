@@ -178,7 +178,7 @@ impl IntoResponse for StreamedRowsChannel {
 
 /// Validates a user-supplied filter expression to prevent SQL injection.
 /// Only allows simple comparison expressions (e.g., "price > 100", "name = 'foo'").
-fn validate_filter(filter: &str) -> Result<(), String> {
+pub(crate) fn validate_filter(filter: &str) -> Result<(), String> {
     if filter.len() > 1024 {
         return Err("filter expression too long (max 1024 chars)".into());
     }
@@ -236,7 +236,7 @@ fn validate_filter(filter: &str) -> Result<(), String> {
 
 /// Validates a SQL identifier (class name, column name) to prevent injection.
 /// Allows Unicode alphanumeric characters, underscores, and dots (for qualified names).
-fn validate_identifier(name: &str) -> Result<(), String> {
+pub(crate) fn validate_identifier(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 128 {
         return Err("identifier must be 1-128 characters".into());
     }
@@ -260,7 +260,7 @@ fn validate_identifier(name: &str) -> Result<(), String> {
 
 /// Strips internal details (file paths, OS errors, line numbers) from error
 /// messages before returning them to the client.
-fn sanitize_error(err: &str) -> String {
+pub(crate) fn sanitize_error(err: &str) -> String {
     let lower = err.to_lowercase();
     if lower.contains("failed to read file")
         || lower.contains("permission denied")
@@ -744,6 +744,15 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/vector/search", post(vector_search))
         // Hybrid query: SQL + vector search
         .route("/api/hybrid/query", post(hybrid_query))
+        // Semantic retrieval (fusion query patterns)
+        .route("/api/semantic/similar", post(crate::semantic::semantic_similar))
+        .route("/api/semantic/trace", post(crate::semantic::semantic_trace))
+        .route("/api/semantic/infer", post(crate::semantic::semantic_infer))
+        .route("/api/semantic/expand", post(crate::semantic::semantic_expand))
+        .route("/api/semantic/path", post(crate::semantic::semantic_path))
+        .route("/api/semantic/gap", post(crate::semantic::semantic_gap))
+        .route("/api/semantic/bridge", post(crate::semantic::semantic_bridge))
+        .route("/api/semantic/subgraph", post(crate::semantic::semantic_subgraph))
         // Schema introspection
         .route("/api/schema", get(get_schema))
         // Cluster info
@@ -869,6 +878,14 @@ pub fn build_router_with_auth(
         .route("/api/sparql", post(sparql_query))
         .route("/api/vector/search", post(vector_search))
         .route("/api/hybrid/query", post(hybrid_query))
+        .route("/api/semantic/similar", post(crate::semantic::semantic_similar))
+        .route("/api/semantic/trace", post(crate::semantic::semantic_trace))
+        .route("/api/semantic/infer", post(crate::semantic::semantic_infer))
+        .route("/api/semantic/expand", post(crate::semantic::semantic_expand))
+        .route("/api/semantic/path", post(crate::semantic::semantic_path))
+        .route("/api/semantic/gap", post(crate::semantic::semantic_gap))
+        .route("/api/semantic/bridge", post(crate::semantic::semantic_bridge))
+        .route("/api/semantic/subgraph", post(crate::semantic::semantic_subgraph))
         .route("/api/schema", get(get_schema))
         .route("/api/cluster", get(cluster_info))
         // Graph endpoints
@@ -1212,7 +1229,7 @@ async fn metrics_json(State(state): State<AppState>) -> impl IntoResponse {
 /// ```
 /// Builds the query-actor identity (namespace scope + audit label) from the
 /// authenticated key info, falling back to "anonymous" when auth is disabled.
-fn actor_of(info: Option<crate::auth::KeyInfo>, client_ip: &str) -> onto_query::QueryActor {
+pub(crate) fn actor_of(info: Option<crate::auth::KeyInfo>, client_ip: &str) -> onto_query::QueryActor {
     match info {
         Some(k) => onto_query::QueryActor {
             label: k.description,
