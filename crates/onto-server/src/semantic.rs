@@ -1264,7 +1264,7 @@ fn list_relation_classes(
     }
 
     // If ontology discovery returns nothing (e.g. __ontology__ schema differs),
-    // fall back to probing known namespaces.
+    // fall back to probing namespaces for edge-like tables.
     if names.is_empty() {
         let ns_rows = query_rows(executor, actor, "SELECT name FROM __ns__")?;
         for ns in &ns_rows {
@@ -1272,11 +1272,21 @@ fn list_relation_classes(
             if ns_name.is_empty() {
                 continue;
             }
-            // Probe common relation suffixes within this namespace
-            for suffix in ["treats", "indicated_for", "has_phenotype", "causes_adverse", "targets_protein"] {
-                let full = format!("{}.{}", ns_name, suffix);
-                if query_rows(executor, actor, &format!("SELECT 1 FROM {} LIMIT 1", full)).is_ok() {
-                    names.push(full);
+            // Probe tables in this namespace: try all classes in the namespace
+            // by querying __ontology__ for classes under this namespace.
+            let cls_rows = query_rows(
+                executor,
+                actor,
+                &format!("SELECT DISTINCT class FROM __ontology__ WHERE class LIKE '{}.%'", ns_name),
+            )?;
+            for cls in &cls_rows {
+                let cname = cls.get("class").and_then(|v| v.as_str()).unwrap_or("");
+                if cname.is_empty() {
+                    continue;
+                }
+                // Probe: does this class have source and target columns?
+                if query_rows(executor, actor, &format!("SELECT source, target FROM {} LIMIT 1", cname)).is_ok() {
+                    names.push(cname.to_string());
                 }
             }
         }
@@ -1536,6 +1546,7 @@ pub async fn semantic_bridge(
 }
 
 /// Gets an entity's display name from common name fields.
+/// Probes the row for any field that looks like a name/label.
 fn get_entity_name(
     executor: &Arc<QueryExecutor>,
     actor: &onto_query::QueryActor,
@@ -1545,30 +1556,48 @@ fn get_entity_name(
     let (class, id) = if let Some(pos) = key.find("::") {
         let head = &key[..pos];
         let tail = &key[pos + 2..];
-        // head is either "ns" (then tail starts with "Class::id") or "ns.Class" (then tail is id/hash)
         if let Some(pos2) = tail.find("::") {
-            // ns::Class::id
             let cls = format!("{}.{}", head, &tail[..pos2]);
             let id = &tail[pos2 + 2..];
             (cls, id.to_string())
         } else {
-            // ns.Class::id or ns.Class::hash
             (head.to_string(), tail.to_string())
         }
     } else {
         return Err(ApiErr::bad("invalid key format"));
     };
 
-    // Try id first
-    let sql = format!("SELECT id, disease_name, drug_name, name, go_id, pref_name FROM {} WHERE id = '{}' LIMIT 1", class, esc(&id));
+    // Query the full row and pick the best name-like field
+    let sql = format!("SELECT * FROM {} WHERE id = '{}' LIMIT 1", class, esc(&id));
     let rows = query_rows(executor, actor, &sql)?;
     if let Some(row) = rows.first() {
-        for field in ["disease_name", "drug_name", "name", "pref_name", "id"] {
-            if let Some(v) = row.get(field).and_then(|v| v.as_str()) {
-                if !v.is_empty() {
-                    return Ok(v.to_string());
-                }
+        // Prefer explicit name fields, then fall back to id
+        // Look for any field containing "name" or "label" or "title"
+        let mut best_name: Option<String> = None;
+        let mut id_val: Option<String> = None;
+        for (k, v) in row.iter() {
+            let s = match v {
+                Value::String(s) => s.as_str(),
+                _ => continue,
+            };
+            if s.is_empty() {
+                continue;
             }
+            if k == "id" {
+                id_val = Some(s.to_string());
+                continue;
+            }
+            let k_lower = k.to_lowercase();
+            if k_lower.contains("name") || k_lower.contains("label") || k_lower.contains("title") {
+                best_name = Some(s.to_string());
+                break; // first name-like field wins
+            }
+        }
+        if let Some(n) = best_name {
+            return Ok(n);
+        }
+        if let Some(i) = id_val {
+            return Ok(i);
         }
     }
     Ok(id)
