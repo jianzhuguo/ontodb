@@ -1676,6 +1676,233 @@ pub async fn semantic_subgraph(
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────────
+// Phase 2: explain — derivation-chain traceability
+// ────────────────────────────────────────────────────────────────────────────────
+
+/// POST /api/semantic/explain — why was this fact inferred?
+#[derive(Debug, Deserialize)]
+pub struct SemanticExplainRequest {
+    /// Target triple to explain.
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    /// Optional fact-collection scope (SQL SELECT returning source/target/predicate).
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Rule filter (empty = all rules).
+    #[serde(default)]
+    pub rules: Vec<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ExplainTriple {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct DerivationStepInfo {
+    pub rule: String,
+    pub conclusion: ExplainTriple,
+    pub premises: Vec<ExplainTriple>,
+}
+
+#[derive(Serialize)]
+pub struct ExplainResponse {
+    pub target: ExplainTriple,
+    /// True if the target can be explained (either stated or inferred).
+    pub explained: bool,
+    /// True if the target is directly stated in the data (not inferred).
+    pub stated: bool,
+    /// Derivation steps if the target was inferred.
+    pub derivations: Vec<DerivationStepInfo>,
+    /// Rule name -> count summary.
+    pub rule_summary: std::collections::HashMap<String, usize>,
+}
+
+/// POST /api/semantic/explain
+pub async fn semantic_explain(
+    State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::auth::KeyInfo>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    Json(req): Json<SemanticExplainRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+    let actor = actor_of(caller.map(|e| e.0), &addr.ip().to_string());
+
+    for s in [&req.subject, &req.predicate, &req.object] {
+        if s.is_empty() || s.len() > 512 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<Value>::error("subject/predicate/object must be 1-512 chars".to_string())),
+            );
+        }
+    }
+
+    let executor = state.executor.clone();
+    let subject = req.subject.clone();
+    let predicate = req.predicate.clone();
+    let object = req.object.clone();
+    let scope = req.scope.clone();
+    let rules = req.rules.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> Res<ExplainResponse> {
+        let target = onto_ontology::Triple {
+            subject: subject.clone(),
+            predicate: predicate.clone(),
+            object: object.clone(),
+        };
+
+        // Collect facts: use scope query or default to relation edges
+        let facts = collect_facts_for_explain(&executor, &actor, scope.as_deref())?;
+
+        // Get ontology for reasoning
+        let ontology = get_merged_ontology_for_explain(&executor, &actor)?;
+
+        // Run reasoner
+        let reasoner = onto_ontology::Reasoner::new(ontology);
+        let steps = reasoner.explain(&facts, &target);
+
+        // Check if target is a directly stated fact
+        let is_stated = facts.iter().any(|f| f.subject == target.subject && f.predicate == target.predicate && f.object == target.object);
+
+        // Filter by rules if specified
+        let wanted: Option<std::collections::HashSet<String>> = if rules.is_empty() {
+            None
+        } else {
+            Some(rules.iter().map(|r| normalize_rule_name_local(r)).collect())
+        };
+
+        let mut derivations: Vec<DerivationStepInfo> = Vec::new();
+        let mut rule_summary: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+        for step in &steps {
+            let rule_name = format!("{:?}", step.rule);
+            let norm = normalize_rule_name_local(&rule_name);
+            if let Some(w) = &wanted {
+                if !w.contains(&norm) {
+                    continue;
+                }
+            }
+            *rule_summary.entry(rule_name.clone()).or_insert(0) += 1;
+            derivations.push(DerivationStepInfo {
+                rule: rule_name,
+                conclusion: ExplainTriple {
+                    subject: step.conclusion.subject.clone(),
+                    predicate: step.conclusion.predicate.clone(),
+                    object: step.conclusion.object.clone(),
+                },
+                premises: step.premises.iter().map(|p| ExplainTriple {
+                    subject: p.subject.clone(),
+                    predicate: p.predicate.clone(),
+                    object: p.object.clone(),
+                }).collect(),
+            });
+        }
+
+        Ok(ExplainResponse {
+            target: ExplainTriple { subject, predicate, object },
+            explained: !derivations.is_empty() || is_stated,
+            stated: is_stated,
+            derivations,
+            rule_summary,
+        })
+    })
+    .await
+    .unwrap_or_else(|e| Err(ApiErr::internal(format!("task join: {e}"))));
+
+    let elapsed = start.elapsed().as_secs_f64();
+    match result {
+        Ok(data) => {
+            state.metrics.record_query("SEMANTIC_EXPLAIN", elapsed, true);
+            let v = serde_json::to_value(data).unwrap_or(Value::Null);
+            (StatusCode::OK, Json(ApiResponse::success(v, elapsed)))
+        }
+        Err(e) => {
+            state.metrics.record_query("SEMANTIC_EXPLAIN", elapsed, false);
+            (e.status, Json(ApiResponse::<Value>::error(e.msg)))
+        }
+    }
+}
+
+/// Collects facts for explain reasoning. If scope is provided, uses it as
+/// fact source; otherwise collects from known relation tables.
+fn collect_facts_for_explain(
+    executor: &Arc<QueryExecutor>,
+    actor: &onto_query::QueryActor,
+    scope: Option<&str>,
+) -> Res<Vec<onto_ontology::Triple>> {
+    let mut facts = Vec::new();
+
+    if let Some(q) = scope {
+        // Try to infer relation name from "FROM sembio.xxx" in the query
+        let default_pred = q
+            .split("FROM ")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|t| t.rsplit('.').next())
+            .unwrap_or("related_to")
+            .to_string();
+
+        // Scope query should return source, target columns (or subject, predicate, object)
+        let rows = query_rows(executor, actor, q)?;
+        for row in rows {
+            let subj = row.get("subject").or_else(|| row.get("source")).and_then(|v| v.as_str()).unwrap_or("");
+            let pred = row.get("predicate").or_else(|| row.get("__class__")).and_then(|v| v.as_str()).unwrap_or("");
+            let obj = row.get("object").or_else(|| row.get("target")).and_then(|v| v.as_str()).unwrap_or("");
+            if !subj.is_empty() && !obj.is_empty() {
+                // Normalize predicate: "sembio.treats" -> "treats"; use inferred default if empty
+                let pred_short = if pred.is_empty() {
+                    default_pred.clone()
+                } else {
+                    pred.rsplit('.').next().unwrap_or(pred).to_string()
+                };
+                facts.push(onto_ontology::Triple {
+                    subject: subj.to_string(),
+                    predicate: pred_short,
+                    object: obj.to_string(),
+                });
+            }
+        }
+    } else {
+        // Default: collect from known relation tables
+        for rel in ["sembio.treats", "sembio.causes_adverse", "sembio.has_phenotype", "sembio.targets_protein"] {
+            if let Ok(rows) = query_rows(executor, actor, &format!("SELECT source, target FROM {} LIMIT 50000", rel)) {
+                let pred_short = rel.rsplit('.').next().unwrap_or("related_to");
+                for row in rows {
+                    if let (Some(s), Some(t)) = (row.get("source").and_then(|v| v.as_str()), row.get("target").and_then(|v| v.as_str())) {
+                        facts.push(onto_ontology::Triple {
+                            subject: s.to_string(),
+                            predicate: pred_short.to_string(),
+                            object: t.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(facts)
+}
+
+/// Gets merged ontology for explain reasoning.
+fn get_merged_ontology_for_explain(
+    _executor: &Arc<QueryExecutor>,
+    _actor: &onto_query::QueryActor,
+) -> Res<onto_ontology::Ontology> {
+    // Return a minimal ontology — the reasoner works on facts alone for
+    // Prp-trp / Prp-inv / Prp-symp etc. Full ontology-aware reasoning
+    // (Cax-sco etc.) would need executor.get_merged_ontology().
+    Ok(onto_ontology::Ontology::new("explain"))
+}
+
+/// Local copy of rule name normalization (mirrors executor's version).
+fn normalize_rule_name_local(name: &str) -> String {
+    name.to_lowercase().replace(['-', '_'], "")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

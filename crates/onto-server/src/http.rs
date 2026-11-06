@@ -753,6 +753,7 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/semantic/gap", post(crate::semantic::semantic_gap))
         .route("/api/semantic/bridge", post(crate::semantic::semantic_bridge))
         .route("/api/semantic/subgraph", post(crate::semantic::semantic_subgraph))
+        .route("/api/semantic/explain", post(crate::semantic::semantic_explain))
         // Schema introspection
         .route("/api/schema", get(get_schema))
         // Cluster info
@@ -886,6 +887,7 @@ pub fn build_router_with_auth(
         .route("/api/semantic/gap", post(crate::semantic::semantic_gap))
         .route("/api/semantic/bridge", post(crate::semantic::semantic_bridge))
         .route("/api/semantic/subgraph", post(crate::semantic::semantic_subgraph))
+        .route("/api/semantic/explain", post(crate::semantic::semantic_explain))
         .route("/api/schema", get(get_schema))
         .route("/api/cluster", get(cluster_info))
         // Graph endpoints
