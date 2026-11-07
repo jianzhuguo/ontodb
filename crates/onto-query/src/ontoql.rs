@@ -961,7 +961,14 @@ impl OntoQLParser {
                 offset = off_str.parse::<usize>().ok();
                 remaining = new_rest;
             } else {
-                break;
+                // Comma-separated cross join (FROM a, b WHERE ...) or unknown
+                // clause — bail out so the caller falls back to the SQL parser,
+                // which handles comma joins natively. Without this, the second
+                // table and everything after it are silently dropped.
+                return Err(CoreError::InvalidArgument(format!(
+                    "OntoQL cannot parse clause starting at '{}'; use SQL syntax",
+                    &remaining[..remaining.len().min(30)]
+                )));
             }
         }
 

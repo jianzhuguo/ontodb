@@ -556,6 +556,9 @@ impl QueryPlanner {
         for j in &cross_joins {
             let key = j.alias.clone().unwrap_or_else(|| j.table.clone());
             cross_join_map.insert(key, j);
+            // Also index by table name so lookups by table_for_column (which
+            // returns the table name, not the alias) can find the join.
+            cross_join_map.entry(j.table.clone()).or_insert(j);
         }
 
         for pred in preds {
@@ -564,6 +567,11 @@ impl QueryPlanner {
             // since it doesn't distinguish column refs from string literals.
             let col_pair = match &pred {
                 FilterExpr::Eq(col_a, LiteralValue::String(col_b))
+                    if col_a.contains('.') && col_b.contains('.') =>
+                {
+                    Some((col_a.clone(), col_b.clone()))
+                }
+                FilterExpr::Eq(col_a, LiteralValue::Column(col_b))
                     if col_a.contains('.') && col_b.contains('.') =>
                 {
                     Some((col_a.clone(), col_b.clone()))
@@ -758,7 +766,7 @@ impl QueryPlanner {
             from_alias,
             &stats,
             &main_filter,
-            joins,
+            &resolved_joins,
             group_by,
             having,
             order_by,
@@ -785,7 +793,7 @@ impl QueryPlanner {
                             &stats,
                             index,
                             &main_filter,
-                            joins,
+                            &resolved_joins,
                             group_by,
                             having,
                             order_by,
@@ -820,7 +828,7 @@ impl QueryPlanner {
                     &stats,
                     index,
                     &main_filter,
-                    joins,
+                            &resolved_joins,
                     group_by,
                     having,
                     order_by,
