@@ -548,40 +548,19 @@ ontodb/
 
 ---
 
-## Enterprise Features
+## Enterprise Edition (Preview)
 
-The Enterprise edition adds three core capabilities on top of Community:
+**The Community edition is always enough** — everything you need to run in production on a single node ships free and open source. The Enterprise edition targets multi-tenant SaaS, compliance/audit, managed operations, and production clusters, delivered under a commercial license:
 
-### Ontology-Driven Rule Engine (World First)
-
-**Ontology knowledge auto-triggers business rules. Domain experts only define ontology, rules activate automatically.** Unlike traditional rule engines that require manual rule authoring, OntoDB Enterprise fuses OWL reasoning with the rule engine to achieve "knowledge as rules."
-
-| Capability | Description |
+| Direction | What you get |
 |-----------|-------------|
-| **Ontology → Rules** | OWL reasoning results auto-inject into rule engine, no coding needed |
-| **Enterprise Rule Engine** | Full DSL syntax, distributed reasoning, conflict detection, versioning, profiling |
+| **Multi-Tenancy** | Tenant management, quotas, metering & billing, enforced isolation |
+| **Security & Compliance** | RBAC separation of duties, LDAP/SSO, SM4 + AES encryption, audit logging & retention, data masking |
+| **Managed Operations** | Automated backup & point-in-time recovery, rolling upgrades, monitoring/alerting, SLA support |
+| **High Availability & Scaling** | Cluster HA, sharding, CDC change capture |
+| **Ontology-Driven Rule Engine** | Knowledge as rules — OWL reasoning results auto-trigger business rules, full DSL & explanation |
 
-### Security & Compliance
-
-Meets compliance requirements for government, financial, and healthcare industries.
-
-| Capability | Description |
-|-----------|-------------|
-| **Identity & Access** | RBAC separation of duties, LDAP/SAML integration |
-| **Data Protection** | SM4 + AES encryption, data masking, key management |
-| **Audit & Compliance** | Audit logging, compliance retention, integrity validation |
-
-### High Availability
-
-Enterprise-grade reliability.
-
-| Capability | Description |
-|-----------|-------------|
-| **Cluster HA** | Auto failover, read/write split, rolling upgrade |
-| **Distributed Query** | Cross-shard aggregation, distributed backup/restore |
-| **Observability** | Slow query analysis, metrics collection, alerting |
-
-Contact: license@ontovalue.com
+> The above is Enterprise **roadmap** capability; parts are still under construction, subject to actual release versions. Commercial licensing: license@ontovalue.com
 
 ---
 
