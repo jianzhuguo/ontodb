@@ -85,6 +85,5 @@ license: Apache-2.0 (Community) / Commercial (Enterprise)
 
 # Contact
 contact:
-  email: 624831343@qq.com
   github: https://github.com/ontodb/ontodb
   gitee: https://gitee.com/ontovalue/ontodb
