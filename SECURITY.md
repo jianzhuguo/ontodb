@@ -1,4 +1,4 @@
-﻿# Security Policy
+# Security Policy
 
 ## Supported Versions
 
@@ -10,7 +10,7 @@
 
 **Please do NOT open a public GitHub issue for security vulnerabilities.**
 
-Instead, report them privately via email to: **security@ontovalue.com**.
+Instead, report them privately via email to: **624831343@qq.com**.
 
 ### What to include
 

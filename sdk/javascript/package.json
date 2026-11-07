@@ -21,7 +21,7 @@
     "prepublishOnly": "npm run build"
   },
   "keywords": ["ontodb", "database", "semantic", "ontology", "vector", "graph"],
-  "author": "OntoDB Team <sdk@ontodb.io>",
+  "author": "Guo Jianzhu (郭建筑) <624831343@qq.com>",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

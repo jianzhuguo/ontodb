@@ -3865,7 +3865,7 @@ async fn graph_enterprise_stub() -> impl IntoResponse {
         StatusCode::FORBIDDEN,
         Json(serde_json::json!({
             "error": "Enterprise Edition required",
-            "message": "This feature requires OntoDB Enterprise. Contact license@ontovalue.com"
+            "message": "This feature requires OntoDB Enterprise. Contact 624831343@qq.com"
         })),
     )
 }

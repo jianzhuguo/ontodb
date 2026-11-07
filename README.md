@@ -574,7 +574,7 @@ ontodb/
 | **高可用与扩展** | 集群高可用、分片扩展、CDC 变更捕获 |
 | **本体驱动规则引擎** | 知识即规则——OWL 推理结果自动触发业务规则，完整 DSL 与推理解释 |
 
-> 以上为企业版**路线图**能力，部分仍在建设中，以实际发布版本为准。商业授权咨询：license@ontovalue.com
+> 以上为企业版**路线图**能力，部分仍在建设中，以实际发布版本为准。商业授权咨询：624831343@qq.com
 
 ---
 
@@ -599,9 +599,9 @@ OntoDB 采用双许可模式：
 - 安全合规（RBAC + LDAP + SM4/AES 加密 + KMS + 审计保留）
 - 高可用（集群故障转移 + 跨分片查询 + 备份恢复）
 - 详见 [LICENSE.COMMERCIAL](LICENSE.COMMERCIAL)
-- 联系方式：license@ontovalue.com
+- 联系方式：624831343@qq.com
 
-**说明：** 企业版功能（`onto-enterprise` crate）为商业许可软件，未经授权不得复制、分发或用于生产环境。商业授权咨询：license@ontovalue.com
+**说明：** 企业版功能（`onto-enterprise` crate）为商业许可软件，未经授权不得复制、分发或用于生产环境。商业授权咨询：624831343@qq.com
 
 ---
 

@@ -560,7 +560,7 @@ ontodb/
 | **High Availability & Scaling** | Cluster HA, sharding, CDC change capture |
 | **Ontology-Driven Rule Engine** | Knowledge as rules — OWL reasoning results auto-trigger business rules, full DSL & explanation |
 
-> The above is Enterprise **roadmap** capability; parts are still under construction, subject to actual release versions. Commercial licensing: license@ontovalue.com
+> The above is Enterprise **roadmap** capability; parts are still under construction, subject to actual release versions. Commercial licensing: 624831343@qq.com
 
 ---
 
@@ -585,9 +585,9 @@ OntoDB uses a dual licensing model:
 - Security compliance (RBAC + LDAP + SM4/AES encryption + KMS + audit retention)
 - High availability (cluster failover + cross-shard query + backup/restore)
 - See [LICENSE.COMMERCIAL](LICENSE.COMMERCIAL)
-- Contact: license@ontovalue.com
+- Contact: 624831343@qq.com
 
-**Note:** Enterprise features (the `onto-enterprise` crate) are licensed under a proprietary commercial license and may not be copied, distributed, or used in production without authorization. Contact: license@ontovalue.com
+**Note:** Enterprise features (the `onto-enterprise` crate) are licensed under a proprietary commercial license and may not be copied, distributed, or used in production without authorization. Contact: 624831343@qq.com
 
 ---
 
