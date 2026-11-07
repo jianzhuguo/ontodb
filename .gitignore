@@ -170,3 +170,5 @@ docs/.obsidian/
 crates/onto-raft/
 crates/onto-sharding/
 crates/onto-enterprise/
+# Business/strategy docs (not for public repo)
+社区版与企业版功能边界.md
