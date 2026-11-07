@@ -348,6 +348,7 @@ pub struct AppState {
     pub audit: Arc<crate::audit::AuditLogger>,
     pub raft_node_id: Option<u64>,
     pub data_dir: std::path::PathBuf,
+    pub alerts: Option<crate::alerts::SharedAlertManager>,
 }
 
 /// SQL query request.
@@ -730,6 +731,7 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/health", get(health))
         .route("/api/health/ready", get(health_ready))
         .route("/api/health/live", get(health_live))
+        .route("/api/alerts", get(alerts_handler))
         // Metrics (Prometheus and JSON)
         .route("/metrics", get(metrics_prometheus))
         .route("/api/metrics", get(metrics_json))
@@ -891,6 +893,7 @@ pub fn build_router_with_auth(
         .route("/api/health", get(health))
         .route("/api/health/ready", get(health_ready))
         .route("/api/health/live", get(health_live))
+        .route("/api/alerts", get(alerts_handler))
         .route("/metrics", get(metrics_prometheus))
         .route("/api/metrics", get(metrics_json))
         // Protected routes
@@ -1245,6 +1248,21 @@ async fn metrics_json(State(state): State<AppState>) -> impl IntoResponse {
             "total": m.slow_queries_total.get(),
             "threshold_seconds": SLOW_QUERY_THRESHOLD_SECS,
         }
+    }))
+}
+
+/// GET /api/alerts - Current alert states (community basic alerting).
+async fn alerts_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(ref mgr) = state.alerts else {
+        return Json(json!({"alerts": [], "firing": 0, "note": "alerting not enabled"}));
+    };
+    let alerts = mgr.states_snapshot();
+    let firing = mgr.firing_count();
+    Json(json!({
+        "alerts": alerts,
+        "firing": firing,
+        "total": alerts.len(),
+        "channels": mgr.channel_names(),
     }))
 }
 

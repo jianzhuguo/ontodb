@@ -28,6 +28,7 @@
 //! - HTTP server (RESTful API with auth, rate limiting, and Prometheus metrics)
 
 pub mod admin;
+pub mod alerts;
 pub mod audit;
 mod auth;
 pub mod cdc;
@@ -313,6 +314,63 @@ struct Args {
     /// Maximum concurrent migrations
     #[arg(long, default_value = "2", env = "SHARDING_MAX_CONCURRENT_MIGRATIONS")]
     max_concurrent_migrations: u32,
+
+    // === Basic alerting (community) ===
+    /// Memory usage fraction (0.0-1.0) that triggers a warning alert
+    #[arg(long, default_value = "0.85", env = "ALERT_MEMORY_WARN")]
+    alert_memory_warn: f64,
+
+    /// Memory usage fraction (0.0-1.0) that triggers a critical alert
+    #[arg(long, default_value = "0.95", env = "ALERT_MEMORY_CRITICAL")]
+    alert_memory_critical: f64,
+
+    /// Disk usage fraction (0.0-1.0) that triggers a warning alert
+    #[arg(long, default_value = "0.90", env = "ALERT_DISK_WARN")]
+    alert_disk_warn: f64,
+
+    /// Disk usage fraction (0.0-1.0) that triggers a critical alert
+    #[arg(long, default_value = "0.95", env = "ALERT_DISK_CRITICAL")]
+    alert_disk_critical: f64,
+
+    /// Slow queries per minute that triggers a warning alert
+    #[arg(long, default_value = "10", env = "ALERT_SLOW_QUERY_WARN")]
+    alert_slow_query_warn: f64,
+
+    /// Slow queries per minute that triggers a critical alert
+    #[arg(long, default_value = "50", env = "ALERT_SLOW_QUERY_CRITICAL")]
+    alert_slow_query_critical: f64,
+
+    /// Error rate fraction (0.0-1.0) that triggers a warning alert
+    #[arg(long, default_value = "0.05", env = "ALERT_ERROR_RATE_WARN")]
+    alert_error_rate_warn: f64,
+
+    /// Error rate fraction (0.0-1.0) that triggers a critical alert
+    #[arg(long, default_value = "0.20", env = "ALERT_ERROR_RATE_CRITICAL")]
+    alert_error_rate_critical: f64,
+
+    /// Active connections that triggers a warning alert
+    #[arg(long, default_value = "1000", env = "ALERT_CONNECTIONS_WARN")]
+    alert_connections_warn: u64,
+
+    /// Active connections that triggers a critical alert
+    #[arg(long, default_value = "5000", env = "ALERT_CONNECTIONS_CRITICAL")]
+    alert_connections_critical: u64,
+
+    /// Seconds between alert evaluations
+    #[arg(long, default_value = "30", env = "ALERT_CHECK_INTERVAL")]
+    alert_check_interval_secs: u64,
+
+    /// Sustained seconds threshold must be exceeded before firing (0 = immediate)
+    #[arg(long, default_value = "0", env = "ALERT_FOR_DURATION")]
+    alert_for_duration_secs: u64,
+
+    /// Webhook URL for alert delivery (POST JSON)
+    #[arg(long, env = "ALERT_WEBHOOK_URL")]
+    alert_webhook_url: Option<String>,
+
+    /// File path for JSONL alert log
+    #[arg(long, env = "ALERT_FILE")]
+    alert_file: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -630,6 +688,22 @@ fn main() -> Result<()> {
                         tls_config,
                         graph_store.clone(),
                         data_dir.clone(),
+                        alerts::AlertConfig {
+                            memory_warn: args.alert_memory_warn,
+                            memory_critical: args.alert_memory_critical,
+                            disk_warn: args.alert_disk_warn,
+                            disk_critical: args.alert_disk_critical,
+                            slow_query_warn: args.alert_slow_query_warn,
+                            slow_query_critical: args.alert_slow_query_critical,
+                            error_rate_warn: args.alert_error_rate_warn,
+                            error_rate_critical: args.alert_error_rate_critical,
+                            connections_warn: args.alert_connections_warn,
+                            connections_critical: args.alert_connections_critical,
+                            check_interval_secs: args.alert_check_interval_secs,
+                            for_duration_secs: args.alert_for_duration_secs,
+                            webhook_url: args.alert_webhook_url.clone(),
+                            file_path: args.alert_file.clone(),
+                        },
                     )),
                     Box::pin(run_tcp_server(
                         &args.listen,
@@ -839,8 +913,10 @@ async fn run_http_server(
     tls_config: Option<tls::TlsConfig>,
     graph: Arc<onto_graph::GraphStore>,
     data_dir: PathBuf,
+    alert_config: alerts::AlertConfig,
 ) -> Result<()> {
     let audit = Arc::new(audit::AuditLogger::new(audit_config));
+    let alert_manager = alerts::spawn_alert_loop(metrics.clone(), alert_config);
     let state = http::AppState {
         executor,
         metrics,
@@ -848,6 +924,7 @@ async fn run_http_server(
         audit,
         raft_node_id,
         data_dir,
+        alerts: Some(alert_manager),
     };
     let auth_state = AuthState::new(&auth_config).with_metrics(state.metrics.clone());
 
