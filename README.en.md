@@ -158,6 +158,36 @@ Full-library search in **< 50ms**; self-match distance 0; salts, stereoisomers, 
 
 ---
 
+## Semantic API — an interface for asking knowledge
+
+In traditional stacks, "find similar, trace mechanism, infer attribution" means glue code across a graph DB, a vector DB, and a separate reasoner. OntoDB wraps these into **9 semantic endpoints**: all semantic decisions happen in the data layer (`__ontology__` + the reasoning kernel) — the API is thin orchestration. **Switching domains means switching the ontology definition; the kernel and API don't change.**
+
+| Endpoint | Capability | In one line |
+|----------|------------|-------------|
+| `POST /api/semantic/similar` | Vector similarity search | Top-K with an **ontology type domain** — "compounds like a drug" automatically includes all subclasses, no hardcoded IN lists |
+| `POST /api/semantic/trace` | Multi-hop relation chain tracing | Walk relation chains hop by hop (drug → adverse reaction → phenotype → disease → target), with optional INFER enhancement at the chain tail |
+| `POST /api/semantic/infer` | Explicit rule reasoning | Run OWL-lite rules (Prp-trp/inv/symp/eq/dom/rng + Cax-sco) over a fact set, streamed with pagination |
+| `POST /api/semantic/expand` | Taxonomy expansion | Fan out GO/disease hierarchies along `subClassOf` — querying a parent class includes all descendants |
+| `POST /api/semantic/path` | Path discovery | Graph traversal to find how two entities are connected |
+| `POST /api/semantic/gap` | Reference completeness assessment | Quantify knowledge gaps: which references/fields are missing, under 100% full-audit semantics |
+| `POST /api/semantic/bridge` | Cross-ontology linking | Bridge between ID spaces / ontologies (e.g. disease names ↔ MONDO/OMIM) |
+| `POST /api/semantic/subgraph` | Subgraph extraction | Extract a knowledge subgraph around an entity, for visualization / RAG context |
+| `POST /api/semantic/explain` | Derivation-chain traceability | Every conclusion is tagged `stated`/`inferred` with its full derivation chain (rule + premise facts) |
+
+**Three fusion-query patterns** (production-verified; evidence in the pattern-library doc):
+
+1. **M1 vector anchor → relation backtrace → intersection convergence** — "similar to DIACEREIN with the same mechanism", 2000 candidates converged to 1
+2. **M2 anchor fan-out → functional localization → mechanism attribution** — DISULFIRAM → ALDH2 mechanism path in one chain
+3. **M3 phenotype anchor → five-hop chain → verification separation** — Antley-Bixler syndrome five-hop chain, 5 VERIFIED + target attribution
+
+**Design philosophy**: a new endpoint = a new OntoQL query composition, no executor changes; endpoints only orchestrate (~1,000 lines), all semantic logic lives in the data layer and reasoning kernel.
+
+> **In one line**: other APIs help you query data; the OntoDB Semantic API helps you **ask knowledge** — similarity, tracing, attribution, gap-finding, provenance, one endpoint family.
+>
+> See [Semantic API capability matrix](docs/OntoDB语义API能力矩阵.md) · [Semantic fusion query pattern library](docs/语义融合查询模式库.md)
+
+---
+
 ## 12 Data Types
 
 OntoDB unifies 12 data types in a single storage engine:
@@ -290,7 +320,7 @@ Traditional TTL: fixed expiry, no value awareness. Living Data: **data lives lik
 | # | Innovation | One-liner |
 |---|-----------|-----------|
 | 24 | **Data Sharding** | Class/Range/Hash strategies, runtime scaling and rebalancing |
-| 25 | **Raft Consensus** | Multi-node cluster consistency, persistent log, cluster whitelist |
+| 25 | **Raft Replication** | Cluster deployment (Raft replication + sharding) / high availability: persistent log, cluster whitelist, config sync |
 | 26 | **Multi-Protocol Access** | PostgreSQL + MySQL + HTTP REST simultaneously |
 | 27 | **Embedded API Gateway** | Load balancing, rate limiting, circuit breaking, auth |
 | 28 | **3-Tier Edge Deployment** | MCU(<100KB) -> Embedded Linux -> Edge server, unified model and API |
@@ -303,7 +333,7 @@ Traditional TTL: fixed expiry, no value awareness. Living Data: **data lives lik
 | 30 | **Namespace Scoped Isolation** | bare class names stamped per namespace, `ns.Class` cross-namespace addressing, no WHERE needed |
 | 31 | **GB/T 22239 Separation of Duties** | System/Security/Audit admins mutually exclusive, meets China gov/finance compliance |
 | 32 | **Data Masking Engine** | Kernel-level dynamic + static masking, auto-detect ID card/phone/bank card patterns |
-| 33 | **CRC Auto-Repair** | SSTable page-level CRC validation, auto-repair from Raft replicas on corruption |
+| 33 | **CRC Validation & Guard Canary** | SSTable page-level CRC validation; corrupted data deterministically rejected, heap-corruption root cause closable |
 
 ### Namespace: Scoped Isolation
 
