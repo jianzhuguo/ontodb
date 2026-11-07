@@ -99,14 +99,19 @@ fn first_atom_end(input: &str) -> usize {
             continue;
         }
         if depth == 0 {
-            let rest = &input[i..];
             for sep in [" AND ", " OR "] {
-                if rest.len() >= sep.len()
-                    && rest[..sep.len()].eq_ignore_ascii_case(sep)
-                {
-                    // Require a word boundary on the left (start or space/
-                    // ')' so `COMMAND` doesn't match ` AND ` inside a name).
-                    return i;
+                let sb = sep.as_bytes();
+                if i + sb.len() <= n {
+                    let mut matched = true;
+                    for j in 0..sb.len() {
+                        if bytes[i + j].to_ascii_uppercase() != sb[j].to_ascii_uppercase() {
+                            matched = false;
+                            break;
+                        }
+                    }
+                    if matched {
+                        return i;
+                    }
                 }
             }
         }
@@ -5645,6 +5650,51 @@ mod tests {
                     other => panic!("expected Eq with empty string, got {:?}", other),
                 }
             }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_where_multibyte_string_literal() {
+        let ast =
+            QueryParser::parse("SELECT * FROM T WHERE name = '柴辛注射液'").unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => {
+                let f = filter.as_ref().unwrap();
+                match f {
+                    FilterExpr::Eq(col, LiteralValue::String(val)) => {
+                        assert_eq!(col, "name");
+                        assert_eq!(val, "柴辛注射液");
+                    }
+                    other => panic!("expected Eq with multibyte string, got {:?}", other),
+                }
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_where_multibyte_and_conjunct_no_panic() {
+        // Regression: first_atom_end used byte-index slicing that panicked
+        // when " AND " offset fell inside a multi-byte UTF-8 character.
+        let ast = QueryParser::parse(
+            "SELECT * FROM T WHERE name = '柴辛注射液' AND company LIKE '%民星%'",
+        )
+        .unwrap();
+        match &ast {
+            QueryAst::Select { filter, .. } => match filter.as_ref().unwrap() {
+                FilterExpr::And(left, right) => {
+                    match left.as_ref() {
+                        FilterExpr::Eq(col, _) => assert_eq!(col, "name"),
+                        other => panic!("left: expected Eq(name), got {:?}", other),
+                    }
+                    match right.as_ref() {
+                        FilterExpr::Like(col, _) => assert_eq!(col, "company"),
+                        other => panic!("right: expected Like(company), got {:?}", other),
+                    }
+                }
+                other => panic!("expected And, got {:?}", other),
+            },
             _ => panic!("expected Select"),
         }
     }
