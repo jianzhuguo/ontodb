@@ -15,9 +15,9 @@ onto-storage = { workspace = true }
 onto-query = { workspace = true }
 onto-graph = { workspace = true }
 onto-ontology = { workspace = true }
-onto-raft = { workspace = true }
-onto-enterprise = { workspace = true, optional = true }
-onto-sharding = { workspace = true }
+onto-raft = { path = "../onto-raft", optional = true }
+onto-enterprise = { path = "../onto-enterprise", optional = true }
+onto-sharding = { path = "../onto-sharding", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
@@ -50,6 +50,10 @@ chrono = "0.4"
 # Random number generation (PG Wire secret)
 rand = { workspace = true }
 
+# CDC publishers (optional, behind cdc-kafka / cdc-webhook)
+rdkafka = { version = "0.36", optional = true }
+reqwest = { version = "0.12", optional = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 
@@ -60,14 +64,20 @@ default = []
 # onto-ontology (basic reasoning) is always included
 # Enterprise features are optional
 
-raft = []
-sharding = []
-enterprise = ["dep:onto-enterprise", "onto-graph/enterprise", "onto-query/enterprise"]
-cdc-kafka = []
-cdc-webhook = []
-encryption = []
-audit-retention = []
+raft = ["dep:onto-raft"]
+sharding = ["dep:onto-sharding"]
+enterprise = ["dep:onto-enterprise", "onto-graph/enterprise", "onto-query/enterprise", "onto-query/sharding"]
+# CDC publishers: rdkafka needs the native librdkafka toolchain, reqwest is pure
+# Rust. Opt-in only; kept out of the enterprise-gov bundle.
+cdc-kafka = ["dep:rdkafka"]
+cdc-webhook = ["dep:reqwest"]
+# encryption/audit-retention gate runtime behavior in onto-server AND the
+# corresponding onto-enterprise modules, so both sides must light up together.
+encryption = ["onto-enterprise/encryption"]
+audit-retention = ["onto-enterprise/audit-retention"]
 
 # === Enterprise Bundles ===
-enterprise-standard = ["enterprise", "raft", "sharding"]
-enterprise-gov = ["enterprise", "raft", "sharding"]
+# Must forward onto-enterprise's own bundles: current_tier() is decided by
+# onto-enterprise's compiled features (enterprise-gov / enterprise-standard).
+enterprise-standard = ["enterprise", "raft", "sharding", "onto-enterprise/enterprise-standard"]
+enterprise-gov = ["enterprise", "raft", "sharding", "encryption", "audit-retention", "onto-enterprise/enterprise-gov"]

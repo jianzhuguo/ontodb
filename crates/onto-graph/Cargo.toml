@@ -7,8 +7,9 @@ description = "Graph data model and traversal engine for OntoDB"
 
 [features]
 default = []
-# Enterprise features: distributed, streaming, GNN, reasoning, pattern matching
-enterprise = ["rayon"]
+# Vestigial: kept so onto-server/onto-query feature chains keep resolving.
+# Graph engine is edition-uniform (v0.5.2).
+enterprise = []
 
 [dependencies]
 onto-core = { workspace = true }
@@ -18,8 +19,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = "0.12"
-# Rayon only required for enterprise parallel features
-rayon = { version = "1.10", optional = true }
+rayon = "1.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }

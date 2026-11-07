@@ -33,8 +33,10 @@ pub struct AdminState {
     pub config_path: Option<PathBuf>,
     pub metrics: SharedMetrics,
     /// Shared config store for cross-node sync (Raft integration).
+    #[cfg(feature = "raft")]
     pub config_store: Option<onto_raft::SharedConfigStore>,
     /// Cluster whitelist manager for cross-node validation.
+    #[cfg(feature = "raft")]
     pub cluster_manager: Option<onto_raft::ClusterWhitelistManager>,
     /// Audit logger for writing admin operations to audit file.
     pub audit: Option<std::sync::Arc<crate::audit::AuditLogger>>,
@@ -75,16 +77,20 @@ pub struct KeyInfo {
 
 /// Build the admin API router.
 pub fn admin_router(state: AdminState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/api/admin/keys", get(list_keys).post(add_key))
         .route("/api/admin/keys/{key}", put(update_key).delete(delete_key))
         .route("/api/admin/keys/{key}/ips", get(list_ips).post(add_ips))
         .route("/api/admin/keys/{key}/ips/{ip}", delete(remove_ip))
-        .route("/api/admin/reload", post(force_reload))
+        .route("/api/admin/reload", post(force_reload));
+
+    #[cfg(feature = "raft")]
+    let router = router
         .route("/api/admin/cluster/validate", get(validate_cluster))
         .route("/api/admin/cluster/sync", post(sync_cluster))
-        .route("/api/admin/cluster/nodes", get(list_cluster_nodes))
-        .with_state(state)
+        .route("/api/admin/cluster/nodes", get(list_cluster_nodes));
+
+    router.with_state(state)
 }
 
 /// GET /api/admin/keys 鈥?List all API keys (key value masked).
@@ -500,6 +506,7 @@ pub async fn force_reload(
 }
 
 /// GET /api/admin/cluster/validate — Validate cluster whitelist consistency.
+#[cfg(feature = "raft")]
 async fn validate_cluster(
     axum::extract::State(state): axum::extract::State<AdminState>,
 ) -> impl IntoResponse {
@@ -526,6 +533,7 @@ async fn validate_cluster(
 }
 
 /// POST /api/admin/cluster/sync — Force sync whitelists to all cluster nodes.
+#[cfg(feature = "raft")]
 async fn sync_cluster(
     axum::extract::State(state): axum::extract::State<AdminState>,
 ) -> impl IntoResponse {
@@ -551,6 +559,7 @@ async fn sync_cluster(
 }
 
 /// GET /api/admin/cluster/nodes — List cluster nodes.
+#[cfg(feature = "raft")]
 async fn list_cluster_nodes(
     axum::extract::State(state): axum::extract::State<AdminState>,
 ) -> impl IntoResponse {
@@ -598,11 +607,21 @@ fn save_config(state: &AdminState, config: &AuthConfig) -> Result<(), String> {
         serde_json::to_string_pretty(config).map_err(|e| format!("serialization error: {}", e))?;
 
     // If SharedConfigStore is available, use it (handles disk + Raft replication)
+    #[cfg(feature = "raft")]
     if let Some(ref store) = state.config_store {
         store.apply(json.as_bytes())?;
         tracing::info!("Config saved via SharedConfigStore (Raft replication if active)");
     } else {
         // Fallback: direct file write
+        let path = state
+            .config_path
+            .as_ref()
+            .ok_or("no config file path configured")?;
+        std::fs::write(path, &json).map_err(|e| format!("failed to write config: {}", e))?;
+    }
+
+    #[cfg(not(feature = "raft"))]
+    {
         let path = state
             .config_path
             .as_ref()

@@ -48,7 +48,14 @@ const MAX_DECOMPRESSED_BLOCK_SIZE: usize = 64 * 1024 * 1024;
 
 /// Extra output slack so `ZSTD_wildcopy` cannot store past the allocation
 /// even if a corrupt sequence slips past the length checks.
-const ZSTD_WILDCOPY_MARGIN: usize = 64;
+/// ZSTD_wildcopy legal overshoot is WILDCOPY_OVERLENGTH (32 bytes), but
+/// zstd 1.5.7's decompress_to_buffer internals can write further in edge
+/// cases (multi-block frames, dictionary refs). 64 bytes was insufficient —
+/// dump 3724: heap corruption survived the canary check because the write
+/// landed past `margin + canary_len`, trashing adjacent chunk headers.
+/// 4 KiB (one page) guarantees any legal overshoot stays inside the
+/// allocation regardless of zstd internals.
+const ZSTD_WILDCOPY_MARGIN: usize = 4096;
 
 /// Guard bytes after the wildcopy slack. Intact after a successful
 /// decompress proves the decompressor stayed inside the allocation;
@@ -223,8 +230,8 @@ fn decompress_limited(src: &[u8], max_out: usize) -> Result<Vec<u8>> {
         if out_cap == 0 {
             return Err(-64);
         }
-        // Layout: [out_cap dst][wildcopy slack][guard canary].
-        // zstd only sees out_cap; slack absorbs legal wildcopy overshoot;
+        // Layout: [out_cap dst][wildcopy slack 4KiB][guard canary].
+        // zstd only sees out_cap; slack absorbs any legal wildcopy overshoot;
         // an intact canary proves nothing wrote past the allocation.
         let canary_start = out_cap.saturating_add(margin);
         let alloc = canary_start.saturating_add(ZSTD_GUARD_CANARY.len());

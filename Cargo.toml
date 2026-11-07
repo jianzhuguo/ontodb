@@ -5,7 +5,6 @@ members = [
     "crates/onto-storage",
     "crates/onto-ontology",
     "crates/onto-query",
-    "crates/onto-sharding",
     "crates/onto-server",
     "crates/onto-cli",
     "crates/onto-graph",
@@ -35,11 +34,10 @@ onto-core     = { path = "crates/onto-core" }
 onto-storage  = { path = "crates/onto-storage" }
 onto-ontology = { path = "crates/onto-ontology" }
 onto-query    = { path = "crates/onto-query" }
-onto-raft     = { path = "crates/onto-raft" }
-onto-sharding = { path = "crates/onto-sharding" }
 onto-graph     = { path = "crates/onto-graph" }
-onto-enterprise = { path = "crates/onto-enterprise" }
 onto-plugin   = { path = "crates/onto-plugin" }
+# Enterprise-only (private, not in this repo):
+# onto-raft, onto-sharding, onto-enterprise — see crates/onto-server/Cargo.toml
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

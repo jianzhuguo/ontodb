@@ -62,25 +62,18 @@ pub mod visualization;
 // Enterprise Edition Modules (Requires `enterprise` feature flag)
 // ══════════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "enterprise")]
 pub mod compressed;
 
-#[cfg(feature = "enterprise")]
 pub mod distributed;
 
-#[cfg(feature = "enterprise")]
 pub mod gnn;
 
-#[cfg(feature = "enterprise")]
 pub mod pattern;
 
-#[cfg(feature = "enterprise")]
 pub mod reasoning;
 
-#[cfg(feature = "enterprise")]
 pub mod streaming;
 
-#[cfg(feature = "enterprise")]
 pub mod streaming_compute;
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -100,25 +93,19 @@ pub use store::{
 pub use traversal::{Direction, TraversalEngine, TraversalPath, TraversalResult};
 
 // Enterprise-only exports
-#[cfg(feature = "enterprise")]
 pub use analytics::{
     betweenness_centrality, dijkstra, dijkstra_path, subgraph_by_edge_label, subgraph_extraction,
     DijkstraResult,
 };
 
-#[cfg(feature = "enterprise")]
 pub use distributed::{DistributedGraph, GlobalStats};
 
-#[cfg(feature = "enterprise")]
 pub use gnn::{GcnModel, NodeEmbeddings};
 
-#[cfg(feature = "enterprise")]
 pub use reasoning::{Reasoner, Triple};
 
-#[cfg(feature = "enterprise")]
 pub use streaming::GraphStream;
 
-#[cfg(feature = "enterprise")]
 pub use streaming_compute::StreamingComputeEngine;
 
 // Community visualization exports
@@ -157,7 +144,6 @@ pub fn available_features() -> Vec<&'static str> {
         "visualization",
     ];
 
-    #[cfg(feature = "enterprise")]
     {
         features.extend([
             "distributed",

@@ -165,3 +165,8 @@ docs/.obsidian/
 # Local data-import / mapping utilities (not part of product source)
 /scripts/import_*.py
 /scripts/map_chebi_chembl.py
+
+# Enterprise-only crates (private repo)
+crates/onto-raft/
+crates/onto-sharding/
+crates/onto-enterprise/

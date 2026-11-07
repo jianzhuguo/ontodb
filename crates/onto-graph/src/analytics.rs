@@ -6,28 +6,22 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-#[cfg(feature = "enterprise")]
 use std::collections::BinaryHeap;
-#[cfg(feature = "enterprise")]
 use std::cmp::{Ordering, Reverse};
 
 /// Wrapper for f64 that implements Ord (for use in BinaryHeap).
 /// Treats NaN as positive infinity.
-#[cfg(feature = "enterprise")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct OrdF64(f64);
 
-#[cfg(feature = "enterprise")]
 impl Eq for OrdF64 {}
 
-#[cfg(feature = "enterprise")]
 impl PartialOrd for OrdF64 {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-#[cfg(feature = "enterprise")]
 impl Ord for OrdF64 {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal)
@@ -353,7 +347,6 @@ pub fn average_clustering_coefficient(store: &GraphStore) -> f64 {
 /// between other vertices. Uses Brandes' algorithm for O(VE) time complexity.
 ///
 /// Returns vertex_id -> centrality mapping.
-#[cfg(feature = "enterprise")]
 pub fn betweenness_centrality(store: &GraphStore) -> HashMap<String, f64> {
     let n = store.vertex_count();
     if n == 0 {
@@ -448,7 +441,6 @@ pub fn betweenness_centrality(store: &GraphStore) -> HashMap<String, f64> {
 ///
 /// The filter selects vertices by label. Returns a new GraphStore with the
 /// filtered subgraph.
-#[cfg(feature = "enterprise")]
 pub fn subgraph_extraction(
     store: &GraphStore,
     vertex_labels: &[String],
@@ -486,7 +478,6 @@ pub fn subgraph_extraction(
 ///
 /// Returns a new GraphStore containing only edges with the specified label,
 /// and the vertices they connect.
-#[cfg(feature = "enterprise")]
 pub fn subgraph_by_edge_label(
     store: &GraphStore,
     edge_label: &str,
@@ -518,7 +509,6 @@ pub fn subgraph_by_edge_label(
 }
 
 /// Result of Dijkstra's shortest path algorithm.
-#[cfg(feature = "enterprise")]
 #[derive(Debug, Clone)]
 pub struct DijkstraResult {
     /// Distance from source to each vertex (f64::INFINITY if unreachable).
@@ -541,7 +531,6 @@ pub struct DijkstraResult {
 /// * `source` - Source vertex ID
 /// * `target` - Optional target vertex ID (stops early if found)
 /// * `weight_key` - Edge property key to use as weight (default: "weight")
-#[cfg(feature = "enterprise")]
 pub fn dijkstra(
     store: &GraphStore,
     source: &str,
@@ -641,7 +630,6 @@ pub fn dijkstra(
 }
 
 /// Reconstruct the shortest path from Dijkstra result.
-#[cfg(feature = "enterprise")]
 pub fn dijkstra_path(result: &DijkstraResult, source: &str, target: &str) -> Option<Vec<String>> {
     let mut path = Vec::new();
     let mut current = target.to_string();
@@ -1082,7 +1070,6 @@ mod tests {
 
     // ── Betweenness Centrality Tests (Enterprise) ──
 
-    #[cfg(feature = "enterprise")]
     #[test]
     fn test_betweenness_centrality_linear() {
         let store = build_linear_graph();
@@ -1095,7 +1082,6 @@ mod tests {
         assert!(bc["3"] > 0.0, "Middle vertex should have positive betweenness");
     }
 
-    #[cfg(feature = "enterprise")]
     #[test]
     fn test_betweenness_centrality_empty() {
         let store = GraphStore::new();
@@ -1103,7 +1089,6 @@ mod tests {
         assert!(bc.is_empty());
     }
 
-    #[cfg(feature = "enterprise")]
     #[test]
     fn test_betweenness_centrality_triangle() {
         let store = GraphStore::new();
@@ -1124,7 +1109,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "enterprise")]
     #[test]
     fn test_betweenness_centrality_star() {
         let store = GraphStore::new();
@@ -1141,7 +1125,6 @@ mod tests {
 
     // ── Subgraph Extraction Tests (Enterprise) ──
 
-    #[cfg(feature = "enterprise")]
     #[test]
     fn test_subgraph_extraction_by_label() {
         let store = GraphStore::new();
@@ -1156,7 +1139,6 @@ mod tests {
         assert_eq!(sub.edge_count(), 1); // Only d1->d2 edge (both are Drugs)
     }
 
-    #[cfg(feature = "enterprise")]
     #[test]
     fn test_subgraph_extraction_empty() {
         let store = GraphStore::new();
@@ -1167,7 +1149,6 @@ mod tests {
         assert_eq!(sub.edge_count(), 0);
     }
 
-    #[cfg(feature = "enterprise")]
     #[test]
     fn test_subgraph_by_edge_label() {
         let store = GraphStore::new();
@@ -1182,7 +1163,6 @@ mod tests {
         assert_eq!(sub.edge_count(), 1); // Only treats edge
     }
 
-    #[cfg(feature = "enterprise")]
     #[test]
     fn test_subgraph_by_edge_label_no_matches() {
         let store = GraphStore::new();
@@ -1195,7 +1175,6 @@ mod tests {
 
     // ── Dijkstra Tests (Enterprise) ──
 
-    #[cfg(feature = "enterprise")]
     #[test]
     fn test_dijkstra_simple_path() {
         let store = GraphStore::new();
@@ -1218,7 +1197,6 @@ mod tests {
         assert_eq!(path, Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]));
     }
 
-    #[cfg(feature = "enterprise")]
     #[test]
     fn test_dijkstra_no_path() {
         let store = GraphStore::new();
@@ -1233,7 +1211,6 @@ mod tests {
         assert_eq!(dist_b, f64::INFINITY);
     }
 
-    #[cfg(feature = "enterprise")]
     #[test]
     fn test_dijkstra_unweighted() {
         let store = GraphStore::new();
@@ -1245,7 +1222,6 @@ mod tests {
         assert_eq!(result.distances.get("b"), Some(&1.0)); // Default weight = 1.0
     }
 
-    #[cfg(feature = "enterprise")]
     #[test]
     fn test_dijkstra_custom_weight_key() {
         let store = GraphStore::new();
@@ -1260,7 +1236,6 @@ mod tests {
         assert_eq!(result.distances.get("b"), Some(&5.0));
     }
 
-    #[cfg(feature = "enterprise")]
     #[test]
     fn test_dijkstra_parallel_bfs() {
         let store = GraphStore::new();

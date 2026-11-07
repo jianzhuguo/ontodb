@@ -541,13 +541,13 @@ impl CdcPublisher for KafkaCdcPublisher {
 
         if tokio::runtime::Handle::try_current().is_err() {
             tracing::warn!("CDC Kafka publish called outside Tokio runtime, skipping");
-            return;
+            return Ok(());
         }
         tokio::spawn(async move {
             let record = FutureRecord::to(&topic).key(&key).payload(&payload);
 
             if let Err((e, _)) = producer
-                .send(record, Timeout::After(Duration::from_secs(5)))
+                .send(record, Timeout::After(std::time::Duration::from_secs(5)))
                 .await
             {
                 eprintln!("CDC Kafka publish error: {}", e);

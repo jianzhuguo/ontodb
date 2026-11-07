@@ -10,7 +10,7 @@ onto-core = { workspace = true }
 onto-graph = { workspace = true }
 onto-storage = { workspace = true }
 onto-ontology = { workspace = true }
-onto-sharding = { workspace = true }
+onto-sharding = { path = "../onto-sharding", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
@@ -23,7 +23,7 @@ hex = "0.4"
 
 [features]
 default = []
-sharding = []
+sharding = ["dep:onto-sharding"]
 # Pass through enterprise feature to onto-graph
 enterprise = ["onto-graph/enterprise"]
 

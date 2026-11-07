@@ -1303,7 +1303,6 @@ impl GraphStore {
     ///
     /// At each level, neighbors are collected and deduplicated in parallel.
     /// Best for wide graphs (many neighbors per node).
-    #[cfg(feature = "enterprise")]
     pub fn bfs_parallel(&self, start_idx: u32, max_depth: usize, direction: Direction) -> Vec<u32> {
         use rayon::prelude::*;
 
@@ -1373,7 +1372,6 @@ impl GraphStore {
     }
 
     /// Parallel BFS that returns all visited nodes (including start).
-    #[cfg(feature = "enterprise")]
     pub fn bfs_parallel_all(&self, start_idx: u32, max_depth: usize, direction: Direction) -> Vec<u32> {
         let mut result = vec![start_idx];
         result.extend(self.bfs_parallel(start_idx, max_depth, direction));

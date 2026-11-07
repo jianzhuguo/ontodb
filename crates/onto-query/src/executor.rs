@@ -13,6 +13,7 @@ use crate::parser::{
 use onto_core::binary_row::BinaryRow;
 use onto_core::{CoreError, Result};
 use onto_ontology::{DataType, OntologyStore, Reasoner};
+#[cfg(feature = "sharding")]
 use onto_sharding::{ShardManager, ShardMap, ShardRouter};
 use onto_storage::LsmEngine;
 use onto_storage::IndexManager;
@@ -498,8 +499,10 @@ pub struct QueryExecutor {
     query_deadline: AtomicU64,
     /// Shard router for data sharding. Optional for backward compatibility.
     /// Wrapped in RwLock for runtime updates.
+    #[cfg(feature = "sharding")]
     shard_router: std::sync::RwLock<Option<ShardRouter>>,
     /// Shard manager for shard lifecycle management. Optional for backward compatibility.
+    #[cfg(feature = "sharding")]
     shard_manager: Mutex<Option<ShardManager>>,
     /// Current active namespace for entity creation.
     /// Set by `USE NAMESPACE <name>`, defaults to "default".
@@ -844,7 +847,9 @@ impl QueryExecutor {
             config,
             inference_cache: std::sync::RwLock::new(InferenceCache::default()),
             query_deadline: AtomicU64::new(0),
+            #[cfg(feature = "sharding")]
             shard_router: std::sync::RwLock::new(None),
+            #[cfg(feature = "sharding")]
             shard_manager: Mutex::new(None),
             current_namespace: Mutex::new("default".to_string()),
             row_count_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -1317,6 +1322,7 @@ impl QueryExecutor {
     }
 
     /// Set the shard router for data sharding support.
+    #[cfg(feature = "sharding")]
     pub fn with_shard_router(
         self,
         shard_map: ShardMap,
@@ -1337,6 +1343,7 @@ impl QueryExecutor {
     }
 
     /// Get a snapshot of the shard router (cloned).
+    #[cfg(feature = "sharding")]
     pub fn shard_router_snapshot(&self) -> Option<ShardRouter> {
         let router = self.shard_router.read().unwrap_or_else(|e| e.into_inner());
         router
@@ -1345,11 +1352,13 @@ impl QueryExecutor {
     }
 
     /// Get the shard manager reference (if configured).
+    #[cfg(feature = "sharding")]
     pub fn shard_manager(&self) -> std::sync::MutexGuard<'_, Option<ShardManager>> {
         self.shard_manager.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Update the shard configuration at runtime.
+    #[cfg(feature = "sharding")]
     pub fn update_shard_config(
         &self,
         shard_map: ShardMap,
@@ -4567,6 +4576,7 @@ impl QueryExecutor {
         let active_txn_id = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
 
         // Sharding: check if this table is sharded and route accordingly
+        #[cfg(feature = "sharding")]
         {
             let shard_router = self.shard_router.read().unwrap_or_else(|e| e.into_inner());
             if let Some(router) = shard_router.as_ref() {
@@ -8575,6 +8585,7 @@ impl QueryExecutor {
         let active_txn_id = *self.active_txn.lock().unwrap_or_else(|e| e.into_inner());
 
         // Sharding: check if this table is sharded and route accordingly
+        #[cfg(feature = "sharding")]
         {
             let shard_router = self.shard_router.read().unwrap_or_else(|e| e.into_inner());
             if let Some(router) = shard_router.as_ref() {
@@ -8940,6 +8951,7 @@ impl QueryExecutor {
             "__pk__".to_string(),
             Value::String(String::from_utf8_lossy(key).to_string()),
         );
+        #[cfg(feature = "sharding")]
         if let Some(router) = self
             .shard_router
             .read()
@@ -10219,6 +10231,7 @@ impl QueryExecutor {
                     }
                 }
                 // Add shard routing info
+                #[cfg(feature = "sharding")]
                 if let Some(router) = self
                     .shard_router
                     .read()
@@ -12855,7 +12868,6 @@ impl QueryExecutor {
                 }
                 Ok(QueryResult::Rows(rows))
             }
-            #[cfg(feature = "enterprise")]
             "betweenness_centrality" | "betweenness" => {
                 let centralities = onto_graph::betweenness_centrality(graph);
                 let mut rows: Vec<Map<String, Value>> = centralities
@@ -12897,7 +12909,6 @@ impl QueryExecutor {
                 ));
                 Ok(QueryResult::Rows(vec![row]))
             }
-            #[cfg(feature = "enterprise")]
             "subgraph_extraction" | "subgraph" => {
                 let labels = params.vertex_labels.as_deref().unwrap_or(&[]);
                 let subgraph = onto_graph::subgraph_extraction(graph, labels);
@@ -12907,10 +12918,7 @@ impl QueryExecutor {
                 Ok(QueryResult::Rows(vec![row]))
             }
             _ => {
-                #[cfg(feature = "enterprise")]
                 let supported = "pagerank, connected_components, degree_distribution, clustering_coefficient, betweenness_centrality, subgraph_extraction";
-                #[cfg(not(feature = "enterprise"))]
-                let supported = "pagerank, connected_components, degree_distribution, clustering_coefficient";
                 Err(CoreError::InvalidArgument(format!(
                     "Unknown graph algorithm: '{}'. Supported: {}",
                     algorithm, supported

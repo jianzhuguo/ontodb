@@ -37,6 +37,7 @@ pub mod mysqlwire;
 pub mod pgwire;
 mod rate_limit;
 pub mod security_audit;
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 mod semantic;
 pub mod tls;
 
@@ -470,6 +471,7 @@ fn main() -> Result<()> {
     let triple_store = Arc::new(onto_ontology::TripleStore::new(Arc::clone(&engine)));
 
     // Initialize sharding if enabled
+    #[cfg(feature = "sharding")]
     let executor = if args.sharding_enabled {
         let shard_config =
             load_sharding_config(args.sharding_config.as_deref(), args.default_shard)?;
@@ -486,6 +488,17 @@ fn main() -> Result<()> {
                 .with_audit_log(&audit_path),
         )
     } else {
+        Arc::new(
+            QueryExecutor::new(Arc::clone(&engine), ontology_store)
+                .with_graph(graph_store.clone())
+                .with_triple_store(triple_store)
+                .with_audit_log(&audit_path),
+        )
+    };
+
+    #[cfg(not(feature = "sharding"))]
+    let executor = {
+        let _ = &args.sharding_enabled; // suppress unused warning
         Arc::new(
             QueryExecutor::new(Arc::clone(&engine), ontology_store)
                 .with_graph(graph_store.clone())
@@ -550,8 +563,10 @@ fn main() -> Result<()> {
         let has_mysql = args.mysql.is_some();
         let mysql_addr = args.mysql.unwrap_or_default();
 
+        #[cfg(feature = "raft")]
         let has_raft = args.raft_node_id.is_some() && args.raft_listen.is_some();
 
+        #[cfg(feature = "raft")]
         if has_raft {
             println!(
                 "Raft node {} enabled, listening on {}",
@@ -643,6 +658,7 @@ fn main() -> Result<()> {
                     }));
                 }
 
+                #[cfg(feature = "raft")]
                 if has_raft {
                     let raft_addr = args.raft_listen.clone().expect("should be valid");
                     let node_id = args.raft_node_id.expect("should be valid");
@@ -739,13 +755,11 @@ fn build_enterprise_config(args: &Args, tier: ProductTier) -> onto_enterprise::E
         {
             config.encryption.storage_encryption = args.encryption_enabled;
             if let Some(ref key_file) = args.master_key_file {
-                #[cfg(feature = "enterprise")]
                 config.encryption.master_key_source = onto_enterprise::encryption::KeySource::File(
                     key_file.to_string_lossy().to_string(),
                 );
             } else if let Some(ref env_var) = args.master_key_env {
                 config.encryption.master_key_source =
-                    #[cfg(feature = "enterprise")]
                     onto_enterprise::encryption::KeySource::Env(env_var.clone());
             }
         }
@@ -753,7 +767,6 @@ fn build_enterprise_config(args: &Args, tier: ProductTier) -> onto_enterprise::E
         // Configure audit retention
         #[cfg(feature = "audit-retention")]
         {
-            #[cfg(feature = "enterprise")]
             config.audit_retention.enabled = args.audit || tier == ProductTier::EnterpriseGov;
             config.audit_retention.log_dir = args.audit_dir.clone();
             config.audit_retention.retention_days = args.audit_retention_days;
@@ -864,20 +877,22 @@ async fn run_http_server(
     });
 
     // Shared config store for cross-node config sync (Raft integration)
-    let config_store = onto_raft::SharedConfigStore::new(api_keys_file.clone());
-    config_store.load_from_disk();
+    #[cfg(feature = "raft")]
+    let config_store = {
+        let store = onto_raft::SharedConfigStore::new(api_keys_file.clone());
+        store.load_from_disk();
 
-    // Register callback: when config changes, reload AuthState in-memory
-    let auth_for_callback = auth_state.clone();
-    config_store.on_change(Box::new(move |json_bytes: &[u8]| {
-        // Parse the new config
-        if let Ok(config) = serde_json::from_slice::<auth::AuthConfig>(json_bytes) {
-            // Update AuthState keys in-memory
-            let mut keys = std::collections::HashMap::new();
-            for k in &config.keys {
-                keys.insert(k.key.clone(), auth::KeyRecord::from(k));
-            }
-            // AuthState uses parking_lot::RwLock, so we can update it directly
+        // Register callback: when config changes, reload AuthState in-memory
+        let auth_for_callback = auth_state.clone();
+        store.on_change(Box::new(move |json_bytes: &[u8]| {
+            // Parse the new config
+            if let Ok(config) = serde_json::from_slice::<auth::AuthConfig>(json_bytes) {
+                // Update AuthState keys in-memory
+                let mut keys = std::collections::HashMap::new();
+                for k in &config.keys {
+                    keys.insert(k.key.clone(), auth::KeyRecord::from(k));
+                }
+                // AuthState uses parking_lot::RwLock, so we can update it directly
             *auth_for_callback.keys.write() = keys;
             tracing::info!(
                 "AuthState updated from config change ({} keys)",
@@ -885,13 +900,17 @@ async fn run_http_server(
             );
         }
     }));
+        store
+    };
 
     // Admin API (requires Admin permission via existing auth middleware)
     let admin_state = admin::AdminState {
         auth: auth_state.clone(),
         config_path: api_keys_file.clone(),
         metrics: state.metrics.clone(),
+        #[cfg(feature = "raft")]
         config_store: Some(config_store.clone()),
+        #[cfg(feature = "raft")]
         cluster_manager: None,
         audit: Some(state.audit.clone()),
     };
@@ -969,6 +988,7 @@ async fn run_http_server(
 }
 
 /// Runs a Raft consensus node for distributed replication.
+#[cfg(feature = "raft")]
 async fn run_raft_node(node_id: u64, listen_addr: &str, peers_str: &str) -> Result<()> {
     use onto_raft::RaftNodeManager;
 
@@ -1209,6 +1229,7 @@ fn execute_and_print(executor: &QueryExecutor, input: &str) {
 }
 
 /// Loads sharding configuration from file or creates default.
+#[cfg(feature = "sharding")]
 fn load_sharding_config(
     file_path: Option<&std::path::Path>,
     default_shard: u32,

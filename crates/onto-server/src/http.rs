@@ -725,7 +725,7 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
     // Max request body size: 64 MB
     const MAX_BODY_SIZE: usize = 64 * 1024 * 1024;
 
-    Router::new()
+    let router = Router::new()
         // Health check
         .route("/api/health", get(health))
         .route("/api/health/ready", get(health_ready))
@@ -735,8 +735,7 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/metrics", get(metrics_json))
         // SQL query execution
         .route("/api/query", post(execute_query))
-        // Batch query execution
-        .route("/api/batch", post(batch_query))
+        // Batch query execution (enterprise — routed below)
         // SPARQL query execution
         .route("/sparql", post(sparql_query))
         .route("/api/sparql", post(sparql_query))
@@ -745,14 +744,9 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         // Hybrid query: SQL + vector search
         .route("/api/hybrid/query", post(hybrid_query))
         // Semantic retrieval (fusion query patterns)
-        .route("/api/semantic/similar", post(crate::semantic::semantic_similar))
         .route("/api/semantic/trace", post(crate::semantic::semantic_trace))
         .route("/api/semantic/infer", post(crate::semantic::semantic_infer))
-        .route("/api/semantic/expand", post(crate::semantic::semantic_expand))
         .route("/api/semantic/path", post(crate::semantic::semantic_path))
-        .route("/api/semantic/gap", post(crate::semantic::semantic_gap))
-        .route("/api/semantic/bridge", post(crate::semantic::semantic_bridge))
-        .route("/api/semantic/subgraph", post(crate::semantic::semantic_subgraph))
         .route("/api/semantic/explain", post(crate::semantic::semantic_explain))
         // Schema introspection
         .route("/api/schema", get(get_schema))
@@ -760,7 +754,6 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/cluster", get(cluster_info))
         // Backup and flush
         .route("/api/backup", post(backup))
-        .route("/api/backup/incremental", post(backup_incremental))
         .route("/api/backup/verify", post(verify_backup_endpoint))
         .route("/api/restore", post(restore_endpoint))
         .route("/api/flush", post(flush))
@@ -785,7 +778,10 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route(
             "/api/digital-twin/layout",
             get(get_digital_twin_layout).put(save_digital_twin_layout),
-        )
+        );
+
+    #[cfg(feature = "sharding")]
+    let router = router
         // Sharding configuration
         .route(
             "/api/sharding/config",
@@ -809,7 +805,9 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/api/sharding/scale/add", post(add_shard_and_rebalance))
         .route("/api/sharding/scale/remove", post(remove_shard))
         // Split endpoints
-        .route("/api/sharding/split", post(split_shard))
+        .route("/api/sharding/split", post(split_shard));
+
+    let router = router
         // API documentation
         .route("/api/docs", get(swagger_ui))
         .route("/api/openapi.json", get(openapi_spec))
@@ -817,7 +815,30 @@ pub fn build_router(state: AppState, cors_origins: &str) -> Router {
         .route("/console", get(web_console))
         .route("/", get(web_console))
         // Digital Twin
-        .route("/digital-twin", get(digital_twin))
+        .route("/digital-twin", get(digital_twin));
+
+    // Enterprise-only routes (community builds get a 403 stub)
+    #[cfg(feature = "enterprise")]
+    let router = router
+        .route("/api/semantic/similar", post(crate::semantic::semantic_similar))
+        .route("/api/semantic/expand", post(crate::semantic::semantic_expand))
+        .route("/api/semantic/gap", post(crate::semantic::semantic_gap))
+        .route("/api/semantic/bridge", post(crate::semantic::semantic_bridge))
+        .route("/api/semantic/subgraph", post(crate::semantic::semantic_subgraph))
+        .route("/api/batch", post(batch_query))
+        .route("/api/backup/incremental", post(backup_incremental));
+
+    #[cfg(not(feature = "enterprise"))]
+    let router = router
+        .route("/api/semantic/similar", post(graph_enterprise_stub))
+        .route("/api/semantic/expand", post(graph_enterprise_stub))
+        .route("/api/semantic/gap", post(graph_enterprise_stub))
+        .route("/api/semantic/bridge", post(graph_enterprise_stub))
+        .route("/api/semantic/subgraph", post(graph_enterprise_stub))
+        .route("/api/batch", post(graph_enterprise_stub))
+        .route("/api/backup/incremental", post(graph_enterprise_stub));
+
+    router
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .layer(build_cors_layer(cors_origins))
         .layer(TraceLayer::new_for_http())
@@ -874,19 +895,13 @@ pub fn build_router_with_auth(
         .route("/api/metrics", get(metrics_json))
         // Protected routes
         .route("/api/query", post(execute_query))
-        .route("/api/batch", post(batch_query))
         .route("/sparql", post(sparql_query))
         .route("/api/sparql", post(sparql_query))
         .route("/api/vector/search", post(vector_search))
         .route("/api/hybrid/query", post(hybrid_query))
-        .route("/api/semantic/similar", post(crate::semantic::semantic_similar))
         .route("/api/semantic/trace", post(crate::semantic::semantic_trace))
         .route("/api/semantic/infer", post(crate::semantic::semantic_infer))
-        .route("/api/semantic/expand", post(crate::semantic::semantic_expand))
         .route("/api/semantic/path", post(crate::semantic::semantic_path))
-        .route("/api/semantic/gap", post(crate::semantic::semantic_gap))
-        .route("/api/semantic/bridge", post(crate::semantic::semantic_bridge))
-        .route("/api/semantic/subgraph", post(crate::semantic::semantic_subgraph))
         .route("/api/semantic/explain", post(crate::semantic::semantic_explain))
         .route("/api/schema", get(get_schema))
         .route("/api/cluster", get(cluster_info))
@@ -911,8 +926,7 @@ pub fn build_router_with_auth(
         .route("/api/graph/visualize/cytoscape", get(graph_visualize_cytoscape))
         .route("/api/graph/visualize/mermaid", get(graph_visualize_mermaid));
 
-    // Enterprise graph routes (with community stubs)
-    #[cfg(feature = "enterprise")]
+    // Graph routes (all editions — engine layer is edition-uniform)
     let router = router
         .route("/api/graph/reasoning/infer", post(graph_reasoning_infer))
         .route("/api/graph/reasoning/explain", post(graph_reasoning_explain))
@@ -923,22 +937,31 @@ pub fn build_router_with_auth(
         .route("/api/graph/streaming/stats", get(graph_streaming_stats))
         .route("/api/graph/analyze/dijkstra", post(graph_analyze_dijkstra));
 
+    // Enterprise-only routes (community builds get a 403 stub)
+    #[cfg(feature = "enterprise")]
+    let router = router
+        .route("/api/semantic/similar", post(crate::semantic::semantic_similar))
+        .route("/api/semantic/expand", post(crate::semantic::semantic_expand))
+        .route("/api/semantic/gap", post(crate::semantic::semantic_gap))
+        .route("/api/semantic/bridge", post(crate::semantic::semantic_bridge))
+        .route("/api/semantic/subgraph", post(crate::semantic::semantic_subgraph))
+        .route("/api/batch", post(batch_query))
+        .route("/api/backup/incremental", post(backup_incremental));
+
     #[cfg(not(feature = "enterprise"))]
     let router = router
-        .route("/api/graph/reasoning/infer", post(graph_enterprise_stub))
-        .route("/api/graph/reasoning/explain", post(graph_enterprise_stub))
-        .route("/api/graph/pattern/match", post(graph_enterprise_stub))
-        .route("/api/graph/gnn/embed", post(graph_enterprise_stub))
-        .route("/api/graph/distributed/status", get(graph_enterprise_stub))
-        .route("/api/graph/streaming/event", post(graph_enterprise_stub))
-        .route("/api/graph/streaming/stats", get(graph_enterprise_stub))
-        .route("/api/graph/analyze/dijkstra", post(graph_enterprise_stub));
+        .route("/api/semantic/similar", post(graph_enterprise_stub))
+        .route("/api/semantic/expand", post(graph_enterprise_stub))
+        .route("/api/semantic/gap", post(graph_enterprise_stub))
+        .route("/api/semantic/bridge", post(graph_enterprise_stub))
+        .route("/api/semantic/subgraph", post(graph_enterprise_stub))
+        .route("/api/batch", post(graph_enterprise_stub))
+        .route("/api/backup/incremental", post(graph_enterprise_stub));
 
-    // Remaining routes + layers (no trailing semicolon — this is the function return value)
-    router
+    // Remaining routes before sharding
+    let router = router
         // Backup and flush (Admin only)
         .route("/api/backup", post(backup))
-        .route("/api/backup/incremental", post(backup_incremental))
         .route("/api/backup/verify", post(verify_backup_endpoint))
         .route("/api/restore", post(restore_endpoint))
         .route("/api/flush", post(flush))
@@ -963,7 +986,10 @@ pub fn build_router_with_auth(
         .route(
             "/api/digital-twin/layout",
             get(get_digital_twin_layout).put(save_digital_twin_layout),
-        )
+        );
+
+    #[cfg(feature = "sharding")]
+    let router = router
         // Sharding configuration (Admin only)
         .route(
             "/api/sharding/config",
@@ -987,7 +1013,9 @@ pub fn build_router_with_auth(
         .route("/api/sharding/scale/add", post(add_shard_and_rebalance))
         .route("/api/sharding/scale/remove", post(remove_shard))
         // Split endpoints (Admin only)
-        .route("/api/sharding/split", post(split_shard))
+        .route("/api/sharding/split", post(split_shard));
+
+    router
         // API documentation and console (no auth required)
         .route("/api/docs", get(swagger_ui))
         .route("/api/openapi.json", get(openapi_spec))
@@ -2299,6 +2327,7 @@ async fn vector_search(
 ///     "pretty": false
 /// }
 /// ```
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 async fn batch_query(
     State(state): State<AppState>,
     caller: Option<axum::Extension<crate::auth::KeyInfo>>,
@@ -3871,7 +3900,6 @@ async fn graph_enterprise_stub() -> impl IntoResponse {
 }
 
 /// POST /api/graph/reasoning/infer - Run forward chain reasoning on the graph.
-#[cfg(feature = "enterprise")]
 async fn graph_reasoning_infer(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
@@ -3910,7 +3938,6 @@ async fn graph_reasoning_infer(
 }
 
 /// POST /api/graph/reasoning/explain - Backward chain reasoning to explain a goal.
-#[cfg(feature = "enterprise")]
 async fn graph_reasoning_explain(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
@@ -3951,7 +3978,6 @@ async fn graph_reasoning_explain(
 }
 
 /// POST /api/graph/pattern/match - Find subgraph pattern matches.
-#[cfg(feature = "enterprise")]
 async fn graph_pattern_match(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
@@ -3999,7 +4025,6 @@ async fn graph_pattern_match(
 }
 
 /// POST /api/graph/gnn/embed - Generate node embeddings via GCN inference.
-#[cfg(feature = "enterprise")]
 async fn graph_gnn_embed(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
@@ -4046,7 +4071,6 @@ async fn graph_gnn_embed(
 }
 
 /// GET /api/graph/distributed/status - Get distributed graph partition status.
-#[cfg(feature = "enterprise")]
 async fn graph_distributed_status(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -4063,7 +4087,6 @@ async fn graph_distributed_status(
 }
 
 /// POST /api/graph/streaming/event - Push a streaming graph event.
-#[cfg(feature = "enterprise")]
 async fn graph_streaming_event(
     State(_state): State<AppState>,
     Json(req): Json<serde_json::Value>,
@@ -4109,7 +4132,6 @@ async fn graph_streaming_event(
 }
 
 /// GET /api/graph/streaming/stats - Get streaming graph statistics.
-#[cfg(feature = "enterprise")]
 async fn graph_streaming_stats(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
@@ -4126,7 +4148,6 @@ async fn graph_streaming_stats(
 }
 
 /// POST /api/graph/analyze/dijkstra - Run Dijkstra shortest path algorithm.
-#[cfg(feature = "enterprise")]
 async fn graph_analyze_dijkstra(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
@@ -4223,6 +4244,7 @@ async fn backup(
 }
 
 /// POST /api/backup/incremental - Create an incremental backup.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 async fn backup_incremental(
     State(state): State<AppState>,
     Json(req): Json<IncrementalBackupRequest>,
@@ -4827,6 +4849,7 @@ async fn activate_entries(
 
 /// Sharding configuration request.
 #[derive(Debug, Deserialize)]
+    #[cfg(feature = "sharding")]
 pub struct ShardConfigRequest {
     /// Shard ID.
     pub id: u32,
@@ -4843,12 +4866,14 @@ pub struct ShardConfigRequest {
     pub is_primary: bool,
 }
 
+    #[cfg(feature = "sharding")]
 fn default_true() -> bool {
     true
 }
 
 /// Class sharding assignment request.
 #[derive(Debug, Deserialize)]
+    #[cfg(feature = "sharding")]
 pub struct ClassShardRequest {
     /// Class (table) name.
     pub class: String,
@@ -4869,12 +4894,14 @@ pub struct ClassShardRequest {
     pub slot_map: Option<Vec<u32>>,
 }
 
+    #[cfg(feature = "sharding")]
 fn default_class_strategy() -> String {
     "class".to_string()
 }
 
 /// Range shard configuration.
 #[derive(Debug, Deserialize, Serialize)]
+    #[cfg(feature = "sharding")]
 pub struct RangeShardConfig {
     /// Upper bound (exclusive).
     pub end_key: String,
@@ -4883,6 +4910,7 @@ pub struct RangeShardConfig {
 }
 
 /// GET /api/sharding/config - Get current sharding configuration.
+    #[cfg(feature = "sharding")]
 async fn get_sharding_config(State(state): State<AppState>) -> impl IntoResponse {
     let start = std::time::Instant::now();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
@@ -4963,6 +4991,7 @@ async fn get_sharding_config(State(state): State<AppState>) -> impl IntoResponse
 }
 
 /// PUT /api/sharding/config - Update sharding configuration.
+    #[cfg(feature = "sharding")]
 async fn update_sharding_config(
     State(state): State<AppState>,
     Json(config): Json<serde_json::Value>,
@@ -5006,6 +5035,7 @@ async fn update_sharding_config(
 }
 
 /// POST /api/sharding/shard - Add a new shard.
+    #[cfg(feature = "sharding")]
 async fn add_shard(
     State(state): State<AppState>,
     Json(req): Json<ShardConfigRequest>,
@@ -5045,6 +5075,7 @@ async fn add_shard(
 }
 
 /// POST /api/sharding/class - Assign a class to a sharding strategy.
+    #[cfg(feature = "sharding")]
 async fn assign_class_shard(
     State(state): State<AppState>,
     Json(req): Json<ClassShardRequest>,
@@ -5119,6 +5150,7 @@ async fn assign_class_shard(
 }
 
 /// GET /api/sharding/status - Get sharding status and statistics.
+    #[cfg(feature = "sharding")]
 async fn get_sharding_status(State(state): State<AppState>) -> impl IntoResponse {
     let start = std::time::Instant::now();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
@@ -5173,6 +5205,7 @@ async fn get_sharding_status(State(state): State<AppState>) -> impl IntoResponse
 
 /// Migration request.
 #[derive(Debug, Deserialize)]
+    #[cfg(feature = "sharding")]
 pub struct MigrationRequest {
     /// Source shard ID.
     pub source_shard: u32,
@@ -5186,12 +5219,14 @@ pub struct MigrationRequest {
     pub key_range: Option<KeyRange>,
 }
 
+    #[cfg(feature = "sharding")]
 fn default_all_classes() -> String {
     "*".to_string()
 }
 
 /// Key range for migration.
 #[derive(Debug, Deserialize)]
+    #[cfg(feature = "sharding")]
 pub struct KeyRange {
     /// Start key (inclusive).
     pub start: String,
@@ -5200,6 +5235,7 @@ pub struct KeyRange {
 }
 
 /// POST /api/sharding/migrate - Start a migration task.
+    #[cfg(feature = "sharding")]
 async fn start_migration(
     State(state): State<AppState>,
     Json(req): Json<MigrationRequest>,
@@ -5250,6 +5286,7 @@ async fn start_migration(
 
 /// Migration progress update request.
 #[derive(Debug, Deserialize)]
+    #[cfg(feature = "sharding")]
 pub struct MigrationProgressRequest {
     /// Migration ID.
     pub migration_id: String,
@@ -5260,6 +5297,7 @@ pub struct MigrationProgressRequest {
 }
 
 /// PUT /api/sharding/migrate/progress - Update migration progress.
+    #[cfg(feature = "sharding")]
 async fn update_migration_progress(
     State(state): State<AppState>,
     Json(req): Json<MigrationProgressRequest>,
@@ -5310,12 +5348,14 @@ async fn update_migration_progress(
 
 /// Migration completion request.
 #[derive(Debug, Deserialize)]
+    #[cfg(feature = "sharding")]
 pub struct MigrationCompleteRequest {
     /// Migration ID.
     pub migration_id: String,
 }
 
 /// POST /api/sharding/migrate/complete - Complete a migration.
+    #[cfg(feature = "sharding")]
 async fn complete_migration(
     State(state): State<AppState>,
     Json(req): Json<MigrationCompleteRequest>,
@@ -5368,6 +5408,7 @@ async fn complete_migration(
 }
 
 /// POST /api/sharding/migrate/cancel - Cancel a migration.
+    #[cfg(feature = "sharding")]
 async fn cancel_migration(
     State(state): State<AppState>,
     Json(req): Json<MigrationCompleteRequest>,
@@ -5410,6 +5451,7 @@ async fn cancel_migration(
 }
 
 /// GET /api/sharding/migrations - List all migrations.
+    #[cfg(feature = "sharding")]
 async fn list_migrations(State(state): State<AppState>) -> impl IntoResponse {
     let start = std::time::Instant::now();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
@@ -5462,6 +5504,7 @@ async fn list_migrations(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Rebalance request.
 #[derive(Debug, Deserialize)]
+    #[cfg(feature = "sharding")]
 pub struct RebalanceRequest {
     /// Classes to rebalance. If empty, rebalances all classes.
     #[serde(default)]
@@ -5469,6 +5512,7 @@ pub struct RebalanceRequest {
 }
 
 /// POST /api/sharding/rebalance - Rebalance classes across shards.
+    #[cfg(feature = "sharding")]
 async fn rebalance_shards(
     State(state): State<AppState>,
     Json(req): Json<RebalanceRequest>,
@@ -5535,6 +5579,7 @@ async fn rebalance_shards(
 
 /// Scale request - add shard and optionally rebalance.
 #[derive(Debug, Deserialize)]
+    #[cfg(feature = "sharding")]
 pub struct ScaleRequest {
     /// Shard configuration.
     pub shard: ShardConfigRequest,
@@ -5544,6 +5589,7 @@ pub struct ScaleRequest {
 }
 
 /// POST /api/sharding/scale/add - Add a new shard and optionally rebalance.
+    #[cfg(feature = "sharding")]
 async fn add_shard_and_rebalance(
     State(state): State<AppState>,
     Json(req): Json<ScaleRequest>,
@@ -5604,6 +5650,7 @@ async fn add_shard_and_rebalance(
 
 /// Remove shard request.
 #[derive(Debug, Deserialize)]
+    #[cfg(feature = "sharding")]
 pub struct RemoveShardRequest {
     /// Shard ID to remove.
     pub shard_id: u32,
@@ -5612,6 +5659,7 @@ pub struct RemoveShardRequest {
 }
 
 /// POST /api/sharding/scale/remove - Remove a shard and migrate its data.
+    #[cfg(feature = "sharding")]
 async fn remove_shard(
     State(state): State<AppState>,
     Json(req): Json<RemoveShardRequest>,
@@ -5664,6 +5712,7 @@ async fn remove_shard(
 
 /// Split shard request.
 #[derive(Debug, Deserialize)]
+    #[cfg(feature = "sharding")]
 pub struct SplitRequest {
     /// Source shard ID to split.
     pub source_shard: u32,
@@ -5677,11 +5726,13 @@ pub struct SplitRequest {
     pub ranges: Option<Vec<KeyRange>>,
 }
 
+    #[cfg(feature = "sharding")]
 fn default_split_strategy() -> String {
     "even".to_string()
 }
 
 /// POST /api/sharding/split - Split a shard into multiple new shards.
+    #[cfg(feature = "sharding")]
 async fn split_shard(
     State(state): State<AppState>,
     Json(req): Json<SplitRequest>,
