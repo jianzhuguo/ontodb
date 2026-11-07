@@ -467,7 +467,7 @@ fn main() -> Result<()> {
     if let Err(e) = graph_store.load_from_engine() {
         tracing::warn!("graph load_from_engine failed: {}", e);
     }
-    let triple_store = Arc::new(onto_ontology::TripleStore::new(engine.default_engine()));
+    let triple_store = Arc::new(onto_ontology::TripleStore::new(Arc::clone(&engine)));
 
     // Initialize sharding if enabled
     let executor = if args.sharding_enabled {

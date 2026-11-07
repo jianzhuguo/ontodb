@@ -12,19 +12,21 @@
 //! - POS: `__triple_pos__{P}__{O}__{S}` → lookup by predicate+object
 //! - OSP: `__triple_osp__{O}__{S}__{P}` → lookup by object+subject
 //!
-//! All three indexes are stored in the same LSM engine as regular document data.
+//! Triple keys are routed to the namespace engine that owns the subject's
+//! class, so each namespace's triples live in its own `data/{ns}/` directory.
 
-use onto_storage::LsmEngine;
+use onto_storage::{EngineSet, LsmEngine};
 use std::sync::Arc;
 
 /// Prefix for SPO triple index in LSM.
 const PREFIX_SPO: &[u8] = b"__triple__";
 
-/// A persistent triple store backed by the LSM engine.
+/// A persistent triple store backed by the engine set.
 ///
 /// Provides efficient lookup by any combination of subject, predicate, object.
+/// Writes are routed to the namespace engine that owns the subject.
 pub struct TripleStore {
-    engine: Arc<LsmEngine>,
+    engine_set: Arc<EngineSet>,
 }
 
 /// A stored triple with its components.
@@ -50,32 +52,38 @@ impl Triple {
 }
 
 impl TripleStore {
-    /// Create a new triple store backed by the given LSM engine.
-    pub fn new(engine: Arc<LsmEngine>) -> Self {
-        Self { engine }
+    /// Create a new triple store backed by the given engine set.
+    pub fn new(engine_set: Arc<EngineSet>) -> Self {
+        Self { engine_set }
+    }
+
+    /// Resolve the engine that owns `subject`'s namespace.
+    ///
+    /// Document keys look like `sempet.Drug::carprofen` — extract the class
+    /// before `::`, then the namespace before the first `.`. Bare subjects
+    /// (no dot in the class region) fall back to the default engine.
+    fn engine_for_subject(&self, subject: &str) -> Arc<LsmEngine> {
+        let class = subject.split("::").next().unwrap_or(subject);
+        self.engine_set.engine_for_class(class)
     }
 
     /// Persist a triple with all three indexes.
     ///
     /// This is idempotent — storing the same triple twice is a no-op.
+    /// All three index keys are written to the subject's namespace engine.
     pub fn add_triple(&self, subject: &str, predicate: &str, object: &str) -> Result<(), String> {
+        let engine = self.engine_for_subject(subject);
         // SPO index (primary)
         let spo_key = Self::make_spo_key(subject, predicate, object);
-        self.engine
-            .put(spo_key, vec![])
-            .map_err(|e| e.to_string())?;
+        engine.put(spo_key, vec![]).map_err(|e| e.to_string())?;
 
         // POS index
         let pos_key = Self::make_pos_key(predicate, object, subject);
-        self.engine
-            .put(pos_key, vec![])
-            .map_err(|e| e.to_string())?;
+        engine.put(pos_key, vec![]).map_err(|e| e.to_string())?;
 
         // OSP index
         let osp_key = Self::make_osp_key(object, subject, predicate);
-        self.engine
-            .put(osp_key, vec![])
-            .map_err(|e| e.to_string())?;
+        engine.put(osp_key, vec![]).map_err(|e| e.to_string())?;
 
         Ok(())
     }
@@ -87,27 +95,28 @@ impl TripleStore {
         predicate: &str,
         object: &str,
     ) -> Result<(), String> {
+        let engine = self.engine_for_subject(subject);
         let spo_key = Self::make_spo_key(subject, predicate, object);
-        self.engine.delete(spo_key).map_err(|e| e.to_string())?;
+        engine.delete(spo_key).map_err(|e| e.to_string())?;
 
         let pos_key = Self::make_pos_key(predicate, object, subject);
-        self.engine.delete(pos_key).map_err(|e| e.to_string())?;
+        engine.delete(pos_key).map_err(|e| e.to_string())?;
 
         let osp_key = Self::make_osp_key(object, subject, predicate);
-        self.engine.delete(osp_key).map_err(|e| e.to_string())?;
+        engine.delete(osp_key).map_err(|e| e.to_string())?;
 
         Ok(())
     }
 
     /// SPO query: given subject and predicate, find all objects.
     pub fn lookup_spo(&self, subject: &str, predicate: &str) -> Result<Vec<String>, String> {
+        let engine = self.engine_for_subject(subject);
         let prefix = format!(
             "__triple__{}__{}__",
             Self::escape(subject),
             Self::escape(predicate)
         );
-        let results = self
-            .engine
+        let results = engine
             .scan_prefix(prefix.as_bytes())
             .map_err(|e| e.to_string())?;
 
@@ -122,9 +131,9 @@ impl TripleStore {
 
     /// SPO query: given subject, find all predicate-object pairs.
     pub fn lookup_s(&self, subject: &str) -> Result<Vec<(String, String)>, String> {
+        let engine = self.engine_for_subject(subject);
         let prefix = format!("__triple__{}__", Self::escape(subject));
-        let results = self
-            .engine
+        let results = engine
             .scan_prefix(prefix.as_bytes())
             .map_err(|e| e.to_string())?;
 
@@ -138,52 +147,60 @@ impl TripleStore {
     }
 
     /// POS query: given predicate and object, find all subjects.
+    ///
+    /// Scans all namespace engines (no subject anchor to route on).
     pub fn lookup_pos(&self, predicate: &str, object: &str) -> Result<Vec<String>, String> {
         let prefix = format!(
             "__triple_pos__{}__{}__",
             Self::escape(predicate),
             Self::escape(object)
         );
-        let results = self
-            .engine
-            .scan_prefix(prefix.as_bytes())
-            .map_err(|e| e.to_string())?;
-
-        Ok(results
-            .into_iter()
-            .filter_map(|(key, _)| {
-                let s = std::str::from_utf8(&key).ok()?;
-                Self::extract_third_component(s)
-            })
-            .collect())
+        let mut out = Vec::new();
+        for engine in self.engine_set.all_engines() {
+            let results = engine
+                .scan_prefix(prefix.as_bytes())
+                .map_err(|e| e.to_string())?;
+            for (key, _) in results {
+                if let Some(s) = std::str::from_utf8(&key).ok() {
+                    if let Some(v) = Self::extract_third_component(s) {
+                        out.push(v);
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// POS query: given predicate, find all subject-object pairs.
+    ///
+    /// Scans all namespace engines.
     pub fn lookup_p(&self, predicate: &str) -> Result<Vec<(String, String)>, String> {
         let prefix = format!("__triple_pos__{}__", Self::escape(predicate));
-        let results = self
-            .engine
-            .scan_prefix(prefix.as_bytes())
-            .map_err(|e| e.to_string())?;
-
-        Ok(results
-            .into_iter()
-            .filter_map(|(key, _)| {
-                let s = std::str::from_utf8(&key).ok()?;
-                Self::extract_last_two_components(s)
-            })
-            .collect())
+        let mut out = Vec::new();
+        for engine in self.engine_set.all_engines() {
+            let results = engine
+                .scan_prefix(prefix.as_bytes())
+                .map_err(|e| e.to_string())?;
+            for (key, _) in results {
+                if let Some(s) = std::str::from_utf8(&key).ok() {
+                    if let Some(pair) = Self::extract_last_two_components(s) {
+                        out.push(pair);
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// OSP query: given object and subject, find all predicates.
     pub fn lookup_osp(&self, object: &str, subject: &str) -> Result<Vec<String>, String> {
+        let engine = self.engine_for_subject(subject);
         let prefix = format!(
             "__triple_osp__{}__{}__",
             Self::escape(object),
             Self::escape(subject)
         );
-        let results = self
-            .engine
+        let results = engine
             .scan_prefix(prefix.as_bytes())
             .map_err(|e| e.to_string())?;
 
@@ -197,44 +214,52 @@ impl TripleStore {
     }
 
     /// OSP query: given object, find all subject-predicate pairs.
+    ///
+    /// Scans all namespace engines.
     pub fn lookup_o(&self, object: &str) -> Result<Vec<(String, String)>, String> {
         let prefix = format!("__triple_osp__{}__", Self::escape(object));
-        let results = self
-            .engine
-            .scan_prefix(prefix.as_bytes())
-            .map_err(|e| e.to_string())?;
-
-        Ok(results
-            .into_iter()
-            .filter_map(|(key, _)| {
-                let s = std::str::from_utf8(&key).ok()?;
-                Self::extract_last_two_components(s)
-            })
-            .collect())
+        let mut out = Vec::new();
+        for engine in self.engine_set.all_engines() {
+            let results = engine
+                .scan_prefix(prefix.as_bytes())
+                .map_err(|e| e.to_string())?;
+            for (key, _) in results {
+                if let Some(s) = std::str::from_utf8(&key).ok() {
+                    if let Some(pair) = Self::extract_last_two_components(s) {
+                        out.push(pair);
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Check if a triple exists.
     pub fn contains(&self, subject: &str, predicate: &str, object: &str) -> Result<bool, String> {
+        let engine = self.engine_for_subject(subject);
         let key = Self::make_spo_key(subject, predicate, object);
-        let result = self.engine.get(&key).map_err(|e| e.to_string())?;
+        let result = engine.get(&key).map_err(|e| e.to_string())?;
         Ok(result.is_some())
     }
 
     /// Get all triples (SPO scan).
+    ///
+    /// Scans all namespace engines.
     pub fn get_all_triples(&self) -> Result<Vec<Triple>, String> {
-        let results = self
-            .engine
-            .scan_prefix(PREFIX_SPO)
-            .map_err(|e| e.to_string())?;
-
-        Ok(results
-            .into_iter()
-            .filter_map(|(key, _)| {
-                let s = std::str::from_utf8(&key).ok()?;
-                let parts = Self::parse_spo_key(s)?;
-                Some(Triple::new(parts.0, parts.1, parts.2))
-            })
-            .collect())
+        let mut out = Vec::new();
+        for engine in self.engine_set.all_engines() {
+            let results = engine
+                .scan_prefix(PREFIX_SPO)
+                .map_err(|e| e.to_string())?;
+            for (key, _) in results {
+                if let Some(s) = std::str::from_utf8(&key).ok() {
+                    if let Some(parts) = Self::parse_spo_key(s) {
+                        out.push(Triple::new(parts.0, parts.1, parts.2));
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Get all triples for a given subject.
@@ -247,14 +272,28 @@ impl TripleStore {
     }
 
     /// Batch add multiple triples.
+    ///
+    /// Groups entries by subject-namespace engine and writes each group
+    /// to its own engine.
     pub fn add_triples(&self, triples: &[(String, String, String)]) -> Result<usize, String> {
-        let mut entries = Vec::with_capacity(triples.len() * 3);
+        // Group keys by target engine (routed by subject).
+        let mut groups: Vec<(Arc<LsmEngine>, Vec<(Vec<u8>, Vec<u8>)>)> = Vec::new();
         for (s, p, o) in triples {
-            entries.push((Self::make_spo_key(s, p, o), vec![]));
-            entries.push((Self::make_pos_key(p, o, s), vec![]));
-            entries.push((Self::make_osp_key(o, s, p), vec![]));
+            let engine = self.engine_for_subject(s);
+            let entries = [
+                (Self::make_spo_key(s, p, o), vec![]),
+                (Self::make_pos_key(p, o, s), vec![]),
+                (Self::make_osp_key(o, s, p), vec![]),
+            ];
+            match groups.iter_mut().find(|(e, _)| Arc::ptr_eq(e, &engine)) {
+                Some((_, list)) => list.extend(entries),
+                None => groups.push((engine, entries.to_vec())),
+            }
         }
-        let count = self.engine.put_batch(entries).map_err(|e| e.to_string())?;
+        let mut count = 0usize;
+        for (engine, list) in groups {
+            count += engine.put_batch(list).map_err(|e| e.to_string())?;
+        }
         Ok(count / 3)
     }
 
@@ -386,7 +425,7 @@ impl TripleStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onto_storage::{LsmEngine, StorageOptions};
+    use onto_storage::{EngineSet, StorageOptions};
     use tempfile::TempDir;
 
     fn create_test_store() -> (TripleStore, TempDir) {
@@ -396,8 +435,8 @@ mod tests {
             memtable_size_limit: 4 * 1024 * 1024,
             ..Default::default()
         };
-        let engine = Arc::new(LsmEngine::open(options).unwrap());
-        let store = TripleStore::new(engine);
+        let engine_set = Arc::new(EngineSet::open_with_discovery(options).unwrap());
+        let store = TripleStore::new(engine_set);
         (store, dir)
     }
 

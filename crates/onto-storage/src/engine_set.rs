@@ -362,7 +362,7 @@ impl EngineSet {
         self.all_engines()
     }
 
-    fn engine_for_namespace(&self, ns: &str) -> Arc<LsmEngine> {
+    pub fn engine_for_namespace(&self, ns: &str) -> Arc<LsmEngine> {
         self.namespaces
             .read()
             .unwrap_or_else(|e| e.into_inner())

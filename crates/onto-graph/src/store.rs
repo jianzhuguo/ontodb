@@ -123,8 +123,9 @@ pub struct GraphStore {
     /// [LOCK 5] Edge property index: prop_key -> prop_value -> set of edge IDs.
     /// Enables O(1) lookup for Eq queries on edge properties.
     edge_prop_index: RwLock<HashMap<String, HashMap<String, HashSet<String>>>>,
-    /// Optional LSM engine set for persistence (`__graph_*` cache keys route
-    /// to the default engine; relation tables route to their namespace).
+    /// Optional LSM engine set for persistence. Graph cache keys are routed
+    /// to the namespace engine that owns the entity (`__graph_v__` / `__graph_e__`
+    /// keys carry the entity's namespace in their ID).
     engine: Option<Arc<onto_storage::EngineSet>>,
     /// [LOCK 6] Internal integer ID mapping for fast traversal.
     id_to_idx: RwLock<HashMap<String, u32>>,
@@ -261,90 +262,96 @@ impl GraphStore {
     /// Call this once after `with_engine()` to restore persisted state.
     /// Rebuilds all in-memory indexes (adjacency lists, label index, etc.).
     pub fn load_from_engine(&self) -> Result<(), GraphError> {
-        let engine = match &self.engine {
+        let engine_set = match &self.engine {
             Some(e) => e,
             None => return Ok(()), // No persistence, nothing to load
         };
 
-        // Streamed restore under a hard memory budget. The old path ran two
-        // full `scan_prefix` passes that materialized every (key, value) into
-        // one Vec before parsing: a 2.6M-edge graph peaked at ~2.5GB with a
-        // single 708MB HashMap alloc and OOM'd startup. Pages are parsed as
-        // they arrive; the running estimate is capped at
-        // `max_cache_memory_bytes`, and whatever does not fit stays cold for
-        // the lazy per-relation path (`load_relation_from_lsm`).
+        // Streamed restore under a hard memory budget. Scan every namespace
+        // engine for graph cache keys (they are routed by entity namespace).
         const PAGE: usize = 10_000;
         let mut mem_estimate = 0usize;
         let mut budget_exhausted = false;
+        let engines = engine_set.all_engines();
 
         // ── Pass 1: scan vertices into local Vec (no locks) ──
         let mut vertices_vec: Vec<Vertex> = Vec::new();
-        let mut after: Option<Vec<u8>> = None;
-        while !budget_exhausted {
-            let page = engine
-                .scan_prefix_after(GRAPH_VERTEX_PREFIX.as_bytes(), after.as_deref(), PAGE)
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
-            if page.is_empty() {
+        for engine in &engines {
+            if budget_exhausted {
                 break;
             }
-            let last_key = page.last().expect("non-empty page").0.clone();
-            for (key, value) in &page {
-                mem_estimate += key.len() + value.len() + 320;
-                if let Ok(vertex) = serde_json::from_slice::<Vertex>(value) {
-                    vertices_vec.push(vertex);
+            let mut after: Option<Vec<u8>> = None;
+            loop {
+                let page = engine
+                    .scan_prefix_after(GRAPH_VERTEX_PREFIX.as_bytes(), after.as_deref(), PAGE)
+                    .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                if page.is_empty() {
+                    break;
                 }
+                let last_key = page.last().expect("non-empty page").0.clone();
+                for (key, value) in &page {
+                    mem_estimate += key.len() + value.len() + 320;
+                    if let Ok(vertex) = serde_json::from_slice::<Vertex>(value) {
+                        vertices_vec.push(vertex);
+                    }
+                }
+                if vertices_vec.len() >= self.limits.max_vertices {
+                    tracing::warn!(
+                        loaded = vertices_vec.len(),
+                        limit = self.limits.max_vertices,
+                        "load_from_engine hit max_vertices; remaining graph stays cold"
+                    );
+                    budget_exhausted = true;
+                } else if mem_estimate >= self.limits.max_cache_memory_bytes {
+                    tracing::warn!(
+                        estimate_mb = mem_estimate / (1024 * 1024),
+                        limit_mb = self.limits.max_cache_memory_bytes / (1024 * 1024),
+                        "load_from_engine hit memory budget; remaining graph stays cold"
+                    );
+                    budget_exhausted = true;
+                }
+                if page.len() < PAGE || budget_exhausted {
+                    break;
+                }
+                after = Some(last_key);
             }
-            if vertices_vec.len() >= self.limits.max_vertices {
-                tracing::warn!(
-                    loaded = vertices_vec.len(),
-                    limit = self.limits.max_vertices,
-                    "load_from_engine hit max_vertices; remaining graph stays cold"
-                );
-                budget_exhausted = true;
-            } else if mem_estimate >= self.limits.max_cache_memory_bytes {
-                tracing::warn!(
-                    estimate_mb = mem_estimate / (1024 * 1024),
-                    limit_mb = self.limits.max_cache_memory_bytes / (1024 * 1024),
-                    "load_from_engine hit memory budget; remaining graph stays cold"
-                );
-                budget_exhausted = true;
-            }
-            if page.len() < PAGE {
-                break;
-            }
-            after = Some(last_key);
         }
 
         // ── Pass 2: scan edges into local Vec (no locks) ──
         let mut edges_vec: Vec<Edge> = Vec::new();
-        let mut after: Option<Vec<u8>> = None;
-        while !budget_exhausted {
-            let page = engine
-                .scan_prefix_after(GRAPH_EDGE_PREFIX.as_bytes(), after.as_deref(), PAGE)
-                .map_err(|e| GraphError::StorageError(e.to_string()))?;
-            if page.is_empty() {
+        for engine in &engines {
+            if budget_exhausted {
                 break;
             }
-            let last_key = page.last().expect("non-empty page").0.clone();
-            for (key, value) in &page {
-                mem_estimate += key.len() + value.len() + 512;
-                if let Ok(edge) = serde_json::from_slice::<Edge>(value) {
-                    edges_vec.push(edge);
+            let mut after: Option<Vec<u8>> = None;
+            loop {
+                let page = engine
+                    .scan_prefix_after(GRAPH_EDGE_PREFIX.as_bytes(), after.as_deref(), PAGE)
+                    .map_err(|e| GraphError::StorageError(e.to_string()))?;
+                if page.is_empty() {
+                    break;
                 }
+                let last_key = page.last().expect("non-empty page").0.clone();
+                for (key, value) in &page {
+                    mem_estimate += key.len() + value.len() + 512;
+                    if let Ok(edge) = serde_json::from_slice::<Edge>(value) {
+                        edges_vec.push(edge);
+                    }
+                }
+                if mem_estimate >= self.limits.max_cache_memory_bytes {
+                    tracing::warn!(
+                        estimate_mb = mem_estimate / (1024 * 1024),
+                        limit_mb = self.limits.max_cache_memory_bytes / (1024 * 1024),
+                        edges = edges_vec.len(),
+                        "load_from_engine hit memory budget during edge scan; remaining edges stay cold"
+                    );
+                    budget_exhausted = true;
+                }
+                if page.len() < PAGE || budget_exhausted {
+                    break;
+                }
+                after = Some(last_key);
             }
-            if mem_estimate >= self.limits.max_cache_memory_bytes {
-                tracing::warn!(
-                    estimate_mb = mem_estimate / (1024 * 1024),
-                    limit_mb = self.limits.max_cache_memory_bytes / (1024 * 1024),
-                    edges = edges_vec.len(),
-                    "load_from_engine hit memory budget during edge scan; remaining edges stay cold"
-                );
-                budget_exhausted = true;
-            }
-            if page.len() < PAGE {
-                break;
-            }
-            after = Some(last_key);
         }
 
         // ── Build all indexes locally (no locks) ──
@@ -481,9 +488,22 @@ impl GraphStore {
 
     // ── Persistence Helpers ──────────────────────────────────────
 
+    /// Resolve the engine that owns a graph entity's namespace.
+    ///
+    /// Vertex IDs use the EntityId format `{ns}::{class}::{pk}` — the first
+    /// `::` segment is the namespace. Falls back to the default engine.
+    fn engine_for_entity_id(&self, id: &str) -> Option<std::sync::Arc<onto_storage::LsmEngine>> {
+        let engine_set = self.engine.as_ref()?;
+        let ns = id.split("::").next().unwrap_or(id);
+        if ns.is_empty() {
+            return Some(engine_set.default_engine());
+        }
+        Some(engine_set.engine_for_namespace(ns))
+    }
+
     /// Persist a vertex to the LSM engine.
     fn persist_vertex(&self, vertex: &Vertex) -> Result<(), GraphError> {
-        if let Some(ref engine) = self.engine {
+        if let Some(engine) = self.engine_for_entity_id(&vertex.id) {
             let key = format!("{}{}", GRAPH_VERTEX_PREFIX, vertex.id);
             let value =
                 serde_json::to_vec(vertex).map_err(|e| GraphError::StorageError(e.to_string()))?;
@@ -496,7 +516,7 @@ impl GraphStore {
 
     /// Remove a vertex from the LSM engine.
     fn unpersist_vertex(&self, id: &str) -> Result<(), GraphError> {
-        if let Some(ref engine) = self.engine {
+        if let Some(engine) = self.engine_for_entity_id(id) {
             let key = format!("{}{}", GRAPH_VERTEX_PREFIX, id);
             engine
                 .delete(key.into_bytes())
@@ -508,7 +528,7 @@ impl GraphStore {
     /// Persist an edge to the LSM engine.
     #[allow(dead_code)]
     fn persist_edge(&self, edge: &Edge) -> Result<(), GraphError> {
-        if let Some(ref engine) = self.engine {
+        if let Some(engine) = self.engine_for_entity_id(&edge.from) {
             let key = format!("{}{}", GRAPH_EDGE_PREFIX, edge.id);
             let value =
                 serde_json::to_vec(edge).map_err(|e| GraphError::StorageError(e.to_string()))?;
@@ -521,11 +541,14 @@ impl GraphStore {
 
     /// Persist an edge to LSM by its ID (reads from the in-memory edges map).
     fn persist_edge_by_id(&self, id: &str) -> Result<(), GraphError> {
-        if let Some(ref engine) = self.engine {
+        let edge_snapshot = {
             let edges = self.edges.read();
-            if let Some(edge) = edges.get(id) {
+            edges.get(id).cloned()
+        };
+        if let Some(edge) = edge_snapshot {
+            if let Some(engine) = self.engine_for_entity_id(&edge.from) {
                 let key = format!("{}{}", GRAPH_EDGE_PREFIX, id);
-                let value = serde_json::to_vec(edge)
+                let value = serde_json::to_vec(&edge)
                     .map_err(|e| GraphError::StorageError(e.to_string()))?;
                 engine
                     .put(key.into_bytes(), value)
@@ -536,8 +559,12 @@ impl GraphStore {
     }
 
     /// Remove an edge from the LSM engine.
-    fn unpersist_edge(&self, id: &str) -> Result<(), GraphError> {
-        if let Some(ref engine) = self.engine {
+    ///
+    /// `from` is the source vertex ID, used to route to the correct
+    /// namespace engine. Callers holding the edges lock must supply it
+    /// directly to avoid re-entrant lock acquisition.
+    fn unpersist_edge_with_source(&self, id: &str, from: &str) -> Result<(), GraphError> {
+        if let Some(engine) = self.engine_for_entity_id(from) {
             let key = format!("{}{}", GRAPH_EDGE_PREFIX, id);
             engine
                 .delete(key.into_bytes())
@@ -655,18 +682,24 @@ impl GraphStore {
                     if let Some(neighbor_id) = idx_to_id.get(*nbr_idx as usize) {
                         outgoing_neighbor_ids.push((neighbor_id.clone(), edge_id.clone()));
                     }
+                    let from = edges.get(edge_id).map(|e| e.from.clone());
                     edges.remove(edge_id);
                     deleted_edge_ids.push(edge_id.clone());
-                    let _ = self.unpersist_edge(edge_id);
+                    if let Some(from) = from {
+                        let _ = self.unpersist_edge_with_source(edge_id, &from);
+                    }
                 }
                 for (nbr_idx, edge_id) in &in_entries {
                     if let Some(neighbor_id) = idx_to_id.get(*nbr_idx as usize) {
                         incoming_neighbor_ids.push((neighbor_id.clone(), edge_id.clone()));
                     }
                     if !deleted_edge_ids.contains(edge_id) {
+                        let from = edges.get(edge_id).map(|e| e.from.clone());
                         edges.remove(edge_id);
                         deleted_edge_ids.push(edge_id.clone());
-                        let _ = self.unpersist_edge(edge_id);
+                        if let Some(from) = from {
+                            let _ = self.unpersist_edge_with_source(edge_id, &from);
+                        }
                     }
                 }
             }
@@ -898,8 +931,9 @@ impl GraphStore {
                 .ok_or_else(|| GraphError::EdgeNotFound(id.to_string()))?
         };
 
-        // Unpersist from LSM engine
-        self.unpersist_edge(id)?;
+        // Unpersist from LSM engine (edge already removed from map, so pass
+        // its source explicitly for namespace routing)
+        self.unpersist_edge_with_source(id, &edge.from)?;
 
         // Remove from edge label index
         {
