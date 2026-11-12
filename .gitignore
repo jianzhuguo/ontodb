@@ -172,3 +172,10 @@ crates/onto-sharding/
 crates/onto-enterprise/
 # Business/strategy docs (not for public repo)
 社区版与企业版功能边界.md
+
+# One-off debug/forensics scratch at repo root
+/_*
+
+# Personal documents (never into public repo)
+*简历*
+BP_*.pdf
