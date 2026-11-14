@@ -2273,18 +2273,10 @@ impl QueryExecutor {
     /// Uses delete+put to ensure scan_prefix sees the update.
     pub fn add_class_extends(&self, class_name: &str, parent_name: &str) -> Result<()> {
         let engine = &self.engine.default_engine();
-        let ontology_name = class_name;
-        let mut ontology = self
-            .ontology_store
-            .load(Some(onto_ontology::store::DEFAULT_NAMESPACE), ontology_name)
-            .ok()
-            .flatten()
-            .or_else(|| self.ontology_store.load(None, ontology_name).ok().flatten())
-            .ok_or_else(|| {
-                onto_core::CoreError::InvalidArgument(format!(
-                    "Ontology '{}' not found", ontology_name
-                ))
-            })?;
+        // Resolve the ontology that OWNS the class — the class may live in a
+        // multi-class ontology (e.g. `CREATE ONTOLOGY fleet (CLASS Car ...)`)
+        // rather than an ontology named after the class.
+        let mut ontology = self.load_ontology_for_class(engine, class_name)?;
 
         if let Some(class) = ontology.classes.get_mut(class_name) {
             if !class.superclasses.contains(&parent_name.to_string()) {
@@ -3985,6 +3977,16 @@ impl QueryExecutor {
                 Ok(QueryResult::Success(format!(
                     "Property '{}' on '{}' updated",
                     name, domain
+                )))
+            }
+            QueryAst::AlterClassExtends {
+                class_name,
+                parent_name,
+            } => {
+                self.add_class_extends(class_name, parent_name)?;
+                Ok(QueryResult::Success(format!(
+                    "Class '{}' now extends '{}'",
+                    class_name, parent_name
                 )))
             }
             QueryAst::AlterClassDisjoint {
@@ -18492,8 +18494,14 @@ impl QueryExecutor {
         };
 
         for disjoint_class in &class_def.disjoint_with {
-            // Check if any existing instance with the same ID exists in the disjoint class
-            if let Some(Value::String(pk)) = doc.get("__pk__") {
+            // Check if any existing instance with the same ID exists in the disjoint class.
+            // INSERT builds rows keyed by `id` without stamping `__pk__`, so fall
+            // back to the `id` column — otherwise the gate is silently skipped.
+            let id_val = doc
+                .get("__pk__")
+                .or_else(|| doc.get("id"))
+                .and_then(|v| v.as_str());
+            if let Some(pk) = id_val {
                 let doc_id = pk.rsplit("::").next().unwrap_or(pk);
                 let disjoint_key = format!("{}::{}", disjoint_class, doc_id);
                 if let Ok(Some(_)) = engine.get(disjoint_key.as_bytes()) {
@@ -19802,6 +19810,77 @@ mod tests {
         assert!(executor
             .execute(&QueryParser::parse("ALTER CLASS NoSuch DISJOINT WITH X").unwrap())
             .is_err());
+    }
+
+    /// Regression: the disjoint gate must fire on INSERT rows keyed by `id`.
+    /// `validate_disjointness` used to read only `doc["__pk__"]`, which plain
+    /// INSERT rows never carry — so the same logical id could land in two
+    /// disjoint classes without rejection.
+    #[test]
+    fn test_disjoint_gate_rejects_same_id_across_classes() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY zoo (CLASS Vehicle, CLASS Car SUBCLASS OF Vehicle, CLASS Boat SUBCLASS OF Vehicle, PROPERTY model DOMAIN Car RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("ALTER CLASS Car DISJOINT WITH Boat").unwrap())
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Boat (id) VALUES ('v1')").unwrap())
+            .unwrap();
+        let clash = executor.execute(
+            &QueryParser::parse("INSERT INTO Car (id, model) VALUES ('v1', 'M')").unwrap(),
+        );
+        assert!(
+            clash.is_err(),
+            "disjoint constraint must reject same id in Car and Boat"
+        );
+        // A different id in Car is fine.
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Car (id, model) VALUES ('v2', 'M')").unwrap())
+            .unwrap();
+    }
+
+    /// ALTER CLASS <name> EXTENDS <parent> must wire the hierarchy after
+    /// creation: the parent query sees subclass instances. Referenced names
+    /// are treated leniently (same as DISJOINT WITH / UNIQUE), so no
+    /// existence check is asserted here.
+    #[test]
+    fn test_alter_class_extends_sets_hierarchy() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY fleet (CLASS Vehicle, CLASS Car, PROPERTY model DOMAIN Car RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("ALTER CLASS Car EXTENDS Vehicle").unwrap())
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Car (id, model) VALUES ('c1', 'M')").unwrap(),
+            )
+            .unwrap();
+        let up = executor
+            .execute(&QueryParser::parse("SELECT id FROM Vehicle").unwrap())
+            .unwrap();
+        match up {
+            QueryResult::Rows(rows) => assert!(
+                rows.iter()
+                    .any(|r| r.get("id").and_then(|v| v.as_str()) == Some("c1")),
+                "Vehicle must see Car instances after ALTER CLASS EXTENDS, got {:?}",
+                rows
+            ),
+            other => panic!("expected rows, got {:?}", other),
+        }
     }
 
     /// Regression: `SELECT * LIMIT n` and `SELECT <col> LIMIT n` must return

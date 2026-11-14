@@ -4024,7 +4024,8 @@ impl QueryParser {
         Ok((domain, Some(range), rest))
     }
 
-    /// Parse ALTER CLASS <name> DISJOINT WITH <other>
+    /// Parse ALTER CLASS <name> EXTENDS <parent>
+    ///              | ALTER CLASS <name> DISJOINT WITH <other>
     ///              | ALTER CLASS <name> UNIQUE (col1, col2, ...)
     ///              | ALTER CLASS <name> RESTRICT <axiom>
     fn parse_alter_class(input: &str) -> Result<QueryAst> {
@@ -4036,6 +4037,19 @@ impl QueryParser {
             ));
         }
         let rest = rest.trim_start();
+        if find_ignore_ascii_case(rest, "EXTENDS") == Some(0) {
+            let after = safe_slice_from(rest, "EXTENDS".len()).trim_start();
+            let (parent, _) = Self::extract_quoted_or_word(after);
+            if parent.is_empty() {
+                return Err(CoreError::InvalidArgument(
+                    "missing parent class after EXTENDS".to_string(),
+                ));
+            }
+            return Ok(QueryAst::AlterClassExtends {
+                class_name,
+                parent_name: parent,
+            });
+        }
         if find_ignore_ascii_case(rest, "DISJOINT WITH") == Some(0) {
             let after = safe_slice_from(rest, "DISJOINT WITH".len()).trim_start();
             let (other, _) = Self::extract_quoted_or_word(after);
@@ -4083,7 +4097,7 @@ impl QueryParser {
             });
         }
         Err(CoreError::InvalidArgument(
-            "ALTER CLASS requires DISJOINT WITH <class>, UNIQUE (cols), or RESTRICT <axiom>"
+            "ALTER CLASS requires EXTENDS <parent>, DISJOINT WITH <class>, UNIQUE (cols), or RESTRICT <axiom>"
                 .to_string(),
         ))
     }
