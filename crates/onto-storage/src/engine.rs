@@ -144,6 +144,9 @@ pub struct LsmEngine {
     /// Vector index manager —HNSW (RwLock for concurrent read-path access).
     vector_index_manager: RwLock<VectorIndexManager>,
 
+    /// CJK n-gram substring index (in-memory; rebuilt at startup).
+    ngram_manager: RwLock<crate::index::NgramManager>,
+
     /// Channel to send flush notifications to the background compaction worker.
     compaction_sender: mpsc::Sender<CompactionMsg>,
 
@@ -445,6 +448,7 @@ impl LsmEngine {
             index_manager: RwLock::new(index_manager),
             index_progress: Arc::new(std::sync::Mutex::new(None)),
             vector_index_manager: RwLock::new(VectorIndexManager::new()),
+            ngram_manager: RwLock::new(crate::index::NgramManager::new()),
             compaction_sender,
             compaction_notif_receiver: Mutex::new(compaction_notif_receiver),
             compaction_pending: AtomicBool::new(false),
@@ -2728,6 +2732,10 @@ impl LsmEngine {
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .deindex_vectors(&key);
+                self.ngram_manager
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .deindex_document(&class, &key, &doc);
             }
         }
         self.delete(key)
@@ -4275,6 +4283,10 @@ impl LsmEngine {
                 .vector_index_manager
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
+            let mut ng_mgr = self
+                .ngram_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
 
             for (key, op, _) in &writes_with_seq {
                 let class = Self::extract_class_from_key(key);
@@ -4285,6 +4297,7 @@ impl LsmEngine {
                         if let Some(ref c) = class {
                             idx_mgr.deindex_document(c, key, old_doc);
                             vec_mgr.deindex_vectors(key);
+                            ng_mgr.deindex_document(c, key, old_doc);
                         }
                     }
                 }
@@ -4295,6 +4308,7 @@ impl LsmEngine {
                         if let Some(ref c) = class {
                             idx_mgr.index_document(c, key, doc);
                             vec_mgr.index_document_vectors(key, c, doc);
+                            ng_mgr.index_document(c, key, doc);
                         }
                     }
                 }
@@ -4637,6 +4651,95 @@ impl LsmEngine {
 
     /// Creates a secondary index on a class.column.
     /// Automatically backfills existing data for the class.
+    // ── CJK n-gram substring index ─────────────────────────────────
+
+    pub fn has_ngram_index(&self, class: &str, column: &str) -> bool {
+        self.ngram_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .has(class, column)
+    }
+
+    /// Register an n-gram column and backfill it (mirrors the create_index
+    /// streaming scan). Column definitions persist to
+    /// `<data_dir>/ngram_indexes.json` and are rebuilt by
+    /// [`Self::rebuild_ngram`] at startup (in-memory postings only).
+    pub fn create_ngram_index(&self, class: &str, column: &str) -> Result<()> {
+        self.ngram_manager
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .create(class, column);
+        self.save_ngram_defs();
+        self.backfill_ngram(class, column)
+    }
+
+    fn backfill_ngram(&self, class: &str, column: &str) -> Result<()> {
+        let prefix = format!("{}::", class);
+        let col = column.to_string();
+        let mut n = 0usize;
+        self.for_each_live_prefix(prefix.as_bytes(), None, None, |pk, val_bytes| {
+            if let Some(val) = extract_index_field(val_bytes, class, &col) {
+                if let Some(s) = val.as_str() {
+                    self.ngram_manager
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .index_value(class, &col, s, pk);
+                    n += 1;
+                }
+            }
+            Ok(())
+        })?;
+        tracing::info!(class, column, rows = n, "ngram index backfill done");
+        Ok(())
+    }
+
+    fn ngram_defs_path(&self) -> std::path::PathBuf {
+        self.options.data_dir.join("ngram_indexes.json")
+    }
+
+    fn save_ngram_defs(&self) {
+        let defs = self
+            .ngram_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .registered();
+        if let Ok(json) = serde_json::to_string(&defs) {
+            let _ = std::fs::write(self.ngram_defs_path(), json);
+        }
+    }
+
+    /// Startup rebuild: restore n-gram column defs and backfill from row data
+    /// (called alongside [`Self::rebuild_indexes`]).
+    pub fn rebuild_ngram(&self) -> Result<()> {
+        let path = self.ngram_defs_path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let defs: Vec<(String, String)> = serde_json::from_str(&text).unwrap_or_default();
+        for (class, column) in defs {
+            self.ngram_manager
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .create(&class, &column);
+            self.backfill_ngram(&class, &column)?;
+        }
+        Ok(())
+    }
+
+    /// n-gram candidate PKs (`None` = no index / needle too short → caller
+    /// falls back to a scan).
+    pub fn ngram_candidates(
+        &self,
+        class: &str,
+        column: &str,
+        needle: &str,
+    ) -> Option<Vec<Vec<u8>>> {
+        self.ngram_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .candidates(class, column, needle)
+    }
+
     pub fn create_index(&self, class: &str, column: &str) -> Result<()> {
         let start = std::time::Instant::now();
         tracing::info!(table = class, column = column, "Index creation started");

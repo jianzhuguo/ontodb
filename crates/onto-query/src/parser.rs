@@ -247,6 +247,8 @@ pub enum QueryAst {
 
     /// CREATE INDEX <name> ON <class> (<column>)
     CreateIndex { class: String, column: String },
+    /// CREATE NGRAM INDEX ON <class> (<column>) — CJK substring search index
+    CreateNgramIndex { class: String, column: String },
 
     /// CREATE INDEX ON <class> (<col1>, <col2>, ...) - Composite index
     CreateCompositeIndex { class: String, columns: Vec<String> },
@@ -566,6 +568,7 @@ impl QueryAst {
             | Delete { class, .. }
             | Match { class, .. }
             | CreateIndex { class, .. }
+            | CreateNgramIndex { class, .. }
             | CreateCompositeIndex { class, .. }
             | DropIndex { class, .. }
             | VacuumTable { class, .. }
@@ -653,6 +656,7 @@ impl QueryAst {
             // DDL
             QueryAst::CreateOntology { .. } => false,
             QueryAst::CreateIndex { .. } => false,
+            QueryAst::CreateNgramIndex { .. } => false,
             QueryAst::CreateCompositeIndex { .. } => false,
             QueryAst::DropIndex { .. } => false,
             QueryAst::CreateVectorIndex { .. } => false,
@@ -1248,6 +1252,8 @@ impl QueryParser {
             Self::parse_drop_materialized_view(input)
         } else if starts_with("REFRESH MATERIALIZED VIEW") {
             Self::parse_refresh_materialized_view(input)
+        } else if starts_with("CREATE NGRAM INDEX") {
+            Self::parse_create_ngram_index(input)
         } else if starts_with("CREATE INDEX") {
             Self::parse_create_index(input)
         } else if starts_with("DROP INDEX") {
@@ -2744,6 +2750,21 @@ impl QueryParser {
         let consumed = safe_slice(input, 0, earliest).trim().to_string();
         let remaining = &input[earliest..];
         (consumed, remaining)
+    }
+
+    /// Parses: CREATE NGRAM INDEX ON <class> (<column>) — reuses the CREATE
+    /// INDEX tail grammar.
+    fn parse_create_ngram_index(input: &str) -> Result<QueryAst> {
+        let rest = input["CREATE NGRAM INDEX".len()..].trim_start();
+        match Self::parse_create_index(&format!("CREATE INDEX {rest}"))? {
+            QueryAst::CreateIndex { class, column } => {
+                Ok(QueryAst::CreateNgramIndex { class, column })
+            }
+            QueryAst::CreateCompositeIndex { .. } => Err(CoreError::InvalidArgument(
+                "NGRAM index is single-column; use CREATE INDEX for composite".to_string(),
+            )),
+            _ => unreachable!(),
+        }
     }
 
     /// Parses: CREATE INDEX ON <class> (<column>) or CREATE INDEX ON <class> (<col1>, <col2>)

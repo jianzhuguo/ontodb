@@ -504,6 +504,9 @@ fn main() -> Result<()> {
                 if let Err(e) = ns_engine.rebuild_vector_indexes() {
                     tracing::warn!("Vector index rebuild failed: {}", e);
                 }
+                if let Err(e) = ns_engine.rebuild_ngram() {
+                    tracing::warn!("Ngram index rebuild failed: {}", e);
+                }
                 ns_engine.mark_index_rebuild_done();
             }
             tracing::info!("Background index rebuild complete");

@@ -13,6 +13,8 @@
 mod btree;
 pub mod disk;
 mod manager;
+pub mod ngram;
 
 pub use btree::{BPlusTree, ValuePkCursor, ValuePkRevCursor};
 pub use manager::{IndexManager, IndexStorageMode};
+pub use ngram::NgramManager;

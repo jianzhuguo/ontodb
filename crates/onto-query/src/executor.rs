@@ -203,12 +203,12 @@ fn eval_binary_filter(row: &BinaryRow, expr: &FilterExpr) -> Option<bool> {
             let v = eval_binary_filter(row, e)?;
             Some(!v)
         }
-        // Like requires pattern matching on strings �?extract and delegate
+        // ---- Like requires pattern matching on stringsextract and delegate ----
         FilterExpr::Like(col, pattern) => {
             let s = row.get_str(col)?;
             Some(QueryExecutor::like_match(s, pattern))
         }
-        // Subqueries need engine access �?can't evaluate here
+        // ---- Subqueries need engine accesscant evaluate here -----------------
         FilterExpr::InSubquery(..) | FilterExpr::Exists(..) | FilterExpr::NotExists(..) => None,
     }
 }
@@ -237,7 +237,7 @@ fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
                 false
             }
         }
-        // Cross-type: TAG_INT vs String �?try parsing string as number
+        // ---- Cross-type: TAG_INT vs Stringtry parsing string as number -------
         (TAG_INT, LiteralValue::String(s)) => {
             if let Ok(arr) = <[u8; 8]>::try_from(raw) {
                 let int_val = i64::from_be_bytes(arr);
@@ -267,7 +267,7 @@ fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
                 false
             }
         }
-        // Cross-type: TAG_FLOAT vs String �?try parsing string as number
+        // ---- Cross-type: TAG_FLOAT vs Stringtry parsing string as number -----
         (TAG_FLOAT, LiteralValue::String(s)) => {
             if let Ok(arr) = <[u8; 8]>::try_from(raw) {
                 let float_val = f64::from_be_bytes(arr);
@@ -281,7 +281,7 @@ fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
             }
         }
         (TAG_STRING, LiteralValue::String(s)) => parse_string_value(raw) == Some(s.as_str()),
-        // Cross-type: TAG_STRING vs Int �?compare string representation
+        // ---- Cross-type: TAG_STRING vs Intcompare string representation ------
         (TAG_STRING, LiteralValue::Int(n)) => {
             if let Some(s) = parse_string_value(raw) {
                 s == n.to_string()
@@ -289,7 +289,7 @@ fn binary_lit_eq(tag: u8, raw: &[u8], lit: &LiteralValue) -> bool {
                 false
             }
         }
-        // Cross-type: TAG_STRING vs Float �?compare string representation
+        // ---- Cross-type: TAG_STRING vs Floatcompare string representation ----
         (TAG_STRING, LiteralValue::Float(n)) => {
             if let Some(s) = parse_string_value(raw) {
                 s == n.to_string()
@@ -313,7 +313,7 @@ fn binary_lit_ord(tag: u8, raw: &[u8], lit: &LiteralValue) -> Option<std::cmp::O
             let arr: [u8; 8] = raw.try_into().ok()?;
             (i64::from_be_bytes(arr) as f64).partial_cmp(n)
         }
-        // Cross-type: TAG_INT vs String �?parse string as number
+        // ---- Cross-type: TAG_INT vs Stringparse string as number -------------
         (TAG_INT, LiteralValue::String(s)) => {
             let arr: [u8; 8] = raw.try_into().ok()?;
             let int_val = i64::from_be_bytes(arr);
@@ -333,7 +333,7 @@ fn binary_lit_ord(tag: u8, raw: &[u8], lit: &LiteralValue) -> Option<std::cmp::O
             let arr: [u8; 8] = raw.try_into().ok()?;
             f64::from_be_bytes(arr).partial_cmp(&(*n as f64))
         }
-        // Cross-type: TAG_FLOAT vs String �?parse string as number
+        // ---- Cross-type: TAG_FLOAT vs Stringparse string as number -----------
         (TAG_FLOAT, LiteralValue::String(s)) => {
             let arr: [u8; 8] = raw.try_into().ok()?;
             let float_val = f64::from_be_bytes(arr);
@@ -344,12 +344,12 @@ fn binary_lit_ord(tag: u8, raw: &[u8], lit: &LiteralValue) -> Option<std::cmp::O
             }
         }
         (TAG_STRING, LiteralValue::String(s)) => parse_string_value(raw).map(|v| v.cmp(s.as_str())),
-        // Cross-type: TAG_STRING vs Int �?compare as strings
+        // ---- Cross-type: TAG_STRING vs Intcompare as strings -----------------
         (TAG_STRING, LiteralValue::Int(n)) => {
             let s = parse_string_value(raw)?;
             Some(s.cmp(&n.to_string()))
         }
-        // Cross-type: TAG_STRING vs Float �?compare as strings
+        // ---- Cross-type: TAG_STRING vs Floatcompare as strings ---------------
         (TAG_STRING, LiteralValue::Float(n)) => {
             let s = parse_string_value(raw)?;
             Some(s.cmp(&n.to_string()))
@@ -451,7 +451,7 @@ impl Ord for TopNRow {
 pub struct QueryExecutor {
     engine: Arc<onto_storage::EngineSet>,
     ontology_store: OntologyStore,
-    /// Graph store for unified entity anchor (relational �?graph sync).
+    // ---- Graph store for unified entity anchor (relationalgraph sync) ----
     /// Optional for backward compatibility.
     graph: Option<Arc<onto_graph::GraphStore>>,
     /// Triple store for persistent RDF triples (SPO/POS/OSP indexes).
@@ -490,7 +490,7 @@ pub struct QueryExecutor {
     active_txn_flag: AtomicU64,
     /// Query execution configuration.
     config: QueryConfig,
-    /// Inference cache: class name �?hierarchy (all super/sub classes).
+    // ---- Inference cache: class namehierarchy (all super/sub classes) ----
     /// Cleared on ontology changes (CREATE ONTOLOGY).
     /// RwLock: the per-query path only reads (cache hit).
     inference_cache: std::sync::RwLock<InferenceCache>,
@@ -508,7 +508,7 @@ pub struct QueryExecutor {
     /// Set by `USE NAMESPACE <name>`, defaults to "default".
     /// All EntityId created by this executor use this namespace.
     current_namespace: Mutex<String>,
-    /// Cached row counts per table: table_name �?(count, last_updated).
+    // ---- Cached row counts per table: table_namecountlast_updated) -------
     /// Avoids full table scan for COUNT(*) queries.
     row_count_cache: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>>,
     /// Optional append-only audit log (JSON lines) for cross-namespace access
@@ -591,23 +591,23 @@ impl RuntimeStats {
 /// Avoids re-running the Reasoner on every query.
 #[derive(Debug, Default)]
 struct InferenceCache {
-    /// Class name �?set of all classes in hierarchy (superclasses + subclasses + equivalent).
+    // ---- Class nameset of all classes in hierarchy (superclasses + subclasses + equivalent) ----
     class_hierarchy: std::collections::HashMap<String, HashSet<String>>,
-    /// Property name �?set of all equivalent/sub-property names.
+    // ---- Property nameset of all equivalent/sub-property names -----------
     property_aliases: std::collections::HashMap<String, HashSet<String>>,
-    /// Property name �?inverse property name.
+    // ---- Property nameinverse property name ------------------------------
     inverse_property: std::collections::HashMap<String, Option<String>>,
-    /// Property name �?is_symmetric flag. Uncached this made every
+    // ---- Property nameis_symmetric flag. Uncached this made every --------
     /// non-matching filter row re-scan all ontologies (DELETE WHERE id=
     /// froze on large classes).
     symmetric_property: std::collections::HashMap<String, bool>,
-    /// Property name �?is_transitive flag (same caching rationale).
+    // ---- Property nameis_transitive flag (same caching rationale) --------
     transitive_property: std::collections::HashMap<String, bool>,
-    /// Transitive closure cache: (property, subject) �?set of all transitive objects.
+    // ---- Transitive closure cache: (propertysubject)set of all transitive objects ----
     transitive_closure: std::collections::HashMap<(String, String), HashSet<String>>,
     /// Cached merged ontology (all ontologies merged into one). Avoids repeated scan_prefix.
     merged_ontology: Option<onto_ontology::Ontology>,
-    /// Class name �?property names (direct + inherited). Fast property lookup.
+    // ---- Class nameproperty names (direct + inherited). Fast property lookup ----
     class_properties: std::collections::HashMap<String, Vec<String>>,
 }
 
@@ -864,7 +864,7 @@ impl QueryExecutor {
     }
 
     /// Get cached row count for a table.
-    /// Cache never expires �?updated incrementally on INSERT, invalidated on DELETE.
+    // ---- Cache never expiresupdated incrementally on INSERTinvalidated on DELETE ----
     /// Warmup populates on startup.
     fn get_cached_row_count(&self, _engine: &LsmEngine, table: &str) -> Option<u64> {
         let cache = self.row_count_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -987,7 +987,7 @@ impl QueryExecutor {
                 let mut cached_count = 0;
 
                 for table in &tables {
-                    // Same expansion the query path uses �?subclass/related
+                    // ---- Same expansion the query path usessubclass/related --------------
                     // prefixes are included, so cached == SELECT row count.
                     let hierarchy = exec.get_class_hierarchy_read(&engine.default_engine(), table);
                     let mut count = 0u64;
@@ -1309,7 +1309,7 @@ impl QueryExecutor {
         result
     }
 
-    /// Set the graph store for unified entity anchor (relational �?graph sync).
+    // ---- Set the graph store for unified entity anchor (relationalgraph sync) ----
     pub fn with_graph(mut self, graph: Arc<onto_graph::GraphStore>) -> Self {
         self.graph = Some(graph);
         self
@@ -1804,7 +1804,7 @@ impl QueryExecutor {
         Ok(merged)
     }
 
-    /// Creates an incremental backup �?only files modified since the given time.
+    // ---- Creates an incremental backuponly files modified since the given time ----
     pub fn backup_incremental(
         &self,
         backup_dir: &std::path::Path,
@@ -2087,7 +2087,7 @@ impl QueryExecutor {
             }
         }
 
-        // Collect index information from the live index manager �?this is the
+        // ---- Collect index information from the live index managerthis is the ----
         // same source the planner uses via has_index(). Also merge any persisted
         // __idx_meta__ records for extra fields (entries, format).
         let mut indexes = Vec::new();
@@ -2203,7 +2203,7 @@ impl QueryExecutor {
         }))
     }
 
-    /// Drop an ontology by name �?deletes the `__ontology__{name}` LSM key.
+    // ---- Drop an ontology by namedeletes theontologynameLSM key ----------
     ///
     /// Uses scan_prefix to check existence instead of get(), because the LSM
     /// engine may have tombstone inconsistencies where get() returns None but
@@ -2292,7 +2292,7 @@ impl QueryExecutor {
             }
         }
 
-        // Delete old entry then save new �?ensures scan_prefix sees the update
+        // ---- Delete old entry then save newensures scan_prefix sees the update ----
         let key = {
             let mut k = Vec::new();
             if let Some(ref ns) = ontology.namespace {
@@ -2916,7 +2916,7 @@ impl QueryExecutor {
         let result = match ast {
             QueryAst::Select { .. } => {
                 // Collect table stats (incl. which columns have indexes) BEFORE
-                // planning �?otherwise the planner sees an empty secondary_indexes
+                // ---- planningotherwise the planner sees an empty secondary_indexes ----
                 // list and never picks IndexScan, and the bad plan gets cached.
                 if let QueryAst::Select { from, .. } = ast {
                     if !from.starts_with("system.") {
@@ -3219,9 +3219,9 @@ impl QueryExecutor {
     }
 
     /// Lock-free execution dispatch. Called by execute_write_with_engine and execute_select_read.
-    /// Does NOT acquire any engine lock �?the caller must hold one.
+    // ---- Does NOT acquire any engine lockthe caller must hold one --------
     /// Lock-free execution dispatch. Called by execute_write_with_engine and execute_select_read.
-    /// Does NOT acquire any engine lock �?the caller must hold one.
+    // ---- Does NOT acquire any engine lockthe caller must hold one --------
     /// Recursive callers (explain, CTE, union, filters) call this directly.
     fn execute_with_engine_inner(&self, ast: &QueryAst, engine: &LsmEngine) -> Result<QueryResult> {
         match ast {
@@ -3317,7 +3317,7 @@ impl QueryExecutor {
                     .unwrap_or_else(|e| e.into_inner())
                     .clear();
                 engine.create_index(class, column)?;
-                // Index now exists �?re-collect stats so IndexScan is chosen.
+                // ---- Index now existsre-collect stats so IndexScan is chosen ---------
                 {
                     let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
                     stats.table_row_counts.remove(class);
@@ -3328,6 +3328,26 @@ impl QueryExecutor {
                     .clear();
                 Ok(QueryResult::Success(format!(
                     "Index created on {}.{}",
+                    class, column
+                )))
+            }
+            QueryAst::CreateNgramIndex { class, column } => {
+                tracing::info!(table = class.as_str(), column = column.as_str(), "Ngram index creation started");
+                self.plan_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                engine.create_ngram_index(class, column)?;
+                {
+                    let mut stats = self.runtime_stats.lock().unwrap_or_else(|e| e.into_inner());
+                    stats.table_row_counts.remove(class);
+                }
+                self.plan_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                Ok(QueryResult::Success(format!(
+                    "Ngram index created on {}.{}",
                     class, column
                 )))
             }
@@ -3868,7 +3888,7 @@ impl QueryExecutor {
                         name
                     )));
                 }
-                // Store current namespace �?all subsequent EntityId will use this
+                // ---- Store current namespaceall subsequent EntityId will use this ----
                 *self.current_namespace.lock().unwrap() = name.to_string();
                 Ok(QueryResult::Success(format!(
                     "Now using namespace '{}'",
@@ -4134,15 +4154,15 @@ impl QueryExecutor {
         }
     }
 
-    // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+    // ----------------------------------------------------------------------
     //  Plan-driven execution engine (Phase 24)
-    // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+    // ----------------------------------------------------------------------
 
     /// Builds a scan+filter plan for DELETE/UPDATE operations.
     ///
     /// Prefer index access when the filter is an indexable predicate on an
     /// indexed column. A raw SeqScan+Filter materializes every row in the table
-    /// before filtering �?fatal on multi-million-row tables (UPDATE/DELETE hang).
+    // ---- before filteringfatal on multi-million-row tables (UPDATE/DELETE hang) ----
     fn build_scan_plan(&self, class: &str, filter: &Option<FilterExpr>) -> Result<ExecutionPlan> {
         if let Some(f) = filter {
             if Self::filter_is_indexable(f) {
@@ -4285,6 +4305,39 @@ impl QueryExecutor {
                 if let Some(rows) = self.plan_pk_point_lookup(predicate, input)? {
                     return Ok(rows);
                 }
+                // Predicate pushdown: merge Filter(SeqScan, pred) into a
+                // filtered scan so the n-gram candidate fast path inside the
+                // scan can see the predicate (outer retain kept as a
+                // semantic safety net).
+                if let PlanNode::SeqScan {
+                    table,
+                    alias,
+                    filter,
+                    ..
+                } = input.as_ref()
+                {
+                    let merged = match filter {
+                        Some(f) => FilterExpr::And(Box::new(f.clone()), Box::new(predicate.clone())),
+                        None => predicate.clone(),
+                    };
+                    let merged = Some(merged);
+                    let mut rows = Vec::new();
+                    self.scan_rows_sink(
+                        engine,
+                        table,
+                        alias.as_deref(),
+                        &merged,
+                        None,
+                        false,
+                        &mut |row| {
+                            rows.push(row);
+                            Ok(true)
+                        },
+                    )?;
+                    let filter_expr = Some(predicate.clone());
+                    rows.retain(|row| self.matches_filter(engine, row, &filter_expr));
+                    return Ok(rows);
+                }
                 let mut rows = self.execute_plan_node(input, engine)?;
                 let filter_expr = Some(predicate.clone());
                 rows.retain(|row| self.matches_filter(engine, row, &filter_expr));
@@ -4302,7 +4355,7 @@ impl QueryExecutor {
 
                 // NOTE: COUNT(*) fast path re-enabled for unfiltered queries.
                 // Uses cached row count to avoid full table scan.
-                // Class hierarchy filtering is skipped for COUNT(*) �?this returns
+                // ---- Class hierarchy filtering is skipped for COUNTthis returns ------
                 // the direct class instance count, not the inheritance-expanded count.
 
                 // Only push column projection down when there are no aggregates/expressions
@@ -4747,6 +4800,49 @@ impl QueryExecutor {
 
         let mut scan_count: u64 = 0;
 
+        // ── n-gram substring fast path ──────────────────────────────
+        // For a single `Like(col, %X%)` on an n-gram-indexed column, use the
+        // candidate PK set instead of walking the whole key space (at scale a
+        // scan is dominated by tombstones/stale versions). Candidate rows run
+        // the exact same per-row tail as the scan below (predicate re-check →
+        // projection → annotate → alias).
+        if let Some(pkeys) = self.ngram_candidates_for(engine, &scan_classes, filter)? {
+            for pk in &pkeys {
+                if let Ok(Some(val_bytes)) = engine.get(pk) {
+                    if let Some(brow) = BinaryRow::parse(&val_bytes) {
+                        if !brow.class_in_hierarchy(&scan_classes) {
+                            continue;
+                        }
+                        if let Some(f) = filter.as_ref() {
+                            if let Some(doc) = brow.to_map() {
+                                let keep = if read_mode {
+                                    self.eval_filter_read(engine, &doc, f)
+                                } else {
+                                    self.eval_filter(engine, &doc, f)
+                                };
+                                if !keep {
+                                    continue;
+                                }
+                                let mut out = if proj_cols.is_empty() {
+                                    doc
+                                } else {
+                                    brow.to_map_projected(&proj_cols).unwrap_or(doc)
+                                };
+                                self.annotate_scanned_row(table, pk, &mut out);
+                                if let Some(a) = alias {
+                                    Self::apply_alias_row(&mut out, a);
+                                }
+                                if !sink(out)? {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         for scan_class in &scan_classes {
             let prefix = format!("{}::", scan_class);
             let mut on_row = |key: &[u8], val_bytes: &[u8]| -> Result<bool> {
@@ -4845,6 +4941,45 @@ impl QueryExecutor {
     }
 
     /// Plan-driven sequential scan with optional filter.
+    /// Candidate PK set from an n-gram index: `Some(pkeys)` when the filter is
+    /// a single `Like(col, %X%)` on an n-gram-indexed column and the needle
+    /// has no wildcard metacharacters (empty set = definitely no match, scan
+    /// can be short-circuited); `None` = not applicable (caller scans).
+    fn ngram_candidates_for(
+        &self,
+        engine: &LsmEngine,
+        scan_classes: &HashSet<String>,
+        filter: &Option<FilterExpr>,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        let Some(FilterExpr::Like(col, pattern)) = filter.as_ref() else {
+            return Ok(None);
+        };
+        let Some(needle) = pattern
+            .strip_prefix('%')
+            .and_then(|p| p.strip_suffix('%'))
+        else {
+            return Ok(None);
+        };
+        if needle.is_empty() || needle.contains('%') || needle.contains('_') {
+            return Ok(None);
+        }
+        let mut pkeys: Vec<Vec<u8>> = Vec::new();
+        let mut used_index = false;
+        for scan_class in scan_classes {
+            if engine.has_ngram_index(scan_class, col) {
+                if let Some(pks) = engine.ngram_candidates(scan_class, col, needle) {
+                    used_index = true;
+                    pkeys.extend(pks);
+                }
+            }
+        }
+        if used_index {
+            Ok(Some(pkeys))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn plan_seq_scan(
         &self,
         engine: &LsmEngine,
@@ -5334,7 +5469,7 @@ impl QueryExecutor {
             }
         }
 
-        // No index on any hierarchy class �?full scan is the only option.
+        // ---- No index on any hierarchy classfull scan is the only option -----
         self.plan_seq_scan(&self.engine.engine_for_class(table), table, alias, filter, None)
     }
 
@@ -6365,7 +6500,7 @@ impl QueryExecutor {
         }
 
         // Lightweight stats: sample a few rows per class to discover column names,
-        // then probe for indexes.  Does NOT count all rows �?uses a default estimate.
+        // ---- then probe for indexes. Does NOT count all rowsuses a default estimate ----
         // Full row counts are collected by explicit ANALYZE.
         let class_hierarchy = self.get_class_hierarchy(engine, table);
         let sample_limit = 3usize;
@@ -6389,7 +6524,7 @@ impl QueryExecutor {
             }
         }
 
-        // Use default row count �?ANALYZE will populate the real count
+        // ---- Use default row countANALYZE will populate the real count -------
         let row_count = 1000u64;
 
         // Update statistics (mark as estimated)
@@ -6534,12 +6669,12 @@ impl QueryExecutor {
         let targeted = Self::extract_class_filter(filter);
 
         if targeted.is_empty() {
-            // No __class__ constraint �?scan full hierarchy but exclude disjoint classes
+            // ---- No __class__ constraintscan full hierarchy but exclude disjoint classes ----
             let disjoint = self.get_disjoint_classes(engine, table);
             return class_hierarchy.difference(&disjoint).cloned().collect();
         }
 
-        // __class__ constraint found �?only scan targeted classes
+        // ---- class__ constraint foundonly scan targeted classes --------------
         let mut scan_classes = HashSet::new();
         for target in &targeted {
             // Expand each targeted class to include its subclasses
@@ -7596,7 +7731,7 @@ impl QueryExecutor {
                 if let Some((class, pk)) = onto_storage::ValueMetadata::parse_meta_key(key) {
                     let cur_score = meta.current_score();
                     // Predict when score drops to 0.4 (cold threshold)
-                    // 0.4 = value_score * e^(-λ * Δt) �?Δt = ln(value_score / 0.4) / λ
+                    // ---- 0.4value_scoreet)tln(value_score / 0.4) -------------------------
                     let predicted_cold_at = if meta.lambda > 0.0 && cur_score > 0.4 {
                         let dt = (meta.value_score / 0.4).ln() / meta.lambda;
                         meta.last_activated_at + dt as u64
@@ -8182,6 +8317,37 @@ impl QueryExecutor {
                 if let Some(rows) = self.plan_pk_point_lookup(predicate, input)? {
                     return Ok(Self::slim_rows(rows, needed));
                 }
+                // Predicate pushdown (mirror of the write-path arm): merge
+                // Filter(SeqScan, pred) into the scan's filter so the n-gram
+                // candidate fast path can see the predicate. The outer retain
+                // below stays as a semantic safety net.
+                if let PlanNode::SeqScan {
+                    table,
+                    alias,
+                    filter,
+                    ..
+                } = input.as_ref()
+                {
+                    let merged = match filter {
+                        Some(f) => {
+                            FilterExpr::And(Box::new(f.clone()), Box::new(predicate.clone()))
+                        }
+                        None => predicate.clone(),
+                    };
+                    let merged = Some(merged);
+                    let mut rows = self.plan_seq_scan_read(
+                        &self.engine.engine_for_class(table),
+                        table,
+                        alias.as_deref(),
+                        &merged,
+                        None,
+                    )?;
+                    rows.retain(|row| self.eval_filter_read(engine, row, predicate));
+                    if let Some(n) = take {
+                        rows.truncate(n);
+                    }
+                    return Ok(Self::slim_rows(rows, needed));
+                }
                 // The filter reads its own columns on top of the consumer's.
                 let child_needed = needed.and_then(|n| {
                     let mut s = n.clone();
@@ -8313,7 +8479,7 @@ impl QueryExecutor {
                         ..
                     } = input.as_ref()
                     {
-                        // Push projection down to index scan �?avoids full to_map() on every row
+                        // ---- Push projection down to index scanavoids full to_map() on every row ----
                         self.plan_index_scan_read(
                             engine,
                             table,
@@ -8662,7 +8828,7 @@ impl QueryExecutor {
                 }
                 cols
             }
-            _ => Vec::new(), // SELECT * �?use full to_map()
+            _ => Vec::new(), // SELECT * -> use full to_map()
         };
 
         let mut rows = Vec::new();
@@ -8743,6 +8909,27 @@ impl QueryExecutor {
                 Ok(None)
             };
 
+        // n-gram substring fast path: a single `Like(col, %X%)` on an
+        // n-gram-indexed column resolves through candidate PKs instead of a
+        // full key-space walk (at scale the scan is dominated by
+        // tombstones/stale versions). Candidate rows run the exact same
+        // per-row tail as the scan below via `row_from_value`.
+        if let Some(pkeys) = self.ngram_candidates_for(engine, &class_hierarchy, filter)? {
+            for pk in &pkeys {
+                if let Ok(Some(val_bytes)) = engine.get(pk) {
+                    if let Some(doc) = row_from_value(pk, &val_bytes, &mut scan_count)? {
+                        rows.push(doc);
+                        if let Some(lim) = scan_limit {
+                            if rows.len() >= lim {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(rows);
+        }
+
         for scan_class in &class_hierarchy {
             if let Some(limit) = effective_scan_limit {
                 if rows.len() >= limit {
@@ -8771,7 +8958,7 @@ impl QueryExecutor {
                 }
             } else {
                 // Streaming path. With a filter+limit we only need `scan_limit`
-                // matching rows �?return Ok(false) to stop the scan early.
+                // ---- matching rowsreturn Ok(false) to stop the scan early ------------
                 let want = scan_limit;
                 let mut on_row = |key: &[u8], val_bytes: &[u8]| -> Result<bool> {
                     if let Some(lim) = want {
@@ -9001,7 +9188,7 @@ impl QueryExecutor {
         {
             return Ok(false);
         }
-        // Tier 2: BinaryRow path �?filter without full deserialization
+        // ---- Tier 2: BinaryRow pathfilter without full deserialization -------
         if let Some(brow) = BinaryRow::parse(val_bytes) {
             if !brow.class_in_hierarchy(class_hierarchy) {
                 return Ok(false);
@@ -9017,7 +9204,7 @@ impl QueryExecutor {
             if direct == Some(false) {
                 return Ok(false);
             }
-            // Filter needs full deserialization �?rare case
+            // ---- Filter needs full deserializationrare case ----------------------
             if let Some(doc) = brow.to_map() {
                 return Ok(self.eval_filter_read(engine, &doc, f));
             }
@@ -9118,7 +9305,7 @@ impl QueryExecutor {
         let mut count: u64 = 0;
 
         // Prefer secondary index when the filter is a simple column predicate
-        // on an indexed column �?O(matches) instead of O(table).
+        // ---- on an indexed columnO(matches) instead of O(table) --------------
         for scan_class in &class_hierarchy {
             if let Some(n) = Self::try_count_via_index(engine, scan_class, filter) {
                 count += n;
@@ -9171,9 +9358,9 @@ impl QueryExecutor {
 
     /// Try to count matching rows via a secondary index for a simple
     /// column predicate. Returns None when the index cannot serve the filter.
-    /// Uses the count-only index APIs �?no pk materialization.
+    // ---- Uses the count-only index APIsno pk materialization -------------
     /// Index-driven `GROUP BY col` with only COUNT(*) aggregates.
-    /// Reads (value, count) pairs straight from the secondary index �?
+    // ---- Reads (valuecount) pairs straight from the secondary index ------
     /// O(distinct values) instead of O(rows). Returns None when the shape
     /// cannot be served from the index (caller falls back to row scan).
     fn try_index_group_by_counts(
@@ -9382,9 +9569,9 @@ impl QueryExecutor {
     /// `SELECT DISTINCT col [, col2, ...]`: enumerate unique column value
     /// combinations without materialising full rows.
     ///
-    /// * Single indexed column �?`distinct_counts_read` on the B+Tree (O(distinct)).
-    /// * Single column, no index �?streaming scan + `encode_value` into BTreeMap.
-    /// * Multi-column �?streaming scan + length-prefixed composite key.
+    // ---- Single indexed columndistinct_counts_readon the B+Tree (O(distinct)) ----
+    // ---- Single columnno indexstreaming scanencode_valueinto BTreeMap ----
+    // ---- Multi-columnstreaming scan + length-prefixed composite key ------
     ///
     /// Returns `None` only when the projection contains expressions or `*`.
     fn try_index_distinct(
@@ -9624,7 +9811,7 @@ impl QueryExecutor {
                 }
                 Some(total)
             }
-            // AND of range predicates on one indexed column �?single count_range.
+            // ---- AND of range predicates on one indexed columnsingle count_range ----
             FilterExpr::And(_, _) => {
                 let mut conjuncts = Vec::new();
                 Self::split_and_conjuncts(f, &mut conjuncts);
@@ -9848,7 +10035,7 @@ impl QueryExecutor {
                                 return field_num != *n;
                             }
                         }
-                        // Skip fast rejection for strings �?BinaryRow bytes may contain
+                        // ---- Skip fast rejection for stringsBinaryRow bytes may contain ------
                         // spurious JSON-like patterns that cause false rejection.
                         // String equality is handled accurately by eval_binary_filter / eval_filter_read.
                         LiteralValue::String(_) => {}
@@ -10135,7 +10322,7 @@ impl QueryExecutor {
             for scan_class in &class_hierarchy {
                 if engine.has_index(scan_class, index_column) {
                     let pkeys = match (f, pk_budget) {
-                        // Eq + LIMIT: bounded lookup �?no full pk materialization.
+                        // ---- Eq + LIMIT: bounded lookupno full pk materialization ------------
                         (FilterExpr::Eq(_, val), Some(lim)) => {
                             let json_val = Self::literal_to_json_static(val);
                             let mgr = engine.index_manager().read().unwrap_or_else(|e| e.into_inner());
@@ -10253,7 +10440,7 @@ impl QueryExecutor {
                 }
                 return Ok(rows);
             }
-            // Index answered with 0 hits �?it is authoritative for an indexed
+            // ---- Index answered with 0 hitsit is authoritative for an indexed ----
             // column. Do NOT fall back to seq scan (that also caused infinite
             // recursion: seq_scan short-circuits back here for indexable filters).
             if engine.has_index(table, index_column) {
@@ -10391,7 +10578,7 @@ impl QueryExecutor {
             }
             FilterExpr::Gte(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                // Inclusive low / open high �?same merge path as Eq/Gt/Lt.
+                // ---- Inclusive low / open highsame merge path as Eq/Gt/Lt ------------
                 // Direct tree.gte_scan skips the disk index after restart.
                 index_mgr
                     .lookup_range_read_limit(class, &col, Some(&json_val), None, limit)
@@ -10433,7 +10620,7 @@ impl QueryExecutor {
         projected_columns: Option<&[String]>,
     ) -> Result<Vec<Map<String, Value>>> {
         let cols = projected_columns.unwrap_or(&[]);
-        // Batch fetch all values in one call �?avoids per-key lock overhead.
+        // ---- Batch fetch all values in one callavoids per-key lock overhead ----
         let values = engine.multi_get(pkeys)?;
         let mut rows = Vec::with_capacity(values.len());
         for val_bytes in values.into_iter().flatten() {
@@ -10550,7 +10737,7 @@ impl QueryExecutor {
         // ---- Aggregates / GROUP BY: single-pass streaming aggregation ----
         if group_by.is_some() || Self::columns_have_aggregates(columns) {
             // Index-driven GROUP BY: single grouped column with only COUNT(*)
-            // and the column is indexed �?read (value, count) pairs straight
+            // ---- and the column is indexedread (valuecount) pairs straight -------
             // from the index. O(distinct) instead of O(rows).
             if let Some(gb) = group_by.as_ref() {
                 if let Some(result) = self.try_index_group_by_counts(
@@ -10680,7 +10867,7 @@ impl QueryExecutor {
                 table, filter, ..
             } => (table.clone(), filter.clone(), None),
             _ => {
-                // Fallback shape �?materialize and emit.
+                // ---- Fallback shapematerialize and emit ------------------------------
                 let rows = self.execute_plan_node_read(node, &self.engine.default_engine())?;
                 return Self::emit_rows_in_batches(rows, &mut sink);
             }
@@ -10689,7 +10876,7 @@ impl QueryExecutor {
         // ---- ORDER BY on an indexed column: stream in index order ----
         // Single-column ORDER BY whose column has a secondary index on *every*
         // class in the hierarchy can walk the index in key order and emit rows
-        // as they are fetched �?no sort, early exit with LIMIT.
+        // ---- as they are fetchedno sortearly exit with LIMIT -----------------
         if order_by.len() == 1 {
             let ob = &order_by[0];
             let ob_col = ob
@@ -10778,7 +10965,7 @@ impl QueryExecutor {
                 }
                 if *distinct {
                     rows.retain(|row| {
-                        // Dedup only on user-visible columns �?__pk__/__class__
+                        // ---- Dedup only on user-visible columnspk__/__class ------------------
                         // are unique per row and would defeat DISTINCT.
                         let key: String = row
                             .iter()
@@ -11230,7 +11417,7 @@ impl QueryExecutor {
                     lo = Some(lo.map_or(b.clone(), |cur| cur.max(b.clone())));
                 }
                 FilterExpr::Gt(c, v) if c == col => {
-                    // Exclusive low �?use the value itself as inclusive low;
+                    // ---- Exclusive lowuse the value itself as inclusive low --------------
                     // residual filter drops the boundary row.
                     let b = onto_storage::IndexManager::encode_value(&Self::literal_to_json_static(v));
                     lo = Some(lo.map_or(b.clone(), |cur| cur.max(b.clone())));
@@ -11240,7 +11427,7 @@ impl QueryExecutor {
                     hi = Some(hi.map_or(b.clone(), |cur| cur.min(b.clone())));
                 }
                 FilterExpr::Lt(c, v) if c == col => {
-                    // Exclusive high �?inclusive high; residual filter drops it.
+                    // ---- Exclusive highinclusive highresidual filter drops it ------------
                     let b = onto_storage::IndexManager::encode_value(&Self::literal_to_json_static(v));
                     hi = Some(hi.map_or(b.clone(), |cur| cur.min(b.clone())));
                 }
@@ -11430,6 +11617,59 @@ impl QueryExecutor {
         let mut scan_count: u64 = 0;
         let mut stop = false;
 
+        // n-gram substring fast path (see plan_seq_scan_read_limit): single
+        // `Like(col, %X%)` on an n-gram-indexed column resolves through
+        // candidate PKs instead of a full key-space walk.
+        if let Some(pkeys) = self.ngram_candidates_for(engine, &class_hierarchy, filter)? {
+            let mut buf: Vec<Map<String, Value>> = Vec::with_capacity(batch);
+            for pk in &pkeys {
+                let Ok(Some(val_bytes)) = engine.get(pk) else {
+                    continue;
+                };
+                let Some(brow) = BinaryRow::parse(&val_bytes) else {
+                    continue;
+                };
+                if !brow.class_in_hierarchy(&class_hierarchy) {
+                    continue;
+                }
+                let mut doc = if let Some(f) = filter {
+                    match eval_binary_filter(&brow, f) {
+                        Some(true) => match brow.to_map_projected(&proj_cols) {
+                            Some(d) => d,
+                            None => continue,
+                        },
+                        Some(false) => continue,
+                        None => {
+                            let Some(d) = brow.to_map() else {
+                                continue;
+                            };
+                            if !self.eval_filter_read(engine, &d, f) {
+                                continue;
+                            }
+                            d
+                        }
+                    }
+                } else {
+                    match brow.to_map_projected(&proj_cols) {
+                        Some(d) => d,
+                        None => continue,
+                    }
+                };
+                self.annotate_scanned_row(table, pk, &mut doc);
+                buf.push(doc);
+                if buf.len() >= batch {
+                    let rows = std::mem::take(&mut buf);
+                    if !sink(rows) {
+                        return Ok(());
+                    }
+                }
+            }
+            if !buf.is_empty() {
+                sink(buf);
+            }
+            return Ok(());
+        }
+
         for scan_class in &class_hierarchy {
             if stop {
                 break;
@@ -11591,7 +11831,7 @@ impl QueryExecutor {
             let prefix = format!("{}::", scan_class);
             let entries = engine.scan_prefix(prefix.as_bytes())?;
             for (key, val_bytes) in &entries {
-                // Tier 1: BinaryRow path (binary-stored data) �?no JSON parsing
+                // ---- Tier 1: BinaryRow path (binary-stored data)no JSON parsing ------
                 if let Some(brow) = BinaryRow::parse(val_bytes) {
                     if !brow.class_in_hierarchy(&class_hierarchy) {
                         continue;
@@ -14331,7 +14571,7 @@ impl QueryExecutor {
     fn extract_simple_seqscan<'a>(node: &'a PlanNode) -> Option<(String, &'a Option<FilterExpr>)> {
         match node {
             PlanNode::SeqScan { table, filter, .. } => Some((table.clone(), filter)),
-            // IndexScan is still a single-table scan with an optional filter �?
+            // ---- IndexScan is still a single-table scan with an optional filter ----
             // aggregation/count fast paths can use it via try_count_via_index.
             PlanNode::IndexScan { table, filter, .. } => Some((table.clone(), filter)),
             PlanNode::Filter { input, .. }
@@ -14339,7 +14579,7 @@ impl QueryExecutor {
             | PlanNode::Aggregation { input, .. }
             | PlanNode::Sort { input, .. }
             | PlanNode::Limit { input, .. } => Self::extract_simple_seqscan(input),
-            // JOIN nodes �?can't stream aggregate across joins
+            // ---- JOIN nodescant stream aggregate across joins --------------------
             PlanNode::NestedLoopJoin { .. }
             | PlanNode::HashJoin { .. }
             | PlanNode::SortMergeJoin { .. }
@@ -14571,7 +14811,7 @@ impl QueryExecutor {
         // Pure unfiltered COUNT(*): count via key-only scan. Avoids materializing
         // every value byte in the class (the OOM path on multi-GB tables).
         // Filtered COUNT(*) uses the same key-only streaming path with a
-        // per-row predicate �?still never materializes all values at once.
+        // ---- per-row predicatestill never materializes all values at once ----
         if group_by.is_none() && Self::is_pure_count_star(columns) {
             let class_hierarchy = self.get_class_hierarchy_read(engine, table);
             let fast_filter_cols = Self::extract_fast_filter_columns(filter);
@@ -14606,7 +14846,7 @@ impl QueryExecutor {
                     count += matched as u64;
                 }
             }
-            // Only the unfiltered count is the table row count �?a filtered
+            // ---- Only the unfiltered count is the table row counta filtered ------
             // COUNT(*) must not poison the row-count cache.
             if filter.is_none() {
                 self.set_cached_row_count(table, count);
@@ -14721,7 +14961,7 @@ impl QueryExecutor {
 
         for scan_class in &class_hierarchy {
             let prefix = format!("{}::", scan_class);
-            // Stream live rows one value at a time �?no full-result materialization.
+            // ---- Stream live rows one value at a timeno full-result materialization ----
             let mut on_value = |val_bytes: &[u8]| -> Result<()> {
                 scan_count += 1;
                 if scan_count & 0x3FF == 0 {
@@ -14929,7 +15169,7 @@ impl QueryExecutor {
                     }
                 }
             }
-            // Use to_map_projected with empty cols �?falls back to to_map()
+            // ---- Use to_map_projected with empty colsfalls back to to_map() ------
             // which now skips fields with unrecognized tags instead of failing.
             if let Some(doc) = brow.to_map_projected(&[]) {
                 apply_doc(doc, groups, group_first_row)?;
@@ -15493,9 +15733,9 @@ impl QueryExecutor {
         }
     }
 
-    // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+    // ----------------------------------------------------------------------
     //  Transactional versions (use txn_* API)
-    // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+    // ----------------------------------------------------------------------
 
     fn execute_insert_txn(
         &self,
@@ -15617,7 +15857,7 @@ impl QueryExecutor {
 
     /// Executes a COPY command: direct bulk load without transaction.
     ///
-    /// This is the fastest import path �?uses `engine.put_batch()` directly
+    // ---- This is the fastest import pathusesengine.put_batch()directly ----
     /// with a single lock acquisition for all rows.
     ///
     /// Syntax: COPY <class> FROM '<file_path>' (FORMAT CSV|JSON)
@@ -16354,7 +16594,7 @@ impl QueryExecutor {
             }
             FilterExpr::Gte(_, val) => {
                 let json_val = Self::literal_to_json_static(val);
-                // Inclusive low / open high �?must merge mem+disk like Gt/Lt.
+                // ---- Inclusive low / open highmust merge mem+disk like Gt/Lt ---------
                 index_mgr
                     .lookup_range_read(class, &col, Some(&json_val), None)
                     .unwrap_or_default()
@@ -16651,7 +16891,7 @@ impl QueryExecutor {
                         };
                         !eq
                     }
-                    None => false, // missing column �?NULL �?Ne is false
+                    None => false, // missing column -> NULL -> NE is false
                 }
             }
             FilterExpr::Gt(col, val) => doc.get(col).is_some_and(|v| self.value_gt(v, val)),
@@ -16731,7 +16971,7 @@ impl QueryExecutor {
             (Value::Number(n), LiteralValue::Float(l)) => n.as_f64() == Some(*l),
             (Value::Bool(b), LiteralValue::Bool(l)) => b == l,
             (Value::Null, LiteralValue::Null) => true,
-            // Cross-type: Number vs String �?try parsing string as number
+            // ---- Cross-type: Number vs Stringtry parsing string as number --------
             (Value::Number(n), LiteralValue::String(s)) => {
                 if let Some(i) = n.as_i64() {
                     s.parse::<i64>().map_or(false, |x| x == i)
@@ -17354,7 +17594,7 @@ impl QueryExecutor {
             }
             // ── GIS Functions ──
             "ST_POINT" => {
-                // ST_POINT(lon, lat) �?WKB hex string
+                // ---- ST_POINT(lonlat)WKB hex string ----------------------------------
                 if args.len() >= 2 {
                     let lon = args[0].as_f64().unwrap_or(0.0);
                     let lat = args[1].as_f64().unwrap_or(0.0);
@@ -17367,7 +17607,7 @@ impl QueryExecutor {
                 }
             }
             "ST_DISTANCE" => {
-                // ST_DISTANCE(geom1, geom2) �?distance in meters
+                // ---- ST_DISTANCE(geom1geom2)distance in meters -----------------------
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -17383,7 +17623,7 @@ impl QueryExecutor {
                 }
             }
             "ST_CONTAINS" => {
-                // ST_CONTAINS(geom1, geom2) �?boolean
+                // ---- ST_CONTAINS(geom1geom2)boolean ----------------------------------
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -17396,7 +17636,7 @@ impl QueryExecutor {
                 }
             }
             "ST_INTERSECTS" => {
-                // ST_INTERSECTS(geom1, geom2) �?boolean
+                // ---- ST_INTERSECTS(geom1geom2)boolean --------------------------------
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -17409,7 +17649,7 @@ impl QueryExecutor {
                 }
             }
             "ST_WITHIN" => {
-                // ST_WITHIN(geom1, geom2) �?boolean
+                // ---- ST_WITHIN(geom1geom2)boolean ------------------------------------
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -17422,7 +17662,7 @@ impl QueryExecutor {
                 }
             }
             "ST_OVERLAPS" => {
-                // ST_OVERLAPS(geom1, geom2) �?boolean
+                // ---- ST_OVERLAPS(geom1geom2)boolean ----------------------------------
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -17435,7 +17675,7 @@ impl QueryExecutor {
                 }
             }
             "ST_TOUCHES" => {
-                // ST_TOUCHES(geom1, geom2) �?boolean
+                // ---- ST_TOUCHES(geom1geom2)boolean -----------------------------------
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -17448,7 +17688,7 @@ impl QueryExecutor {
                 }
             }
             "ST_CROSSES" => {
-                // ST_CROSSES(geom1, geom2) �?boolean
+                // ---- ST_CROSSES(geom1geom2)boolean -----------------------------------
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -17461,7 +17701,7 @@ impl QueryExecutor {
                 }
             }
             "ST_DISJOINT" => {
-                // ST_DISJOINT(geom1, geom2) �?boolean
+                // ---- ST_DISJOINT(geom1geom2)boolean ----------------------------------
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -17474,7 +17714,7 @@ impl QueryExecutor {
                 }
             }
             "ST_EQUALS" => {
-                // ST_EQUALS(geom1, geom2) �?boolean
+                // ---- ST_EQUALS(geom1geom2)boolean ------------------------------------
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -17487,7 +17727,7 @@ impl QueryExecutor {
                 }
             }
             "ST_RELATE" => {
-                // ST_RELATE(geom1, geom2) �?relationship string
+                // ---- ST_RELATE(geom1geom2)relationship string ------------------------
                 if args.len() >= 2 {
                     let g1 = parse_geometry_from_value(&args[0]);
                     let g2 = parse_geometry_from_value(&args[1]);
@@ -17503,7 +17743,7 @@ impl QueryExecutor {
                 }
             }
             "ST_AS_TEXT" => {
-                // ST_AS_TEXT(geom) �?WKT string
+                // ---- ST_AS_TEXT(geom)WKT string --------------------------------------
                 if let Some(geom) = parse_geometry_from_value(&args[0]) {
                     Ok(Value::String(geom.to_wkt()))
                 } else {
@@ -17511,7 +17751,7 @@ impl QueryExecutor {
                 }
             }
             "ST_FROM_TEXT" => {
-                // ST_FROM_TEXT(wkt) �?WKB hex string
+                // ---- ST_FROM_TEXT(wkt)WKB hex string ---------------------------------
                 if let Some(Value::String(wkt)) = args.first() {
                     if let Some(geom) = onto_core::geo::Geometry::from_wkt(wkt) {
                         let wkb = geom.to_wkb();
@@ -17524,7 +17764,7 @@ impl QueryExecutor {
                 }
             }
             "GEOHASH" => {
-                // GEOHASH(lat, lon, precision) �?geohash string
+                // ---- GEOHASH(latlonprecision)geohash string --------------------------
                 if args.len() >= 2 {
                     let lat = args[0].as_f64().unwrap_or(0.0);
                     let lon = args[1].as_f64().unwrap_or(0.0);
@@ -17537,7 +17777,7 @@ impl QueryExecutor {
                 }
             }
             "ST_X" => {
-                // ST_X(point) �?x coordinate (longitude)
+                // ---- ST_X(point)x coordinate (longitude) -----------------------------
                 if let Some(geom) = parse_geometry_from_value(&args[0]) {
                     if let onto_core::geo::Geometry::Point(c) = geom {
                         Ok(json!(c.x))
@@ -17549,7 +17789,7 @@ impl QueryExecutor {
                 }
             }
             "ST_Y" => {
-                // ST_Y(point) �?y coordinate (latitude)
+                // ---- ST_Y(point)y coordinate (latitude) ------------------------------
                 if let Some(geom) = parse_geometry_from_value(&args[0]) {
                     if let onto_core::geo::Geometry::Point(c) = geom {
                         Ok(json!(c.y))
@@ -17561,7 +17801,7 @@ impl QueryExecutor {
                 }
             }
             "ST_GEOMETRY_TYPE" => {
-                // ST_GEOMETRY_TYPE(geom) �?geometry type name
+                // ---- ST_GEOMETRY_TYPE(geom)geometry type name ------------------------
                 if let Some(geom) = parse_geometry_from_value(&args[0]) {
                     Ok(Value::String(geom.geometry_type().to_string()))
                 } else {
@@ -17570,7 +17810,7 @@ impl QueryExecutor {
             }
             // ── Time Series Functions ──
             "TS_MEAN" => {
-                // TS_MEAN(array) �?mean of numeric array
+                // ---- TS_MEAN(array)mean of numeric array -----------------------------
                 if let Some(Value::Array(arr)) = args.first() {
                     let values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                     if values.is_empty() {
@@ -17584,7 +17824,7 @@ impl QueryExecutor {
                 }
             }
             "TS_STDDEV" => {
-                // TS_STDDEV(array) �?standard deviation of numeric array
+                // ---- TS_STDDEV(array)standard deviation of numeric array -------------
                 if let Some(Value::Array(arr)) = args.first() {
                     let values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                     if values.is_empty() {
@@ -17600,7 +17840,7 @@ impl QueryExecutor {
                 }
             }
             "TS_MIN" => {
-                // TS_MIN(array) �?minimum value
+                // ---- TS_MIN(array)minimum value --------------------------------------
                 if let Some(Value::Array(arr)) = args.first() {
                     let min = arr
                         .iter()
@@ -17616,7 +17856,7 @@ impl QueryExecutor {
                 }
             }
             "TS_MAX" => {
-                // TS_MAX(array) �?maximum value
+                // ---- TS_MAX(array)maximum value --------------------------------------
                 if let Some(Value::Array(arr)) = args.first() {
                     let max = arr
                         .iter()
@@ -17632,7 +17872,7 @@ impl QueryExecutor {
                 }
             }
             "TS_COUNT" => {
-                // TS_COUNT(array) �?count of non-null values
+                // ---- TS_COUNT(array)count of non-null values -------------------------
                 if let Some(Value::Array(arr)) = args.first() {
                     let count = arr.iter().filter(|v| !v.is_null()).count();
                     Ok(json!(count))
@@ -17641,7 +17881,7 @@ impl QueryExecutor {
                 }
             }
             "TS_SUM" => {
-                // TS_SUM(array) �?sum of numeric values
+                // ---- TS_SUM(array)sum of numeric values ------------------------------
                 if let Some(Value::Array(arr)) = args.first() {
                     let sum: f64 = arr.iter().filter_map(|v| v.as_f64()).sum();
                     Ok(json!(sum))
@@ -17650,7 +17890,7 @@ impl QueryExecutor {
                 }
             }
             "TS_ANOMALY_DETECT" => {
-                // TS_ANOMALY_DETECT(array, threshold) �?array of anomalous indices
+                // ---- TS_ANOMALY_DETECT(arraythreshold)array of anomalous indices -----
                 if let Some(Value::Array(arr)) = args.first() {
                     let values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                     let threshold = args.get(1).and_then(|v| v.as_f64()).unwrap_or(2.0);
@@ -17663,7 +17903,7 @@ impl QueryExecutor {
                 }
             }
             "TS_DTW" => {
-                // TS_DTW(array1, array2) �?DTW distance between two sequences
+                // ---- TS_DTW(array1array2)DTW distance between two sequences ----------
                 if args.len() >= 2 {
                     match (&args[0], &args[1]) {
                         (Value::Array(a1), Value::Array(a2)) => {
@@ -17679,7 +17919,7 @@ impl QueryExecutor {
                 }
             }
             "TS_PERCENTILE" => {
-                // TS_PERCENTILE(array, percentile) �?percentile value
+                // ---- TS_PERCENTILE(arraypercentile)percentile value ------------------
                 if let Some(Value::Array(arr)) = args.first() {
                     let mut values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                     let percentile = args.get(1).and_then(|v| v.as_f64()).unwrap_or(50.0) / 100.0;
@@ -17696,7 +17936,7 @@ impl QueryExecutor {
                 }
             }
             "TS_MEDIAN" => {
-                // TS_MEDIAN(array) �?median value
+                // ---- TS_MEDIAN(array)median value ------------------------------------
                 if let Some(Value::Array(arr)) = args.first() {
                     let mut values: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
                     if values.is_empty() {
@@ -17802,9 +18042,9 @@ impl QueryExecutor {
         }
     }
 
-    // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+    // ----------------------------------------------------------------------
     //  Schema Validation
-    // 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺?
+    // ----------------------------------------------------------------------
 
     /// Validates a document against the ontology schema.
     /// Validates serialized rows against the class schema before a bulk write
@@ -17919,7 +18159,7 @@ impl QueryExecutor {
             .find_ontology_for_class_global(engine, class)?
         {
             Some(o) => o,
-            None => return Ok(()), // No ontology �?no constraints
+            None => return Ok(()), // No ontology -> no constraints
         };
 
         let class_def = match ontology.classes.get(class) {
@@ -20959,7 +21199,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ UPDATE edge cases 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- UPDATE edge cases -----------------------------------------------
 
     #[test]
     fn test_update_no_match() {
@@ -21028,7 +21268,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ DELETE edge cases 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- DELETE edge cases -----------------------------------------------
 
     #[test]
     fn test_delete_no_match() {
@@ -21103,7 +21343,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Full lifecycle 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Full lifecycle --------------------------------------------------
 
     #[test]
     fn test_full_lifecycle() {
@@ -21195,7 +21435,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Data persistence across flush 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Data persistence across flush -----------------------------------
 
     #[test]
     fn test_data_persists_after_flush() {
@@ -21242,7 +21482,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ JOIN tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- JOIN tests ------------------------------------------------------
 
     fn insert_order(executor: &QueryExecutor, product_id: &str, quantity: i64) {
         let ast = QueryAst::Insert {
@@ -21935,7 +22175,7 @@ mod tests {
         assert_eq!(rows.len(), 50_000);
     }
 
-    // 鈹€鈹€ GROUP BY and aggregate tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- GROUP BY and aggregate tests ------------------------------------
 
     #[test]
     fn test_count_star() {
@@ -22212,7 +22452,7 @@ mod tests {
         }
     }
 
-    /// SUM + AVG over the same column must share one accumulator �?not double-count.
+    // ---- SUM + AVG over the same column must share one accumulatornot double-count ----
     #[test]
     fn test_sum_avg_same_column_no_double_count() {
         let (executor, _dir) = setup();
@@ -22443,7 +22683,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ ORDER BY tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- ORDER BY tests --------------------------------------------------
 
     #[test]
     fn test_order_by_asc() {
@@ -22697,7 +22937,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ DISTINCT tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- DISTINCT tests --------------------------------------------------
 
     #[test]
     fn test_distinct() {
@@ -22717,7 +22957,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ LIKE tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- LIKE tests ------------------------------------------------------
 
     #[test]
     fn test_like_prefix() {
@@ -22796,7 +23036,7 @@ mod tests {
         assert!(!QueryExecutor::like_match("中文测试", "%英文%"));
     }
 
-    // 鈹€鈹€ BETWEEN tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- BETWEEN tests ---------------------------------------------------
 
     #[test]
     fn test_between() {
@@ -22819,7 +23059,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ IN tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- IN tests --------------------------------------------------------
 
     #[test]
     fn test_in() {
@@ -22862,7 +23102,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ UNION tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- UNION tests -----------------------------------------------------
 
     #[test]
     fn test_union_basic() {
@@ -22932,7 +23172,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Subquery tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Subquery tests --------------------------------------------------
 
     #[test]
     fn test_subquery_in_where() {
@@ -23070,7 +23310,7 @@ mod tests {
         assert_eq!(rows.len(), 2); // iPhone matches 2 orders
     }
 
-    // 鈹€鈹€ Index-accelerated range query tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Index-accelerated range query tests -----------------------------
 
     #[test]
     fn test_index_range_gt() {
@@ -23086,7 +23326,7 @@ mod tests {
         insert_row(&executor, "Product", "AirPods", 249);
         executor.engine().flush_all().unwrap();
 
-        // Range query: price > 500 �?should use index
+        // ---- Range query: price500should use index ---------------------------
         let ast = QueryParser::parse("SELECT name, price FROM Product WHERE price > 500").unwrap();
         let result = executor.execute(&ast).unwrap();
         match &result {
@@ -23202,7 +23442,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Index consistency on UPDATE/DELETE 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Index consistency on UPDATE/DELETE ------------------------------
 
     #[test]
     fn test_index_update_consistency() {
@@ -23323,7 +23563,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Vector search tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Vector search tests ---------------------------------------------
 
     #[test]
     fn test_vector_search_basic() {
@@ -23525,7 +23765,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Phase 21: CASE WHEN tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 21: CASE WHEN tests ---------------------------------------
 
     #[test]
     fn test_case_when_basic() {
@@ -23553,7 +23793,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Phase 21: CTE tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 21: CTE tests ---------------------------------------------
 
     #[test]
     fn test_cte_basic() {
@@ -23576,7 +23816,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Phase 21: Window Function tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 21: Window Function tests ---------------------------------
 
     #[test]
     fn test_window_row_number() {
@@ -23657,7 +23897,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Phase 21: EXPLAIN ANALYZE tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 21: EXPLAIN ANALYZE tests ---------------------------------
 
     #[test]
     fn test_explain_analyze() {
@@ -23678,7 +23918,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Phase 21: Materialized View tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 21: Materialized View tests -------------------------------
 
     #[test]
     fn test_materialized_view_create_and_query() {
@@ -23794,7 +24034,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Phase 22: ANALYZE tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 22: ANALYZE tests -----------------------------------------
 
     #[test]
     fn test_analyze_command() {
@@ -23818,7 +24058,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Phase 22: Plan Cache tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 22: Plan Cache tests --------------------------------------
 
     #[test]
     fn test_plan_cache_integration() {
@@ -23838,7 +24078,7 @@ mod tests {
         assert_eq!(stats.plan_cache_hits, 1, "should have 1 plan cache hit");
     }
 
-    // 鈹€鈹€ Phase 22: Composite Index tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 22: Composite Index tests ---------------------------------
 
     #[test]
     fn test_composite_index_create() {
@@ -23859,7 +24099,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Phase 22: Index Condition Pushdown tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 22: Index Condition Pushdown tests ------------------------
 
     #[test]
     fn test_index_condition_pushdown_and() {
@@ -23890,7 +24130,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Phase 22: Runtime stats tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 22: Runtime stats tests -----------------------------------
 
     #[test]
     fn test_runtime_stats_tracking() {
@@ -23916,7 +24156,7 @@ mod tests {
         assert!(stats.table_scan_counts.contains_key("Product"));
     }
 
-    // 鈹€鈹€ Phase 23: LIMIT OFFSET tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 23: LIMIT OFFSET tests ------------------------------------
 
     #[test]
     fn test_limit_offset() {
@@ -23954,7 +24194,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Phase 23: Batch INSERT tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 23: Batch INSERT tests ------------------------------------
 
     #[test]
     fn test_batch_insert() {
@@ -23978,7 +24218,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Phase 23: Built-in function tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 23: Built-in function tests -------------------------------
 
     #[test]
     fn test_coalesce_function() {
@@ -24033,7 +24273,7 @@ mod tests {
         }
     }
 
-    // 鈹€鈹€ Phase 23: Transaction command tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 23: Transaction command tests -----------------------------
 
     #[test]
     fn test_transaction_commands() {
@@ -24071,7 +24311,7 @@ mod tests {
         assert!(!executor.in_transaction());
     }
 
-    // 鈹€鈹€ Phase 23: Recursive CTE parser test 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // ---- Phase 23: Recursive CTE parser test -----------------------------
 
     #[test]
     fn test_recursive_cte_parse() {
@@ -24476,9 +24716,9 @@ mod tests {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════�?
+    // ----------------------------------------------------------------------
     //  Import tests
-    // ══════════════════════════════════════════════════════════════════�?
+    // ----------------------------------------------------------------------
 
     /// Regression: collect_facts_for_class must read BinaryRow-stored docs.
     /// A bare serde_json parse silently dropped every binary row, so INFER
@@ -25370,7 +25610,7 @@ mod tests {
         };
         assert!(executor.execute(&ast).is_ok());
 
-        // Same student + same course �?should fail
+        // ---- Same student + same courseshould fail ---------------------------
         let ast = QueryAst::Insert {
             class: "Enrollment".to_string(),
             columns: vec!["student".to_string(), "course".to_string()],
@@ -25381,7 +25621,7 @@ mod tests {
         };
         assert!(executor.execute(&ast).is_err());
 
-        // Same student + different course �?should succeed
+        // ---- Same student + different courseshould succeed -------------------
         let ast = QueryAst::Insert {
             class: "Enrollment".to_string(),
             columns: vec!["student".to_string(), "course".to_string()],
@@ -25392,7 +25632,7 @@ mod tests {
         };
         assert!(executor.execute(&ast).is_ok());
 
-        // Different student + same course �?should succeed
+        // ---- Different student + same courseshould succeed -------------------
         let ast = QueryAst::Insert {
             class: "Enrollment".to_string(),
             columns: vec!["student".to_string(), "course".to_string()],
@@ -25417,7 +25657,7 @@ mod tests {
         let ontology_store = OntologyStore::new(engine.default_engine());
         let executor = QueryExecutor::new(engine.clone(), ontology_store);
 
-        // 默认 namespace �?"default"
+        // ---- namespacedefault ------------------------------------------------
         assert_eq!(executor.current_namespace(), "default");
 
         // 创建 namespace "tenant_a"
@@ -25426,19 +25666,19 @@ mod tests {
         };
         executor.execute(&ast).unwrap();
 
-        // 切换�?tenant_a
+        // ---- tenant_a --------------------------------------------------------
         let ast = QueryAst::UseNamespace {
             name: "tenant_a".to_string(),
         };
         executor.execute(&ast).unwrap();
         assert_eq!(executor.current_namespace(), "tenant_a");
 
-        // make_entity_id 应使用当�?namespace
+        // ---- make_entity_idnamespace -----------------------------------------
         let eid = executor.make_entity_id("Device", "001");
         assert_eq!(eid.namespace(), "tenant_a");
         assert_eq!(eid.to_lsm_key(), b"tenant_a::Device::001");
 
-        // 创建 namespace "tenant_b" 并切�?
+        // ---- namespacetenant_b -----------------------------------------------
         let ast = QueryAst::CreateNamespace {
             name: "tenant_b".to_string(),
         };
@@ -25454,10 +25694,10 @@ mod tests {
         assert_eq!(eid2.namespace(), "tenant_b");
         assert_eq!(eid2.to_lsm_key(), b"tenant_b::Device::001");
 
-        // �?class+pk 不同 namespace �?key 不碰�?
+        // ---- class+pknamespacekey --------------------------------------------
         assert_ne!(eid.to_lsm_key(), eid2.to_lsm_key());
 
-        // 切换到不存在�?namespace 应报�?
+        // ---- namespace -------------------------------------------------------
         let ast = QueryAst::UseNamespace {
             name: "nonexistent".to_string(),
         };
