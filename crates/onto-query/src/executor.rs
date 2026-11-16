@@ -6458,16 +6458,11 @@ impl QueryExecutor {
         let mut classes = HashSet::new();
         classes.insert(table.to_string());
 
-        // Find subclasses using the merged ontology
+        // Downward closure only: the table's extent is its own rows plus subclass
+        // and equivalent-class rows. A rdf:type reasoner probe would also add
+        // SUPERclasses (Cax-sco is upward entailment) — that leaked parent rows
+        // into subclass scans (`SELECT FROM Child` returned Parent rows).
         if merged_ontology.classes.contains_key(table) {
-            let reasoner = Reasoner::new(merged_ontology.clone());
-            let probe_triple = onto_ontology::Triple::type_of("__probe__", table);
-            let result = reasoner.reason(&[probe_triple]);
-            for triple in &result.all_facts {
-                if triple.subject == "__probe__" && triple.predicate == "rdf:type" {
-                    classes.insert(triple.object.clone());
-                }
-            }
             let subclasses = merged_ontology.get_all_subclasses(table);
             classes.extend(subclasses);
         }
@@ -13546,16 +13541,9 @@ impl QueryExecutor {
         // Rebuild indexes on merged ontology
         merged_ontology.rebuild_indexes();
 
-        // Now find subclasses using the merged ontology
+        // Downward closure only (see get_class_hierarchy): subclass and
+        // equivalent-class rows, never superclass rows.
         if merged_ontology.classes.contains_key(table) {
-            let reasoner = Reasoner::new(merged_ontology.clone());
-            let probe_triple = onto_ontology::Triple::type_of("__probe__", table);
-            let result = reasoner.reason(&[probe_triple]);
-            for triple in &result.all_facts {
-                if triple.subject == "__probe__" && triple.predicate == "rdf:type" {
-                    classes.insert(triple.object.clone());
-                }
-            }
             let subclasses = merged_ontology.get_all_subclasses(table);
             classes.extend(subclasses);
         }
@@ -18493,7 +18481,18 @@ impl QueryExecutor {
             None => return Ok(()),
         };
 
-        for disjoint_class in &class_def.disjoint_with {
+        // Disjointness is symmetric, but `ALTER CLASS A DISJOINT WITH B` records
+        // the axiom on A only — collect reverse declarations too, or inserting
+        // into B with A's id already present slips through the gate.
+        let mut disjoint_classes: std::collections::HashSet<String> =
+            class_def.disjoint_with.iter().cloned().collect();
+        for (other_name, other_def) in &ontology.classes {
+            if other_name.as_str() != class && other_def.disjoint_with.iter().any(|d| d == class) {
+                disjoint_classes.insert(other_name.clone());
+            }
+        }
+
+        for disjoint_class in &disjoint_classes {
             // Check if any existing instance with the same ID exists in the disjoint class.
             // INSERT builds rows keyed by `id` without stamping `__pk__`, so fall
             // back to the `id` column — otherwise the gate is silently skipped.
@@ -19844,6 +19843,95 @@ mod tests {
         executor
             .execute(&QueryParser::parse("INSERT INTO Car (id, model) VALUES ('v2', 'M')").unwrap())
             .unwrap();
+    }
+
+    /// Regression: disjointness is symmetric. `ALTER CLASS Car DISJOINT WITH Boat`
+    /// records the axiom on Car only — inserting into Boat with Car's id already
+    /// present must be rejected too (that direction used to slip through).
+    #[test]
+    fn test_disjoint_gate_rejects_reverse_direction() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY zoo2 (CLASS Vehicle, CLASS Car SUBCLASS OF Vehicle, CLASS Boat SUBCLASS OF Vehicle, PROPERTY model DOMAIN Car RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("ALTER CLASS Car DISJOINT WITH Boat").unwrap())
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Car (id, model) VALUES ('v1', 'M')").unwrap())
+            .unwrap();
+        let clash = executor.execute(&QueryParser::parse("INSERT INTO Boat (id) VALUES ('v1')").unwrap());
+        assert!(
+            clash.is_err(),
+            "disjoint constraint must reject Boat id already held by disjoint Car"
+        );
+    }
+
+    /// Regression: a subclass scan must NOT return superclass rows. Cax-sco is
+    /// upward entailment (a GraspEvent is a TaskEvent), never downward — the
+    /// hierarchy expansion used to include ancestor classes, so
+    /// `SELECT FROM Child` leaked parent rows.
+    #[test]
+    fn test_subclass_scan_excludes_superclass_rows() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY zoo3 (CLASS TaskEvent, CLASS GraspEvent SUBCLASS OF TaskEvent, PROPERTY agent_id DOMAIN TaskEvent RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO TaskEvent (id, agent_id) VALUES ('e1', 'r1')").unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO GraspEvent (id, agent_id) VALUES ('g1', 'r1')").unwrap(),
+            )
+            .unwrap();
+
+        let ids = |sql: &str| -> Vec<String> {
+            match executor.execute(&QueryParser::parse(sql).unwrap()).unwrap() {
+                QueryResult::Rows(rows) => rows
+                    .iter()
+                    .map(|r| r.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string())
+                    .collect(),
+                other => panic!("expected rows for {}, got {:?}", sql, other),
+            }
+        };
+        assert_eq!(
+            ids("SELECT id FROM GraspEvent"),
+            vec!["g1".to_string()],
+            "subclass scan must return subclass rows only"
+        );
+        let parent_ids = ids("SELECT id FROM TaskEvent");
+        assert!(
+            parent_ids.contains(&"e1".to_string()) && parent_ids.contains(&"g1".to_string()),
+            "parent scan must see own + subclass rows, got {:?}",
+            parent_ids
+        );
+
+        // Same semantics on the read path (execute_read → get_class_hierarchy_read).
+        match executor
+            .execute_read(&QueryParser::parse("SELECT id FROM GraspEvent").unwrap())
+            .unwrap()
+        {
+            QueryResult::Rows(rows) => {
+                let leaked = rows
+                    .iter()
+                    .any(|r| r.get("id").and_then(|v| v.as_str()) == Some("e1"));
+                assert!(!leaked, "read path leaked superclass row into subclass scan: {:?}", rows);
+            }
+            other => panic!("expected rows, got {:?}", other),
+        }
     }
 
     /// ALTER CLASS <name> EXTENDS <parent> must wire the hierarchy after
