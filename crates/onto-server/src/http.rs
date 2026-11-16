@@ -3265,7 +3265,7 @@ async fn openapi_spec() -> impl IntoResponse {
     (
         StatusCode::OK,
         [("Content-Type", "application/json")],
-        include_str!("../../../docs/api/openapi.json"),
+        include_str!("static/openapi.json"),
     )
 }
 

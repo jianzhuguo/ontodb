@@ -1,0 +1,754 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "OntoDB API",
+    "description": "OntoDB — ontology-driven semantic multi-modal database. Supports SQL, SPARQL, vector search, and property graph queries.",
+    "version": "0.1.0",
+    "license": {
+      "name": "Apache-2.0",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:7912",
+      "description": "Local development server (default HTTP port)"
+    }
+  ],
+  "paths": {
+    "/api/health": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Comprehensive health check",
+        "description": "Probes storage engine, WAL status, and query parser. Returns 200 if healthy, 503 if degraded.",
+        "operationId": "healthCheck",
+        "responses": {
+          "200": {
+            "description": "All systems healthy",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" }
+              }
+            }
+          },
+          "503": {
+            "description": "One or more subsystems degraded",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/health/ready": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Kubernetes readiness probe",
+        "description": "Returns 200 if the server can accept queries.",
+        "operationId": "healthReady",
+        "responses": {
+          "200": { "description": "Ready to accept traffic" },
+          "503": { "description": "Not ready" }
+        }
+      }
+    },
+    "/api/health/live": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Kubernetes liveness probe",
+        "description": "Returns 200 if the server process is alive.",
+        "operationId": "healthLive",
+        "responses": {
+          "200": { "description": "Server is alive" }
+        }
+      }
+    },
+    "/api/query": {
+      "post": {
+        "tags": ["Query"],
+        "summary": "Execute SQL query",
+        "description": "Execute a SQL or OntoDB query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE, VECTOR SEARCH, and more.",
+        "operationId": "executeQuery",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/QueryRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Query executed successfully",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/QueryResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Parse error",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "500": {
+            "description": "Execution error",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sparql": {
+      "post": {
+        "tags": ["SPARQL"],
+        "summary": "Execute SPARQL query",
+        "description": "Execute a SPARQL query. Translates to SQL internally and returns W3C SPARQL Results JSON format.",
+        "operationId": "sparqlQuery",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SparqlRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "SPARQL query results",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/QueryResponse" }
+              }
+            }
+          },
+          "400": { "description": "SPARQL parse error" },
+          "500": { "description": "Execution error" }
+        }
+      }
+    },
+    "/api/vector/search": {
+      "post": {
+        "tags": ["Vector"],
+        "summary": "Vector similarity search",
+        "description": "Perform HNSW-based vector similarity search with optional SQL filter for hybrid queries.",
+        "operationId": "vectorSearch",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/VectorSearchRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Search results",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/QueryResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hybrid/query": {
+      "post": {
+        "tags": ["Vector"],
+        "summary": "Hybrid SQL + vector search",
+        "description": "Combine SQL filtering with vector similarity ranking.",
+        "operationId": "hybridQuery",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/HybridQueryRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Hybrid query results",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/QueryResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/semantic/similar": {
+      "post": {
+        "tags": ["Semantic"],
+        "summary": "Semantic/structural similarity search",
+        "description": "Vector similarity search with optional entity anchor (the anchor's stored vector is loaded automatically, JSON array or base64 bit-vector) and SQL WHERE filter. Ontology type scoping via the class name (class + hierarchy).",
+        "operationId": "semanticSimilar",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["class", "column", "top_k"],
+                "properties": {
+                  "class": { "type": "string", "description": "Target class (search scope = class + hierarchy)" },
+                  "column": { "type": "string", "description": "Vector column" },
+                  "query_vector": { "type": "array", "items": { "type": "number" }, "description": "Query vector (exactly one of query_vector / entity_id)" },
+                  "entity_id": { "type": "string", "description": "Anchor entity id; its vector becomes the query" },
+                  "id_column": { "type": "string", "description": "Id column for entity lookup (default id)" },
+                  "top_k": { "type": "integer", "description": "Result count (cap 10000)" },
+                  "filter": { "type": "string", "description": "SQL WHERE fragment" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Rows with _distance",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/QueryResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/semantic/trace": {
+      "post": {
+        "tags": ["Semantic"],
+        "summary": "Relation-chain trace with inference",
+        "description": "Traverses a relation chain hop by hop from an anchor (out: source=prev; in: target=prev), optionally enriching with INFER-produced facts (rule-attributed).",
+        "operationId": "semanticTrace",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["anchor", "chain"],
+                "properties": {
+                  "anchor": {
+                    "description": "Storage key string, or {class, id[, id_column]} resolved via id lookup",
+                    "oneOf": [
+                      { "type": "string" },
+                      {
+                        "type": "object",
+                        "required": ["class", "id"],
+                        "properties": {
+                          "class": { "type": "string" },
+                          "id": { "type": "string" },
+                          "id_column": { "type": "string" }
+                        }
+                      }
+                    ]
+                  },
+                  "chain": {
+                    "type": "array",
+                    "items": {
+                      "oneOf": [
+                        { "type": "string" },
+                        {
+                          "type": "object",
+                          "required": ["relation"],
+                          "properties": {
+                            "relation": { "type": "string" },
+                            "direction": { "type": "string", "enum": ["out", "in"] },
+                            "limit": { "type": "integer" }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "infer_relations": { "type": "array", "items": { "type": "string" } },
+                  "rules": { "type": "array", "items": { "type": "string" }, "description": "Rule filter, e.g. [\"Prp-inv\"]" },
+                  "limit_per_hop": { "type": "integer", "description": "Default 100, cap 5000" },
+                  "inferred_limit": { "type": "integer", "description": "Default 500, cap 50000" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Per-hop edges plus inferred facts",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/QueryResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/semantic/infer": {
+      "post": {
+        "tags": ["Semantic"],
+        "summary": "Explicit inference query (rule selection + pagination)",
+        "description": "Runs OWL-lite reasoning scoped by an inner SELECT, returns inferred triples {subject, predicate, object, rule} with offset/limit pagination over the streaming closure.",
+        "operationId": "semanticInfer",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                  "query": { "type": "string", "description": "Inner SELECT (fact-collection scope)" },
+                  "rules": { "type": "array", "items": { "type": "string" }, "description": "Empty = all 7 rules" },
+                  "limit": { "type": "integer", "description": "Default 100, cap 10000" },
+                  "offset": { "type": "integer", "description": "Default 0" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Inferred triples page",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/QueryResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/semantic/expand": {
+      "post": {
+        "tags": ["Semantic"],
+        "summary": "Semantic expansion (hierarchy + synonyms + similar)",
+        "description": "BFS expansion over a hierarchy relation (up = ancestors, down = descendants), synonym links via caller-named relations, and optional vector-similar concepts.",
+        "operationId": "semanticExpand",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["term", "relation"],
+                "properties": {
+                  "term": {
+                    "oneOf": [
+                      { "type": "string" },
+                      {
+                        "type": "object",
+                        "required": ["class", "id"],
+                        "properties": {
+                          "class": { "type": "string" },
+                          "id": { "type": "string" },
+                          "id_column": { "type": "string" }
+                        }
+                      }
+                    ]
+                  },
+                  "relation": { "type": "string", "description": "Hierarchy relation, qualified class name (e.g. sembio.go_is_a)" },
+                  "direction": { "type": "string", "enum": ["up", "down", "both"], "description": "Default both" },
+                  "max_depth": { "type": "integer", "description": "Default 3, cap 10" },
+                  "synonym_relations": { "type": "array", "items": { "type": "string" } },
+                  "similar": {
+                    "type": "object",
+                    "required": ["class", "column", "key_field", "key_value"],
+                    "properties": {
+                      "class": { "type": "string" },
+                      "column": { "type": "string" },
+                      "key_field": { "type": "string" },
+                      "key_value": { "type": "string" },
+                      "top_k": { "type": "integer" }
+                    }
+                  },
+                  "limit": { "type": "integer", "description": "Per bucket, default 200, cap 5000" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ancestors / descendants / synonyms / similar",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/QueryResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/schema": {
+      "get": {
+        "tags": ["Schema"],
+        "summary": "Schema introspection",
+        "description": "Get database schema information including all classes, columns, and indexes.",
+        "operationId": "getSchema",
+        "responses": {
+          "200": {
+            "description": "Schema information",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/QueryResponse" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/graph/vertex": {
+      "post": {
+        "tags": ["Graph"],
+        "summary": "Add a vertex",
+        "description": "Add a vertex (node) to the property graph with optional labels and properties.",
+        "operationId": "addVertex",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/VertexRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Vertex added" },
+          "400": { "description": "Missing vertex id" },
+          "409": { "description": "Duplicate vertex" }
+        }
+      }
+    },
+    "/api/graph/edge": {
+      "post": {
+        "tags": ["Graph"],
+        "summary": "Add an edge",
+        "description": "Add an edge (relationship) between two vertices.",
+        "operationId": "addEdge",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/EdgeRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Edge added" },
+          "400": { "description": "Missing required fields" },
+          "404": { "description": "Source or target vertex not found" },
+          "409": { "description": "Duplicate edge" }
+        }
+      }
+    },
+    "/api/graph/traverse": {
+      "post": {
+        "tags": ["Graph"],
+        "summary": "Traverse the graph",
+        "description": "Perform BFS or DFS traversal from a starting vertex with optional edge label and depth filters.",
+        "operationId": "graphTraverse",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TraverseRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Traversal results" },
+          "404": { "description": "Start vertex not found" }
+        }
+      }
+    },
+    "/api/graph/shortest-path": {
+      "post": {
+        "tags": ["Graph"],
+        "summary": "Find shortest path",
+        "description": "Find the shortest path between two vertices using BFS.",
+        "operationId": "graphShortestPath",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ShortestPathRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Path found (or not)" },
+          "404": { "description": "Vertex not found" }
+        }
+      }
+    },
+    "/api/graph/vertex/{id}": {
+      "get": {
+        "tags": ["Graph"],
+        "summary": "Get a vertex by ID",
+        "operationId": "getVertex",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Vertex ID"
+          }
+        ],
+        "responses": {
+          "200": { "description": "Vertex found" },
+          "404": { "description": "Vertex not found" }
+        }
+      },
+      "delete": {
+        "tags": ["Graph"],
+        "summary": "Delete a vertex",
+        "description": "Delete a vertex and all its connected edges.",
+        "operationId": "deleteVertex",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Vertex ID"
+          }
+        ],
+        "responses": {
+          "200": { "description": "Vertex deleted" },
+          "404": { "description": "Vertex not found" }
+        }
+      }
+    },
+    "/api/graph/neighbors/{id}": {
+      "get": {
+        "tags": ["Graph"],
+        "summary": "Get neighbors of a vertex",
+        "operationId": "getNeighbors",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Vertex ID"
+          }
+        ],
+        "responses": {
+          "200": { "description": "Neighbor list" }
+        }
+      }
+    },
+    "/api/backup": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Create backup",
+        "description": "Create a full snapshot backup to the specified directory.",
+        "operationId": "backup",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BackupRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Backup completed" },
+          "500": { "description": "Backup failed" }
+        }
+      }
+    },
+    "/api/flush": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Flush MemTable",
+        "description": "Force flush the in-memory MemTable to SSTable on disk.",
+        "operationId": "flush",
+        "responses": {
+          "200": { "description": "Flush completed" },
+          "500": { "description": "Flush failed" }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": ["Monitoring"],
+        "summary": "Prometheus metrics",
+        "description": "Returns metrics in Prometheus exposition format.",
+        "operationId": "metricsPrometheus",
+        "responses": {
+          "200": {
+            "description": "Prometheus metrics",
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/metrics": {
+      "get": {
+        "tags": ["Monitoring"],
+        "summary": "JSON metrics",
+        "description": "Returns server metrics in JSON format.",
+        "operationId": "metricsJson",
+        "responses": {
+          "200": {
+            "description": "JSON metrics",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "degraded"] },
+          "version": { "type": "string" },
+          "engine": { "type": "string" },
+          "uptime_seconds": { "type": "integer" },
+          "checks": { "type": "object" }
+        }
+      },
+      "QueryRequest": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": { "type": "string", "description": "SQL or OntoDB query string", "example": "SELECT * FROM Product WHERE price > 100" },
+          "pretty": { "type": "boolean", "default": false, "description": "Pretty-print JSON response" }
+        }
+      },
+      "SparqlRequest": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": { "type": "string", "description": "SPARQL query string", "example": "SELECT ?name WHERE { ?x <name> ?name }" }
+        }
+      },
+      "VectorSearchRequest": {
+        "type": "object",
+        "required": ["class", "column", "query_vector", "top_k"],
+        "properties": {
+          "class": { "type": "string", "description": "Target class (table) name", "example": "Product" },
+          "column": { "type": "string", "description": "Vector column name", "example": "embedding" },
+          "query_vector": { "type": "array", "items": { "type": "number", "format": "float" }, "description": "Query vector" },
+          "top_k": { "type": "integer", "description": "Number of results to return", "example": 10 },
+          "filter": { "type": "string", "description": "Optional SQL WHERE filter", "example": "price > 100" }
+        }
+      },
+      "HybridQueryRequest": {
+        "type": "object",
+        "required": ["sql_filter", "vector_column", "query_vector", "top_k"],
+        "properties": {
+          "sql_filter": { "type": "string", "example": "SELECT * FROM Product WHERE price > 100" },
+          "vector_column": { "type": "string", "example": "embedding" },
+          "query_vector": { "type": "array", "items": { "type": "number", "format": "float" } },
+          "top_k": { "type": "integer", "example": 10 },
+          "class": { "type": "string", "description": "Optional class name override" }
+        }
+      },
+      "VertexRequest": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string", "description": "Unique vertex identifier", "example": "v1" },
+          "labels": { "type": "array", "items": { "type": "string" }, "description": "Vertex labels", "example": ["Person"] },
+          "properties": { "type": "object", "description": "Key-value properties", "example": {"name": "Alice", "age": 30} }
+        }
+      },
+      "EdgeRequest": {
+        "type": "object",
+        "required": ["id", "from", "to"],
+        "properties": {
+          "id": { "type": "string", "description": "Unique edge identifier", "example": "e1" },
+          "from": { "type": "string", "description": "Source vertex ID", "example": "v1" },
+          "to": { "type": "string", "description": "Target vertex ID", "example": "v2" },
+          "label": { "type": "string", "description": "Edge label/type", "example": "KNOWS" },
+          "properties": { "type": "object", "description": "Key-value properties", "example": {"since": 2020} }
+        }
+      },
+      "TraverseRequest": {
+        "type": "object",
+        "required": ["start"],
+        "properties": {
+          "start": { "type": "string", "description": "Starting vertex ID", "example": "v1" },
+          "direction": { "type": "string", "enum": ["out", "in", "both"], "default": "out" },
+          "max_depth": { "type": "integer", "default": 3, "description": "Maximum traversal depth" },
+          "edge_label": { "type": "string", "description": "Filter by edge label", "example": "KNOWS" },
+          "algorithm": { "type": "string", "enum": ["bfs", "dfs"], "default": "bfs" }
+        }
+      },
+      "ShortestPathRequest": {
+        "type": "object",
+        "required": ["from", "to"],
+        "properties": {
+          "from": { "type": "string", "description": "Source vertex ID", "example": "v1" },
+          "to": { "type": "string", "description": "Target vertex ID", "example": "v5" },
+          "max_depth": { "type": "integer", "default": 10 }
+        }
+      },
+      "BackupRequest": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": { "type": "string", "description": "Backup directory path", "example": "/backups/2026-08-08" }
+        }
+      },
+      "QueryResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean" },
+          "data": { "description": "Query result data" },
+          "error": { "type": "string" },
+          "elapsed_ms": { "type": "number", "format": "double" }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "success": { "type": "boolean", "enum": [false] },
+          "error": { "type": "string" }
+        }
+      }
+    },
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "API key for authentication. See config/api_keys.example.json for setup."
+      }
+    }
+  },
+  "security": [
+    { "ApiKeyAuth": [] }
+  ],
+  "tags": [
+    { "name": "Health", "description": "Health check and probe endpoints (no auth required)" },
+    { "name": "Query", "description": "SQL query execution" },
+    { "name": "SPARQL", "description": "SPARQL query execution" },
+    { "name": "Vector", "description": "Vector similarity and hybrid search" },
+    { "name": "Graph", "description": "Property graph CRUD and traversal" },
+    { "name": "Schema", "description": "Schema introspection" },
+    { "name": "Admin", "description": "Backup and maintenance (admin key required)" },
+    { "name": "Monitoring", "description": "Prometheus and JSON metrics" }
+  ]
+}
