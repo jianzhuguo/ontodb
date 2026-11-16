@@ -179,3 +179,47 @@ crates/onto-enterprise/
 # Personal documents (never into public repo)
 *简历*
 BP_*.pdf
+
+# Root-level one-off scripts & local data artifacts (2026-11-16 sweep)
+/dbg_*.py
+/demo_*.py
+/eval_*.py
+/gen_*.py
+/cleanup_*.py
+/del_probe_*.py
+/repro_*.py
+/recheck_*.py
+/scan_*.py
+/smoke_*.py
+/run_*.bat
+/heap*
+/crash_*
+/map_*.py
+/migrate_*.py
+/parse_*.py
+/p11_*.py
+/find_*.py
+/update_*portal.py
+/patch_resume.py
+/jd.txt
+/*_list.txt
+/*_del_ids.txt
+/*_missing.txt
+/*_report.json
+/*_map.json
+/*.sqlite
+/zstd-pr/
+*.state.json
+*.err.*
+*.out.*
+*.bak
+*.pdf
+
+# Local data-pipeline / analysis utilities in scripts/ (not product source)
+/scripts/*_dedupe.py
+/scripts/*_rebuild.py
+/scripts/*_pipeline.py
+/scripts/disease_semantic_*.py
+/scripts/link_clinvar.py
+/scripts/ontodb_semantic.py
+/scripts/semantic_*.py
