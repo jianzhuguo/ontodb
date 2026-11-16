@@ -11,7 +11,7 @@
 //! - Conservative pruning that preserves graph connectivity
 //! - Bidirectional edges maintained carefully
 
-use super::distance::{distance, hamming_packed, tanimoto_packed, DistanceMetric};
+use super::distance::{distance, distance_packed, DistanceMetric};
 use rand::Rng;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
@@ -87,15 +87,12 @@ impl VecData {
     }
 
     /// Distance between two vectors; Packed pairs use bit ops (fast path).
+    ///
+    /// The bit path honours *every* metric: `from_f32` packs any all-0/1
+    /// vector, so an L2/Cosine/InnerProduct index can hold Packed nodes too.
     pub fn distance_to(&self, other: &VecData, metric: DistanceMetric) -> f32 {
         match (self, other) {
-            (VecData::Packed(a), VecData::Packed(b)) => {
-                if metric == DistanceMetric::Tanimoto {
-                    tanimoto_packed(a, b)
-                } else {
-                    hamming_packed(a, b)
-                }
-            }
+            (VecData::Packed(a), VecData::Packed(b)) => distance_packed(a, b, metric),
             (a, b) => {
                 let dim = match (a, b) {
                     (VecData::Dense(x), _) => x.len(),
@@ -1206,6 +1203,48 @@ mod tests {
 
         let results = index.search(&[1.0, 0.0, 0.0], 2);
         assert_eq!(results[0].entry.id, b"x");
+    }
+
+    /// Regression: `from_f32` packs 0/1 vectors, so a Cosine/L2/InnerProduct
+    /// index can hold Packed nodes.  The Packed×Packed path used to report
+    /// Hamming for every non-Tanimoto metric, which reorders results (below:
+    /// Hamming prefers `few`, Cosine prefers `dense`).
+    #[test]
+    fn test_packed_binary_vectors_honour_index_metric() {
+        let q = VecData::from_f32(&[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let dense = VecData::from_f32(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+        let few = VecData::from_f32(&[1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+        assert!(matches!(q, VecData::Packed(_)));
+        assert!(matches!(dense, VecData::Packed(_)));
+        assert!(matches!(few, VecData::Packed(_)));
+
+        // Hamming: few(3) beats dense(6). Cosine: dense(0.5) beats few(~0.592).
+        assert_eq!(q.distance_to(&few, DistanceMetric::Hamming), 3.0);
+        assert_eq!(q.distance_to(&dense, DistanceMetric::Hamming), 6.0);
+        assert!((q.distance_to(&dense, DistanceMetric::Cosine) - 0.5).abs() < 1e-6);
+        assert!(
+            q.distance_to(&dense, DistanceMetric::Cosine)
+                < q.distance_to(&few, DistanceMetric::Cosine)
+        );
+        assert!((q.distance_to(&few, DistanceMetric::L2) - 3.0f32.sqrt()).abs() < 1e-6);
+        assert_eq!(q.distance_to(&few, DistanceMetric::InnerProduct), -1.0);
+
+        let config = HnswConfig::new(8, DistanceMetric::Cosine)
+            .with_m(8)
+            .with_ef_construction(50)
+            .with_ef_search(30);
+        let mut index = HnswIndex::new(config);
+        index.insert(VectorEntry {
+            id: b"few".to_vec(),
+            vector: vec![1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        });
+        index.insert(VectorEntry {
+            id: b"dense".to_vec(),
+            vector: vec![1.0; 8],
+        });
+        let results = index.search(&[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].entry.id, b"dense");
     }
 
     // ── prune_ids: 6 boundary cases ─────────────────────────────────

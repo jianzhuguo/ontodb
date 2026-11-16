@@ -3509,73 +3509,10 @@ impl QueryExecutor {
                     *ef_construction,
                     *ef_search,
                 )?;
-                // Backfill existing documents into the fresh index in bounded
-                // batches.  base64 Bytes decode straight to packed bits (no
-                // 1024-float round-trip); keeps memory flat for 2.45M rows.
-                {
-                    let prefix = format!("{}::", class);
-                    let mut total = 0usize;
-                    let mut batch: Vec<(Vec<u8>, String, String, onto_storage::VecData)> =
-                        Vec::new();
-                    const BATCH: usize = 10_000;
-                    {
-                        let mut sink = |pk: &[u8], val_bytes: &[u8]| -> Result<bool> {
-                            if let Some(doc) = Self::parse_doc_bytes(val_bytes) {
-                                if doc.get("__class__").and_then(|v| v.as_str())
-                                    == Some(class.as_str())
-                                {
-                                    if let Some(data) = doc.get(column.as_str()).and_then(|v| {
-                                        onto_storage::VecData::from_json(v, *dimension)
-                                    }) {
-                                        batch.push((
-                                            pk.to_vec(),
-                                            class.clone(),
-                                            column.clone(),
-                                            data,
-                                        ));
-                                    }
-                                }
-                            }
-                            if batch.len() >= BATCH {
-                                engine
-                                    .vector_index_manager()
-                                    .write()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .index_vector_data_owned(std::mem::take(&mut batch));
-                                total += BATCH;
-                                tracing::info!(
-                                    table = class.as_str(),
-                                    column = column.as_str(),
-                                    indexed = total,
-                                    "Vector index backfill progress"
-                                );
-                            }
-                            Ok(true)
-                        };
-                        engine.for_each_live_prefix_until(
-                            prefix.as_bytes(),
-                            None,
-                            None,
-                            &mut sink,
-                        )?;
-                    }
-                    if !batch.is_empty() {
-                        total += batch.len();
-                        engine
-                            .vector_index_manager()
-                            .write()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .index_vector_data_owned(std::mem::take(&mut batch));
-                    }
-                    tracing::info!(
-                        table = class.as_str(),
-                        column = column.as_str(),
-                        vectors = total,
-                        "Vector index backfill complete"
-                    );
-                    // Persist the full HNSW graph so restarts do not rebuild.
-                    engine.persist_vector_graph(class, column)?;
-                }
+                // `create_vector_index` already performed the one authoritative
+                // backfill (JSON arrays + base64 packed fingerprints, streamed
+                // in bounded batches) and persisted the graph. Scanning again
+                // here would insert a second HNSW node for every document.
                 Ok(QueryResult::Success(format!(
                     "Vector index created on {}.{} (dim={}, metric={:?})",
                     class, column, dimension, distance_metric
@@ -23868,6 +23805,155 @@ mod tests {
 
         // Verify it's gone
         assert!(!executor.engine().has_vector_index("Product", "embedding"));
+    }
+
+    /// Regression: `CREATE VECTOR INDEX` must scan the table once, not once in
+    /// the engine and again in the executor (5 rows used to yield 10 nodes).
+    #[test]
+    fn test_create_vector_index_backfills_each_row_once() {
+        let (executor, _dir) = setup();
+        for i in 0..5 {
+            let ast = QueryAst::Insert {
+                class: "Product".to_string(),
+                columns: vec!["name".to_string(), "embedding".to_string()],
+                values: vec![
+                    LiteralValue::String(format!("p{i}")),
+                    LiteralValue::String(format!("[0.{i}, 1.0, 0.0]")),
+                ],
+            };
+            executor.execute(&ast).unwrap();
+        }
+        executor.engine().flush_all().unwrap();
+
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            executor.engine().vector_index_len("Product", "embedding"),
+            Some(5),
+            "one HNSW node per document; a double backfill would report 10"
+        );
+    }
+
+    /// Regression: base64 bit-packed BYTES columns must be backfilled by the
+    /// engine instead of being skipped as non-JSON arrays.
+    #[test]
+    fn test_create_vector_index_backfills_base64_fingerprints() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY chem (CLASS Molecule, PROPERTY name DOMAIN Molecule RANGE STRING, PROPERTY fp DOMAIN Molecule RANGE BYTES)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        for (name, bits) in [
+            ("a", 0b1010_0000u8),
+            ("b", 0b1100_0000u8),
+            ("c", 0b1000_0000u8),
+        ] {
+            let ast = QueryAst::Insert {
+                class: "Molecule".to_string(),
+                columns: vec!["name".to_string(), "fp".to_string()],
+                values: vec![
+                    LiteralValue::String(name.to_string()),
+                    LiteralValue::String(onto_core::binary_fp::bytes_to_b64(&[bits])),
+                ],
+            };
+            executor.execute(&ast).unwrap();
+        }
+        executor.engine().flush_all().unwrap();
+
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE VECTOR INDEX ON Molecule (fp) METRIC tanimoto DIMENSION 8",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            executor.engine().vector_index_len("Molecule", "fp"),
+            Some(3),
+            "base64 packed fingerprints must take the same backfill path"
+        );
+    }
+
+    /// End-to-end vector search over base64-packed 0/1 fingerprints with the
+    /// Cosine metric. Before the fix, Packed×Packed silently used Hamming:
+    /// Hamming prefers `few` (3 vs 6) while Cosine prefers `dense` (0.5 vs
+    /// ~0.592), so a wrong ranking here proves the whole path is wired up.
+    #[test]
+    fn test_vector_search_cosine_over_packed_fingerprints() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY chem (CLASS Molecule, PROPERTY name DOMAIN Molecule RANGE STRING, PROPERTY fp DOMAIN Molecule RANGE BYTES)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Insert before CREATE INDEX so the vectors arrive via engine backfill
+        // (base64 -> Packed, no Cosine pre-normalization).
+        for (name, bits) in [
+            ("few", 0b1011_0000u8),     // q=[1,1,0..]; inter=1, on-bits=3
+            ("dense", 0b1111_1111u8),   // q=[1,1,0..]; inter=2, on-bits=8
+        ] {
+            let ast = QueryAst::Insert {
+                class: "Molecule".to_string(),
+                columns: vec!["name".to_string(), "fp".to_string()],
+                values: vec![
+                    LiteralValue::String(name.to_string()),
+                    LiteralValue::String(onto_core::binary_fp::bytes_to_b64(&[bits])),
+                ],
+            };
+            executor.execute(&ast).unwrap();
+        }
+        executor.engine().flush_all().unwrap();
+
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE VECTOR INDEX ON Molecule (fp) METRIC cosine DIMENSION 8",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let rows = match executor
+            .execute(
+                &QueryParser::parse(
+                    "VECTOR SEARCH ON Molecule (fp) QUERY [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] TOP 2",
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        {
+            QueryResult::Rows(rows) => rows,
+            other => panic!("expected Rows from VECTOR SEARCH, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get("name").unwrap().as_str().unwrap(),
+            "dense",
+            "Cosine must rank dense first; Hamming would rank few first"
+        );
+        let d = rows[0]
+            .get("_distance")
+            .and_then(|v| v.as_f64())
+            .expect("distance column");
+        assert!((d - 0.5).abs() < 1e-5, "expected cosine distance 0.5, got {d}");
     }
 
     #[test]

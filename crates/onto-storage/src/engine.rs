@@ -5008,37 +5008,52 @@ impl LsmEngine {
             ws.memtable.put_with_seq(meta_key, meta_val, seq);
         }
 
-        // Backfill: scan existing documents, collect vectors, then batch insert under single lock
+        // Backfill: one streaming pass over the class prefix. `from_json`
+        // accepts both legacy f32 arrays and base64 bit-packed fingerprints,
+        // so the two column encodings take the same path into the same graph.
+        // Batches keep peak memory flat for multi-million-row tables.
         let prefix = format!("{}::", class);
-        let entries = self.scan_prefix(prefix.as_bytes())?;
-
-        let mut vectors: Vec<(Vec<u8>, Vec<f32>)> = Vec::new();
-        for (pk, val_bytes) in entries {
-            if let Some(doc) = parse_doc_bytes(&val_bytes) {
-                if doc.get("__class__").and_then(|v| v.as_str()) == Some(class) {
-                    if let Some(serde_json::Value::Array(arr)) = doc.get(column) {
-                        let vec: Vec<f32> = arr
-                            .iter()
-                            .filter_map(|v| v.as_f64().map(|f| f as f32))
-                            .collect();
-                        if vec.len() == dimension {
-                            vectors.push((pk, vec));
-                        }
+        const BACKFILL_BATCH: usize = 10_000;
+        let mut batch: Vec<(Vec<u8>, String, String, VecData)> =
+            Vec::with_capacity(BACKFILL_BATCH);
+        let mut total = 0usize;
+        {
+            let mut sink = |pk: &[u8], val_bytes: &[u8]| -> Result<()> {
+                if let Some(val) = extract_index_field(val_bytes, class, column) {
+                    if let Some(data) = VecData::from_json(&val, dimension) {
+                        batch.push((
+                            pk.to_vec(),
+                            class.to_string(),
+                            column.to_string(),
+                            data,
+                        ));
                     }
                 }
-            }
+                if batch.len() >= BACKFILL_BATCH {
+                    self.vector_index_manager
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .index_vector_data_owned(std::mem::take(&mut batch));
+                    total += BACKFILL_BATCH;
+                }
+                Ok(())
+            };
+            self.for_each_live_prefix(prefix.as_bytes(), None, None, &mut sink)?;
         }
-
-        // Batch insert under single write lock (not per-document)
-        if !vectors.is_empty() {
-            let owned: Vec<(Vec<u8>, String, String, Vec<f32>)> = vectors
-                .into_iter()
-                .map(|(pk, v)| (pk, class.to_string(), column.to_string(), v))
-                .collect();
+        if !batch.is_empty() {
+            total += batch.len();
             self.vector_index_manager
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
-                .index_vector_batch_owned(owned);
+                .index_vector_data_owned(batch);
+        }
+        if total > 0 {
+            tracing::info!(
+                table = %class,
+                column = %column,
+                vectors = total,
+                "Vector index backfill complete"
+            );
         }
 
         // Persist the HNSW graph for fast restart (file snapshot).

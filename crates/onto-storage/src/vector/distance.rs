@@ -47,6 +47,49 @@ pub fn hamming_packed(a: &[u8], b: &[u8]) -> f32 {
     bits as f32
 }
 
+/// Distance between two bit-packed 0/1 vectors for **any** metric.
+///
+/// `VecData::from_f32` silently packs any all-0/1 vector, so a binary
+/// fingerprint can live in the index under L2, Cosine or InnerProduct too.
+/// For 0/1 data the f32 formulas collapse to three popcounts:
+///
+/// - squared L2 = Hamming = `ca + cb - 2*inter`
+/// - dot product = `inter`, `||a||² = ca`, `||b||² = cb`
+///
+/// Keeping this as a bit-op path avoids expanding 1024-bit fingerprints to
+/// f32 on every graph traversal while still returning the metric the caller
+/// asked for (returning Hamming for Cosine would reorder search results).
+pub fn distance_packed(a: &[u8], b: &[u8], metric: DistanceMetric) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "packed vector lengths must match");
+    match metric {
+        DistanceMetric::Hamming => hamming_packed(a, b),
+        DistanceMetric::Tanimoto => tanimoto_packed(a, b),
+        DistanceMetric::L2 | DistanceMetric::Cosine | DistanceMetric::InnerProduct => {
+            let mut inter = 0u32;
+            let mut ca = 0u32;
+            let mut cb = 0u32;
+            for (x, y) in a.iter().zip(b.iter()) {
+                inter += (x & y).count_ones();
+                ca += x.count_ones();
+                cb += y.count_ones();
+            }
+            match metric {
+                DistanceMetric::L2 => ((ca + cb - 2 * inter) as f32).sqrt(),
+                DistanceMetric::Cosine => {
+                    let denom = (ca as f32).sqrt() * (cb as f32).sqrt();
+                    if denom == 0.0 {
+                        1.0
+                    } else {
+                        1.0 - inter as f32 / denom
+                    }
+                }
+                DistanceMetric::InnerProduct => -(inter as f32),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
 /// Tanimoto distance on bit-packed bytes: 1 - |a∩b|/|a∪b| = 1 - c/(a+b-c)
 /// where c = shared on-bits, a/b = on-bit counts. Lower = more similar.
 /// Standard metric for chemical fingerprints (ECFP/Morgan).
@@ -185,5 +228,41 @@ mod tests {
         let b = [4.0, 5.0, 6.0];
         let d = distance(&a, &b, DistanceMetric::InnerProduct);
         assert!((d - (-32.0)).abs() < 1e-6); // -(1*4 + 2*5 + 3*6) = -32
+    }
+
+    /// The packed fast path must agree with the f32 path for every metric;
+    /// otherwise 0/1 vectors indexed as Packed get silently mis-ranked.
+    #[test]
+    fn test_distance_packed_matches_f32_for_all_metrics() {
+        let a = [1.0f32, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let b = [1.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let pa = [0b1010_0000u8];
+        let pb = [0b1100_0000u8];
+        for metric in [
+            DistanceMetric::L2,
+            DistanceMetric::Cosine,
+            DistanceMetric::InnerProduct,
+            DistanceMetric::Hamming,
+            DistanceMetric::Tanimoto,
+        ] {
+            let from_f32 = distance(&a, &b, metric);
+            // Hamming/Tanimoto are defined on packed bytes in `distance`;
+            // compare against their dedicated packed implementations.
+            let expected = match metric {
+                DistanceMetric::Hamming => hamming_packed(&pa, &pb),
+                DistanceMetric::Tanimoto => tanimoto_packed(&pa, &pb),
+                _ => from_f32,
+            };
+            assert!(
+                (distance_packed(&pa, &pb, metric) - expected).abs() < 1e-6,
+                "metric {metric:?}: packed path disagrees with reference"
+            );
+        }
+
+        // Zero-vector cosine must stay at the neutral 1.0, same as f32.
+        assert_eq!(
+            distance_packed(&[0u8], &[0u8], DistanceMetric::Cosine),
+            distance(&[0.0f32; 8], &[0.0f32; 8], DistanceMetric::Cosine)
+        );
     }
 }
