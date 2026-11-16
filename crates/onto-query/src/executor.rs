@@ -5453,6 +5453,86 @@ impl QueryExecutor {
         Ok(Vec::new())
     }
 
+    /// A missing or empty vector index used to look identical to "no matches"
+    /// (a silent `[]`). Build an error that names the likely intended class
+    /// instead: either another class indexed on the same column, or a subclass
+    /// that actually owns the column while the queried index has 0 vectors.
+    fn vector_index_unavailable_error(
+        &self,
+        engine: &LsmEngine,
+        class: &str,
+        column: &str,
+    ) -> CoreError {
+        let engines = self.engine.all_engines();
+
+        // No index for this class.column — point at peers on the same column.
+        if !engine.has_vector_index(class, column) {
+            let mut peers: Vec<String> = Vec::new();
+            for candidate in &engines {
+                let mgr = candidate
+                    .vector_index_manager()
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                peers.extend(
+                    mgr.list_indexes()
+                        .into_iter()
+                        .filter(|m| m.column == column && m.class != class)
+                        .map(|m| format!("{}.{}", m.class, m.column)),
+                );
+            }
+            peers.sort();
+            peers.dedup();
+            return if peers.is_empty() {
+                CoreError::InvalidArgument(format!(
+                    "no vector index on {class}.{column}; run CREATE VECTOR INDEX ON {class} ({column}) ... first"
+                ))
+            } else {
+                CoreError::InvalidArgument(format!(
+                    "no vector index on {class}.{column}; classes with an index on '{column}': {} — use VECTOR SEARCH ON <class> ({column}) ... with one of those classes",
+                    peers.join(", ")
+                ))
+            };
+        }
+
+        // Index exists but is empty. Name subclasses that declare the column
+        // (or index it themselves) — the query likely targets the wrong class.
+        if engine.vector_index_len(class, column).unwrap_or(0) == 0 {
+            let ontology = self.get_merged_ontology(engine);
+            let mut owners: Vec<String> = ontology
+                .get_all_subclasses(class)
+                .into_iter()
+                .filter(|sub| sub != class)
+                .filter(|sub| {
+                    let declares = ontology
+                        .get_class(sub)
+                        .is_some_and(|c| c.properties.iter().any(|p| p == column));
+                    let indexed = engines.iter().any(|e| {
+                        e.vector_index_manager()
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .has_index(sub, column)
+                    });
+                    declares || indexed
+                })
+                .collect();
+            owners.sort();
+            owners.dedup();
+            return if owners.is_empty() {
+                CoreError::InvalidArgument(format!(
+                    "vector index {class}.{column} exists but has 0 vectors; insert rows with a '{column}' vector into {class} and retry"
+                ))
+            } else {
+                CoreError::InvalidArgument(format!(
+                    "vector index {class}.{column} exists but has 0 vectors; column '{column}' is defined on subclass(es): {} — try VECTOR SEARCH ON {} ({column}) ...",
+                    owners.join(", "),
+                    owners[0]
+                ))
+            };
+        }
+
+        CoreError::InvalidArgument(format!("vector search on {class}.{column} is unavailable"))
+    }
+
     /// Plan-driven vector search.
     fn plan_vector_search(
         &self,
@@ -5464,8 +5544,10 @@ impl QueryExecutor {
         ef_search: Option<usize>,
         filter: &Option<FilterExpr>,
     ) -> Result<Vec<Map<String, Value>>> {
-        if !engine.has_vector_index(table, column) {
-            return Ok(Vec::new());
+        if !engine.has_vector_index(table, column)
+            || engine.vector_index_len(table, column).unwrap_or(0) == 0
+        {
+            return Err(self.vector_index_unavailable_error(engine, table, column));
         }
 
         let search_results = if let Some(f) = filter {
@@ -11704,8 +11786,10 @@ impl QueryExecutor {
         ef_search: Option<usize>,
         filter: &Option<FilterExpr>,
     ) -> Result<Vec<Map<String, Value>>> {
-        if !engine.has_vector_index(table, column) {
-            return Ok(Vec::new());
+        if !engine.has_vector_index(table, column)
+            || engine.vector_index_len(table, column).unwrap_or(0) == 0
+        {
+            return Err(self.vector_index_unavailable_error(engine, table, column));
         }
 
         let search_results = if let Some(f) = filter {
@@ -13294,11 +13378,10 @@ impl QueryExecutor {
         ef_search: Option<usize>,
         filter: &Option<FilterExpr>,
     ) -> Result<QueryResult> {
-        if !engine.has_vector_index(class, column) {
-            return Err(CoreError::InvalidArgument(format!(
-                "no vector index on {}.{}",
-                class, column
-            )));
+        if !engine.has_vector_index(class, column)
+            || engine.vector_index_len(class, column).unwrap_or(0) == 0
+        {
+            return Err(self.vector_index_unavailable_error(engine, class, column));
         }
 
         let search_results = if let Some(filter_expr) = filter {
@@ -16305,11 +16388,10 @@ impl QueryExecutor {
         filter: &Option<FilterExpr>,
     ) -> Result<QueryResult> {
         // Check that a vector index exists
-        if !engine.has_vector_index(class, column) {
-            return Err(CoreError::InvalidArgument(format!(
-                "no vector index on {}.{}",
-                class, column
-            )));
+        if !engine.has_vector_index(class, column)
+            || engine.vector_index_len(class, column).unwrap_or(0) == 0
+        {
+            return Err(self.vector_index_unavailable_error(engine, class, column));
         }
 
         let search_results = if let Some(filter_expr) = filter {
@@ -23954,6 +24036,78 @@ mod tests {
             .and_then(|v| v.as_f64())
             .expect("distance column");
         assert!((d - 0.5).abs() < 1e-5, "expected cosine distance 0.5, got {d}");
+    }
+
+    /// A VECTOR SEARCH against a class without an index used to return `[]`,
+    /// indistinguishable from "no matches". It must name the class that does
+    /// have an index on the same column.
+    #[test]
+    fn test_vector_search_missing_index_suggests_indexed_class() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY zoo (CLASS Animal, CLASS Dog SUBCLASS OF Animal, PROPERTY emb DOMAIN Dog RANGE BYTES)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE VECTOR INDEX ON Dog (emb) METRIC cosine DIMENSION 8",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let err = executor
+            .execute(
+                &QueryParser::parse(
+                    "VECTOR SEARCH ON Animal (emb) QUERY [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] TOP 2",
+                )
+                .unwrap(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no vector index on Animal.emb"), "{err}");
+        assert!(err.contains("Dog.emb"), "{err}");
+    }
+
+    /// Regression: an empty index on the parent class must point at the
+    /// subclass that actually owns the column, not silently return `[]`.
+    #[test]
+    fn test_vector_search_empty_index_names_subclass_owner() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY zoo (CLASS Animal, CLASS Dog SUBCLASS OF Animal, PROPERTY emb DOMAIN Dog RANGE BYTES)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE VECTOR INDEX ON Animal (emb) METRIC cosine DIMENSION 8",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let err = executor
+            .execute(
+                &QueryParser::parse(
+                    "VECTOR SEARCH ON Animal (emb) QUERY [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] TOP 2",
+                )
+                .unwrap(),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has 0 vectors"), "{err}");
+        assert!(err.contains("Dog"), "{err}");
+        assert!(err.contains("VECTOR SEARCH ON Dog (emb)"), "{err}");
     }
 
     #[test]
