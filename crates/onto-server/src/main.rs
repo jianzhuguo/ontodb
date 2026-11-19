@@ -54,7 +54,7 @@ use rate_limit::{RateLimitConfig, RateLimiter};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 // ═══════════════════════════════════════════════════════
@@ -1111,6 +1111,125 @@ const MAX_TCP_CONNECTIONS: usize = 256;
 /// Maximum line size for TCP protocol (1 MB).
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
+/// Hard cap on bytes discarded while resynchronising after an oversized line.
+/// Past this the connection is dropped instead of draining forever.
+const MAX_DRAIN_BYTES: usize = 8 * 1024 * 1024;
+
+/// Outcome of a single bounded read from a client stream.
+enum LineRead {
+    /// A complete line with the trailing `\n` stripped.
+    Line(Vec<u8>),
+    /// The peer closed the connection.
+    Eof,
+    /// The line exceeded the cap. Its tail was discarded up to the next
+    /// newline, so the stream is back on a query boundary and can continue.
+    TooLong,
+    /// The line exceeded the cap and no newline followed within the drain
+    /// budget; the stream cannot be resynchronised.
+    Aborted,
+}
+
+/// Reads one newline-terminated line without ever buffering past `max_bytes`.
+///
+/// `AsyncBufReadExt::read_line` keeps appending to its `String` until it finds
+/// a newline, so a client that never sends one grows that buffer without
+/// bound — a post-hoc `line.len() > MAX` check rejects the request only after
+/// the memory is already committed. Reading through `fill_buf` enforces the
+/// cap *before* the bytes are copied into `buf`, and the overflow path drains
+/// to the next newline in constant memory.
+///
+/// `max_drain` bounds how much of an oversized line is discarded while looking
+/// for its newline; past that the stream is considered unsalvageable.
+async fn read_line_bounded<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+    max_drain: usize,
+) -> io::Result<LineRead>
+where
+    R: AsyncBufRead + Unpin,
+{
+    buf.clear();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            // `read_line` also returns a trailing partial line without `\n`.
+            return Ok(if buf.is_empty() {
+                LineRead::Eof
+            } else {
+                LineRead::Line(std::mem::take(buf))
+            });
+        }
+
+        match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                let consumed = pos + 1;
+                if buf.len() + pos > max_bytes {
+                    // Whole line is in this chunk: dropping it fully resyncs.
+                    reader.consume(consumed);
+                    return Ok(LineRead::TooLong);
+                }
+                buf.extend_from_slice(&available[..pos]);
+                reader.consume(consumed);
+                return Ok(LineRead::Line(std::mem::take(buf)));
+            }
+            None => {
+                let chunk_len = available.len();
+                if buf.len() + chunk_len > max_bytes {
+                    // Refuse before copying: `buf` stays at the last accepted
+                    // size, so memory is bounded by the cap, not the input.
+                    reader.consume(chunk_len);
+                    return Ok(match drain_to_newline(reader, max_drain).await? {
+                        DrainOutcome::FoundNewline => LineRead::TooLong,
+                        DrainOutcome::Eof => LineRead::Eof,
+                        DrainOutcome::CapExceeded => LineRead::Aborted,
+                    });
+                }
+                buf.extend_from_slice(available);
+                reader.consume(chunk_len);
+            }
+        }
+    }
+}
+
+/// Outcome of skipping the remainder of an oversized line.
+enum DrainOutcome {
+    /// A newline was consumed; the stream is on a query boundary.
+    FoundNewline,
+    /// The peer closed the connection first.
+    Eof,
+    /// `max_bytes` were discarded without finding a newline.
+    CapExceeded,
+}
+
+/// Discards bytes up to and including the next newline in constant memory.
+async fn drain_to_newline<R>(reader: &mut R, max_bytes: usize) -> io::Result<DrainOutcome>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut dropped = 0usize;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(DrainOutcome::Eof);
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                reader.consume(pos + 1);
+                return Ok(DrainOutcome::FoundNewline);
+            }
+            None => {
+                let chunk_len = available.len();
+                dropped += chunk_len;
+                reader.consume(chunk_len);
+                if dropped >= max_bytes {
+                    return Ok(DrainOutcome::CapExceeded);
+                }
+            }
+        }
+    }
+}
+
 /// Runs the async TCP server, accepting client connections.
 async fn run_tcp_server(
     addr: &str,
@@ -1170,27 +1289,38 @@ async fn handle_client(
 
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut line = Vec::with_capacity(256);
 
     loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .await
-            .map_err(onto_core::CoreError::Io)?;
-        if n == 0 {
-            break;
-        }
+        let input =
+            match read_line_bounded(&mut reader, &mut line, MAX_LINE_BYTES, MAX_DRAIN_BYTES).await {
+                Ok(LineRead::Line(bytes)) => match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(_) => {
+                        writer
+                            .write_all(b"ERR: query is not valid UTF-8\n\0")
+                            .await?;
+                        continue;
+                    }
+                },
+                Ok(LineRead::TooLong) => {
+                    // Keep the advertised cap in sync with MAX_LINE_BYTES.
+                    let msg = format!(
+                        "ERR: line too long (max {}MB)\n\0",
+                        MAX_LINE_BYTES / (1024 * 1024)
+                    );
+                    writer.write_all(msg.as_bytes()).await?;
+                    continue;
+                }
+                Ok(LineRead::Eof) => break,
+                Ok(LineRead::Aborted) => {
+                    eprintln!("Client {peer}: oversized request with no newline, closing");
+                    break;
+                }
+                Err(e) => return Err(onto_core::CoreError::Io(e)),
+            };
 
-        if line.len() > MAX_LINE_BYTES {
-            writer
-                .write_all(b"ERR: line too long (max 1MB)\n\0")
-                .await?;
-            line.clear();
-            continue;
-        }
-
-        let input = line.trim();
+        let input = input.trim();
 
         if input.is_empty() {
             writer.write_all(&[0]).await?;
@@ -1324,5 +1454,145 @@ fn load_sharding_config(
         // Create default config with a single shard
         tracing::info!("No sharding config file specified, using default single-shard config");
         Ok(onto_sharding::ShardMap::new(default_shard))
+    }
+}
+
+#[cfg(test)]
+mod tcp_line_tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    fn reader(bytes: &[u8]) -> BufReader<&[u8]> {
+        BufReader::new(bytes)
+    }
+
+    #[tokio::test]
+    async fn reads_newline_terminated_lines() {
+        let mut r = reader(b"SELECT 1\nSELECT 2\n");
+        let mut buf = Vec::new();
+
+        match read_line_bounded(&mut r, &mut buf, 1024, 4096).await.unwrap() {
+            LineRead::Line(line) => assert_eq!(line, b"SELECT 1"),
+            _ => panic!("expected a line"),
+        }
+        match read_line_bounded(&mut r, &mut buf, 1024, 4096).await.unwrap() {
+            LineRead::Line(line) => assert_eq!(line, b"SELECT 2"),
+            _ => panic!("expected a line"),
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_trailing_partial_line_then_eof() {
+        let mut r = reader(b"SELECT 1");
+        let mut buf = Vec::new();
+
+        // No trailing newline: the partial line is still delivered, matching
+        // `AsyncBufReadExt::read_line`.
+        match read_line_bounded(&mut r, &mut buf, 1024, 4096).await.unwrap() {
+            LineRead::Line(line) => assert_eq!(line, b"SELECT 1"),
+            _ => panic!("expected the partial line"),
+        }
+        match read_line_bounded(&mut r, &mut buf, 1024, 4096).await.unwrap() {
+            LineRead::Eof => {}
+            _ => panic!("expected EOF"),
+        }
+    }
+
+    /// The old `read_line` + post-hoc length check materialised the whole
+    /// unterminated line before rejecting it. Memory must stay at the cap and
+    /// the stream must be usable again once the newline finally arrives.
+    #[tokio::test]
+    async fn unterminated_oversized_line_stays_bounded_and_resyncs() {
+        // 16 KiB line against a 4 KiB cap: rejected on the first chunk, then
+        // drained (well within the 64 KiB budget) so the next query survives.
+        let mut data = vec![b'x'; 16 * 1024];
+        data.push(b'\n');
+        data.extend_from_slice(b"SELECT 1\n");
+        let mut r = reader(&data);
+        let mut buf = Vec::new();
+
+        match read_line_bounded(&mut r, &mut buf, 4096, 64 * 1024)
+            .await
+            .unwrap()
+        {
+            LineRead::TooLong => {}
+            _ => panic!("expected TooLong"),
+        }
+        assert!(
+            buf.capacity() <= 4096,
+            "buffer grew to {} bytes despite a 4096-byte cap",
+            buf.capacity()
+        );
+
+        match read_line_bounded(&mut r, &mut buf, 4096, 64 * 1024)
+            .await
+            .unwrap()
+        {
+            LineRead::Line(line) => assert_eq!(line, b"SELECT 1"),
+            _ => panic!("expected the stream to resync at the next newline"),
+        }
+    }
+
+    /// Overflow that happens *after* `buf` already holds a large prefix: the
+    /// first test rejects on the very first chunk, which never exercises the
+    /// accumulation path. Capacity must track the cap, not the line length.
+    #[tokio::test]
+    async fn overflow_after_large_prefix_keeps_buffer_bounded() {
+        let mut data = vec![b'a'; 3000];
+        data.resize(6000, b'b');
+        data.push(b'\n');
+        // 1 KiB chunks so the 3000-byte prefix really accumulates in `buf`.
+        let mut r = BufReader::with_capacity(1024, data.as_slice());
+        let mut buf = Vec::new();
+
+        match read_line_bounded(&mut r, &mut buf, 4096, 4096).await.unwrap() {
+            LineRead::TooLong => {}
+            _ => panic!("expected TooLong"),
+        }
+        // Vec doubling may overshoot the cap, but only by its growth factor.
+        assert!(
+            buf.capacity() <= 8192,
+            "capacity {} should stay near the 4096-byte cap",
+            buf.capacity()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_line_ending_in_same_chunk_is_rejected() {
+        let mut r = reader(b"SELECT 1\nSELECT 2\n");
+        let mut buf = Vec::new();
+
+        match read_line_bounded(&mut r, &mut buf, 4, 4096).await.unwrap() {
+            LineRead::TooLong => {}
+            _ => panic!("expected TooLong"),
+        }
+        assert!(buf.is_empty(), "rejected line must not be accumulated");
+
+        // The newline was consumed along with the rejected line.
+        match read_line_bounded(&mut r, &mut buf, 1024, 4096).await.unwrap() {
+            LineRead::Line(line) => assert_eq!(line, b"SELECT 2"),
+            _ => panic!("expected the next line"),
+        }
+    }
+
+    #[tokio::test]
+    async fn endless_line_without_newline_aborts() {
+        // A small drain budget keeps the test cheap; the code path is the same
+        // as the 8 MiB production budget.
+        let data = vec![b'x'; 64 * 1024];
+        let mut r = reader(&data);
+        let mut buf = Vec::new();
+
+        match read_line_bounded(&mut r, &mut buf, 1024, 4096).await.unwrap() {
+            LineRead::Aborted => {}
+            LineRead::Line(_) => panic!("expected Aborted, got Line"),
+            LineRead::Eof => panic!("expected Aborted, got Eof"),
+            LineRead::TooLong => panic!("expected Aborted, got TooLong"),
+        }
+        assert!(
+            buf.capacity() <= 1024,
+            "buffer grew to {} bytes despite a 1024-byte cap",
+            buf.capacity()
+        );
     }
 }
