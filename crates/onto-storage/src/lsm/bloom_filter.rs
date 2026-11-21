@@ -34,13 +34,18 @@ impl BloomFilter {
     }
 
     /// Inserts a key into the bloom filter.
+    ///
+    /// The two base hashes depend only on `key`, so they are computed once and
+    /// the k probes are derived by repeated addition (double hashing). The old
+    /// implementation recomputed both hashes for every probe — at a 1% false
+    /// positive rate that scanned the key 14 times per insert instead of once.
     pub fn insert(&mut self, key: &[u8]) {
-        for i in 0..self.num_hashes {
-            let hash = self.hash(key, i);
-            let bit_idx = (hash as usize) % self.num_bits;
-            let word_idx = bit_idx / 64;
-            let bit_offset = bit_idx % 64;
-            self.bits[word_idx] |= 1u64 << bit_offset;
+        let (mut hash, step) = Self::base_hashes(key);
+        for _ in 0..self.num_hashes {
+            let (word, mask) = self.bit_mask(hash);
+            self.bits[word] |= mask;
+            // Equivalent to h1 + i*h2 mod 2^64, without the per-probe multiply.
+            hash = hash.wrapping_add(step);
         }
     }
 
@@ -49,14 +54,13 @@ impl BloomFilter {
     /// Returns `false` if the key is definitely NOT in the set.
     /// Returns `true` if the key MIGHT be in the set (with false positive probability).
     pub fn might_contain(&self, key: &[u8]) -> bool {
-        for i in 0..self.num_hashes {
-            let hash = self.hash(key, i);
-            let bit_idx = (hash as usize) % self.num_bits;
-            let word_idx = bit_idx / 64;
-            let bit_offset = bit_idx % 64;
-            if self.bits[word_idx] & (1u64 << bit_offset) == 0 {
+        let (mut hash, step) = Self::base_hashes(key);
+        for _ in 0..self.num_hashes {
+            let (word, mask) = self.bit_mask(hash);
+            if self.bits[word] & mask == 0 {
                 return false;
             }
+            hash = hash.wrapping_add(step);
         }
         true
     }
@@ -105,30 +109,29 @@ impl BloomFilter {
         })
     }
 
-    fn hash(&self, key: &[u8], hash_index: usize) -> u64 {
-        // Double hashing: h(i) = h1 + i * h2
-        let h1 = Self::fnv_hash(key);
-        let h2 = Self::murmur_hash(key);
-        h1.wrapping_add((hash_index as u64).wrapping_mul(h2))
+    /// FNV-1a and the murmur-style mixer in one pass over `key`.
+    ///
+    /// Both hashes are independent, so interleaving their state updates gives
+    /// bit-for-bit the same result as the two separate loops that existed
+    /// before, at half the memory traffic.
+    #[inline]
+    fn base_hashes(key: &[u8]) -> (u64, u64) {
+        let mut fnv = 0xcbf29ce484222325u64; // FNV offset basis
+        let mut murmur = 0x5bd1e995u64;
+        for &byte in key {
+            fnv = (fnv ^ byte as u64).wrapping_mul(0x100000001b3); // FNV prime
+            murmur ^= byte as u64;
+            murmur = murmur.wrapping_mul(0x5bd1e995);
+            murmur ^= murmur >> 15;
+        }
+        (fnv, murmur)
     }
 
-    fn fnv_hash(key: &[u8]) -> u64 {
-        let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
-        for &byte in key {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3); // FNV prime
-        }
-        hash
-    }
-
-    fn murmur_hash(key: &[u8]) -> u64 {
-        let mut h: u64 = 0x5bd1e995;
-        for &byte in key {
-            h ^= byte as u64;
-            h = h.wrapping_mul(0x5bd1e995);
-            h ^= h >> 15;
-        }
-        h
+    /// Maps a probe hash to a `(word index, bit mask)` pair.
+    #[inline]
+    fn bit_mask(&self, hash: u64) -> (usize, u64) {
+        let bit_idx = (hash as usize) % self.num_bits;
+        (bit_idx / 64, 1u64 << (bit_idx % 64))
     }
 
     fn optimal_bits(n: usize, p: f64) -> usize {
@@ -174,5 +177,116 @@ mod tests {
 
         assert!(bf2.might_contain(b"test"));
         assert!(bf2.might_contain(b"data"));
+    }
+
+    // The original implementations, kept as an oracle. The on-disk filter is
+    // shared between versions, so the optimisation must not change a single
+    // bit — otherwise old SSTables would report false negatives for new keys
+    // and vice versa.
+    fn legacy_fnv(key: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &byte in key {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    fn legacy_murmur(key: &[u8]) -> u64 {
+        let mut h: u64 = 0x5bd1e995;
+        for &byte in key {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x5bd1e995);
+            h ^= h >> 15;
+        }
+        h
+    }
+
+    fn legacy_probe(bf: &BloomFilter, key: &[u8], i: usize) -> usize {
+        let hash = legacy_fnv(key)
+            .wrapping_add((i as u64).wrapping_mul(legacy_murmur(key)));
+        ((hash as usize) % bf.num_bits)
+    }
+
+    fn legacy_insert(bf: &mut BloomFilter, key: &[u8]) {
+        for i in 0..bf.num_hashes {
+            let bit_idx = legacy_probe(bf, key, i);
+            bf.bits[bit_idx / 64] |= 1u64 << (bit_idx % 64);
+        }
+    }
+
+    fn legacy_might_contain(bf: &BloomFilter, key: &[u8]) -> bool {
+        (0..bf.num_hashes).all(|i| {
+            let bit_idx = legacy_probe(bf, key, i);
+            bf.bits[bit_idx / 64] & (1u64 << (bit_idx % 64)) != 0
+        })
+    }
+
+    fn sample_keys() -> Vec<Vec<u8>> {
+        let mut keys = vec![Vec::new(), b"a".to_vec(), vec![0xff; 512]];
+        for i in 0..256usize {
+            let mut key = format!("user:{}:", i).into_bytes();
+            key.extend(std::iter::repeat((i % 251) as u8).take(i % 37));
+            keys.push(key);
+        }
+        keys
+    }
+
+    /// Guards both changes: fusing the two hash loops and replacing `i*h2`
+    /// with repeated addition must leave the serialized bit array unchanged.
+    #[test]
+    fn optimized_probes_match_original_bit_for_bit() {
+        let keys = sample_keys();
+        for &(n, p) in &[
+            (1usize, 0.01f64),
+            (17, 0.05),
+            (1000, 0.01),
+            (100_000, 0.001),
+        ] {
+            let mut fast = BloomFilter::new(n, p);
+            let mut legacy = BloomFilter::new(n, p);
+            assert_eq!(fast.num_hashes, legacy.num_hashes);
+            assert_eq!(fast.num_bits, legacy.num_bits);
+
+            for key in &keys {
+                fast.insert(key);
+                legacy_insert(&mut legacy, key);
+            }
+            assert_eq!(
+                fast.to_bytes(),
+                legacy.to_bytes(),
+                "on-disk bit pattern changed for n={n}, p={p}"
+            );
+
+            for key in &keys {
+                assert_eq!(
+                    fast.might_contain(key),
+                    legacy_might_contain(&legacy, key),
+                    "present-key lookup changed for n={n}, p={p}"
+                );
+            }
+        }
+    }
+
+    /// False positives are part of the observable behaviour too: a key that
+    /// the old filter rejected must still be rejected by the new one.
+    #[test]
+    fn absent_keys_keep_identical_lookup_results() {
+        let present = sample_keys();
+        let mut fast = BloomFilter::new(1000, 0.01);
+        let mut legacy = BloomFilter::new(1000, 0.01);
+        for key in &present {
+            fast.insert(key);
+            legacy_insert(&mut legacy, key);
+        }
+
+        for i in 0..2048u32 {
+            let key = format!("absent-{i}").into_bytes();
+            assert_eq!(
+                fast.might_contain(&key),
+                legacy_might_contain(&legacy, &key),
+                "absent-key lookup changed for {i}"
+            );
+        }
     }
 }
