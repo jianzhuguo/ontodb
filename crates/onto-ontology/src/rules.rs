@@ -32,6 +32,9 @@ pub enum RuleId {
     PrpTrp,
     /// Symmetric property: x P y -> y P x
     PrpSymp,
+    /// State machine reachability: Transition(from=A,to=B) => A reachable B,
+    /// then transitive closure (no self-loops).
+    StateReach,
 }
 
 /// An inference rule that operates on an ontology and a set of known triples.
@@ -468,6 +471,79 @@ impl Rule for PrpSymp {
     }
 }
 
+/// State machine reachability via Transition closure.
+///
+/// Scans facts for `from_state` / `to_state` pairs (Transition instances),
+/// builds a state adjacency graph, then computes the transitive closure.
+/// Output: `(A, "reachable", B)` for every reachable pair A ≠ B.
+pub struct StateReach;
+
+impl Rule for StateReach {
+    fn id(&self) -> RuleId {
+        RuleId::StateReach
+    }
+
+    fn apply(
+        &self,
+        _ontology: &Ontology,
+        facts: &HashSet<Triple>,
+        _new_facts: &[Triple],
+    ) -> Vec<Triple> {
+        // 1. Build adjacency: for each subject with both from_state and to_state,
+        //    add edge from_state_value -> to_state_value.
+        let mut from_map: HashMap<&str, &str> = HashMap::new();
+        let mut to_map: HashMap<&str, &str> = HashMap::new();
+        for fact in facts {
+            match fact.predicate.as_str() {
+                "from_state" => {
+                    from_map.insert(fact.subject.as_str(), fact.object.as_str());
+                }
+                "to_state" => {
+                    to_map.insert(fact.subject.as_str(), fact.object.as_str());
+                }
+                _ => {}
+            }
+        }
+
+        // Build state adjacency list
+        let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (subj, from) in &from_map {
+            if let Some(to) = to_map.get(subj) {
+                adj.entry(from).or_default().push(to);
+            }
+        }
+
+        if adj.is_empty() {
+            return Vec::new();
+        }
+
+        // 2. Transitive closure via BFS from each node (no self-loops)
+        let mut inferred = Vec::new();
+        let nodes: Vec<&str> = adj.keys().copied().collect();
+        for &start in &nodes {
+            let mut visited: HashSet<&str> = HashSet::new();
+            let mut queue: Vec<&str> = vec![start];
+            while let Some(curr) = queue.pop() {
+                if let Some(neighbors) = adj.get(curr) {
+                    for &next in neighbors {
+                        if !visited.contains(next) {
+                            visited.insert(next);
+                            queue.push(next);
+                            if next != start {
+                                let t = Triple::new(start, "reachable", next);
+                                if !facts.contains(&t) {
+                                    inferred.push(t);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        inferred
+    }
+}
+
 /// Returns the default set of OWL-lite inference rules.
 pub fn default_rules() -> Vec<Box<dyn Rule>> {
     vec![
@@ -478,6 +554,7 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         Box::new(PrpInv),
         Box::new(PrpTrp),
         Box::new(PrpSymp),
+        Box::new(StateReach),
     ]
 }
 
@@ -646,9 +723,74 @@ mod tests {
     }
 
     #[test]
+    fn test_state_reach_direct() {
+        let onto = Ontology::new("test");
+        let facts: HashSet<Triple> = vec![
+            Triple::new("tr1", "from_state", "State::A"),
+            Triple::new("tr1", "to_state", "State::B"),
+        ]
+        .into_iter()
+        .collect();
+        let rule = StateReach;
+        let inferred = rule.apply(&onto, &facts, &[]);
+        assert!(inferred.contains(&Triple::new("State::A", "reachable", "State::B")));
+        assert_eq!(inferred.len(), 1); // no self-loop
+    }
+
+    #[test]
+    fn test_state_reach_transitive() {
+        let onto = Ontology::new("test");
+        let facts: HashSet<Triple> = vec![
+            Triple::new("tr1", "from_state", "State::A"),
+            Triple::new("tr1", "to_state", "State::B"),
+            Triple::new("tr2", "from_state", "State::B"),
+            Triple::new("tr2", "to_state", "State::C"),
+        ]
+        .into_iter()
+        .collect();
+        let rule = StateReach;
+        let inferred = rule.apply(&onto, &facts, &[]);
+        assert!(inferred.contains(&Triple::new("State::A", "reachable", "State::B")));
+        assert!(inferred.contains(&Triple::new("State::B", "reachable", "State::C")));
+        assert!(inferred.contains(&Triple::new("State::A", "reachable", "State::C")));
+        assert_eq!(inferred.len(), 3);
+    }
+
+    #[test]
+    fn test_state_reach_no_self_loop() {
+        let onto = Ontology::new("test");
+        // A -> B -> A (cycle)
+        let facts: HashSet<Triple> = vec![
+            Triple::new("tr1", "from_state", "State::A"),
+            Triple::new("tr1", "to_state", "State::B"),
+            Triple::new("tr2", "from_state", "State::B"),
+            Triple::new("tr2", "to_state", "State::A"),
+        ]
+        .into_iter()
+        .collect();
+        let rule = StateReach;
+        let inferred = rule.apply(&onto, &facts, &[]);
+        assert!(inferred.contains(&Triple::new("State::A", "reachable", "State::B")));
+        assert!(inferred.contains(&Triple::new("State::B", "reachable", "State::A")));
+        // No self-loops: (A, reachable, A) and (B, reachable, B) must not appear
+        assert!(!inferred.contains(&Triple::new("State::A", "reachable", "State::A")));
+        assert!(!inferred.contains(&Triple::new("State::B", "reachable", "State::B")));
+        assert_eq!(inferred.len(), 2);
+    }
+
+    #[test]
+    fn test_state_reach_empty() {
+        let onto = Ontology::new("test");
+        let facts: HashSet<Triple> = HashSet::new();
+        let rule = StateReach;
+        let inferred = rule.apply(&onto, &facts, &[]);
+        assert!(inferred.is_empty());
+    }
+
+    #[test]
     fn test_default_rules_returns_all() {
         let rules = default_rules();
-        assert_eq!(rules.len(), 7);
+        assert_eq!(rules.len(), 8);
         let ids: HashSet<RuleId> = rules.iter().map(|r| r.id()).collect();
         assert!(ids.contains(&RuleId::CaxSco));
         assert!(ids.contains(&RuleId::CaxEqc));
@@ -657,5 +799,6 @@ mod tests {
         assert!(ids.contains(&RuleId::PrpInv));
         assert!(ids.contains(&RuleId::PrpTrp));
         assert!(ids.contains(&RuleId::PrpSymp));
+        assert!(ids.contains(&RuleId::StateReach));
     }
 }
