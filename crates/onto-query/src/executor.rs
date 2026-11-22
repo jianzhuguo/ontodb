@@ -18153,22 +18153,20 @@ impl QueryExecutor {
             }
         }
 
-        // L2 guard gate: `guard` is data, and when it is written in the
-        // supported `field <op> <literal>` shape it is evaluated here, at write
-        // time, against the same document. A definite failure rejects. Guards
-        // we cannot judge (operand absent, unsupported shape) stay Unknown and
-        // are let through — schema-on-read, not a silent guess.
+        // L2 guard gate: `guard` is data, and when it is written in a supported
+        // shape it is evaluated here, at write time. A definite failure rejects.
+        // Guards we cannot judge (operand absent, unsupported shape) stay
+        // Unknown and are let through — schema-on-read, not a silent guess.
+        //
+        // Two clause forms are judged:
+        //   - `field <op> <literal>`          against the document being written
+        //   - `EXISTS(Class WHERE ...)`       against rows already stored
         if let Some(Value::String(g)) = doc.get("guard") {
-            if let Some(pred) = Self::parse_guard(g) {
-                if Self::eval_guard(&pred, doc) == GuardOutcome::Violated {
+            if let Some(clauses) = Self::parse_guard(g) {
+                if Self::eval_guard_clauses(&clauses, doc, engine) == GuardOutcome::Violated {
                     return Err(CoreError::InvalidArgument(format!(
-                        "guard violation on class '{}': '{}' — field '{}' is {}, which fails the guard",
-                        class,
-                        g,
-                        pred.field,
-                        doc.get(&pred.field)
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "<absent>".to_string())
+                        "guard violation on class '{}': '{}' — precondition does not hold",
+                        class, g
                     )));
                 }
             }
@@ -18434,10 +18432,111 @@ impl QueryExecutor {
         }
     }
 
-    /// Parses `field <op> <literal>`, e.g. `quality_score >= 0.8`,
-    /// `status != 'done'`. Returns `None` for anything outside that shape.
-    fn parse_guard(expr: &str) -> Option<GuardPred> {
+    /// Splits `s` on `sep` occurrences that sit outside quotes and brackets.
+    fn split_top_level<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
+        let chars: Vec<(usize, char)> = s.char_indices().collect();
+        let mut parts = Vec::new();
+        let mut depth: i32 = 0;
+        let mut in_quote: Option<char> = None;
+        let mut start = 0usize;
+        let mut i = 0usize;
+        while i < chars.len() {
+            let (idx, c) = chars[i];
+            if let Some(q) = in_quote {
+                if c == q {
+                    in_quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                '\'' | '"' => in_quote = Some(c),
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && s[idx..].starts_with(sep) {
+                parts.push(&s[start..idx]);
+                start = idx + sep.len();
+                while i < chars.len() && chars[i].0 < start {
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+        }
+        parts.push(&s[start..]);
+        parts
+    }
+
+    /// Parses a whole guard expression into clauses joined by top-level `AND`.
+    ///
+    /// Supported shapes:
+    /// - `quality_score >= 0.8` — comparison against the document being written
+    /// - `EXISTS(ExecEvent WHERE task_name = 'inspect' AND process_of = $process_of)`
+    ///   — cross-subject precondition, with `$field` reading the written document
+    /// - `A AND B` — conjunction of the two, at paren depth 0
+    ///
+    /// Returns `None` when the expression does not parse as clauses we can judge.
+    fn parse_guard(expr: &str) -> Option<Vec<GuardClause>> {
         let s = expr.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let mut clauses = Vec::new();
+        for part in Self::split_top_level(s, " AND ") {
+            let t = part.trim();
+            if t.is_empty() {
+                return None;
+            }
+            clauses.push(Self::parse_guard_clause(t)?);
+        }
+        Some(clauses)
+    }
+
+    fn parse_guard_clause(s: &str) -> Option<GuardClause> {
+        let t = s.trim();
+        let up = t.to_ascii_uppercase();
+        if let Some(rest) = up.strip_prefix("EXISTS(") {
+            let inner_start = t.len() - rest.len();
+            let inner_end = t
+                .rfind(')')
+                .filter(|p| *p > inner_start)?;
+            return Self::parse_exists_body(&t[inner_start..inner_end]);
+        }
+        Self::parse_guard_cond(t).map(GuardClause::Cmp)
+    }
+
+    /// Parses `Class WHERE cond (AND cond)*` — the body of an `EXISTS(...)`.
+    fn parse_exists_body(body: &str) -> Option<GuardClause> {
+        let upper = body.to_ascii_uppercase();
+        let wpos = upper.find("WHERE")?;
+        let class = body[..wpos].trim();
+        if class.is_empty()
+            || !class.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        let mut conds = Vec::new();
+        for part in Self::split_top_level(body[wpos + 5..].trim(), " AND ") {
+            let t = part.trim();
+            if t.is_empty() {
+                return None;
+            }
+            conds.push(Self::parse_guard_cond(t)?);
+        }
+        if conds.is_empty() {
+            return None;
+        }
+        Some(GuardClause::Exists {
+            class: class.to_string(),
+            conds,
+        })
+    }
+
+    /// Parses one `field <op> <operand>` comparison.
+    fn parse_guard_cond(s: &str) -> Option<GuardCond> {
+        let t = s.trim();
         // Two-character operators must win over their one-character prefixes
         // (`>=` over `>`, `!=` over `=`, `==` over `=`).
         const OPS: &[(&str, GuardOp)] = &[
@@ -18451,7 +18550,7 @@ impl QueryExecutor {
         ];
         let mut best: Option<(usize, usize, GuardOp)> = None;
         for (tok, op) in OPS {
-            if let Some(pos) = s.find(tok) {
+            if let Some(pos) = t.find(tok) {
                 let better = match best {
                     None => true,
                     Some((bpos, blen, _)) => pos < bpos || (pos == bpos && tok.len() > blen),
@@ -18462,35 +18561,46 @@ impl QueryExecutor {
             }
         }
         let (pos, len, op) = best?;
-        let field = s[..pos].trim();
-        let rhs = s[pos + len..].trim();
+        let field = t[..pos].trim();
+        let rhs = t[pos + len..].trim();
         if field.is_empty() || rhs.is_empty() {
             return None;
         }
         if !field.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return None;
         }
-        let value = Self::parse_guard_literal(rhs)?;
-        Some(GuardPred {
+        let operand = Self::parse_guard_operand(rhs)?;
+        Some(GuardCond {
             field: field.to_string(),
             op,
-            value,
+            operand,
         })
     }
 
-    /// Parses the right-hand side of a guard: quoted string, integer, float or
-    /// boolean literal. Anything else is not a literal we can judge.
+    /// Parses the right-hand side: `$field` correlation reference, quoted
+    /// string, integer, float or boolean literal.
+    fn parse_guard_operand(s: &str) -> Option<GuardOperand> {
+        let t = s.trim();
+        if let Some(name) = t.strip_prefix('$') {
+            let name = name.trim();
+            if name.is_empty()
+                || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                return None;
+            }
+            return Some(GuardOperand::DocRef(name.to_string()));
+        }
+        Self::parse_guard_literal(t).map(GuardOperand::Lit)
+    }
+
+    /// Parses a literal: quoted string, integer, float or boolean.
     fn parse_guard_literal(s: &str) -> Option<Value> {
         let t = s.trim();
         if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
-            return Some(Value::String(
-                t[1..t.len() - 1].replace("''", "'"),
-            ));
+            return Some(Value::String(t[1..t.len() - 1].replace("''", "'")));
         }
         if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
-            return Some(Value::String(
-                t[1..t.len() - 1].replace("\"\"", "\""),
-            ));
+            return Some(Value::String(t[1..t.len() - 1].replace("\"\"", "\"")));
         }
         if let Ok(i) = t.parse::<i64>() {
             return Some(json!(i));
@@ -18507,20 +18617,30 @@ impl QueryExecutor {
         None
     }
 
-    /// Evaluates one guard predicate against the document being written.
+    /// Resolves a condition's right-hand side against the written document.
+    /// A `$field` that is absent resolves to `None`, which makes the condition
+    /// undecidable rather than false.
+    fn resolve_operand<'a>(op: &'a GuardOperand, doc: &'a Map<String, Value>) -> Option<&'a Value> {
+        match op {
+            GuardOperand::Lit(v) => Some(v),
+            GuardOperand::DocRef(name) => match doc.get(name) {
+                Some(v) if !v.is_null() => Some(v),
+                _ => None,
+            },
+        }
+    }
+
+    /// Compares `actual` (a field of some row) against `expected`.
     ///
     /// Numeric operands support every operator; strings and booleans only
     /// support equality, since ordering on them is not a judgment we should be
     /// making silently.
-    fn eval_guard(pred: &GuardPred, doc: &Map<String, Value>) -> GuardOutcome {
-        let Some(actual) = doc.get(&pred.field) else {
-            return GuardOutcome::Unknown;
-        };
+    fn compare_guard_values(actual: &Value, op: GuardOp, expected: &Value) -> GuardOutcome {
         if actual.is_null() {
             return GuardOutcome::Unknown;
         }
-        if let (Some(a), Some(b)) = (Self::json_as_f64(actual), Self::json_as_f64(&pred.value)) {
-            let holds = match pred.op {
+        if let (Some(a), Some(b)) = (Self::json_as_f64(actual), Self::json_as_f64(expected)) {
+            let holds = match op {
                 GuardOp::Ge => a >= b,
                 GuardOp::Le => a <= b,
                 GuardOp::Gt => a > b,
@@ -18534,16 +18654,16 @@ impl QueryExecutor {
                 GuardOutcome::Violated
             };
         }
-        match pred.op {
+        match op {
             GuardOp::Eq => {
-                if actual == &pred.value {
+                if actual == expected {
                     GuardOutcome::Satisfied
                 } else {
                     GuardOutcome::Violated
                 }
             }
             GuardOp::Ne => {
-                if actual != &pred.value {
+                if actual != expected {
                     GuardOutcome::Satisfied
                 } else {
                     GuardOutcome::Violated
@@ -18551,6 +18671,120 @@ impl QueryExecutor {
             }
             // Ordering over non-numeric operands: not decidable here.
             _ => GuardOutcome::Unknown,
+        }
+    }
+
+    /// Evaluates one condition against the document being written.
+    fn eval_cond(cond: &GuardCond, doc: &Map<String, Value>) -> GuardOutcome {
+        let Some(expected) = Self::resolve_operand(&cond.operand, doc) else {
+            return GuardOutcome::Unknown;
+        };
+        let Some(actual) = doc.get(&cond.field) else {
+            return GuardOutcome::Unknown;
+        };
+        Self::compare_guard_values(actual, cond.op, expected)
+    }
+
+    /// Evaluates a cross-subject precondition: some row of `class` already
+    /// satisfies every condition, with `$field` reading the written document.
+    ///
+    /// Three-valued: a matching row is Satisfied; a full scan that finds no
+    /// match is Violated (definite — no such fact exists yet); a class the
+    /// ontology does not know, or an unresolvable `$field`, is Unknown.
+    fn eval_exists(
+        class: &str,
+        conds: &[GuardCond],
+        doc: &Map<String, Value>,
+        engine: &LsmEngine,
+    ) -> GuardOutcome {
+        // A correlation reference we cannot resolve makes the whole clause
+        // undecidable — we cannot claim "no such row" when we do not know what
+        // we are correlating on.
+        for c in conds {
+            if let GuardOperand::DocRef(name) = &c.operand {
+                match doc.get(name) {
+                    Some(v) if !v.is_null() => {}
+                    _ => return GuardOutcome::Unknown,
+                }
+            }
+        }
+
+        let prefix = format!("{}::", class);
+        let Ok(entries) = engine.scan_prefix(prefix.as_bytes()) else {
+            return GuardOutcome::Unknown;
+        };
+
+        let mut saw_row = false;
+        let mut saw_decidable_mismatch = false;
+        for (_key, val_bytes) in &entries {
+            let Some(row) = Self::parse_doc_bytes(val_bytes) else {
+                continue;
+            };
+            saw_row = true;
+            let mut all_hold = true;
+            let mut any_unknown = false;
+            for c in conds {
+                let Some(expected) = Self::resolve_operand(&c.operand, doc) else {
+                    any_unknown = true;
+                    break;
+                };
+                let Some(actual) = row.get(&c.field) else {
+                    any_unknown = true;
+                    break;
+                };
+                match Self::compare_guard_values(actual, c.op, expected) {
+                    GuardOutcome::Satisfied => {}
+                    GuardOutcome::Violated => {
+                        all_hold = false;
+                        saw_decidable_mismatch = true;
+                    }
+                    GuardOutcome::Unknown => {
+                        any_unknown = true;
+                        break;
+                    }
+                }
+            }
+            if all_hold && !any_unknown {
+                return GuardOutcome::Satisfied;
+            }
+        }
+        // No row satisfied the precondition. When nothing matched at all, or
+        // every candidate failed on evidence, that is a definite falsehood for
+        // the existential — reject. Only when rows were present but none was
+        // decidable do we stay Unknown.
+        if !saw_row || saw_decidable_mismatch {
+            GuardOutcome::Violated
+        } else {
+            GuardOutcome::Unknown
+        }
+    }
+
+    /// Evaluates all guard clauses under three-valued AND: a definite failure
+    /// anywhere is Violated; otherwise any Unknown is Unknown; only all
+    /// Satisfied is Satisfied.
+    fn eval_guard_clauses(
+        clauses: &[GuardClause],
+        doc: &Map<String, Value>,
+        engine: &LsmEngine,
+    ) -> GuardOutcome {
+        let mut unknown = false;
+        for clause in clauses {
+            let out = match clause {
+                GuardClause::Cmp(cond) => Self::eval_cond(cond, doc),
+                GuardClause::Exists { class, conds } => {
+                    Self::eval_exists(class, conds, doc, engine)
+                }
+            };
+            match out {
+                GuardOutcome::Violated => return GuardOutcome::Violated,
+                GuardOutcome::Unknown => unknown = true,
+                GuardOutcome::Satisfied => {}
+            }
+        }
+        if unknown {
+            GuardOutcome::Unknown
+        } else {
+            GuardOutcome::Satisfied
         }
     }
 
@@ -19182,16 +19416,38 @@ enum GuardOp {
     Ne,
 }
 
-/// A guard of the restricted form `field <op> <literal>`.
-///
-/// Deliberately not a general expression language: no arithmetic, no boolean
-/// connectives, no function calls. Anything outside this shape is left
-/// unevaluated (see [`GuardOutcome::Unknown`]) rather than guessed at.
+/// Right-hand side of a guard condition: a literal, or a `$field` reference
+/// that reads the document currently being written (correlation for
+/// cross-subject clauses).
 #[derive(Debug, Clone)]
-struct GuardPred {
+enum GuardOperand {
+    Lit(Value),
+    /// `$name` — read field `name` off the document being written.
+    DocRef(String),
+}
+
+/// One comparison: `field <op> <operand>`.
+#[derive(Debug, Clone)]
+struct GuardCond {
     field: String,
     op: GuardOp,
-    value: Value,
+    operand: GuardOperand,
+}
+
+/// A guard clause. Deliberately not a general expression language: no
+/// arithmetic, no function calls, no negation, no nesting beyond the
+/// `EXISTS(...)` form. Anything outside the shape is left unevaluated (see
+/// [`GuardOutcome::Unknown`]) rather than guessed at.
+#[derive(Debug, Clone)]
+enum GuardClause {
+    /// Comparison against the document being written (the original L2 form).
+    Cmp(GuardCond),
+    /// `EXISTS(Class WHERE cond (AND cond)*)` — some row of `Class` already
+    /// satisfies every condition. This is the cross-subject precondition form.
+    Exists {
+        class: String,
+        conds: Vec<GuardCond>,
+    },
 }
 
 /// Result of evaluating a guard predicate against one document.
@@ -20072,75 +20328,166 @@ mod tests {
         }
 
         // Two-character operators beat their one-character prefixes.
-        let p = QueryExecutor::parse_guard("a >= 1").unwrap();
-        assert_eq!(p.op, GuardOp::Ge);
-        let p = QueryExecutor::parse_guard("a != 1").unwrap();
-        assert_eq!(p.op, GuardOp::Ne);
-        let p = QueryExecutor::parse_guard("a == 1").unwrap();
-        assert_eq!(p.op, GuardOp::Eq);
+        let clauses = QueryExecutor::parse_guard("a >= 1").unwrap();
+        let GuardClause::Cmp(c) = &clauses[0] else {
+            panic!("expected Cmp");
+        };
+        assert_eq!(c.op, GuardOp::Ge);
+        let clauses = QueryExecutor::parse_guard("a != 1").unwrap();
+        let GuardClause::Cmp(c) = &clauses[0] else {
+            panic!("expected Cmp");
+        };
+        assert_eq!(c.op, GuardOp::Ne);
+        let clauses = QueryExecutor::parse_guard("a == 1").unwrap();
+        let GuardClause::Cmp(c) = &clauses[0] else {
+            panic!("expected Cmp");
+        };
+        assert_eq!(c.op, GuardOp::Eq);
+
+        // EXISTS(...) is its own clause form, and the inner AND does not split
+        // the outer conjunction.
+        let clauses = QueryExecutor::parse_guard(
+            "EXISTS(ExecEvent WHERE task_name = 'inspect' AND process_of = $process_of) AND quality_score >= 0.8",
+        )
+        .unwrap();
+        assert_eq!(clauses.len(), 2);
+        let GuardClause::Exists { class, conds } = &clauses[0] else {
+            panic!("expected Exists, got {:?}", clauses[0]);
+        };
+        assert_eq!(class, "ExecEvent");
+        assert_eq!(conds.len(), 2);
+        assert!(matches!(conds[1].operand, GuardOperand::DocRef(_)));
+        assert!(matches!(&clauses[1], GuardClause::Cmp(_)));
+
+        // Malformed EXISTS forms are not judged.
+        for expr in [
+            "EXISTS()",
+            "EXISTS(ExecEvent)",
+            "EXISTS(ExecEvent WHERE)",
+            "EXISTS(ExecEvent WHERE task_name)",
+            "EXISTS(bad-class WHERE a = 1)",
+        ] {
+            assert!(
+                QueryExecutor::parse_guard(expr).is_none(),
+                "must not parse: {expr}"
+            );
+        }
     }
 
     #[test]
     fn test_guard_eval_three_valued_semantics() {
+        let (executor, _dir) = setup();
+        let engine = executor.engine.default_engine();
         let doc: Map<String, Value> = serde_json::from_str(
             r#"{"quality_score": 0.3, "status": "done", "count": 3, "flag": true}"#,
         )
         .unwrap();
+        let eval = |expr: &str| {
+            let clauses = QueryExecutor::parse_guard(expr).unwrap();
+            QueryExecutor::eval_guard_clauses(&clauses, &doc, &engine)
+        };
 
         // Numeric comparisons.
-        assert_eq!(
-            QueryExecutor::eval_guard(
-                &QueryExecutor::parse_guard("quality_score >= 0.8").unwrap(),
-                &doc
-            ),
-            GuardOutcome::Violated
-        );
-        assert_eq!(
-            QueryExecutor::eval_guard(
-                &QueryExecutor::parse_guard("quality_score >= 0.2").unwrap(),
-                &doc
-            ),
-            GuardOutcome::Satisfied
-        );
-        assert_eq!(
-            QueryExecutor::eval_guard(&QueryExecutor::parse_guard("count = 3").unwrap(), &doc),
-            GuardOutcome::Satisfied
-        );
-        assert_eq!(
-            QueryExecutor::eval_guard(&QueryExecutor::parse_guard("count != 3").unwrap(), &doc),
-            GuardOutcome::Violated
-        );
+        assert_eq!(eval("quality_score >= 0.8"), GuardOutcome::Violated);
+        assert_eq!(eval("quality_score >= 0.2"), GuardOutcome::Satisfied);
+        assert_eq!(eval("count = 3"), GuardOutcome::Satisfied);
+        assert_eq!(eval("count != 3"), GuardOutcome::Violated);
 
         // String and boolean equality.
-        assert_eq!(
-            QueryExecutor::eval_guard(&QueryExecutor::parse_guard("status = 'done'").unwrap(), &doc),
-            GuardOutcome::Satisfied
-        );
-        assert_eq!(
-            QueryExecutor::eval_guard(
-                &QueryExecutor::parse_guard("status != 'done'").unwrap(),
-                &doc
-            ),
-            GuardOutcome::Violated
-        );
-        assert_eq!(
-            QueryExecutor::eval_guard(&QueryExecutor::parse_guard("flag = true").unwrap(), &doc),
-            GuardOutcome::Satisfied
-        );
+        assert_eq!(eval("status = 'done'"), GuardOutcome::Satisfied);
+        assert_eq!(eval("status != 'done'"), GuardOutcome::Violated);
+        assert_eq!(eval("flag = true"), GuardOutcome::Satisfied);
 
         // Absent operand -> Unknown, never a guess.
-        assert_eq!(
-            QueryExecutor::eval_guard(
-                &QueryExecutor::parse_guard("missing_field >= 1").unwrap(),
-                &doc
-            ),
-            GuardOutcome::Unknown
-        );
+        assert_eq!(eval("missing_field >= 1"), GuardOutcome::Unknown);
 
         // Ordering over non-numeric operands -> Unknown, not a silent compare.
+        assert_eq!(eval("status >= 'a'"), GuardOutcome::Unknown);
+
+        // Three-valued AND: Violated dominates, then Unknown, then Satisfied.
         assert_eq!(
-            QueryExecutor::eval_guard(&QueryExecutor::parse_guard("status >= 'a'").unwrap(), &doc),
-            GuardOutcome::Unknown
+            eval("missing_field >= 1 AND quality_score >= 0.8"),
+            GuardOutcome::Violated,
+            "a definite failure anywhere is Violated"
+        );
+        assert_eq!(
+            eval("missing_field >= 1 AND quality_score >= 0.2"),
+            GuardOutcome::Unknown,
+            "unknown + satisfied is Unknown"
+        );
+        assert_eq!(
+            eval("count = 3 AND quality_score >= 0.2"),
+            GuardOutcome::Satisfied
+        );
+    }
+
+    #[test]
+    fn test_guard_exists_precondition_is_cross_subject() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY p (CLASS Step, PROPERTY name DOMAIN Step RANGE STRING, PROPERTY process_of DOMAIN Step RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY p2 (CLASS Job, PROPERTY name DOMAIN Job RANGE STRING, PROPERTY process_of DOMAIN Job RANGE STRING, PROPERTY guard DOMAIN Job RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let insert = |sql: &str| executor.execute(&QueryParser::parse(sql).unwrap());
+
+        // No 'inspect' step exists yet -> the precondition is definitely false.
+        let early = insert(
+            "INSERT INTO Job (name, process_of, guard) VALUES ('place', 'P1', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')",
+        );
+        let msg = early.unwrap_err().to_string();
+        assert!(
+            msg.contains("guard violation"),
+            "missing prior fact must reject, got: {msg}"
+        );
+
+        // Write the prior step for the *same* process.
+        insert("INSERT INTO Step (name, process_of) VALUES ('inspect', 'P1')").unwrap();
+
+        // Same precondition now holds.
+        insert(
+            "INSERT INTO Job (name, process_of, guard) VALUES ('place', 'P1', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')",
+        )
+        .unwrap();
+
+        // ...but it correlates on $process_of, so a different process is still
+        // rejected. This is what makes it cross-subject rather than a mere
+        // class-existence check.
+        let other = insert(
+            "INSERT INTO Job (name, process_of, guard) VALUES ('place', 'P2', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')",
+        );
+        assert!(
+            other.unwrap_err().to_string().contains("guard violation"),
+            "correlation on $process_of must not leak across subjects"
+        );
+
+        // A correlation reference that is absent -> Unknown -> schema-on-read.
+        insert(
+            "INSERT INTO Job (name, guard) VALUES ('noref', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')",
+        )
+        .unwrap();
+
+        // A class with no rows at all: the existential is definitely false, so
+        // this rejects. (Exact storage-key prefix match; hierarchy- and
+        // namespace-aware lookup is not attempted.)
+        let empty = insert(
+            "INSERT INTO Job (name, process_of, guard) VALUES ('noclass', 'P1', 'EXISTS(Nope WHERE x = 1)')",
+        );
+        assert!(
+            empty.unwrap_err().to_string().contains("guard violation"),
+            "an existential over an empty class must reject"
         );
     }
 

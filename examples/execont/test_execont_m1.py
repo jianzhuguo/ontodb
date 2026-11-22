@@ -225,6 +225,16 @@ expect_reject("闸门⑦ 守卫不满足拒写：0.3 >= 0.8", "INSERT INTO Guard
 expect_ok("闸门⑦a 操作数缺失→未判定放行(schema-on-read)", "INSERT INTO GuardT (name, guard) VALUES ('nodata', 'quality_score >= 0.8')")
 expect_ok("闸门⑦b 非支持语法→不判定不拦截", "INSERT INTO GuardT (name, guard) VALUES ('weird', 'a and b')")
 
+# 闸门⑧ 跨主体前置条件（EXISTS 子句）：guard 可要求「另一个主体的某事实已存在」，
+# 用 $field 关联到本次写入的文档。存在性命题确定为假 → 当场拒写；关联字段缺失 → 未判定放行。
+expect_ok("闸门⑧ 准备：前置事实载体 Step", "CREATE ONTOLOGY exec_pre (CLASS Step, PROPERTY name DOMAIN Step RANGE STRING, PROPERTY process_of DOMAIN Step RANGE STRING)")
+expect_ok("闸门⑧ 准备：Job 带 guard", "CREATE ONTOLOGY exec_pre2 (CLASS Job, PROPERTY name DOMAIN Job RANGE STRING, PROPERTY process_of DOMAIN Job RANGE STRING, PROPERTY guard DOMAIN Job RANGE STRING)")
+expect_reject("闸门⑧ 前置事实不存在→拒写", "INSERT INTO Job (name, process_of, guard) VALUES ('place', 'P1', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+expect_ok("闸门⑧ 写入前置事实(同主体 P1)", "INSERT INTO Step (name, process_of) VALUES ('inspect', 'P1')")
+expect_ok("闸门⑧ 前置满足→放行", "INSERT INTO Job (name, process_of, guard) VALUES ('place', 'P1', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')")
+expect_reject("闸门⑧b $process_of 关联不跨主体→拒写", "INSERT INTO Job (name, process_of, guard) VALUES ('place', 'P2', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+expect_ok("闸门⑧c 关联字段缺失→未判定放行", "INSERT INTO Job (name, guard) VALUES ('noref', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')")
+
 print()
 print("=" * 72)
 print("Part 3 · 推理就绪（层级透明 + 工序传递 + 物化 + 演进面）  ← M1 验收③")
