@@ -2,7 +2,7 @@
 
 English | **[中文](README.md)**
 
-**The world's first multi-modal semantic database embedding an OWL reasoning engine in the storage kernel.**
+**The world's first multi-modal semantic database embedding an OWL reasoning engine in the database kernel.**
 
 Unified storage of 12 data types, 7-step write-on-insert pipeline, embedded incremental reasoning 100x faster than external solutions.
 
@@ -18,7 +18,7 @@ OntoDB solves this in one engine:
 |-----------|------------|--------|
 | **Architecture** | MySQL + Neo4j + Milvus + InfluxDB + PostGIS + Jena (6 systems) | **1 system**, 12 data types unified |
 | **Semantics** | ETL after write, seconds to minutes | **Semantic-on-Insert**, 7-step atomic pipeline, microseconds |
-| **Reasoning** | External engine, data shuffling | **OWL reasoning embedded in storage kernel**, zero overhead |
+| **Reasoning** | External engine, data shuffling | **OWL reasoning embedded in the database**, zero data movement |
 | **Query** | SQL + Cypher + SPARQL + proprietary API (4 languages) | **OntoQL**, one syntax for relational + graph + vector + reasoning |
 | **Semantic Metadata** | Metadata only describes table structure (`pg_catalog`); taxonomy lives in application code | **Ontology IS the metadata**: class inheritance / equivalence / disjointness are inferable; `subClassOf` queries auto-expand subclasses |
 | **Deployment** | 6 independent systems, complex ops | **3-tier edge**, ESP32 to cloud server, unified architecture |
@@ -41,7 +41,7 @@ OntoDB solves this in one engine:
 
 Traditional database metadata (PostgreSQL's `pg_catalog` / `information_schema`) only describes **table structure** — table names, column types, indexes, constraints. Taxonomy, relationship semantics, and inference rules live in application code; the database itself cannot "understand" its data.
 
-OntoDB embeds the **Ontology** into the storage kernel — it is not just a schema, but **inferable domain knowledge**.
+OntoDB embeds the **Ontology** into the database kernel — it is not just a schema, but **inferable domain knowledge**.
 
 ### Point-by-point comparison (PostgreSQL as baseline)
 
@@ -166,7 +166,7 @@ In traditional stacks, "find similar, trace mechanism, infer attribution" means 
 |----------|------------|-------------|
 | `POST /api/semantic/similar` | Vector similarity search | Top-K with an **ontology type domain** — "compounds like a drug" automatically includes all subclasses, no hardcoded IN lists |
 | `POST /api/semantic/trace` | Multi-hop relation chain tracing | Walk relation chains hop by hop (drug → adverse reaction → phenotype → disease → target), with optional INFER enhancement at the chain tail |
-| `POST /api/semantic/infer` | Explicit rule reasoning | Run OWL-lite rules (Prp-trp/inv/symp/eq/dom/rng + Cax-sco) over a fact set, streamed with pagination |
+| `POST /api/semantic/infer` | Explicit rule reasoning | Run inference rules (Cax-sco/eqc, Prp-spo/eqp/inv/trp/symp + StateReach) over a fact set, streamed with pagination |
 | `POST /api/semantic/expand` | Taxonomy expansion | Fan out GO/disease hierarchies along `subClassOf` — querying a parent class includes all descendants |
 | `POST /api/semantic/path` | Path discovery | Graph traversal to find how two entities are connected |
 | `POST /api/semantic/gap` | Reference completeness assessment | Quantify knowledge gaps: which references/fields are missing, under 100% full-audit semantics |
@@ -228,17 +228,17 @@ All data linked via **unified semantic anchor** (`{Class}::{PrimaryKey}`), zero 
 
 | # | Innovation | One-liner |
 |---|-----------|-----------|
-| 7 | **Embedded Incremental Reasoning** | OWL 2 RL embedded in storage kernel, incremental fixpoint, 10-100x speedup |
+| 7 | **Embedded Incremental Reasoning** | OWL 2 RL embedded in the database (same process as the storage engine), incremental fixpoint, 10-100x speedup |
 | 8 | **Reasoning Safety** | Fact budget control, parallel thread pool, cycle detection |
 | 9 | **Derivation Chain Tracing** | Every derived fact records source rule and input facts |
 
 ### Ontology Kernel: OWL 2 RL Reasoning Engine
 
-OntoDB embeds the OWL 2 RL reasoning engine **inside the storage kernel**, not as an external component. Reasoning happens automatically on write, subclasses expand automatically on query, derived facts persist instantly.
+OntoDB embeds the OWL 2 RL reasoning engine **inside the database** (same process as the storage engine, shared memory space), not as an external component. The write path performs constraint-gate validation and fact reification; reasoning runs on demand at query time — subclasses expand automatically, INFER can materialize closures, and every derived fact keeps its derivation chain.
 
 ```
 Traditional: DB -> ETL -> external reasoning engine -> write back (minutes)
-OntoDB:      Data write -> kernel auto-reasoning -> instant persist (microseconds)
+OntoDB:      Write -> gate validation + reification -> on-demand reasoning at query time (INFER / class closure, with derivation chains)
 ```
 
 **Supported OWL 2 RL Rules:**
