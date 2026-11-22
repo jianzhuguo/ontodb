@@ -231,7 +231,7 @@ All data linked via **unified semantic anchor** (`{Class}::{PrimaryKey}`), zero 
 | 7 | **Embedded Incremental Reasoning** | OWL 2 RL embedded in the database (same process as the storage engine), incremental fixpoint, 10-100x speedup |
 | 8 | **Reasoning Safety** | Fact budget control, parallel thread pool, cycle detection |
 | 9 | **Derivation Chain Tracing** | Every derived fact records source rule and input facts |
-| 10 | **Execution-State Reasoning (ExecOnt)** | State-machine reachability closure (StateReach) + guarded-transition rejection; process / state / event / intent become first-class ontology citizens |
+| 10 | **Execution-State Reasoning (ExecOnt)** | State-machine reachability closure (StateReach) + guarded-transition modelling with constraint rejection; process / state / event / intent become first-class ontology citizens |
 
 ### Ontology Kernel: OWL 2 RL Reasoning Engine
 
@@ -272,7 +272,7 @@ The first two layers capture the **static world**: the T-Box is the world's **vo
 
 **Six-face metamodel**: Agent face (Agent / Capability), Process face (Process / Activity / Action), State face (StateMachine / State / Transition / Guard), Event face (ExecEvent / Causality), Intent face (Goal / Intent / Constraint), Resource face (Resource / ExecutionContext).
 
-**State reachability (StateReach)**: scans `from_state` / `to_state` transition facts to build a state adjacency graph, computes the BFS transitive closure, and derives `A reachable B` — hosted and attributed by the **same mechanism as the 7 OWL 2 RL rules**, so every derivation is inspectable. Transition guards (`guard`) are data, not code: a transition violating its constraint is **rejected at the write gate**, not cleaned up afterwards.
+**State reachability (StateReach)**: scans `from_state` / `to_state` transition facts to build a state adjacency graph, computes the BFS transitive closure, and derives `A reachable B` — hosted and attributed by the **same mechanism as the 7 OWL 2 RL rules**, so every derivation is inspectable. Transition guards (`guard`) are data, not code: whatever can be expressed as a DDL constraint (required / range / OWL restriction / disjointness / unique) is **rejected at the write gate**, not cleaned up afterwards; free-form guard expressions are evaluated by compliance reconciliation, which reports a VIOLATION.
 
 **Boundary**: ExecOnt is the **modeling and bookkeeping layer of execution semantics** — it does not schedule or drive execution and is not a workflow engine; control loops stay in the robot / PLC. High-frequency raw sensor streams never enter the ontology reasoning path; what enters the ontology layer is **semantized, event-level facts**.
 
