@@ -272,7 +272,7 @@ OntoDB：  数据写入 → 闸门校验 + 事实化 → 查询面随取随算�
 
 **六面元模型**：主体面（Agent / Capability）、过程面（Process / Activity / Action）、状态面（StateMachine / State / Transition / Guard）、事件面（ExecEvent / Causality）、意图面（Goal / Intent / Constraint）、资源面（Resource / ExecutionContext）。
 
-**状态可达推理（StateReach）**：扫 `from_state` / `to_state` 迁移事实建状态邻接图，BFS 求传递闭包，推出 `A reachable B`——与 7 条 OWL 2 RL 规则**同宿主、同归因机制**，推导链可查。迁移守卫（`guard`）是数据不是代码：DDL 约束（必填 / 值域 / OWL 限制 / 不相交 / 唯一）与写成 `字段 op 字面量`、`EXISTS(类 WHERE ...)`（跨主体前置条件，`$字段` 关联到本次写入）的守卫，都在写入闸门**当场拒写**，不是事后清洗。
+**状态可达推理（StateReach）**：扫 `from_state` / `to_state` 迁移事实建状态邻接图，BFS 求传递闭包，推出 `A reachable B`——与 7 条 OWL 2 RL 规则**同宿主、同归因机制**，推导链可查。迁移守卫（`guard`）是数据不是代码：DDL 约束（必填 / 值域 / OWL 限制 / 不相交 / 唯一）、同文档比较（`字段 op 字面量`）、跨主体前置（`EXISTS(类 WHERE ...)`）、时序前置（`BEFORE(类 WHERE ...)`，按 `ts` 判「更早」）——都在写入闸门**当场拒写**，不是事后清洗。
 
 **边界**：ExecOnt 是执行语义的**建模与记账层**——不调度、不驱动执行，不是工作流引擎；控制环留在机器人 / PLC。高频原始传感流不进本体推理路径，进本体面的是**事件化后的语义事实**。
 

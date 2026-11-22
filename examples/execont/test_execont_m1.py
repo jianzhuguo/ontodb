@@ -235,6 +235,18 @@ expect_ok("闸门⑧ 前置满足→放行", "INSERT INTO Job (name, process_of,
 expect_reject("闸门⑧b $process_of 关联不跨主体→拒写", "INSERT INTO Job (name, process_of, guard) VALUES ('place', 'P2', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
 expect_ok("闸门⑧c 关联字段缺失→未判定放行", "INSERT INTO Job (name, guard) VALUES ('noref', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')")
 
+# 闸门⑨ 时序前置（BEFORE 子句）：要求某事实**发生在本次写入之前**。
+# 排序键固定为 ts（ExecOnt 约定 ExecEvent.ts REQUIRED）；本次写入无 ts → 未判定放行。
+expect_ok("闸门⑨ 准备：时序载体 Step(ts)", "CREATE ONTOLOGY exec_t (CLASS Step, PROPERTY name DOMAIN Step RANGE STRING, PROPERTY process_of DOMAIN Step RANGE STRING, PROPERTY ts DOMAIN Step RANGE FLOAT64)")
+expect_ok("闸门⑨ 准备：Job 带 ts + guard", "CREATE ONTOLOGY exec_t2 (CLASS Job, PROPERTY name DOMAIN Job RANGE STRING, PROPERTY process_of DOMAIN Job RANGE STRING, PROPERTY ts DOMAIN Job RANGE FLOAT64, PROPERTY guard DOMAIN Job RANGE STRING)")
+expect_reject("闸门⑨ 无先前事实→拒写", "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 2000.0, 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+expect_ok("闸门⑨ 写入先前事实(ts=1000)", "INSERT INTO Step (name, process_of, ts) VALUES ('inspect', 'P1', 1000.0)")
+expect_ok("闸门⑨ 先前事实成立(ts=2000)→放行", "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 2000.0, 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')")
+expect_reject("闸门⑨b 回溯写入(ts=500)无更早事实→拒写", "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 500.0, 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+expect_reject("闸门⑨c ts 相等不算更早→拒写", "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 1000.0, 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+expect_ok("闸门⑨d 本次无 ts→未判定放行", "INSERT INTO Job (name, process_of, guard) VALUES ('nots', 'P1', 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')")
+expect_reject("闸门⑨e $process_of 不跨主体→拒写", "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P2', 2000.0, 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+
 print()
 print("=" * 72)
 print("Part 3 · 推理就绪（层级透明 + 工序传递 + 物化 + 演进面）  ← M1 验收③")

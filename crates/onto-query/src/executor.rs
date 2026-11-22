@@ -18497,24 +18497,28 @@ impl QueryExecutor {
     fn parse_guard_clause(s: &str) -> Option<GuardClause> {
         let t = s.trim();
         let up = t.to_ascii_uppercase();
-        if let Some(rest) = up.strip_prefix("EXISTS(") {
-            let inner_start = t.len() - rest.len();
-            let inner_end = t
-                .rfind(')')
-                .filter(|p| *p > inner_start)?;
-            return Self::parse_exists_body(&t[inner_start..inner_end]);
+        for (prefix, temporal) in [("EXISTS(", false), ("BEFORE(", true)] {
+            if let Some(rest) = up.strip_prefix(prefix) {
+                let inner_start = t.len() - rest.len();
+                let inner_end = t.rfind(')').filter(|p| *p > inner_start)?;
+                let (class, conds) = Self::parse_exists_body(&t[inner_start..inner_end])?;
+                return Some(if temporal {
+                    GuardClause::Before { class, conds }
+                } else {
+                    GuardClause::Exists { class, conds }
+                });
+            }
         }
         Self::parse_guard_cond(t).map(GuardClause::Cmp)
     }
 
-    /// Parses `Class WHERE cond (AND cond)*` — the body of an `EXISTS(...)`.
-    fn parse_exists_body(body: &str) -> Option<GuardClause> {
+    /// Parses `Class WHERE cond (AND cond)*` — the body of an `EXISTS(...)` or
+    /// `BEFORE(...)`.
+    fn parse_exists_body(body: &str) -> Option<(String, Vec<GuardCond>)> {
         let upper = body.to_ascii_uppercase();
         let wpos = upper.find("WHERE")?;
         let class = body[..wpos].trim();
-        if class.is_empty()
-            || !class.chars().all(|c| c.is_alphanumeric() || c == '_')
-        {
+        if class.is_empty() || !class.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return None;
         }
         let mut conds = Vec::new();
@@ -18528,10 +18532,7 @@ impl QueryExecutor {
         if conds.is_empty() {
             return None;
         }
-        Some(GuardClause::Exists {
-            class: class.to_string(),
-            conds,
-        })
+        Some((class.to_string(), conds))
     }
 
     /// Parses one `field <op> <operand>` comparison.
@@ -18759,6 +18760,68 @@ impl QueryExecutor {
         }
     }
 
+    /// Evaluates a temporal precondition: some row of `class` satisfies every
+    /// condition **and** is strictly earlier than the row being written.
+    ///
+    /// Unlike [`Self::eval_exists`], this demands *evidence of ordering*, so a
+    /// row that cannot be placed in time (no usable `ts`) is not a witness —
+    /// and the absence of any witness rejects. Otherwise a row written without
+    /// `ts` would silently disable every `BEFORE` guard pointing at it.
+    ///
+    /// `ts` is the fixed ordering key (the ExecOnt convention that
+    /// `ExecEvent.ts` is REQUIRED). "Earlier" is event time, not write time, so
+    /// a backdated row does not satisfy a precondition it should not.
+    fn eval_before(
+        class: &str,
+        conds: &[GuardCond],
+        doc: &Map<String, Value>,
+        engine: &LsmEngine,
+    ) -> GuardOutcome {
+        // Without a numeric ordering key on the written row, "earlier than
+        // this" is not expressible at all — undecidable, not false.
+        let Some(doc_ts) = doc.get("ts").and_then(|v| Self::json_as_f64(v)) else {
+            return GuardOutcome::Unknown;
+        };
+
+        let prefix = format!("{}::", class);
+        let Ok(entries) = engine.scan_prefix(prefix.as_bytes()) else {
+            return GuardOutcome::Unknown;
+        };
+
+        for (_key, val_bytes) in &entries {
+            let Some(row) = Self::parse_doc_bytes(val_bytes) else {
+                continue;
+            };
+            let mut all_hold = true;
+            for c in conds {
+                let Some(expected) = Self::resolve_operand(&c.operand, doc) else {
+                    all_hold = false;
+                    break;
+                };
+                let Some(actual) = row.get(&c.field) else {
+                    all_hold = false;
+                    break;
+                };
+                if Self::compare_guard_values(actual, c.op, expected) != GuardOutcome::Satisfied {
+                    all_hold = false;
+                    break;
+                }
+            }
+            if !all_hold {
+                continue;
+            }
+            // The content conditions hold; this row is a witness only if it can
+            // be shown to be strictly earlier.
+            let Some(row_ts) = row.get("ts").and_then(|v| Self::json_as_f64(v)) else {
+                continue;
+            };
+            if row_ts < doc_ts {
+                return GuardOutcome::Satisfied;
+            }
+        }
+        GuardOutcome::Violated
+    }
+
     /// Evaluates all guard clauses under three-valued AND: a definite failure
     /// anywhere is Violated; otherwise any Unknown is Unknown; only all
     /// Satisfied is Satisfied.
@@ -18773,6 +18836,11 @@ impl QueryExecutor {
                 GuardClause::Cmp(cond) => Self::eval_cond(cond, doc),
                 GuardClause::Exists { class, conds } => {
                     Self::eval_exists(class, conds, doc, engine)
+                }
+                // `BEFORE` demands evidence of a strictly earlier row; it is
+                // deliberately stricter than `EXISTS` (see `eval_before`).
+                GuardClause::Before { class, conds } => {
+                    Self::eval_before(class, conds, doc, engine)
                 }
             };
             match out {
@@ -19445,6 +19513,14 @@ enum GuardClause {
     /// `EXISTS(Class WHERE cond (AND cond)*)` — some row of `Class` already
     /// satisfies every condition. This is the cross-subject precondition form.
     Exists {
+        class: String,
+        conds: Vec<GuardCond>,
+    },
+    /// `BEFORE(Class WHERE cond (AND cond)*)` — some row of `Class` already
+    /// satisfies every condition **and** its `ts` is strictly less than the
+    /// `ts` of the document being written. Sugar over `Exists` with an implicit
+    /// `ts < $ts` condition; `ts` is the fixed ordering key.
+    Before {
         class: String,
         conds: Vec<GuardCond>,
     },
@@ -20359,6 +20435,20 @@ mod tests {
         assert!(matches!(conds[1].operand, GuardOperand::DocRef(_)));
         assert!(matches!(&clauses[1], GuardClause::Cmp(_)));
 
+        // BEFORE(...) parses as its own temporal clause and keeps the inner AND
+        // inside the clause rather than splitting the outer conjunction.
+        let clauses = QueryExecutor::parse_guard(
+            "BEFORE(Step WHERE name = 'inspect' AND process_of = $process_of) AND quality_score >= 0.8",
+        )
+        .unwrap();
+        assert_eq!(clauses.len(), 2);
+        let GuardClause::Before { class, conds } = &clauses[0] else {
+            panic!("expected Before, got {:?}", clauses[0]);
+        };
+        assert_eq!(class, "Step");
+        assert_eq!(conds.len(), 2);
+        assert!(matches!(&clauses[1], GuardClause::Cmp(_)));
+
         // Malformed EXISTS forms are not judged.
         for expr in [
             "EXISTS()",
@@ -20366,6 +20456,9 @@ mod tests {
             "EXISTS(ExecEvent WHERE)",
             "EXISTS(ExecEvent WHERE task_name)",
             "EXISTS(bad-class WHERE a = 1)",
+            "BEFORE()",
+            "BEFORE(Step)",
+            "BEFORE(Step WHERE)",
         ] {
             assert!(
                 QueryExecutor::parse_guard(expr).is_none(),
@@ -20488,6 +20581,112 @@ mod tests {
         assert!(
             empty.unwrap_err().to_string().contains("guard violation"),
             "an existential over an empty class must reject"
+        );
+    }
+
+    #[test]
+    fn test_guard_temporal_precondition_orders_on_ts() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY t (CLASS Step, PROPERTY name DOMAIN Step RANGE STRING, PROPERTY process_of DOMAIN Step RANGE STRING, PROPERTY ts DOMAIN Step RANGE FLOAT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY t2 (CLASS Job, PROPERTY name DOMAIN Job RANGE STRING, PROPERTY process_of DOMAIN Job RANGE STRING, PROPERTY ts DOMAIN Job RANGE FLOAT64, PROPERTY guard DOMAIN Job RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let insert = |sql: &str| executor.execute(&QueryParser::parse(sql).unwrap());
+
+        // The general form works without any sugar: the matched row's ts must
+        // be strictly less than the written doc's ts.
+        let general = "EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of AND ts < $ts)";
+        // BEFORE(...) is the same thing, with `ts` as the fixed ordering key.
+        let sugar = "BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)";
+
+        for guard in [general, sugar] {
+            // Nothing happened yet -> the temporal claim is definitely false.
+            let early = insert(&format!(
+                "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 2000.0, '{}')",
+                guard
+            ));
+            assert!(
+                early.unwrap_err().to_string().contains("guard violation"),
+                "must reject with no prior row: {guard}"
+            );
+        }
+
+        // A prior inspect for P1 at ts=1000.
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('inspect', 'P1', 1000.0)").unwrap();
+
+        for guard in [general, sugar] {
+            // Writing place at ts=2000: the inspect is earlier -> pass.
+            insert(&format!(
+                "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 2000.0, '{}')",
+                guard
+            ))
+            .unwrap();
+
+            // Writing place at ts=500 (backdated): no Step has ts < 500, so
+            // "something happened before this" is false -> reject. Event time,
+            // not write time, is what orders these.
+            let back = insert(&format!(
+                "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 500.0, '{}')",
+                guard
+            ));
+            assert!(
+                back.unwrap_err().to_string().contains("guard violation"),
+                "a backdated row must not satisfy BEFORE: {guard}"
+            );
+        }
+
+        // The ordering key is `ts`; a row whose ts is equal is not strictly
+        // earlier.
+        let equal = insert(&format!(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 1000.0, '{}')",
+            sugar
+        ));
+        assert!(
+            equal.unwrap_err().to_string().contains("guard violation"),
+            "ts < ts must not hold on equal timestamps"
+        );
+
+        // Without a `ts` on the written doc the ordering is undecidable ->
+        // Unknown -> schema-on-read passes it.
+        insert(&format!(
+            "INSERT INTO Job (name, process_of, guard) VALUES ('nots', 'P1', '{}')",
+            sugar
+        ))
+        .unwrap();
+
+        // Correlation still binds to the subject: a prior inspect for P1 does
+        // not license a place for P2.
+        let other = insert(&format!(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P2', 2000.0, '{}')",
+            sugar
+        ));
+        assert!(
+            other.unwrap_err().to_string().contains("guard violation"),
+            "temporal preconditions must not leak across subjects"
+        );
+
+        // A row that matches the content conditions but carries no `ts` is NOT
+        // evidence of earliness — otherwise writing a row without a timestamp
+        // would silently switch off every BEFORE guard aimed at that class.
+        insert("INSERT INTO Step (name, process_of) VALUES ('assemble', 'P3')").unwrap();
+        let untimeable = insert(&format!(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P3', 2000.0, 'BEFORE(Step WHERE name = ''assemble'' AND process_of = $process_of)')",
+        ));
+        assert!(
+            untimeable.unwrap_err().to_string().contains("guard violation"),
+            "a row without ts must not count as temporal evidence"
         );
     }
 
