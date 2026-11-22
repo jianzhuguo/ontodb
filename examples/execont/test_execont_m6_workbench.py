@@ -73,14 +73,18 @@ def main():
 
     # ── Run through workbench ──
     result = wb.run(scenario)
+    # Idempotency pin: re-running the same scenario must converge to the same
+    # state (same business keys overwrite) instead of accumulating rows.
+    rerun = wb.run(scenario)
 
-    total = result["passed"] + result["failed"]
+    total = rerun["passed"] + rerun["failed"]
     print(f"\n{'='*50}")
-    print(f"  Workbench validation: {result['passed']}/{total} passed")
-    if result["failed"] == 0:
+    print(f"  Workbench validation: {rerun['passed']}/{total} passed")
+    if result["failed"] == 0 and rerun["failed"] == 0:
         print("  NEW SCENARIO CREATED AND VERIFIED FROM ZERO")
+        print("  RE-RUN IDEMPOTENT (second execution also clean)")
     print(f"{'='*50}")
-    return result["failed"] == 0
+    return result["failed"] == 0 and rerun["failed"] == 0
 
 
 if __name__ == "__main__":

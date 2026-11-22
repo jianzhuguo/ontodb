@@ -11,7 +11,7 @@ M1 交付与验收：
   ③ preceded_by 工序传递 INFER 带归因（PrpTrp）
 内核改动：零（纯 DDL 约定）。
 """
-import json, urllib.request
+import json, os, urllib.request
 
 BASE = "http://127.0.0.1:7912/api/query"
 SCHEMA = "http://127.0.0.1:7912/api/schema"
@@ -78,6 +78,58 @@ def check(name, cond, detail=""):
         print(f"FAIL  {name}" + (f"  ({detail})" if detail else "")); FAIL += 1
 
 
+# exec_onto_meta.sql 是元模型 DDL 的**单源**——Part 1 直接执行该文件的语句，
+# 不在本套件内复写 DDL，改 .sql 即被回归触达。
+META_SQL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exec_onto_meta.sql")
+
+
+def load_meta_statements(path):
+    """把 exec_onto_meta.sql 切成可执行 DDL 语句：去 `--` 注释，按括号配平断句
+    （CREATE ONTOLOGY 多行整体成句，单行 ALTER 各自成句）。"""
+    stmts, buf, depth = [], [], 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            code = line.split("--", 1)[0].strip()
+            if not code:
+                continue
+            buf.append(code)
+            depth += code.count("(") - code.count(")")
+            if depth <= 0:
+                stmts.append(" ".join(buf))
+                buf, depth = [], 0
+    if buf:
+        stmts.append(" ".join(buf))
+    return stmts
+
+
+def meta_stmt_label(stmt):
+    """按语句内容映射回约定①-⑩ 的断言名（口径引用不变，语句文本来自 .sql）。"""
+    up = " ".join(stmt.upper().split())
+    if up.startswith("CREATE ONTOLOGY"):
+        return "DDL 六面元模型 + 机器人特化（exec_onto 一本体，单源 exec_onto_meta.sql）"
+    if "EVENT_AGENT" in up and "REQUIRED" in up:
+        return "约定①：event_agent REQUIRED（谁：provenance 必填）"
+    if "TS DOMAIN EXECEVENT" in up and "REQUIRED" in up:
+        return "约定②：ts REQUIRED（何时：provenance 必填）"
+    if "UNIQUE" in up:
+        return "约定③：ExecAgent UNIQUE(agent_serial)"
+    if "PRECEDED_BY" in up and "TRANSITIVE" in up:
+        return "约定④：preceded_by TRANSITIVE（工序先后）"
+    if "CAUSED_BY" in up and "TRANSITIVE" in up:
+        return "约定⑤：caused_by TRANSITIVE（因果）"
+    if "COMPOSED_OF" in up and "TRANSITIVE" in up:
+        return "约定⑥：composed_of TRANSITIVE（过程分解）"
+    if "DISJOINT" in up:
+        return "约定⑦：GraspEvent DISJOINT WITH PlaceEvent（事件互斥）"
+    if "FROM_STATE" in up and "FUNCTIONAL" in up:
+        return "约定⑧：from_state FUNCTIONAL（迁移唯一源，形式语义 A.6 纪律1）"
+    if "TO_STATE" in up and "FUNCTIONAL" in up:
+        return "约定⑨：to_state FUNCTIONAL（迁移唯一目标）"
+    if "CURRENT_STATE" in up and "FUNCTIONAL" in up:
+        return "约定⑩：current_state FUNCTIONAL（过程唯一当前位置）"
+    return "meta.sql 新增 DDL：" + " ".join(stmt.split())[:70]
+
+
 print("=" * 72)
 print("Part 0 · 清场（套件可重复执行）")
 print("=" * 72)
@@ -89,6 +141,14 @@ for sql in [
     "TRUNCATE TABLE ExecEvent", "TRUNCATE TABLE GraspEvent", "TRUNCATE TABLE PlaceEvent",
     "TRUNCATE TABLE Goal", "TRUNCATE TABLE Intent", "TRUNCATE TABLE ExecConstraint",
     "TRUNCATE TABLE Resource", "TRUNCATE TABLE ExecutionContext",
+    # 闸门夹具本体/类：不清理则残留事实会让「前置不存在→拒写」等阴性用例
+    # 被上一轮数据满足（Step/Phase/Job 跨轮残留，实测踩过）。
+    "DROP ONTOLOGY exec_gate", "DROP ONTOLOGY exec_guard",
+    "DROP ONTOLOGY exec_pre", "DROP ONTOLOGY exec_pre2",
+    "DROP ONTOLOGY exec_t", "DROP ONTOLOGY exec_t2",
+    "DROP ONTOLOGY exec_h", "DROP ONTOLOGY exec_pv", "DROP ONTOLOGY exec_pv2",
+    "TRUNCATE TABLE Bag", "TRUNCATE TABLE GuardT", "TRUNCATE TABLE Step",
+    "TRUNCATE TABLE Job", "TRUNCATE TABLE Job2", "TRUNCATE TABLE Phase", "TRUNCATE TABLE Job3",
 ]:
     try:
         q(sql)
@@ -98,67 +158,12 @@ print("      cleanup done")
 
 print()
 print("=" * 72)
-print("Part 1 · M1 验收①：六面元模型 DDL 全绿（零内核改动）")
+print("Part 1 · M1 验收①：六面元模型 DDL 全绿（单源加载 exec_onto_meta.sql）")
 print("=" * 72)
-expect_ok("DDL 六面元模型 + 机器人特化（exec_onto 一本体）", (
-    "CREATE ONTOLOGY exec_onto ("
-    # 主体面
-    "CLASS ExecAgent, CLASS Capability, "
-    # 过程面
-    "CLASS Process, CLASS Activity, "
-    # 状态面
-    "CLASS State, CLASS Transition, "
-    # 事件面
-    "CLASS ExecEvent, "
-    # 意图面
-    "CLASS Goal, CLASS Intent, CLASS ExecConstraint, "
-    # 资源面
-    "CLASS Resource, CLASS ExecutionContext, "
-    # 主体面属性
-    "PROPERTY agent_serial DOMAIN ExecAgent RANGE STRING, "
-    "PROPERTY capability_of DOMAIN Capability RANGE STRING, "
-    # 过程面属性
-    "PROPERTY activity_name DOMAIN Activity RANGE STRING, "
-    "PROPERTY process_of DOMAIN Activity RANGE STRING, "
-    "PROPERTY composed_of DOMAIN Process RANGE STRING, "
-    "PROPERTY preceded_by DOMAIN Activity RANGE STRING, "
-    "PROPERTY exec_agent DOMAIN Process RANGE STRING, "
-    # 状态面属性
-    "PROPERTY state_name DOMAIN State RANGE STRING, "
-    "PROPERTY state_machine DOMAIN State RANGE STRING, "
-    "PROPERTY from_state DOMAIN Transition RANGE STRING, "
-    "PROPERTY to_state DOMAIN Transition RANGE STRING, "
-    "PROPERTY guard DOMAIN Transition RANGE STRING, "
-    "PROPERTY current_state DOMAIN Process RANGE STRING, "
-    # 事件面属性（provenance 必填约定作用于 ExecEvent）
-    "PROPERTY event_agent DOMAIN ExecEvent RANGE STRING, "
-    "PROPERTY ts DOMAIN ExecEvent RANGE FLOAT64, "
-    "PROPERTY frame DOMAIN ExecEvent RANGE STRING, "
-    "PROPERTY task_name DOMAIN ExecEvent RANGE STRING, "
-    "PROPERTY caused_by DOMAIN ExecEvent RANGE STRING, "
-    # 意图面属性
-    "PROPERTY goal_of DOMAIN Intent RANGE STRING, "
-    "PROPERTY constraint_of DOMAIN ExecConstraint RANGE STRING, "
-    "PROPERTY has_intent DOMAIN Process RANGE STRING, "
-    # 资源面属性
-    "PROPERTY ctx_of DOMAIN ExecutionContext RANGE STRING, "
-    "PROPERTY obj_name DOMAIN Resource RANGE STRING, "
-    "PROPERTY embedding DOMAIN Resource RANGE ARRAY, "
-    # 机器人特化
-    "CLASS GraspEvent SUBCLASS OF ExecEvent, CLASS PlaceEvent, "
-    "PROPERTY target DOMAIN GraspEvent RANGE STRING, "
-    "PROPERTY confidence DOMAIN GraspEvent RANGE FLOAT64)"))
-
-expect_ok("约定①：event_agent REQUIRED（谁：provenance 必填）", "ALTER PROPERTY event_agent DOMAIN ExecEvent REQUIRED")
-expect_ok("约定②：ts REQUIRED（何时：provenance 必填）", "ALTER PROPERTY ts DOMAIN ExecEvent REQUIRED")
-expect_ok("约定③：ExecAgent UNIQUE(agent_serial)", "ALTER CLASS ExecAgent UNIQUE (agent_serial)")
-expect_ok("约定④：preceded_by TRANSITIVE（工序先后）", "ALTER PROPERTY preceded_by DOMAIN Activity CHARACTERISTICS TRANSITIVE")
-expect_ok("约定⑤：caused_by TRANSITIVE（因果）", "ALTER PROPERTY caused_by DOMAIN ExecEvent CHARACTERISTICS TRANSITIVE")
-expect_ok("约定⑥：composed_of TRANSITIVE（过程分解）", "ALTER PROPERTY composed_of DOMAIN Process CHARACTERISTICS TRANSITIVE")
-expect_ok("约定⑦：GraspEvent DISJOINT WITH PlaceEvent（事件互斥）", "ALTER CLASS GraspEvent DISJOINT WITH PlaceEvent")
-expect_ok("约定⑧：from_state FUNCTIONAL（迁移唯一源，形式语义 A.6 纪律1）", "ALTER PROPERTY from_state DOMAIN Transition CHARACTERISTICS FUNCTIONAL")
-expect_ok("约定⑨：to_state FUNCTIONAL（迁移唯一目标）", "ALTER PROPERTY to_state DOMAIN Transition CHARACTERISTICS FUNCTIONAL")
-expect_ok("约定⑩：current_state FUNCTIONAL（过程唯一当前位置）", "ALTER PROPERTY current_state DOMAIN Process CHARACTERISTICS FUNCTIONAL")
+meta_stmts = load_meta_statements(META_SQL)
+check("exec_onto_meta.sql 解析出全部 DDL 语句", len(meta_stmts) >= 11, f"count={len(meta_stmts)}")
+for stmt in meta_stmts:
+    expect_ok(meta_stmt_label(stmt), stmt)
 
 try:
     req = urllib.request.Request(SCHEMA)
@@ -172,6 +177,35 @@ try:
           "GraspEvent" in schema_text and "PlaceEvent" in schema_text)
 except Exception as e:
     check("六面 12 类全部登记于 schema", False, f"schema fetch error: {e}")
+    schema_text = ""
+
+# 元契约钉住：exec_onto_meta.sql 里的约定必须在 schema 可见——谁从 .sql
+# 删掉一条 ALTER，这里当场红，而不是等语义悄悄失效。
+try:
+    ontos = json.loads(schema_text)["data"]["ontologies"]
+    onto = next(o for o in ontos if o.get("name") == "exec_onto")
+    props, classes = onto["properties"], onto["classes"]
+    # unique_columns 是约束列表的列表（多列 UNIQUE 一约束多列），拍平取列名
+    uniq_cols = {c for cols in classes.get("ExecAgent", {}).get("unique_columns", [])
+                 for c in (cols if isinstance(cols, list) else [cols])}
+    contract = {
+        "event_agent.required": props.get("event_agent", {}).get("required") is True,
+        "ts.required": props.get("ts", {}).get("required") is True,
+        "from_state.is_functional": props.get("from_state", {}).get("is_functional") is True,
+        "to_state.is_functional": props.get("to_state", {}).get("is_functional") is True,
+        "current_state.is_functional": props.get("current_state", {}).get("is_functional") is True,
+        "preceded_by.is_transitive": props.get("preceded_by", {}).get("is_transitive") is True,
+        "caused_by.is_transitive": props.get("caused_by", {}).get("is_transitive") is True,
+        "composed_of.is_transitive": props.get("composed_of", {}).get("is_transitive") is True,
+        "ExecAgent.unique(agent_serial)": "agent_serial" in uniq_cols,
+        "GraspEvent.disjoint(PlaceEvent)": "PlaceEvent" in classes.get("GraspEvent", {}).get("disjoint_with", []),
+    }
+    broken = [k for k, ok in contract.items() if not ok]
+    check("元契约钉住（REQUIRED/FUNCTIONAL/TRANSITIVE/UNIQUE/DISJOINT 经 schema 可见）",
+          not broken, f"broken={broken}")
+except Exception as e:
+    check("元契约钉住（REQUIRED/FUNCTIONAL/TRANSITIVE/UNIQUE/DISJOINT 经 schema 可见）",
+          False, f"schema parse error: {e}")
 
 print()
 print("      -- 六面实例烟测（每面至少一行，provenance 合规） --")

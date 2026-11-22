@@ -64,10 +64,32 @@ class Workbench:
         ddl = f"CREATE ONTOLOGY {onto_name} (\n" + ",\n".join(parts) + "\n)"
         return ddl
 
+    # ── Idempotent setup ────────────────────────────────────
+    @staticmethod
+    def generate_cleanup(scenario: dict) -> list:
+        """Generate DELETE statements for this scenario's business keys.
+
+        Run before the inserts so a re-run (or a site polluted by an earlier
+        run) converges to the same state instead of accumulating rows.
+        """
+        stmts = []
+        proc = scenario.get("process", {})
+        if proc.get("key"):
+            stmts.append(f"DELETE FROM Process WHERE key = '{proc['key']}'")
+        for act in scenario.get("activities", []):
+            stmts.append(f"DELETE FROM Activity WHERE key = '{act['key']}'")
+        for ev in scenario.get("events", []):
+            stmts.append(f"DELETE FROM ExecEvent WHERE key = '{ev['key']}'")
+        return stmts
+
     # ── Event sample generation ────────────────────────────
     @staticmethod
     def generate_inserts(scenario: dict) -> list:
         """Generate INSERT statements from scenario data definitions.
+
+        Each row carries an explicit ``__pk__`` of the form ``Class::key`` so
+        the scenario's business key is the document key: re-inserting the same
+        scenario overwrites the same rows instead of duplicating them.
 
         scenario = {
             "process": {"key": "P-001", "state": "running", "agent": "a-01", "intent": "g-1"},
@@ -84,21 +106,22 @@ class Workbench:
         proc = scenario.get("process", {})
         if proc:
             stmts.append(
-                f"INSERT INTO Process (key, current_state, exec_agent, has_intent) "
-                f"VALUES ('{proc['key']}', '{proc.get('state','running')}', "
-                f"'{proc.get('agent','')}', '{proc.get('intent','')}')")
+                f"INSERT INTO Process (__pk__, key, current_state, exec_agent, has_intent) "
+                f"VALUES ('Process::{proc['key']}', '{proc['key']}', "
+                f"'{proc.get('state','running')}', '{proc.get('agent','')}', "
+                f"'{proc.get('intent','')}')")
         for act in scenario.get("activities", []):
             pred = f"'{act['preceded_by']}'" if act.get("preceded_by") else "''"
             stmts.append(
-                f"INSERT INTO Activity (key, activity_name, process_of, preceded_by) "
-                f"VALUES ('{act['key']}', '{act['name']}', "
+                f"INSERT INTO Activity (__pk__, key, activity_name, process_of, preceded_by) "
+                f"VALUES ('Activity::{act['key']}', '{act['key']}', '{act['name']}', "
                 f"'{act['process']}', {pred})")
         for ev in scenario.get("events", []):
             cause = f"'{ev['caused_by']}'" if ev.get("caused_by") else "''"
             stmts.append(
-                f"INSERT INTO ExecEvent (key, event_agent, ts, frame, task_name, caused_by) "
-                f"VALUES ('{ev['key']}', '{ev['agent']}', {ev['ts']}, "
-                f"'{ev['frame']}', '{ev['task']}', {cause})")
+                f"INSERT INTO ExecEvent (__pk__, key, event_agent, ts, frame, task_name, caused_by) "
+                f"VALUES ('ExecEvent::{ev['key']}', '{ev['key']}', '{ev['agent']}', "
+                f"{ev['ts']}, '{ev['frame']}', '{ev['task']}', {cause})")
         return stmts
 
     # ── Assertion runner ───────────────────────────────────
@@ -159,7 +182,10 @@ class Workbench:
             status = "OK" if r.get("success") else f"SKIP ({r.get('error','')[:60]})"
             print(f"  DDL: {status}")
 
-        # 2. Setup
+        # 2. Idempotent setup: clear this scenario's prior rows, then insert
+        #    under explicit Class::key document keys (overwrite, not duplicate).
+        for s in self.generate_cleanup(scenario):
+            self.sql(s)
         stmts = self.generate_inserts(scenario)
         for s in stmts:
             r = self.sql(s)
