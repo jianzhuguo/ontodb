@@ -18153,6 +18153,27 @@ impl QueryExecutor {
             }
         }
 
+        // L2 guard gate: `guard` is data, and when it is written in the
+        // supported `field <op> <literal>` shape it is evaluated here, at write
+        // time, against the same document. A definite failure rejects. Guards
+        // we cannot judge (operand absent, unsupported shape) stay Unknown and
+        // are let through — schema-on-read, not a silent guess.
+        if let Some(Value::String(g)) = doc.get("guard") {
+            if let Some(pred) = Self::parse_guard(g) {
+                if Self::eval_guard(&pred, doc) == GuardOutcome::Violated {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "guard violation on class '{}': '{}' — field '{}' is {}, which fails the guard",
+                        class,
+                        g,
+                        pred.field,
+                        doc.get(&pred.field)
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "<absent>".to_string())
+                    )));
+                }
+            }
+        }
+
         // Validate OWL restrictions
         self.validate_restrictions(engine, &ontology, class_def, doc)?;
 
@@ -18410,6 +18431,133 @@ impl QueryExecutor {
             Some(Value::Null) => 0,
             Some(Value::Array(arr)) => arr.len(),
             Some(_) => 1,
+        }
+    }
+
+    /// Parses `field <op> <literal>`, e.g. `quality_score >= 0.8`,
+    /// `status != 'done'`. Returns `None` for anything outside that shape.
+    fn parse_guard(expr: &str) -> Option<GuardPred> {
+        let s = expr.trim();
+        // Two-character operators must win over their one-character prefixes
+        // (`>=` over `>`, `!=` over `=`, `==` over `=`).
+        const OPS: &[(&str, GuardOp)] = &[
+            (">=", GuardOp::Ge),
+            ("<=", GuardOp::Le),
+            ("!=", GuardOp::Ne),
+            ("==", GuardOp::Eq),
+            (">", GuardOp::Gt),
+            ("<", GuardOp::Lt),
+            ("=", GuardOp::Eq),
+        ];
+        let mut best: Option<(usize, usize, GuardOp)> = None;
+        for (tok, op) in OPS {
+            if let Some(pos) = s.find(tok) {
+                let better = match best {
+                    None => true,
+                    Some((bpos, blen, _)) => pos < bpos || (pos == bpos && tok.len() > blen),
+                };
+                if better {
+                    best = Some((pos, tok.len(), *op));
+                }
+            }
+        }
+        let (pos, len, op) = best?;
+        let field = s[..pos].trim();
+        let rhs = s[pos + len..].trim();
+        if field.is_empty() || rhs.is_empty() {
+            return None;
+        }
+        if !field.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        let value = Self::parse_guard_literal(rhs)?;
+        Some(GuardPred {
+            field: field.to_string(),
+            op,
+            value,
+        })
+    }
+
+    /// Parses the right-hand side of a guard: quoted string, integer, float or
+    /// boolean literal. Anything else is not a literal we can judge.
+    fn parse_guard_literal(s: &str) -> Option<Value> {
+        let t = s.trim();
+        if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+            return Some(Value::String(
+                t[1..t.len() - 1].replace("''", "'"),
+            ));
+        }
+        if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+            return Some(Value::String(
+                t[1..t.len() - 1].replace("\"\"", "\""),
+            ));
+        }
+        if let Ok(i) = t.parse::<i64>() {
+            return Some(json!(i));
+        }
+        if let Ok(f) = t.parse::<f64>() {
+            return Some(json!(f));
+        }
+        if t.eq_ignore_ascii_case("true") {
+            return Some(Value::Bool(true));
+        }
+        if t.eq_ignore_ascii_case("false") {
+            return Some(Value::Bool(false));
+        }
+        None
+    }
+
+    /// Evaluates one guard predicate against the document being written.
+    ///
+    /// Numeric operands support every operator; strings and booleans only
+    /// support equality, since ordering on them is not a judgment we should be
+    /// making silently.
+    fn eval_guard(pred: &GuardPred, doc: &Map<String, Value>) -> GuardOutcome {
+        let Some(actual) = doc.get(&pred.field) else {
+            return GuardOutcome::Unknown;
+        };
+        if actual.is_null() {
+            return GuardOutcome::Unknown;
+        }
+        if let (Some(a), Some(b)) = (Self::json_as_f64(actual), Self::json_as_f64(&pred.value)) {
+            let holds = match pred.op {
+                GuardOp::Ge => a >= b,
+                GuardOp::Le => a <= b,
+                GuardOp::Gt => a > b,
+                GuardOp::Lt => a < b,
+                GuardOp::Eq => a == b,
+                GuardOp::Ne => a != b,
+            };
+            return if holds {
+                GuardOutcome::Satisfied
+            } else {
+                GuardOutcome::Violated
+            };
+        }
+        match pred.op {
+            GuardOp::Eq => {
+                if actual == &pred.value {
+                    GuardOutcome::Satisfied
+                } else {
+                    GuardOutcome::Violated
+                }
+            }
+            GuardOp::Ne => {
+                if actual != &pred.value {
+                    GuardOutcome::Satisfied
+                } else {
+                    GuardOutcome::Violated
+                }
+            }
+            // Ordering over non-numeric operands: not decidable here.
+            _ => GuardOutcome::Unknown,
+        }
+    }
+
+    fn json_as_f64(v: &Value) -> Option<f64> {
+        match v {
+            Value::Number(n) => n.as_f64(),
+            _ => None,
         }
     }
 
@@ -19021,6 +19169,42 @@ fn parse_geojson(map: &serde_json::Map<String, Value>) -> Option<onto_core::geo:
         }
         _ => None,
     }
+}
+
+/// Comparison operator of a parsed guard predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardOp {
+    Ge,
+    Le,
+    Gt,
+    Lt,
+    Eq,
+    Ne,
+}
+
+/// A guard of the restricted form `field <op> <literal>`.
+///
+/// Deliberately not a general expression language: no arithmetic, no boolean
+/// connectives, no function calls. Anything outside this shape is left
+/// unevaluated (see [`GuardOutcome::Unknown`]) rather than guessed at.
+#[derive(Debug, Clone)]
+struct GuardPred {
+    field: String,
+    op: GuardOp,
+    value: Value,
+}
+
+/// Result of evaluating a guard predicate against one document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardOutcome {
+    /// The predicate holds: let the write through.
+    Satisfied,
+    /// The predicate is definitely false: reject the write.
+    Violated,
+    /// Undecidable (operand absent, type not comparable, guard not in the
+    /// supported shape). Schema-on-read lets the write through instead of
+    /// blocking on a judgment it cannot make.
+    Unknown,
 }
 
 #[cfg(test)]
@@ -19847,6 +20031,173 @@ mod tests {
             scalar_multi.is_err(),
             "a STRING-typed property must not accept a list"
         );
+    }
+
+    #[test]
+    fn test_guard_parse_accepts_only_the_restricted_shape() {
+        // Supported: identifier on the left, operator, literal on the right.
+        for expr in [
+            "quality_score >= 0.8",
+            "quality_score>=0.8",
+            "count <= 3",
+            "count > 0",
+            "count < 10",
+            "status != 'done'",
+            "status = 'done'",
+            "status == 'done'",
+            "flag = true",
+        ] {
+            assert!(
+                QueryExecutor::parse_guard(expr).is_some(),
+                "should parse: {expr}"
+            );
+        }
+
+        // Outside the shape: not judged, not guessed.
+        for expr in [
+            "",
+            "quality_score",
+            "quality_score >=",
+            ">= 0.8",
+            "quality_score + 1 >= 2",
+            "a and b",
+            "func(x) = 1",
+            "field = other_field",
+            "field = [1,2]",
+        ] {
+            assert!(
+                QueryExecutor::parse_guard(expr).is_none(),
+                "must not parse: {expr}"
+            );
+        }
+
+        // Two-character operators beat their one-character prefixes.
+        let p = QueryExecutor::parse_guard("a >= 1").unwrap();
+        assert_eq!(p.op, GuardOp::Ge);
+        let p = QueryExecutor::parse_guard("a != 1").unwrap();
+        assert_eq!(p.op, GuardOp::Ne);
+        let p = QueryExecutor::parse_guard("a == 1").unwrap();
+        assert_eq!(p.op, GuardOp::Eq);
+    }
+
+    #[test]
+    fn test_guard_eval_three_valued_semantics() {
+        let doc: Map<String, Value> = serde_json::from_str(
+            r#"{"quality_score": 0.3, "status": "done", "count": 3, "flag": true}"#,
+        )
+        .unwrap();
+
+        // Numeric comparisons.
+        assert_eq!(
+            QueryExecutor::eval_guard(
+                &QueryExecutor::parse_guard("quality_score >= 0.8").unwrap(),
+                &doc
+            ),
+            GuardOutcome::Violated
+        );
+        assert_eq!(
+            QueryExecutor::eval_guard(
+                &QueryExecutor::parse_guard("quality_score >= 0.2").unwrap(),
+                &doc
+            ),
+            GuardOutcome::Satisfied
+        );
+        assert_eq!(
+            QueryExecutor::eval_guard(&QueryExecutor::parse_guard("count = 3").unwrap(), &doc),
+            GuardOutcome::Satisfied
+        );
+        assert_eq!(
+            QueryExecutor::eval_guard(&QueryExecutor::parse_guard("count != 3").unwrap(), &doc),
+            GuardOutcome::Violated
+        );
+
+        // String and boolean equality.
+        assert_eq!(
+            QueryExecutor::eval_guard(&QueryExecutor::parse_guard("status = 'done'").unwrap(), &doc),
+            GuardOutcome::Satisfied
+        );
+        assert_eq!(
+            QueryExecutor::eval_guard(
+                &QueryExecutor::parse_guard("status != 'done'").unwrap(),
+                &doc
+            ),
+            GuardOutcome::Violated
+        );
+        assert_eq!(
+            QueryExecutor::eval_guard(&QueryExecutor::parse_guard("flag = true").unwrap(), &doc),
+            GuardOutcome::Satisfied
+        );
+
+        // Absent operand -> Unknown, never a guess.
+        assert_eq!(
+            QueryExecutor::eval_guard(
+                &QueryExecutor::parse_guard("missing_field >= 1").unwrap(),
+                &doc
+            ),
+            GuardOutcome::Unknown
+        );
+
+        // Ordering over non-numeric operands -> Unknown, not a silent compare.
+        assert_eq!(
+            QueryExecutor::eval_guard(&QueryExecutor::parse_guard("status >= 'a'").unwrap(), &doc),
+            GuardOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn test_guard_gate_rejects_violation_on_write() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY g (CLASS Transition, PROPERTY from_state DOMAIN Transition RANGE STRING, PROPERTY to_state DOMAIN Transition RANGE STRING, PROPERTY guard DOMAIN Transition RANGE STRING, PROPERTY quality_score DOMAIN Transition RANGE FLOAT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Guard satisfied -> written.
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "INSERT INTO Transition (from_state, to_state, guard, quality_score) VALUES ('inspect', 'place', 'quality_score >= 0.8', 0.95)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Guard violated -> rejected at the write gate, not flagged later.
+        let bad = executor.execute(
+            &QueryParser::parse(
+                "INSERT INTO Transition (from_state, to_state, guard, quality_score) VALUES ('inspect', 'place', 'quality_score >= 0.8', 0.3)",
+            )
+            .unwrap(),
+        );
+        let msg = bad.unwrap_err().to_string();
+        assert!(
+            msg.contains("guard violation"),
+            "guard violation must reject on write, got: {msg}"
+        );
+
+        // Operand absent -> Unknown -> schema-on-read lets it through.
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "INSERT INTO Transition (from_state, to_state, guard) VALUES ('place', 'ship', 'quality_score >= 0.8')",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Guard outside the supported shape -> not judged, not blocked.
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "INSERT INTO Transition (from_state, to_state, guard) VALUES ('ship', 'store', 'a and b')",
+                )
+                .unwrap(),
+            )
+            .unwrap();
     }
 
     #[test]

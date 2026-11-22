@@ -217,6 +217,14 @@ expect_reject("闸门⑥ 功能属性多值拒写：['a','b']", "INSERT INTO Bag
 expect_ok("闸门⑥ 同值重复仍算一个值：['a','a']", "INSERT INTO Bag (tags) VALUES (['a', 'a'])")
 expect_reject("闸门⑥b 标量属性不接受列表(from_state)", "INSERT INTO Transition (id, from_state) VALUES ('gx6', ['A', 'Z'])", "type")
 
+# 闸门⑦ L2 守卫求值：guard 是数据，写成 `字段 op 字面量` 时内核当场判定。
+# 三值语义（形式语义 A.5）：满足放行 / 不满足拒写 / 判不了（缺操作数或语法不支持）不猜、放行。
+expect_ok("闸门⑦ 准备：守卫载体", "CREATE ONTOLOGY exec_guard (CLASS GuardT, PROPERTY name DOMAIN GuardT RANGE STRING, PROPERTY guard DOMAIN GuardT RANGE STRING, PROPERTY quality_score DOMAIN GuardT RANGE FLOAT64)")
+expect_ok("闸门⑦ 守卫满足放行：0.95 >= 0.8", "INSERT INTO GuardT (name, guard, quality_score) VALUES ('ok', 'quality_score >= 0.8', 0.95)")
+expect_reject("闸门⑦ 守卫不满足拒写：0.3 >= 0.8", "INSERT INTO GuardT (name, guard, quality_score) VALUES ('bad', 'quality_score >= 0.8', 0.3)", "guard violation")
+expect_ok("闸门⑦a 操作数缺失→未判定放行(schema-on-read)", "INSERT INTO GuardT (name, guard) VALUES ('nodata', 'quality_score >= 0.8')")
+expect_ok("闸门⑦b 非支持语法→不判定不拦截", "INSERT INTO GuardT (name, guard) VALUES ('weird', 'a and b')")
+
 print()
 print("=" * 72)
 print("Part 3 · 推理就绪（层级透明 + 工序传递 + 物化 + 演进面）  ← M1 验收③")
