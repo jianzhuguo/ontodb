@@ -678,4 +678,94 @@ mod tests {
         let results = engine.evaluate(&event);
         assert_eq!(results.len(), 1); // Only geofence triggers
     }
+
+    /// M3 acceptance: STTRL anomaly rules hit execution events with provenance.
+    /// Demonstrates a robot/agent ExecEvent (with event_agent + event_ts) triggering
+    /// both UnusualLocation and TimeAnomaly rules.
+    #[test]
+    fn test_anomaly_hits_exec_event() {
+        // Anomaly rule 1: robot should stay within known work cells
+        let location_rule = Rule::new(
+            "exec_unusual_location",
+            RuleType::UnusualLocation {
+                known_locations: vec![
+                    Region::Circle {
+                        center_lon: 116.4,
+                        center_lat: 39.9,
+                        radius_m: 500.0,
+                    },
+                    Region::Circle {
+                        center_lon: 116.41,
+                        center_lat: 39.91,
+                        radius_m: 500.0,
+                    },
+                ],
+                tolerance_m: 50.0,
+            },
+        );
+
+        // Anomaly rule 2: maintenance events should only occur during off-hours (22:00-06:00)
+        let time_rule = Rule::new(
+            "exec_time_anomaly",
+            RuleType::TimeAnomaly {
+                region: Region::Circle {
+                    center_lon: 116.45,
+                    center_lat: 39.95,
+                    radius_m: 20000.0,
+                },
+                expected_hours: vec![22, 23, 0, 1, 2, 3, 4, 5],
+            },
+        );
+
+        // ExecEvent: robot_01 enters restricted area at 14:00 (during production)
+        // timestamp in nanoseconds: 2024-01-01 14:00 UTC
+        let exec_event = SpatioTemporalEvent {
+            entity_id: "robot_01".to_string(),
+            lon: 116.5,
+            lat: 40.0,
+            timestamp: 1_704_117_600_000_000_000_i64,
+            properties: {
+                let mut p = HashMap::new();
+                p.insert("event_agent".to_string(), "ExecAgent::robot_01".to_string());
+                p.insert("event_type".to_string(), "ExecEvent::MaintenanceStart".to_string());
+                p
+            },
+        };
+
+        // Both anomaly rules should trigger
+        let loc_result = location_rule.evaluate(&exec_event, &[]);
+        assert!(
+            matches!(loc_result, RuleResult::Triggered { .. }),
+            "UnusualLocation should trigger for robot outside work cells"
+        );
+
+        let time_result = time_rule.evaluate(&exec_event, &[]);
+        assert!(
+            matches!(time_result, RuleResult::Triggered { .. }),
+            "TimeAnomaly should trigger for 14:00 event (outside 22-06 window)"
+        );
+
+        // Normal event: robot in work cell at 23:00 (off-hours maintenance)
+        let normal_event = SpatioTemporalEvent {
+            entity_id: "robot_01".to_string(),
+            lon: 116.401,
+            lat: 39.901,
+            timestamp: 1_704_150_000_000_000_000_i64, // 2024-01-01 23:00 UTC
+            properties: {
+                let mut p = HashMap::new();
+                p.insert("event_agent".to_string(), "ExecAgent::robot_01".to_string());
+                p
+            },
+        };
+
+        // Normal event: location OK, time OK
+        assert!(matches!(
+            location_rule.evaluate(&normal_event, &[]),
+            RuleResult::NotTriggered
+        ));
+        assert!(matches!(
+            time_rule.evaluate(&normal_event, &[]),
+            RuleResult::NotTriggered
+        ));
+    }
 }

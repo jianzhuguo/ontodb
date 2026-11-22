@@ -648,6 +648,25 @@ impl VectorIndexManager {
     /// (zero-copy) instead of storing a second payload.
     pub fn note_doc_vector(&mut self, doc_key: Vec<u8>, class: String, column: String, data: VecData) {
         self.deleted_keys.remove(&doc_key);
+        // Reconcile feeds the RAW document vector here, but graph nodes hold
+        // the insert-path form (Cosine Dense vectors are L2-normalized).
+        // Canonicalize the same way `index_vector_data_owned` does or the
+        // stale filter compares raw vs normalized and drops every hit.
+        let data = match data {
+            VecData::Dense(mut v) => {
+                let key = IndexKey {
+                    class: class.clone(),
+                    column: column.clone(),
+                };
+                if let Some(meta) = self.metadata.get(&key) {
+                    if should_normalize(&meta.metric) {
+                        l2_normalize(&mut v);
+                    }
+                }
+                VecData::Dense(v)
+            }
+            packed => packed,
+        };
         let map = self
             .doc_vectors
             .entry((class, column))
@@ -1159,6 +1178,36 @@ mod tests {
             .search("Product", "embedding", &[1.0, 0.0, 0.0], 5)
             .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn test_note_doc_vector_normalizes_cosine_like_insert_path() {
+        let mut mgr = VectorIndexManager::new();
+        mgr.create_index("Car", "embedding", 3, DistanceMetric::Cosine, 16, 200, 100)
+            .unwrap();
+
+        // Insert path stores the L2-normalized vector in the graph node.
+        mgr.index_vector(b"Car::v1", "Car", "embedding", vec![0.1, 0.2, 0.3]);
+
+        // Restore reconcile feeds the RAW document vector through
+        // note_doc_vector; it must be canonicalized or the stale filter
+        // drops the node and search returns empty after restart.
+        mgr.note_doc_vector(
+            b"Car::v1".to_vec(),
+            "Car".to_string(),
+            "embedding".to_string(),
+            VecData::from_f32(&[0.1, 0.2, 0.3]),
+        );
+
+        let hits = mgr
+            .search("Car", "embedding", &[0.1, 0.2, 0.3], 5)
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "restored non-unit cosine vector must survive the stale filter"
+        );
+        assert_eq!(hits[0].entry.id, b"Car::v1");
     }
 
     #[test]

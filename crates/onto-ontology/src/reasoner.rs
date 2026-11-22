@@ -741,43 +741,63 @@ impl Reasoner {
     /// Explains how a particular triple was derived.
     ///
     /// Returns the derivation chain: which rules and input triples produced the target.
+    /// Returns the full derivation chain for `target`, deepest premise first
+    /// entry is the final step (index 0 = conclusion closest to target).
+    /// Each step includes the premises that produced it, enabling recursive
+    /// causal-chain attribution (e.g. 3+ hop `caused_by` chains).
     pub fn explain(&self, facts: &[Triple], target: &Triple) -> Vec<DerivationStep> {
         let result = self.reason(facts);
         if !result.all_facts.contains(target) {
             return Vec::new();
         }
 
-        // Simple explanation: re-run rules one at a time and track which rule produced the target
-        let mut all_facts: HashSet<Triple> = facts.iter().cloned().collect();
-        let mut steps = Vec::new();
+        // 1. Record every derivation step
+        let original: HashSet<Triple> = facts.iter().cloned().collect();
+        let mut all_facts: HashSet<Triple> = original.clone();
+        let mut all_steps: Vec<DerivationStep> = Vec::new();
         let mut new_facts: Vec<Triple> = Vec::new();
 
         for _iter in 0..self.max_iterations {
-            let mut found = false;
             let mut new_this_round: Vec<Triple> = Vec::new();
             for rule in &self.rules {
                 let inferred = rule.apply(&self.ontology, &all_facts, &new_facts);
                 for t in inferred {
-                    if &t == target && !all_facts.contains(&t) {
-                        steps.push(DerivationStep {
+                    if all_facts.insert(t.clone()) {
+                        all_steps.push(DerivationStep {
                             rule: rule.id(),
                             conclusion: t.clone(),
                             premises: find_premises(&self.ontology, rule.id(), &t, &all_facts),
                         });
-                        found = true;
-                    }
-                    if all_facts.insert(t.clone()) {
                         new_this_round.push(t);
                     }
                 }
             }
             new_facts = new_this_round;
-            if found || all_facts.contains(target) {
+            if new_facts.is_empty() {
                 break;
             }
         }
 
-        steps
+        // 2. Trace back from target through derivation steps (reverse topological order)
+        let mut chain: Vec<DerivationStep> = Vec::new();
+        let mut visited: HashSet<Triple> = HashSet::new();
+        let mut to_explain: Vec<Triple> = vec![target.clone()];
+
+        while let Some(current) = to_explain.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            if let Some(step) = all_steps.iter().find(|s| s.conclusion == current) {
+                chain.push(step.clone());
+                for premise in &step.premises {
+                    if !original.contains(premise) {
+                        to_explain.push(premise.clone());
+                    }
+                }
+            }
+        }
+
+        chain
     }
 }
 
@@ -886,6 +906,84 @@ fn find_premises(
                 }
             }
             vec![]
+        }
+        RuleId::StateReach => {
+            // Conclusion: (A, reachable, B). Find the chain of Transition
+            // from_state/to_state facts forming a path A -> ... -> B.
+            use std::collections::{HashMap, VecDeque};
+
+            // Build adjacency and map edges to their source Transition facts
+            let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+            let mut edge_facts: HashMap<(&str, &str), Vec<Triple>> = HashMap::new();
+            let mut from_map: HashMap<&str, &str> = HashMap::new();
+            let mut to_map: HashMap<&str, &str> = HashMap::new();
+            for fact in facts {
+                match fact.predicate.as_str() {
+                    "from_state" => {
+                        from_map.insert(fact.subject.as_str(), fact.object.as_str());
+                    }
+                    "to_state" => {
+                        to_map.insert(fact.subject.as_str(), fact.object.as_str());
+                    }
+                    _ => {}
+                }
+            }
+            for (subj, from) in &from_map {
+                if let Some(to) = to_map.get(subj) {
+                    adj.entry(*from).or_default().push(to);
+                    edge_facts
+                        .entry((*from, *to))
+                        .or_default()
+                        .push(Triple::new(*subj, "from_state", *from));
+                    edge_facts
+                        .entry((*from, *to))
+                        .or_default()
+                        .push(Triple::new(*subj, "to_state", *to));
+                }
+            }
+
+            // BFS to find path from conclusion.subject to conclusion.object
+            let start = conclusion.subject.as_str();
+            let goal = conclusion.object.as_str();
+            let mut prev: HashMap<&str, &str> = HashMap::new();
+            let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut q = VecDeque::new();
+            q.push_back(start);
+            visited.insert(start);
+            let mut found = false;
+            while let Some(curr) = q.pop_front() {
+                if curr == goal {
+                    found = true;
+                    break;
+                }
+                if let Some(neighbors) = adj.get(curr) {
+                    for &next in neighbors {
+                        if !visited.contains(next) {
+                            visited.insert(next);
+                            prev.insert(next, curr);
+                            q.push_back(next);
+                        }
+                    }
+                }
+            }
+            if !found {
+                return vec![];
+            }
+            // Reconstruct path and collect Transition facts
+            let mut path = vec![goal];
+            let mut curr = goal;
+            while let Some(&p) = prev.get(curr) {
+                path.push(p);
+                curr = p;
+            }
+            path.reverse();
+            let mut premises = Vec::new();
+            for pair in path.windows(2) {
+                if let Some(facts_pair) = edge_facts.get(&(pair[0], pair[1])) {
+                    premises.extend(facts_pair.clone());
+                }
+            }
+            premises
         }
     }
 }
@@ -1186,6 +1284,82 @@ mod tests {
         let steps = reasoner.explain(&facts, &target);
         assert!(!steps.is_empty());
         assert_eq!(steps[0].rule, RuleId::CaxSco);
+    }
+
+    #[test]
+    fn test_explain_causal_chain_3hop() {
+        // M3 acceptance: causal chain INFER with attribution (3+ links)
+        // caused_by is transitive: e1←e2←e3←e4  ⇒  e1 caused_by e4 (3 hops)
+        let mut onto = Ontology::new("test");
+        onto.add_property(
+            crate::model::Property::new("caused_by", "ExecEvent", crate::model::DataType::String)
+                .transitive(),
+        );
+        let reasoner = Reasoner::new(onto);
+
+        let facts = vec![
+            Triple::new("e1", "caused_by", "e2"),
+            Triple::new("e2", "caused_by", "e3"),
+            Triple::new("e3", "caused_by", "e4"),
+        ];
+        let target = Triple::new("e1", "caused_by", "e4");
+        let steps = reasoner.explain(&facts, &target);
+
+        // Must return full chain (not just last hop)
+        assert!(steps.len() >= 2, "chain should have 2+ derivation steps, got {}", steps.len());
+        // Final step produces the target
+        assert_eq!(steps[0].conclusion, target);
+        assert_eq!(steps[0].rule, RuleId::PrpTrp);
+        // All steps are PrpTrp (transitive closure)
+        for step in &steps {
+            assert_eq!(step.rule, RuleId::PrpTrp);
+        }
+    }
+
+    #[test]
+    fn test_explain_causal_chain_5hop() {
+        // 5-hop chain: e1←e2←e3←e4←e5←e6  ⇒  e1 caused_by e6
+        let mut onto = Ontology::new("test");
+        onto.add_property(
+            crate::model::Property::new("caused_by", "ExecEvent", crate::model::DataType::String)
+                .transitive(),
+        );
+        let reasoner = Reasoner::new(onto);
+
+        let facts = vec![
+            Triple::new("e1", "caused_by", "e2"),
+            Triple::new("e2", "caused_by", "e3"),
+            Triple::new("e3", "caused_by", "e4"),
+            Triple::new("e4", "caused_by", "e5"),
+            Triple::new("e5", "caused_by", "e6"),
+        ];
+        let target = Triple::new("e1", "caused_by", "e6");
+        let steps = reasoner.explain(&facts, &target);
+
+        assert!(steps.len() >= 2, "chain should have 2+ derivation steps, got {}", steps.len());
+        assert_eq!(steps[0].conclusion, target);
+    }
+
+    #[test]
+    fn test_explain_preceded_by_chain() {
+        // preceded_by is also transitive (already proven in M1)
+        let mut onto = Ontology::new("test");
+        onto.add_property(
+            crate::model::Property::new("preceded_by", "Activity", crate::model::DataType::String)
+                .transitive(),
+        );
+        let reasoner = Reasoner::new(onto);
+
+        let facts = vec![
+            Triple::new("act3", "preceded_by", "act2"),
+            Triple::new("act2", "preceded_by", "act1"),
+        ];
+        let target = Triple::new("act3", "preceded_by", "act1");
+        let steps = reasoner.explain(&facts, &target);
+
+        assert!(!steps.is_empty());
+        assert_eq!(steps[0].conclusion, target);
+        assert_eq!(steps[0].rule, RuleId::PrpTrp);
     }
 
     #[test]
