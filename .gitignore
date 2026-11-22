@@ -223,3 +223,9 @@ BP_*.pdf
 /scripts/link_clinvar.py
 /scripts/ontodb_semantic.py
 /scripts/semantic_*.py
+
+# ExecOnt example suites are product source (exception to temp-script rules)
+!examples/execont/test_*.py
+# SemMesh bridge cases (local only, never committed)
+examples/execont/semmesh_contract.sql
+examples/execont/test_execont_m4.py
