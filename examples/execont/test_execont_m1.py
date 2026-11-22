@@ -247,6 +247,14 @@ expect_reject("闸门⑨c ts 相等不算更早→拒写", "INSERT INTO Job (nam
 expect_ok("闸门⑨d 本次无 ts→未判定放行", "INSERT INTO Job (name, process_of, guard) VALUES ('nots', 'P1', 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')")
 expect_reject("闸门⑨e $process_of 不跨主体→拒写", "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P2', 2000.0, 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
 
+# 闸门⑩ 类层级展开：守卫指向父类时，子类实例一并计入（扫父类 + 全部子类的存储键前缀）。
+# 断言里用 task_name='抓取'——它只存在于 GraspEvent（ExecEvent 的子类）实例上，
+# 不展开层级就看不见，所以这几条能真正证明展开生效。
+expect_ok("闸门⑩ 准备：Job2 带 ts + guard", "CREATE ONTOLOGY exec_h (CLASS Job2, PROPERTY name DOMAIN Job2 RANGE STRING, PROPERTY ts DOMAIN Job2 RANGE FLOAT64, PROPERTY guard DOMAIN Job2 RANGE STRING)")
+expect_ok("闸门⑩ 父类守卫看到子类实例(EXISTS)", "INSERT INTO Job2 (name, ts, guard) VALUES ('has_grasp', 5000.0, 'EXISTS(ExecEvent WHERE task_name = ''抓取'')')")
+expect_ok("闸门⑩ 父类守卫看到子类实例(BEFORE)", "INSERT INTO Job2 (name, ts, guard) VALUES ('after_grasp', 5000.0, 'BEFORE(ExecEvent WHERE task_name = ''抓取'')')")
+expect_reject("闸门⑩b 父类守卫：真不存在的仍拒写", "INSERT INTO Job2 (name, ts, guard) VALUES ('nope', 5000.0, 'BEFORE(ExecEvent WHERE task_name = ''不存在的工序'')')", "guard violation")
+
 print()
 print("=" * 72)
 print("Part 3 · 推理就绪（层级透明 + 工序传递 + 物化 + 演进面）  ← M1 验收③")

@@ -18163,7 +18163,7 @@ impl QueryExecutor {
         //   - `EXISTS(Class WHERE ...)`       against rows already stored
         if let Some(Value::String(g)) = doc.get("guard") {
             if let Some(clauses) = Self::parse_guard(g) {
-                if Self::eval_guard_clauses(&clauses, doc, engine) == GuardOutcome::Violated {
+                if self.eval_guard_clauses(&clauses, doc, engine) == GuardOutcome::Violated {
                     return Err(CoreError::InvalidArgument(format!(
                         "guard violation on class '{}': '{}' — precondition does not hold",
                         class, g
@@ -18686,13 +18686,38 @@ impl QueryExecutor {
         Self::compare_guard_values(actual, cond.op, expected)
     }
 
-    /// Evaluates a cross-subject precondition: some row of `class` already
-    /// satisfies every condition, with `$field` reading the written document.
+    /// Storage-key prefixes that hold instances of `class` — the class itself
+    /// plus every subclass and equivalent class, so a guard aimed at a parent
+    /// also sees its children.
+    ///
+    /// Resolving the hierarchy needs the ontology that defines the class. When
+    /// that cannot be resolved (class unknown, ontology lookup fails) the
+    /// caller falls back to the exact prefix alone rather than guessing.
+    fn guard_scan_prefixes(&self, engine: &LsmEngine, class: &str) -> Vec<String> {
+        let mut prefixes = vec![format!("{}::", class)];
+        if let Ok(Some(onto)) = self
+            .ontology_store
+            .find_ontology_for_class_global(engine, class)
+        {
+            for sub in onto.get_all_subclasses(class) {
+                let p = format!("{}::", sub);
+                if !prefixes.contains(&p) {
+                    prefixes.push(p);
+                }
+            }
+        }
+        prefixes
+    }
+
+    /// Evaluates a cross-subject precondition: some row of `class` (or any of
+    /// its subclasses) already satisfies every condition, with `$field`
+    /// reading the written document.
     ///
     /// Three-valued: a matching row is Satisfied; a full scan that finds no
     /// match is Violated (definite — no such fact exists yet); a class the
     /// ontology does not know, or an unresolvable `$field`, is Unknown.
     fn eval_exists(
+        &self,
         class: &str,
         conds: &[GuardCond],
         doc: &Map<String, Value>,
@@ -18710,43 +18735,43 @@ impl QueryExecutor {
             }
         }
 
-        let prefix = format!("{}::", class);
-        let Ok(entries) = engine.scan_prefix(prefix.as_bytes()) else {
-            return GuardOutcome::Unknown;
-        };
-
         let mut saw_row = false;
         let mut saw_decidable_mismatch = false;
-        for (_key, val_bytes) in &entries {
-            let Some(row) = Self::parse_doc_bytes(val_bytes) else {
-                continue;
+        for prefix in self.guard_scan_prefixes(engine, class) {
+            let Ok(entries) = engine.scan_prefix(prefix.as_bytes()) else {
+                return GuardOutcome::Unknown;
             };
-            saw_row = true;
-            let mut all_hold = true;
-            let mut any_unknown = false;
-            for c in conds {
-                let Some(expected) = Self::resolve_operand(&c.operand, doc) else {
-                    any_unknown = true;
-                    break;
+            for (_key, val_bytes) in &entries {
+                let Some(row) = Self::parse_doc_bytes(val_bytes) else {
+                    continue;
                 };
-                let Some(actual) = row.get(&c.field) else {
-                    any_unknown = true;
-                    break;
-                };
-                match Self::compare_guard_values(actual, c.op, expected) {
-                    GuardOutcome::Satisfied => {}
-                    GuardOutcome::Violated => {
-                        all_hold = false;
-                        saw_decidable_mismatch = true;
-                    }
-                    GuardOutcome::Unknown => {
+                saw_row = true;
+                let mut all_hold = true;
+                let mut any_unknown = false;
+                for c in conds {
+                    let Some(expected) = Self::resolve_operand(&c.operand, doc) else {
                         any_unknown = true;
                         break;
+                    };
+                    let Some(actual) = row.get(&c.field) else {
+                        any_unknown = true;
+                        break;
+                    };
+                    match Self::compare_guard_values(actual, c.op, expected) {
+                        GuardOutcome::Satisfied => {}
+                        GuardOutcome::Violated => {
+                            all_hold = false;
+                            saw_decidable_mismatch = true;
+                        }
+                        GuardOutcome::Unknown => {
+                            any_unknown = true;
+                            break;
+                        }
                     }
                 }
-            }
-            if all_hold && !any_unknown {
-                return GuardOutcome::Satisfied;
+                if all_hold && !any_unknown {
+                    return GuardOutcome::Satisfied;
+                }
             }
         }
         // No row satisfied the precondition. When nothing matched at all, or
@@ -18772,6 +18797,7 @@ impl QueryExecutor {
     /// `ExecEvent.ts` is REQUIRED). "Earlier" is event time, not write time, so
     /// a backdated row does not satisfy a precondition it should not.
     fn eval_before(
+        &self,
         class: &str,
         conds: &[GuardCond],
         doc: &Map<String, Value>,
@@ -18783,40 +18809,40 @@ impl QueryExecutor {
             return GuardOutcome::Unknown;
         };
 
-        let prefix = format!("{}::", class);
-        let Ok(entries) = engine.scan_prefix(prefix.as_bytes()) else {
-            return GuardOutcome::Unknown;
-        };
-
-        for (_key, val_bytes) in &entries {
-            let Some(row) = Self::parse_doc_bytes(val_bytes) else {
-                continue;
+        for prefix in self.guard_scan_prefixes(engine, class) {
+            let Ok(entries) = engine.scan_prefix(prefix.as_bytes()) else {
+                return GuardOutcome::Unknown;
             };
-            let mut all_hold = true;
-            for c in conds {
-                let Some(expected) = Self::resolve_operand(&c.operand, doc) else {
-                    all_hold = false;
-                    break;
+            for (_key, val_bytes) in &entries {
+                let Some(row) = Self::parse_doc_bytes(val_bytes) else {
+                    continue;
                 };
-                let Some(actual) = row.get(&c.field) else {
-                    all_hold = false;
-                    break;
-                };
-                if Self::compare_guard_values(actual, c.op, expected) != GuardOutcome::Satisfied {
-                    all_hold = false;
-                    break;
+                let mut all_hold = true;
+                for c in conds {
+                    let Some(expected) = Self::resolve_operand(&c.operand, doc) else {
+                        all_hold = false;
+                        break;
+                    };
+                    let Some(actual) = row.get(&c.field) else {
+                        all_hold = false;
+                        break;
+                    };
+                    if Self::compare_guard_values(actual, c.op, expected) != GuardOutcome::Satisfied {
+                        all_hold = false;
+                        break;
+                    }
                 }
-            }
-            if !all_hold {
-                continue;
-            }
-            // The content conditions hold; this row is a witness only if it can
-            // be shown to be strictly earlier.
-            let Some(row_ts) = row.get("ts").and_then(|v| Self::json_as_f64(v)) else {
-                continue;
-            };
-            if row_ts < doc_ts {
-                return GuardOutcome::Satisfied;
+                if !all_hold {
+                    continue;
+                }
+                // The content conditions hold; this row is a witness only if it
+                // can be shown to be strictly earlier.
+                let Some(row_ts) = row.get("ts").and_then(|v| Self::json_as_f64(v)) else {
+                    continue;
+                };
+                if row_ts < doc_ts {
+                    return GuardOutcome::Satisfied;
+                }
             }
         }
         GuardOutcome::Violated
@@ -18826,6 +18852,7 @@ impl QueryExecutor {
     /// anywhere is Violated; otherwise any Unknown is Unknown; only all
     /// Satisfied is Satisfied.
     fn eval_guard_clauses(
+        &self,
         clauses: &[GuardClause],
         doc: &Map<String, Value>,
         engine: &LsmEngine,
@@ -18835,12 +18862,12 @@ impl QueryExecutor {
             let out = match clause {
                 GuardClause::Cmp(cond) => Self::eval_cond(cond, doc),
                 GuardClause::Exists { class, conds } => {
-                    Self::eval_exists(class, conds, doc, engine)
+                    self.eval_exists(class, conds, doc, engine)
                 }
                 // `BEFORE` demands evidence of a strictly earlier row; it is
                 // deliberately stricter than `EXISTS` (see `eval_before`).
                 GuardClause::Before { class, conds } => {
-                    Self::eval_before(class, conds, doc, engine)
+                    self.eval_before(class, conds, doc, engine)
                 }
             };
             match out {
@@ -20477,7 +20504,7 @@ mod tests {
         .unwrap();
         let eval = |expr: &str| {
             let clauses = QueryExecutor::parse_guard(expr).unwrap();
-            QueryExecutor::eval_guard_clauses(&clauses, &doc, &engine)
+            executor.eval_guard_clauses(&clauses, &doc, &engine)
         };
 
         // Numeric comparisons.
@@ -20688,6 +20715,59 @@ mod tests {
             untimeable.unwrap_err().to_string().contains("guard violation"),
             "a row without ts must not count as temporal evidence"
         );
+    }
+
+    #[test]
+    fn test_guard_class_hierarchy_expansion() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY h (CLASS ExecEvent, PROPERTY name DOMAIN ExecEvent RANGE STRING, PROPERTY ts DOMAIN ExecEvent RANGE FLOAT64, CLASS GraspEvent SUBCLASS OF ExecEvent, CLASS PlaceEvent SUBCLASS OF ExecEvent)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY h2 (CLASS Job, PROPERTY name DOMAIN Job RANGE STRING, PROPERTY ts DOMAIN Job RANGE FLOAT64, PROPERTY guard DOMAIN Job RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let insert = |sql: &str| executor.execute(&QueryParser::parse(sql).unwrap());
+
+        // The only event is a *subclass* instance, stored under `GraspEvent::`.
+        insert("INSERT INTO GraspEvent (name, ts) VALUES ('grab', 1000.0)").unwrap();
+
+        // A guard aimed at the parent class must still see it: without
+        // hierarchy expansion the scan of `ExecEvent::` finds nothing.
+        insert(
+            "INSERT INTO Job (name, ts, guard) VALUES ('place', 2000.0, 'BEFORE(ExecEvent WHERE name = ''grab'')')",
+        )
+        .unwrap();
+        insert(
+            "INSERT INTO Job (name, ts, guard) VALUES ('place2', 2000.0, 'EXISTS(ExecEvent WHERE name = ''grab'')')",
+        )
+        .unwrap();
+
+        // Negative control: content that exists nowhere still rejects, so the
+        // expansion is not simply making the guard vacuous.
+        let miss = insert(
+            "INSERT INTO Job (name, ts, guard) VALUES ('place3', 2000.0, 'BEFORE(ExecEvent WHERE name = ''nope'')')",
+        );
+        assert!(
+            miss.unwrap_err().to_string().contains("guard violation"),
+            "a name on no row at all must still reject"
+        );
+
+        // Sibling subclasses are seen too, not just the one that was written.
+        insert("INSERT INTO PlaceEvent (name, ts) VALUES ('drop', 1500.0)").unwrap();
+        insert(
+            "INSERT INTO Job (name, ts, guard) VALUES ('place4', 2000.0, 'BEFORE(ExecEvent WHERE name = ''drop'')')",
+        )
+        .unwrap();
     }
 
     #[test]
