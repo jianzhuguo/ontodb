@@ -18124,6 +18124,35 @@ impl QueryExecutor {
             // Fields not in the ontology are allowed (schema-on-read compatible)
         }
 
+        // Functional-property gate: owl:FunctionalProperty means the subject
+        // carries at most one value for the property. A row supplying several
+        // distinct values breaks that, and downstream inference would have to
+        // guess which one applies (see StateReach ambiguity handling).
+        for prop in &props {
+            if !prop.is_functional {
+                continue;
+            }
+            if let Some(val) = doc.get(&prop.name) {
+                let distinct = match val {
+                    Value::Null => 0,
+                    Value::Array(arr) => {
+                        let mut seen = std::collections::HashSet::new();
+                        for v in arr {
+                            seen.insert(v.to_string());
+                        }
+                        seen.len()
+                    }
+                    _ => 1,
+                };
+                if distinct > 1 {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "functional property '{}' for class '{}' accepts at most one value, got {} distinct values",
+                        prop.name, class, distinct
+                    )));
+                }
+            }
+        }
+
         // Validate OWL restrictions
         self.validate_restrictions(engine, &ontology, class_def, doc)?;
 
@@ -19735,6 +19764,89 @@ mod tests {
         let rel = &onto.properties["relatesTo"];
         assert!(rel.is_symmetric);
         assert_eq!(rel.inverse_of.as_deref(), Some("relatedFrom"));
+    }
+
+    #[test]
+    fn test_functional_property_gate_rejects_multiple_values() {
+        let (executor, _dir) = setup();
+
+        // ARRAY-typed property: the type gate allows a list, so the functional
+        // gate is what keeps a subject down to one distinct value.
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY exec (CLASS Bag, PROPERTY tags DOMAIN Bag RANGE ARRAY)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("ALTER PROPERTY tags DOMAIN Bag CHARACTERISTICS FUNCTIONAL")
+                    .unwrap(),
+            )
+            .unwrap();
+
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Bag (tags) VALUES (['a'])").unwrap())
+            .unwrap();
+
+        let multi = executor
+            .execute(&QueryParser::parse("INSERT INTO Bag (tags) VALUES (['a', 'b'])").unwrap());
+        let msg = multi.unwrap_err().to_string();
+        assert!(
+            msg.contains("functional property"),
+            "functional gate must reject multiple distinct values, got: {msg}"
+        );
+
+        // Repeating one value is still a single distinct value.
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Bag (tags) VALUES (['a', 'a'])").unwrap())
+            .unwrap();
+
+        // A non-functional property keeps its list.
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY exec2 (CLASS Note, PROPERTY tag DOMAIN Note RANGE ARRAY)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Note (tag) VALUES (['a', 'b'])").unwrap())
+            .unwrap();
+
+        // STRING-typed properties reject lists at the type gate, so a row can
+        // never smuggle in two values for a scalar functional property.
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY exec3 (CLASS Transition, PROPERTY from_state DOMAIN Transition RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "ALTER PROPERTY from_state DOMAIN Transition CHARACTERISTICS FUNCTIONAL",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Transition (from_state) VALUES ('A')").unwrap(),
+            )
+            .unwrap();
+        let scalar_multi = executor.execute(
+            &QueryParser::parse("INSERT INTO Transition (from_state) VALUES (['A', 'Z'])").unwrap(),
+        );
+        assert!(
+            scalar_multi.is_err(),
+            "a STRING-typed property must not accept a list"
+        );
     }
 
     #[test]

@@ -89,6 +89,12 @@ ALTER PROPERTY caused_by DOMAIN ExecEvent CHARACTERISTICS TRANSITIVE
 -- 过程分解为传递（A composed_of B，B composed_of C ⇒ A composed_of C 为工序链闭包的类比）
 ALTER PROPERTY composed_of DOMAIN Process CHARACTERISTICS TRANSITIVE
 
+-- 单值强制（形式语义附录 A.6 纪律 1/2）：迁移只有一个源、一个目标，过程只有一个当前位置。
+-- 缺这条约束时 StateReach 只能在推理侧标记 ambiguous_transition 并拒猜边。
+ALTER PROPERTY from_state DOMAIN Transition CHARACTERISTICS FUNCTIONAL
+ALTER PROPERTY to_state DOMAIN Transition CHARACTERISTICS FUNCTIONAL
+ALTER PROPERTY current_state DOMAIN Process CHARACTERISTICS FUNCTIONAL
+
 -- 身份键唯一性（主体面）
 ALTER CLASS ExecAgent UNIQUE (agent_serial)
 

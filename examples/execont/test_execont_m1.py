@@ -156,6 +156,9 @@ expect_ok("约定④：preceded_by TRANSITIVE（工序先后）", "ALTER PROPERT
 expect_ok("约定⑤：caused_by TRANSITIVE（因果）", "ALTER PROPERTY caused_by DOMAIN ExecEvent CHARACTERISTICS TRANSITIVE")
 expect_ok("约定⑥：composed_of TRANSITIVE（过程分解）", "ALTER PROPERTY composed_of DOMAIN Process CHARACTERISTICS TRANSITIVE")
 expect_ok("约定⑦：GraspEvent DISJOINT WITH PlaceEvent（事件互斥）", "ALTER CLASS GraspEvent DISJOINT WITH PlaceEvent")
+expect_ok("约定⑧：from_state FUNCTIONAL（迁移唯一源，形式语义 A.6 纪律1）", "ALTER PROPERTY from_state DOMAIN Transition CHARACTERISTICS FUNCTIONAL")
+expect_ok("约定⑨：to_state FUNCTIONAL（迁移唯一目标）", "ALTER PROPERTY to_state DOMAIN Transition CHARACTERISTICS FUNCTIONAL")
+expect_ok("约定⑩：current_state FUNCTIONAL（过程唯一当前位置）", "ALTER PROPERTY current_state DOMAIN Process CHARACTERISTICS FUNCTIONAL")
 
 try:
     req = urllib.request.Request(SCHEMA)
@@ -204,6 +207,15 @@ expect_reject("闸门②值域不符(confidence='high')", "INSERT INTO GraspEven
 expect_reject("闸门③唯一冲突(重复 agent_serial)", "INSERT INTO ExecAgent (id, agent_serial) VALUES ('r2', 'SN-001')", "unique")
 expect_ok("准备 disjoint 对照：GraspEvent same_ev", "INSERT INTO GraspEvent (id, event_agent, ts, task_name, target, confidence) VALUES ('same_ev', 'r9', 2002.0, '抓取', '工装', 0.9)")
 expect_reject("闸门④不相交(same_ev 双事件类)", "INSERT INTO PlaceEvent (id, event_agent, ts, task_name) VALUES ('same_ev', 'r9', 2003.0, '放置')", "disjoint")
+
+# 闸门⑥ 功能属性单值（owl:FunctionalProperty，形式语义 A.6 纪律1）。
+# 载体用 ARRAY 型属性——STRING 型在类型闸门就挡掉列表了，那样测不到功能闸门本身。
+expect_ok("闸门⑥ 准备：ARRAY 型功能属性载体", "CREATE ONTOLOGY exec_gate (CLASS Bag, PROPERTY tags DOMAIN Bag RANGE ARRAY)")
+expect_ok("闸门⑥ 约定：tags FUNCTIONAL", "ALTER PROPERTY tags DOMAIN Bag CHARACTERISTICS FUNCTIONAL")
+expect_ok("闸门⑥ 单值放行：['a']", "INSERT INTO Bag (tags) VALUES (['a'])")
+expect_reject("闸门⑥ 功能属性多值拒写：['a','b']", "INSERT INTO Bag (tags) VALUES (['a', 'b'])", "functional")
+expect_ok("闸门⑥ 同值重复仍算一个值：['a','a']", "INSERT INTO Bag (tags) VALUES (['a', 'a'])")
+expect_reject("闸门⑥b 标量属性不接受列表(from_state)", "INSERT INTO Transition (id, from_state) VALUES ('gx6', ['A', 'Z'])", "type")
 
 print()
 print("=" * 72)
