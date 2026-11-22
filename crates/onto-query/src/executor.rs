@@ -18497,15 +18497,19 @@ impl QueryExecutor {
     fn parse_guard_clause(s: &str) -> Option<GuardClause> {
         let t = s.trim();
         let up = t.to_ascii_uppercase();
-        for (prefix, temporal) in [("EXISTS(", false), ("BEFORE(", true)] {
+        for (prefix, kind) in [
+            ("EXISTS(", ClauseKind::Exists),
+            ("BEFORE(", ClauseKind::Before),
+            ("PREV(", ClauseKind::Prev),
+        ] {
             if let Some(rest) = up.strip_prefix(prefix) {
                 let inner_start = t.len() - rest.len();
                 let inner_end = t.rfind(')').filter(|p| *p > inner_start)?;
                 let (class, conds) = Self::parse_exists_body(&t[inner_start..inner_end])?;
-                return Some(if temporal {
-                    GuardClause::Before { class, conds }
-                } else {
-                    GuardClause::Exists { class, conds }
+                return Some(match kind {
+                    ClauseKind::Exists => GuardClause::Exists { class, conds },
+                    ClauseKind::Before => GuardClause::Before { class, conds },
+                    ClauseKind::Prev => GuardClause::Prev { class, conds },
                 });
             }
         }
@@ -18848,6 +18852,96 @@ impl QueryExecutor {
         GuardOutcome::Violated
     }
 
+    /// Evaluates an immediate-predecessor precondition: the most recent row of
+    /// `class` strictly earlier than the row being written must satisfy every
+    /// condition. Unlike [`Self::eval_before`], an intervening row makes this
+    /// fail — it expresses "the previous step was X", not "X happened at some
+    /// point before".
+    ///
+    /// Ties on `ts` are handled conservatively: every row sharing the latest
+    /// timestamp has to satisfy the conditions, so an ambiguous predecessor is
+    /// never waved through.
+    fn eval_prev(
+        &self,
+        class: &str,
+        conds: &[GuardCond],
+        doc: &Map<String, Value>,
+        engine: &LsmEngine,
+    ) -> GuardOutcome {
+        // Without a numeric ordering key on the written row, "the row just
+        // before this one" is not expressible — undecidable, not false.
+        let Some(doc_ts) = doc.get("ts").and_then(|v| Self::json_as_f64(v)) else {
+            return GuardOutcome::Unknown;
+        };
+
+        let mut latest_ts: Option<f64> = None;
+        let mut latest_rows: Vec<Map<String, Value>> = Vec::new();
+
+        for prefix in self.guard_scan_prefixes(engine, class) {
+            let Ok(entries) = engine.scan_prefix(prefix.as_bytes()) else {
+                return GuardOutcome::Unknown;
+            };
+            for (_key, val_bytes) in &entries {
+                let Some(row) = Self::parse_doc_bytes(val_bytes) else {
+                    continue;
+                };
+                let Some(row_ts) = row.get("ts").and_then(|v| Self::json_as_f64(v)) else {
+                    continue;
+                };
+                if row_ts >= doc_ts {
+                    continue;
+                }
+                match latest_ts {
+                    Some(b) if row_ts < b => {} // strictly older, not the latest
+                    Some(b) if row_ts == b => latest_rows.push(row),
+                    _ => {
+                        latest_ts = Some(row_ts);
+                        latest_rows.clear();
+                        latest_rows.push(row);
+                    }
+                }
+            }
+        }
+
+        // No earlier row at all: "the previous step was X" is definitely false.
+        if latest_ts.is_none() {
+            return GuardOutcome::Violated;
+        }
+
+        let mut saw_unknown = false;
+        for row in &latest_rows {
+            let mut row_outcome = GuardOutcome::Satisfied;
+            for c in conds {
+                let Some(expected) = Self::resolve_operand(&c.operand, doc) else {
+                    row_outcome = GuardOutcome::Unknown;
+                    break;
+                };
+                let Some(actual) = row.get(&c.field) else {
+                    row_outcome = GuardOutcome::Unknown;
+                    break;
+                };
+                match Self::compare_guard_values(actual, c.op, expected) {
+                    GuardOutcome::Satisfied => {}
+                    other => {
+                        row_outcome = other;
+                        break;
+                    }
+                }
+            }
+            match row_outcome {
+                // A most-recent row that is definitely wrong rejects.
+                GuardOutcome::Violated => return GuardOutcome::Violated,
+                GuardOutcome::Unknown => saw_unknown = true,
+                GuardOutcome::Satisfied => {}
+            }
+        }
+        if saw_unknown {
+            GuardOutcome::Unknown
+        } else {
+            GuardOutcome::Satisfied
+        }
+    }
+
     /// Evaluates all guard clauses under three-valued AND: a definite failure
     /// anywhere is Violated; otherwise any Unknown is Unknown; only all
     /// Satisfied is Satisfied.
@@ -18868,6 +18962,10 @@ impl QueryExecutor {
                 // deliberately stricter than `EXISTS` (see `eval_before`).
                 GuardClause::Before { class, conds } => {
                     self.eval_before(class, conds, doc, engine)
+                }
+                // `PREV` additionally forbids an intervening row.
+                GuardClause::Prev { class, conds } => {
+                    self.eval_prev(class, conds, doc, engine)
                 }
             };
             match out {
@@ -19529,6 +19627,15 @@ struct GuardCond {
     operand: GuardOperand,
 }
 
+/// Which kind of class-subject guard clause is being parsed. Only used while
+/// parsing; the result is carried by [`GuardClause`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClauseKind {
+    Exists,
+    Before,
+    Prev,
+}
+
 /// A guard clause. Deliberately not a general expression language: no
 /// arithmetic, no function calls, no negation, no nesting beyond the
 /// `EXISTS(...)` form. Anything outside the shape is left unevaluated (see
@@ -19548,6 +19655,15 @@ enum GuardClause {
     /// `ts` of the document being written. Sugar over `Exists` with an implicit
     /// `ts < $ts` condition; `ts` is the fixed ordering key.
     Before {
+        class: String,
+        conds: Vec<GuardCond>,
+    },
+    /// `PREV(Class WHERE cond (AND cond)*)` — the **most recent** row of
+    /// `Class` strictly earlier than the document being written satisfies
+    /// every condition. Unlike `Before`, this forbids an intervening row, so
+    /// it expresses "the previous step was X" rather than "X happened at some
+    /// point before".
+    Prev {
         class: String,
         conds: Vec<GuardCond>,
     },
@@ -20476,6 +20592,14 @@ mod tests {
         assert_eq!(conds.len(), 2);
         assert!(matches!(&clauses[1], GuardClause::Cmp(_)));
 
+        // PREV(...) parses the same way and still keeps the inner AND inside
+        // the clause.
+        let clauses =
+            QueryExecutor::parse_guard("PREV(Step WHERE name = 'inspect') AND count > 0").unwrap();
+        assert_eq!(clauses.len(), 2);
+        assert!(matches!(&clauses[0], GuardClause::Prev { .. }));
+        assert!(matches!(&clauses[1], GuardClause::Cmp(_)));
+
         // Malformed EXISTS forms are not judged.
         for expr in [
             "EXISTS()",
@@ -20486,6 +20610,9 @@ mod tests {
             "BEFORE()",
             "BEFORE(Step)",
             "BEFORE(Step WHERE)",
+            "PREV()",
+            "PREV(Step)",
+            "PREV(Step WHERE)",
         ] {
             assert!(
                 QueryExecutor::parse_guard(expr).is_none(),
@@ -20766,6 +20893,87 @@ mod tests {
         insert("INSERT INTO PlaceEvent (name, ts) VALUES ('drop', 1500.0)").unwrap();
         insert(
             "INSERT INTO Job (name, ts, guard) VALUES ('place4', 2000.0, 'BEFORE(ExecEvent WHERE name = ''drop'')')",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_guard_prev_requires_the_immediate_predecessor() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY pv (CLASS Step, PROPERTY name DOMAIN Step RANGE STRING, PROPERTY process_of DOMAIN Step RANGE STRING, PROPERTY ts DOMAIN Step RANGE FLOAT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY pv2 (CLASS Job, PROPERTY name DOMAIN Job RANGE STRING, PROPERTY process_of DOMAIN Job RANGE STRING, PROPERTY ts DOMAIN Job RANGE FLOAT64, PROPERTY guard DOMAIN Job RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let insert = |sql: &str| executor.execute(&QueryParser::parse(sql).unwrap());
+
+        // Nothing preceded this write: "the previous step was X" is false.
+        let none = insert(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 3000.0, 'PREV(Step WHERE name = ''inspect'')')",
+        );
+        assert!(none.unwrap_err().to_string().contains("guard violation"));
+
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('pickup', 'P1', 1000.0)").unwrap();
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('inspect', 'P1', 2000.0)").unwrap();
+
+        // The most recent Step before ts=3000 is inspect@2000 -> matches.
+        insert(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 3000.0, 'PREV(Step WHERE name = ''inspect'')')",
+        )
+        .unwrap();
+
+        // The same write asking for pickup fails: pickup is not the most recent,
+        // an inspect intervened. This is precisely what PREV adds over BEFORE.
+        let intervened = insert(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place2', 'P1', 3000.0, 'PREV(Step WHERE name = ''pickup'')')",
+        );
+        assert!(
+            intervened.unwrap_err().to_string().contains("guard violation"),
+            "an intervening row must make PREV fail"
+        );
+
+        // ...while BEFORE is satisfied by the older pickup, by design.
+        insert(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place3', 'P1', 3000.0, 'BEFORE(Step WHERE name = ''pickup'' AND process_of = $process_of)')",
+        )
+        .unwrap();
+
+        // No numeric ts on the written row -> ordering is not expressible.
+        insert(
+            "INSERT INTO Job (name, process_of, guard) VALUES ('nots', 'P1', 'PREV(Step WHERE name = ''inspect'')')",
+        )
+        .unwrap();
+
+        // Ties on the latest ts are conservative: a tied row that is definitely
+        // wrong rejects rather than being waved through. The tied pair sits at
+        // the newest ts so it really is the predecessor under test.
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('pickup', 'P2', 500.0)").unwrap();
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('inspect', 'P2', 2500.0)").unwrap();
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('ship', 'P2', 2500.0)").unwrap();
+        let tie = insert(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place4', 'P2', 3000.0, 'PREV(Step WHERE name = ''inspect'' AND process_of = $process_of)')",
+        );
+        assert!(
+            tie.unwrap_err().to_string().contains("guard violation"),
+            "a tied most-recent row that fails must reject"
+        );
+
+        // With the tie removed the same guard passes, confirming the rejection
+        // came from the tie and not from the correlation.
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('inspect', 'P2', 2700.0)").unwrap();
+        insert(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place5', 'P2', 3000.0, 'PREV(Step WHERE name = ''inspect'' AND process_of = $process_of)')",
         )
         .unwrap();
     }

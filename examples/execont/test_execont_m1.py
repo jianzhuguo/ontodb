@@ -255,6 +255,18 @@ expect_ok("闸门⑩ 父类守卫看到子类实例(EXISTS)", "INSERT INTO Job2 
 expect_ok("闸门⑩ 父类守卫看到子类实例(BEFORE)", "INSERT INTO Job2 (name, ts, guard) VALUES ('after_grasp', 5000.0, 'BEFORE(ExecEvent WHERE task_name = ''抓取'')')")
 expect_reject("闸门⑩b 父类守卫：真不存在的仍拒写", "INSERT INTO Job2 (name, ts, guard) VALUES ('nope', 5000.0, 'BEFORE(ExecEvent WHERE task_name = ''不存在的工序'')')", "guard violation")
 
+# 闸门⑪ 相邻前驱（PREV 子句）：要求**最近的一条**更早行满足条件——中间插入别的步骤即失败。
+# 这是 PREV 与 BEFORE 的区别：BEFORE 只问「曾经有过」，PREV 问「上一步就是它」。
+expect_ok("闸门⑪ 准备：工序载体 Phase", "CREATE ONTOLOGY exec_pv (CLASS Phase, PROPERTY name DOMAIN Phase RANGE STRING, PROPERTY process_of DOMAIN Phase RANGE STRING, PROPERTY ts DOMAIN Phase RANGE FLOAT64)")
+expect_ok("闸门⑪ 准备：Job3 带 ts + guard", "CREATE ONTOLOGY exec_pv2 (CLASS Job3, PROPERTY name DOMAIN Job3 RANGE STRING, PROPERTY process_of DOMAIN Job3 RANGE STRING, PROPERTY ts DOMAIN Job3 RANGE FLOAT64, PROPERTY guard DOMAIN Job3 RANGE STRING)")
+expect_reject("闸门⑪ 无先前工序→拒写", "INSERT INTO Job3 (name, process_of, ts, guard) VALUES ('place', 'P1', 3000.0, 'PREV(Phase WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+expect_ok("闸门⑪ 写 pickup@1000", "INSERT INTO Phase (name, process_of, ts) VALUES ('pickup', 'P1', 1000.0)")
+expect_ok("闸门⑪ 写 inspect@2000", "INSERT INTO Phase (name, process_of, ts) VALUES ('inspect', 'P1', 2000.0)")
+expect_ok("闸门⑪ 最近一条是 inspect→放行", "INSERT INTO Job3 (name, process_of, ts, guard) VALUES ('place', 'P1', 3000.0, 'PREV(Phase WHERE name = ''inspect'' AND process_of = $process_of)')")
+expect_reject("闸门⑪b 要求上一步是 pickup 但被 inspect 插入→拒写", "INSERT INTO Job3 (name, process_of, ts, guard) VALUES ('place2', 'P1', 3000.0, 'PREV(Phase WHERE name = ''pickup'' AND process_of = $process_of)')", "guard violation")
+expect_ok("闸门⑪c 同一写入用 BEFORE 则放行(PREV/BEFORE 对照)", "INSERT INTO Job3 (name, process_of, ts, guard) VALUES ('place3', 'P1', 3000.0, 'BEFORE(Phase WHERE name = ''pickup'' AND process_of = $process_of)')")
+expect_ok("闸门⑪d 本次无 ts→未判定放行", "INSERT INTO Job3 (name, process_of, guard) VALUES ('nots', 'P1', 'PREV(Phase WHERE name = ''inspect'' AND process_of = $process_of)')")
+
 print()
 print("=" * 72)
 print("Part 3 · 推理就绪（层级透明 + 工序传递 + 物化 + 演进面）  ← M1 验收③")
