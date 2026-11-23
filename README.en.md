@@ -573,50 +573,6 @@ ontodb/
 ```
 
 ---
-
-## Enterprise Edition (Preview)
-
-**The Community edition is always enough** — everything you need to run in production on a single node ships free and open source. The Enterprise edition targets multi-tenant SaaS, compliance/audit, managed operations, and production clusters, delivered under a commercial license:
-
-| Direction | What you get |
-|-----------|-------------|
-| **Multi-Tenancy** | Tenant management, quotas, metering & billing, enforced isolation |
-| **Security & Compliance** | RBAC separation of duties, LDAP/SSO, SM4 + AES encryption, audit logging & retention, data masking |
-| **Managed Operations** | Automated backup & point-in-time recovery, rolling upgrades, monitoring/alerting, SLA support |
-| **High Availability & Scaling** | Cluster HA, sharding, CDC change capture |
-| **Ontology-Driven Rule Engine** | Knowledge as rules — OWL reasoning results auto-trigger business rules, full DSL & explanation |
-
-> The above is Enterprise **roadmap** capability; parts are still under construction, subject to actual release versions. Commercial licensing: 624831343@qq.com
-
----
-
-## License
-
-OntoDB uses a dual licensing model:
-
-| Edition | License | Description |
-|---------|---------|-------------|
-| **Community** | Apache-2.0 | Free and open source, free to use, modify and distribute |
-| **Enterprise** | Commercial | Full features, requires purchased license |
-
-**Community (Apache-2.0):**
-- Allowed: free use by any individual or organization, no revenue threshold
-- Allowed: internal use, local deployment, secondary development, commercial distribution
-- Allowed: enterprise self-hosting, embedding in SaaS products
-- Required: retain copyright notices and the NOTICE file (Apache-2.0 Section 4)
-- See [LICENSE](LICENSE)
-
-**Enterprise (Commercial):**
-- Advanced reasoning engine (full DSL + OWL integration + distributed reasoning + profiling)
-- Security compliance (RBAC + LDAP + SM4/AES encryption + KMS + audit retention)
-- High availability (cluster failover + cross-shard query + backup/restore)
-- See [LICENSE.COMMERCIAL](LICENSE.COMMERCIAL)
-- Contact: 624831343@qq.com
-
-**Note:** Enterprise features (the `onto-enterprise` crate) are licensed under a proprietary commercial license and may not be copied, distributed, or used in production without authorization. Contact: 624831343@qq.com
-
----
-
 ## Contributing
 
 Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md).
