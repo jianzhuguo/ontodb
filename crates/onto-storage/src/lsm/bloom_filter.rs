@@ -109,22 +109,38 @@ impl BloomFilter {
         })
     }
 
-    /// FNV-1a and the murmur-style mixer in one pass over `key`.
+    /// Computes the two base hashes consumed by double hashing.
     ///
-    /// Both hashes are independent, so interleaving their state updates gives
-    /// bit-for-bit the same result as the two separate loops that existed
-    /// before, at half the memory traffic.
+    /// The two hashes are produced by separate helpers, mirroring the original
+    /// `fnv_hash` / `murmur_hash` split. They are still computed only once per
+    /// insert/lookup here — `insert` and `might_contain` derive the k probes by
+    /// repeated addition rather than rehashing the key k times.
     #[inline]
     fn base_hashes(key: &[u8]) -> (u64, u64) {
-        let mut fnv = 0xcbf29ce484222325u64; // FNV offset basis
-        let mut murmur = 0x5bd1e995u64;
+        (Self::fnv_hash(key), Self::murmur_hash(key))
+    }
+
+    /// FNV-1a hash over `key`.
+    #[inline]
+    fn fnv_hash(key: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
         for &byte in key {
-            fnv = (fnv ^ byte as u64).wrapping_mul(0x100000001b3); // FNV prime
-            murmur ^= byte as u64;
-            murmur = murmur.wrapping_mul(0x5bd1e995);
-            murmur ^= murmur >> 15;
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3); // FNV prime
         }
-        (fnv, murmur)
+        hash
+    }
+
+    /// Murmur-style byte mixer over `key`.
+    #[inline]
+    fn murmur_hash(key: &[u8]) -> u64 {
+        let mut h: u64 = 0x5bd1e995;
+        for &byte in key {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x5bd1e995);
+            h ^= h >> 15;
+        }
+        h
     }
 
     /// Maps a probe hash to a `(word index, bit mask)` pair.
