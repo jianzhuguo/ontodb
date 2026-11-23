@@ -2,7 +2,7 @@
 
 English | **[中文](README.md)**
 
-**The world's first multi-modal semantic database embedding an OWL reasoning engine in the storage kernel.**
+**The world's first multi-modal semantic database embedding an OWL reasoning engine in the database kernel.**
 
 Unified storage of 12 data types, 7-step write-on-insert pipeline, embedded incremental reasoning 100x faster than external solutions.
 
@@ -18,7 +18,7 @@ OntoDB solves this in one engine:
 |-----------|------------|--------|
 | **Architecture** | MySQL + Neo4j + Milvus + InfluxDB + PostGIS + Jena (6 systems) | **1 system**, 12 data types unified |
 | **Semantics** | ETL after write, seconds to minutes | **Semantic-on-Insert**, 7-step atomic pipeline, microseconds |
-| **Reasoning** | External engine, data shuffling | **OWL reasoning embedded in storage kernel**, zero overhead |
+| **Reasoning** | External engine, data shuffling | **OWL reasoning embedded in the database**, zero data movement |
 | **Query** | SQL + Cypher + SPARQL + proprietary API (4 languages) | **OntoQL**, one syntax for relational + graph + vector + reasoning |
 | **Semantic Metadata** | Metadata only describes table structure (`pg_catalog`); taxonomy lives in application code | **Ontology IS the metadata**: class inheritance / equivalence / disjointness are inferable; `subClassOf` queries auto-expand subclasses |
 | **Deployment** | 6 independent systems, complex ops | **3-tier edge**, ESP32 to cloud server, unified architecture |
@@ -41,7 +41,7 @@ OntoDB solves this in one engine:
 
 Traditional database metadata (PostgreSQL's `pg_catalog` / `information_schema`) only describes **table structure** — table names, column types, indexes, constraints. Taxonomy, relationship semantics, and inference rules live in application code; the database itself cannot "understand" its data.
 
-OntoDB embeds the **Ontology** into the storage kernel — it is not just a schema, but **inferable domain knowledge**.
+OntoDB embeds the **Ontology** into the database kernel — it is not just a schema, but **inferable domain knowledge**.
 
 ### Point-by-point comparison (PostgreSQL as baseline)
 
@@ -166,7 +166,7 @@ In traditional stacks, "find similar, trace mechanism, infer attribution" means 
 |----------|------------|-------------|
 | `POST /api/semantic/similar` | Vector similarity search | Top-K with an **ontology type domain** — "compounds like a drug" automatically includes all subclasses, no hardcoded IN lists |
 | `POST /api/semantic/trace` | Multi-hop relation chain tracing | Walk relation chains hop by hop (drug → adverse reaction → phenotype → disease → target), with optional INFER enhancement at the chain tail |
-| `POST /api/semantic/infer` | Explicit rule reasoning | Run OWL-lite rules (Prp-trp/inv/symp/eq/dom/rng + Cax-sco) over a fact set, streamed with pagination |
+| `POST /api/semantic/infer` | Explicit rule reasoning | Run inference rules (Cax-sco/eqc, Prp-spo/eqp/inv/trp/symp + StateReach) over a fact set, streamed with pagination |
 | `POST /api/semantic/expand` | Taxonomy expansion | Fan out GO/disease hierarchies along `subClassOf` — querying a parent class includes all descendants |
 | `POST /api/semantic/path` | Path discovery | Graph traversal to find how two entities are connected |
 | `POST /api/semantic/gap` | Reference completeness assessment | Quantify knowledge gaps: which references/fields are missing, under 100% full-audit semantics |
@@ -211,7 +211,7 @@ All data linked via **unified semantic anchor** (`{Class}::{PrimaryKey}`), zero 
 
 ---
 
-## 33 Core Technologies
+## 34 Core Technologies
 
 ### Storage Engine
 
@@ -222,23 +222,24 @@ All data linked via **unified semantic anchor** (`{Class}::{PrimaryKey}`), zero 
 | 3 | **Full-Modal Unified Storage** | LSM-Tree + key-prefix routing, 12 data types coexist in one engine |
 | 4 | **Binary Row Zero-Copy Filtering** | Filter on binary data without deserialization, 60% parse time reduction |
 | 5 | **3-Phase Lock Commit** | Prepare -> pre-commit -> commit, avoids write/index lock deadlock |
-| 7 | **4-Layer Cache Kernel Embedding** | Block cache + query cache + semantic cache + adaptive memory, zero network overhead, shared memory |
+| 6 | **4-Layer Cache Kernel Embedding** | Block cache + query cache + semantic cache + adaptive memory, zero network overhead, shared memory |
 
 ### Reasoning Engine
 
 | # | Innovation | One-liner |
 |---|-----------|-----------|
-| 7 | **Embedded Incremental Reasoning** | OWL 2 RL embedded in storage kernel, incremental fixpoint, 10-100x speedup |
+| 7 | **Embedded Incremental Reasoning** | OWL 2 RL embedded in the database (same process as the storage engine), incremental fixpoint, 10-100x speedup |
 | 8 | **Reasoning Safety** | Fact budget control, parallel thread pool, cycle detection |
 | 9 | **Derivation Chain Tracing** | Every derived fact records source rule and input facts |
+| 10 | **Execution-State Reasoning (ExecOnt)** | State-machine reachability closure (StateReach) + transition guards evaluated and enforced at write time; process / state / event / intent become first-class ontology citizens |
 
 ### Ontology Kernel: OWL 2 RL Reasoning Engine
 
-OntoDB embeds the OWL 2 RL reasoning engine **inside the storage kernel**, not as an external component. Reasoning happens automatically on write, subclasses expand automatically on query, derived facts persist instantly.
+OntoDB embeds the OWL 2 RL reasoning engine **inside the database** (same process as the storage engine, shared memory space), not as an external component. The write path performs constraint-gate validation and fact reification; reasoning runs on demand at query time — subclasses expand automatically, INFER can materialize closures, and every derived fact keeps its derivation chain.
 
 ```
 Traditional: DB -> ETL -> external reasoning engine -> write back (minutes)
-OntoDB:      Data write -> kernel auto-reasoning -> instant persist (microseconds)
+OntoDB:      Write -> gate validation + reification -> on-demand reasoning at query time (INFER / class closure, with derivation chains)
 ```
 
 **Supported OWL 2 RL Rules:**
@@ -255,17 +256,41 @@ OntoDB:      Data write -> kernel auto-reasoning -> instant persist (microsecond
 
 **Safety:** Budget control (max facts), parallel thread pool, cycle detection, full derivation tracing.
 
+### Execution-State Ontology (ExecOnt): letting the world say how it runs
+
+The first two layers capture the **static world**: the T-Box is the world's **vocabulary** (classes, properties, constraints), the A-Box is the world's **ledger** (who did what, when). But one kind of semantics sits outside that frame — **how the world runs**: which step a task is on, which of three operations came first, whether a transition should have happened. Today that lives in workflow diagrams, robot behavior trees, and application status fields — unreadable by the database, unreachable by the reasoner.
+
+**Execution-State Ontology (ExecOnt)** makes process, state, transition, event, intent and agent first-class ontology citizens, completing the third layer — **Exec-Box, the world's behavior**:
+
+| Layer | Governs | One-liner |
+|------|---------|-----------|
+| T-Box | The world's **vocabulary** | What things are, what the rules are |
+| A-Box | The world's **ledger** | Who did what, when (static facts) |
+| **Exec-Box** | The world's **behavior** | What is happening now, how far it got, whether it should happen, whether it was done right |
+
+**Reasoning = rules × ledger × behavior**: on top of static reasoning (subclass / transitive / inverse / symmetric) sits execution reasoning (process ordering, state reachability, guard preconditions, compliance reconciliation).
+
+**Six-face metamodel**: Agent face (Agent / Capability), Process face (Process / Activity / Action), State face (StateMachine / State / Transition / Guard), Event face (ExecEvent / Causality), Intent face (Goal / Intent / Constraint), Resource face (Resource / ExecutionContext).
+
+**State reachability (StateReach)**: scans `from_state` / `to_state` transition facts to build a state adjacency graph, computes the BFS transitive closure, and derives `A reachable B` — hosted and attributed by the **same mechanism as the 7 OWL 2 RL rules**, so every derivation is inspectable. Transition guards (`guard`) are data, not code: DDL constraints (required / range / OWL restriction / disjointness / unique), same-document comparisons (`field op literal`), cross-subject preconditions (`EXISTS(Class WHERE ...)`), temporal preconditions (`BEFORE(Class WHERE ...)`, ordering on `ts`), and immediate-predecessor preconditions (`PREV(Class WHERE ...)`, the most recent earlier row must match — an intervening row breaks it) are all **rejected at the write gate**, with class references expanding over the class hierarchy so a guard on a parent also sees subclass instances.
+
+**Boundary**: ExecOnt is the **modeling and bookkeeping layer of execution semantics** — it does not schedule or drive execution and is not a workflow engine; control loops stay in the robot / PLC. High-frequency raw sensor streams never enter the ontology reasoning path; what enters the ontology layer is **semantized, event-level facts**.
+
+**Status**: M1–M6 implemented and accepted (`examples/execont/`, covering robot tasks / digital-twin runtime / measurement processes / biomedical / biopharma, with execution-compliance reconciliation and golden Q&A); M7 (execution vocabulary into SemDNS, SemBIW real-data pilot) is planned.
+
+> Ontologies are often criticized for only describing the world's nouns; ExecOnt brings the world's verbs — process, state, transition, event — into the same reasoning substrate.
+
 ### Query Engine
 
 | # | Innovation | One-liner |
 |---|-----------|-----------|
-| 10 | **OntoQL Unified Query** | One syntax for SQL + graph traversal + vector search + ontology reasoning + temporal + spatial |
-| 11 | **SPARQL Support** | Standard SPARQL 1.1, FILTER/OPTIONAL/UNION/EXISTS |
-| 12 | **Inference Clause** | Real-time reasoning in queries, `SELECT * FROM Device` auto-includes all subclasses |
-| 13 | **Semantic Cache** | Queries with same semantic meaning hit same cache, regardless of text differences |
-| 14 | **Multi-Modal Fusion Optimizer** | Vector+relational, spatial+temporal, text+vector auto-select optimal execution plan |
-| 15 | **Data Lineage** | Kernel-level provenance tracking, traces to original write + every reasoning step |
-| 16 | **Federated Query** | External sources (PG/MySQL/REST/CSV/JSON) mapped as namespaces, unified query |
+| 11 | **OntoQL Unified Query** | One syntax for SQL + graph traversal + vector search + ontology reasoning + temporal + spatial |
+| 12 | **SPARQL Support** | Standard SPARQL 1.1, FILTER/OPTIONAL/UNION/EXISTS |
+| 13 | **Inference Clause** | Real-time reasoning in queries, `SELECT * FROM Device` auto-includes all subclasses |
+| 14 | **Semantic Cache** | Queries with same semantic meaning hit same cache, regardless of text differences |
+| 15 | **Multi-Modal Fusion Optimizer** | Vector+relational, spatial+temporal, text+vector auto-select optimal execution plan |
+| 16 | **Data Lineage** | Kernel-level provenance tracking, traces to original write + every reasoning step |
+| 17 | **Federated Query** | External sources (PG/MySQL/REST/CSV/JSON) mapped as namespaces, unified query |
 
 ### OntoQL: Unified Query Language
 
@@ -292,8 +317,8 @@ SELECT * FROM pois WHERE ST_Distance(location, ST_Point(116.4, 39.9)) < 1000;
 
 | # | Innovation | One-liner |
 |---|-----------|-----------|
-| 17 | **Living Data Lifecycle** | Exponential/linear/logarithmic decay, 3-tier half-life (7h/70d/2yr), auto-activate on access |
-| 18 | **Value-Driven Query** | Filter and sort by value score, high-frequency data auto-promotes |
+| 18 | **Living Data Lifecycle** | Exponential/linear/logarithmic decay, 3-tier half-life (7h/70d/2yr), auto-activate on access |
+| 19 | **Value-Driven Query** | Filter and sort by value score, high-frequency data auto-promotes |
 
 Traditional TTL: fixed expiry, no value awareness. Living Data: **data lives like a living thing** — unused data slowly "dies", accessed data "revives".
 
@@ -309,31 +334,31 @@ Traditional TTL: fixed expiry, no value awareness. Living Data: **data lives lik
 
 | # | Innovation | One-liner |
 |---|-----------|-----------|
-| 19 | **TSM Columnar Storage** | Timestamp Delta encoding + float Gorilla encoding, 60%+ storage reduction |
-| 20 | **Spatio-Temporal Joint Index** | Quadtree spatial partition + timeline sort in single data structure |
-| 21 | **Embedded STTRL Engine** | 10+ spatio-temporal rules (geofence/speed/proximity/anomaly) at database level |
-| 22 | **3-Tier Storage** | Hot(memory) -> Warm(SSD) -> Cold(HDD), auto-migration by data temperature |
-| 23 | **Advanced Time Series** | DTW distance, streaming anomaly detection, tumbling/hopping/session windows |
+| 20 | **TSM Columnar Storage** | Timestamp Delta encoding + float Gorilla encoding, 60%+ storage reduction |
+| 21 | **Spatio-Temporal Joint Index** | Quadtree spatial partition + timeline sort in single data structure |
+| 22 | **Embedded STTRL Engine** | 10+ spatio-temporal rules (geofence/speed/proximity/anomaly) at database level |
+| 23 | **3-Tier Storage** | Hot(memory) -> Warm(SSD) -> Cold(HDD), auto-migration by data temperature |
+| 24 | **Advanced Time Series** | DTW distance, streaming anomaly detection, tumbling/hopping/session windows |
 
 ### Distributed & Scaling
 
 | # | Innovation | One-liner |
 |---|-----------|-----------|
-| 24 | **Data Sharding** | Class/Range/Hash strategies, runtime scaling and rebalancing |
-| 25 | **Raft Replication** | Cluster deployment (Raft replication + sharding) / high availability: persistent log, cluster whitelist, config sync |
-| 26 | **Multi-Protocol Access** | PostgreSQL + MySQL + HTTP REST simultaneously |
-| 27 | **Embedded API Gateway** | Load balancing, rate limiting, circuit breaking, auth |
-| 28 | **3-Tier Edge Deployment** | MCU(<100KB) -> Embedded Linux -> Edge server, unified model and API |
+| 25 | **Data Sharding** | Class/Range/Hash strategies, runtime scaling and rebalancing |
+| 26 | **Raft Replication** | Cluster deployment (Raft replication + sharding) / high availability: persistent log, cluster whitelist, config sync |
+| 27 | **Multi-Protocol Access** | PostgreSQL + MySQL + HTTP REST simultaneously |
+| 28 | **Embedded API Gateway** | Load balancing, rate limiting, circuit breaking, auth |
+| 29 | **3-Tier Edge Deployment** | MCU(<100KB) -> Embedded Linux -> Edge server, unified model and API |
 
 ### Security & Operations
 
 | # | Innovation | One-liner |
 |---|-----------|-----------|
-| 29 | **CDC Change Capture** | Kernel-integrated, WAL real-time extraction, Flink/Spark compatible |
-| 30 | **Namespace Scoped Isolation** | bare class names stamped per namespace, `ns.Class` cross-namespace addressing, no WHERE needed |
-| 31 | **GB/T 22239 Separation of Duties** | System/Security/Audit admins mutually exclusive, meets China gov/finance compliance |
-| 32 | **Data Masking Engine** | Kernel-level dynamic + static masking, auto-detect ID card/phone/bank card patterns |
-| 33 | **CRC Validation & Guard Canary** | SSTable page-level CRC validation; corrupted data deterministically rejected, heap-corruption root cause closable |
+| 30 | **CDC Change Capture** | Kernel-integrated, WAL real-time extraction, Flink/Spark compatible |
+| 31 | **Namespace Scoped Isolation** | bare class names stamped per namespace, `ns.Class` cross-namespace addressing, no WHERE needed |
+| 32 | **GB/T 22239 Separation of Duties** | System/Security/Audit admins mutually exclusive, meets China gov/finance compliance |
+| 33 | **Data Masking Engine** | Kernel-level dynamic + static masking, auto-detect ID card/phone/bank card patterns |
+| 34 | **CRC Validation & Guard Canary** | SSTable page-level CRC validation; corrupted data deterministically rejected, heap-corruption root cause closable |
 
 ### Namespace: Scoped Isolation
 
@@ -487,9 +512,10 @@ SELECT * FROM sensor_data WHERE time > '2024-01-01' LIMIT 100;
 | **Knowledge Graphs** | OWL reasoning embedded, write-on-reason, traceable derivation chains |
 | **Intelligent Search** | Vector + full-text + semantic reasoning fused query |
 | **IoT / Industrial** | Time series + spatial + graph + ontology unified, STTRL engine built-in |
-| **Digital Twin** | 12 data types + living data + STTRL + CDC real-time events |
+| **Digital Twin** | 12 data types + living data + STTRL + CDC real-time events; ExecOnt lifts twin runtime state from in-memory mirror to inferable facts |
 | **Autonomous Driving** | 3-tier edge deployment + STTRL + CDC |
-| **Robotics** | Edge low-power + real-time reasoning + spatial awareness + ontology rules |
+| **Robotics** | Edge low-power + real-time reasoning + spatial awareness + ontology rules; ExecOnt makes task-execution semantics (state / process / intent) inferable and auditable |
+| **Quality Traceability / Compliance** | ExecOnt reconciles plan-vs-actual execution and replays execution evidence chains — the execution-state currency for IATF 16949 / GxP / PPAP-style traceability |
 | **Smart Healthcare** | Namespace multi-tenant + ontology + time series (vitals) + spatial (ward) |
 | **Financial Risk** | Ontology rules auto-trigger risk controls + stream + CDC + audit chain |
 | **E-Commerce** | Vector similarity + graph relations + living data decay + real-time events |
@@ -547,50 +573,6 @@ ontodb/
 ```
 
 ---
-
-## Enterprise Edition (Preview)
-
-**The Community edition is always enough** — everything you need to run in production on a single node ships free and open source. The Enterprise edition targets multi-tenant SaaS, compliance/audit, managed operations, and production clusters, delivered under a commercial license:
-
-| Direction | What you get |
-|-----------|-------------|
-| **Multi-Tenancy** | Tenant management, quotas, metering & billing, enforced isolation |
-| **Security & Compliance** | RBAC separation of duties, LDAP/SSO, SM4 + AES encryption, audit logging & retention, data masking |
-| **Managed Operations** | Automated backup & point-in-time recovery, rolling upgrades, monitoring/alerting, SLA support |
-| **High Availability & Scaling** | Cluster HA, sharding, CDC change capture |
-| **Ontology-Driven Rule Engine** | Knowledge as rules — OWL reasoning results auto-trigger business rules, full DSL & explanation |
-
-> The above is Enterprise **roadmap** capability; parts are still under construction, subject to actual release versions. Commercial licensing: 624831343@qq.com
-
----
-
-## License
-
-OntoDB uses a dual licensing model:
-
-| Edition | License | Description |
-|---------|---------|-------------|
-| **Community** | Apache-2.0 | Free and open source, free to use, modify and distribute |
-| **Enterprise** | Commercial | Full features, requires purchased license |
-
-**Community (Apache-2.0):**
-- Allowed: free use by any individual or organization, no revenue threshold
-- Allowed: internal use, local deployment, secondary development, commercial distribution
-- Allowed: enterprise self-hosting, embedding in SaaS products
-- Required: retain copyright notices and the NOTICE file (Apache-2.0 Section 4)
-- See [LICENSE](LICENSE)
-
-**Enterprise (Commercial):**
-- Advanced reasoning engine (full DSL + OWL integration + distributed reasoning + profiling)
-- Security compliance (RBAC + LDAP + SM4/AES encryption + KMS + audit retention)
-- High availability (cluster failover + cross-shard query + backup/restore)
-- See [LICENSE.COMMERCIAL](LICENSE.COMMERCIAL)
-- Contact: 624831343@qq.com
-
-**Note:** Enterprise features (the `onto-enterprise` crate) are licensed under a proprietary commercial license and may not be copied, distributed, or used in production without authorization. Contact: 624831343@qq.com
-
----
-
 ## Contributing
 
 Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md).

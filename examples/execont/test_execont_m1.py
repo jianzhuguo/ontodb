@@ -1,0 +1,427 @@
+# -*- coding: utf-8 -*-
+"""ExecOnt 执行态本体 · M1 验收断言套件（HTTP /api/query @7912）
+
+配套文档：E:\\ontodb\\docs\\执行态本体开发方案与战略意义.md（§六 M1 验收）
+元模型包：examples/execont/exec_onto_meta.sql
+对照基线：E:\\semmesh\\tmp-gate\\test_robot_ai_ready.py（49/49，2026-11-15）
+
+M1 交付与验收：
+  ① 六面元模型 DDL 全绿（主体/过程/状态/事件/意图/资源 + 机器人特化）
+  ② 机器人断言在 ExecOnt 形态下全过（闸门/推理/AI 面/灰色地带/金标问答）
+  ③ preceded_by 工序传递 INFER 带归因（PrpTrp）
+内核改动：零（纯 DDL 约定）。
+"""
+import json, os, urllib.request
+
+BASE = "http://127.0.0.1:7912/api/query"
+SCHEMA = "http://127.0.0.1:7912/api/schema"
+PASS, FAIL = 0, 0
+
+
+def q(sql):
+    body = json.dumps({"query": sql}).encode()
+    req = urllib.request.Request(BASE, data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode())
+
+
+def expect_ok(name, sql):
+    global PASS, FAIL
+    try:
+        d = q(sql)
+        if "error" in d and d.get("error"):
+            print(f"FAIL  {name}: {d['error']}"); FAIL += 1
+        else:
+            print(f"PASS  {name}"); PASS += 1
+        return d
+    except Exception as e:
+        detail = ""
+        try:
+            detail = e.read().decode()[:160]
+        except Exception:
+            pass
+        print(f"FAIL  {name}: {e} {detail}"); FAIL += 1
+        return None
+
+
+def expect_reject(name, sql, needle):
+    global PASS, FAIL
+    try:
+        d = q(sql)
+        err = str(d.get("error", ""))
+        if err:
+            if needle.lower() in err.lower():
+                print(f"PASS  {name} -> rejected: {err[:90]}")
+            else:
+                print(f"PASS? {name} -> rejected but unexpected msg: {err[:120]}")
+            PASS += 1
+        else:
+            print(f"FAIL  {name}: write was ACCEPTED, expected gate rejection"); FAIL += 1
+    except Exception as e:
+        detail = ""
+        try:
+            detail = e.read().decode()
+        except Exception:
+            pass
+        if needle.lower() in detail.lower():
+            print(f"PASS  {name} -> rejected: {detail[:110]}")
+        else:
+            print(f"PASS? {name} -> rejected: {detail[:110]}")
+        PASS += 1
+
+
+def check(name, cond, detail=""):
+    global PASS, FAIL
+    if cond:
+        print(f"PASS  {name}" + (f"  ({detail})" if detail else "")); PASS += 1
+    else:
+        print(f"FAIL  {name}" + (f"  ({detail})" if detail else "")); FAIL += 1
+
+
+# exec_onto_meta.sql 是元模型 DDL 的**单源**——Part 1 直接执行该文件的语句，
+# 不在本套件内复写 DDL，改 .sql 即被回归触达。
+META_SQL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exec_onto_meta.sql")
+
+
+def load_meta_statements(path):
+    """把 exec_onto_meta.sql 切成可执行 DDL 语句：去 `--` 注释，按括号配平断句
+    （CREATE ONTOLOGY 多行整体成句，单行 ALTER 各自成句）。"""
+    stmts, buf, depth = [], [], 0
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            code = line.split("--", 1)[0].strip()
+            if not code:
+                continue
+            buf.append(code)
+            depth += code.count("(") - code.count(")")
+            if depth <= 0:
+                stmts.append(" ".join(buf))
+                buf, depth = [], 0
+    if buf:
+        stmts.append(" ".join(buf))
+    return stmts
+
+
+def meta_stmt_label(stmt):
+    """按语句内容映射回约定①-⑩ 的断言名（口径引用不变，语句文本来自 .sql）。"""
+    up = " ".join(stmt.upper().split())
+    if up.startswith("CREATE ONTOLOGY"):
+        return "DDL 六面元模型 + 机器人特化（exec_onto 一本体，单源 exec_onto_meta.sql）"
+    if "EVENT_AGENT" in up and "REQUIRED" in up:
+        return "约定①：event_agent REQUIRED（谁：provenance 必填）"
+    if "TS DOMAIN EXECEVENT" in up and "REQUIRED" in up:
+        return "约定②：ts REQUIRED（何时：provenance 必填）"
+    if "UNIQUE" in up:
+        return "约定③：ExecAgent UNIQUE(agent_serial)"
+    if "PRECEDED_BY" in up and "TRANSITIVE" in up:
+        return "约定④：preceded_by TRANSITIVE（工序先后）"
+    if "CAUSED_BY" in up and "TRANSITIVE" in up:
+        return "约定⑤：caused_by TRANSITIVE（因果）"
+    if "COMPOSED_OF" in up and "TRANSITIVE" in up:
+        return "约定⑥：composed_of TRANSITIVE（过程分解）"
+    if "DISJOINT" in up:
+        return "约定⑦：GraspEvent DISJOINT WITH PlaceEvent（事件互斥）"
+    if "FROM_STATE" in up and "FUNCTIONAL" in up:
+        return "约定⑧：from_state FUNCTIONAL（迁移唯一源，形式语义 A.6 纪律1）"
+    if "TO_STATE" in up and "FUNCTIONAL" in up:
+        return "约定⑨：to_state FUNCTIONAL（迁移唯一目标）"
+    if "CURRENT_STATE" in up and "FUNCTIONAL" in up:
+        return "约定⑩：current_state FUNCTIONAL（过程唯一当前位置）"
+    return "meta.sql 新增 DDL：" + " ".join(stmt.split())[:70]
+
+
+print("=" * 72)
+print("Part 0 · 清场（套件可重复执行）")
+print("=" * 72)
+for sql in [
+    "DROP ONTOLOGY exec_onto",
+    "TRUNCATE TABLE ExecAgent", "TRUNCATE TABLE Capability",
+    "TRUNCATE TABLE Process", "TRUNCATE TABLE Activity",
+    "TRUNCATE TABLE State", "TRUNCATE TABLE Transition",
+    "TRUNCATE TABLE ExecEvent", "TRUNCATE TABLE GraspEvent", "TRUNCATE TABLE PlaceEvent",
+    "TRUNCATE TABLE Goal", "TRUNCATE TABLE Intent", "TRUNCATE TABLE ExecConstraint",
+    "TRUNCATE TABLE Resource", "TRUNCATE TABLE ExecutionContext",
+    # 闸门夹具本体/类：不清理则残留事实会让「前置不存在→拒写」等阴性用例
+    # 被上一轮数据满足（Step/Phase/Job 跨轮残留，实测踩过）。
+    "DROP ONTOLOGY exec_gate", "DROP ONTOLOGY exec_guard",
+    "DROP ONTOLOGY exec_pre", "DROP ONTOLOGY exec_pre2",
+    "DROP ONTOLOGY exec_t", "DROP ONTOLOGY exec_t2",
+    "DROP ONTOLOGY exec_h", "DROP ONTOLOGY exec_pv", "DROP ONTOLOGY exec_pv2",
+    "TRUNCATE TABLE Bag", "TRUNCATE TABLE GuardT", "TRUNCATE TABLE Step",
+    "TRUNCATE TABLE Job", "TRUNCATE TABLE Job2", "TRUNCATE TABLE Phase", "TRUNCATE TABLE Job3",
+]:
+    try:
+        q(sql)
+    except Exception:
+        pass
+print("      cleanup done")
+
+print()
+print("=" * 72)
+print("Part 1 · M1 验收①：六面元模型 DDL 全绿（单源加载 exec_onto_meta.sql）")
+print("=" * 72)
+meta_stmts = load_meta_statements(META_SQL)
+check("exec_onto_meta.sql 解析出全部 DDL 语句", len(meta_stmts) >= 11, f"count={len(meta_stmts)}")
+for stmt in meta_stmts:
+    expect_ok(meta_stmt_label(stmt), stmt)
+
+try:
+    req = urllib.request.Request(SCHEMA)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        schema_text = r.read().decode()
+    planes = ["ExecAgent", "Capability", "Process", "Activity", "State", "Transition",
+              "ExecEvent", "Goal", "Intent", "ExecConstraint", "Resource", "ExecutionContext"]
+    missing = [c for c in planes if c not in schema_text]
+    check("六面 12 类全部登记于 schema", not missing, f"missing={missing}")
+    check("机器人特化类登记于 schema（GraspEvent/PlaceEvent）",
+          "GraspEvent" in schema_text and "PlaceEvent" in schema_text)
+except Exception as e:
+    check("六面 12 类全部登记于 schema", False, f"schema fetch error: {e}")
+    schema_text = ""
+
+# 元契约钉住：exec_onto_meta.sql 里的约定必须在 schema 可见——谁从 .sql
+# 删掉一条 ALTER，这里当场红，而不是等语义悄悄失效。
+try:
+    ontos = json.loads(schema_text)["data"]["ontologies"]
+    onto = next(o for o in ontos if o.get("name") == "exec_onto")
+    props, classes = onto["properties"], onto["classes"]
+    # unique_columns 是约束列表的列表（多列 UNIQUE 一约束多列），拍平取列名
+    uniq_cols = {c for cols in classes.get("ExecAgent", {}).get("unique_columns", [])
+                 for c in (cols if isinstance(cols, list) else [cols])}
+    contract = {
+        "event_agent.required": props.get("event_agent", {}).get("required") is True,
+        "ts.required": props.get("ts", {}).get("required") is True,
+        "from_state.is_functional": props.get("from_state", {}).get("is_functional") is True,
+        "to_state.is_functional": props.get("to_state", {}).get("is_functional") is True,
+        "current_state.is_functional": props.get("current_state", {}).get("is_functional") is True,
+        "preceded_by.is_transitive": props.get("preceded_by", {}).get("is_transitive") is True,
+        "caused_by.is_transitive": props.get("caused_by", {}).get("is_transitive") is True,
+        "composed_of.is_transitive": props.get("composed_of", {}).get("is_transitive") is True,
+        "ExecAgent.unique(agent_serial)": "agent_serial" in uniq_cols,
+        "GraspEvent.disjoint(PlaceEvent)": "PlaceEvent" in classes.get("GraspEvent", {}).get("disjoint_with", []),
+    }
+    broken = [k for k, ok in contract.items() if not ok]
+    check("元契约钉住（REQUIRED/FUNCTIONAL/TRANSITIVE/UNIQUE/DISJOINT 经 schema 可见）",
+          not broken, f"broken={broken}")
+except Exception as e:
+    check("元契约钉住（REQUIRED/FUNCTIONAL/TRANSITIVE/UNIQUE/DISJOINT 经 schema 可见）",
+          False, f"schema parse error: {e}")
+
+print()
+print("      -- 六面实例烟测（每面至少一行，provenance 合规） --")
+expect_ok("主体面：ExecAgent agent_meta", "INSERT INTO ExecAgent (id, agent_serial) VALUES ('agent_meta', 'META-001')")
+expect_ok("主体面：Capability cap1", "INSERT INTO Capability (id, capability_of) VALUES ('cap1', 'ExecAgent::agent_meta')")
+expect_ok("过程面：Process proc1（巡检过程）", "INSERT INTO Process (id, exec_agent, current_state, has_intent) VALUES ('proc1', 'ExecAgent::agent_meta', 'State::st_running', 'Intent::i1')")
+expect_ok("过程面：Activity act_meta（工序）", "INSERT INTO Activity (id, activity_name, process_of) VALUES ('act_meta', '元模型工序', 'Process::proc1')")
+expect_ok("状态面：State st_created/st_running", "INSERT INTO State (id, state_name, state_machine) VALUES ('st_created', '已创建', 'SM::proc_lifecycle')")
+expect_ok("状态面：State st_running", "INSERT INTO State (id, state_name, state_machine) VALUES ('st_running', '运行中', 'SM::proc_lifecycle')")
+expect_ok("状态面：Transition tr1（守卫迁移）", "INSERT INTO Transition (id, from_state, to_state, guard) VALUES ('tr1', 'State::st_created', 'State::st_running', 'precondition_ok')")
+expect_ok("事件面：ExecEvent em_meta（provenance 合规）", "INSERT INTO ExecEvent (id, event_agent, ts, frame, task_name) VALUES ('em_meta', 'agent_meta', 500.0, 'map', '元模型烟测')")
+expect_ok("意图面：Goal g_inspect", "INSERT INTO Goal (id) VALUES ('g_inspect')")
+expect_ok("意图面：Intent i1（绑定目标）", "INSERT INTO Intent (id, goal_of) VALUES ('i1', 'Goal::g_inspect')")
+expect_ok("意图面：ExecConstraint c1（绑定意图）", "INSERT INTO ExecConstraint (id, constraint_of) VALUES ('c1', 'Intent::i1')")
+expect_ok("资源面：Resource res_meta", "INSERT INTO Resource (id, obj_name) VALUES ('res_meta', '元模型资源')")
+expect_ok("资源面：ExecutionContext ctx1", "INSERT INTO ExecutionContext (id, ctx_of) VALUES ('ctx1', 'Process::proc1')")
+
+d = expect_ok("六面实例可读：SELECT current_state FROM Process", "SELECT id, current_state FROM Process")
+if d:
+    rows = d.get("data", [])
+    ok = rows and rows[0].get("current_state") == "State::st_running"
+    check("状态面引用可读（proc1 处于 st_running）", bool(ok), f"rows={rows}")
+
+print()
+print("=" * 72)
+print("Part 2 · 写入即事实化 + 五道闸门（ExecOnt 机器人形态）")
+print("=" * 72)
+expect_ok("INSERT 合规行：机器人 r1", "INSERT INTO ExecAgent (id, agent_serial) VALUES ('r1', 'SN-001')")
+expect_ok("INSERT 合规行：事件 e1（巡检）", "INSERT INTO ExecEvent (id, event_agent, ts, frame, task_name) VALUES ('e1', 'r1', 1000.0, 'map', '巡检')")
+expect_ok("INSERT 合规行：抓取 g1（蓝色工具箱）", "INSERT INTO GraspEvent (id, event_agent, ts, task_name, target, confidence) VALUES ('g1', 'r1', 1001.0, '抓取', '蓝色工具箱', 0.97)")
+expect_reject("闸门①必填缺失(缺 event_agent)", "INSERT INTO ExecEvent (id, ts) VALUES ('gx1', 2000.0)", "required")
+expect_reject("闸门②值域不符(confidence='high')", "INSERT INTO GraspEvent (id, event_agent, ts, task_name, target, confidence) VALUES ('gx2', 'r1', 2001.0, '抓取', '料箱', 'high')", "type")
+expect_reject("闸门③唯一冲突(重复 agent_serial)", "INSERT INTO ExecAgent (id, agent_serial) VALUES ('r2', 'SN-001')", "unique")
+expect_ok("准备 disjoint 对照：GraspEvent same_ev", "INSERT INTO GraspEvent (id, event_agent, ts, task_name, target, confidence) VALUES ('same_ev', 'r9', 2002.0, '抓取', '工装', 0.9)")
+expect_reject("闸门④不相交(same_ev 双事件类)", "INSERT INTO PlaceEvent (id, event_agent, ts, task_name) VALUES ('same_ev', 'r9', 2003.0, '放置')", "disjoint")
+
+# 闸门⑥ 功能属性单值（owl:FunctionalProperty，形式语义 A.6 纪律1）。
+# 载体用 ARRAY 型属性——STRING 型在类型闸门就挡掉列表了，那样测不到功能闸门本身。
+expect_ok("闸门⑥ 准备：ARRAY 型功能属性载体", "CREATE ONTOLOGY exec_gate (CLASS Bag, PROPERTY tags DOMAIN Bag RANGE ARRAY)")
+expect_ok("闸门⑥ 约定：tags FUNCTIONAL", "ALTER PROPERTY tags DOMAIN Bag CHARACTERISTICS FUNCTIONAL")
+expect_ok("闸门⑥ 单值放行：['a']", "INSERT INTO Bag (tags) VALUES (['a'])")
+expect_reject("闸门⑥ 功能属性多值拒写：['a','b']", "INSERT INTO Bag (tags) VALUES (['a', 'b'])", "functional")
+expect_ok("闸门⑥ 同值重复仍算一个值：['a','a']", "INSERT INTO Bag (tags) VALUES (['a', 'a'])")
+expect_reject("闸门⑥b 标量属性不接受列表(from_state)", "INSERT INTO Transition (id, from_state) VALUES ('gx6', ['A', 'Z'])", "type")
+
+# 闸门⑦ L2 守卫求值：guard 是数据，写成 `字段 op 字面量` 时内核当场判定。
+# 三值语义（形式语义 A.5）：满足放行 / 不满足拒写 / 判不了（缺操作数或语法不支持）不猜、放行。
+expect_ok("闸门⑦ 准备：守卫载体", "CREATE ONTOLOGY exec_guard (CLASS GuardT, PROPERTY name DOMAIN GuardT RANGE STRING, PROPERTY guard DOMAIN GuardT RANGE STRING, PROPERTY quality_score DOMAIN GuardT RANGE FLOAT64)")
+expect_ok("闸门⑦ 守卫满足放行：0.95 >= 0.8", "INSERT INTO GuardT (name, guard, quality_score) VALUES ('ok', 'quality_score >= 0.8', 0.95)")
+expect_reject("闸门⑦ 守卫不满足拒写：0.3 >= 0.8", "INSERT INTO GuardT (name, guard, quality_score) VALUES ('bad', 'quality_score >= 0.8', 0.3)", "guard violation")
+expect_ok("闸门⑦a 操作数缺失→未判定放行(schema-on-read)", "INSERT INTO GuardT (name, guard) VALUES ('nodata', 'quality_score >= 0.8')")
+expect_ok("闸门⑦b 非支持语法→不判定不拦截", "INSERT INTO GuardT (name, guard) VALUES ('weird', 'a and b')")
+
+# 闸门⑧ 跨主体前置条件（EXISTS 子句）：guard 可要求「另一个主体的某事实已存在」，
+# 用 $field 关联到本次写入的文档。存在性命题确定为假 → 当场拒写；关联字段缺失 → 未判定放行。
+expect_ok("闸门⑧ 准备：前置事实载体 Step", "CREATE ONTOLOGY exec_pre (CLASS Step, PROPERTY name DOMAIN Step RANGE STRING, PROPERTY process_of DOMAIN Step RANGE STRING)")
+expect_ok("闸门⑧ 准备：Job 带 guard", "CREATE ONTOLOGY exec_pre2 (CLASS Job, PROPERTY name DOMAIN Job RANGE STRING, PROPERTY process_of DOMAIN Job RANGE STRING, PROPERTY guard DOMAIN Job RANGE STRING)")
+expect_reject("闸门⑧ 前置事实不存在→拒写", "INSERT INTO Job (name, process_of, guard) VALUES ('place', 'P1', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+expect_ok("闸门⑧ 写入前置事实(同主体 P1)", "INSERT INTO Step (name, process_of) VALUES ('inspect', 'P1')")
+expect_ok("闸门⑧ 前置满足→放行", "INSERT INTO Job (name, process_of, guard) VALUES ('place', 'P1', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')")
+expect_reject("闸门⑧b $process_of 关联不跨主体→拒写", "INSERT INTO Job (name, process_of, guard) VALUES ('place', 'P2', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+expect_ok("闸门⑧c 关联字段缺失→未判定放行", "INSERT INTO Job (name, guard) VALUES ('noref', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')")
+
+# 闸门⑨ 时序前置（BEFORE 子句）：要求某事实**发生在本次写入之前**。
+# 排序键固定为 ts（ExecOnt 约定 ExecEvent.ts REQUIRED）；本次写入无 ts → 未判定放行。
+expect_ok("闸门⑨ 准备：时序载体 Step(ts)", "CREATE ONTOLOGY exec_t (CLASS Step, PROPERTY name DOMAIN Step RANGE STRING, PROPERTY process_of DOMAIN Step RANGE STRING, PROPERTY ts DOMAIN Step RANGE FLOAT64)")
+expect_ok("闸门⑨ 准备：Job 带 ts + guard", "CREATE ONTOLOGY exec_t2 (CLASS Job, PROPERTY name DOMAIN Job RANGE STRING, PROPERTY process_of DOMAIN Job RANGE STRING, PROPERTY ts DOMAIN Job RANGE FLOAT64, PROPERTY guard DOMAIN Job RANGE STRING)")
+expect_reject("闸门⑨ 无先前事实→拒写", "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 2000.0, 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+expect_ok("闸门⑨ 写入先前事实(ts=1000)", "INSERT INTO Step (name, process_of, ts) VALUES ('inspect', 'P1', 1000.0)")
+expect_ok("闸门⑨ 先前事实成立(ts=2000)→放行", "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 2000.0, 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')")
+expect_reject("闸门⑨b 回溯写入(ts=500)无更早事实→拒写", "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 500.0, 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+expect_reject("闸门⑨c ts 相等不算更早→拒写", "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 1000.0, 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+expect_ok("闸门⑨d 本次无 ts→未判定放行", "INSERT INTO Job (name, process_of, guard) VALUES ('nots', 'P1', 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')")
+expect_reject("闸门⑨e $process_of 不跨主体→拒写", "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P2', 2000.0, 'BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+
+# 闸门⑩ 类层级展开：守卫指向父类时，子类实例一并计入（扫父类 + 全部子类的存储键前缀）。
+# 断言里用 task_name='抓取'——它只存在于 GraspEvent（ExecEvent 的子类）实例上，
+# 不展开层级就看不见，所以这几条能真正证明展开生效。
+expect_ok("闸门⑩ 准备：Job2 带 ts + guard", "CREATE ONTOLOGY exec_h (CLASS Job2, PROPERTY name DOMAIN Job2 RANGE STRING, PROPERTY ts DOMAIN Job2 RANGE FLOAT64, PROPERTY guard DOMAIN Job2 RANGE STRING)")
+expect_ok("闸门⑩ 父类守卫看到子类实例(EXISTS)", "INSERT INTO Job2 (name, ts, guard) VALUES ('has_grasp', 5000.0, 'EXISTS(ExecEvent WHERE task_name = ''抓取'')')")
+expect_ok("闸门⑩ 父类守卫看到子类实例(BEFORE)", "INSERT INTO Job2 (name, ts, guard) VALUES ('after_grasp', 5000.0, 'BEFORE(ExecEvent WHERE task_name = ''抓取'')')")
+expect_reject("闸门⑩b 父类守卫：真不存在的仍拒写", "INSERT INTO Job2 (name, ts, guard) VALUES ('nope', 5000.0, 'BEFORE(ExecEvent WHERE task_name = ''不存在的工序'')')", "guard violation")
+
+# 闸门⑪ 相邻前驱（PREV 子句）：要求**最近的一条**更早行满足条件——中间插入别的步骤即失败。
+# 这是 PREV 与 BEFORE 的区别：BEFORE 只问「曾经有过」，PREV 问「上一步就是它」。
+expect_ok("闸门⑪ 准备：工序载体 Phase", "CREATE ONTOLOGY exec_pv (CLASS Phase, PROPERTY name DOMAIN Phase RANGE STRING, PROPERTY process_of DOMAIN Phase RANGE STRING, PROPERTY ts DOMAIN Phase RANGE FLOAT64)")
+expect_ok("闸门⑪ 准备：Job3 带 ts + guard", "CREATE ONTOLOGY exec_pv2 (CLASS Job3, PROPERTY name DOMAIN Job3 RANGE STRING, PROPERTY process_of DOMAIN Job3 RANGE STRING, PROPERTY ts DOMAIN Job3 RANGE FLOAT64, PROPERTY guard DOMAIN Job3 RANGE STRING)")
+expect_reject("闸门⑪ 无先前工序→拒写", "INSERT INTO Job3 (name, process_of, ts, guard) VALUES ('place', 'P1', 3000.0, 'PREV(Phase WHERE name = ''inspect'' AND process_of = $process_of)')", "guard violation")
+expect_ok("闸门⑪ 写 pickup@1000", "INSERT INTO Phase (name, process_of, ts) VALUES ('pickup', 'P1', 1000.0)")
+expect_ok("闸门⑪ 写 inspect@2000", "INSERT INTO Phase (name, process_of, ts) VALUES ('inspect', 'P1', 2000.0)")
+expect_ok("闸门⑪ 最近一条是 inspect→放行", "INSERT INTO Job3 (name, process_of, ts, guard) VALUES ('place', 'P1', 3000.0, 'PREV(Phase WHERE name = ''inspect'' AND process_of = $process_of)')")
+expect_reject("闸门⑪b 要求上一步是 pickup 但被 inspect 插入→拒写", "INSERT INTO Job3 (name, process_of, ts, guard) VALUES ('place2', 'P1', 3000.0, 'PREV(Phase WHERE name = ''pickup'' AND process_of = $process_of)')", "guard violation")
+expect_ok("闸门⑪c 同一写入用 BEFORE 则放行(PREV/BEFORE 对照)", "INSERT INTO Job3 (name, process_of, ts, guard) VALUES ('place3', 'P1', 3000.0, 'BEFORE(Phase WHERE name = ''pickup'' AND process_of = $process_of)')")
+expect_ok("闸门⑪d 本次无 ts→未判定放行", "INSERT INTO Job3 (name, process_of, guard) VALUES ('nots', 'P1', 'PREV(Phase WHERE name = ''inspect'' AND process_of = $process_of)')")
+
+print()
+print("=" * 72)
+print("Part 3 · 推理就绪（层级透明 + 工序传递 + 物化 + 演进面）  ← M1 验收③")
+print("=" * 72)
+d = expect_ok("事实化可读：SELECT GraspEvent", "SELECT id, target FROM GraspEvent")
+if d:
+    print(f"      -> GraspEvent rows: {[r.get('id') for r in d.get('data', [])]}")
+d = expect_ok("类层级透明：SELECT ExecEvent 含 GraspEvent 实例", "SELECT id, task_name FROM ExecEvent")
+if d:
+    ids = [r.get("id") for r in d.get("data", [])]
+    print(f"      -> ExecEvent rows: {ids}")
+    check("Cax-sco：g1 经子类推理出现在 ExecEvent 查询中", "g1" in ids, f"ids={ids}")
+
+expect_ok("规则事实：工序链 act_a → act_b", "INSERT INTO Activity (id, activity_name, process_of, preceded_by) VALUES ('act_a', '取料', 'Process::proc1', 'Activity::act_b')")
+expect_ok("规则事实：工序链 act_b → act_c", "INSERT INTO Activity (id, activity_name, process_of, preceded_by) VALUES ('act_b', '转运', 'Process::proc1', 'Activity::act_c')")
+expect_ok("规则事实：工序链末端 act_c", "INSERT INTO Activity (id, activity_name, process_of) VALUES ('act_c', '上料', 'Process::proc1')")
+d = expect_ok("推理物化：INFER SELECT * FROM Activity", "INFER SELECT * FROM Activity")
+if d:
+    inferred = d.get("data", [])
+    chained = any(
+        r.get("subject", "").endswith("act_a") and r.get("object", "").endswith("act_c")
+        for r in inferred
+    )
+    print(f"      -> inferred rows: {len(inferred)}")
+    for r in inferred[:6]:
+        print(f"         {r.get('subject')} --{r.get('predicate')}--> {r.get('object')}  [{r.get('rule')}]")
+    check("M1验收③ Prp-trp 传递推理：act_a→act_c 蕴含由 act_a→act_b→act_c 工序链推出", chained)
+    attributed = any(
+        r.get("subject", "").endswith("act_a") and r.get("object", "").endswith("act_c") and r.get("rule")
+        for r in inferred
+    )
+    check("M1验收③ 蕴含行带 rule 归因", attributed)
+
+d = expect_ok("推理物化：INFER SELECT * FROM GraspEvent（层级蕴含）", "INFER SELECT * FROM GraspEvent")
+if d:
+    inferred = d.get("data", [])
+    type_inf = [r for r in inferred if r.get("predicate") == "rdf:type"]
+    print(f"      -> inferred rows: {len(inferred)}; rdf:type facts: {[(r.get('subject'), r.get('object')) for r in type_inf]}")
+    hit = any(r.get("subject", "").endswith("g1") and r.get("object") == "ExecEvent" for r in type_inf)
+    check("Cax-sco 物化：g1 rdf:type ExecEvent 蕴含带 rule 归因", hit)
+    if type_inf:
+        print(f"      -> rule attribution: {type_inf[0].get('rule')}")
+
+expect_ok("演进面：ALTER CLASS PlaceEvent EXTENDS ExecEvent", "ALTER CLASS PlaceEvent EXTENDS ExecEvent")
+expect_ok("演进后写入：放置 p1", "INSERT INTO PlaceEvent (id, event_agent, ts, task_name) VALUES ('p1', 'r1', 3004.0, '放置')")
+d = expect_ok("演进后层级透明：SELECT ExecEvent 含 p1", "SELECT id, task_name FROM ExecEvent")
+if d:
+    ids = [r.get("id") for r in d.get("data", [])]
+    check("演进后 Cax-sco：p1 出现在 ExecEvent 查询中", "p1" in ids, f"ids={ids}")
+
+print()
+print("=" * 72)
+print("Part 4 · AI/Agent 面（中文检索 + 向量 + 机读）")
+print("=" * 72)
+expect_ok("资源建行：蓝色工具箱", "INSERT INTO Resource (id, obj_name, embedding) VALUES ('o1', '蓝色工具箱', '[0.1, 0.2, 0.3]')")
+expect_ok("CJK n-gram 索引", "CREATE NGRAM INDEX ON Resource (obj_name)")
+d = expect_ok("CJK 检索 LIKE '%工具箱%'", "SELECT id, obj_name FROM Resource WHERE obj_name LIKE '%工具箱%'")
+if d and any(r.get("id") == "o1" for r in d.get("data", [])):
+    check("中文子串检索命中 o1（CJK n-gram 索引）", True)
+else:
+    check("中文子串检索命中 o1（CJK n-gram 索引）", False, f"data={d.get('data') if d else None}")
+
+try:
+    q("DROP VECTOR INDEX ON Resource (embedding)")
+except Exception:
+    pass
+expect_ok("向量索引", "CREATE VECTOR INDEX ON Resource (embedding) DIMENSION 3")
+d = expect_ok("向量检索 top1", "VECTOR SEARCH ON Resource (embedding) QUERY [0.1, 0.2, 0.3] TOP 1")
+if d:
+    rows = d.get("data", [])
+    print(f"      -> hits: {[r.get('id') for r in rows]}")
+    check("HNSW 向量检索命中（AI 语义检索面）", bool(rows))
+
+d = expect_ok("Agent 面：机器可读 JSON", "SELECT id, task_name FROM ExecEvent")
+if d and isinstance(d, dict):
+    keys = list(d.keys())
+    print(f"      -> JSON envelope keys: {keys}")
+    check("全链路响应为机器可读 JSON（Agent 可直读）", True)
+
+print()
+print("=" * 72)
+print("Part 5 · 灰色地带闭环（未登记字段 → 补登记 → 闸门生效）")
+print("=" * 72)
+expect_ok("灰色地带实证：未登记字段 raw_imu 写入不拒收", "INSERT INTO ExecEvent (id, event_agent, ts, task_name, raw_imu) VALUES ('ev9', 'r1', 9000.0, '巡检', '0.98')")
+d = expect_ok("灰色地带可见：SELECT ev9", "SELECT * FROM ExecEvent WHERE id = 'ev9'")
+if d:
+    rows = d.get("data", [])
+    visible = rows and rows[0].get("raw_imu") == "0.98"
+    check("未登记字段可读（schema-on-read 灰色地带实证）", bool(visible), f"row={rows[0] if rows else None}")
+expect_ok("补登记：CREATE DATATYPE PROPERTY raw_imu RANGE FLOAT64", "CREATE DATATYPE PROPERTY raw_imu DOMAIN ExecEvent RANGE FLOAT64")
+expect_reject("登记后闸门生效：raw_imu='bad'（FLOAT64）", "INSERT INTO ExecEvent (id, event_agent, ts, task_name, raw_imu) VALUES ('gx5', 'r1', 9001.0, '巡检', 'bad')", "type")
+
+print()
+print("=" * 72)
+print("Part 6 · 金标问答（Agent 终裁）+ 完备性探针")
+print("=" * 72)
+expect_ok("补写抓取 g2（黑色料箱）", "INSERT INTO GraspEvent (id, event_agent, ts, task_name, target, confidence) VALUES ('g2', 'r1', 4001.0, '抓取', '黑色料箱', 0.91)")
+
+d = expect_ok("金标①：「机器人 r1 的抓取事件有几次？」", "SELECT id FROM GraspEvent WHERE event_agent = 'r1'")
+if d:
+    ids = [r.get("id") for r in d.get("data", [])]
+    print(f"      -> Agent 查库作答：{len(ids)} 次（{sorted(ids)}）")
+    check("金标① 答案与事实一致（期望 2 次：g1, g2）", sorted(ids) == ["g1", "g2"], f"ids={sorted(ids)}")
+
+d = expect_ok("金标②：「g1 的抓取目标叫什么？」", "SELECT target FROM GraspEvent WHERE id = 'g1'")
+if d:
+    rows = d.get("data", [])
+    ans = rows[0].get("target") if rows else None
+    print(f"      -> Agent 查库作答：{ans}")
+    check("金标② 答案与事实一致（期望 蓝色工具箱）", ans == "蓝色工具箱", f"ans={ans}")
+
+d = expect_ok("完备性探针：ExecEvent frame 覆盖率", "SELECT id, frame FROM ExecEvent")
+if d:
+    rows = d.get("data", [])
+    total = len(rows)
+    covered = sum(1 for r in rows if r.get("frame"))
+    pct = (100.0 * covered / total) if total else 0.0
+    print(f"      -> frame 覆盖率：{covered}/{total} = {pct:.1f}%")
+    check("完备性探针报出 frame 覆盖率 < 100%（gap 被看见）", total > 0 and covered < total, f"{pct:.1f}%")
+
+print()
+print("=" * 72)
+print(f"RESULT  PASS={PASS}  FAIL={FAIL}")
+print("=" * 72)

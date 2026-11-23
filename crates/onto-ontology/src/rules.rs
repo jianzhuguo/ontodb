@@ -13,7 +13,7 @@
 //! - prp-symp: symmetric property inference
 
 use crate::model::{Ontology, Triple};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Identifies which rule produced an inference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,6 +32,9 @@ pub enum RuleId {
     PrpTrp,
     /// Symmetric property: x P y -> y P x
     PrpSymp,
+    /// State machine reachability: Transition(from=A,to=B) => A reachable B,
+    /// then transitive closure (no self-loops).
+    StateReach,
 }
 
 /// An inference rule that operates on an ontology and a set of known triples.
@@ -468,6 +471,112 @@ impl Rule for PrpSymp {
     }
 }
 
+/// State machine reachability via Transition closure.
+///
+/// Scans facts for `from_state` / `to_state` pairs (Transition instances),
+/// builds a state adjacency graph, then computes the transitive closure.
+/// Output: `(A, "reachable", B)` for every reachable pair A ≠ B.
+///
+/// Well-formedness: a Transition carries exactly one `from_state` and one
+/// `to_state`. A subject carrying several values is **ambiguous**, so the edge
+/// is not invented — it is skipped and the subject is flagged with
+/// `(subject, "ambiguous_transition", reason)`. Previously the last value in
+/// `HashSet` iteration order silently won, which made the closure
+/// irreproducible across runs on identical input.
+///
+/// Determinism: values are collected in `BTreeSet`s and neighbours are walked
+/// in sorted order, so both the emitted set and its order are a pure function
+/// of `facts`.
+pub struct StateReach;
+
+impl Rule for StateReach {
+    fn id(&self) -> RuleId {
+        RuleId::StateReach
+    }
+
+    fn apply(
+        &self,
+        _ontology: &Ontology,
+        facts: &HashSet<Triple>,
+        _new_facts: &[Triple],
+    ) -> Vec<Triple> {
+        // 1. Collect every value per subject so multi-valued facts stay visible
+        //    instead of silently overwriting each other.
+        let mut from_map: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        let mut to_map: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for fact in facts {
+            match fact.predicate.as_str() {
+                "from_state" => {
+                    from_map
+                        .entry(fact.subject.as_str())
+                        .or_default()
+                        .insert(fact.object.as_str());
+                }
+                "to_state" => {
+                    to_map
+                        .entry(fact.subject.as_str())
+                        .or_default()
+                        .insert(fact.object.as_str());
+                }
+                _ => {}
+            }
+        }
+
+        // 2. Build adjacency from well-formed transitions only; flag the rest.
+        let mut adj: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        let mut inferred: Vec<Triple> = Vec::new();
+        for (subj, froms) in &from_map {
+            let Some(tos) = to_map.get(subj) else {
+                continue;
+            };
+            if froms.len() > 1 || tos.len() > 1 {
+                let reason = if froms.len() > 1 && tos.len() > 1 {
+                    "multiple_from_state_and_to_state"
+                } else if froms.len() > 1 {
+                    "multiple_from_state"
+                } else {
+                    "multiple_to_state"
+                };
+                let t = Triple::new(*subj, "ambiguous_transition", reason);
+                if !facts.contains(&t) {
+                    inferred.push(t);
+                }
+                continue;
+            }
+            let from = *froms.iter().next().expect("froms checked non-empty");
+            let to = *tos.iter().next().expect("tos checked non-empty");
+            adj.entry(from).or_default().insert(to);
+        }
+
+        if adj.is_empty() {
+            return inferred;
+        }
+
+        // 3. Transitive closure via DFS from each node (no self-loops).
+        let nodes: Vec<&str> = adj.keys().copied().collect();
+        for &start in &nodes {
+            let mut visited: BTreeSet<&str> = BTreeSet::new();
+            let mut queue: Vec<&str> = vec![start];
+            while let Some(curr) = queue.pop() {
+                if let Some(neighbors) = adj.get(curr) {
+                    for &next in neighbors {
+                        if visited.insert(next) {
+                            queue.push(next);
+                            if next != start {
+                                let t = Triple::new(start, "reachable", next);
+                                if !facts.contains(&t) {
+                                    inferred.push(t);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        inferred
+    }
+}
+
 /// Returns the default set of OWL-lite inference rules.
 pub fn default_rules() -> Vec<Box<dyn Rule>> {
     vec![
@@ -478,6 +587,7 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         Box::new(PrpInv),
         Box::new(PrpTrp),
         Box::new(PrpSymp),
+        Box::new(StateReach),
     ]
 }
 
@@ -646,9 +756,146 @@ mod tests {
     }
 
     #[test]
+    fn test_state_reach_direct() {
+        let onto = Ontology::new("test");
+        let facts: HashSet<Triple> = vec![
+            Triple::new("tr1", "from_state", "State::A"),
+            Triple::new("tr1", "to_state", "State::B"),
+        ]
+        .into_iter()
+        .collect();
+        let rule = StateReach;
+        let inferred = rule.apply(&onto, &facts, &[]);
+        assert!(inferred.contains(&Triple::new("State::A", "reachable", "State::B")));
+        assert_eq!(inferred.len(), 1); // no self-loop
+    }
+
+    #[test]
+    fn test_state_reach_transitive() {
+        let onto = Ontology::new("test");
+        let facts: HashSet<Triple> = vec![
+            Triple::new("tr1", "from_state", "State::A"),
+            Triple::new("tr1", "to_state", "State::B"),
+            Triple::new("tr2", "from_state", "State::B"),
+            Triple::new("tr2", "to_state", "State::C"),
+        ]
+        .into_iter()
+        .collect();
+        let rule = StateReach;
+        let inferred = rule.apply(&onto, &facts, &[]);
+        assert!(inferred.contains(&Triple::new("State::A", "reachable", "State::B")));
+        assert!(inferred.contains(&Triple::new("State::B", "reachable", "State::C")));
+        assert!(inferred.contains(&Triple::new("State::A", "reachable", "State::C")));
+        assert_eq!(inferred.len(), 3);
+    }
+
+    #[test]
+    fn test_state_reach_no_self_loop() {
+        let onto = Ontology::new("test");
+        // A -> B -> A (cycle)
+        let facts: HashSet<Triple> = vec![
+            Triple::new("tr1", "from_state", "State::A"),
+            Triple::new("tr1", "to_state", "State::B"),
+            Triple::new("tr2", "from_state", "State::B"),
+            Triple::new("tr2", "to_state", "State::A"),
+        ]
+        .into_iter()
+        .collect();
+        let rule = StateReach;
+        let inferred = rule.apply(&onto, &facts, &[]);
+        assert!(inferred.contains(&Triple::new("State::A", "reachable", "State::B")));
+        assert!(inferred.contains(&Triple::new("State::B", "reachable", "State::A")));
+        // No self-loops: (A, reachable, A) and (B, reachable, B) must not appear
+        assert!(!inferred.contains(&Triple::new("State::A", "reachable", "State::A")));
+        assert!(!inferred.contains(&Triple::new("State::B", "reachable", "State::B")));
+        assert_eq!(inferred.len(), 2);
+    }
+
+    #[test]
+    fn test_state_reach_empty() {
+        let onto = Ontology::new("test");
+        let facts: HashSet<Triple> = HashSet::new();
+        let rule = StateReach;
+        let inferred = rule.apply(&onto, &facts, &[]);
+        assert!(inferred.is_empty());
+    }
+
+    #[test]
+    fn test_state_reach_multi_from_is_ambiguous_not_guessed() {
+        let onto = Ontology::new("test");
+        // tr1 claims two source states: no edge may be invented from it.
+        let facts: HashSet<Triple> = vec![
+            Triple::new("tr1", "from_state", "State::A"),
+            Triple::new("tr1", "from_state", "State::Z"),
+            Triple::new("tr1", "to_state", "State::B"),
+            Triple::new("tr2", "from_state", "State::B"),
+            Triple::new("tr2", "to_state", "State::C"),
+        ]
+        .into_iter()
+        .collect();
+        let rule = StateReach;
+        let inferred = rule.apply(&onto, &facts, &[]);
+
+        assert!(inferred
+            .contains(&Triple::new("tr1", "ambiguous_transition", "multiple_from_state")));
+        // tr1 contributes no edge at all...
+        assert!(!inferred.contains(&Triple::new("State::A", "reachable", "State::B")));
+        assert!(!inferred.contains(&Triple::new("State::Z", "reachable", "State::B")));
+        // ...while the well-formed tr2 still closes normally.
+        assert!(inferred.contains(&Triple::new("State::B", "reachable", "State::C")));
+        assert_eq!(inferred.len(), 2);
+    }
+
+    #[test]
+    fn test_state_reach_multi_to_is_ambiguous_not_guessed() {
+        let onto = Ontology::new("test");
+        let facts: HashSet<Triple> = vec![
+            Triple::new("tr1", "from_state", "State::A"),
+            Triple::new("tr1", "to_state", "State::B"),
+            Triple::new("tr1", "to_state", "State::Y"),
+        ]
+        .into_iter()
+        .collect();
+        let rule = StateReach;
+        let inferred = rule.apply(&onto, &facts, &[]);
+
+        assert!(inferred.contains(&Triple::new("tr1", "ambiguous_transition", "multiple_to_state")));
+        assert!(!inferred.contains(&Triple::new("State::A", "reachable", "State::B")));
+        assert!(!inferred.contains(&Triple::new("State::A", "reachable", "State::Y")));
+        assert_eq!(inferred.len(), 1);
+    }
+
+    #[test]
+    fn test_state_reach_is_deterministic_across_insertion_orders() {
+        // The same fact set built in two different insertion orders must yield
+        // the identical inference vector (order included), since HashMap
+        // iteration order may differ between the two sets.
+        let triples = vec![
+            Triple::new("tr1", "from_state", "State::A"),
+            Triple::new("tr1", "to_state", "State::B"),
+            Triple::new("tr2", "from_state", "State::B"),
+            Triple::new("tr2", "to_state", "State::C"),
+            Triple::new("tr3", "from_state", "State::C"),
+            Triple::new("tr3", "to_state", "State::D"),
+            Triple::new("tr4", "from_state", "State::A"),
+            Triple::new("tr4", "to_state", "State::D"),
+        ];
+        let forward: HashSet<Triple> = triples.iter().cloned().collect();
+        let mut reversed = triples.clone();
+        reversed.reverse();
+        let backward: HashSet<Triple> = reversed.into_iter().collect();
+
+        let rule = StateReach;
+        let a = rule.apply(&Ontology::new("test"), &forward, &[]);
+        let b = rule.apply(&Ontology::new("test"), &backward, &[]);
+        assert_eq!(a, b, "inference must not depend on HashSet iteration order");
+        assert_eq!(a.len(), 6); // 4 direct + 2 transitive (A->C, B->D)... plus A->D already direct
+    }
+
+    #[test]
     fn test_default_rules_returns_all() {
         let rules = default_rules();
-        assert_eq!(rules.len(), 7);
+        assert_eq!(rules.len(), 8);
         let ids: HashSet<RuleId> = rules.iter().map(|r| r.id()).collect();
         assert!(ids.contains(&RuleId::CaxSco));
         assert!(ids.contains(&RuleId::CaxEqc));
@@ -657,5 +904,6 @@ mod tests {
         assert!(ids.contains(&RuleId::PrpInv));
         assert!(ids.contains(&RuleId::PrpTrp));
         assert!(ids.contains(&RuleId::PrpSymp));
+        assert!(ids.contains(&RuleId::StateReach));
     }
 }

@@ -1651,6 +1651,69 @@ fn integration_vector_index_recovery_after_restart() {
     }
 }
 
+// Regression: snapshot-restore reconciliation feeds RAW document vectors
+// through note_doc_vector while the graph holds L2-normalized ones (Cosine).
+// The stale filter must not drop every restored entry (empty search results).
+#[test]
+fn integration_vector_index_recovery_non_unit_cosine_after_restart() {
+    let dir = tempdir().unwrap();
+    let data_dir = dir.path().to_path_buf();
+
+    // Phase 1: non-unit cosine vectors. Rows land BEFORE CREATE VECTOR
+    // INDEX so the backfill persists a snapshot that contains the nodes —
+    // reopen then restores + reconciles them via note_doc_vector (the path
+    // that used to drop every restored entry).
+    {
+        let options = StorageOptions {
+            data_dir: data_dir.clone(),
+            memtable_size_limit: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = Arc::new(onto_storage::EngineSet::new(Arc::new(
+            LsmEngine::open(options).unwrap(),
+        )));
+        let executor = make_executor(&engine);
+
+        exec_ok(
+            &executor,
+            "INSERT INTO Product (name, embedding) VALUES ('alpha', '[0.1, 0.2, 0.3]')",
+        );
+        exec_ok(
+            &executor,
+            "INSERT INTO Product (name, embedding) VALUES ('beta', '[0.3, 0.2, 0.1]')",
+        );
+        exec_ok(
+            &executor,
+            "CREATE VECTOR INDEX ON Product (embedding) METRIC cosine DIMENSION 3 M 8 EF_CONSTRUCTION 50 EF_SEARCH 30",
+        );
+        engine.flush_all().unwrap();
+    }
+
+    // Phase 2: reopen — restore + reconcile must keep the hits alive.
+    {
+        let options = StorageOptions {
+            data_dir,
+            memtable_size_limit: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = LsmEngine::open(options).unwrap();
+        engine.rebuild_vector_indexes().unwrap();
+        assert!(engine.has_vector_index("Product", "embedding"));
+
+        let results = engine
+            .vector_index_manager()
+            .read()
+            .unwrap()
+            .search("Product", "embedding", &[0.1, 0.2, 0.3], 2)
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "non-unit cosine vectors must survive snapshot restore + reconcile"
+        );
+    }
+}
+
 // ── 19. Vector search with compaction ─────────────────────────────
 
 #[test]

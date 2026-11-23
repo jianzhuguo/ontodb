@@ -18143,6 +18143,54 @@ impl QueryExecutor {
             // Fields not in the ontology are allowed (schema-on-read compatible)
         }
 
+        // Functional-property gate: owl:FunctionalProperty means the subject
+        // carries at most one value for the property. A row supplying several
+        // distinct values breaks that, and downstream inference would have to
+        // guess which one applies (see StateReach ambiguity handling).
+        for prop in &props {
+            if !prop.is_functional {
+                continue;
+            }
+            if let Some(val) = doc.get(&prop.name) {
+                let distinct = match val {
+                    Value::Null => 0,
+                    Value::Array(arr) => {
+                        let mut seen = std::collections::HashSet::new();
+                        for v in arr {
+                            seen.insert(v.to_string());
+                        }
+                        seen.len()
+                    }
+                    _ => 1,
+                };
+                if distinct > 1 {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "functional property '{}' for class '{}' accepts at most one value, got {} distinct values",
+                        prop.name, class, distinct
+                    )));
+                }
+            }
+        }
+
+        // L2 guard gate: `guard` is data, and when it is written in a supported
+        // shape it is evaluated here, at write time. A definite failure rejects.
+        // Guards we cannot judge (operand absent, unsupported shape) stay
+        // Unknown and are let through — schema-on-read, not a silent guess.
+        //
+        // Two clause forms are judged:
+        //   - `field <op> <literal>`          against the document being written
+        //   - `EXISTS(Class WHERE ...)`       against rows already stored
+        if let Some(Value::String(g)) = doc.get("guard") {
+            if let Some(clauses) = Self::parse_guard(g) {
+                if self.eval_guard_clauses(&clauses, doc, engine) == GuardOutcome::Violated {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "guard violation on class '{}': '{}' — precondition does not hold",
+                        class, g
+                    )));
+                }
+            }
+        }
+
         // Validate OWL restrictions
         self.validate_restrictions(engine, &ontology, class_def, doc)?;
 
@@ -18400,6 +18448,562 @@ impl QueryExecutor {
             Some(Value::Null) => 0,
             Some(Value::Array(arr)) => arr.len(),
             Some(_) => 1,
+        }
+    }
+
+    /// Splits `s` on `sep` occurrences that sit outside quotes and brackets.
+    fn split_top_level<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
+        let chars: Vec<(usize, char)> = s.char_indices().collect();
+        let mut parts = Vec::new();
+        let mut depth: i32 = 0;
+        let mut in_quote: Option<char> = None;
+        let mut start = 0usize;
+        let mut i = 0usize;
+        while i < chars.len() {
+            let (idx, c) = chars[i];
+            if let Some(q) = in_quote {
+                if c == q {
+                    in_quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                '\'' | '"' => in_quote = Some(c),
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && s[idx..].starts_with(sep) {
+                parts.push(&s[start..idx]);
+                start = idx + sep.len();
+                while i < chars.len() && chars[i].0 < start {
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+        }
+        parts.push(&s[start..]);
+        parts
+    }
+
+    /// Parses a whole guard expression into clauses joined by top-level `AND`.
+    ///
+    /// Supported shapes:
+    /// - `quality_score >= 0.8` — comparison against the document being written
+    /// - `EXISTS(ExecEvent WHERE task_name = 'inspect' AND process_of = $process_of)`
+    ///   — cross-subject precondition, with `$field` reading the written document
+    /// - `A AND B` — conjunction of the two, at paren depth 0
+    ///
+    /// Returns `None` when the expression does not parse as clauses we can judge.
+    fn parse_guard(expr: &str) -> Option<Vec<GuardClause>> {
+        let s = expr.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let mut clauses = Vec::new();
+        for part in Self::split_top_level(s, " AND ") {
+            let t = part.trim();
+            if t.is_empty() {
+                return None;
+            }
+            clauses.push(Self::parse_guard_clause(t)?);
+        }
+        Some(clauses)
+    }
+
+    fn parse_guard_clause(s: &str) -> Option<GuardClause> {
+        let t = s.trim();
+        let up = t.to_ascii_uppercase();
+        for (prefix, kind) in [
+            ("EXISTS(", ClauseKind::Exists),
+            ("BEFORE(", ClauseKind::Before),
+            ("PREV(", ClauseKind::Prev),
+        ] {
+            if let Some(rest) = up.strip_prefix(prefix) {
+                let inner_start = t.len() - rest.len();
+                let inner_end = t.rfind(')').filter(|p| *p > inner_start)?;
+                let (class, conds) = Self::parse_exists_body(&t[inner_start..inner_end])?;
+                return Some(match kind {
+                    ClauseKind::Exists => GuardClause::Exists { class, conds },
+                    ClauseKind::Before => GuardClause::Before { class, conds },
+                    ClauseKind::Prev => GuardClause::Prev { class, conds },
+                });
+            }
+        }
+        Self::parse_guard_cond(t).map(GuardClause::Cmp)
+    }
+
+    /// Parses `Class WHERE cond (AND cond)*` — the body of an `EXISTS(...)` or
+    /// `BEFORE(...)`.
+    fn parse_exists_body(body: &str) -> Option<(String, Vec<GuardCond>)> {
+        let upper = body.to_ascii_uppercase();
+        let wpos = upper.find("WHERE")?;
+        let class = body[..wpos].trim();
+        if class.is_empty() || !class.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        let mut conds = Vec::new();
+        for part in Self::split_top_level(body[wpos + 5..].trim(), " AND ") {
+            let t = part.trim();
+            if t.is_empty() {
+                return None;
+            }
+            conds.push(Self::parse_guard_cond(t)?);
+        }
+        if conds.is_empty() {
+            return None;
+        }
+        Some((class.to_string(), conds))
+    }
+
+    /// Parses one `field <op> <operand>` comparison.
+    fn parse_guard_cond(s: &str) -> Option<GuardCond> {
+        let t = s.trim();
+        // Two-character operators must win over their one-character prefixes
+        // (`>=` over `>`, `!=` over `=`, `==` over `=`).
+        const OPS: &[(&str, GuardOp)] = &[
+            (">=", GuardOp::Ge),
+            ("<=", GuardOp::Le),
+            ("!=", GuardOp::Ne),
+            ("==", GuardOp::Eq),
+            (">", GuardOp::Gt),
+            ("<", GuardOp::Lt),
+            ("=", GuardOp::Eq),
+        ];
+        let mut best: Option<(usize, usize, GuardOp)> = None;
+        for (tok, op) in OPS {
+            if let Some(pos) = t.find(tok) {
+                let better = match best {
+                    None => true,
+                    Some((bpos, blen, _)) => pos < bpos || (pos == bpos && tok.len() > blen),
+                };
+                if better {
+                    best = Some((pos, tok.len(), *op));
+                }
+            }
+        }
+        let (pos, len, op) = best?;
+        let field = t[..pos].trim();
+        let rhs = t[pos + len..].trim();
+        if field.is_empty() || rhs.is_empty() {
+            return None;
+        }
+        if !field.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        let operand = Self::parse_guard_operand(rhs)?;
+        Some(GuardCond {
+            field: field.to_string(),
+            op,
+            operand,
+        })
+    }
+
+    /// Parses the right-hand side: `$field` correlation reference, quoted
+    /// string, integer, float or boolean literal.
+    fn parse_guard_operand(s: &str) -> Option<GuardOperand> {
+        let t = s.trim();
+        if let Some(name) = t.strip_prefix('$') {
+            let name = name.trim();
+            if name.is_empty()
+                || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            {
+                return None;
+            }
+            return Some(GuardOperand::DocRef(name.to_string()));
+        }
+        Self::parse_guard_literal(t).map(GuardOperand::Lit)
+    }
+
+    /// Parses a literal: quoted string, integer, float or boolean.
+    fn parse_guard_literal(s: &str) -> Option<Value> {
+        let t = s.trim();
+        if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+            return Some(Value::String(t[1..t.len() - 1].replace("''", "'")));
+        }
+        if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+            return Some(Value::String(t[1..t.len() - 1].replace("\"\"", "\"")));
+        }
+        if let Ok(i) = t.parse::<i64>() {
+            return Some(json!(i));
+        }
+        if let Ok(f) = t.parse::<f64>() {
+            return Some(json!(f));
+        }
+        if t.eq_ignore_ascii_case("true") {
+            return Some(Value::Bool(true));
+        }
+        if t.eq_ignore_ascii_case("false") {
+            return Some(Value::Bool(false));
+        }
+        None
+    }
+
+    /// Resolves a condition's right-hand side against the written document.
+    /// A `$field` that is absent resolves to `None`, which makes the condition
+    /// undecidable rather than false.
+    fn resolve_operand<'a>(op: &'a GuardOperand, doc: &'a Map<String, Value>) -> Option<&'a Value> {
+        match op {
+            GuardOperand::Lit(v) => Some(v),
+            GuardOperand::DocRef(name) => match doc.get(name) {
+                Some(v) if !v.is_null() => Some(v),
+                _ => None,
+            },
+        }
+    }
+
+    /// Compares `actual` (a field of some row) against `expected`.
+    ///
+    /// Numeric operands support every operator; strings and booleans only
+    /// support equality, since ordering on them is not a judgment we should be
+    /// making silently.
+    fn compare_guard_values(actual: &Value, op: GuardOp, expected: &Value) -> GuardOutcome {
+        if actual.is_null() {
+            return GuardOutcome::Unknown;
+        }
+        if let (Some(a), Some(b)) = (Self::json_as_f64(actual), Self::json_as_f64(expected)) {
+            let holds = match op {
+                GuardOp::Ge => a >= b,
+                GuardOp::Le => a <= b,
+                GuardOp::Gt => a > b,
+                GuardOp::Lt => a < b,
+                GuardOp::Eq => a == b,
+                GuardOp::Ne => a != b,
+            };
+            return if holds {
+                GuardOutcome::Satisfied
+            } else {
+                GuardOutcome::Violated
+            };
+        }
+        match op {
+            GuardOp::Eq => {
+                if actual == expected {
+                    GuardOutcome::Satisfied
+                } else {
+                    GuardOutcome::Violated
+                }
+            }
+            GuardOp::Ne => {
+                if actual != expected {
+                    GuardOutcome::Satisfied
+                } else {
+                    GuardOutcome::Violated
+                }
+            }
+            // Ordering over non-numeric operands: not decidable here.
+            _ => GuardOutcome::Unknown,
+        }
+    }
+
+    /// Evaluates one condition against the document being written.
+    fn eval_cond(cond: &GuardCond, doc: &Map<String, Value>) -> GuardOutcome {
+        let Some(expected) = Self::resolve_operand(&cond.operand, doc) else {
+            return GuardOutcome::Unknown;
+        };
+        let Some(actual) = doc.get(&cond.field) else {
+            return GuardOutcome::Unknown;
+        };
+        Self::compare_guard_values(actual, cond.op, expected)
+    }
+
+    /// Storage-key prefixes that hold instances of `class` — the class itself
+    /// plus every subclass and equivalent class, so a guard aimed at a parent
+    /// also sees its children.
+    ///
+    /// Resolving the hierarchy needs the ontology that defines the class. When
+    /// that cannot be resolved (class unknown, ontology lookup fails) the
+    /// caller falls back to the exact prefix alone rather than guessing.
+    fn guard_scan_prefixes(&self, engine: &LsmEngine, class: &str) -> Vec<String> {
+        let mut prefixes = vec![format!("{}::", class)];
+        if let Ok(Some(onto)) = self
+            .ontology_store
+            .find_ontology_for_class_global(engine, class)
+        {
+            for sub in onto.get_all_subclasses(class) {
+                let p = format!("{}::", sub);
+                if !prefixes.contains(&p) {
+                    prefixes.push(p);
+                }
+            }
+        }
+        prefixes
+    }
+
+    /// Evaluates a cross-subject precondition: some row of `class` (or any of
+    /// its subclasses) already satisfies every condition, with `$field`
+    /// reading the written document.
+    ///
+    /// Three-valued: a matching row is Satisfied; a full scan that finds no
+    /// match is Violated (definite — no such fact exists yet); a class the
+    /// ontology does not know, or an unresolvable `$field`, is Unknown.
+    fn eval_exists(
+        &self,
+        class: &str,
+        conds: &[GuardCond],
+        doc: &Map<String, Value>,
+        engine: &LsmEngine,
+    ) -> GuardOutcome {
+        // A correlation reference we cannot resolve makes the whole clause
+        // undecidable — we cannot claim "no such row" when we do not know what
+        // we are correlating on.
+        for c in conds {
+            if let GuardOperand::DocRef(name) = &c.operand {
+                match doc.get(name) {
+                    Some(v) if !v.is_null() => {}
+                    _ => return GuardOutcome::Unknown,
+                }
+            }
+        }
+
+        let mut saw_row = false;
+        let mut saw_decidable_mismatch = false;
+        for prefix in self.guard_scan_prefixes(engine, class) {
+            let Ok(entries) = engine.scan_prefix(prefix.as_bytes()) else {
+                return GuardOutcome::Unknown;
+            };
+            for (_key, val_bytes) in &entries {
+                let Some(row) = Self::parse_doc_bytes(val_bytes) else {
+                    continue;
+                };
+                saw_row = true;
+                let mut all_hold = true;
+                let mut any_unknown = false;
+                for c in conds {
+                    let Some(expected) = Self::resolve_operand(&c.operand, doc) else {
+                        any_unknown = true;
+                        break;
+                    };
+                    let Some(actual) = row.get(&c.field) else {
+                        any_unknown = true;
+                        break;
+                    };
+                    match Self::compare_guard_values(actual, c.op, expected) {
+                        GuardOutcome::Satisfied => {}
+                        GuardOutcome::Violated => {
+                            all_hold = false;
+                            saw_decidable_mismatch = true;
+                        }
+                        GuardOutcome::Unknown => {
+                            any_unknown = true;
+                            break;
+                        }
+                    }
+                }
+                if all_hold && !any_unknown {
+                    return GuardOutcome::Satisfied;
+                }
+            }
+        }
+        // No row satisfied the precondition. When nothing matched at all, or
+        // every candidate failed on evidence, that is a definite falsehood for
+        // the existential — reject. Only when rows were present but none was
+        // decidable do we stay Unknown.
+        if !saw_row || saw_decidable_mismatch {
+            GuardOutcome::Violated
+        } else {
+            GuardOutcome::Unknown
+        }
+    }
+
+    /// Evaluates a temporal precondition: some row of `class` satisfies every
+    /// condition **and** is strictly earlier than the row being written.
+    ///
+    /// Unlike [`Self::eval_exists`], this demands *evidence of ordering*, so a
+    /// row that cannot be placed in time (no usable `ts`) is not a witness —
+    /// and the absence of any witness rejects. Otherwise a row written without
+    /// `ts` would silently disable every `BEFORE` guard pointing at it.
+    ///
+    /// `ts` is the fixed ordering key (the ExecOnt convention that
+    /// `ExecEvent.ts` is REQUIRED). "Earlier" is event time, not write time, so
+    /// a backdated row does not satisfy a precondition it should not.
+    fn eval_before(
+        &self,
+        class: &str,
+        conds: &[GuardCond],
+        doc: &Map<String, Value>,
+        engine: &LsmEngine,
+    ) -> GuardOutcome {
+        // Without a numeric ordering key on the written row, "earlier than
+        // this" is not expressible at all — undecidable, not false.
+        let Some(doc_ts) = doc.get("ts").and_then(|v| Self::json_as_f64(v)) else {
+            return GuardOutcome::Unknown;
+        };
+
+        for prefix in self.guard_scan_prefixes(engine, class) {
+            let Ok(entries) = engine.scan_prefix(prefix.as_bytes()) else {
+                return GuardOutcome::Unknown;
+            };
+            for (_key, val_bytes) in &entries {
+                let Some(row) = Self::parse_doc_bytes(val_bytes) else {
+                    continue;
+                };
+                let mut all_hold = true;
+                for c in conds {
+                    let Some(expected) = Self::resolve_operand(&c.operand, doc) else {
+                        all_hold = false;
+                        break;
+                    };
+                    let Some(actual) = row.get(&c.field) else {
+                        all_hold = false;
+                        break;
+                    };
+                    if Self::compare_guard_values(actual, c.op, expected) != GuardOutcome::Satisfied {
+                        all_hold = false;
+                        break;
+                    }
+                }
+                if !all_hold {
+                    continue;
+                }
+                // The content conditions hold; this row is a witness only if it
+                // can be shown to be strictly earlier.
+                let Some(row_ts) = row.get("ts").and_then(|v| Self::json_as_f64(v)) else {
+                    continue;
+                };
+                if row_ts < doc_ts {
+                    return GuardOutcome::Satisfied;
+                }
+            }
+        }
+        GuardOutcome::Violated
+    }
+
+    /// Evaluates an immediate-predecessor precondition: the most recent row of
+    /// `class` strictly earlier than the row being written must satisfy every
+    /// condition. Unlike [`Self::eval_before`], an intervening row makes this
+    /// fail — it expresses "the previous step was X", not "X happened at some
+    /// point before".
+    ///
+    /// Ties on `ts` are handled conservatively: every row sharing the latest
+    /// timestamp has to satisfy the conditions, so an ambiguous predecessor is
+    /// never waved through.
+    fn eval_prev(
+        &self,
+        class: &str,
+        conds: &[GuardCond],
+        doc: &Map<String, Value>,
+        engine: &LsmEngine,
+    ) -> GuardOutcome {
+        // Without a numeric ordering key on the written row, "the row just
+        // before this one" is not expressible — undecidable, not false.
+        let Some(doc_ts) = doc.get("ts").and_then(|v| Self::json_as_f64(v)) else {
+            return GuardOutcome::Unknown;
+        };
+
+        let mut latest_ts: Option<f64> = None;
+        let mut latest_rows: Vec<Map<String, Value>> = Vec::new();
+
+        for prefix in self.guard_scan_prefixes(engine, class) {
+            let Ok(entries) = engine.scan_prefix(prefix.as_bytes()) else {
+                return GuardOutcome::Unknown;
+            };
+            for (_key, val_bytes) in &entries {
+                let Some(row) = Self::parse_doc_bytes(val_bytes) else {
+                    continue;
+                };
+                let Some(row_ts) = row.get("ts").and_then(|v| Self::json_as_f64(v)) else {
+                    continue;
+                };
+                if row_ts >= doc_ts {
+                    continue;
+                }
+                match latest_ts {
+                    Some(b) if row_ts < b => {} // strictly older, not the latest
+                    Some(b) if row_ts == b => latest_rows.push(row),
+                    _ => {
+                        latest_ts = Some(row_ts);
+                        latest_rows.clear();
+                        latest_rows.push(row);
+                    }
+                }
+            }
+        }
+
+        // No earlier row at all: "the previous step was X" is definitely false.
+        if latest_ts.is_none() {
+            return GuardOutcome::Violated;
+        }
+
+        let mut saw_unknown = false;
+        for row in &latest_rows {
+            let mut row_outcome = GuardOutcome::Satisfied;
+            for c in conds {
+                let Some(expected) = Self::resolve_operand(&c.operand, doc) else {
+                    row_outcome = GuardOutcome::Unknown;
+                    break;
+                };
+                let Some(actual) = row.get(&c.field) else {
+                    row_outcome = GuardOutcome::Unknown;
+                    break;
+                };
+                match Self::compare_guard_values(actual, c.op, expected) {
+                    GuardOutcome::Satisfied => {}
+                    other => {
+                        row_outcome = other;
+                        break;
+                    }
+                }
+            }
+            match row_outcome {
+                // A most-recent row that is definitely wrong rejects.
+                GuardOutcome::Violated => return GuardOutcome::Violated,
+                GuardOutcome::Unknown => saw_unknown = true,
+                GuardOutcome::Satisfied => {}
+            }
+        }
+        if saw_unknown {
+            GuardOutcome::Unknown
+        } else {
+            GuardOutcome::Satisfied
+        }
+    }
+
+    /// Evaluates all guard clauses under three-valued AND: a definite failure
+    /// anywhere is Violated; otherwise any Unknown is Unknown; only all
+    /// Satisfied is Satisfied.
+    fn eval_guard_clauses(
+        &self,
+        clauses: &[GuardClause],
+        doc: &Map<String, Value>,
+        engine: &LsmEngine,
+    ) -> GuardOutcome {
+        let mut unknown = false;
+        for clause in clauses {
+            let out = match clause {
+                GuardClause::Cmp(cond) => Self::eval_cond(cond, doc),
+                GuardClause::Exists { class, conds } => {
+                    self.eval_exists(class, conds, doc, engine)
+                }
+                // `BEFORE` demands evidence of a strictly earlier row; it is
+                // deliberately stricter than `EXISTS` (see `eval_before`).
+                GuardClause::Before { class, conds } => {
+                    self.eval_before(class, conds, doc, engine)
+                }
+                // `PREV` additionally forbids an intervening row.
+                GuardClause::Prev { class, conds } => {
+                    self.eval_prev(class, conds, doc, engine)
+                }
+            };
+            match out {
+                GuardOutcome::Violated => return GuardOutcome::Violated,
+                GuardOutcome::Unknown => unknown = true,
+                GuardOutcome::Satisfied => {}
+            }
+        }
+        if unknown {
+            GuardOutcome::Unknown
+        } else {
+            GuardOutcome::Satisfied
+        }
+    }
+
+    fn json_as_f64(v: &Value) -> Option<f64> {
+        match v {
+            Value::Number(n) => n.as_f64(),
+            _ => None,
         }
     }
 
@@ -19011,6 +19615,90 @@ fn parse_geojson(map: &serde_json::Map<String, Value>) -> Option<onto_core::geo:
         }
         _ => None,
     }
+}
+
+/// Comparison operator of a parsed guard predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardOp {
+    Ge,
+    Le,
+    Gt,
+    Lt,
+    Eq,
+    Ne,
+}
+
+/// Right-hand side of a guard condition: a literal, or a `$field` reference
+/// that reads the document currently being written (correlation for
+/// cross-subject clauses).
+#[derive(Debug, Clone)]
+enum GuardOperand {
+    Lit(Value),
+    /// `$name` — read field `name` off the document being written.
+    DocRef(String),
+}
+
+/// One comparison: `field <op> <operand>`.
+#[derive(Debug, Clone)]
+struct GuardCond {
+    field: String,
+    op: GuardOp,
+    operand: GuardOperand,
+}
+
+/// Which kind of class-subject guard clause is being parsed. Only used while
+/// parsing; the result is carried by [`GuardClause`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClauseKind {
+    Exists,
+    Before,
+    Prev,
+}
+
+/// A guard clause. Deliberately not a general expression language: no
+/// arithmetic, no function calls, no negation, no nesting beyond the
+/// `EXISTS(...)` form. Anything outside the shape is left unevaluated (see
+/// [`GuardOutcome::Unknown`]) rather than guessed at.
+#[derive(Debug, Clone)]
+enum GuardClause {
+    /// Comparison against the document being written (the original L2 form).
+    Cmp(GuardCond),
+    /// `EXISTS(Class WHERE cond (AND cond)*)` — some row of `Class` already
+    /// satisfies every condition. This is the cross-subject precondition form.
+    Exists {
+        class: String,
+        conds: Vec<GuardCond>,
+    },
+    /// `BEFORE(Class WHERE cond (AND cond)*)` — some row of `Class` already
+    /// satisfies every condition **and** its `ts` is strictly less than the
+    /// `ts` of the document being written. Sugar over `Exists` with an implicit
+    /// `ts < $ts` condition; `ts` is the fixed ordering key.
+    Before {
+        class: String,
+        conds: Vec<GuardCond>,
+    },
+    /// `PREV(Class WHERE cond (AND cond)*)` — the **most recent** row of
+    /// `Class` strictly earlier than the document being written satisfies
+    /// every condition. Unlike `Before`, this forbids an intervening row, so
+    /// it expresses "the previous step was X" rather than "X happened at some
+    /// point before".
+    Prev {
+        class: String,
+        conds: Vec<GuardCond>,
+    },
+}
+
+/// Result of evaluating a guard predicate against one document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardOutcome {
+    /// The predicate holds: let the write through.
+    Satisfied,
+    /// The predicate is definitely false: reject the write.
+    Violated,
+    /// Undecidable (operand absent, type not comparable, guard not in the
+    /// supported shape). Schema-on-read lets the write through instead of
+    /// blocking on a judgment it cannot make.
+    Unknown,
 }
 
 #[cfg(test)]
@@ -19754,6 +20442,615 @@ mod tests {
         let rel = &onto.properties["relatesTo"];
         assert!(rel.is_symmetric);
         assert_eq!(rel.inverse_of.as_deref(), Some("relatedFrom"));
+    }
+
+    #[test]
+    fn test_functional_property_gate_rejects_multiple_values() {
+        let (executor, _dir) = setup();
+
+        // ARRAY-typed property: the type gate allows a list, so the functional
+        // gate is what keeps a subject down to one distinct value.
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY exec (CLASS Bag, PROPERTY tags DOMAIN Bag RANGE ARRAY)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("ALTER PROPERTY tags DOMAIN Bag CHARACTERISTICS FUNCTIONAL")
+                    .unwrap(),
+            )
+            .unwrap();
+
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Bag (tags) VALUES (['a'])").unwrap())
+            .unwrap();
+
+        let multi = executor
+            .execute(&QueryParser::parse("INSERT INTO Bag (tags) VALUES (['a', 'b'])").unwrap());
+        let msg = multi.unwrap_err().to_string();
+        assert!(
+            msg.contains("functional property"),
+            "functional gate must reject multiple distinct values, got: {msg}"
+        );
+
+        // Repeating one value is still a single distinct value.
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Bag (tags) VALUES (['a', 'a'])").unwrap())
+            .unwrap();
+
+        // A non-functional property keeps its list.
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY exec2 (CLASS Note, PROPERTY tag DOMAIN Note RANGE ARRAY)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(&QueryParser::parse("INSERT INTO Note (tag) VALUES (['a', 'b'])").unwrap())
+            .unwrap();
+
+        // STRING-typed properties reject lists at the type gate, so a row can
+        // never smuggle in two values for a scalar functional property.
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY exec3 (CLASS Transition, PROPERTY from_state DOMAIN Transition RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "ALTER PROPERTY from_state DOMAIN Transition CHARACTERISTICS FUNCTIONAL",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse("INSERT INTO Transition (from_state) VALUES ('A')").unwrap(),
+            )
+            .unwrap();
+        let scalar_multi = executor.execute(
+            &QueryParser::parse("INSERT INTO Transition (from_state) VALUES (['A', 'Z'])").unwrap(),
+        );
+        assert!(
+            scalar_multi.is_err(),
+            "a STRING-typed property must not accept a list"
+        );
+    }
+
+    #[test]
+    fn test_guard_parse_accepts_only_the_restricted_shape() {
+        // Supported: identifier on the left, operator, literal on the right.
+        for expr in [
+            "quality_score >= 0.8",
+            "quality_score>=0.8",
+            "count <= 3",
+            "count > 0",
+            "count < 10",
+            "status != 'done'",
+            "status = 'done'",
+            "status == 'done'",
+            "flag = true",
+        ] {
+            assert!(
+                QueryExecutor::parse_guard(expr).is_some(),
+                "should parse: {expr}"
+            );
+        }
+
+        // Outside the shape: not judged, not guessed.
+        for expr in [
+            "",
+            "quality_score",
+            "quality_score >=",
+            ">= 0.8",
+            "quality_score + 1 >= 2",
+            "a and b",
+            "func(x) = 1",
+            "field = other_field",
+            "field = [1,2]",
+        ] {
+            assert!(
+                QueryExecutor::parse_guard(expr).is_none(),
+                "must not parse: {expr}"
+            );
+        }
+
+        // Two-character operators beat their one-character prefixes.
+        let clauses = QueryExecutor::parse_guard("a >= 1").unwrap();
+        let GuardClause::Cmp(c) = &clauses[0] else {
+            panic!("expected Cmp");
+        };
+        assert_eq!(c.op, GuardOp::Ge);
+        let clauses = QueryExecutor::parse_guard("a != 1").unwrap();
+        let GuardClause::Cmp(c) = &clauses[0] else {
+            panic!("expected Cmp");
+        };
+        assert_eq!(c.op, GuardOp::Ne);
+        let clauses = QueryExecutor::parse_guard("a == 1").unwrap();
+        let GuardClause::Cmp(c) = &clauses[0] else {
+            panic!("expected Cmp");
+        };
+        assert_eq!(c.op, GuardOp::Eq);
+
+        // EXISTS(...) is its own clause form, and the inner AND does not split
+        // the outer conjunction.
+        let clauses = QueryExecutor::parse_guard(
+            "EXISTS(ExecEvent WHERE task_name = 'inspect' AND process_of = $process_of) AND quality_score >= 0.8",
+        )
+        .unwrap();
+        assert_eq!(clauses.len(), 2);
+        let GuardClause::Exists { class, conds } = &clauses[0] else {
+            panic!("expected Exists, got {:?}", clauses[0]);
+        };
+        assert_eq!(class, "ExecEvent");
+        assert_eq!(conds.len(), 2);
+        assert!(matches!(conds[1].operand, GuardOperand::DocRef(_)));
+        assert!(matches!(&clauses[1], GuardClause::Cmp(_)));
+
+        // BEFORE(...) parses as its own temporal clause and keeps the inner AND
+        // inside the clause rather than splitting the outer conjunction.
+        let clauses = QueryExecutor::parse_guard(
+            "BEFORE(Step WHERE name = 'inspect' AND process_of = $process_of) AND quality_score >= 0.8",
+        )
+        .unwrap();
+        assert_eq!(clauses.len(), 2);
+        let GuardClause::Before { class, conds } = &clauses[0] else {
+            panic!("expected Before, got {:?}", clauses[0]);
+        };
+        assert_eq!(class, "Step");
+        assert_eq!(conds.len(), 2);
+        assert!(matches!(&clauses[1], GuardClause::Cmp(_)));
+
+        // PREV(...) parses the same way and still keeps the inner AND inside
+        // the clause.
+        let clauses =
+            QueryExecutor::parse_guard("PREV(Step WHERE name = 'inspect') AND count > 0").unwrap();
+        assert_eq!(clauses.len(), 2);
+        assert!(matches!(&clauses[0], GuardClause::Prev { .. }));
+        assert!(matches!(&clauses[1], GuardClause::Cmp(_)));
+
+        // Malformed EXISTS forms are not judged.
+        for expr in [
+            "EXISTS()",
+            "EXISTS(ExecEvent)",
+            "EXISTS(ExecEvent WHERE)",
+            "EXISTS(ExecEvent WHERE task_name)",
+            "EXISTS(bad-class WHERE a = 1)",
+            "BEFORE()",
+            "BEFORE(Step)",
+            "BEFORE(Step WHERE)",
+            "PREV()",
+            "PREV(Step)",
+            "PREV(Step WHERE)",
+        ] {
+            assert!(
+                QueryExecutor::parse_guard(expr).is_none(),
+                "must not parse: {expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_guard_eval_three_valued_semantics() {
+        let (executor, _dir) = setup();
+        let engine = executor.engine.default_engine();
+        let doc: Map<String, Value> = serde_json::from_str(
+            r#"{"quality_score": 0.3, "status": "done", "count": 3, "flag": true}"#,
+        )
+        .unwrap();
+        let eval = |expr: &str| {
+            let clauses = QueryExecutor::parse_guard(expr).unwrap();
+            executor.eval_guard_clauses(&clauses, &doc, &engine)
+        };
+
+        // Numeric comparisons.
+        assert_eq!(eval("quality_score >= 0.8"), GuardOutcome::Violated);
+        assert_eq!(eval("quality_score >= 0.2"), GuardOutcome::Satisfied);
+        assert_eq!(eval("count = 3"), GuardOutcome::Satisfied);
+        assert_eq!(eval("count != 3"), GuardOutcome::Violated);
+
+        // String and boolean equality.
+        assert_eq!(eval("status = 'done'"), GuardOutcome::Satisfied);
+        assert_eq!(eval("status != 'done'"), GuardOutcome::Violated);
+        assert_eq!(eval("flag = true"), GuardOutcome::Satisfied);
+
+        // Absent operand -> Unknown, never a guess.
+        assert_eq!(eval("missing_field >= 1"), GuardOutcome::Unknown);
+
+        // Ordering over non-numeric operands -> Unknown, not a silent compare.
+        assert_eq!(eval("status >= 'a'"), GuardOutcome::Unknown);
+
+        // Three-valued AND: Violated dominates, then Unknown, then Satisfied.
+        assert_eq!(
+            eval("missing_field >= 1 AND quality_score >= 0.8"),
+            GuardOutcome::Violated,
+            "a definite failure anywhere is Violated"
+        );
+        assert_eq!(
+            eval("missing_field >= 1 AND quality_score >= 0.2"),
+            GuardOutcome::Unknown,
+            "unknown + satisfied is Unknown"
+        );
+        assert_eq!(
+            eval("count = 3 AND quality_score >= 0.2"),
+            GuardOutcome::Satisfied
+        );
+    }
+
+    #[test]
+    fn test_guard_exists_precondition_is_cross_subject() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY p (CLASS Step, PROPERTY name DOMAIN Step RANGE STRING, PROPERTY process_of DOMAIN Step RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY p2 (CLASS Job, PROPERTY name DOMAIN Job RANGE STRING, PROPERTY process_of DOMAIN Job RANGE STRING, PROPERTY guard DOMAIN Job RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let insert = |sql: &str| executor.execute(&QueryParser::parse(sql).unwrap());
+
+        // No 'inspect' step exists yet -> the precondition is definitely false.
+        let early = insert(
+            "INSERT INTO Job (name, process_of, guard) VALUES ('place', 'P1', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')",
+        );
+        let msg = early.unwrap_err().to_string();
+        assert!(
+            msg.contains("guard violation"),
+            "missing prior fact must reject, got: {msg}"
+        );
+
+        // Write the prior step for the *same* process.
+        insert("INSERT INTO Step (name, process_of) VALUES ('inspect', 'P1')").unwrap();
+
+        // Same precondition now holds.
+        insert(
+            "INSERT INTO Job (name, process_of, guard) VALUES ('place', 'P1', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')",
+        )
+        .unwrap();
+
+        // ...but it correlates on $process_of, so a different process is still
+        // rejected. This is what makes it cross-subject rather than a mere
+        // class-existence check.
+        let other = insert(
+            "INSERT INTO Job (name, process_of, guard) VALUES ('place', 'P2', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')",
+        );
+        assert!(
+            other.unwrap_err().to_string().contains("guard violation"),
+            "correlation on $process_of must not leak across subjects"
+        );
+
+        // A correlation reference that is absent -> Unknown -> schema-on-read.
+        insert(
+            "INSERT INTO Job (name, guard) VALUES ('noref', 'EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of)')",
+        )
+        .unwrap();
+
+        // A class with no rows at all: the existential is definitely false, so
+        // this rejects. (Exact storage-key prefix match; hierarchy- and
+        // namespace-aware lookup is not attempted.)
+        let empty = insert(
+            "INSERT INTO Job (name, process_of, guard) VALUES ('noclass', 'P1', 'EXISTS(Nope WHERE x = 1)')",
+        );
+        assert!(
+            empty.unwrap_err().to_string().contains("guard violation"),
+            "an existential over an empty class must reject"
+        );
+    }
+
+    #[test]
+    fn test_guard_temporal_precondition_orders_on_ts() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY t (CLASS Step, PROPERTY name DOMAIN Step RANGE STRING, PROPERTY process_of DOMAIN Step RANGE STRING, PROPERTY ts DOMAIN Step RANGE FLOAT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY t2 (CLASS Job, PROPERTY name DOMAIN Job RANGE STRING, PROPERTY process_of DOMAIN Job RANGE STRING, PROPERTY ts DOMAIN Job RANGE FLOAT64, PROPERTY guard DOMAIN Job RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let insert = |sql: &str| executor.execute(&QueryParser::parse(sql).unwrap());
+
+        // The general form works without any sugar: the matched row's ts must
+        // be strictly less than the written doc's ts.
+        let general = "EXISTS(Step WHERE name = ''inspect'' AND process_of = $process_of AND ts < $ts)";
+        // BEFORE(...) is the same thing, with `ts` as the fixed ordering key.
+        let sugar = "BEFORE(Step WHERE name = ''inspect'' AND process_of = $process_of)";
+
+        for guard in [general, sugar] {
+            // Nothing happened yet -> the temporal claim is definitely false.
+            let early = insert(&format!(
+                "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 2000.0, '{}')",
+                guard
+            ));
+            assert!(
+                early.unwrap_err().to_string().contains("guard violation"),
+                "must reject with no prior row: {guard}"
+            );
+        }
+
+        // A prior inspect for P1 at ts=1000.
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('inspect', 'P1', 1000.0)").unwrap();
+
+        for guard in [general, sugar] {
+            // Writing place at ts=2000: the inspect is earlier -> pass.
+            insert(&format!(
+                "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 2000.0, '{}')",
+                guard
+            ))
+            .unwrap();
+
+            // Writing place at ts=500 (backdated): no Step has ts < 500, so
+            // "something happened before this" is false -> reject. Event time,
+            // not write time, is what orders these.
+            let back = insert(&format!(
+                "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 500.0, '{}')",
+                guard
+            ));
+            assert!(
+                back.unwrap_err().to_string().contains("guard violation"),
+                "a backdated row must not satisfy BEFORE: {guard}"
+            );
+        }
+
+        // The ordering key is `ts`; a row whose ts is equal is not strictly
+        // earlier.
+        let equal = insert(&format!(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 1000.0, '{}')",
+            sugar
+        ));
+        assert!(
+            equal.unwrap_err().to_string().contains("guard violation"),
+            "ts < ts must not hold on equal timestamps"
+        );
+
+        // Without a `ts` on the written doc the ordering is undecidable ->
+        // Unknown -> schema-on-read passes it.
+        insert(&format!(
+            "INSERT INTO Job (name, process_of, guard) VALUES ('nots', 'P1', '{}')",
+            sugar
+        ))
+        .unwrap();
+
+        // Correlation still binds to the subject: a prior inspect for P1 does
+        // not license a place for P2.
+        let other = insert(&format!(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P2', 2000.0, '{}')",
+            sugar
+        ));
+        assert!(
+            other.unwrap_err().to_string().contains("guard violation"),
+            "temporal preconditions must not leak across subjects"
+        );
+
+        // A row that matches the content conditions but carries no `ts` is NOT
+        // evidence of earliness — otherwise writing a row without a timestamp
+        // would silently switch off every BEFORE guard aimed at that class.
+        insert("INSERT INTO Step (name, process_of) VALUES ('assemble', 'P3')").unwrap();
+        let untimeable = insert(&format!(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P3', 2000.0, 'BEFORE(Step WHERE name = ''assemble'' AND process_of = $process_of)')",
+        ));
+        assert!(
+            untimeable.unwrap_err().to_string().contains("guard violation"),
+            "a row without ts must not count as temporal evidence"
+        );
+    }
+
+    #[test]
+    fn test_guard_class_hierarchy_expansion() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY h (CLASS ExecEvent, PROPERTY name DOMAIN ExecEvent RANGE STRING, PROPERTY ts DOMAIN ExecEvent RANGE FLOAT64, CLASS GraspEvent SUBCLASS OF ExecEvent, CLASS PlaceEvent SUBCLASS OF ExecEvent)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY h2 (CLASS Job, PROPERTY name DOMAIN Job RANGE STRING, PROPERTY ts DOMAIN Job RANGE FLOAT64, PROPERTY guard DOMAIN Job RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let insert = |sql: &str| executor.execute(&QueryParser::parse(sql).unwrap());
+
+        // The only event is a *subclass* instance, stored under `GraspEvent::`.
+        insert("INSERT INTO GraspEvent (name, ts) VALUES ('grab', 1000.0)").unwrap();
+
+        // A guard aimed at the parent class must still see it: without
+        // hierarchy expansion the scan of `ExecEvent::` finds nothing.
+        insert(
+            "INSERT INTO Job (name, ts, guard) VALUES ('place', 2000.0, 'BEFORE(ExecEvent WHERE name = ''grab'')')",
+        )
+        .unwrap();
+        insert(
+            "INSERT INTO Job (name, ts, guard) VALUES ('place2', 2000.0, 'EXISTS(ExecEvent WHERE name = ''grab'')')",
+        )
+        .unwrap();
+
+        // Negative control: content that exists nowhere still rejects, so the
+        // expansion is not simply making the guard vacuous.
+        let miss = insert(
+            "INSERT INTO Job (name, ts, guard) VALUES ('place3', 2000.0, 'BEFORE(ExecEvent WHERE name = ''nope'')')",
+        );
+        assert!(
+            miss.unwrap_err().to_string().contains("guard violation"),
+            "a name on no row at all must still reject"
+        );
+
+        // Sibling subclasses are seen too, not just the one that was written.
+        insert("INSERT INTO PlaceEvent (name, ts) VALUES ('drop', 1500.0)").unwrap();
+        insert(
+            "INSERT INTO Job (name, ts, guard) VALUES ('place4', 2000.0, 'BEFORE(ExecEvent WHERE name = ''drop'')')",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_guard_prev_requires_the_immediate_predecessor() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY pv (CLASS Step, PROPERTY name DOMAIN Step RANGE STRING, PROPERTY process_of DOMAIN Step RANGE STRING, PROPERTY ts DOMAIN Step RANGE FLOAT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY pv2 (CLASS Job, PROPERTY name DOMAIN Job RANGE STRING, PROPERTY process_of DOMAIN Job RANGE STRING, PROPERTY ts DOMAIN Job RANGE FLOAT64, PROPERTY guard DOMAIN Job RANGE STRING)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let insert = |sql: &str| executor.execute(&QueryParser::parse(sql).unwrap());
+
+        // Nothing preceded this write: "the previous step was X" is false.
+        let none = insert(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 3000.0, 'PREV(Step WHERE name = ''inspect'')')",
+        );
+        assert!(none.unwrap_err().to_string().contains("guard violation"));
+
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('pickup', 'P1', 1000.0)").unwrap();
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('inspect', 'P1', 2000.0)").unwrap();
+
+        // The most recent Step before ts=3000 is inspect@2000 -> matches.
+        insert(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place', 'P1', 3000.0, 'PREV(Step WHERE name = ''inspect'')')",
+        )
+        .unwrap();
+
+        // The same write asking for pickup fails: pickup is not the most recent,
+        // an inspect intervened. This is precisely what PREV adds over BEFORE.
+        let intervened = insert(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place2', 'P1', 3000.0, 'PREV(Step WHERE name = ''pickup'')')",
+        );
+        assert!(
+            intervened.unwrap_err().to_string().contains("guard violation"),
+            "an intervening row must make PREV fail"
+        );
+
+        // ...while BEFORE is satisfied by the older pickup, by design.
+        insert(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place3', 'P1', 3000.0, 'BEFORE(Step WHERE name = ''pickup'' AND process_of = $process_of)')",
+        )
+        .unwrap();
+
+        // No numeric ts on the written row -> ordering is not expressible.
+        insert(
+            "INSERT INTO Job (name, process_of, guard) VALUES ('nots', 'P1', 'PREV(Step WHERE name = ''inspect'')')",
+        )
+        .unwrap();
+
+        // Ties on the latest ts are conservative: a tied row that is definitely
+        // wrong rejects rather than being waved through. The tied pair sits at
+        // the newest ts so it really is the predecessor under test.
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('pickup', 'P2', 500.0)").unwrap();
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('inspect', 'P2', 2500.0)").unwrap();
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('ship', 'P2', 2500.0)").unwrap();
+        let tie = insert(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place4', 'P2', 3000.0, 'PREV(Step WHERE name = ''inspect'' AND process_of = $process_of)')",
+        );
+        assert!(
+            tie.unwrap_err().to_string().contains("guard violation"),
+            "a tied most-recent row that fails must reject"
+        );
+
+        // With the tie removed the same guard passes, confirming the rejection
+        // came from the tie and not from the correlation.
+        insert("INSERT INTO Step (name, process_of, ts) VALUES ('inspect', 'P2', 2700.0)").unwrap();
+        insert(
+            "INSERT INTO Job (name, process_of, ts, guard) VALUES ('place5', 'P2', 3000.0, 'PREV(Step WHERE name = ''inspect'' AND process_of = $process_of)')",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_guard_gate_rejects_violation_on_write() {
+        let (executor, _dir) = setup();
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "CREATE ONTOLOGY g (CLASS Transition, PROPERTY from_state DOMAIN Transition RANGE STRING, PROPERTY to_state DOMAIN Transition RANGE STRING, PROPERTY guard DOMAIN Transition RANGE STRING, PROPERTY quality_score DOMAIN Transition RANGE FLOAT64)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Guard satisfied -> written.
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "INSERT INTO Transition (from_state, to_state, guard, quality_score) VALUES ('inspect', 'place', 'quality_score >= 0.8', 0.95)",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Guard violated -> rejected at the write gate, not flagged later.
+        let bad = executor.execute(
+            &QueryParser::parse(
+                "INSERT INTO Transition (from_state, to_state, guard, quality_score) VALUES ('inspect', 'place', 'quality_score >= 0.8', 0.3)",
+            )
+            .unwrap(),
+        );
+        let msg = bad.unwrap_err().to_string();
+        assert!(
+            msg.contains("guard violation"),
+            "guard violation must reject on write, got: {msg}"
+        );
+
+        // Operand absent -> Unknown -> schema-on-read lets it through.
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "INSERT INTO Transition (from_state, to_state, guard) VALUES ('place', 'ship', 'quality_score >= 0.8')",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Guard outside the supported shape -> not judged, not blocked.
+        executor
+            .execute(
+                &QueryParser::parse(
+                    "INSERT INTO Transition (from_state, to_state, guard) VALUES ('ship', 'store', 'a and b')",
+                )
+                .unwrap(),
+            )
+            .unwrap();
     }
 
     #[test]
