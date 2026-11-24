@@ -14,12 +14,11 @@ fn compile_zstd_cmake() {
     config.define("ZSTD_BUILD_TESTS", "OFF");
     config.define("ZSTD_BUILD_CONTRIB", "OFF");
 
-    // Legacy support
-    if cfg!(feature = "legacy") {
-        config.define("ZSTD_LEGACY_SUPPORT", "ON");
-    } else {
-        config.define("ZSTD_LEGACY_SUPPORT", "OFF");
-    }
+    // Legacy support — forced OFF regardless of the cargo feature. The
+    // v0.1-v0.7 legacy decoders lack the FSE state-bounds guards of the
+    // modern decoder (ZSTD_seqStateInBounds), and we never write legacy
+    // frames, so a legacy magic on a corrupt block must error, not decode.
+    config.define("ZSTD_LEGACY_SUPPORT", "OFF");
 
     // Multi-threading support
     if cfg!(feature = "zstdmt") {
@@ -207,8 +206,11 @@ fn set_legacy(_config: &mut cc::Build) {}
 
 #[cfg(all(feature = "legacy", not(feature = "cmake")))]
 fn set_legacy(config: &mut cc::Build) {
-    config.define("ZSTD_LEGACY_SUPPORT", Some("1"));
-    config.include("zstd/lib/legacy");
+    // Forced OFF even when the cargo feature is on: the v0.1-v0.7 legacy
+    // decoders lack the FSE state-bounds guards (ZSTD_seqStateInBounds) of
+    // the modern decoder, and we never write legacy frames. The legacy
+    // include dir is deliberately not added.
+    config.define("ZSTD_LEGACY_SUPPORT", Some("0"));
 }
 
 #[cfg(all(feature = "zstdmt", not(feature = "cmake")))]
@@ -254,8 +256,6 @@ fn compile_zstd() {
         "zstd/contrib/seekable_format",
         #[cfg(feature = "zdict_builder")]
         "zstd/lib/dictBuilder",
-        #[cfg(feature = "legacy")]
-        "zstd/lib/legacy",
     ] {
         let mut entries: Vec<_> = fs::read_dir(dir)
             .unwrap()

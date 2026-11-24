@@ -361,7 +361,14 @@ MEM_STATIC void*
 ZSTD_cwksp_reserve_internal(ZSTD_cwksp* ws, size_t bytes, ZSTD_cwksp_alloc_phase_e phase)
 {
     void* alloc;
-    if (ZSTD_isError(ZSTD_cwksp_internal_advance_phase(ws, phase)) || bytes == 0) {
+    if (ZSTD_isError(ZSTD_cwksp_internal_advance_phase(ws, phase))) {
+        /* Phase-advance failure must flag the workspace: callers probe
+         * ZSTD_cwksp_reserve_failed() and would otherwise proceed on the
+         * NULL pointer and write through it (0xc0000374 later). */
+        ws->allocFailed = 1;
+        return NULL;
+    }
+    if (bytes == 0) {
         return NULL;
     }
 
@@ -454,6 +461,7 @@ MEM_STATIC void* ZSTD_cwksp_reserve_table(ZSTD_cwksp* ws, size_t bytes)
      * start of the workspace */
     if(ws->phase < phase) {
         if (ZSTD_isError(ZSTD_cwksp_internal_advance_phase(ws, phase))) {
+            ws->allocFailed = 1;
             return NULL;
         }
     }

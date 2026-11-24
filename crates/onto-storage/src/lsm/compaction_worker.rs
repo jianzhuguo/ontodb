@@ -32,6 +32,13 @@ use std::time::Duration;
 pub(crate) const MAX_MERGE_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 /// Hard cap on SST files opened by one merge (source + next-level overlap).
 pub(crate) const MAX_SSTABLES_PER_MERGE: usize = 8;
+/// Hard ceiling on one in-progress output SST's in-memory residency
+/// (stored blocks + block being assembled). The raw-size cut targets assume
+/// ~3-4x zstd compression; on raw fallback the builder holds raw bytes and
+/// those estimates run 3-4x short, so residency is the only unit that
+/// actually bounds memory pressure (a tight zstd workspace that fails its
+/// reservation is what turns into heap writes).
+pub(crate) const BUILDER_RESIDENT_CAP: usize = 256 * 1024 * 1024;
 
 /// Metadata about an SSTable file, kept in memory.
 #[derive(Clone, Debug)]
@@ -1063,8 +1070,10 @@ impl CompactionWorker {
             entry_count += 1;
             last_key = Some(dedup_key);
 
-            // Flush SST when target size reached
-            if current_size >= target_sst_size {
+            // Flush SST when target size reached. The residency cap is a
+            // hard bound independent of the raw-size estimate: on zstd raw
+            // fallback the builder holds raw bytes and the estimate is short.
+            if current_size >= target_sst_size || builder.resident_len() >= BUILDER_RESIDENT_CAP {
                 // Throttle: yield between SST flushes to avoid starving queries
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
@@ -1322,8 +1331,14 @@ impl CompactionWorker {
             // flush, so a batch of N always ends at ≤ N-1 outputs. The
             // discard path below becomes unreachable on count — a merge can
             // never burn minutes and then throw its output away.
-            if current_size >= target_sst_size
-                && Self::midstream_cut_allowed(new_ssts.len(), batch.len())
+            // The residency cap deliberately bypasses that budget: letting a
+            // builder accumulate past its memory bound while the budget is
+            // exhausted is how a tight zstd workspace turns into heap writes.
+            // One extra output is an acceptable price; the win check still
+            // governs adoption.
+            if builder.resident_len() >= BUILDER_RESIDENT_CAP
+                || (current_size >= target_sst_size
+                    && Self::midstream_cut_allowed(new_ssts.len(), batch.len()))
             {
                 let sst_id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
                 let sst_path = self
@@ -1597,8 +1612,12 @@ impl CompactionWorker {
             // under batch.len(): at most batch.len()-2 cuts here + 1 tail.
             // A batch of 2 thus never splits — its whole content becomes
             // one output, exactly the 2→1 win the old cut target missed.
-            if current_size >= target_output_size
-                && Self::midstream_cut_allowed(new_ssts.len(), batch.len())
+            // The residency cap deliberately bypasses that budget: letting a
+            // builder accumulate past its memory bound while the budget is
+            // exhausted is how a tight zstd workspace turns into heap writes.
+            if builder.resident_len() >= BUILDER_RESIDENT_CAP
+                || (current_size >= target_output_size
+                    && Self::midstream_cut_allowed(new_ssts.len(), batch.len()))
             {
                 let id = self.sst_counter.fetch_add(1, Ordering::Relaxed);
                 let path = self

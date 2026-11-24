@@ -378,6 +378,15 @@ impl SsTableBuilder {
         self.compression_level = level.clamp(0, 21);
     }
 
+    /// Bytes of the in-progress SST currently held in memory (stored blocks
+    /// plus the block being assembled). Unlike the raw-size cut estimates
+    /// this is the real resident footprint, so it stays honest when zstd
+    /// falls back to raw blocks (where stored == raw and the 3-4x size
+    /// estimates are 3-4x short).
+    pub fn resident_len(&self) -> usize {
+        self.data.len() + self.current_block.len()
+    }
+
     /// Adds an entry to the SSTable. Entries MUST be added in sorted key order.
     pub fn add(&mut self, entry: &Entry) {
         self.max_seq_no = self.max_seq_no.max(entry.seq_no);

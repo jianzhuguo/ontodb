@@ -770,6 +770,21 @@ size_t ZSTD_decodeSeqHeaders(ZSTD_DCtx* dctx, int* nbSeqPtr,
             RETURN_ERROR_IF(ZSTD_isError(mlhSize), corruption_detected, "ZSTD_buildSeqTable failed");
             ip += mlhSize;
         }
+
+        /* set_repeat keeps whatever dctx->*Tptr held before — a corrupt
+         * prior frame or heap damage can point them anywhere. The only
+         * values ZSTD_buildSeqTable ever assigns are the DCtx-embedded
+         * tables and the ROM defaults, so reject anything else before the
+         * FSE states dereference it. */
+        RETURN_ERROR_IF(dctx->LLTptr != dctx->entropy.LLTable
+                     && dctx->LLTptr != LL_defaultDTable,
+                     corruption_detected, "LL decode-table pointer corrupted");
+        RETURN_ERROR_IF(dctx->OFTptr != dctx->entropy.OFTable
+                     && dctx->OFTptr != OF_defaultDTable,
+                     corruption_detected, "OF decode-table pointer corrupted");
+        RETURN_ERROR_IF(dctx->MLTptr != dctx->entropy.MLTable
+                     && dctx->MLTptr != ML_defaultDTable,
+                     corruption_detected, "ML decode-table pointer corrupted");
     }
 
     return ip-istart;
