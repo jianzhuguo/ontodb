@@ -163,7 +163,21 @@ impl StreamingMergeIterator {
         // Refill from the source that provided the current entry
         if let Some(ref entry) = result {
             let source_idx = entry.source_idx;
-            if let Some(new_entry) = self.sources[source_idx].next() {
+            // Defensive bounds check: `source_idx` is set at construction
+            // (enumerate index) and propagated in `next()`. A panic here with
+            // `len=1 index=4` means the `sources` Vec header was corrupted
+            // (same family as the 19420 crash shape). Fail fast with a
+            // snapshot instead of a bare index-out-of-bounds.
+            let source = match self.sources.get_mut(source_idx) {
+                Some(s) => s,
+                None => panic!(
+                    "StreamingMergeIterator source index out of bounds \
+                     (source_idx={} sources.len={}); sources Vec header is likely corrupt",
+                    source_idx,
+                    self.sources.len()
+                ),
+            };
+            if let Some(new_entry) = source.next() {
                 self.heap.push(HeapEntry {
                     key: new_entry.0,
                     value: new_entry.1,
@@ -248,6 +262,36 @@ mod tests {
     fn test_owned_bytes_rejects_sentinel_ptr_slice() {
         let s: &[u8] = unsafe { std::slice::from_raw_parts(0x1 as *const u8, 105) };
         let _ = owned_bytes(s);
+    }
+
+    /// The 166 crash shape: a `HeapEntry` with `source_idx=4` but `sources.len()==1`.
+    /// `next()` must panic with a diagnostic message instead of a bare
+    /// "index out of bounds" that carries no forensic value.
+    #[test]
+    #[should_panic(expected = "source index out of bounds")]
+    fn test_next_rejects_stale_source_idx() {
+        use crate::lsm::sstable::SsTableBuilder;
+        use onto_core::Entry;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.sst");
+        let mut builder = SsTableBuilder::new();
+        builder.add(&Entry::put(b"key1".to_vec(), b"val1".to_vec(), 10));
+        builder.build(&path).unwrap();
+
+        // Build a valid iterator with 1 source
+        let mut iter = StreamingMergeIterator::new(&[&path]).unwrap();
+        // Poison current with a stale source_idx=4 (simulates Vec header corruption)
+        iter.current = Some(HeapEntry {
+            key: b"keyX".to_vec(),
+            value: b"valX".to_vec(),
+            seq_no: 99,
+            kind: EntryKind::Put,
+            source_idx: 4,
+        });
+        // next() will try to refill from sources[4] -> must panic
+        let _ = iter.next();
     }
 
     #[test]
