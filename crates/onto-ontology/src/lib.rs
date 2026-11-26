@@ -26,6 +26,7 @@
 
 pub mod model;
 pub mod parser;
+pub mod policy_store;
 pub mod rdf;
 pub mod reasoner;
 pub mod rules;

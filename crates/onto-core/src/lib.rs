@@ -37,6 +37,7 @@ pub mod geo;
 pub mod geohash_index;
 pub mod lineage;
 pub mod multimedia;
+pub mod policy;
 pub mod rtree;
 pub mod spatiotemporal;
 pub mod sttrl;

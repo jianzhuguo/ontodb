@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 resolver = "2"
 members = [
     "crates/onto-core",
@@ -24,7 +24,7 @@ members = [
 version = "0.6.2"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["Guo Jianzhu (郭建筑) <624831343@qq.com>"]
+authors = ["Guo Jianzhu (閮缓绛? <624831343@qq.com>"]
 repository = "https://gitee.com/ontovalue/ontodb"
 description = "OntoDB - An ontology-driven semantic multi-modal database"
 
@@ -37,7 +37,7 @@ onto-query    = { path = "crates/onto-query" }
 onto-graph     = { path = "crates/onto-graph" }
 onto-plugin   = { path = "crates/onto-plugin" }
 # Enterprise-only (private, not in this repo):
-# onto-raft, onto-sharding, onto-enterprise — see crates/onto-server/Cargo.toml
+# onto-raft, onto-sharding, onto-enterprise 鈥?see crates/onto-server/Cargo.toml
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -74,6 +74,9 @@ base64 = "0.21"
 
 # Random
 rand = "0.8"
+
+# Authn/authz (RBAC M1: blake3-hmac credentials, 2026-11-26 ruling)
+blake3 = "1"
 
 # Time
 chrono = "0.4"
