@@ -8,6 +8,7 @@ description = "Query engine - SQL parser, semantic extensions, optimizer, and ex
 [dependencies]
 onto-core = { workspace = true }
 onto-graph = { workspace = true }
+rand = { workspace = true }
 onto-storage = { workspace = true }
 onto-ontology = { workspace = true }
 onto-sharding = { path = "../onto-sharding", optional = true }

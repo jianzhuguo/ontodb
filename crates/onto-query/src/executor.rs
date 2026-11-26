@@ -514,6 +514,8 @@ pub struct QueryExecutor {
     /// Optional append-only audit log (JSON lines) for cross-namespace access
     /// and scoped-key denials. None = auditing disabled.
     audit_log: Option<Mutex<std::fs::File>>,
+    /// RBAC policy service (M1): PDP + durable store. None = RBAC inactive.
+    policy: Option<Arc<onto_ontology::policy_store::PolicyService>>,
 }
 
 /// Identity of a query caller, used for namespace scoping and audit records.
@@ -525,6 +527,9 @@ pub struct QueryActor {
     pub namespace: Option<String>,
     /// Client IP for audit records.
     pub client_ip: String,
+    /// Control-plane admin (Permission::Admin key, or auth disabled).
+    /// Gates policy DDL (CREATE USER/ROLE, GRANT/REVOKE) — RBAC M1.
+    pub is_admin: bool,
 }
 
 impl QueryActor {
@@ -534,6 +539,7 @@ impl QueryActor {
             label: "anonymous".to_string(),
             namespace: None,
             client_ip: "unknown".to_string(),
+            is_admin: true,
         }
     }
 }
@@ -854,6 +860,7 @@ impl QueryExecutor {
             current_namespace: Mutex::new("default".to_string()),
             row_count_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             audit_log: None,
+            policy: None,
         }
     }
 
@@ -1119,6 +1126,13 @@ impl QueryExecutor {
         self
     }
 
+    /// Attaches the RBAC policy service (M1): plan-time checks in
+    /// `prepare_as` and policy-DDL handling in `run_as` light up when set.
+    pub fn with_policy_service(mut self, svc: Arc<onto_ontology::policy_store::PolicyService>) -> Self {
+        self.policy = Some(svc);
+        self
+    }
+
     /// Appends one audit record (cross-namespace access or scoped-key denial).
     fn audit(&self, actor: Option<&QueryActor>, action: &str, classes: &[String], detail: &str) {
         let Some(log) = &self.audit_log else { return };
@@ -1278,9 +1292,231 @@ impl QueryExecutor {
         })
     }
 
+    /// RBAC policy administration (M1): users, roles, grants.
+    ///
+    /// SHOW statements are open to any caller; mutations require the
+    /// control-plane admin flag (`Permission::Admin` key, or auth disabled)
+    /// and leave a `grant_change` audit record — deny leaves `denied`.
+    fn execute_policy_admin(&self, ast: &QueryAst, actor: &QueryActor) -> Result<QueryResult> {
+        use onto_core::policy::{
+            password_hash, CredentialRecord, Grant, Principal, PrincipalKind, CRED_SALT_LEN,
+            CRED_SCHEME_BLAKE3,
+        };
+        use QueryAst as A;
+
+        let Some(svc) = &self.policy else {
+            return Err(CoreError::InvalidArgument(
+                "RBAC policy service is not configured on this executor".to_string(),
+            ));
+        };
+        let pepper = std::env::var("ONTODB_CRED_PEPPER").ok();
+
+        // ── introspection (any caller, M1) ──
+        match ast {
+            A::ShowRoles => {
+                let rows = svc
+                    .engine
+                    .roles()
+                    .into_iter()
+                    .map(|role| {
+                        let mut m = Map::new();
+                        m.insert("role".to_string(), Value::String(role));
+                        m
+                    })
+                    .collect();
+                return Ok(QueryResult::Rows(rows));
+            }
+            A::ShowGrants { role } => {
+                let grants = match role {
+                    Some(r) => svc.engine.grants_for_role(r),
+                    None => svc.engine.grants(),
+                };
+                let rows = grants
+                    .into_iter()
+                    .map(|g| {
+                        let mut m = Map::new();
+                        m.insert("role".to_string(), Value::String(g.role));
+                        m.insert(
+                            "action".to_string(),
+                            Value::String(g.action.as_str().to_string()),
+                        );
+                        m.insert("object".to_string(), Value::String(g.object.display()));
+                        m
+                    })
+                    .collect();
+                return Ok(QueryResult::Rows(rows));
+            }
+            _ => {}
+        }
+
+        // ── mutations: control-plane admin only ──
+        if !actor.is_admin {
+            self.audit(Some(actor), "denied", &[], "policy DDL requires Admin");
+            return Err(CoreError::InvalidArgument(
+                "policy DDL requires an Admin API key (or auth disabled)".to_string(),
+            ));
+        }
+
+        let detail = format!("{ast:?}");
+        let success = match ast {
+            A::CreateUser {
+                id,
+                service_account,
+                password,
+            } => {
+                let kind = if *service_account {
+                    PrincipalKind::ServiceAccount
+                } else {
+                    PrincipalKind::User
+                };
+                svc.upsert_principal(Principal {
+                    id: id.clone(),
+                    kind,
+                    roles: Default::default(),
+                    token_epoch: 0,
+                    disabled: false,
+                    cred_scheme: CRED_SCHEME_BLAKE3.to_string(),
+                })?;
+                if let Some(pw) = password {
+                    let mut salt = [0u8; CRED_SALT_LEN];
+                    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt);
+                    svc.put_credential(CredentialRecord {
+                        principal_id: id.clone(),
+                        salt,
+                        hash: password_hash(pw, &salt, pepper.as_ref().map(|s| s.as_bytes())),
+                        cred_scheme: CRED_SCHEME_BLAKE3.to_string(),
+                    })?;
+                }
+                format!("user '{id}' created")
+            }
+            A::DropUser { id } => {
+                svc.remove_principal(id)?;
+                format!("user '{id}' dropped")
+            }
+            A::AlterUserPassword { id, password } => {
+                let mut p = svc.engine.principal(id).ok_or_else(|| {
+                    CoreError::InvalidArgument(format!("no such user '{id}'"))
+                })?;
+                // Epoch bump retires every token minted under the old password.
+                p.token_epoch += 1;
+                svc.upsert_principal(p)?;
+                let mut salt = [0u8; CRED_SALT_LEN];
+                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt);
+                svc.put_credential(CredentialRecord {
+                    principal_id: id.clone(),
+                    salt,
+                    hash: password_hash(password, &salt, pepper.as_ref().map(|s| s.as_bytes())),
+                    cred_scheme: CRED_SCHEME_BLAKE3.to_string(),
+                })?;
+                format!("password updated for '{id}' (tokens rotated)")
+            }
+            A::CreateRole { name } => {
+                if !svc.create_role(name)? {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "role '{name}' already exists"
+                    )));
+                }
+                format!("role '{name}' created")
+            }
+            A::DropRole { name } => {
+                svc.drop_role(name)?;
+                format!("role '{name}' dropped")
+            }
+            A::GrantRole { role, principal } => {
+                if !svc.engine.role_exists(role) {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "no such role '{role}' (CREATE ROLE first)"
+                    )));
+                }
+                if !svc.grant_role(principal, role)? {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "no such principal '{principal}'"
+                    )));
+                }
+                format!("role '{role}' granted to '{principal}'")
+            }
+            A::RevokeRole { role, principal } => {
+                svc.revoke_role(principal, role)?;
+                format!("role '{role}' revoked from '{principal}'")
+            }
+            A::GrantPrivilege {
+                action,
+                object,
+                role,
+            } => {
+                if !svc.engine.role_exists(role) {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "no such role '{role}' (CREATE ROLE first)"
+                    )));
+                }
+                svc.grant(Grant {
+                    role: role.clone(),
+                    action: *action,
+                    object: object.clone(),
+                })?;
+                format!(
+                    "granted {} on {} to '{}'",
+                    action.as_str(),
+                    object.display(),
+                    role
+                )
+            }
+            A::RevokePrivilege {
+                action,
+                object,
+                role,
+            } => {
+                let removed = svc.revoke(&Grant {
+                    role: role.clone(),
+                    action: *action,
+                    object: object.clone(),
+                })?;
+                format!(
+                    "{} on {} {} role '{}'",
+                    action.as_str(),
+                    object.display(),
+                    if removed {
+                        "revoked from"
+                    } else {
+                        "not held by"
+                    },
+                    role
+                )
+            }
+            // Unreachable: the run_as intercept only routes the arms above.
+            other => {
+                return Err(CoreError::InvalidArgument(format!(
+                    "not a policy statement: {other:?}"
+                )))
+            }
+        };
+        self.audit(Some(actor), "grant_change", &[], &format!("{detail} -> {success}"));
+        Ok(QueryResult::Success(success))
+    }
+
     fn run_as(&self, ast: &QueryAst, actor: &QueryActor, read: bool) -> Result<QueryResult> {
         use QueryAst as A;
         let resolved = self.prepare_as(ast, actor)?;
+
+        // RBAC policy administration (M1): handled here so mutations carry
+        // the actor for the admin gate and the audit trail.
+        if matches!(
+            ast,
+            A::CreateUser { .. }
+                | A::DropUser { .. }
+                | A::AlterUserPassword { .. }
+                | A::CreateRole { .. }
+                | A::DropRole { .. }
+                | A::GrantRole { .. }
+                | A::RevokeRole { .. }
+                | A::GrantPrivilege { .. }
+                | A::RevokePrivilege { .. }
+                | A::ShowRoles
+                | A::ShowGrants { .. }
+        ) {
+            return self.execute_policy_admin(ast, actor);
+        }
+
         let result = if read {
             self.execute_read(&resolved)
         } else {
@@ -19720,11 +19956,101 @@ mod tests {
         executor.execute(&ast).unwrap();
     }
 
+    /// RBAC M1: policy DDL end-to-end (docs/RBAC权限模型详细设计.md §8).
+    /// CREATE USER/ROLE, GRANT/REVOKE (role + privilege), SHOW, admin gate.
+    #[test]
+    fn policy_ddl_end_to_end() {
+        use onto_core::policy::Action;
+        let (executor, _dir) = setup();
+        let pdir = tempdir().unwrap();
+        let svc = onto_ontology::policy_store::PolicyService::open(
+            onto_ontology::policy_store::PolicyStore::new(Arc::new(
+                LsmEngine::open(StorageOptions {
+                    data_dir: pdir.path().to_path_buf(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )),
+        )
+        .unwrap();
+        let executor = executor.with_policy_service(svc.clone());
+        let admin = QueryActor {
+            label: "root".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: true,
+        };
+        let run = |sql: &str| {
+            let ast = QueryParser::parse(sql).unwrap();
+            executor.execute_as(&ast, &admin)
+        };
+
+        // Role + user + membership + grants.
+        assert!(matches!(
+            run("CREATE ROLE analyst").unwrap(),
+            QueryResult::Success(_)
+        ));
+        run("CREATE USER alice WITH PASSWORD 'pw'").unwrap();
+        run("GRANT ROLE analyst TO alice").unwrap();
+        run("GRANT READ ON CLASS erp.orders TO analyst").unwrap();
+        run("GRANT WRITE ON CLASS erp.orders TO analyst").unwrap();
+
+        // SHOW reflects the state.
+        let QueryResult::Rows(rows) = run("SHOW GRANTS FOR analyst").unwrap() else {
+            panic!("SHOW GRANTS must return rows");
+        };
+        assert_eq!(rows.len(), 2);
+        let QueryResult::Rows(roles) = run("SHOW ROLES").unwrap() else {
+            panic!("SHOW ROLES must return rows");
+        };
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].get("role").unwrap(), "analyst");
+
+        // The password credential works; class grants are exact (M1: no
+        // inheritance — a sibling class is not covered).
+        assert!(svc.engine.authenticate_password("alice", "pw", None).is_some());
+        assert!(svc.engine.check_class("alice", Action::Read, "erp", "orders"));
+        assert!(svc.engine.check_class("alice", Action::Write, "erp", "orders"));
+        assert!(
+            !svc.engine.check_class("alice", Action::Read, "erp", "invoices"),
+            "class grant must be exact"
+        );
+        assert!(
+            !svc.engine.check_class("alice", Action::Read, "hr", "orders"),
+            "other namespaces stay closed"
+        );
+
+        // Duplicate role rejected; grammar errors rejected.
+        assert!(run("CREATE ROLE analyst").is_err());
+        assert!(QueryParser::parse("GRANT FLY ON NAMESPACE x TO r").is_err());
+        assert!(QueryParser::parse("CREATE USER bob WITH PASSWORD pw").is_err());
+
+        // Non-admin callers cannot touch the policy plane.
+        let user_actor = QueryActor {
+            label: "scoped".to_string(),
+            namespace: Some("vet".to_string()),
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+        };
+        let ast = QueryParser::parse("CREATE ROLE sneaky").unwrap();
+        assert!(executor.execute_as(&ast, &user_actor).is_err());
+        assert!(!svc.engine.role_exists("sneaky"));
+
+        // Revoke takes access away; DROP ROLE cleans grants + membership.
+        run("REVOKE READ ON CLASS erp.orders FROM analyst").unwrap();
+        assert!(!svc.engine.check_class("alice", Action::Read, "erp", "orders"));
+        assert!(svc.engine.check_class("alice", Action::Write, "erp", "orders"));
+        run("DROP ROLE analyst").unwrap();
+        assert!(!svc.engine.role_exists("analyst"));
+        assert!(!svc.engine.check_class("alice", Action::Write, "erp", "orders"));
+    }
+
     fn test_actor(ns: Option<&str>) -> QueryActor {
         QueryActor {
             label: "test-key".to_string(),
             namespace: ns.map(String::from),
             client_ip: "127.0.0.1".to_string(),
+            is_admin: ns.is_none(),
         }
     }
 

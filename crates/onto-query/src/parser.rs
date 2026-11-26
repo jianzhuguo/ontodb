@@ -426,6 +426,54 @@ pub enum QueryAst {
     /// USE NAMESPACE <name>
     UseNamespace { name: String },
 
+    // ─── RBAC administration (M1, docs/RBAC权限模型详细设计.md §8) ─────────
+    /// CREATE USER <id> [WITH PASSWORD '<pw>'] / CREATE SERVICE ACCOUNT <id>
+    CreateUser {
+        id: String,
+        service_account: bool,
+        password: Option<String>,
+    },
+
+    /// DROP USER <id>
+    DropUser { id: String },
+
+    /// ALTER USER <id> PASSWORD '<pw>' (bumps token epoch)
+    AlterUserPassword { id: String, password: String },
+
+    /// CREATE ROLE <name>
+    CreateRole { name: String },
+
+    /// DROP ROLE <name> (removes its grants and memberships)
+    DropRole { name: String },
+
+    /// GRANT ROLE <role> TO <principal>
+    GrantRole { role: String, principal: String },
+
+    /// REVOKE ROLE <role> FROM <principal>
+    RevokeRole { role: String, principal: String },
+
+    /// GRANT <READ|WRITE|DDL> ON NAMESPACE <ns> TO <role>
+    /// GRANT <READ|WRITE|DDL> ON CLASS <ns.cls> TO <role>
+    GrantPrivilege {
+        action: onto_core::policy::Action,
+        object: onto_core::policy::ObjectRef,
+        role: String,
+    },
+
+    /// REVOKE <READ|WRITE|DDL> ON NAMESPACE <ns> FROM <role>
+    /// REVOKE <READ|WRITE|DDL> ON CLASS <ns.cls> FROM <role>
+    RevokePrivilege {
+        action: onto_core::policy::Action,
+        object: onto_core::policy::ObjectRef,
+        role: String,
+    },
+
+    /// SHOW ROLES
+    ShowRoles,
+
+    /// SHOW GRANTS [FOR <role>]
+    ShowGrants { role: Option<String> },
+
     /// DROP ONTOLOGY <name>
     DropOntology { name: String },
 
@@ -676,6 +724,19 @@ impl QueryAst {
             QueryAst::AlterClassDisjoint { .. } => false,
             QueryAst::AlterClassUnique { .. } => false,
             QueryAst::AlterClassRestriction { .. } => false,
+
+            // RBAC administration (M1): SHOW reads, mutations write the policy state
+            QueryAst::ShowRoles => true,
+            QueryAst::ShowGrants { .. } => true,
+            QueryAst::CreateUser { .. } => false,
+            QueryAst::DropUser { .. } => false,
+            QueryAst::AlterUserPassword { .. } => false,
+            QueryAst::CreateRole { .. } => false,
+            QueryAst::DropRole { .. } => false,
+            QueryAst::GrantRole { .. } => false,
+            QueryAst::RevokeRole { .. } => false,
+            QueryAst::GrantPrivilege { .. } => false,
+            QueryAst::RevokePrivilege { .. } => false,
 
             // Transaction control
             QueryAst::Begin => false,
@@ -1234,6 +1295,24 @@ impl QueryParser {
             Self::parse_alter_ontology_property(input)
         } else if starts_with("ALTER CLASS") {
             Self::parse_alter_class(input)
+        } else if starts_with("CREATE USER") || starts_with("CREATE SERVICE ACCOUNT") {
+            Self::parse_create_user(input)
+        } else if starts_with("DROP USER") {
+            Self::parse_drop_user(input)
+        } else if starts_with("ALTER USER") {
+            Self::parse_alter_user_password(input)
+        } else if starts_with("CREATE ROLE") {
+            Self::parse_create_role(input)
+        } else if starts_with("DROP ROLE") {
+            Self::parse_drop_role(input)
+        } else if starts_with("GRANT") {
+            Self::parse_grant(input)
+        } else if starts_with("REVOKE") {
+            Self::parse_revoke(input)
+        } else if starts_with("SHOW ROLES") {
+            Ok(QueryAst::ShowRoles)
+        } else if starts_with("SHOW GRANTS") {
+            Self::parse_show_grants(input)
         } else if starts_with("CREATE ONTOLOGY") {
             Ok(QueryAst::CreateOntology {
                 sql: input.to_string(),
@@ -1337,6 +1416,296 @@ impl QueryParser {
                 input
             )))
         }
+    }
+
+    // ─── RBAC administration parsing (M1) ──────────────────────────────────
+
+    /// First whitespace-delimited word plus the trimmed remainder.
+    fn split_word(s: &str) -> Option<(&str, &str)> {
+        let s = s.trim_start();
+        let i = s.find(char::is_whitespace).unwrap_or(s.len());
+        let (w, r) = s.split_at(i);
+        if w.is_empty() {
+            None
+        } else {
+            Some((w, r.trim_start()))
+        }
+    }
+
+    /// Extract a single-quoted string, returning it and the trimmed rest.
+    fn take_quoted(s: &str) -> Option<(String, &str)> {
+        let s = s.trim_start();
+        let after = &s[s.find('\'')? + 1..];
+        let end = after.find('\'')?;
+        Some((after[..end].to_string(), after[end + 1..].trim_start()))
+    }
+
+    fn parse_action(word: &str) -> Result<onto_core::policy::Action> {
+        use onto_core::policy::Action;
+        match word.to_ascii_uppercase().as_str() {
+            "READ" => Ok(Action::Read),
+            "WRITE" => Ok(Action::Write),
+            "DDL" => Ok(Action::Ddl),
+            _ => Err(CoreError::InvalidArgument(format!(
+                "unknown action {word:?} (use READ|WRITE|DDL)"
+            ))),
+        }
+    }
+
+    /// `ns.cls` → Class{ns, class}; bare `cls` → Class{_default, class}.
+    fn parse_class_ref(token: &str) -> Result<onto_core::policy::ObjectRef> {
+        use onto_core::policy::ObjectRef;
+        match token.split_once('.') {
+            Some((ns, class)) if !ns.is_empty() && !class.is_empty() => Ok(ObjectRef::Class {
+                ns: ns.to_string(),
+                class: class.to_string(),
+            }),
+            None if !token.is_empty() => Ok(ObjectRef::Class {
+                ns: "_default".to_string(),
+                class: token.to_string(),
+            }),
+            _ => Err(CoreError::InvalidArgument(format!(
+                "bad class reference {token:?} (use [ns.]class)"
+            ))),
+        }
+    }
+
+    fn parse_create_user(input: &str) -> Result<QueryAst> {
+        let (service_account, rest) = if input.starts_with("CREATE SERVICE ACCOUNT") {
+            (true, &input["CREATE SERVICE ACCOUNT".len()..])
+        } else {
+            (false, &input["CREATE USER".len()..])
+        };
+        let (id, rest) = Self::split_word(rest.trim()).ok_or_else(|| {
+            CoreError::InvalidArgument(
+                "usage: CREATE USER <id> [WITH PASSWORD '<pw>'] | CREATE SERVICE ACCOUNT <id>"
+                    .to_string(),
+            )
+        })?;
+        let password = if rest.is_empty() {
+            None
+        } else {
+            let r = rest.strip_prefix("WITH").unwrap_or(rest).trim_start();
+            let r = r.strip_prefix("PASSWORD").ok_or_else(|| {
+                CoreError::InvalidArgument("usage: … WITH PASSWORD '<pw>'".to_string())
+            })?;
+            Some(
+                Self::take_quoted(r)
+                    .ok_or_else(|| {
+                        CoreError::InvalidArgument("password must be single-quoted".to_string())
+                    })?
+                    .0,
+            )
+        };
+        Ok(QueryAst::CreateUser {
+            id: id.to_string(),
+            service_account,
+            password,
+        })
+    }
+
+    fn parse_drop_user(input: &str) -> Result<QueryAst> {
+        let (id, rest) = Self::split_word(input["DROP USER".len()..].trim()).ok_or_else(|| {
+            CoreError::InvalidArgument("usage: DROP USER <id>".to_string())
+        })?;
+        if !rest.is_empty() {
+            return Err(CoreError::InvalidArgument(format!(
+                "trailing input in DROP USER: {rest}"
+            )));
+        }
+        Ok(QueryAst::DropUser {
+            id: id.to_string(),
+        })
+    }
+
+    fn parse_alter_user_password(input: &str) -> Result<QueryAst> {
+        let (id, rest) =
+            Self::split_word(input["ALTER USER".len()..].trim()).ok_or_else(|| {
+                CoreError::InvalidArgument("usage: ALTER USER <id> PASSWORD '<pw>'".to_string())
+            })?;
+        let r = rest.strip_prefix("PASSWORD").ok_or_else(|| {
+            CoreError::InvalidArgument("usage: ALTER USER <id> PASSWORD '<pw>'".to_string())
+        })?;
+        let (pw, rest) = Self::take_quoted(r).ok_or_else(|| {
+            CoreError::InvalidArgument("password must be single-quoted".to_string())
+        })?;
+        if !rest.is_empty() {
+            return Err(CoreError::InvalidArgument(format!(
+                "trailing input in ALTER USER: {rest}"
+            )));
+        }
+        Ok(QueryAst::AlterUserPassword {
+            id: id.to_string(),
+            password: pw,
+        })
+    }
+
+    fn parse_create_role(input: &str) -> Result<QueryAst> {
+        let (name, rest) = Self::split_word(input["CREATE ROLE".len()..].trim()).ok_or_else(|| {
+            CoreError::InvalidArgument("usage: CREATE ROLE <name>".to_string())
+        })?;
+        if !rest.is_empty() {
+            return Err(CoreError::InvalidArgument(format!(
+                "trailing input in CREATE ROLE: {rest}"
+            )));
+        }
+        Ok(QueryAst::CreateRole {
+            name: name.to_string(),
+        })
+    }
+
+    fn parse_drop_role(input: &str) -> Result<QueryAst> {
+        let (name, rest) = Self::split_word(input["DROP ROLE".len()..].trim()).ok_or_else(|| {
+            CoreError::InvalidArgument("usage: DROP ROLE <name>".to_string())
+        })?;
+        if !rest.is_empty() {
+            return Err(CoreError::InvalidArgument(format!(
+                "trailing input in DROP ROLE: {rest}"
+            )));
+        }
+        Ok(QueryAst::DropRole {
+            name: name.to_string(),
+        })
+    }
+
+    fn parse_grant(input: &str) -> Result<QueryAst> {
+        let rest = input["GRANT".len()..].trim();
+        if let Some(r) = rest.strip_prefix("ROLE") {
+            // GRANT ROLE <role> TO <principal>
+            let (role, r) = Self::split_word(r.trim()).ok_or_else(|| {
+                CoreError::InvalidArgument("usage: GRANT ROLE <role> TO <principal>".to_string())
+            })?;
+            let (kw, principal) = Self::split_word(r).ok_or_else(|| {
+                CoreError::InvalidArgument("usage: GRANT ROLE <role> TO <principal>".to_string())
+            })?;
+            if !kw.eq_ignore_ascii_case("TO") {
+                return Err(CoreError::InvalidArgument(format!(
+                    "expected TO, got {kw:?}"
+                )));
+            }
+            return Ok(QueryAst::GrantRole {
+                role: role.to_string(),
+                principal: principal.to_string(),
+            });
+        }
+        // GRANT <action> ON NAMESPACE <ns> TO <role>
+        // GRANT <action> ON CLASS <ns.cls> TO <role>
+        let (action, r) = Self::split_word(rest).ok_or_else(|| {
+            CoreError::InvalidArgument(
+                "usage: GRANT <READ|WRITE|DDL> ON NAMESPACE <ns> | ON CLASS <cls> TO <role>"
+                    .to_string(),
+            )
+        })?;
+        let action = Self::parse_action(action)?;
+        let (on, r) = Self::split_word(r).ok_or_else(|| {
+            CoreError::InvalidArgument("expected ON NAMESPACE|CLASS".to_string())
+        })?;
+        if !on.eq_ignore_ascii_case("ON") {
+            return Err(CoreError::InvalidArgument(format!("expected ON, got {on:?}")));
+        }
+        let (kind, r) = Self::split_word(r)
+            .ok_or_else(|| CoreError::InvalidArgument("expected NAMESPACE|CLASS".to_string()))?;
+        let (target, r) = Self::split_word(r)
+            .ok_or_else(|| CoreError::InvalidArgument("expected namespace/class name".to_string()))?;
+        let object = match kind.to_ascii_uppercase().as_str() {
+            "NAMESPACE" => onto_core::policy::ObjectRef::Namespace(target.to_string()),
+            "CLASS" => Self::parse_class_ref(target)?,
+            _ => {
+                return Err(CoreError::InvalidArgument(format!(
+                    "expected NAMESPACE|CLASS, got {kind:?}"
+                )))
+            }
+        };
+        let (kw, role) = Self::split_word(r).ok_or_else(|| {
+            CoreError::InvalidArgument("usage: … TO <role>".to_string())
+        })?;
+        if !kw.eq_ignore_ascii_case("TO") {
+            return Err(CoreError::InvalidArgument(format!("expected TO, got {kw:?}")));
+        }
+        Ok(QueryAst::GrantPrivilege {
+            action,
+            object,
+            role: role.to_string(),
+        })
+    }
+
+    fn parse_revoke(input: &str) -> Result<QueryAst> {
+        let rest = input["REVOKE".len()..].trim();
+        if let Some(r) = rest.strip_prefix("ROLE") {
+            let (role, r) = Self::split_word(r.trim()).ok_or_else(|| {
+                CoreError::InvalidArgument("usage: REVOKE ROLE <role> FROM <principal>".to_string())
+            })?;
+            let (kw, principal) = Self::split_word(r).ok_or_else(|| {
+                CoreError::InvalidArgument("usage: REVOKE ROLE <role> FROM <principal>".to_string())
+            })?;
+            if !kw.eq_ignore_ascii_case("FROM") {
+                return Err(CoreError::InvalidArgument(format!(
+                    "expected FROM, got {kw:?}"
+                )));
+            }
+            return Ok(QueryAst::RevokeRole {
+                role: role.to_string(),
+                principal: principal.to_string(),
+            });
+        }
+        // REVOKE <action> ON NAMESPACE <ns> FROM <role> / … ON CLASS <cls> …
+        let (action, r) = Self::split_word(rest).ok_or_else(|| {
+            CoreError::InvalidArgument(
+                "usage: REVOKE <READ|WRITE|DDL> ON NAMESPACE <ns> | ON CLASS <cls> FROM <role>"
+                    .to_string(),
+            )
+        })?;
+        let action = Self::parse_action(action)?;
+        let (on, r) = Self::split_word(r).ok_or_else(|| {
+            CoreError::InvalidArgument("expected ON NAMESPACE|CLASS".to_string())
+        })?;
+        if !on.eq_ignore_ascii_case("ON") {
+            return Err(CoreError::InvalidArgument(format!("expected ON, got {on:?}")));
+        }
+        let (kind, r) = Self::split_word(r)
+            .ok_or_else(|| CoreError::InvalidArgument("expected NAMESPACE|CLASS".to_string()))?;
+        let (target, r) = Self::split_word(r)
+            .ok_or_else(|| CoreError::InvalidArgument("expected namespace/class name".to_string()))?;
+        let object = match kind.to_ascii_uppercase().as_str() {
+            "NAMESPACE" => onto_core::policy::ObjectRef::Namespace(target.to_string()),
+            "CLASS" => Self::parse_class_ref(target)?,
+            _ => {
+                return Err(CoreError::InvalidArgument(format!(
+                    "expected NAMESPACE|CLASS, got {kind:?}"
+                )))
+            }
+        };
+        let (kw, role) = Self::split_word(r).ok_or_else(|| {
+            CoreError::InvalidArgument("usage: … FROM <role>".to_string())
+        })?;
+        if !kw.eq_ignore_ascii_case("FROM") {
+            return Err(CoreError::InvalidArgument(format!(
+                "expected FROM, got {kw:?}"
+            )));
+        }
+        Ok(QueryAst::RevokePrivilege {
+            action,
+            object,
+            role: role.to_string(),
+        })
+    }
+
+    fn parse_show_grants(input: &str) -> Result<QueryAst> {
+        let rest = input["SHOW GRANTS".len()..].trim();
+        if rest.is_empty() {
+            return Ok(QueryAst::ShowGrants { role: None });
+        }
+        let (kw, role) = Self::split_word(rest).ok_or_else(|| {
+            CoreError::InvalidArgument("usage: SHOW GRANTS [FOR <role>]".to_string())
+        })?;
+        if !kw.eq_ignore_ascii_case("FOR") || role.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "usage: SHOW GRANTS [FOR <role>]".to_string(),
+            ));
+        }
+        Ok(QueryAst::ShowGrants {
+            role: Some(role.to_string()),
+        })
     }
 
     /// Parses EXPLAIN [REASONING] <query>
