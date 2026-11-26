@@ -607,10 +607,11 @@ fn main() -> Result<()> {
             // read-only and is re-mapped at every start. Fails fast: a silent
             // miss would leave RBAC unenforced without telling anyone.
             match rbac::migrate_api_keys(&cfg, &policy_svc) {
-                Ok(n) if n > 0 => println!(
-                    "RBAC: {} api key(s) mapped into __sys__.users (roles _readonly/_readwrite/_admin)",
-                    n
-                ),
+                Ok(outcome) if outcome.keys_mapped > 0 => {
+                    // 一批=一审计记录 (design §12): the whole batch is one record.
+                    executor.audit_system("grant_change", &outcome.audit_detail());
+                    println!("RBAC: {}", outcome.audit_detail());
+                }
                 Ok(_) => {}
                 Err(e) => {
                     return Err(onto_core::CoreError::Custom(format!(

@@ -24,10 +24,11 @@ use onto_core::Result;
 use onto_ontology::policy_store::PolicyService;
 use std::collections::HashMap;
 
-/// Map `api_keys.json` into the policy store. Returns the number of keys
-/// mapped. Safe to re-run: ensure-style, converges to the config's content.
-pub fn migrate_api_keys(config: &AuthConfig, svc: &PolicyService) -> Result<usize> {
-    ensure_builtin_roles(svc)?;
+/// Map `api_keys.json` into the policy store. Returns what the batch did
+/// (design §12 「一批=一审计记录」: the whole migration run is one audit
+/// record). Safe to re-run: ensure-style, converges to the config's content.
+pub fn migrate_api_keys(config: &AuthConfig, svc: &PolicyService) -> Result<MigrationOutcome> {
+    let roles_created = ensure_builtin_roles(svc)?;
 
     // Two passes: keys sharing a principal union their tier (the model unions
     // roles), so reconcile against the strongest tier seen for that id.
@@ -41,6 +42,7 @@ pub fn migrate_api_keys(config: &AuthConfig, svc: &PolicyService) -> Result<usiz
         }
     }
 
+    let mut principals_created = 0usize;
     for key in &config.keys {
         let id = principal_id_for(key);
         if svc.engine.principal(&id).is_none() {
@@ -52,6 +54,7 @@ pub fn migrate_api_keys(config: &AuthConfig, svc: &PolicyService) -> Result<usiz
                 disabled: false,
                 cred_scheme: CRED_SCHEME_BLAKE3.to_string(),
             })?;
+            principals_created += 1;
         }
         // Config-managed keys are not epoch-gated (lifetime = config file).
         svc.put_token(&key.key, &id, None)?;
@@ -60,12 +63,36 @@ pub fn migrate_api_keys(config: &AuthConfig, svc: &PolicyService) -> Result<usiz
     for (id, want) in &tier {
         reconcile_tier(svc, id, want)?;
     }
-    Ok(config.keys.len())
+    Ok(MigrationOutcome {
+        keys_mapped: config.keys.len(),
+        principals_created,
+        roles_created,
+    })
+}
+
+/// What a migration batch did (for the one audit record and the startup log).
+pub struct MigrationOutcome {
+    pub keys_mapped: usize,
+    pub principals_created: usize,
+    pub roles_created: usize,
+}
+
+impl MigrationOutcome {
+    /// Secret-free audit/log detail for the batch (never names key material).
+    pub fn audit_detail(&self) -> String {
+        format!(
+            "api_keys migration: {} key(s) mapped to principals ({} created); \
+             built-in roles _readonly/_readwrite/_admin ensured ({} created)",
+            self.keys_mapped, self.principals_created, self.roles_created
+        )
+    }
 }
 
 /// The three built-in tiers (design §9.2), each granted `NAMESPACE *` at its
 /// action level. Idempotent: roles may already exist and grants deduplicate.
-fn ensure_builtin_roles(svc: &PolicyService) -> Result<()> {
+/// Returns how many roles were newly created.
+fn ensure_builtin_roles(svc: &PolicyService) -> Result<usize> {
+    let mut created = 0usize;
     for (role, actions) in [
         (BUILTIN_ROLE_READONLY, vec![Action::Read]),
         (BUILTIN_ROLE_READWRITE, vec![Action::Read, Action::Write]),
@@ -74,7 +101,9 @@ fn ensure_builtin_roles(svc: &PolicyService) -> Result<()> {
             vec![Action::Read, Action::Write, Action::Ddl],
         ),
     ] {
-        svc.create_role(role)?;
+        if svc.create_role(role)? {
+            created += 1;
+        }
         for action in actions {
             svc.grant(Grant {
                 role: role.to_string(),
@@ -83,7 +112,7 @@ fn ensure_builtin_roles(svc: &PolicyService) -> Result<()> {
             })?;
         }
     }
-    Ok(())
+    Ok(created)
 }
 
 /// Keep only `want` of the three built-in tier roles on `id`. Any other role
@@ -191,7 +220,7 @@ mod tests {
             key("sec-rw", Permission::ReadWrite, None),
             key("sec-ad", Permission::Admin, None),
         ]);
-        assert_eq!(migrate_api_keys(&cfg, &svc).unwrap(), 3);
+        assert_eq!(migrate_api_keys(&cfg, &svc).unwrap().keys_mapped, 3);
 
         // Built-in roles exist with the tier grants on NAMESPACE *.
         let eng: &PolicyEngine = &svc.engine;
@@ -231,12 +260,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let svc = service(dir.path());
         let cfg = config(vec![key("sec-1", Permission::ReadWrite, Some("alice"))]);
-        migrate_api_keys(&cfg, &svc).unwrap();
+        let first = migrate_api_keys(&cfg, &svc).unwrap();
+        assert_eq!(first.principals_created, 1);
+        assert_eq!(first.roles_created, 3);
         svc.grant_role("alice", "analyst").unwrap();
         let grants_before = svc.engine.grants_for_role(BUILTIN_ROLE_READWRITE).len();
 
-        // Second run converges without clobbering operator-added state.
-        migrate_api_keys(&cfg, &svc).unwrap();
+        // Second run converges without clobbering operator-added state, and
+        // the batch reports no creation (audit sees a no-op batch).
+        let second = migrate_api_keys(&cfg, &svc).unwrap();
+        assert_eq!(second.principals_created, 0);
+        assert_eq!(second.roles_created, 0);
         let alice = svc.engine.principal("alice").unwrap();
         assert!(alice.roles.contains("analyst"), "extra role must survive");
         assert!(alice.roles.contains(BUILTIN_ROLE_READWRITE));
@@ -250,6 +284,23 @@ mod tests {
             svc.engine.authenticate_token("sec-1").unwrap().id,
             "alice"
         );
+    }
+
+    #[test]
+    fn migration_audit_detail_names_counts_but_no_key_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service(dir.path());
+        let cfg = config(vec![
+            key("sec-1", Permission::ReadOnly, None),
+            key("sec-2", Permission::Admin, Some("alice")),
+        ]);
+        let outcome = migrate_api_keys(&cfg, &svc).unwrap();
+        let detail = outcome.audit_detail();
+        assert!(detail.contains("2 key(s)"), "{detail}");
+        assert!(detail.contains("_readonly/_readwrite/_admin"), "{detail}");
+        // Secrets must never reach the audit trail.
+        assert!(!detail.contains("sec-1"), "{detail}");
+        assert!(!detail.contains("sec-2"), "{detail}");
     }
 
     #[test]

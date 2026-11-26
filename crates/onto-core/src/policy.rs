@@ -338,6 +338,25 @@ impl PolicyEngine {
         Some(p.clone())
     }
 
+    /// ROTATE TOKEN (design §10): bump the principal's token epoch — every
+    /// epoch-gated token dies — and register `new_token` at the new epoch.
+    /// Config-managed keys (not epoch-gated) are unaffected. Returns false
+    /// when the principal is unknown.
+    pub fn rotate_token(&self, principal_id: &str, new_token: &str) -> bool {
+        {
+            let mut st = self.state.write().unwrap();
+            let Some(p) = st.principals.get_mut(principal_id) else {
+                return false;
+            };
+            p.token_epoch += 1;
+            let epoch = p.token_epoch;
+            st.token_index
+                .insert(token_hash(new_token), (principal_id.to_string(), Some(epoch)));
+        }
+        self.bump();
+        true
+    }
+
     /// Store/replace a principal's password credential (salt+hash).
     pub fn put_credential(&self, rec: CredentialRecord) {
         let mut st = self.state.write().unwrap();
@@ -877,5 +896,21 @@ mod tests {
         assert!(eng2.authenticate_token("session-tok").is_some());
         assert!(eng2.authenticate_token("old-session").is_none());
         assert!(eng2.authenticate_token("config-key").is_some());
+    }
+
+    #[test]
+    fn rotate_token_kills_epoch_gated_but_not_config_keys() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &[]));
+        eng.put_token("session-1", "alice", Some(0));
+        eng.put_token("config-key", "alice", None);
+        assert!(eng.rotate_token("alice", "session-2"));
+        // Old epoch-gated token is dead; the replacement and config key live.
+        assert!(eng.authenticate_token("session-1").is_none());
+        assert!(eng.authenticate_token("session-2").is_some());
+        assert!(eng.authenticate_token("config-key").is_some());
+        assert_eq!(eng.principal("alice").unwrap().token_epoch, 1);
+        // Unknown principal: no-op, false.
+        assert!(!eng.rotate_token("ghost", "tok"));
     }
 }

@@ -1171,6 +1171,12 @@ impl QueryExecutor {
         }
     }
 
+    /// Append one audit record as the server-local system actor — startup
+    /// migration events (design §12 「一批=一审计记录」).
+    pub fn audit_system(&self, action: &str, detail: &str) {
+        self.audit(None, action, &[], detail);
+    }
+
     /// Collects every class/table name referenced by the statement.
     fn collect_class_names(ast: &QueryAst) -> Vec<String> {
         let mut names = Vec::new();
@@ -1420,7 +1426,24 @@ impl QueryExecutor {
             ));
         }
 
-        let detail = format!("{ast:?}");
+        // Audit detail must not carry secrets (passwords); success messages
+        // are already secret-free (ROTATE TOKEN returns early below).
+        let detail = match ast {
+            A::CreateUser {
+                id,
+                service_account,
+                ..
+            } => format!(
+                "CREATE {} {id}",
+                if *service_account {
+                    "SERVICE ACCOUNT"
+                } else {
+                    "USER"
+                }
+            ),
+            A::AlterUserPassword { id, .. } => format!("ALTER USER {id} PASSWORD"),
+            other => format!("{other:?}"),
+        };
         let success = match ast {
             A::CreateUser {
                 id,
@@ -1472,6 +1495,23 @@ impl QueryExecutor {
                     cred_scheme: CRED_SCHEME_BLAKE3.to_string(),
                 })?;
                 format!("password updated for '{id}' (tokens rotated)")
+            }
+            A::RotateToken { id } => {
+                // Epoch bump + replacement token in one transaction (design
+                // §10). The minted secret goes to the caller only — the audit
+                // line below must not echo it.
+                let mut raw = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut raw);
+                let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+                if !svc.rotate_token(id, &token)? {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "no such principal '{id}'"
+                    )));
+                }
+                self.audit(Some(actor), "token_rotate", &[], &format!("ROTATE TOKEN {id}"));
+                return Ok(QueryResult::Success(format!(
+                    "token rotated for '{id}': {token}"
+                )));
             }
             A::CreateRole { name } => {
                 if !svc.create_role(name)? {
@@ -1553,7 +1593,14 @@ impl QueryExecutor {
                 )))
             }
         };
-        self.audit(Some(actor), "grant_change", &[], &format!("{detail} -> {success}"));
+        // Credential/rotation changes are `token_rotate` (design §12 event
+        // types); the rest of the policy plane is `grant_change`.
+        let event = if matches!(ast, A::AlterUserPassword { .. }) {
+            "token_rotate"
+        } else {
+            "grant_change"
+        };
+        self.audit(Some(actor), event, &[], &format!("{detail} -> {success}"));
         Ok(QueryResult::Success(success))
     }
 
@@ -1568,6 +1615,7 @@ impl QueryExecutor {
             A::CreateUser { .. }
                 | A::DropUser { .. }
                 | A::AlterUserPassword { .. }
+                | A::RotateToken { .. }
                 | A::CreateRole { .. }
                 | A::DropRole { .. }
                 | A::GrantRole { .. }
@@ -20244,6 +20292,88 @@ mod tests {
         // The PDP agrees with the PEP (check_class facade).
         assert!(svc.check_class("alice", Action::Read, "erp", "orders"));
         assert!(!svc.check_class("bob", Action::Read, "erp", "orders"));
+    }
+
+    /// ROTATE TOKEN (design §10/§12): the epoch bump retires in-flight
+    /// session tokens, mints a replacement, and audits `token_rotate`
+    /// without echoing secrets.
+    #[test]
+    fn rotate_token_lifecycle_and_audit() {
+        let (executor, _dir) = setup();
+        let pdir = tempdir().unwrap();
+        let svc = onto_ontology::policy_store::PolicyService::open(
+            onto_ontology::policy_store::PolicyStore::new(Arc::new(
+                LsmEngine::open(StorageOptions {
+                    data_dir: pdir.path().to_path_buf(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )),
+        )
+        .unwrap();
+        let adir = tempdir().unwrap();
+        let audit_path = adir.path().join("audit.log");
+        let executor = executor
+            .with_policy_service(svc.clone())
+            .with_audit_log(&audit_path);
+        let admin = QueryActor {
+            label: "root".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: true,
+            principal_id: None,
+        };
+        let run = |sql: &str| {
+            let ast = QueryParser::parse(sql).unwrap();
+            executor.execute_as(&ast, &admin)
+        };
+
+        run("CREATE USER alice WITH PASSWORD 'pw'").unwrap();
+        // A session token minted at epoch 0 (as CLI LOGIN would).
+        svc.engine.put_token("session-1", "alice", Some(0));
+        svc.engine.put_token("cfg-key", "alice", None);
+        assert!(svc.engine.authenticate_token("session-1").is_some());
+
+        // Policy DDL is admin-only: a non-admin principal cannot rotate.
+        let user_actor = QueryActor {
+            label: "alice".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+            principal_id: Some("alice".to_string()),
+        };
+        let ast = QueryParser::parse("ROTATE TOKEN alice").unwrap();
+        assert!(executor.execute_as(&ast, &user_actor).is_err());
+
+        // Rotation: the old session token dies, the returned one works, the
+        // config-managed key survives (not epoch-gated).
+        let text = match run("ROTATE TOKEN alice").unwrap() {
+            QueryResult::Success(s) => s,
+            other => panic!("unexpected result: {other:?}"),
+        };
+        assert!(text.contains("token rotated for 'alice':"), "{text}");
+        let token = text.split_once(": ").unwrap().1.trim().to_string();
+        assert!(!token.is_empty());
+        assert!(svc.engine.authenticate_token("session-1").is_none());
+        assert!(svc.engine.authenticate_token(&token).is_some());
+        assert!(svc.engine.authenticate_token("cfg-key").is_some());
+
+        // Unknown principal errors.
+        assert!(run("ROTATE TOKEN ghost").is_err());
+
+        // Audit: `token_rotate` event, no secrets carried.
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(audit.contains("\"token_rotate\""), "audit: {audit}");
+        assert!(audit.contains("ROTATE TOKEN alice"), "audit: {audit}");
+        assert!(!audit.contains(&token), "audit must not echo the token: {audit}");
+
+        // ALTER USER PASSWORD is a rotation too (design §10): epoch bump,
+        // `token_rotate` event, password never in the audit trail.
+        run("ALTER USER alice PASSWORD 'newpw'").unwrap();
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(audit.contains("ALTER USER alice PASSWORD"), "audit: {audit}");
+        assert!(!audit.contains("newpw"), "audit must not echo the password: {audit}");
+        assert!(!audit.contains("'pw'"), "audit must not echo the password: {audit}");
     }
 
     fn test_actor(ns: Option<&str>) -> QueryActor {

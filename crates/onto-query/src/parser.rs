@@ -440,6 +440,9 @@ pub enum QueryAst {
     /// ALTER USER <id> PASSWORD '<pw>' (bumps token epoch)
     AlterUserPassword { id: String, password: String },
 
+    /// ROTATE TOKEN <principal> (bumps token epoch, mints a replacement)
+    RotateToken { id: String },
+
     /// CREATE ROLE <name>
     CreateRole { name: String },
 
@@ -778,6 +781,7 @@ impl QueryAst {
             | A::CreateUser { .. }
             | A::DropUser { .. }
             | A::AlterUserPassword { .. }
+            | A::RotateToken { .. }
             | A::CreateRole { .. }
             | A::DropRole { .. }
             | A::GrantRole { .. }
@@ -843,6 +847,7 @@ impl QueryAst {
             QueryAst::CreateUser { .. } => false,
             QueryAst::DropUser { .. } => false,
             QueryAst::AlterUserPassword { .. } => false,
+            QueryAst::RotateToken { .. } => false,
             QueryAst::CreateRole { .. } => false,
             QueryAst::DropRole { .. } => false,
             QueryAst::GrantRole { .. } => false,
@@ -1413,6 +1418,8 @@ impl QueryParser {
             Self::parse_drop_user(input)
         } else if starts_with("ALTER USER") {
             Self::parse_alter_user_password(input)
+        } else if starts_with("ROTATE TOKEN") {
+            Self::parse_rotate_token(input)
         } else if starts_with("CREATE ROLE") {
             Self::parse_create_role(input)
         } else if starts_with("DROP ROLE") {
@@ -1650,6 +1657,19 @@ impl QueryParser {
             id: id.to_string(),
             password: pw,
         })
+    }
+
+    /// Parses: ROTATE TOKEN <principal>
+    fn parse_rotate_token(input: &str) -> Result<QueryAst> {
+        let (id, rest) = Self::split_word(input["ROTATE TOKEN".len()..].trim()).ok_or_else(|| {
+            CoreError::InvalidArgument("usage: ROTATE TOKEN <principal>".to_string())
+        })?;
+        if !rest.is_empty() {
+            return Err(CoreError::InvalidArgument(format!(
+                "trailing input in ROTATE TOKEN: {rest}"
+            )));
+        }
+        Ok(QueryAst::RotateToken { id: id.to_string() })
     }
 
     fn parse_create_role(input: &str) -> Result<QueryAst> {
@@ -6712,5 +6732,22 @@ mod tests {
             }
             _ => panic!("expected Select"),
         }
+    }
+
+    #[test]
+    fn test_parse_rotate_token() {
+        match QueryParser::parse("ROTATE TOKEN alice").unwrap() {
+            QueryAst::RotateToken { id } => assert_eq!(id, "alice"),
+            other => panic!("expected RotateToken, got {other:?}"),
+        }
+        assert!(QueryParser::parse("ROTATE TOKEN").is_err());
+        assert!(QueryParser::parse("ROTATE TOKEN a b").is_err());
+        // Policy plane: no data object access (gated by the admin gate).
+        assert!(
+            QueryParser::parse("ROTATE TOKEN alice")
+                .unwrap()
+                .required_action()
+                .is_none()
+        );
     }
 }

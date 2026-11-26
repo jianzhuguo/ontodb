@@ -88,6 +88,16 @@ impl PolicyService {
         self.persist()
     }
 
+    /// ROTATE TOKEN (design §10): epoch-bump + replacement token as one
+    /// transaction. Returns false when the principal is unknown.
+    pub fn rotate_token(&self, principal_id: &str, new_token: &str) -> Result<bool> {
+        let ok = self.engine.rotate_token(principal_id, new_token);
+        if ok {
+            self.persist()?;
+        }
+        Ok(ok)
+    }
+
     // -- roles & grants --
 
     pub fn grant_role(&self, principal_id: &str, role: &str) -> Result<bool> {
