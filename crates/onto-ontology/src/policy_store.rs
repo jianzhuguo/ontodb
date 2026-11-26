@@ -80,9 +80,11 @@ impl PolicyService {
         self.persist()
     }
 
-    /// Register a bearer token (only its hash is stored).
-    pub fn put_token(&self, token: &str, principal_id: &str) -> Result<()> {
-        self.engine.put_token(token, principal_id);
+    /// Register a bearer token (only its hash is stored). `mint_epoch`:
+    /// `Some(epoch)` = session token that dies with the principal's next
+    /// epoch bump; `None` = config-managed key (not epoch-gated).
+    pub fn put_token(&self, token: &str, principal_id: &str, mint_epoch: Option<u64>) -> Result<()> {
+        self.engine.put_token(token, principal_id, mint_epoch);
         self.persist()
     }
 
@@ -169,14 +171,14 @@ mod tests {
                 object: ObjectRef::Namespace("erp".into()),
             })
             .unwrap();
-            svc.put_token("tok-a", "alice").unwrap();
+            svc.put_token("tok-a", "alice", None).unwrap();
         }
         // Fresh service over the same engine dir: grants and tokens survive.
         let svc = PolicyService::open(open_store(dir.path())).unwrap();
         assert!(svc.check_class("alice", Action::Read, "erp", "orders"));
         assert!(svc
             .engine
-            .authenticate_token("tok-a", 0)
+            .authenticate_token("tok-a")
             .is_some());
         assert_eq!(svc.engine.grants().len(), 1);
     }

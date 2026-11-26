@@ -178,12 +178,30 @@ fn connect(address: &str, tls_cert: Option<&str>, api_key: Option<&str>) -> io::
         // TODO: Implement TLS upgrade using native-tls or rustls
     }
 
-    // If API key is provided, send authentication
+    // If API key is provided, send authentication and read the reply
+    // (server frames responses with a trailing \0).
     if let Some(key) = api_key {
         let auth_msg = format!("AUTH {}\n", key);
         stream.write_all(auth_msg.as_bytes())?;
-        // Note: Server would need to handle AUTH command
-        // For now, this is a placeholder for the authentication protocol
+        stream.flush()?;
+
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            reader.read_exact(&mut byte)?;
+            if byte[0] == 0 {
+                break;
+            }
+            response.push(byte[0]);
+        }
+        let reply = String::from_utf8_lossy(&response);
+        if reply.trim_start().starts_with("ERR") {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                reply.trim().to_string(),
+            ));
+        }
     }
 
     Ok(stream)

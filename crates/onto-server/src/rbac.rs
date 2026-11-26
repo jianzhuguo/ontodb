@@ -53,7 +53,8 @@ pub fn migrate_api_keys(config: &AuthConfig, svc: &PolicyService) -> Result<usiz
                 cred_scheme: CRED_SCHEME_BLAKE3.to_string(),
             })?;
         }
-        svc.put_token(&key.key, &id)?;
+        // Config-managed keys are not epoch-gated (lifetime = config file).
+        svc.put_token(&key.key, &id, None)?;
     }
 
     for (id, want) in &tier {
@@ -202,13 +203,13 @@ mod tests {
         assert_eq!(eng.grants_for_role(BUILTIN_ROLE_ADMIN).len(), 3);
 
         // Each key resolves to its own ServiceAccount with the right tier.
-        let ro = eng.authenticate_token_current("sec-ro").unwrap();
+        let ro = eng.authenticate_token("sec-ro").unwrap();
         assert!(matches!(ro.kind, PrincipalKind::ServiceAccount));
         assert!(ro.roles.contains(BUILTIN_ROLE_READONLY));
         assert!(!ro.roles.contains(BUILTIN_ROLE_READWRITE));
-        let rw = eng.authenticate_token_current("sec-rw").unwrap();
+        let rw = eng.authenticate_token("sec-rw").unwrap();
         assert!(rw.roles.contains(BUILTIN_ROLE_READWRITE));
-        let ad = eng.authenticate_token_current("sec-ad").unwrap();
+        let ad = eng.authenticate_token("sec-ad").unwrap();
         assert!(ad.roles.contains(BUILTIN_ROLE_ADMIN));
 
         // Tier behavior matrix (design §9.2): no ride-along between levels.
@@ -222,7 +223,7 @@ mod tests {
         assert!(eng.check_class(&ad.id, Action::Ddl, ns, cls));
 
         // Unknown keys resolve to nothing.
-        assert!(eng.authenticate_token_current("nope").is_none());
+        assert!(eng.authenticate_token("nope").is_none());
     }
 
     #[test]
@@ -246,7 +247,7 @@ mod tests {
             "grants must not duplicate"
         );
         assert_eq!(
-            svc.engine.authenticate_token_current("sec-1").unwrap().id,
+            svc.engine.authenticate_token("sec-1").unwrap().id,
             "alice"
         );
     }
@@ -261,17 +262,17 @@ mod tests {
         ]);
         migrate_api_keys(&cfg, &svc).unwrap();
         assert_eq!(
-            svc.engine.authenticate_token_current("sec-a").unwrap().id,
+            svc.engine.authenticate_token("sec-a").unwrap().id,
             "alice"
         );
-        let derived = svc.engine.authenticate_token_current("sec-b").unwrap().id;
+        let derived = svc.engine.authenticate_token("sec-b").unwrap().id;
         assert!(derived.starts_with("key_"), "derived id: {derived}");
         assert_eq!(derived.len(), 4 + 8, "derived id: {derived}");
 
         // Stable across re-runs (same key → same id, no second principal).
         migrate_api_keys(&cfg, &svc).unwrap();
         assert_eq!(
-            svc.engine.authenticate_token_current("sec-b").unwrap().id,
+            svc.engine.authenticate_token("sec-b").unwrap().id,
             derived
         );
         assert_eq!(svc.engine.principals().len(), 2);

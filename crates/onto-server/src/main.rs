@@ -738,6 +738,7 @@ fn main() -> Result<()> {
                         &args.listen,
                         executor.clone(),
                         metrics.clone(),
+                        args.auth,
                     )),
                 ];
 
@@ -827,7 +828,7 @@ fn main() -> Result<()> {
                 res
             })?;
         } else {
-            rt.block_on(run_tcp_server(&args.listen, executor.clone(), metrics))?;
+            rt.block_on(run_tcp_server(&args.listen, executor.clone(), metrics, args.auth))?;
         }
     }
 
@@ -1144,6 +1145,7 @@ async fn run_tcp_server(
     addr: &str,
     executor: Arc<QueryExecutor>,
     metrics: Arc<metrics::Metrics>,
+    auth_enabled: bool,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr)
         .await
@@ -1167,7 +1169,7 @@ async fn run_tcp_server(
         metrics.tcp_connections_active.inc();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, &executor, &metrics).await {
+            if let Err(e) = handle_client(stream, &executor, &metrics, auth_enabled).await {
                 eprintln!("Client error: {}", e);
             }
             metrics.tcp_connections_active.dec();
@@ -1175,6 +1177,64 @@ async fn run_tcp_server(
         });
     }
     Ok(())
+}
+
+/// Case-insensitive reserved-command match: `CMD <rest>` at line start.
+/// `AUTHORIZE ...` does not match `AUTH` (the separator is required).
+fn strip_auth_cmd<'a>(input: &'a str, cmd: &str) -> Option<&'a str> {
+    let rest = input.get(cmd.len()..)?;
+    if input.len() > cmd.len() && input[..cmd.len()].eq_ignore_ascii_case(cmd) && rest.starts_with(' ') {
+        let rest = rest.trim_start();
+        if !rest.is_empty() {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// `LOGIN <user> PASSWORD '<pw>'` → (user, password). Quotes around the
+/// password are optional.
+fn parse_login(rest: &str) -> Option<(String, String)> {
+    let (user, tail) = rest.trim().split_once(|c: char| c.is_whitespace())?;
+    let (kw, pw_raw) = tail.trim_start().split_once(|c: char| c.is_whitespace())?;
+    if !kw.eq_ignore_ascii_case("PASSWORD") {
+        return None;
+    }
+    let pw = pw_raw.trim();
+    let pw = pw
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| pw.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .unwrap_or(pw);
+    if user.is_empty() || pw.is_empty() {
+        return None;
+    }
+    Some((user.to_string(), pw.to_string()))
+}
+
+/// Resolve a presented bearer token to its live principal (policy store):
+/// migrated API keys (design §9.2) and session tokens (design §10) both land
+/// in `__sys__.users`. Fails closed on unknown / disabled / epoch-stale.
+fn cli_authenticate(executor: &QueryExecutor, token: &str) -> Option<onto_core::policy::Principal> {
+    executor.policy_service()?.engine.authenticate_token(token)
+}
+
+/// `LOGIN <user> PASSWORD '<pw>'`: password check + mint an epoch-gated
+/// session token (design §10: 会话 token，epoch 失效对齐). The token dies
+/// when the principal's `token_epoch` moves (password change / rotation).
+fn cli_login(executor: &QueryExecutor, user: &str, password: &str) -> Option<String> {
+    let svc = executor.policy_service()?;
+    let pepper = std::env::var("ONTODB_CRED_PEPPER").ok();
+    let p = svc.engine.authenticate_password(
+        user,
+        password,
+        pepper.as_ref().map(|s| s.as_bytes()),
+    )?;
+    let mut raw = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut raw);
+    let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    svc.put_token(&token, &p.id, Some(p.token_epoch)).ok()?;
+    Some(token)
 }
 
 /// Handles a single client connection asynchronously.
@@ -1185,10 +1245,21 @@ async fn run_tcp_server(
 /// - Result is terminated by a null byte (`\0`) as end-of-message marker
 /// - Errors are prefixed with `ERR: `
 /// - Client sends `quit` or `exit` to disconnect
+///
+/// Wire auth (RBAC M1, design §10) when the server runs with `--auth`:
+/// - `AUTH <token>` — validate a bearer token (API key or session token) and
+///   bind it to the connection; replies `OK` / `ERR: ...`
+/// - `LOGIN <user> PASSWORD '<pw>'` — password login; replies `OK <token>`
+///   with a fresh epoch-gated session token, also bound to the connection
+/// - every query revalidates the bound token and runs as that principal
+///   (`execute_as`), so the class/namespace PEP applies. Unauthenticated
+///   connections cannot query. Without `--auth` the wire keeps its pre-RBAC
+///   anonymous behavior (design: `--auth` 不开 = 现行为).
 async fn handle_client(
     stream: tokio::net::TcpStream,
     executor: &QueryExecutor,
     metrics: &metrics::Metrics,
+    auth_enabled: bool,
 ) -> Result<()> {
     let peer = stream
         .peer_addr()
@@ -1199,6 +1270,8 @@ async fn handle_client(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
+    // Bearer token bound to this connection (via AUTH or LOGIN).
+    let mut session_token: Option<String> = None;
 
     loop {
         line.clear();
@@ -1229,8 +1302,81 @@ async fn handle_client(
             break;
         }
 
+        // ── wire auth commands (reserved words, not SQL) ──
+        if let Some(token) = strip_auth_cmd(input, "AUTH") {
+            let reply = if auth_enabled {
+                match cli_authenticate(executor, token) {
+                    Some(_) => {
+                        session_token = Some(token.to_string());
+                        "OK\n".to_string()
+                    }
+                    None => {
+                        session_token = None;
+                        "ERR: invalid credentials\n".to_string()
+                    }
+                }
+            } else {
+                // Auth disabled = pre-RBAC behavior; the key is accepted but
+                // not bound (queries keep running anonymously).
+                "OK\n".to_string()
+            };
+            writer.write_all(reply.as_bytes()).await?;
+            writer.write_all(&[0]).await?;
+            writer.flush().await?;
+            continue;
+        }
+        if let Some(rest) = strip_auth_cmd(input, "LOGIN") {
+            let reply = if auth_enabled {
+                match parse_login(rest) {
+                    Some((user, password)) => match cli_login(executor, &user, &password) {
+                        Some(token) => {
+                            session_token = Some(token.clone());
+                            format!("OK {token}\n")
+                        }
+                        None => "ERR: invalid credentials\n".to_string(),
+                    },
+                    None => "ERR: usage: LOGIN <user> PASSWORD '<pw>'\n".to_string(),
+                }
+            } else {
+                "ERR: authentication disabled\n".to_string()
+            };
+            writer.write_all(reply.as_bytes()).await?;
+            writer.write_all(&[0]).await?;
+            writer.flush().await?;
+            continue;
+        }
+
         // Remove trailing semicolon
         let input = input.trim_end_matches(';').trim();
+
+        // Resolve the connection identity. The token is revalidated on every
+        // query, so a password change / rotation kills in-flight sessions
+        // (design §9.1 "在途 token 全失效").
+        let actor = if auth_enabled {
+            let Some(token) = session_token.as_deref() else {
+                writer.write_all(b"ERR: not authenticated\n\0").await?;
+                continue;
+            };
+            match cli_authenticate(executor, token) {
+                Some(p) => {
+                    use onto_core::policy::BUILTIN_ROLE_ADMIN;
+                    Some(onto_query::QueryActor {
+                        label: p.id.clone(),
+                        namespace: None,
+                        client_ip: peer.clone(),
+                        is_admin: p.roles.contains(BUILTIN_ROLE_ADMIN),
+                        principal_id: Some(p.id),
+                    })
+                }
+                None => {
+                    session_token = None;
+                    writer.write_all(b"ERR: session expired\n\0").await?;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
 
         // Execute query
         let start = std::time::Instant::now();
@@ -1244,10 +1390,12 @@ async fn handle_client(
                     onto_query::QueryAst::VectorSearch { .. } => "VECTOR_SEARCH",
                     _ => "OTHER",
                 };
-                let result = if onto_query::QueryExecutor::is_read_only_query(&ast) {
-                    executor.execute_read(&ast)
-                } else {
-                    executor.execute(&ast)
+                let read_only = onto_query::QueryExecutor::is_read_only_query(&ast);
+                let result = match (&actor, read_only) {
+                    (Some(a), true) => executor.execute_read_as(&ast, a),
+                    (Some(a), false) => executor.execute_as(&ast, a),
+                    (None, true) => executor.execute_read(&ast),
+                    (None, false) => executor.execute(&ast),
                 };
                 match result {
                     Ok(result) => {
@@ -1352,5 +1500,233 @@ fn load_sharding_config(
         // Create default config with a single shard
         tracing::info!("No sharding config file specified, using default single-shard config");
         Ok(onto_sharding::ShardMap::new(default_shard))
+    }
+}
+
+#[cfg(test)]
+mod tcp_auth_tests {
+    use super::*;
+    use onto_core::policy::{Action, BUILTIN_ROLE_ADMIN};
+    use onto_ontology::policy_store::{PolicyService, PolicyStore};
+    use onto_storage::{EngineSet, LsmEngine};
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+
+    fn setup() -> (Arc<QueryExecutor>, Arc<PolicyService>) {
+        let dir = tempfile::tempdir().unwrap();
+        let options = StorageOptions {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let engine = Arc::new(EngineSet::new(Arc::new(LsmEngine::open(options).unwrap())));
+        let ontology_store = OntologyStore::new(engine.default_engine());
+        let svc = PolicyService::open(PolicyStore::new(engine.default_engine())).unwrap();
+        let executor = Arc::new(
+            QueryExecutor::new(Arc::clone(&engine), ontology_store)
+                .with_policy_service(svc.clone()),
+        );
+        // Keep the tempdir alive for the whole test (like the e2e fixture).
+        std::mem::forget(dir);
+        (executor, svc)
+    }
+
+    fn admin() -> onto_query::QueryActor {
+        onto_query::QueryActor {
+            label: "test-admin".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: true,
+            principal_id: None,
+        }
+    }
+
+    fn run(executor: &QueryExecutor, sql: &str) {
+        let ast = QueryParser::parse(sql).unwrap();
+        executor.execute_as(&ast, &admin()).unwrap();
+    }
+
+    /// Serve the TCP wire (one accept loop, handler per connection) on a
+    /// random port. Returns the port.
+    fn spawn_server(executor: Arc<QueryExecutor>, auth_enabled: bool) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let executor = Arc::clone(&executor);
+                    tokio::spawn(async move {
+                        let metrics = metrics::Metrics::new();
+                        let _ = handle_client(stream, &executor, &metrics, auth_enabled).await;
+                    });
+                }
+            });
+        });
+        port
+    }
+
+    fn connect(port: u16) -> TcpStream {
+        let addr = format!("127.0.0.1:{port}");
+        for _ in 0..50 {
+            if let Ok(s) = TcpStream::connect(&addr) {
+                return s;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("could not connect to {addr}");
+    }
+
+    fn send(stream: &mut TcpStream, line: &str) -> String {
+        stream.write_all(format!("{line}\n").as_bytes()).unwrap();
+        stream.flush().unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            reader.read_exact(&mut byte).unwrap();
+            if byte[0] == 0 {
+                break;
+            }
+            response.push(byte[0]);
+        }
+        String::from_utf8_lossy(&response).to_string()
+    }
+
+    #[test]
+    fn strip_cmd_matches_reserved_words_only() {
+        assert_eq!(strip_auth_cmd("AUTH tok-1", "AUTH"), Some("tok-1"));
+        assert_eq!(strip_auth_cmd("auth tok-1", "AUTH"), Some("tok-1"));
+        assert_eq!(strip_auth_cmd("AUTHORIZE now", "AUTH"), None);
+        assert_eq!(strip_auth_cmd("AUTH", "AUTH"), None);
+        assert_eq!(strip_auth_cmd("LOGIN bob PASSWORD 'pw'", "LOGIN"), Some("bob PASSWORD 'pw'"));
+    }
+
+    #[test]
+    fn parse_login_extracts_user_and_password() {
+        assert_eq!(
+            parse_login("alice PASSWORD 'pw'").unwrap(),
+            ("alice".into(), "pw".into())
+        );
+        assert_eq!(
+            parse_login("alice PASSWORD \"pw\"").unwrap(),
+            ("alice".into(), "pw".into())
+        );
+        assert_eq!(
+            parse_login("alice password plain").unwrap(),
+            ("alice".into(), "plain".into())
+        );
+        assert!(parse_login("alice").is_none());
+        assert!(parse_login("alice SECRET 'pw'").is_none());
+    }
+
+    #[test]
+    fn tcp_auth_gates_queries_and_enforces_class_pep() {
+        let (executor, svc) = setup();
+        run(&executor, "CREATE ROLE reader");
+        run(&executor, "CREATE USER viewer WITH PASSWORD 'pw'");
+        run(&executor, "GRANT ROLE reader TO viewer");
+        run(&executor, "GRANT READ ON CLASS erp.orders TO reader");
+        run(&executor, "INSERT INTO erp.orders (name, price) VALUES ('o1', 1)");
+        // Config-managed key (migrated api_keys style): not epoch-gated.
+        svc.engine
+            .put_token("cfg-key-1", "viewer", None);
+        let port = spawn_server(executor, true);
+
+        let mut c = connect(port);
+        // Fail closed before authentication.
+        assert!(send(&mut c, "SELECT name FROM erp.orders").contains("not authenticated"));
+        // Bad token is rejected and binds nothing.
+        assert!(send(&mut c, "AUTH nope").contains("ERR"));
+        assert!(send(&mut c, "SELECT name FROM erp.orders").contains("not authenticated"));
+        // Good token binds the principal; PEP then applies per action.
+        assert!(send(&mut c, "AUTH cfg-key-1").trim().starts_with("OK"));
+        assert!(!send(&mut c, "SELECT name FROM erp.orders").starts_with("ERR"));
+        let denied = send(&mut c, "INSERT INTO erp.orders (name, price) VALUES ('o2', 2)");
+        assert!(denied.contains("permission denied"), "{denied}");
+    }
+
+    #[test]
+    fn tcp_login_mints_session_token_and_password_change_revokes_it() {
+        let (executor, _svc) = setup();
+        run(&executor, "CREATE ROLE reader");
+        run(&executor, "CREATE USER alice WITH PASSWORD 'pw'");
+        run(&executor, "GRANT ROLE reader TO alice");
+        run(&executor, "GRANT READ ON CLASS erp.orders TO reader");
+        run(&executor, "INSERT INTO erp.orders (name, price) VALUES ('o1', 1)");
+        let port = spawn_server(Arc::clone(&executor), true);
+
+        let mut c = connect(port);
+        assert!(send(&mut c, "LOGIN alice PASSWORD 'nope'").contains("ERR"));
+        let reply = send(&mut c, "LOGIN alice PASSWORD 'pw'");
+        assert!(reply.trim().starts_with("OK "), "{reply}");
+        let token = reply.trim().trim_start_matches("OK ").trim().to_string();
+        assert!(!token.is_empty());
+        // The session runs queries as alice.
+        assert!(!send(&mut c, "SELECT name FROM erp.orders").starts_with("ERR"));
+        // The session token also works on a fresh connection (design: 会话 token).
+        let mut c2 = connect(port);
+        assert!(send(&mut c2, &format!("AUTH {token}")).trim().starts_with("OK"));
+        // Password change bumps the epoch: in-flight tokens die (§9.1).
+        run(&executor, "ALTER USER alice PASSWORD 'newpw'");
+        assert!(send(&mut c, "SELECT name FROM erp.orders").contains("session expired"));
+        assert!(send(&mut c2, &format!("AUTH {token}")).contains("ERR"));
+    }
+
+    #[test]
+    fn tcp_admin_role_gates_policy_ddl() {
+        let (executor, svc) = setup();
+        run(&executor, "CREATE USER bob WITH PASSWORD 'pw'");
+        run(&executor, "CREATE USER alice WITH PASSWORD 'pw'");
+        svc.engine.grant_role("bob", BUILTIN_ROLE_ADMIN);
+        svc.engine
+            .put_token("bob-key", "bob", None);
+        svc.engine
+            .put_token("alice-key", "alice", None);
+        let port = spawn_server(executor, true);
+
+        let mut bob = connect(port);
+        assert!(send(&mut bob, "AUTH bob-key").trim().starts_with("OK"));
+        assert!(!send(&mut bob, "CREATE ROLE ops").starts_with("ERR"));
+
+        let mut alice = connect(port);
+        assert!(send(&mut alice, "AUTH alice-key").trim().starts_with("OK"));
+        let denied = send(&mut alice, "CREATE ROLE sneaky");
+        assert!(denied.contains("policy DDL requires"), "{denied}");
+    }
+
+    #[test]
+    fn tcp_auth_disabled_keeps_anonymous_behavior() {
+        let (executor, _svc) = setup();
+        run(&executor, "INSERT INTO erp.orders (name, price) VALUES ('o1', 1)");
+        let port = spawn_server(executor, false);
+
+        let mut c = connect(port);
+        // No AUTH needed; queries run anonymously (pre-RBAC behavior).
+        assert!(!send(&mut c, "SELECT name FROM erp.orders").starts_with("ERR"));
+        assert!(!send(&mut c, "SELECT name FROM erp.orders").starts_with("ERR"));
+        // AUTH is accepted but not bound (server stays anonymous).
+        assert!(send(&mut c, "AUTH whatever").trim().starts_with("OK"));
+        assert!(send(&mut c, "LOGIN alice PASSWORD 'pw'").contains("disabled"));
+    }
+
+    #[test]
+    fn tcp_admin_role_gates_policy_ddl_and_data_ddl() {
+        // Smoke: the PDP decision matrix reaches the wire (READ ≠ WRITE).
+        let (executor, svc) = setup();
+        run(&executor, "CREATE USER ops WITH PASSWORD 'pw'");
+        run(&executor, "INSERT INTO erp.orders (name, price) VALUES ('o1', 1)");
+        svc.engine.grant_role("ops", BUILTIN_ROLE_ADMIN);
+        svc.engine.put_token("ops-key", "ops", None);
+        assert!(svc.engine.check_class("ops", Action::Ddl, "erp", "orders"));
+        let port = spawn_server(executor, true);
+        let mut c = connect(port);
+        assert!(send(&mut c, "AUTH ops-key").trim().starts_with("OK"));
+        // Data DDL rides on the `_admin` short-circuit (design §8).
+        let reply = send(&mut c, "CREATE INDEX ON erp.orders (price)");
+        assert!(!reply.starts_with("ERR"), "{reply}");
     }
 }

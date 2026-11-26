@@ -221,7 +221,7 @@ impl AuthState {
         self.policy
             .as_ref()?
             .engine
-            .authenticate_token_current(key)
+            .authenticate_token(key)
             .map(|p| p.id)
     }
 

@@ -164,8 +164,12 @@ struct PolicyState {
     principals: HashMap<String, Principal>,
     /// principal id → credential (salt+hash), verified on password auth.
     credentials: HashMap<String, CredentialRecord>,
-    /// `BLAKE3(token)` → principal id (tokens are bearer secrets).
-    token_index: HashMap<[u8; 32], String>,
+    /// `BLAKE3(token)` → (principal id, mint epoch). The mint epoch is the
+    /// principal's `token_epoch` when the token was minted; a token dies once
+    /// the principal's epoch moves past it (design §9.1 "在途 token 全失效").
+    /// `None` = not epoch-gated (config-managed API keys: their lifetime is
+    /// governed by the config file, design §9.2).
+    token_index: HashMap<[u8; 32], (String, Option<u64>)>,
     /// Decision cache: (principal id, action, object) → allowed.
     cache: HashMap<(String, Action, ObjectRef), bool>,
 }
@@ -181,6 +185,11 @@ pub struct PolicySnapshot {
     pub roles: Vec<String>,
     /// (hex of `BLAKE3(token)`, principal id)
     pub tokens: Vec<(String, String)>,
+    /// (hex of `BLAKE3(token)`, mint epoch) — only epoch-gated tokens appear
+    /// here; absent = not epoch-gated. `#[serde(default)]` keeps snapshots
+    /// written before epoch tracking readable.
+    #[serde(default)]
+    pub token_epochs: Vec<(String, u64)>,
 }
 
 /// A credential record as persisted in the system namespace (M1.1 storage).
@@ -219,7 +228,12 @@ impl PolicyEngine {
             tokens: st
                 .token_index
                 .iter()
-                .map(|(h, id)| (to_hex(h), id.clone()))
+                .map(|(h, (id, _))| (to_hex(h), id.clone()))
+                .collect(),
+            token_epochs: st
+                .token_index
+                .iter()
+                .filter_map(|(h, (_, e))| e.map(|e| (to_hex(h), e)))
                 .collect(),
         }
     }
@@ -242,9 +256,11 @@ impl PolicyEngine {
             for c in snap.credentials {
                 st.credentials.insert(c.principal_id.clone(), c);
             }
+            let epochs: HashMap<String, u64> = snap.token_epochs.into_iter().collect();
             for (h, id) in snap.tokens {
                 if let Some(arr) = from_hex(&h) {
-                    st.token_index.insert(arr, id);
+                    let mint_epoch = epochs.get(&h).copied();
+                    st.token_index.insert(arr, (id, mint_epoch));
                 }
             }
         }
@@ -276,7 +292,7 @@ impl PolicyEngine {
     pub fn remove_principal(&self, id: &str) -> bool {
         let removed = {
             let mut st = self.state.write().unwrap();
-            st.token_index.retain(|_, v| v != id);
+            st.token_index.retain(|_, v| v.0 != id);
             st.principals.remove(id).is_some()
         };
         if removed {
@@ -294,35 +310,30 @@ impl PolicyEngine {
     }
 
     /// Register/replace a bearer token for a principal (stores only the hash).
-    /// `epoch` is the token's mint epoch: presented tokens whose epoch is
-    /// older than the principal's current epoch are rejected at auth time.
-    pub fn put_token(&self, token: &str, principal_id: &str) {
+    /// `mint_epoch` is `Some(epoch)` for session tokens minted under that
+    /// principal epoch — they die when the principal's epoch moves past them
+    /// (password change / revocation, design §9.1). `None` = not epoch-gated
+    /// (config-managed API keys, design §9.2: lifetime = config file).
+    pub fn put_token(&self, token: &str, principal_id: &str, mint_epoch: Option<u64>) {
         let mut st = self.state.write().unwrap();
-        st.token_index.insert(token_hash(token), principal_id.to_string());
+        st.token_index
+            .insert(token_hash(token), (principal_id.to_string(), mint_epoch));
     }
 
-    /// Resolve a bearer token to its live principal (disabled or
-    /// epoch-stale principals fail closed).
-    pub fn authenticate_token(&self, token: &str, mint_epoch: u64) -> Option<Principal> {
+    /// Resolve a bearer token to its live principal. Fails closed: unknown
+    /// token, disabled principal, and epoch-stale session tokens all yield
+    /// `None`.
+    pub fn authenticate_token(&self, token: &str) -> Option<Principal> {
         let st = self.state.read().unwrap();
-        let id = st.token_index.get(&token_hash(token))?;
-        let p = st.principals.get(id)?;
-        if p.disabled || mint_epoch < p.token_epoch {
-            return None;
-        }
-        Some(p.clone())
-    }
-
-    /// Like [`Self::authenticate_token`] for a token treated as minted at the
-    /// principal's current epoch: config-managed API keys (design §9.2) are
-    /// not epoch-minted — their lifetime is governed by the config file — so
-    /// only the `disabled` flag gates them.
-    pub fn authenticate_token_current(&self, token: &str) -> Option<Principal> {
-        let st = self.state.read().unwrap();
-        let id = st.token_index.get(&token_hash(token))?;
+        let (id, mint_epoch) = st.token_index.get(&token_hash(token))?;
         let p = st.principals.get(id)?;
         if p.disabled {
             return None;
+        }
+        if let Some(minted) = mint_epoch {
+            if *minted < p.token_epoch {
+                return None;
+            }
         }
         Some(p.clone())
     }
@@ -610,9 +621,9 @@ mod tests {
     fn token_hash_is_stable_and_lookup_works() {
         let eng = PolicyEngine::new();
         eng.upsert_principal(principal("alice", &["analyst"]));
-        eng.put_token("tok-1", "alice");
-        assert!(eng.authenticate_token("tok-1", 0).is_some());
-        assert!(eng.authenticate_token("tok-2", 0).is_none());
+        eng.put_token("tok-1", "alice", Some(0));
+        assert!(eng.authenticate_token("tok-1").is_some());
+        assert!(eng.authenticate_token("tok-2").is_none());
     }
 
     #[test]
@@ -621,15 +632,17 @@ mod tests {
         let mut p = principal("bob", &[]);
         p.token_epoch = 3;
         eng.upsert_principal(p);
-        eng.put_token("tok-b", "bob");
-        // Token minted at epoch 2 dies when the principal is at 3.
-        assert!(eng.authenticate_token("tok-b", 2).is_none());
-        assert!(eng.authenticate_token("tok-b", 3).is_some());
-        // Disabled fails closed.
+        eng.put_token("tok-b", "bob", Some(2));
+        eng.put_token("tok-c", "bob", Some(3));
+        // Session token minted at epoch 2 dies when the principal is at 3
+        // (password change / rotation bumps the epoch).
+        assert!(eng.authenticate_token("tok-b").is_none());
+        assert!(eng.authenticate_token("tok-c").is_some());
+        // Disabled fails closed for every token.
         let mut p = eng.principal("bob").unwrap();
         p.disabled = true;
         eng.upsert_principal(p);
-        assert!(eng.authenticate_token("tok-b", 3).is_none());
+        assert!(eng.authenticate_token("tok-c").is_none());
     }
 
     #[test]
@@ -748,7 +761,7 @@ mod tests {
             hash: [2u8; 32],
             cred_scheme: CRED_SCHEME_BLAKE3.to_string(),
         });
-        eng.put_token("tok-1", "alice");
+        eng.put_token("tok-1", "alice", None);
         eng.grant(Grant {
             role: "analyst".into(),
             action: Action::Read,
@@ -759,7 +772,7 @@ mod tests {
         let eng2 = PolicyEngine::new();
         eng2.import_snapshot(snap);
         assert!(eng2.check_class("alice", Action::Read, "erp", "orders"));
-        assert!(eng2.authenticate_token("tok-1", 0).is_some());
+        assert!(eng2.authenticate_token("tok-1").is_some());
         assert_eq!(eng2.grants().len(), 1);
     }
 
@@ -830,22 +843,39 @@ mod tests {
     }
 
     #[test]
-    fn authenticate_token_current_ignores_epoch_but_honors_disabled() {
+    fn config_tokens_are_not_epoch_gated_but_honor_disabled() {
         let eng = PolicyEngine::new();
         let mut p = principal("svc", &[]);
         p.token_epoch = 5;
         eng.upsert_principal(p);
-        eng.put_token("api-key-1", "svc");
+        eng.put_token("api-key-1", "svc", None);
         // Config keys are not epoch-minted: a bumped epoch does not kill them.
-        assert!(eng.authenticate_token_current("api-key-1").is_some());
-        assert_eq!(
-            eng.authenticate_token_current("api-key-1").unwrap().id,
-            "svc"
-        );
-        assert!(eng.authenticate_token_current("unknown").is_none());
+        assert!(eng.authenticate_token("api-key-1").is_some());
+        assert_eq!(eng.authenticate_token("api-key-1").unwrap().id, "svc");
+        assert!(eng.authenticate_token("unknown").is_none());
         let mut p = eng.principal("svc").unwrap();
         p.disabled = true;
         eng.upsert_principal(p);
-        assert!(eng.authenticate_token_current("api-key-1").is_none());
+        assert!(eng.authenticate_token("api-key-1").is_none());
+    }
+
+    #[test]
+    fn snapshot_roundtrip_keeps_token_epochs_and_immortality() {
+        let eng = PolicyEngine::new();
+        let mut p = principal("alice", &[]);
+        p.token_epoch = 2;
+        eng.upsert_principal(p);
+        eng.put_token("session-tok", "alice", Some(2));
+        eng.put_token("old-session", "alice", Some(1)); // stale at mint check time
+        eng.put_token("config-key", "alice", None);
+
+        let snap = eng.export_snapshot();
+        // Only epoch-gated tokens carry a mint epoch in the snapshot.
+        assert_eq!(snap.token_epochs.len(), 2);
+        let eng2 = PolicyEngine::new();
+        eng2.import_snapshot(snap);
+        assert!(eng2.authenticate_token("session-tok").is_some());
+        assert!(eng2.authenticate_token("old-session").is_none());
+        assert!(eng2.authenticate_token("config-key").is_some());
     }
 }
