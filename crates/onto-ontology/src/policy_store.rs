@@ -117,6 +117,15 @@ impl PolicyService {
         self.persist()
     }
 
+    /// CREATE ROLE: false (and no write) when the name is taken.
+    pub fn create_role(&self, role: &str) -> Result<bool> {
+        let created = self.engine.create_role(role);
+        if created {
+            self.persist()?;
+        }
+        Ok(created)
+    }
+
     // -- reads (no persistence) --
 
     pub fn check_class(&self, principal_id: &str, action: onto_core::policy::Action, ns: &str, class: &str) -> bool {

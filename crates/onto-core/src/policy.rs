@@ -149,6 +149,8 @@ pub struct PolicyEngine {
 
 #[derive(Debug, Default)]
 struct PolicyState {
+    /// Registered role names (CREATE ROLE / DROP ROLE).
+    roles: HashSet<String>,
     /// role → grants (M1: flat list; M2 adds inheritance options).
     grants: HashMap<String, Vec<(Action, ObjectRef)>>,
     /// principal id → principal.
@@ -168,6 +170,8 @@ pub struct PolicySnapshot {
     pub principals: Vec<Principal>,
     pub credentials: Vec<CredentialRecord>,
     pub grants: Vec<Grant>,
+    /// Registered role names.
+    pub roles: Vec<String>,
     /// (hex of `BLAKE3(token)`, principal id)
     pub tokens: Vec<(String, String)>,
 }
@@ -204,6 +208,7 @@ impl PolicyEngine {
                     })
                 })
                 .collect(),
+            roles: st.roles.iter().cloned().collect(),
             tokens: st
                 .token_index
                 .iter()
@@ -220,6 +225,7 @@ impl PolicyEngine {
             st.principals.clear();
             st.credentials.clear();
             st.token_index.clear();
+            st.roles = snap.roles.iter().cloned().collect();
             for g in snap.grants {
                 st.grants.entry(g.role).or_default().push((g.action, g.object));
             }
@@ -397,12 +403,37 @@ impl PolicyEngine {
     pub fn drop_role(&self, role: &str) {
         {
             let mut st = self.state.write().unwrap();
+            st.roles.remove(role);
             st.grants.remove(role);
             for p in st.principals.values_mut() {
                 p.roles.remove(role);
             }
         }
         self.bump();
+    }
+
+    // -- role registry --
+
+    /// CREATE ROLE: false when the name is taken.
+    pub fn create_role(&self, name: &str) -> bool {
+        let created = {
+            let mut st = self.state.write().unwrap();
+            st.roles.insert(name.to_string())
+        };
+        if created {
+            self.bump();
+        }
+        created
+    }
+
+    pub fn role_exists(&self, name: &str) -> bool {
+        self.state.read().unwrap().roles.contains(name)
+    }
+
+    pub fn roles(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.state.read().unwrap().roles.iter().cloned().collect();
+        v.sort();
+        v
     }
 
     /// Grant role membership to a principal.
@@ -667,6 +698,18 @@ mod tests {
         p.disabled = true;
         eng.upsert_principal(p);
         assert!(eng.authenticate_password("alice", "s3cret", None).is_none());
+    }
+
+    #[test]
+    fn role_registry_lifecycle() {
+        let eng = PolicyEngine::new();
+        assert!(eng.create_role("analyst"));
+        assert!(!eng.create_role("analyst"), "duplicate rejected");
+        assert!(eng.role_exists("analyst"));
+        assert_eq!(eng.roles(), vec!["analyst"]);
+        eng.drop_role("analyst");
+        assert!(!eng.role_exists("analyst"));
+        assert!(eng.roles().is_empty());
     }
 
     #[test]

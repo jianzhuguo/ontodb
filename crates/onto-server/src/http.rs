@@ -1279,15 +1279,20 @@ async fn alerts_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// authenticated key info, falling back to "anonymous" when auth is disabled.
 pub(crate) fn actor_of(info: Option<crate::auth::KeyInfo>, client_ip: &str) -> onto_query::QueryActor {
     match info {
-        Some(k) => onto_query::QueryActor {
-            label: k.description,
-            namespace: k.namespace,
-            client_ip: client_ip.to_string(),
-        },
+        Some(k) => {
+            let is_admin = k.permission == crate::auth::Permission::Admin;
+            onto_query::QueryActor {
+                label: k.description,
+                namespace: k.namespace,
+                client_ip: client_ip.to_string(),
+                is_admin,
+            }
+        }
         None => onto_query::QueryActor {
             label: "anonymous".to_string(),
             namespace: None,
             client_ip: client_ip.to_string(),
+            is_admin: true,
         },
     }
 }
