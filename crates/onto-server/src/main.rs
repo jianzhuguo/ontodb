@@ -37,6 +37,7 @@ mod metrics;
 pub mod mysqlwire;
 pub mod pgwire;
 mod rate_limit;
+mod rbac;
 pub mod security_audit;
 #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 mod semantic;
@@ -516,6 +517,11 @@ fn main() -> Result<()> {
     // DDL / catalog keys (`__ontology__`, `__ns__`) and triples live in the
     // default engine; document writes are routed per namespace.
     let ontology_store = OntologyStore::new(engine.default_engine());
+    // RBAC policy store (design §9.1): the PDP state lives in a single
+    // `__policy__state` row of the default engine, alongside `__ns__`.
+    let policy_svc = onto_ontology::policy_store::PolicyService::open(
+        onto_ontology::policy_store::PolicyStore::new(engine.default_engine()),
+    )?;
     // Wire the LSM engine set into GraphStore: without it `load_relation_from_lsm`
     // fails ("No LSM engine configured") and every GRAPH query sees an empty
     // cache / degrades to JOIN.
@@ -546,14 +552,16 @@ fn main() -> Result<()> {
                 .with_graph(graph_store.clone())
                 .with_triple_store(triple_store)
                 .with_shard_router(shard_config, local_shards)
-                .with_audit_log(&audit_path),
+                .with_audit_log(&audit_path)
+                .with_policy_service(policy_svc.clone()),
         )
     } else {
         Arc::new(
             QueryExecutor::new(Arc::clone(&engine), ontology_store)
                 .with_graph(graph_store.clone())
                 .with_triple_store(triple_store)
-                .with_audit_log(&audit_path),
+                .with_audit_log(&audit_path)
+                .with_policy_service(policy_svc.clone()),
         )
     };
 
@@ -564,7 +572,8 @@ fn main() -> Result<()> {
             QueryExecutor::new(Arc::clone(&engine), ontology_store)
                 .with_graph(graph_store.clone())
                 .with_triple_store(triple_store)
-                .with_audit_log(&audit_path),
+                .with_audit_log(&audit_path)
+                .with_policy_service(policy_svc.clone()),
         )
     };
 
@@ -592,7 +601,24 @@ fn main() -> Result<()> {
 
         // Load auth configuration (needed if HTTP is enabled)
         let auth_config = if args.auth {
-            load_auth_config(args.api_keys_file.as_deref())?
+            let cfg = load_auth_config(args.api_keys_file.as_deref())?;
+            // RBAC M1 (design §9.2): map api_keys.json into `__sys__.users` —
+            // built-in tier roles + key→user/token. Idempotent; the file stays
+            // read-only and is re-mapped at every start. Fails fast: a silent
+            // miss would leave RBAC unenforced without telling anyone.
+            match rbac::migrate_api_keys(&cfg, &policy_svc) {
+                Ok(n) if n > 0 => println!(
+                    "RBAC: {} api key(s) mapped into __sys__.users (roles _readonly/_readwrite/_admin)",
+                    n
+                ),
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(onto_core::CoreError::Custom(format!(
+                        "RBAC api_keys migration failed: {e}"
+                    )));
+                }
+            }
+            cfg
         } else {
             AuthConfig::default()
         };
@@ -929,7 +955,9 @@ async fn run_http_server(
         data_dir,
         alerts: Some(alert_manager),
     };
-    let auth_state = AuthState::new(&auth_config).with_metrics(state.metrics.clone());
+    let auth_state = AuthState::new(&auth_config)
+        .with_metrics(state.metrics.clone())
+        .with_policy(state.executor.policy_service());
 
     // Enable hot-reload for auth config file (check every 10 seconds)
     if let Some(ref api_keys_path) = api_keys_file {

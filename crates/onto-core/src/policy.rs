@@ -69,6 +69,13 @@ pub fn token_hash(token: &str) -> [u8; 32] {
 
 // ─── Policy model ──────────────────────────────────────────────────────────
 
+/// Built-in tier roles (design §9.2): api_keys.json permissions map onto
+/// these at migration time. `_admin` membership short-circuits the PDP
+/// (design §8 `check` pseudocode).
+pub const BUILTIN_ROLE_READONLY: &str = "_readonly";
+pub const BUILTIN_ROLE_READWRITE: &str = "_readwrite";
+pub const BUILTIN_ROLE_ADMIN: &str = "_admin";
+
 /// M1 action set (INFER joins in M2; ADMIN stays at the HTTP control plane).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Action {
@@ -306,6 +313,20 @@ impl PolicyEngine {
         Some(p.clone())
     }
 
+    /// Like [`Self::authenticate_token`] for a token treated as minted at the
+    /// principal's current epoch: config-managed API keys (design §9.2) are
+    /// not epoch-minted — their lifetime is governed by the config file — so
+    /// only the `disabled` flag gates them.
+    pub fn authenticate_token_current(&self, token: &str) -> Option<Principal> {
+        let st = self.state.read().unwrap();
+        let id = st.token_index.get(&token_hash(token))?;
+        let p = st.principals.get(id)?;
+        if p.disabled {
+            return None;
+        }
+        Some(p.clone())
+    }
+
     /// Store/replace a principal's password credential (salt+hash).
     pub fn put_credential(&self, rec: CredentialRecord) {
         let mut st = self.state.write().unwrap();
@@ -490,12 +511,14 @@ impl PolicyEngine {
             if p.disabled {
                 return false;
             }
-            p.roles.iter().any(|role| {
-                st.grants.get(role).is_some_and(|list| {
-                    list.iter()
-                        .any(|(a, o)| *a == action && grant_covers(o, object))
+            // Design §8: `_admin` members are allowed unconditionally.
+            p.roles.contains(BUILTIN_ROLE_ADMIN)
+                || p.roles.iter().any(|role| {
+                    st.grants.get(role).is_some_and(|list| {
+                        list.iter()
+                            .any(|(a, o)| *a == action && grant_covers(o, object))
+                    })
                 })
-            })
         };
         if let Ok(mut st) = self.state.write() {
             st.cache.insert(key, allowed);
@@ -540,9 +563,12 @@ fn from_hex(s: &str) -> Option<[u8; 32]> {
 }
 
 /// M1 object matching: a namespace grant covers its classes; a class grant
-/// covers exactly that class. (M2 adds `is_a` inheritance and explicit
-/// deny-over-inheritance.)
-fn grant_covers(grant_obj: &ObjectRef, wanted: &ObjectRef) -> bool {    match (grant_obj, wanted) {
+/// covers exactly that class; `NAMESPACE *` is the built-in-tier wildcard
+/// (design §9.2) covering every namespace and class. (M2 adds `is_a`
+/// inheritance and explicit deny-over-inheritance.)
+fn grant_covers(grant_obj: &ObjectRef, wanted: &ObjectRef) -> bool {
+    match (grant_obj, wanted) {
+        (ObjectRef::Namespace(g), _) if g == "*" => true,
         (ObjectRef::Namespace(g), ObjectRef::Namespace(w)) => g == w,
         (ObjectRef::Namespace(g), ObjectRef::Class { ns, .. }) => g == ns,
         (ObjectRef::Class { .. }, ObjectRef::Namespace(_)) => false,
@@ -770,5 +796,56 @@ mod tests {
         assert!(eng.check_class("alice", Action::Ddl, "erp", "orders"));
         assert!(eng.revoke_role("alice", "ops"));
         assert!(!eng.check_class("alice", Action::Ddl, "erp", "orders"));
+    }
+
+    #[test]
+    fn wildcard_namespace_grant_covers_every_object() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("reader", &["_readonly"]));
+        eng.grant(Grant {
+            role: "_readonly".into(),
+            action: Action::Read,
+            object: ObjectRef::Namespace("*".into()),
+        });
+        assert!(eng.check("reader", Action::Read, &ObjectRef::Namespace("erp".into())));
+        assert!(eng.check("reader", Action::Read, &ObjectRef::Namespace("hr".into())));
+        assert!(eng.check_class("reader", Action::Read, "erp", "orders"));
+        assert!(eng.check_class("reader", Action::Read, "hr", "people"));
+        // Wildcard is per action: no WRITE/DDL ride-along.
+        assert!(!eng.check_class("reader", Action::Write, "erp", "orders"));
+        assert!(!eng.check("reader", Action::Ddl, &ObjectRef::Namespace("erp".into())));
+    }
+
+    #[test]
+    fn admin_role_short_circuits_without_grants() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("root", &["_admin"]));
+        // No grants at all — the `_admin` membership alone allows (design §8).
+        assert!(eng.check("root", Action::Ddl, &ObjectRef::Namespace("erp".into())));
+        assert!(eng.check_class("root", Action::Write, "any", "class"));
+        assert!(eng.check_class("root", Action::Read, "other", "thing"));
+        // Losing the membership drops the short-circuit.
+        assert!(eng.revoke_role("root", "_admin"));
+        assert!(!eng.check_class("root", Action::Read, "any", "class"));
+    }
+
+    #[test]
+    fn authenticate_token_current_ignores_epoch_but_honors_disabled() {
+        let eng = PolicyEngine::new();
+        let mut p = principal("svc", &[]);
+        p.token_epoch = 5;
+        eng.upsert_principal(p);
+        eng.put_token("api-key-1", "svc");
+        // Config keys are not epoch-minted: a bumped epoch does not kill them.
+        assert!(eng.authenticate_token_current("api-key-1").is_some());
+        assert_eq!(
+            eng.authenticate_token_current("api-key-1").unwrap().id,
+            "svc"
+        );
+        assert!(eng.authenticate_token_current("unknown").is_none());
+        let mut p = eng.principal("svc").unwrap();
+        p.disabled = true;
+        eng.upsert_principal(p);
+        assert!(eng.authenticate_token_current("api-key-1").is_none());
     }
 }

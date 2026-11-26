@@ -1139,6 +1139,11 @@ impl QueryExecutor {
         self
     }
 
+    /// The attached RBAC policy service (M1), if any.
+    pub fn policy_service(&self) -> Option<Arc<onto_ontology::policy_store::PolicyService>> {
+        self.policy.clone()
+    }
+
     /// Appends one audit record (cross-namespace access or scoped-key denial).
     fn audit(&self, actor: Option<&QueryActor>, action: &str, classes: &[String], detail: &str) {
         let Some(log) = &self.audit_log else { return };

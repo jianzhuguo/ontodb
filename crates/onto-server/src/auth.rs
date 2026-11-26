@@ -170,6 +170,9 @@ pub struct AuthState {
     config_path: Option<std::path::PathBuf>,
     /// Last known modification time of the config file.
     last_modified: Arc<parking_lot::RwLock<Option<std::time::SystemTime>>>,
+    /// RBAC policy service (M1): when set, keys resolve to principals through
+    /// the migrated `__sys__.users` token mapping (design §9.2).
+    pub policy: Option<Arc<onto_ontology::policy_store::PolicyService>>,
 }
 
 impl AuthState {
@@ -186,6 +189,7 @@ impl AuthState {
             ip_whitelist: Arc::new(parking_lot::RwLock::new(IpWhitelistConfig::default())),
             config_path: None,
             last_modified: Arc::new(parking_lot::RwLock::new(None)),
+            policy: None,
         }
     }
 
@@ -199,6 +203,26 @@ impl AuthState {
     pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
         self.config_path = Some(path);
         self
+    }
+
+    /// Attach the RBAC policy service for key→principal resolution.
+    pub fn with_policy(mut self, policy: Option<Arc<onto_ontology::policy_store::PolicyService>>) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Principal id for a validated key: the explicit `principal` config field
+    /// wins; otherwise resolve through the migrated `__sys__.users` token
+    /// mapping. `None` = legacy key (pre-RBAC namespace-ACL behavior).
+    pub fn principal_for(&self, key: &str, record: &KeyRecord) -> Option<String> {
+        if record.principal.is_some() {
+            return record.principal.clone();
+        }
+        self.policy
+            .as_ref()?
+            .engine
+            .authenticate_token_current(key)
+            .map(|p| p.id)
     }
 
     /// Reload configuration from disk. Returns true if config changed.
@@ -541,6 +565,7 @@ pub async fn auth_middleware(
     }
 
     // Add key info to request extensions for downstream handlers
+    let principal = auth.principal_for(&key, &record);
     let mut request = request;
     request.extensions_mut().insert(KeyInfo {
         key: key.clone(),
@@ -548,7 +573,7 @@ pub async fn auth_middleware(
         permission: record.permission,
         rate_limit: record.rate_limit,
         namespace: record.namespace,
-        principal: record.principal,
+        principal,
         client_ip,
     });
 
@@ -695,4 +720,73 @@ fn parse_ipv4(ip: &str) -> Option<u32> {
         result = (result << 8) | octet;
     }
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rbac::migrate_api_keys;
+    use onto_storage::{LsmEngine, StorageOptions};
+    use std::sync::Arc;
+
+    fn record(principal: Option<&str>) -> KeyRecord {
+        KeyRecord {
+            description: "test".to_string(),
+            permission: Permission::ReadOnly,
+            rate_limit: None,
+            allowed_ips: None,
+            namespace: None,
+            principal: principal.map(String::from),
+        }
+    }
+
+    #[test]
+    fn principal_for_prefers_config_then_migrated_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            LsmEngine::open(StorageOptions {
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let svc = onto_ontology::policy_store::PolicyService::open(
+            onto_ontology::policy_store::PolicyStore::new(engine),
+        )
+        .unwrap();
+        let mk = |secret: &str, principal: Option<&str>| ApiKeyConfig {
+            key: secret.to_string(),
+            description: format!("key {secret}"),
+            permission: Permission::ReadOnly,
+            rate_limit: None,
+            allowed_ips: None,
+            namespace: None,
+            principal: principal.map(String::from),
+        };
+        let cfg = AuthConfig {
+            enabled: true,
+            keys: vec![mk("sec-mapped", None), mk("sec-explicit", Some("alice"))],
+            default_permission: Permission::ReadOnly,
+        };
+        migrate_api_keys(&cfg, &svc).unwrap();
+
+        let auth = AuthState::new(&cfg).with_policy(Some(svc));
+        // Explicit config field wins.
+        assert_eq!(
+            auth.principal_for("sec-explicit", &record(Some("alice"))).as_deref(),
+            Some("alice")
+        );
+        // Even over a different token mapping (operator intent).
+        assert_eq!(
+            auth.principal_for("sec-mapped", &record(Some("override"))).as_deref(),
+            Some("override")
+        );
+        // No config field: resolve through the migrated token mapping.
+        let migrated = auth.principal_for("sec-mapped", &record(None));
+        assert!(migrated.unwrap().starts_with("key_"));
+        // No policy service / unknown key: legacy (None → pre-RBAC behavior).
+        let auth = AuthState::new(&cfg);
+        assert!(auth.principal_for("sec-mapped", &record(None)).is_none());
+        assert!(auth.principal_for("unknown", &record(None)).is_none());
+    }
 }
