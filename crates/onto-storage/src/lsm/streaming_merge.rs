@@ -157,34 +157,42 @@ impl StreamingMergeIterator {
     }
 
     /// Advances to the next entry.
+    ///
+    /// If a source index is out of bounds (indicating heap corruption of
+    /// either the `sources` Vec header or the `HeapEntry`), iteration stops
+    /// gracefully: the current entry is still returned, `current` is set to
+    /// `None` so `has_next()` returns `false`, and an error is logged.
+    /// Panicking here would kill the compaction-worker thread and, on
+    /// Windows, escalate to a process-fatal heap-corruption crash (0xc0000374).
     pub fn next(&mut self) -> Option<HeapEntry> {
         let result = self.current.take();
         
         // Refill from the source that provided the current entry
         if let Some(ref entry) = result {
             let source_idx = entry.source_idx;
-            // Defensive bounds check: `source_idx` is set at construction
-            // (enumerate index) and propagated in `next()`. A panic here with
-            // `len=1 index=4` means the `sources` Vec header was corrupted
-            // (same family as the 19420 crash shape). Fail fast with a
-            // snapshot instead of a bare index-out-of-bounds.
-            let source = match self.sources.get_mut(source_idx) {
-                Some(s) => s,
-                None => panic!(
-                    "StreamingMergeIterator source index out of bounds \
-                     (source_idx={} sources.len={}); sources Vec header is likely corrupt",
-                    source_idx,
-                    self.sources.len()
-                ),
-            };
-            if let Some(new_entry) = source.next() {
-                self.heap.push(HeapEntry {
-                    key: new_entry.0,
-                    value: new_entry.1,
-                    seq_no: new_entry.2,
-                    kind: new_entry.3,
-                    source_idx,
-                });
+            match self.sources.get_mut(source_idx) {
+                Some(source) => {
+                    if let Some(new_entry) = source.next() {
+                        self.heap.push(HeapEntry {
+                            key: new_entry.0,
+                            value: new_entry.1,
+                            seq_no: new_entry.2,
+                            kind: new_entry.3,
+                            source_idx,
+                        });
+                    }
+                }
+                None => {
+                    tracing::error!(
+                        source_idx,
+                        sources_len = self.sources.len(),
+                        "StreamingMergeIterator source index out of bounds — \
+                         sources Vec header or HeapEntry is corrupt; \
+                         stopping iteration to avoid process crash"
+                    );
+                    self.current = None;
+                    return result;
+                }
             }
         }
         
@@ -265,11 +273,11 @@ mod tests {
     }
 
     /// The 166 crash shape: a `HeapEntry` with `source_idx=4` but `sources.len()==1`.
-    /// `next()` must panic with a diagnostic message instead of a bare
-    /// "index out of bounds" that carries no forensic value.
+    /// `next()` must degrade gracefully — return the current entry, stop
+    /// iteration, and NOT panic (a panic here escalates to 0xc0000374 on
+    /// Windows and kills the whole process).
     #[test]
-    #[should_panic(expected = "source index out of bounds")]
-    fn test_next_rejects_stale_source_idx() {
+    fn test_next_stops_gracefully_on_stale_source_idx() {
         use crate::lsm::sstable::SsTableBuilder;
         use onto_core::Entry;
         use tempfile::tempdir;
@@ -290,8 +298,13 @@ mod tests {
             kind: EntryKind::Put,
             source_idx: 4,
         });
-        // next() will try to refill from sources[4] -> must panic
-        let _ = iter.next();
+        // next() must return the poisoned entry, stop iteration, and not panic
+        let entry = iter.next().expect("should return current entry");
+        assert_eq!(entry.key, b"keyX");
+        assert_eq!(entry.source_idx, 4);
+        // Iteration must be stopped — no further entries
+        assert!(!iter.has_next());
+        assert!(iter.next().is_none());
     }
 
     #[test]

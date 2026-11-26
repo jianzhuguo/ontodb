@@ -680,6 +680,7 @@ impl CompactionWorker {
                 Some(e) => e,
                 None => break,
             };
+            Self::check_entry_bufs(&entry.key, &entry.value, "tombstone_span");
             if entry.kind == EntryKind::Delete {
                 match &mut span {
                     None => span = Some((entry.key.clone(), entry.key.clone())),
@@ -695,6 +696,22 @@ impl CompactionWorker {
             }
         }
         span
+    }
+
+    /// Corrupt-header gate for merged entries before any deref (compare,
+    /// clone, or the builder's memcpy).
+    ///
+    /// Dump 10460: a smashed `(ptr=0x1, len=137)` key sailed past the bare
+    /// `==` dedup compare straight into `memcmp` (VCRUNTIME140 AV). The
+    /// `HeapEntry::key_bytes` guard only covers heap-ordering compares; the
+    /// consumer loops move the key out and compare/clone it unguarded. Per
+    /// the 2026-10-28 fail-fast ruling, panic with a snapshot here rather
+    /// than let a silently empty key wrongly dedup/reorder and poison the
+    /// output SST.
+    #[track_caller]
+    fn check_entry_bufs(key: &Vec<u8>, value: &Vec<u8>, ctx: &str) {
+        crate::ptr_guard::checked_vec(key, "compaction entry key", ctx);
+        crate::ptr_guard::checked_vec(value, "compaction entry value", ctx);
     }
 
     fn compact_level(&mut self, level: usize) -> Result<()> {
@@ -1030,6 +1047,7 @@ impl CompactionWorker {
                 )));
             }
             let entry = merge_iter.next().unwrap();
+            Self::check_entry_bufs(&entry.key, &entry.value, "compact_level");
             let key = entry.key;
             let value = entry.value;
             let seq_no = entry.seq_no;
@@ -1294,6 +1312,7 @@ impl CompactionWorker {
 
         while merge_iter.has_next() {
             let entry = merge_iter.next().unwrap();
+            Self::check_entry_bufs(&entry.key, &entry.value, "merge_self_batch_at");
             let key = entry.key;
             let value = entry.value;
             let seq_no = entry.seq_no;
@@ -1588,6 +1607,7 @@ impl CompactionWorker {
 
         while merge_iter.has_next() {
             let entry = merge_iter.next().unwrap();
+            Self::check_entry_bufs(&entry.key, &entry.value, "merge_last_level_batch");
             // StreamingMergeIterator yields newest-first per key; keep one.
             if last_key.as_ref() == Some(&entry.key) {
                 deduped += 1;
@@ -1812,6 +1832,7 @@ impl CompactionWorker {
 
         while merge_iter.has_next() {
             let entry = merge_iter.next().unwrap();
+            Self::check_entry_bufs(&entry.key, &entry.value, "merge_small_files");
 
             // Dedup: StreamingMergeIterator returns newest first per key,
             // so skip subsequent entries with the same key
@@ -2043,6 +2064,18 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Dump 10460 crash shape: a `(ptr=0x1, len=137)` key must be rejected
+    /// with a snapshot before reaching a bare `==` dedup compare / memcmp.
+    #[test]
+    #[should_panic(expected = "compaction entry key: corrupt Vec header")]
+    fn test_check_entry_bufs_rejects_dump_10460_shape() {
+        // Fake the smashed header without owning a real allocation.
+        let key: Vec<u8> = unsafe { Vec::from_raw_parts(0x1 as *mut u8, 137, 137) };
+        let key = std::mem::ManuallyDrop::new(key);
+        let value: Vec<u8> = Vec::new();
+        CompactionWorker::check_entry_bufs(&key, &value, "test");
     }
 
     /// Output budget invariant: a batch of N inputs must end at ≤ N-1 files
