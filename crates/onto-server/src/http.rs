@@ -1277,6 +1277,9 @@ async fn alerts_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// ```
 /// Builds the query-actor identity (namespace scope + audit label) from the
 /// authenticated key info, falling back to "anonymous" when auth is disabled.
+/// `principal_id` carries the key's RBAC principal (api_keys.json `principal`)
+/// so `prepare_as` can enforce class/namespace grants; keys without one keep
+/// the pre-RBAC namespace-ACL behavior.
 pub(crate) fn actor_of(info: Option<crate::auth::KeyInfo>, client_ip: &str) -> onto_query::QueryActor {
     match info {
         Some(k) => {
@@ -1286,6 +1289,7 @@ pub(crate) fn actor_of(info: Option<crate::auth::KeyInfo>, client_ip: &str) -> o
                 namespace: k.namespace,
                 client_ip: client_ip.to_string(),
                 is_admin,
+                principal_id: k.principal,
             }
         }
         None => onto_query::QueryActor {
@@ -1293,6 +1297,7 @@ pub(crate) fn actor_of(info: Option<crate::auth::KeyInfo>, client_ip: &str) -> o
             namespace: None,
             client_ip: client_ip.to_string(),
             is_admin: true,
+            principal_id: None,
         },
     }
 }
@@ -5867,5 +5872,40 @@ mod tests {
     #[test]
     fn test_sanitize_error_keeps_plain_messages() {
         assert_eq!(sanitize_error("parse error: unexpected token 'foo'"), "parse error: unexpected token 'foo'");
+    }
+
+    #[test]
+    fn test_actor_of_carries_principal() {
+        let info = crate::auth::KeyInfo {
+            key: "k".to_string(),
+            description: "alice key".to_string(),
+            permission: crate::auth::Permission::ReadOnly,
+            rate_limit: None,
+            namespace: Some("erp".to_string()),
+            principal: Some("alice".to_string()),
+            client_ip: "127.0.0.1".to_string(),
+        };
+        let actor = super::actor_of(Some(info), "127.0.0.1");
+        assert_eq!(actor.principal_id.as_deref(), Some("alice"));
+        assert_eq!(actor.namespace.as_deref(), Some("erp"));
+        assert!(!actor.is_admin);
+
+        // Legacy key (no principal) keeps the pre-RBAC path.
+        let legacy = crate::auth::KeyInfo {
+            key: "k".to_string(),
+            description: "legacy".to_string(),
+            permission: crate::auth::Permission::Admin,
+            rate_limit: None,
+            namespace: None,
+            principal: None,
+            client_ip: "127.0.0.1".to_string(),
+        };
+        let actor = super::actor_of(Some(legacy), "127.0.0.1");
+        assert!(actor.principal_id.is_none());
+        assert!(actor.is_admin);
+
+        // Auth disabled → anonymous, no principal.
+        let actor = super::actor_of(None, "127.0.0.1");
+        assert!(actor.principal_id.is_none());
     }
 }

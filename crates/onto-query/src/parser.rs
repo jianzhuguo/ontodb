@@ -599,6 +599,16 @@ pub struct GraphEdge {
     pub direction: GraphDirection,
 }
 
+/// READ < WRITE < DDL, for compound statements whose branches disagree.
+fn action_max(a: onto_core::policy::Action, b: onto_core::policy::Action) -> onto_core::policy::Action {
+    use onto_core::policy::Action;
+    match (a, b) {
+        (Action::Ddl, _) | (_, Action::Ddl) => Action::Ddl,
+        (Action::Write, _) | (_, Action::Write) => Action::Write,
+        _ => Action::Read,
+    }
+}
+
 impl QueryAst {
     /// Rewrites every class/table name through `f` — used by the executor to
     /// stamp bare class names with the session namespace. Recurses into
@@ -674,6 +684,108 @@ impl QueryAst {
                 query.map_class_names(f);
             }
             _ => {}
+        }
+    }
+
+    /// The authorization action this statement performs on its target
+    /// classes/namespaces (RBAC M1, docs/RBAC权限模型详细设计.md §5/§10).
+    /// `None` = policy-plane or session/ops statement that touches no data
+    /// object (gated elsewhere, e.g. policy DDL by `is_admin`).
+    /// Exhaustive on purpose: a new variant must pick its action here.
+    pub fn required_action(&self) -> Option<onto_core::policy::Action> {
+        use onto_core::policy::Action;
+        use QueryAst as A;
+        match self {
+            // Reads
+            A::Select { .. }
+            | A::Match { .. }
+            | A::VectorSearch { .. }
+            | A::Explain { .. }
+            | A::ExplainReasoning { .. }
+            | A::Infer { .. }
+            | A::ShowTableStats { .. }
+            | A::ShowClasses
+            | A::ShowSchemas
+            | A::Describe { .. }
+            | A::GraphTraverse { .. }
+            | A::GraphMatch { .. }
+            | A::GraphShortestPath { .. }
+            | A::GraphAnalyze { .. } => Some(Action::Read),
+            // Writes (DML + stats/matview refresh)
+            A::Insert { .. }
+            | A::BatchInsert { .. }
+            | A::BatchUpsert { .. }
+            | A::InsertSelect { .. }
+            | A::Upsert { .. }
+            | A::Update { .. }
+            | A::Delete { .. }
+            | A::Import { .. }
+            | A::Copy { .. }
+            | A::TruncateTable { .. }
+            | A::InsertVertex { .. }
+            | A::InsertEdge { .. }
+            | A::Analyze { .. }
+            | A::RefreshMaterializedView { .. } => Some(Action::Write),
+            // Compound SELECTs: the strongest action of their branches, so a
+            // pure read UNION/WITH stays readable with just a READ grant.
+            A::Union { left, right, .. } => match (left.required_action(), right.required_action()) {
+                (Some(x), Some(y)) => Some(action_max(x, y)),
+                (x, y) => x.or(y),
+            },
+            A::With { ctes, query, .. } => ctes
+                .iter()
+                .map(|cte| cte.query.required_action())
+                .chain(std::iter::once(query.required_action()))
+                .flatten()
+                .reduce(action_max),
+            // DDL (schema/catalog). USE is a namespace *entry* (design §5:
+            // DDL covers CREATE/ALTER/DROP only) and is checked as READ on
+            // the namespace below.
+            A::CreateOntology { .. }
+            | A::DropOntology { .. }
+            | A::CreateIndex { .. }
+            | A::CreateNgramIndex { .. }
+            | A::CreateCompositeIndex { .. }
+            | A::DropIndex { .. }
+            | A::CreateVectorIndex { .. }
+            | A::DropVectorIndex { .. }
+            | A::CompactVectorIndex { .. }
+            | A::CreateMaterializedView { .. }
+            | A::DropMaterializedView { .. }
+            | A::VacuumTable { .. }
+            | A::CreateVertexTable { .. }
+            | A::CreateEdgeTable { .. }
+            | A::CreateNamespace { .. }
+            | A::DropNamespace { .. }
+            | A::DropOntologyProperty { .. }
+            | A::CreateOntologyProperty { .. }
+            | A::AlterOntologyProperty { .. }
+            | A::AlterClassExtends { .. }
+            | A::AlterClassDisjoint { .. }
+            | A::AlterClassUnique { .. }
+            | A::AlterClassRestriction { .. }
+            | A::SystemActivate { .. } => Some(Action::Ddl),
+            // Namespace entry: READ on the namespace (also gates the
+            // class-list metadata that follows a switch).
+            A::UseNamespace { .. } => Some(Action::Read),
+            // Policy plane + transaction/ops controls: no data object access.
+            A::Begin
+            | A::Commit
+            | A::Rollback
+            | A::Backup { .. }
+            | A::Restore { .. }
+            | A::Flush
+            | A::CreateUser { .. }
+            | A::DropUser { .. }
+            | A::AlterUserPassword { .. }
+            | A::CreateRole { .. }
+            | A::DropRole { .. }
+            | A::GrantRole { .. }
+            | A::RevokeRole { .. }
+            | A::GrantPrivilege { .. }
+            | A::RevokePrivilege { .. }
+            | A::ShowRoles
+            | A::ShowGrants { .. } => None,
         }
     }
 

@@ -74,6 +74,11 @@ pub struct ApiKeyConfig {
     /// cannot issue namespace DDL. Absent = unscoped (subject to audit).
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Optional RBAC principal id (a user in `__sys__.users`). When set and a
+    /// policy service is attached, class/namespace grants are enforced for
+    /// this key's queries. Absent = legacy key (namespace-ACL behavior only).
+    #[serde(default)]
+    pub principal: Option<String>,
 }
 
 /// Validated API key record (hot-reloadable).
@@ -84,6 +89,7 @@ pub struct KeyRecord {
     pub rate_limit: Option<u32>,
     pub allowed_ips: Option<Vec<String>>,
     pub namespace: Option<String>,
+    pub principal: Option<String>,
 }
 
 impl From<&ApiKeyConfig> for KeyRecord {
@@ -94,6 +100,7 @@ impl From<&ApiKeyConfig> for KeyRecord {
             rate_limit: c.rate_limit,
             allowed_ips: c.allowed_ips.clone(),
             namespace: c.namespace.clone(),
+            principal: c.principal.clone(),
         }
     }
 }
@@ -541,6 +548,7 @@ pub async fn auth_middleware(
         permission: record.permission,
         rate_limit: record.rate_limit,
         namespace: record.namespace,
+        principal: record.principal,
         client_ip,
     });
 
@@ -632,6 +640,8 @@ pub struct KeyInfo {
     pub rate_limit: Option<u32>,
     /// Namespace scope of the key (None = unscoped).
     pub namespace: Option<String>,
+    /// RBAC principal id (None = legacy key, pre-RBAC behavior).
+    pub principal: Option<String>,
     /// Client IP captured by the auth middleware (for audit records).
     pub client_ip: String,
 }

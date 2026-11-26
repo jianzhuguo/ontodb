@@ -55,6 +55,9 @@ pub struct KeyRequest {
     /// Optional namespace scope for this key (None = unscoped).
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Optional RBAC principal id (None = legacy key, namespace-ACL only).
+    #[serde(default)]
+    pub principal: Option<String>,
 }
 
 /// Request body for adding IPs.
@@ -73,6 +76,8 @@ pub struct KeyInfo {
     pub allowed_ips: Vec<String>,
     /// Namespace scope of the key (None = unscoped).
     pub namespace: Option<String>,
+    /// RBAC principal id (None = legacy key).
+    pub principal: Option<String>,
 }
 
 /// Build the admin API router.
@@ -123,6 +128,7 @@ pub async fn list_keys(
                 rate_limit: k.rate_limit,
                 allowed_ips: k.allowed_ips.clone().unwrap_or_default(),
                 namespace: k.namespace.clone(),
+                principal: k.principal.clone(),
             }
         })
         .collect();
@@ -191,6 +197,7 @@ pub async fn add_key(
         rate_limit: req.rate_limit,
         allowed_ips: req.allowed_ips.clone(),
         namespace: req.namespace.clone(),
+        principal: req.principal.clone(),
     });
 
     if let Err(e) = save_config(&state, &config) {
@@ -262,6 +269,7 @@ pub async fn update_key(
         rate_limit: req.rate_limit,
         allowed_ips: req.allowed_ips.clone(),
         namespace: req.namespace.clone(),
+        principal: req.principal.clone(),
     };
 
     if let Err(e) = save_config(&state, &config) {

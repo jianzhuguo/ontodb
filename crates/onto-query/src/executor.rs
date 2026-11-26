@@ -530,6 +530,11 @@ pub struct QueryActor {
     /// Control-plane admin (Permission::Admin key, or auth disabled).
     /// Gates policy DDL (CREATE USER/ROLE, GRANT/REVOKE) — RBAC M1.
     pub is_admin: bool,
+    /// Authenticated principal id (RBAC M1): when present and a policy
+    /// service is attached, class/namespace grants are enforced in
+    /// `prepare_as`. `None` = legacy caller (API key without a principal) —
+    /// keeps the pre-RBAC namespace-ACL behavior.
+    pub principal_id: Option<String>,
 }
 
 impl QueryActor {
@@ -540,6 +545,7 @@ impl QueryActor {
             namespace: None,
             client_ip: "unknown".to_string(),
             is_admin: true,
+            principal_id: None,
         }
     }
 }
@@ -1271,6 +1277,58 @@ impl QueryExecutor {
                     "global-catalog write denied for a namespace-scoped API key: {}",
                     catalog_writes.join(", ")
                 )));
+            }
+        }
+
+        // RBAC M1 class/namespace checks (docs/RBAC权限模型详细设计.md §7/§10):
+        // when a policy is attached and the actor carries a principal, every
+        // touched object must hold the statement's action. Legacy callers
+        // (no principal, or no policy configured) keep the namespace-ACL
+        // behavior above untouched.
+        if let (Some(svc), Some(pid)) = (&self.policy, &actor.principal_id) {
+            if let Some(action) = ast.required_action() {
+                use onto_core::policy::ObjectRef;
+                // Namespace switches/DDL name their object directly.
+                if let A::CreateNamespace { name }
+                | A::DropNamespace { name }
+                | A::UseNamespace { name } = ast
+                {
+                    let obj = ObjectRef::Namespace(name.clone());
+                    if !svc.engine.check(pid, action, &obj) {
+                        self.audit(
+                            Some(actor),
+                            "denied",
+                            &[name.clone()],
+                            &format!("RBAC deny: {} on {}", action.as_str(), obj.display()),
+                        );
+                        return Err(CoreError::InvalidArgument(format!(
+                            "permission denied: {} on {}",
+                            action.as_str(),
+                            obj.display()
+                        )));
+                    }
+                }
+                for n in &names {
+                    let resolved = self.resolve_class_name_in(n, scope);
+                    let (ns, class) = match resolved.split_once('.') {
+                        Some((ns, class)) => (ns.to_string(), class.to_string()),
+                        None => ("_default".to_string(), resolved.clone()),
+                    };
+                    if !svc.check_class(pid, action, &ns, &class) {
+                        let obj = ObjectRef::Class { ns, class };
+                        self.audit(
+                            Some(actor),
+                            "denied",
+                            &names,
+                            &format!("RBAC deny: {} on {}", action.as_str(), obj.display()),
+                        );
+                        return Err(CoreError::InvalidArgument(format!(
+                            "permission denied: {} on {}",
+                            action.as_str(),
+                            obj.display()
+                        )));
+                    }
+                }
             }
         }
 
@@ -19979,6 +20037,7 @@ mod tests {
             namespace: None,
             client_ip: "127.0.0.1".to_string(),
             is_admin: true,
+            principal_id: None,
         };
         let run = |sql: &str| {
             let ast = QueryParser::parse(sql).unwrap();
@@ -20031,6 +20090,7 @@ mod tests {
             namespace: Some("vet".to_string()),
             client_ip: "127.0.0.1".to_string(),
             is_admin: false,
+            principal_id: None,
         };
         let ast = QueryParser::parse("CREATE ROLE sneaky").unwrap();
         assert!(executor.execute_as(&ast, &user_actor).is_err());
@@ -20045,12 +20105,149 @@ mod tests {
         assert!(!svc.engine.check_class("alice", Action::Write, "erp", "orders"));
     }
 
+    /// RBAC M1 PEP: class-level checks in `prepare_as`
+    /// (docs/RBAC权限模型详细设计.md §7/§10). Per-statement action is checked
+    /// against every touched class; namespace grants cascade to classes;
+    /// denials leave an audit record; legacy actors (no principal) keep the
+    /// pre-RBAC behavior.
+    #[test]
+    fn policy_class_level_pep() {
+        use onto_core::policy::Action;
+        let (executor, _dir) = setup();
+        let pdir = tempdir().unwrap();
+        let svc = onto_ontology::policy_store::PolicyService::open(
+            onto_ontology::policy_store::PolicyStore::new(Arc::new(
+                LsmEngine::open(StorageOptions {
+                    data_dir: pdir.path().to_path_buf(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )),
+        )
+        .unwrap();
+        let adir = tempdir().unwrap();
+        let audit_path = adir.path().join("audit.log");
+        let executor = executor
+            .with_policy_service(svc.clone())
+            .with_audit_log(&audit_path);
+        let admin = QueryActor {
+            label: "root".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: true,
+            principal_id: None,
+        };
+        // Mirror the HTTP dispatch: OntoQL first (namespace DDL lives on the
+        // OntoQL surface), SQL parser as fallback.
+        let parse_stmt = |sql: &str| {
+            crate::ontoql::OntoQLParser::parse(sql)
+                .ok()
+                .and_then(|oa| oa.to_query_ast().ok())
+                .unwrap_or_else(|| QueryParser::parse(sql).unwrap())
+        };
+        let run = |sql: &str| executor.execute_as(&parse_stmt(sql), &admin);
+        let run_for = |sql: &str, actor: &QueryActor| executor.execute_as(&parse_stmt(sql), actor);
+
+        // Policy plane: reader role with an exact class grant, no namespace grant.
+        run("CREATE ROLE reader").unwrap();
+        run("CREATE USER alice WITH PASSWORD 'pw'").unwrap();
+        run("GRANT ROLE reader TO alice").unwrap();
+        run("GRANT READ ON CLASS erp.orders TO reader").unwrap();
+        // Register the namespace (USE NAMESPACE checks it exists), then seed a
+        // row outside the PEP (class materializes on insert).
+        run("CREATE NAMESPACE erp").unwrap();
+        insert_row(&executor, "erp.orders", "o1", 1);
+
+        let alice = QueryActor {
+            label: "alice".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+            principal_id: Some("alice".to_string()),
+        };
+
+        // READ grant: reads pass; writes and DDL are denied per action.
+        assert!(run_for("SELECT name FROM erp.orders", &alice).is_ok());
+        assert!(run_for("SELECT name FROM erp.invoices", &alice).is_err());
+        assert!(run_for(
+            "UPDATE erp.orders SET price = 2 WHERE name = 'o1'",
+            &alice
+        )
+        .is_err());
+        assert!(
+            run_for("INSERT INTO erp.orders (name, price) VALUES ('o2', 3)", &alice).is_err(),
+            "WRITE must not ride on a READ grant"
+        );
+        assert!(run_for("CREATE INDEX ON erp.orders (price)", &alice).is_err());
+        assert!(
+            run_for("CREATE NAMESPACE vault", &alice).is_err(),
+            "namespace DDL needs its own grant"
+        );
+        assert!(
+            run_for("USE NAMESPACE erp", &alice).is_err(),
+            "namespace entry needs a namespace grant"
+        );
+
+        // Denials left an audit trail.
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(audit.contains("\"denied\""), "audit: {audit}");
+        assert!(audit.contains("RBAC deny: READ on CLASS erp.invoices"), "audit: {audit}");
+
+        // Namespace grants cascade to every class inside; USE reads the namespace.
+        run("GRANT READ ON NAMESPACE erp TO reader").unwrap();
+        assert!(run_for("USE NAMESPACE erp", &alice).is_ok());
+        assert!(run_for("SELECT name FROM erp.invoices", &alice).is_ok());
+        assert!(
+            run_for("UPDATE erp.orders SET price = 2 WHERE name = 'o1'", &alice).is_err(),
+            "namespace READ must not imply WRITE"
+        );
+
+        // Grants are exact per action: a pure writer cannot read.
+        run("CREATE ROLE writer").unwrap();
+        run("CREATE USER bob WITH PASSWORD 'pw'").unwrap();
+        run("GRANT ROLE writer TO bob").unwrap();
+        run("GRANT WRITE ON CLASS erp.orders TO writer").unwrap();
+        let bob = QueryActor {
+            label: "bob".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+            principal_id: Some("bob".to_string()),
+        };
+        assert!(
+            run_for("INSERT INTO erp.orders (name, price) VALUES ('o2', 3)", &bob).is_ok(),
+            "bob holds WRITE on erp.orders"
+        );
+        assert!(
+            run_for("SELECT name FROM erp.orders", &bob).is_err(),
+            "WRITE must not imply READ"
+        );
+
+        // Namespace DDL needs the DDL action on that namespace.
+        assert!(run_for("CREATE NAMESPACE vault", &bob).is_err());
+        run("GRANT DDL ON NAMESPACE vault TO writer").unwrap();
+        assert!(run_for("CREATE NAMESPACE vault", &bob).is_ok());
+        assert!(
+            run_for("DROP NAMESPACE erp", &bob).is_err(),
+            "DDL grant on vault must not cover erp"
+        );
+
+        // Legacy callers (no principal) keep the pre-RBAC behavior.
+        let legacy = test_actor(None);
+        assert!(run_for("SELECT name FROM erp.orders", &legacy).is_ok());
+
+        // The PDP agrees with the PEP (check_class facade).
+        assert!(svc.check_class("alice", Action::Read, "erp", "orders"));
+        assert!(!svc.check_class("bob", Action::Read, "erp", "orders"));
+    }
+
     fn test_actor(ns: Option<&str>) -> QueryActor {
         QueryActor {
             label: "test-key".to_string(),
             namespace: ns.map(String::from),
             client_ip: "127.0.0.1".to_string(),
             is_admin: ns.is_none(),
+            principal_id: None,
         }
     }
 
