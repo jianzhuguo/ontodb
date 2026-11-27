@@ -1146,15 +1146,34 @@ impl QueryExecutor {
 
     /// Appends one audit record (cross-namespace access or scoped-key denial).
     fn audit(&self, actor: Option<&QueryActor>, action: &str, classes: &[String], detail: &str) {
+        let (label, ns, ip) = match actor {
+            Some(a) => (a.label.as_str(), a.namespace.as_deref(), a.client_ip.as_str()),
+            None => ("local", None, "local"),
+        };
+        self.write_audit(label, ns, ip, action, classes, detail);
+    }
+
+    /// Append one audit record with an explicit identity — wire-surface
+    /// `login` / `authn_fail` events (design §12), whose actor is only known
+    /// at the connection handler.
+    pub fn audit_event(&self, label: &str, ip: &str, action: &str, detail: &str) {
+        self.write_audit(label, None, ip, action, &[], detail);
+    }
+
+    fn write_audit(
+        &self,
+        label: &str,
+        ns: Option<&str>,
+        ip: &str,
+        action: &str,
+        classes: &[String],
+        detail: &str,
+    ) {
         let Some(log) = &self.audit_log else { return };
         let ts_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let (label, ns, ip) = match actor {
-            Some(a) => (a.label.as_str(), a.namespace.as_deref(), a.client_ip.as_str()),
-            None => ("local", None, "local"),
-        };
         let line = serde_json::json!({
             "ts_unix_ms": ts_ms,
             "actor": label,
@@ -1367,13 +1386,74 @@ impl QueryExecutor {
     /// control-plane admin flag (`Permission::Admin` key, or auth disabled)
     /// and leave a `grant_change` audit record — deny leaves `denied`.
     fn execute_policy_admin(&self, ast: &QueryAst, actor: &QueryActor) -> Result<QueryResult> {
-        use onto_core::policy::{
-            password_hash, CredentialRecord, Grant, Principal, PrincipalKind, CRED_SALT_LEN,
-            CRED_SCHEME_BLAKE3,
-        };
         use QueryAst as A;
 
+        // Audit detail must not carry secrets (passwords); success messages
+        // are already secret-free (ROTATE TOKEN returns early below).
+        let detail = match ast {
+            A::CreateUser {
+                id,
+                service_account,
+                ..
+            } => format!(
+                "CREATE {} {id}",
+                if *service_account {
+                    "SERVICE ACCOUNT"
+                } else {
+                    "USER"
+                }
+            ),
+            A::DropUser { id } => format!("DROP USER {id}"),
+            A::AlterUserPassword { id, .. } => format!("ALTER USER {id} PASSWORD"),
+            A::RotateToken { id } => format!("ROTATE TOKEN {id}"),
+            A::CreateRole { name } => format!("CREATE ROLE {name}"),
+            A::DropRole { name } => format!("DROP ROLE {name}"),
+            A::GrantRole { role, principal } => format!("GRANT ROLE {role} TO {principal}"),
+            A::RevokeRole { role, principal } => format!("REVOKE ROLE {role} FROM {principal}"),
+            A::GrantPrivilege {
+                action,
+                object,
+                role,
+            } => format!(
+                "GRANT {} ON {} TO {role}",
+                action.as_str(),
+                object.display()
+            ),
+            A::RevokePrivilege {
+                action,
+                object,
+                role,
+            } => format!(
+                "REVOKE {} ON {} FROM {role}",
+                action.as_str(),
+                object.display()
+            ),
+            other => format!("{other:?}"),
+        };
+        // Credential/rotation changes are `token_rotate` (design §12 event
+        // types); the rest of the policy plane is `grant_change`. Every
+        // statement — success or failure — leaves exactly one record
+        // (design §17.5: GRANT/REVOKE/拒绝 各产生一条合规事件).
+        let event = if matches!(
+            ast,
+            A::AlterUserPassword { .. } | A::RotateToken { .. }
+        ) {
+            "token_rotate"
+        } else {
+            "grant_change"
+        };
+
         let Some(svc) = &self.policy else {
+            // A mutation attempted without the policy service still is a
+            // grant/revoke-plane event; introspection is noise, not compliance.
+            if !matches!(ast, A::ShowRoles | A::ShowGrants { .. }) {
+                self.audit(
+                    Some(actor),
+                    event,
+                    &[],
+                    &format!("{detail} -> error: policy service not configured"),
+                );
+            }
             return Err(CoreError::InvalidArgument(
                 "RBAC policy service is not configured on this executor".to_string(),
             ));
@@ -1426,25 +1506,38 @@ impl QueryExecutor {
             ));
         }
 
-        // Audit detail must not carry secrets (passwords); success messages
-        // are already secret-free (ROTATE TOKEN returns early below).
-        let detail = match ast {
-            A::CreateUser {
-                id,
-                service_account,
-                ..
-            } => format!(
-                "CREATE {} {id}",
-                if *service_account {
-                    "SERVICE ACCOUNT"
+        match Self::eval_policy_mutation(ast, svc, pepper.as_deref()) {
+            Ok(success) => {
+                // The minted token must never reach the audit trail.
+                let audited = if matches!(ast, A::RotateToken { .. }) {
+                    format!("{detail} -> token rotated")
                 } else {
-                    "USER"
-                }
-            ),
-            A::AlterUserPassword { id, .. } => format!("ALTER USER {id} PASSWORD"),
-            other => format!("{other:?}"),
+                    format!("{detail} -> {success}")
+                };
+                self.audit(Some(actor), event, &[], &audited);
+                Ok(QueryResult::Success(success))
+            }
+            Err(e) => {
+                self.audit(Some(actor), event, &[], &format!("{detail} -> error: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// One policy-plane mutation's secret-free success message. Rejections
+    /// and fallible store errors surface as `Err` so the caller audits both
+    /// outcomes (every GRANT/REVOKE attempt leaves one record).
+    fn eval_policy_mutation(
+        ast: &QueryAst,
+        svc: &onto_ontology::policy_store::PolicyService,
+        pepper: Option<&str>,
+    ) -> Result<String> {
+        use onto_core::policy::{
+            password_hash, CredentialRecord, Grant, Principal, PrincipalKind, CRED_SALT_LEN,
+            CRED_SCHEME_BLAKE3,
         };
-        let success = match ast {
+        use QueryAst as A;
+        Ok(match ast {
             A::CreateUser {
                 id,
                 service_account,
@@ -1508,10 +1601,7 @@ impl QueryExecutor {
                         "no such principal '{id}'"
                     )));
                 }
-                self.audit(Some(actor), "token_rotate", &[], &format!("ROTATE TOKEN {id}"));
-                return Ok(QueryResult::Success(format!(
-                    "token rotated for '{id}': {token}"
-                )));
+                return Ok(format!("token rotated for '{id}': {token}"));
             }
             A::CreateRole { name } => {
                 if !svc.create_role(name)? {
@@ -1539,8 +1629,15 @@ impl QueryExecutor {
                 format!("role '{role}' granted to '{principal}'")
             }
             A::RevokeRole { role, principal } => {
-                svc.revoke_role(principal, role)?;
-                format!("role '{role}' revoked from '{principal}'")
+                let removed = svc.revoke_role(principal, role)?;
+                format!(
+                    "role '{role}' {} '{principal}'",
+                    if removed {
+                        "revoked from"
+                    } else {
+                        "not held by"
+                    }
+                )
             }
             A::GrantPrivilege {
                 action,
@@ -1592,16 +1689,7 @@ impl QueryExecutor {
                     "not a policy statement: {other:?}"
                 )))
             }
-        };
-        // Credential/rotation changes are `token_rotate` (design §12 event
-        // types); the rest of the policy plane is `grant_change`.
-        let event = if matches!(ast, A::AlterUserPassword { .. }) {
-            "token_rotate"
-        } else {
-            "grant_change"
-        };
-        self.audit(Some(actor), event, &[], &format!("{detail} -> {success}"));
-        Ok(QueryResult::Success(success))
+        })
     }
 
     fn run_as(&self, ast: &QueryAst, actor: &QueryActor, read: bool) -> Result<QueryResult> {
@@ -20374,6 +20462,104 @@ mod tests {
         assert!(audit.contains("ALTER USER alice PASSWORD"), "audit: {audit}");
         assert!(!audit.contains("newpw"), "audit must not echo the password: {audit}");
         assert!(!audit.contains("'pw'"), "audit must not echo the password: {audit}");
+    }
+
+    /// Every policy mutation attempt — success or failure — leaves exactly
+    /// one audit record (design §17.5: GRANT/REVOKE/拒绝 各产生一条合规事件),
+    /// and rejected attempts never carry secrets.
+    #[test]
+    fn policy_mutation_failures_are_audited() {
+        let (executor, _dir) = setup();
+        let pdir = tempdir().unwrap();
+        let svc = onto_ontology::policy_store::PolicyService::open(
+            onto_ontology::policy_store::PolicyStore::new(Arc::new(
+                LsmEngine::open(StorageOptions {
+                    data_dir: pdir.path().to_path_buf(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )),
+        )
+        .unwrap();
+        let adir = tempdir().unwrap();
+        let audit_path = adir.path().join("audit.log");
+        let executor = executor
+            .with_policy_service(svc.clone())
+            .with_audit_log(&audit_path);
+        let admin = QueryActor {
+            label: "root".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: true,
+            principal_id: None,
+        };
+        let run = |sql: &str| {
+            let ast = QueryParser::parse(sql).unwrap();
+            executor.execute_as(&ast, &admin)
+        };
+
+        run("CREATE ROLE analyst").unwrap();
+        run("CREATE USER alice WITH PASSWORD 'pw'").unwrap();
+
+        // Failed mutations: each still leaves a record naming the error.
+        assert!(run("CREATE ROLE analyst").is_err(), "duplicate role");
+        assert!(run("GRANT ROLE analyst TO ghost").is_err(), "no such principal");
+        assert!(
+            run("GRANT READ ON CLASS erp.orders TO ghost-role").is_err(),
+            "no such role"
+        );
+        assert!(run("ALTER USER ghost PASSWORD 'pw2'").is_err(), "no such user");
+        assert!(run("ROTATE TOKEN ghost").is_err(), "no such principal");
+
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        for stmt in [
+            "CREATE ROLE analyst",
+            "GRANT ROLE analyst TO ghost",
+            "GRANT READ ON CLASS erp.orders TO ghost-role",
+            "ALTER USER ghost PASSWORD",
+            "ROTATE TOKEN ghost",
+        ] {
+            assert!(
+                audit.contains(&format!("{stmt} -> error:")),
+                "'{stmt}' failure missing from audit: {audit}"
+            );
+        }
+        // One record per statement: the duplicate CREATE ROLE leaves exactly
+        // one success + one failure line, not more.
+        assert_eq!(
+            audit.matches("CREATE ROLE analyst ->").count(),
+            2,
+            "audit: {audit}"
+        );
+        assert_eq!(audit.matches("CREATE USER alice ->").count(), 1, "audit: {audit}");
+        // Rejected attempts never echo credentials.
+        assert!(!audit.contains("'pw'"), "audit must not echo passwords: {audit}");
+        assert!(!audit.contains("pw2"), "audit must not echo passwords: {audit}");
+    }
+
+    /// A mutation attempted with no policy service attached is still a
+    /// grant/revoke-plane event and lands in the audit trail.
+    #[test]
+    fn policy_mutation_without_service_is_audited() {
+        let (executor, _dir) = setup();
+        let adir = tempdir().unwrap();
+        let audit_path = adir.path().join("audit.log");
+        let executor = executor.with_audit_log(&audit_path);
+        let admin = QueryActor {
+            label: "root".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: true,
+            principal_id: None,
+        };
+        let ast = QueryParser::parse("GRANT ROLE analyst TO alice").unwrap();
+        assert!(executor.execute_as(&ast, &admin).is_err());
+
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(
+            audit.contains("GRANT ROLE analyst TO alice -> error: policy service not configured"),
+            "missing audit record: {audit}"
+        );
     }
 
     fn test_actor(ns: Option<&str>) -> QueryActor {

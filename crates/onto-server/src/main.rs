@@ -959,7 +959,8 @@ async fn run_http_server(
     };
     let auth_state = AuthState::new(&auth_config)
         .with_metrics(state.metrics.clone())
-        .with_policy(state.executor.policy_service());
+        .with_policy(state.executor.policy_service())
+        .with_audit(Some(state.audit.clone()));
 
     // Enable hot-reload for auth config file (check every 10 seconds)
     if let Some(ref api_keys_path) = api_keys_file {
@@ -1273,6 +1274,8 @@ async fn handle_client(
     let mut line = String::new();
     // Bearer token bound to this connection (via AUTH or LOGIN).
     let mut session_token: Option<String> = None;
+    // Principal bound to the session (audit identity for authn events).
+    let mut session_user: Option<String> = None;
 
     loop {
         line.clear();
@@ -1307,12 +1310,18 @@ async fn handle_client(
         if let Some(token) = strip_auth_cmd(input, "AUTH") {
             let reply = if auth_enabled {
                 match cli_authenticate(executor, token) {
-                    Some(_) => {
+                    Some(p) => {
                         session_token = Some(token.to_string());
+                        session_user = Some(p.id.clone());
+                        // design §12: session establishment is a `login`
+                        // event; the token itself never reaches the trail.
+                        executor.audit_event(&p.id, &peer, "login", "AUTH");
                         "OK\n".to_string()
                     }
                     None => {
                         session_token = None;
+                        session_user = None;
+                        executor.audit_event("anonymous", &peer, "authn_fail", "AUTH");
                         "ERR: invalid credentials\n".to_string()
                     }
                 }
@@ -1332,9 +1341,14 @@ async fn handle_client(
                     Some((user, password)) => match cli_login(executor, &user, &password) {
                         Some(token) => {
                             session_token = Some(token.clone());
+                            session_user = Some(user.clone());
+                            executor.audit_event(&user, &peer, "login", "LOGIN");
                             format!("OK {token}\n")
                         }
-                        None => "ERR: invalid credentials\n".to_string(),
+                        None => {
+                            executor.audit_event(&user, &peer, "authn_fail", "LOGIN");
+                            "ERR: invalid credentials\n".to_string()
+                        }
                     },
                     None => "ERR: usage: LOGIN <user> PASSWORD '<pw>'\n".to_string(),
                 }
@@ -1370,7 +1384,16 @@ async fn handle_client(
                     })
                 }
                 None => {
+                    // Revoked/expired session token: an authn failure worth
+                    // recording (design §9.1 in-flight token revocation).
+                    executor.audit_event(
+                        session_user.as_deref().unwrap_or("anonymous"),
+                        &peer,
+                        "authn_fail",
+                        "session token rejected (revoked or expired)",
+                    );
                     session_token = None;
+                    session_user = None;
                     writer.write_all(b"ERR: session expired\n\0").await?;
                     continue;
                 }
@@ -1513,22 +1536,24 @@ mod tcp_auth_tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpStream;
 
-    fn setup() -> (Arc<QueryExecutor>, Arc<PolicyService>) {
+    fn setup() -> (Arc<QueryExecutor>, Arc<PolicyService>, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let options = StorageOptions {
             data_dir: dir.path().to_path_buf(),
             ..Default::default()
         };
+        let audit_path = dir.path().join("audit.log");
         let engine = Arc::new(EngineSet::new(Arc::new(LsmEngine::open(options).unwrap())));
         let ontology_store = OntologyStore::new(engine.default_engine());
         let svc = PolicyService::open(PolicyStore::new(engine.default_engine())).unwrap();
         let executor = Arc::new(
             QueryExecutor::new(Arc::clone(&engine), ontology_store)
-                .with_policy_service(svc.clone()),
+                .with_policy_service(svc.clone())
+                .with_audit_log(&audit_path),
         );
         // Keep the tempdir alive for the whole test (like the e2e fixture).
         std::mem::forget(dir);
-        (executor, svc)
+        (executor, svc, audit_path)
     }
 
     fn admin() -> onto_query::QueryActor {
@@ -1626,7 +1651,7 @@ mod tcp_auth_tests {
 
     #[test]
     fn tcp_auth_gates_queries_and_enforces_class_pep() {
-        let (executor, svc) = setup();
+        let (executor, svc, _audit) = setup();
         run(&executor, "CREATE ROLE reader");
         run(&executor, "CREATE USER viewer WITH PASSWORD 'pw'");
         run(&executor, "GRANT ROLE reader TO viewer");
@@ -1652,7 +1677,7 @@ mod tcp_auth_tests {
 
     #[test]
     fn tcp_login_mints_session_token_and_password_change_revokes_it() {
-        let (executor, _svc) = setup();
+        let (executor, _svc, _audit) = setup();
         run(&executor, "CREATE ROLE reader");
         run(&executor, "CREATE USER alice WITH PASSWORD 'pw'");
         run(&executor, "GRANT ROLE reader TO alice");
@@ -1677,9 +1702,46 @@ mod tcp_auth_tests {
         assert!(send(&mut c2, &format!("AUTH {token}")).contains("ERR"));
     }
 
+    /// Wire authn events reach the audit trail (design §12 `login` /
+    /// `authn_fail`); the minted session token never does.
+    #[test]
+    fn tcp_login_and_authn_fail_land_in_audit() {
+        let (executor, _svc, audit_path) = setup();
+        run(&executor, "CREATE USER alice WITH PASSWORD 'pw'");
+        let port = spawn_server(Arc::clone(&executor), true);
+
+        let mut c = connect(port);
+        assert!(send(&mut c, "LOGIN alice PASSWORD 'nope'").contains("ERR"));
+        let reply = send(&mut c, "LOGIN alice PASSWORD 'pw'");
+        assert!(reply.trim().starts_with("OK "), "{reply}");
+        let token = reply.trim().trim_start_matches("OK ").trim().to_string();
+        assert!(send(&mut c, "AUTH nope").contains("ERR"));
+
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(
+            audit.contains("\"action\":\"login\"") && audit.contains("\"actor\":\"alice\""),
+            "login event missing: {audit}"
+        );
+        assert!(
+            audit.contains("\"action\":\"authn_fail\""),
+            "authn_fail events missing: {audit}"
+        );
+        assert_eq!(
+            audit.matches("\"action\":\"login\"").count(),
+            1,
+            "exactly one login record: {audit}"
+        );
+        assert_eq!(
+            audit.matches("\"action\":\"authn_fail\"").count(),
+            2,
+            "failed LOGIN + failed AUTH: {audit}"
+        );
+        assert!(!audit.contains(&token), "session token must not reach audit: {audit}");
+    }
+
     #[test]
     fn tcp_admin_role_gates_policy_ddl() {
-        let (executor, svc) = setup();
+        let (executor, svc, _audit) = setup();
         run(&executor, "CREATE USER bob WITH PASSWORD 'pw'");
         run(&executor, "CREATE USER alice WITH PASSWORD 'pw'");
         svc.engine.grant_role("bob", BUILTIN_ROLE_ADMIN);
@@ -1701,7 +1763,7 @@ mod tcp_auth_tests {
 
     #[test]
     fn tcp_auth_disabled_keeps_anonymous_behavior() {
-        let (executor, _svc) = setup();
+        let (executor, _svc, _audit) = setup();
         run(&executor, "INSERT INTO erp.orders (name, price) VALUES ('o1', 1)");
         let port = spawn_server(executor, false);
 
@@ -1717,7 +1779,7 @@ mod tcp_auth_tests {
     #[test]
     fn tcp_admin_role_gates_policy_ddl_and_data_ddl() {
         // Smoke: the PDP decision matrix reaches the wire (READ ≠ WRITE).
-        let (executor, svc) = setup();
+        let (executor, svc, _audit) = setup();
         run(&executor, "CREATE USER ops WITH PASSWORD 'pw'");
         run(&executor, "INSERT INTO erp.orders (name, price) VALUES ('o1', 1)");
         svc.engine.grant_role("ops", BUILTIN_ROLE_ADMIN);

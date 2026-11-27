@@ -173,6 +173,9 @@ pub struct AuthState {
     /// RBAC policy service (M1): when set, keys resolve to principals through
     /// the migrated `__sys__.users` token mapping (design §9.2).
     pub policy: Option<Arc<onto_ontology::policy_store::PolicyService>>,
+    /// Audit sink for authn failures / authorization denials (design §12
+    /// `authn_fail` / `authz_deny` events, hash-chained `audit_logs/`).
+    pub audit: Option<Arc<crate::audit::AuditLogger>>,
 }
 
 impl AuthState {
@@ -190,6 +193,7 @@ impl AuthState {
             config_path: None,
             last_modified: Arc::new(parking_lot::RwLock::new(None)),
             policy: None,
+            audit: None,
         }
     }
 
@@ -209,6 +213,21 @@ impl AuthState {
     pub fn with_policy(mut self, policy: Option<Arc<onto_ontology::policy_store::PolicyService>>) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Attach the audit logger for authn_fail / authz_deny records.
+    pub fn with_audit(mut self, audit: Option<Arc<crate::audit::AuditLogger>>) -> Self {
+        self.audit = audit;
+        self
+    }
+
+    /// Leave one `authn_fail` / `authz_deny` record for a rejected request
+    /// (design §12). The API key is masked by the logger; failures land only
+    /// when audit logging is enabled (`--audit`).
+    fn audit_reject(&self, client_ip: &str, api_key: Option<&str>, action: &str, detail: &str) {
+        if let Some(audit) = &self.audit {
+            audit.log(audit.create_auth_entry(client_ip, api_key, action, detail, false));
+        }
     }
 
     /// Principal id for a validated key: the explicit `principal` config field
@@ -462,6 +481,12 @@ pub async fn auth_middleware(
 
     // Check global IP whitelist (before auth)
     if !auth.is_ip_allowed(&client_ip) {
+        auth.audit_reject(
+            &client_ip,
+            None,
+            "authz_deny",
+            &format!("IP {} is not in the server whitelist", client_ip),
+        );
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -497,6 +522,7 @@ pub async fn auth_middleware(
             if let Some(ref metrics) = auth.metrics {
                 metrics.auth_failures.inc();
             }
+            auth.audit_reject(&client_ip, None, "authn_fail", "missing API key");
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({
@@ -515,6 +541,7 @@ pub async fn auth_middleware(
             if let Some(ref metrics) = auth.metrics {
                 metrics.auth_failures.inc();
             }
+            auth.audit_reject(&client_ip, Some(&key), "authn_fail", "invalid API key");
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({
@@ -531,6 +558,12 @@ pub async fn auth_middleware(
         if let Some(ref metrics) = auth.metrics {
             metrics.auth_failures.inc();
         }
+        auth.audit_reject(
+            &client_ip,
+            Some(&key),
+            "authz_deny",
+            &format!("IP {} is not allowed for this API key", client_ip),
+        );
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -549,6 +582,15 @@ pub async fn auth_middleware(
         if let Some(ref metrics) = auth.metrics {
             metrics.auth_failures.inc();
         }
+        auth.audit_reject(
+            &client_ip,
+            Some(&key),
+            "authz_deny",
+            &format!(
+                "insufficient permissions for {} {} (key '{}')",
+                method, path, record.description
+            ),
+        );
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -788,5 +830,63 @@ mod tests {
         let auth = AuthState::new(&cfg);
         assert!(auth.principal_for("sec-mapped", &record(None)).is_none());
         assert!(auth.principal_for("unknown", &record(None)).is_none());
+    }
+
+    /// Rejected requests leave an `authn_fail` / `authz_deny` record in the
+    /// hash-chained audit trail, with the API key masked (design §12).
+    #[test]
+    fn audit_reject_leaves_authn_fail_and_authz_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("audit_logs");
+        let audit = Arc::new(crate::audit::AuditLogger::new(crate::audit::AuditConfig {
+            enabled: true,
+            log_dir: log_dir.clone(),
+            ..Default::default()
+        }));
+        let cfg = AuthConfig {
+            enabled: true,
+            keys: vec![],
+            default_permission: Permission::ReadOnly,
+        };
+        let auth = AuthState::new(&cfg).with_audit(Some(audit));
+
+        auth.audit_reject("10.0.0.1", Some("secret-key-123456"), "authn_fail", "invalid API key");
+        auth.audit_reject("10.0.0.2", None, "authz_deny", "IP not in whitelist");
+
+        let mut entries = Vec::new();
+        for f in std::fs::read_dir(&log_dir).unwrap() {
+            let text = std::fs::read_to_string(f.unwrap().path()).unwrap();
+            for line in text.lines() {
+                entries.push(serde_json::from_str::<serde_json::Value>(line).unwrap());
+            }
+        }
+        assert_eq!(entries.len(), 2, "one record per rejection: {entries:?}");
+        assert_eq!(entries[0]["event_type"], "auth");
+        assert_eq!(entries[0]["operation"], "authn_fail");
+        assert_eq!(entries[0]["success"], false);
+        assert_eq!(entries[0]["client_ip"], "10.0.0.1");
+        assert_eq!(entries[0]["detail"], "invalid API key");
+        assert!(!entries[0]["api_key_id"]
+            .as_str()
+            .unwrap()
+            .contains("secret-key-123456"),
+            "key must be masked: {}", entries[0]["api_key_id"]);
+        assert_eq!(entries[1]["operation"], "authz_deny");
+        assert_eq!(entries[1]["success"], false);
+        assert_eq!(entries[1]["client_ip"], "10.0.0.2");
+        assert_eq!(entries[1]["api_key_id"], "unknown");
+    }
+
+    /// Without an audit handle (or with audit disabled) rejections still
+    /// respond — the trail simply gains nothing.
+    #[test]
+    fn audit_reject_is_silent_without_logger() {
+        let cfg = AuthConfig {
+            enabled: true,
+            keys: vec![],
+            default_permission: Permission::ReadOnly,
+        };
+        let auth = AuthState::new(&cfg);
+        auth.audit_reject("10.0.0.1", Some("k"), "authn_fail", "invalid API key");
     }
 }
