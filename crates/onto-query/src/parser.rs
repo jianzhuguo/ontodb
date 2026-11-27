@@ -455,20 +455,24 @@ pub enum QueryAst {
     /// REVOKE ROLE <role> FROM <principal>
     RevokeRole { role: String, principal: String },
 
-    /// GRANT <READ|WRITE|DDL> ON NAMESPACE <ns> TO <role>
-    /// GRANT <READ|WRITE|DDL> ON CLASS <ns.cls> TO <role>
+    /// GRANT <READ|WRITE|DDL> ON NAMESPACE <ns> [ONLY] TO <role>
+    /// GRANT <READ|WRITE|DDL> ON CLASS <ns.cls> [ONLY] TO <role>
+    /// `ONLY` stops `is_a` downward inheritance (design §7.1, M2).
     GrantPrivilege {
         action: onto_core::policy::Action,
         object: onto_core::policy::ObjectRef,
         role: String,
+        only: bool,
     },
 
-    /// REVOKE <READ|WRITE|DDL> ON NAMESPACE <ns> FROM <role>
-    /// REVOKE <READ|WRITE|DDL> ON CLASS <ns.cls> FROM <role>
+    /// REVOKE <READ|WRITE|DDL> ON NAMESPACE <ns> [ONLY] FROM <role>
+    /// REVOKE <READ|WRITE|DDL> ON CLASS <ns.cls> [ONLY] FROM <role>
+    /// Records an explicit deny (carve-out, design §7.1).
     RevokePrivilege {
         action: onto_core::policy::Action,
         object: onto_core::policy::ObjectRef,
         role: String,
+        only: bool,
     },
 
     /// SHOW ROLES
@@ -1748,6 +1752,9 @@ impl QueryParser {
                 )))
             }
         };
+        // Optional `ONLY` — stops `is_a` subclass expansion (design §7.1).
+        // Only meaningful on CLASS grants.
+        let (r, only) = Self::parse_only(r, &object)?;
         let (kw, role) = Self::split_word(r).ok_or_else(|| {
             CoreError::InvalidArgument("usage: … TO <role>".to_string())
         })?;
@@ -1758,7 +1765,30 @@ impl QueryParser {
             action,
             object,
             role: role.to_string(),
+            only,
         })
+    }
+
+    /// Parse an optional trailing `ONLY` keyword after a GRANT/REVOKE target.
+    /// Returns the remaining input (unchanged when `ONLY` is absent) and the
+    /// flag. `ONLY` is only valid on `CLASS` targets (it stops subclass
+    /// expansion; namespace cascade is not `is_a` inheritance, design §6/§7.1).
+    fn parse_only<'a>(
+        r: &'a str,
+        object: &onto_core::policy::ObjectRef,
+    ) -> Result<(&'a str, bool)> {
+        let Some((kw, rest)) = Self::split_word(r) else {
+            return Ok((r, false));
+        };
+        if !kw.eq_ignore_ascii_case("ONLY") {
+            return Ok((r, false));
+        }
+        if !matches!(object, onto_core::policy::ObjectRef::Class { .. }) {
+            return Err(CoreError::InvalidArgument(
+                "ONLY is only valid on CLASS grants".to_string(),
+            ));
+        }
+        Ok((rest, true))
     }
 
     fn parse_revoke(input: &str) -> Result<QueryAst> {
@@ -1807,6 +1837,8 @@ impl QueryParser {
                 )))
             }
         };
+        // Optional `ONLY` — limits the carve-out to the class itself.
+        let (r, only) = Self::parse_only(r, &object)?;
         let (kw, role) = Self::split_word(r).ok_or_else(|| {
             CoreError::InvalidArgument("usage: … FROM <role>".to_string())
         })?;
@@ -1819,6 +1851,7 @@ impl QueryParser {
             action,
             object,
             role: role.to_string(),
+            only,
         })
     }
 
@@ -6748,6 +6781,62 @@ mod tests {
                 .unwrap()
                 .required_action()
                 .is_none()
+        );
+    }
+
+    /// M2 T4.1: `ONLY` parses onto CLASS targets only (design §7.1) —
+    /// it stops `is_a` subclass expansion, so a namespace cascade rejects it.
+    #[test]
+    fn test_parse_grant_revoke_only() {
+        use onto_core::policy::{Action, ObjectRef};
+
+        // CLASS target + ONLY → flag set; bare class name lands in _default.
+        match QueryParser::parse("GRANT READ ON CLASS ns.C ONLY TO r").unwrap() {
+            QueryAst::GrantPrivilege { action, object, role, only } => {
+                assert_eq!(action, Action::Read);
+                assert_eq!(
+                    object,
+                    ObjectRef::Class { ns: "ns".into(), class: "C".into() }
+                );
+                assert_eq!(role, "r");
+                assert!(only);
+            }
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        match QueryParser::parse("GRANT READ ON CLASS C ONLY TO r").unwrap() {
+            QueryAst::GrantPrivilege { object, only, .. } => {
+                assert_eq!(
+                    object,
+                    ObjectRef::Class { ns: "_default".into(), class: "C".into() }
+                );
+                assert!(only);
+            }
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        // No ONLY → flag stays false (M1 parse shape unchanged).
+        match QueryParser::parse("GRANT READ ON CLASS ns.C TO r").unwrap() {
+            QueryAst::GrantPrivilege { only, .. } => assert!(!only),
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        // REVOKE is symmetric: ONLY limits the carve-out to the class itself.
+        match QueryParser::parse("REVOKE READ ON CLASS ns.C ONLY FROM r").unwrap() {
+            QueryAst::RevokePrivilege { only, .. } => assert!(only),
+            other => panic!("expected RevokePrivilege, got {other:?}"),
+        }
+        match QueryParser::parse("REVOKE READ ON CLASS ns.C FROM r").unwrap() {
+            QueryAst::RevokePrivilege { only, .. } => assert!(!only),
+            other => panic!("expected RevokePrivilege, got {other:?}"),
+        }
+        // NAMESPACE target + ONLY is a hard error (cascade ≠ is_a inheritance).
+        let err = QueryParser::parse("GRANT READ ON NAMESPACE x ONLY TO r").unwrap_err();
+        assert!(
+            err.to_string().contains("ONLY is only valid on CLASS grants"),
+            "err: {err}"
+        );
+        let err = QueryParser::parse("REVOKE READ ON NAMESPACE x ONLY FROM r").unwrap_err();
+        assert!(
+            err.to_string().contains("ONLY is only valid on CLASS grants"),
+            "err: {err}"
         );
     }
 }

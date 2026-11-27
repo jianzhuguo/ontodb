@@ -109,6 +109,7 @@ fn ensure_builtin_roles(svc: &PolicyService) -> Result<usize> {
                 role: role.to_string(),
                 action,
                 object: ObjectRef::Namespace("*".to_string()),
+                options: Default::default(),
             })?;
         }
     }

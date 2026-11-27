@@ -1134,14 +1134,48 @@ impl QueryExecutor {
 
     /// Attaches the RBAC policy service (M1): plan-time checks in
     /// `prepare_as` and policy-DDL handling in `run_as` light up when set.
+    /// Also installs the materialized `is_a` closure so the PDP can expand
+    /// grants down the subclass line (M2).
     pub fn with_policy_service(mut self, svc: Arc<onto_ontology::policy_store::PolicyService>) -> Self {
         self.policy = Some(svc);
+        self.refresh_policy_hierarchy();
         self
     }
 
     /// The attached RBAC policy service (M1), if any.
     pub fn policy_service(&self) -> Option<Arc<onto_ontology::policy_store::PolicyService>> {
         self.policy.clone()
+    }
+
+    /// Rebuild the materialized `is_a` closure (design §7.1/§14) from the
+    /// merged ontology and install it into the policy engine, so downward
+    /// grant inheritance can be answered without depending on this crate
+    /// from `onto-core`. Called at policy attach time and after every
+    /// ontology-structure change.
+    fn refresh_policy_hierarchy(&self) {
+        let Some(svc) = &self.policy else {
+            return;
+        };
+        let merged = self.get_merged_ontology(&self.engine.default_engine());
+        let mut closure = onto_core::policy::ClassClosure::default();
+        // `get_all_superclasses` is the transitive view (direct + indirect +
+        // equivalent), so the closure is materialized in one pass per class
+        // (design §14: 物化缓存).
+        for name in merged.classes.keys() {
+            for sup in merged.get_all_superclasses(name) {
+                closure.insert(name, &sup);
+            }
+        }
+        svc.engine.set_hierarchy(Arc::new(closure));
+    }
+
+    /// Drop ontology-derived caches and rebuild the PDP `is_a` closure.
+    fn invalidate_ontology_caches(&self, name: &str) {
+        self.inference_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate_ontology(name);
+        self.refresh_policy_hierarchy();
     }
 
     /// Appends one audit record (cross-namespace access or scoped-key denial).
@@ -1414,19 +1448,23 @@ impl QueryExecutor {
                 action,
                 object,
                 role,
+                only,
             } => format!(
-                "GRANT {} ON {} TO {role}",
+                "GRANT {} ON {}{} TO {role}",
                 action.as_str(),
-                object.display()
+                object.display(),
+                if *only { " ONLY" } else { "" }
             ),
             A::RevokePrivilege {
                 action,
                 object,
                 role,
+                only,
             } => format!(
-                "REVOKE {} ON {} FROM {role}",
+                "REVOKE {} ON {}{} FROM {role}",
                 action.as_str(),
-                object.display()
+                object.display(),
+                if *only { " ONLY" } else { "" }
             ),
             other => format!("{other:?}"),
         };
@@ -1476,23 +1514,39 @@ impl QueryExecutor {
                 return Ok(QueryResult::Rows(rows));
             }
             A::ShowGrants { role } => {
-                let grants = match role {
+                let row = |g: &onto_core::policy::Grant, effect: &str| {
+                    let mut m = Map::new();
+                    m.insert("role".to_string(), Value::String(g.role.clone()));
+                    m.insert(
+                        "action".to_string(),
+                        Value::String(g.action.as_str().to_string()),
+                    );
+                    let mut obj = g.object.display();
+                    if g.options.only {
+                        obj.push_str(" ONLY");
+                    }
+                    m.insert("object".to_string(), Value::String(obj));
+                    m.insert("effect".to_string(), Value::String(effect.to_string()));
+                    m
+                };
+                let mut rows = match role {
                     Some(r) => svc.engine.grants_for_role(r),
                     None => svc.engine.grants(),
-                };
-                let rows = grants
-                    .into_iter()
-                    .map(|g| {
-                        let mut m = Map::new();
-                        m.insert("role".to_string(), Value::String(g.role));
-                        m.insert(
-                            "action".to_string(),
-                            Value::String(g.action.as_str().to_string()),
-                        );
-                        m.insert("object".to_string(), Value::String(g.object.display()));
-                        m
-                    })
-                    .collect();
+                }
+                .iter()
+                .map(|g| row(g, "ALLOW"))
+                .collect::<Vec<_>>();
+                // Explicit denies (REVOKE carve-outs) sit alongside the allows
+                // so operators can see what inheritance has punched out
+                // (design §7.1).
+                rows.extend(
+                    match role {
+                        Some(r) => svc.engine.denies_for_role(r),
+                        None => svc.engine.denies(),
+                    }
+                    .iter()
+                    .map(|g| row(g, "DENY")),
+                );
                 return Ok(QueryResult::Rows(rows));
             }
             _ => {}
@@ -1643,6 +1697,7 @@ impl QueryExecutor {
                 action,
                 object,
                 role,
+                only,
             } => {
                 if !svc.engine.role_exists(role) {
                     return Err(CoreError::InvalidArgument(format!(
@@ -1653,34 +1708,45 @@ impl QueryExecutor {
                     role: role.clone(),
                     action: *action,
                     object: object.clone(),
+                    options: onto_core::policy::GrantOptions {
+                        only: *only,
+                        ..Default::default()
+                    },
                 })?;
                 format!(
-                    "granted {} on {} to '{}'",
+                    "granted {} on {} to '{}'{}",
                     action.as_str(),
                     object.display(),
-                    role
+                    role,
+                    if *only { " ONLY" } else { "" }
                 )
             }
             A::RevokePrivilege {
                 action,
                 object,
                 role,
+                only,
             } => {
                 let removed = svc.revoke(&Grant {
                     role: role.clone(),
                     action: *action,
                     object: object.clone(),
+                    options: onto_core::policy::GrantOptions {
+                        only: *only,
+                        ..Default::default()
+                    },
                 })?;
                 format!(
-                    "{} on {} {} role '{}'",
+                    "{} on {} {} role '{}'{}",
                     action.as_str(),
                     object.display(),
                     if removed {
                         "revoked from"
                     } else {
-                        "not held by"
+                        "denied for"
                     },
-                    role
+                    role,
+                    if *only { " ONLY" } else { "" }
                 )
             }
             // Unreachable: the run_as intercept only routes the arms above.
@@ -2690,10 +2756,7 @@ impl QueryExecutor {
             for cls in &found_classes {
                 self.drop_row_count_aliases(cls);
             }
-            self.inference_cache
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .invalidate_ontology(name);
+            self.invalidate_ontology_caches(name);
             tracing::info!("Dropped ontology '{}'", name);
             Ok(())
         } else {
@@ -2735,10 +2798,7 @@ impl QueryExecutor {
         engine.delete(key)?;
         self.ontology_store.save_with_engine(engine, &ontology)?;
         engine.flush()?;
-        self.inference_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .invalidate_ontology(&ontology.name);
+        self.invalidate_ontology_caches(&ontology.name);
         Ok(())
     }
 
@@ -2818,10 +2878,7 @@ impl QueryExecutor {
         engine.delete(key)?;
         self.ontology_store.save_with_engine(engine, &ontology)?;
         engine.flush()?;
-        self.inference_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .invalidate_ontology(&ontology.name);
+        self.invalidate_ontology_caches(&ontology.name);
         Ok(())
     }
 
@@ -2870,10 +2927,7 @@ impl QueryExecutor {
         engine.delete(key)?;
         self.ontology_store.save_with_engine(engine, &ontology)?;
         engine.flush()?;
-        self.inference_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .invalidate_ontology(&ontology.name);
+        self.invalidate_ontology_caches(&ontology.name);
         Ok(())
     }
 
@@ -2957,10 +3011,7 @@ impl QueryExecutor {
         engine.delete(key)?;
         self.ontology_store.save_with_engine(engine, &ontology)?;
         engine.flush()?;
-        self.inference_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .invalidate_ontology(&ontology.name);
+        self.invalidate_ontology_caches(&ontology.name);
         Ok(())
     }
 
@@ -2985,10 +3036,7 @@ impl QueryExecutor {
         engine.delete(key)?;
         self.ontology_store.save_with_engine(engine, ontology)?;
         engine.flush()?;
-        self.inference_cache
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .invalidate_ontology(&ontology.name);
+        self.invalidate_ontology_caches(&ontology.name);
         Ok(())
     }
 
@@ -3714,10 +3762,7 @@ impl QueryExecutor {
 
                 self.ontology_store.save_with_engine(engine, &ontology)?;
                 // Selective invalidation: only clear caches related to this ontology
-                self.inference_cache
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .invalidate_ontology(&ontology.name);
+                self.invalidate_ontology_caches(&ontology.name);
                 Ok(QueryResult::Success(format!(
                     "Ontology '{}' created with {} classes and {} properties",
                     ontology.name,
@@ -4331,10 +4376,7 @@ impl QueryExecutor {
                         if ontology.name == *name {
                             engine.delete(key.clone())?;
                             // Invalidate cache
-                            self.inference_cache
-                                .write()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .invalidate_ontology(&ontology.name);
+                            self.invalidate_ontology_caches(&ontology.name);
                             // Drop cached row counts too (full + short aliases),
                             // or SHOW CLASSES keeps listing the dead class.
                             self.drop_row_count_aliases(&ontology.name);
@@ -20462,6 +20504,119 @@ mod tests {
         assert!(audit.contains("ALTER USER alice PASSWORD"), "audit: {audit}");
         assert!(!audit.contains("newpw"), "audit must not echo the password: {audit}");
         assert!(!audit.contains("'pw'"), "audit must not echo the password: {audit}");
+    }
+
+    /// RBAC M2: `is_a` inheritance end-to-end (design §7.1). A grant on a
+    /// parent class covers its whole subclass line through the PEP, `ONLY`
+    /// stops the expansion, and an explicit `REVOKE` carves the subtree out
+    /// of the inherited allow set. Acceptance anchor: 继承闭包与推理物化一致 —
+    /// the closure the PDP uses is the ontology's own `get_all_subclasses`
+    /// view, refreshed on every ontology change.
+    #[test]
+    fn policy_is_a_inheritance_and_carve_out() {
+        use onto_core::policy::Action;
+        let (executor, _dir) = setup();
+        let pdir = tempdir().unwrap();
+        let svc = onto_ontology::policy_store::PolicyService::open(
+            onto_ontology::policy_store::PolicyStore::new(Arc::new(
+                LsmEngine::open(StorageOptions {
+                    data_dir: pdir.path().to_path_buf(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )),
+        )
+        .unwrap();
+        let adir = tempdir().unwrap();
+        let audit_path = adir.path().join("audit.log");
+        let executor = executor
+            .with_policy_service(svc.clone())
+            .with_audit_log(&audit_path);
+        let admin = QueryActor {
+            label: "root".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: true,
+            principal_id: None,
+        };
+        let parse_stmt = |sql: &str| {
+            crate::ontoql::OntoQLParser::parse(sql)
+                .ok()
+                .and_then(|oa| oa.to_query_ast().ok())
+                .unwrap_or_else(|| QueryParser::parse(sql).unwrap())
+        };
+        let run = |sql: &str| executor.execute_as(&parse_stmt(sql), &admin);
+        let run_for = |sql: &str, actor: &QueryActor| executor.execute_as(&parse_stmt(sql), actor);
+
+        // Animal ← Dog ← Puppy, Animal ← Cat.
+        run("CREATE ONTOLOGY zoo (CLASS Animal, CLASS Dog SUBCLASS OF Animal, CLASS Puppy SUBCLASS OF Dog, CLASS Cat SUBCLASS OF Animal, PROPERTY name DOMAIN Animal RANGE STRING)").unwrap();
+        insert_row(&executor, "Animal", "a1", 1);
+        insert_row(&executor, "Dog", "d1", 1);
+        insert_row(&executor, "Puppy", "p1", 1);
+        insert_row(&executor, "Cat", "c1", 1);
+
+        run("CREATE ROLE viewer").unwrap();
+        run("CREATE USER alice WITH PASSWORD 'pw'").unwrap();
+        run("GRANT ROLE viewer TO alice").unwrap();
+        run("GRANT READ ON CLASS Animal TO viewer").unwrap();
+
+        let alice = QueryActor {
+            label: "alice".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+            principal_id: Some("alice".to_string()),
+        };
+        // The parent grant covers the whole subclass line, transitively.
+        assert!(run_for("SELECT name FROM Animal", &alice).is_ok());
+        assert!(run_for("SELECT name FROM Dog", &alice).is_ok());
+        assert!(run_for("SELECT name FROM Puppy", &alice).is_ok());
+        assert!(run_for("SELECT name FROM Cat", &alice).is_ok());
+        // …and never crosses the action dimension.
+        assert!(run_for("UPDATE Animal SET price = 2 WHERE name = 'a1'", &alice).is_err());
+
+        // REVOKE carves Dog (and its subtree) out of the inherited allow set.
+        run("REVOKE READ ON CLASS Dog FROM viewer").unwrap();
+        assert!(run_for("SELECT name FROM Animal", &alice).is_ok());
+        assert!(run_for("SELECT name FROM Cat", &alice).is_ok());
+        assert!(run_for("SELECT name FROM Dog", &alice).is_err());
+        assert!(run_for("SELECT name FROM Puppy", &alice).is_err());
+        // No direct allow on Dog was removed — the statement planted a deny,
+        // so the audit line must say `denied for`, not `revoked from`.
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(audit.contains("denied for role 'viewer'"), "audit: {audit}");
+        assert!(!audit.contains("revoked from role 'viewer'"), "audit: {audit}");
+
+        // ONLY stops the downward expansion at the granted class.
+        run("CREATE ROLE strict").unwrap();
+        run("CREATE USER bob WITH PASSWORD 'pw'").unwrap();
+        run("GRANT ROLE strict TO bob").unwrap();
+        run("GRANT READ ON CLASS Animal ONLY TO strict").unwrap();
+        let bob = QueryActor {
+            label: "bob".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+            principal_id: Some("bob".to_string()),
+        };
+        assert!(run_for("SELECT name FROM Animal", &bob).is_ok());
+        assert!(run_for("SELECT name FROM Dog", &bob).is_err());
+        assert!(run_for("SELECT name FROM Puppy", &bob).is_err());
+        assert!(run_for("SELECT name FROM Cat", &bob).is_err());
+
+        // SHOW GRANTS surfaces the carve-out as a DENY row.
+        let res = run("SHOW GRANTS FOR viewer").unwrap();
+        let rows = match res {
+            crate::QueryResult::Rows(rows) => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert!(
+            rows.iter().any(|r| {
+                r.get("effect").and_then(|v| v.as_str()) == Some("DENY")
+                    && r.get("object").and_then(|v| v.as_str()) == Some("CLASS _default.Dog")
+            }),
+            "SHOW GRANTS should list the Dog carve-out: {rows:?}"
+        );
     }
 
     /// Every policy mutation attempt — success or failure — leaves exactly

@@ -179,6 +179,7 @@ mod tests {
                 role: "analyst".into(),
                 action: Action::Read,
                 object: ObjectRef::Namespace("erp".into()),
+                options: Default::default(),
             })
             .unwrap();
             svc.put_token("tok-a", "alice", None).unwrap();
@@ -213,6 +214,7 @@ mod tests {
                 ns: "erp".into(),
                 class: "orders".into(),
             },
+            options: Default::default(),
         };
         svc.grant(g.clone()).unwrap();
         assert!(svc.check_class("alice", Action::Write, "erp", "orders"));

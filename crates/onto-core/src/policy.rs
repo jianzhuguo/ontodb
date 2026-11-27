@@ -18,7 +18,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 // ─── Credentials ───────────────────────────────────────────────────────────
 
@@ -94,21 +94,45 @@ impl Action {
     }
 }
 
-/// Grant object: a namespace (cascades to its classes) or one class.
+/// Grant object: a namespace (cascades to its classes), one class (cascades
+/// to its `is_a` subclasses), one property of a class, or one inference rule.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ObjectRef {
     Namespace(String),
     Class { ns: String, class: String },
+    /// `GRANT ... ON CLASS X(a,b)` — one property of one class (M2).
+    Property {
+        ns: String,
+        class: String,
+        prop: String,
+    },
+    /// `GRANT INFER ON RULE <name>` — inference-rule visibility (M2).
+    Rule(String),
 }
 
 impl ObjectRef {
-    /// `NAMESPACE x` / `CLASS ns.cls` rendering for SHOW and audit.
+    /// `NAMESPACE x` / `CLASS ns.cls` / `PROPERTY ns.cls.prop` / `RULE r`
+    /// rendering for SHOW and audit.
     pub fn display(&self) -> String {
         match self {
             ObjectRef::Namespace(ns) => format!("NAMESPACE {ns}"),
             ObjectRef::Class { ns, class } => format!("CLASS {ns}.{class}"),
+            ObjectRef::Property { ns, class, prop } => format!("PROPERTY {ns}.{class}.{prop}"),
+            ObjectRef::Rule(r) => format!("RULE {r}"),
         }
     }
+}
+
+/// Grant options (design §5/§7.1). `ONLY` stops `is_a` downward inheritance;
+/// `WITH GRANT OPTION` lets the holder delegate (M2 — wired in T4.5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantOptions {
+    /// `GRANT ... ON CLASS X ONLY` — covers `X` itself, not its subclasses.
+    #[serde(default)]
+    pub only: bool,
+    /// `WITH GRANT OPTION` — the role may delegate this grant (T4.5).
+    #[serde(default)]
+    pub with_grant_option: bool,
 }
 
 /// One authorization grant: role may `action` on `object`.
@@ -117,6 +141,36 @@ pub struct Grant {
     pub role: String,
     pub action: Action,
     pub object: ObjectRef,
+    #[serde(default)]
+    pub options: GrantOptions,
+}
+
+/// Materialized `is_a` closure (design §7.1/§14): class name → the set of
+/// its transitive super-class names. Built from the ontology and installed
+/// into the engine ([`PolicyEngine::set_hierarchy`]) so downward grant
+/// inheritance is answered with hash lookups. Keys are bare (unqualified)
+/// class names — the evaluator matches namespaces before consulting the
+/// closure, so cross-namespace inheritance never fires.
+#[derive(Debug, Default, Clone)]
+pub struct ClassClosure {
+    ancestors: HashMap<String, HashSet<String>>,
+}
+
+impl ClassClosure {
+    /// Record one (child → transitive-ancestor) pair.
+    pub fn insert(&mut self, child: &str, ancestor: &str) {
+        self.ancestors
+            .entry(child.to_string())
+            .or_default()
+            .insert(ancestor.to_string());
+    }
+
+    /// True when `child` is a (transitive) subclass of `parent`.
+    pub fn is_subclass_of(&self, child: &str, parent: &str) -> bool {
+        self.ancestors
+            .get(child)
+            .is_some_and(|set| set.contains(parent))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,8 +212,11 @@ pub struct PolicyEngine {
 struct PolicyState {
     /// Registered role names (CREATE ROLE / DROP ROLE).
     roles: HashSet<String>,
-    /// role → grants (M1: flat list; M2 adds inheritance options).
-    grants: HashMap<String, Vec<(Action, ObjectRef)>>,
+    /// role → allow grants (action, object, options).
+    grants: HashMap<String, Vec<(Action, ObjectRef, GrantOptions)>>,
+    /// role → explicit denies (REVOKE carve-outs, design §7.1/§8). Deny wins
+    /// over an inherited allow and expands down the `is_a` line like an allow.
+    denies: HashMap<String, Vec<(Action, ObjectRef, GrantOptions)>>,
     /// principal id → principal.
     principals: HashMap<String, Principal>,
     /// principal id → credential (salt+hash), verified on password auth.
@@ -170,6 +227,9 @@ struct PolicyState {
     /// `None` = not epoch-gated (config-managed API keys: their lifetime is
     /// governed by the config file, design §9.2).
     token_index: HashMap<[u8; 32], (String, Option<u64>)>,
+    /// Materialized `is_a` closure for downward grant inheritance (M2).
+    /// `None` = no inheritance expansion (M1 behavior).
+    hierarchy: Option<Arc<ClassClosure>>,
     /// Decision cache: (principal id, action, object) → allowed.
     cache: HashMap<(String, Action, ObjectRef), bool>,
 }
@@ -181,6 +241,9 @@ pub struct PolicySnapshot {
     pub principals: Vec<Principal>,
     pub credentials: Vec<CredentialRecord>,
     pub grants: Vec<Grant>,
+    /// Explicit denies (REVOKE carve-outs, M2).
+    #[serde(default)]
+    pub denies: Vec<Grant>,
     /// Registered role names.
     pub roles: Vec<String>,
     /// (hex of `BLAKE3(token)`, principal id)
@@ -217,10 +280,23 @@ impl PolicyEngine {
                 .grants
                 .iter()
                 .flat_map(|(role, list)| {
-                    list.iter().map(move |(a, o)| Grant {
+                    list.iter().map(move |(a, o, opts)| Grant {
                         role: role.clone(),
                         action: *a,
                         object: o.clone(),
+                        options: *opts,
+                    })
+                })
+                .collect(),
+            denies: st
+                .denies
+                .iter()
+                .flat_map(|(role, list)| {
+                    list.iter().map(move |(a, o, opts)| Grant {
+                        role: role.clone(),
+                        action: *a,
+                        object: o.clone(),
+                        options: *opts,
                     })
                 })
                 .collect(),
@@ -243,12 +319,16 @@ impl PolicyEngine {
         {
             let mut st = self.state.write().unwrap();
             st.grants.clear();
+            st.denies.clear();
             st.principals.clear();
             st.credentials.clear();
             st.token_index.clear();
             st.roles = snap.roles.iter().cloned().collect();
             for g in snap.grants {
-                st.grants.entry(g.role).or_default().push((g.action, g.object));
+                st.grants.entry(g.role).or_default().push((g.action, g.object, g.options));
+            }
+            for g in snap.denies {
+                st.denies.entry(g.role).or_default().push((g.action, g.object, g.options));
             }
             for p in snap.principals {
                 st.principals.insert(p.id.clone(), p);
@@ -389,34 +469,58 @@ impl PolicyEngine {
 
     // -- grants --
 
+    /// Insert an allow grant. Also clears any same-key explicit deny: an
+    /// explicit `GRANT` undoes a prior `REVOKE` carve-out on that object
+    /// (design §8 — deny wins over *inherited* allow, not over a re-grant).
     pub fn grant(&self, g: Grant) {
         {
             let mut st = self.state.write().unwrap();
+            if let Some(denies) = st.denies.get_mut(&g.role) {
+                denies.retain(|(a, o, _)| *a != g.action || *o != g.object);
+                if denies.is_empty() {
+                    st.denies.remove(&g.role);
+                }
+            }
             let list = st.grants.entry(g.role.clone()).or_default();
-            if !list.iter().any(|(a, o)| *a == g.action && *o == g.object) {
-                list.push((g.action, g.object));
+            match list
+                .iter_mut()
+                .find(|(a, o, _)| *a == g.action && *o == g.object)
+            {
+                Some(entry) => entry.2 = g.options,
+                None => list.push((g.action, g.object, g.options)),
             }
         }
         self.bump();
     }
 
+    /// Remove any same-key allow **and** record an explicit deny (design
+    /// §7.1: `REVOKE ON CLASS Child` carves the child out of an inherited
+    /// allow set; the explicit deny wins over the inherited allow and, like
+    /// an allow, expands down the `is_a` line). Returns whether an allow
+    /// entry was actually removed.
     pub fn revoke(&self, g: &Grant) -> bool {
         let removed = {
             let mut st = self.state.write().unwrap();
             let mut removed = false;
             if let Some(list) = st.grants.get_mut(&g.role) {
                 let before = list.len();
-                list.retain(|(a, o)| *a != g.action || *o != g.object);
+                list.retain(|(a, o, _)| *a != g.action || *o != g.object);
                 removed = list.len() != before;
                 if list.is_empty() {
                     st.grants.remove(&g.role);
                 }
             }
+            let denies = st.denies.entry(g.role.clone()).or_default();
+            match denies
+                .iter_mut()
+                .find(|(a, o, _)| *a == g.action && *o == g.object)
+            {
+                Some(entry) => entry.2 = g.options,
+                None => denies.push((g.action, g.object.clone(), g.options)),
+            }
             removed
         };
-        if removed {
-            self.bump();
-        }
+        self.bump();
         removed
     }
 
@@ -426,10 +530,29 @@ impl PolicyEngine {
             .get(role)
             .map(|list| {
                 list.iter()
-                    .map(|(a, o)| Grant {
+                    .map(|(a, o, opts)| Grant {
                         role: role.to_string(),
                         action: *a,
                         object: o.clone(),
+                        options: *opts,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Explicit denies held by a role (REVOKE carve-outs).
+    pub fn denies_for_role(&self, role: &str) -> Vec<Grant> {
+        let st = self.state.read().unwrap();
+        st.denies
+            .get(role)
+            .map(|list| {
+                list.iter()
+                    .map(|(a, o, opts)| Grant {
+                        role: role.to_string(),
+                        action: *a,
+                        object: o.clone(),
+                        options: *opts,
                     })
                     .collect()
             })
@@ -441,21 +564,39 @@ impl PolicyEngine {
         st.grants
             .iter()
             .flat_map(|(role, list)| {
-                list.iter().map(move |(a, o)| Grant {
+                list.iter().map(move |(a, o, opts)| Grant {
                     role: role.clone(),
                     action: *a,
                     object: o.clone(),
+                    options: *opts,
                 })
             })
             .collect()
     }
 
-    /// Drop every grant of a removed role (DROP ROLE semantics).
+    /// Every explicit deny across roles (SHOW GRANTS / audit).
+    pub fn denies(&self) -> Vec<Grant> {
+        let st = self.state.read().unwrap();
+        st.denies
+            .iter()
+            .flat_map(|(role, list)| {
+                list.iter().map(move |(a, o, opts)| Grant {
+                    role: role.clone(),
+                    action: *a,
+                    object: o.clone(),
+                    options: *opts,
+                })
+            })
+            .collect()
+    }
+
+    /// Drop every grant and deny of a removed role (DROP ROLE semantics).
     pub fn drop_role(&self, role: &str) {
         {
             let mut st = self.state.write().unwrap();
             st.roles.remove(role);
             st.grants.remove(role);
+            st.denies.remove(role);
             for p in st.principals.values_mut() {
                 p.roles.remove(role);
             }
@@ -521,10 +662,25 @@ impl PolicyEngine {
 
     // -- decisions --
 
-    /// M1 evaluation: allow iff some role of the principal holds a grant for
-    /// the action on the object (namespace grants cascade to classes).
-    /// Cached per (principal, action, object); the cache dies with any grant
-    /// or membership change.
+    /// Install the materialized `is_a` closure used for downward grant
+    /// inheritance (M2). Clears the decision cache: cached verdicts may have
+    /// been computed without the hierarchy.
+    pub fn set_hierarchy(&self, hierarchy: Arc<ClassClosure>) {
+        {
+            let mut st = self.state.write().unwrap();
+            st.hierarchy = Some(hierarchy);
+            st.cache.clear();
+        }
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M2 evaluation (design §8): `_admin` short-circuits to allow; an
+    /// explicit deny (REVOKE carve-out) covering the object wins over any
+    /// allow; otherwise allow iff some role holds a covering grant. Covers
+    /// expand down the `is_a` line unless the grant/deny is `ONLY`
+    /// (namespace grants still cascade to their classes). Cached per
+    /// (principal, action, object); the cache dies with any grant, role,
+    /// or hierarchy change.
     pub fn check(&self, principal_id: &str, action: Action, object: &ObjectRef) -> bool {
         let key = (principal_id.to_string(), action, object.clone());
         {
@@ -541,14 +697,27 @@ impl PolicyEngine {
             if p.disabled {
                 return false;
             }
-            // Design §8: `_admin` members are allowed unconditionally.
-            p.roles.contains(BUILTIN_ROLE_ADMIN)
-                || p.roles.iter().any(|role| {
-                    st.grants.get(role).is_some_and(|list| {
+            // Design §8: `_admin` members are allowed unconditionally — the
+            // short-circuit sits before the deny scan.
+            if p.roles.contains(BUILTIN_ROLE_ADMIN) {
+                true
+            } else {
+                let h = st.hierarchy.as_deref();
+                // Explicit deny beats an inherited allow (design §7.1).
+                let denied = p.roles.iter().any(|role| {
+                    st.denies.get(role).is_some_and(|list| {
                         list.iter()
-                            .any(|(a, o)| *a == action && grant_covers(o, object))
+                            .any(|(a, o, opts)| *a == action && covers(o, *opts, object, h))
                     })
-                })
+                });
+                !denied
+                    && p.roles.iter().any(|role| {
+                        st.grants.get(role).is_some_and(|list| {
+                            list.iter()
+                                .any(|(a, o, opts)| *a == action && covers(o, *opts, object, h))
+                        })
+                    })
+            }
         };
         if let Ok(mut st) = self.state.write() {
             st.cache.insert(key, allowed);
@@ -592,20 +761,63 @@ fn from_hex(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// M1 object matching: a namespace grant covers its classes; a class grant
-/// covers exactly that class; `NAMESPACE *` is the built-in-tier wildcard
-/// (design §9.2) covering every namespace and class. (M2 adds `is_a`
-/// inheritance and explicit deny-over-inheritance.)
-fn grant_covers(grant_obj: &ObjectRef, wanted: &ObjectRef) -> bool {
+/// Object matching (M2, design §7.1/§8): a namespace grant covers its
+/// classes; a class grant covers exactly that class and — unless `ONLY` —
+/// its `is_a` subclasses (via the installed [`ClassClosure`]); a class grant
+/// also covers that class's property touches (design §6: class-level READ
+/// implies all its properties); property grants match the same property on
+/// the same class line; rule grants match the rule only. `NAMESPACE *` is
+/// the built-in-tier wildcard (design §9.2). Namespaces must match first —
+/// inheritance never crosses a namespace boundary. Used for both allows and
+/// denies (deny expands down the `is_a` line like an allow).
+fn covers(
+    grant_obj: &ObjectRef,
+    opts: GrantOptions,
+    wanted: &ObjectRef,
+    h: Option<&ClassClosure>,
+) -> bool {
     match (grant_obj, wanted) {
         (ObjectRef::Namespace(g), _) if g == "*" => true,
         (ObjectRef::Namespace(g), ObjectRef::Namespace(w)) => g == w,
         (ObjectRef::Namespace(g), ObjectRef::Class { ns, .. }) => g == ns,
+        (ObjectRef::Namespace(g), ObjectRef::Property { ns, .. }) => g == ns,
         (ObjectRef::Class { .. }, ObjectRef::Namespace(_)) => false,
         (ObjectRef::Class { ns: gn, class: gc }, ObjectRef::Class { ns: wn, class: wc }) => {
-            gn == wn && gc == wc
+            gn == wn && class_line_covers(gc, wc, opts.only, h)
         }
+        (
+            ObjectRef::Class { ns: gn, class: gc },
+            ObjectRef::Property { ns: wn, class: wc, .. },
+        ) => gn == wn && class_line_covers(gc, wc, opts.only, h),
+        (
+            ObjectRef::Property {
+                ns: gn,
+                class: gc,
+                prop: gp,
+            },
+            ObjectRef::Property {
+                ns: wn,
+                class: wc,
+                prop: wp,
+            },
+        ) => gn == wn && gp == wp && class_line_covers(gc, wc, opts.only, h),
+        (ObjectRef::Property { .. }, _) => false,
+        (ObjectRef::Rule(g), ObjectRef::Rule(w)) => g == w,
+        (ObjectRef::Rule(_), _) => false,
+        (_, ObjectRef::Rule(_)) => false,
     }
+}
+
+/// True when the granted class covers the wanted class: same class, or —
+/// unless `ONLY` — the wanted class is an `is_a` subclass of the granted one.
+fn class_line_covers(
+    granted: &str,
+    wanted: &str,
+    only: bool,
+    h: Option<&ClassClosure>,
+) -> bool {
+    granted == wanted
+        || (!only && h.is_some_and(|c| c.is_subclass_of(wanted, granted)))
 }
 
 #[cfg(test)]
@@ -672,6 +884,7 @@ mod tests {
             role: "analyst".into(),
             action: Action::Read,
             object: ObjectRef::Namespace("erp".into()),
+            options: GrantOptions::default(),
         });
         assert!(eng.check_class("alice", Action::Read, "erp", "orders"));
         assert!(eng.check(
@@ -696,6 +909,7 @@ mod tests {
                 ns: "erp".into(),
                 class: "orders".into(),
             },
+            options: GrantOptions::default(),
         });
         eng.grant(Grant {
             role: "r2".into(),
@@ -704,6 +918,7 @@ mod tests {
                 ns: "erp".into(),
                 class: "orders".into(),
             },
+            options: GrantOptions::default(),
         });
         assert!(eng.check_class("alice", Action::Read, "erp", "orders"));
         assert!(eng.check_class("alice", Action::Write, "erp", "orders"));
@@ -724,6 +939,7 @@ mod tests {
             role: "analyst".into(),
             action: Action::Read,
             object: ObjectRef::Namespace("erp".into()),
+            options: GrantOptions::default(),
         };
         eng.grant(g.clone());
         assert!(eng.check_class("alice", Action::Read, "erp", "orders"));
@@ -785,6 +1001,7 @@ mod tests {
             role: "analyst".into(),
             action: Action::Read,
             object: ObjectRef::Namespace("erp".into()),
+            options: GrantOptions::default(),
         });
 
         let snap = eng.export_snapshot();
@@ -809,6 +1026,7 @@ mod tests {
             role: "r".into(),
             action: Action::Read,
             object: obj.clone(),
+            options: GrantOptions::default(),
         });
         assert!(eng.epoch() > e0);
         assert!(eng.check("alice", Action::Read, &obj));
@@ -822,6 +1040,7 @@ mod tests {
             role: "ops".into(),
             action: Action::Ddl,
             object: ObjectRef::Namespace("erp".into()),
+            options: GrantOptions::default(),
         });
         assert!(!eng.check_class("alice", Action::Ddl, "erp", "orders"));
         assert!(eng.grant_role("alice", "ops"));
@@ -838,6 +1057,7 @@ mod tests {
             role: "_readonly".into(),
             action: Action::Read,
             object: ObjectRef::Namespace("*".into()),
+            options: GrantOptions::default(),
         });
         assert!(eng.check("reader", Action::Read, &ObjectRef::Namespace("erp".into())));
         assert!(eng.check("reader", Action::Read, &ObjectRef::Namespace("hr".into())));
@@ -912,5 +1132,370 @@ mod tests {
         assert_eq!(eng.principal("alice").unwrap().token_epoch, 1);
         // Unknown principal: no-op, false.
         assert!(!eng.rotate_token("ghost", "tok"));
+    }
+
+    // ── M2: is_a inheritance / ONLY / explicit deny (design §7.1/§8) ───────
+
+    /// Build a sealed closure from transitive (child, ancestor) pairs.
+    fn closure(pairs: &[(&str, &str)]) -> Arc<ClassClosure> {
+        let mut c = ClassClosure::default();
+        for (child, ancestor) in pairs {
+            c.insert(child, ancestor);
+        }
+        Arc::new(c)
+    }
+
+    /// Disease ← Cancer ← Melanoma (each also sees its transitive ancestor).
+    fn disease_line() -> Arc<ClassClosure> {
+        closure(&[
+            ("Cancer", "Disease"),
+            ("Melanoma", "Cancer"),
+            ("Melanoma", "Disease"),
+        ])
+    }
+
+    #[test]
+    fn class_closure_is_subclass_of_direct() {
+        let c = disease_line();
+        // Direct and transitive edges both resolve…
+        assert!(c.is_subclass_of("Cancer", "Disease"));
+        assert!(c.is_subclass_of("Melanoma", "Cancer"));
+        assert!(c.is_subclass_of("Melanoma", "Disease"));
+        // …and the relation is directional, closed under self only as the
+        // empty relation: nothing is a subclass of itself or its descendants.
+        assert!(!c.is_subclass_of("Disease", "Cancer"));
+        assert!(!c.is_subclass_of("Cancer", "Melanoma"));
+        assert!(!c.is_subclass_of("Disease", "Disease"));
+        assert!(!c.is_subclass_of("Cancer", "Cancer"));
+        // Unknown classes never match.
+        assert!(!c.is_subclass_of("Ghost", "Disease"));
+        assert!(!c.is_subclass_of("Disease", "Ghost"));
+    }
+
+    #[test]
+    fn is_a_inheritance_covers_subclasses_but_not_siblings() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.set_hierarchy(disease_line());
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Disease".into(),
+            },
+            options: GrantOptions::default(),
+        });
+        // Grant on the parent covers the whole subclass line.
+        assert!(eng.check_class("alice", Action::Read, "bio", "Disease"));
+        assert!(eng.check_class("alice", Action::Read, "bio", "Cancer"));
+        assert!(eng.check_class("alice", Action::Read, "bio", "Melanoma"));
+        // …but not siblings/other lines, other namespaces, or other actions.
+        assert!(!eng.check_class("alice", Action::Read, "bio", "Compound"));
+        assert!(!eng.check_class("alice", Action::Read, "med", "Melanoma"));
+        assert!(!eng.check_class("alice", Action::Write, "bio", "Melanoma"));
+    }
+
+    #[test]
+    fn without_hierarchy_inheritance_does_not_fire() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Disease".into(),
+            },
+            options: GrantOptions::default(),
+        });
+        // No closure installed: the class grant is exact (M1 behavior).
+        assert!(eng.check_class("alice", Action::Read, "bio", "Disease"));
+        assert!(!eng.check_class("alice", Action::Read, "bio", "Cancer"));
+    }
+
+    #[test]
+    fn only_grant_stops_subclass_expansion() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.set_hierarchy(disease_line());
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Disease".into(),
+            },
+            options: GrantOptions { only: true, ..Default::default() },
+        });
+        assert!(eng.check_class("alice", Action::Read, "bio", "Disease"));
+        assert!(!eng.check_class("alice", Action::Read, "bio", "Cancer"));
+        assert!(!eng.check_class("alice", Action::Read, "bio", "Melanoma"));
+    }
+
+    #[test]
+    fn explicit_deny_carves_out_of_inherited_allow() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.set_hierarchy(disease_line());
+        // Whole tree readable…
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Disease".into(),
+            },
+            options: GrantOptions::default(),
+        });
+        // …then carve Cancer out.
+        assert!(!eng.revoke(&Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Cancer".into(),
+            },
+            options: GrantOptions::default(),
+        }));
+        assert!(eng.check_class("alice", Action::Read, "bio", "Disease"));
+        // The carve-out denies the class and its subclasses (design §7.1).
+        assert!(!eng.check_class("alice", Action::Read, "bio", "Cancer"));
+        assert!(!eng.check_class("alice", Action::Read, "bio", "Melanoma"));
+    }
+
+    #[test]
+    fn deny_only_carves_the_class_itself() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.set_hierarchy(disease_line());
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Disease".into(),
+            },
+            options: GrantOptions::default(),
+        });
+        eng.revoke(&Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Cancer".into(),
+            },
+            options: GrantOptions { only: true, ..Default::default() },
+        });
+        assert!(!eng.check_class("alice", Action::Read, "bio", "Cancer"));
+        // The subtree stays readable through the parent allow.
+        assert!(eng.check_class("alice", Action::Read, "bio", "Melanoma"));
+    }
+
+    #[test]
+    fn explicit_deny_wins_over_every_allow() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.set_hierarchy(disease_line());
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Disease".into(),
+            },
+            options: GrantOptions::default(),
+        });
+        eng.revoke(&Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Cancer".into(),
+            },
+            options: GrantOptions::default(),
+        });
+        // A direct grant on the carved-out class must NOT resurrect it while
+        // the deny entry sits on an ancestor of it — deny is checked first.
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Melanoma".into(),
+            },
+            options: GrantOptions::default(),
+        });
+        assert!(!eng.check_class("alice", Action::Read, "bio", "Melanoma"));
+    }
+
+    #[test]
+    fn regrant_on_same_object_clears_the_deny() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.set_hierarchy(disease_line());
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Disease".into(),
+            },
+            options: GrantOptions::default(),
+        });
+        let cancer = Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Cancer".into(),
+            },
+            options: GrantOptions::default(),
+        };
+        assert!(!eng.revoke(&cancer)); // carve-out, no direct allow existed
+        assert!(!eng.check_class("alice", Action::Read, "bio", "Cancer"));
+        assert_eq!(eng.denies_for_role("analyst").len(), 1);
+        // A direct GRANT on the same object undoes the carve-out.
+        eng.grant(cancer.clone());
+        assert!(eng.check_class("alice", Action::Read, "bio", "Cancer"));
+        assert!(eng.denies_for_role("analyst").is_empty());
+        // A direct revoke of a real grant removes it and denies it.
+        assert!(eng.revoke(&cancer));
+        assert!(!eng.check_class("alice", Action::Read, "bio", "Cancer"));
+    }
+
+    #[test]
+    fn admin_short_circuit_beats_deny() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("root", &["_admin"]));
+        eng.set_hierarchy(disease_line());
+        eng.revoke(&Grant {
+            role: "_admin".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Cancer".into(),
+            },
+            options: GrantOptions::default(),
+        });
+        // Design §8 places the `_admin` check before the deny scan.
+        assert!(eng.check_class("root", Action::Read, "bio", "Cancer"));
+    }
+
+    #[test]
+    fn installing_hierarchy_invalidates_cached_decisions() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Disease".into(),
+            },
+            options: GrantOptions::default(),
+        });
+        // Cached "no" without a hierarchy…
+        assert!(!eng.check_class("alice", Action::Read, "bio", "Cancer"));
+        let e0 = eng.epoch();
+        eng.set_hierarchy(disease_line());
+        assert!(eng.epoch() > e0);
+        // …must not survive the install.
+        assert!(eng.check_class("alice", Action::Read, "bio", "Cancer"));
+    }
+
+    #[test]
+    fn class_grant_covers_its_properties_and_property_grants_stay_narrow() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.set_hierarchy(disease_line());
+        let prop = |class: &str, prop: &str| ObjectRef::Property {
+            ns: "bio".into(),
+            class: class.into(),
+            prop: prop.into(),
+        };
+        // A class grant implies every property of that class (design §6)…
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Disease".into(),
+            },
+            options: GrantOptions::default(),
+        });
+        assert!(eng.check("alice", Action::Read, &prop("Disease", "name")));
+        assert!(eng.check("alice", Action::Read, &prop("Cancer", "name")));
+        // …but a property grant is one column of one class line.
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.set_hierarchy(disease_line());
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: prop("Disease", "name"),
+            options: GrantOptions::default(),
+        });
+        assert!(eng.check("alice", Action::Read, &prop("Disease", "name")));
+        assert!(eng.check("alice", Action::Read, &prop("Cancer", "name")));
+        assert!(!eng.check("alice", Action::Read, &prop("Disease", "icd10")));
+        assert!(!eng.check_class("alice", Action::Read, "bio", "Disease"));
+    }
+
+    #[test]
+    fn rule_grants_match_the_rule_only() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Rule("treats-inheritance".into()),
+            options: GrantOptions::default(),
+        });
+        assert!(eng.check(
+            "alice",
+            Action::Read,
+            &ObjectRef::Rule("treats-inheritance".into())
+        ));
+        assert!(!eng.check(
+            "alice",
+            Action::Read,
+            &ObjectRef::Rule("other-rule".into())
+        ));
+        assert!(!eng.check_class("alice", Action::Read, "bio", "Disease"));
+    }
+
+    #[test]
+    fn denies_survive_snapshot_roundtrip() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.set_hierarchy(disease_line());
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Disease".into(),
+            },
+            options: GrantOptions::default(),
+        });
+        eng.revoke(&Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: ObjectRef::Class {
+                ns: "bio".into(),
+                class: "Cancer".into(),
+            },
+            options: GrantOptions::default(),
+        });
+        let snap = eng.export_snapshot();
+        assert_eq!(snap.grants.len(), 1);
+        assert_eq!(snap.denies.len(), 1);
+        let eng2 = PolicyEngine::new();
+        eng2.import_snapshot(snap);
+        // The deny is durable, the allow keeps working outside the carve-out.
+        assert!(!eng2.check_class("alice", Action::Read, "bio", "Cancer"));
+        assert!(!eng2.check_class("alice", Action::Read, "bio", "Melanoma"));
+        assert!(eng2.check_class("alice", Action::Read, "bio", "Disease"));
     }
 }
