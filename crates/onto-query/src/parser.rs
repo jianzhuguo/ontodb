@@ -456,23 +456,27 @@ pub enum QueryAst {
     RevokeRole { role: String, principal: String },
 
     /// GRANT <READ|WRITE|DDL> ON NAMESPACE <ns> [ONLY] TO <role>
-    /// GRANT <READ|WRITE|DDL> ON CLASS <ns.cls> [ONLY] TO <role>
+    /// GRANT <READ|WRITE|DDL> ON CLASS <ns.cls>[(p1, p2)] [ONLY] TO <role>
     /// `ONLY` stops `is_a` downward inheritance (design §7.1, M2).
+    /// A property list narrows the grant to those columns (design §7.2);
+    /// empty = whole object.
     GrantPrivilege {
         action: onto_core::policy::Action,
         object: onto_core::policy::ObjectRef,
         role: String,
         only: bool,
+        props: Vec<String>,
     },
 
     /// REVOKE <READ|WRITE|DDL> ON NAMESPACE <ns> [ONLY] FROM <role>
-    /// REVOKE <READ|WRITE|DDL> ON CLASS <ns.cls> [ONLY] FROM <role>
+    /// REVOKE <READ|WRITE|DDL> ON CLASS <ns.cls>[(p1, p2)] [ONLY] FROM <role>
     /// Records an explicit deny (carve-out, design §7.1).
     RevokePrivilege {
         action: onto_core::policy::Action,
         object: onto_core::policy::ObjectRef,
         role: String,
         only: bool,
+        props: Vec<String>,
     },
 
     /// SHOW ROLES
@@ -1741,11 +1745,17 @@ impl QueryParser {
         }
         let (kind, r) = Self::split_word(r)
             .ok_or_else(|| CoreError::InvalidArgument("expected NAMESPACE|CLASS".to_string()))?;
-        let (target, r) = Self::split_word(r)
-            .ok_or_else(|| CoreError::InvalidArgument("expected namespace/class name".to_string()))?;
+        let (target, props, r) = Self::parse_target_with_props(r)?;
         let object = match kind.to_ascii_uppercase().as_str() {
-            "NAMESPACE" => onto_core::policy::ObjectRef::Namespace(target.to_string()),
-            "CLASS" => Self::parse_class_ref(target)?,
+            "NAMESPACE" => {
+                if !props.is_empty() {
+                    return Err(CoreError::InvalidArgument(
+                        "property lists are only valid on CLASS grants".to_string(),
+                    ));
+                }
+                onto_core::policy::ObjectRef::Namespace(target)
+            }
+            "CLASS" => Self::parse_class_ref(&target)?,
             _ => {
                 return Err(CoreError::InvalidArgument(format!(
                     "expected NAMESPACE|CLASS, got {kind:?}"
@@ -1766,6 +1776,7 @@ impl QueryParser {
             object,
             role: role.to_string(),
             only,
+            props,
         })
     }
 
@@ -1789,6 +1800,46 @@ impl QueryParser {
             ));
         }
         Ok((rest, true))
+    }
+
+    /// Parse `<name>` or `<name>(<prop>, <prop>, …)` after NAMESPACE|CLASS.
+    /// Returns the bare target name, the optional property list (design §7.2)
+    /// and the remaining input. The property list is rejected for NAMESPACE
+    /// targets by the caller.
+    fn parse_target_with_props<'a>(r: &'a str) -> Result<(String, Vec<String>, &'a str)> {
+        let r = r.trim_start();
+        let name_end = r
+            .find(|c: char| c == '(' || c.is_whitespace())
+            .unwrap_or(r.len());
+        let (name, rest) = r.split_at(name_end);
+        if name.is_empty() {
+            return Err(CoreError::InvalidArgument(
+                "expected namespace/class name".to_string(),
+            ));
+        }
+        let rest = rest.trim_start();
+        if !rest.starts_with('(') {
+            return Ok((name.to_string(), Vec::new(), rest));
+        }
+        let close = rest
+            .find(')')
+            .ok_or_else(|| CoreError::InvalidArgument("unterminated property list".to_string()))?;
+        let mut props = Vec::new();
+        for p in rest[1..close].split(',') {
+            let p = p.trim();
+            if p.is_empty() {
+                return Err(CoreError::InvalidArgument(
+                    "empty property name in list".to_string(),
+                ));
+            }
+            if !p.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                return Err(CoreError::InvalidArgument(format!(
+                    "bad property name {p:?}"
+                )));
+            }
+            props.push(p.to_string());
+        }
+        Ok((name.to_string(), props, rest[close + 1..].trim_start()))
     }
 
     fn parse_revoke(input: &str) -> Result<QueryAst> {
@@ -1826,11 +1877,17 @@ impl QueryParser {
         }
         let (kind, r) = Self::split_word(r)
             .ok_or_else(|| CoreError::InvalidArgument("expected NAMESPACE|CLASS".to_string()))?;
-        let (target, r) = Self::split_word(r)
-            .ok_or_else(|| CoreError::InvalidArgument("expected namespace/class name".to_string()))?;
+        let (target, props, r) = Self::parse_target_with_props(r)?;
         let object = match kind.to_ascii_uppercase().as_str() {
-            "NAMESPACE" => onto_core::policy::ObjectRef::Namespace(target.to_string()),
-            "CLASS" => Self::parse_class_ref(target)?,
+            "NAMESPACE" => {
+                if !props.is_empty() {
+                    return Err(CoreError::InvalidArgument(
+                        "property lists are only valid on CLASS grants".to_string(),
+                    ));
+                }
+                onto_core::policy::ObjectRef::Namespace(target)
+            }
+            "CLASS" => Self::parse_class_ref(&target)?,
             _ => {
                 return Err(CoreError::InvalidArgument(format!(
                     "expected NAMESPACE|CLASS, got {kind:?}"
@@ -1852,6 +1909,7 @@ impl QueryParser {
             object,
             role: role.to_string(),
             only,
+            props,
         })
     }
 
@@ -6792,7 +6850,7 @@ mod tests {
 
         // CLASS target + ONLY → flag set; bare class name lands in _default.
         match QueryParser::parse("GRANT READ ON CLASS ns.C ONLY TO r").unwrap() {
-            QueryAst::GrantPrivilege { action, object, role, only } => {
+            QueryAst::GrantPrivilege { action, object, role, only, props } => {
                 assert_eq!(action, Action::Read);
                 assert_eq!(
                     object,
@@ -6800,6 +6858,7 @@ mod tests {
                 );
                 assert_eq!(role, "r");
                 assert!(only);
+                assert!(props.is_empty());
             }
             other => panic!("expected GrantPrivilege, got {other:?}"),
         }
@@ -6838,5 +6897,73 @@ mod tests {
             err.to_string().contains("ONLY is only valid on CLASS grants"),
             "err: {err}"
         );
+    }
+
+    /// M2 T4.2: property lists (design §7.2) narrow a CLASS grant to the
+    /// named columns — `GRANT READ ON CLASS X(a, b)`; NAMESPACE rejects them.
+    #[test]
+    fn test_parse_grant_revoke_property_list() {
+        use onto_core::policy::{Action, ObjectRef};
+
+        match QueryParser::parse("GRANT READ ON CLASS ns.C(a, b) TO r").unwrap() {
+            QueryAst::GrantPrivilege {
+                action,
+                object,
+                role,
+                only,
+                props,
+            } => {
+                assert_eq!(action, Action::Read);
+                assert_eq!(
+                    object,
+                    ObjectRef::Class { ns: "ns".into(), class: "C".into() }
+                );
+                assert_eq!(role, "r");
+                assert!(!only);
+                assert_eq!(props, vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        // Property list + ONLY compose; bare class names land in _default.
+        match QueryParser::parse("GRANT WRITE ON CLASS C(x) ONLY TO r").unwrap() {
+            QueryAst::GrantPrivilege {
+                object, only, props, ..
+            } => {
+                assert_eq!(
+                    object,
+                    ObjectRef::Class { ns: "_default".into(), class: "C".into() }
+                );
+                assert!(only);
+                assert_eq!(props, vec!["x".to_string()]);
+            }
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        // REVOKE is symmetric (per-column carve-out).
+        match QueryParser::parse("REVOKE READ ON CLASS ns.C(secret) FROM r").unwrap() {
+            QueryAst::RevokePrivilege { props, .. } => {
+                assert_eq!(props, vec!["secret".to_string()]);
+            }
+            other => panic!("expected RevokePrivilege, got {other:?}"),
+        }
+        // No list → empty props (whole-object grant).
+        match QueryParser::parse("GRANT READ ON CLASS ns.C TO r").unwrap() {
+            QueryAst::GrantPrivilege { props, .. } => assert!(props.is_empty()),
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        // NAMESPACE cascade is not is_a inheritance: property lists rejected.
+        let err = QueryParser::parse("GRANT READ ON NAMESPACE x(a) TO r").unwrap_err();
+        assert!(
+            err.to_string().contains("property lists are only valid on CLASS grants"),
+            "err: {err}"
+        );
+        let err = QueryParser::parse("REVOKE READ ON NAMESPACE x(a) FROM r").unwrap_err();
+        assert!(
+            err.to_string().contains("property lists are only valid on CLASS grants"),
+            "err: {err}"
+        );
+        // Malformed lists are hard errors.
+        assert!(QueryParser::parse("GRANT READ ON CLASS C( TO r").is_err());
+        assert!(QueryParser::parse("GRANT READ ON CLASS C() TO r").is_err());
+        assert!(QueryParser::parse("GRANT READ ON CLASS C(a b) TO r").is_err());
     }
 }

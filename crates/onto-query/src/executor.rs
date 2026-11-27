@@ -1241,6 +1241,378 @@ impl QueryExecutor {
         names
     }
 
+    /// Base column name of a reference: strips a `" as alias"` suffix and a
+    /// `table.` qualifier (`p.name` / `name as n` → `name`).
+    fn column_base_name(raw: &str) -> &str {
+        let s = match raw.find(" as ") {
+            Some(pos) => &raw[..pos],
+            None => raw,
+        };
+        s.rsplit('.').next_back().unwrap_or(s).trim()
+    }
+
+    /// Declared property names of `class` (inherited included) from the
+    /// merged ontology view — the schema a projection can name. Empty when
+    /// the class is not an ontology class.
+    fn class_property_names(&self, class: &str) -> Vec<String> {
+        let merged = self.get_merged_ontology(&self.engine.default_engine());
+        merged
+            .get_class_properties(class)
+            .into_iter()
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    /// Column names referenced inside a value expression.
+    fn value_expr_columns(e: &ValueExpr, out: &mut Vec<String>) {
+        match e {
+            ValueExpr::Column(c) => out.push(c.clone()),
+            ValueExpr::Literal(_) => {}
+            ValueExpr::CaseWhen {
+                when_branches,
+                else_expr,
+            } => {
+                for (f, v) in when_branches {
+                    Self::filter_columns(f, out);
+                    Self::value_expr_columns(v, out);
+                }
+                if let Some(v) = else_expr {
+                    Self::value_expr_columns(v, out);
+                }
+            }
+            ValueExpr::ScalarSubquery(_) => {}
+            ValueExpr::Arithmetic { left, right, .. } => {
+                Self::value_expr_columns(left, out);
+                Self::value_expr_columns(right, out);
+            }
+            ValueExpr::Function { args, .. } => {
+                for a in args {
+                    Self::value_expr_columns(a, out);
+                }
+            }
+        }
+    }
+
+    /// Column names referenced inside a filter expression (both the
+    /// compared column and `LiteralValue::Column` operands).
+    fn filter_columns(f: &FilterExpr, out: &mut Vec<String>) {
+        use FilterExpr as F;
+        match f {
+            F::Eq(c, v)
+            | F::Ne(c, v)
+            | F::Gt(c, v)
+            | F::Lt(c, v)
+            | F::Gte(c, v)
+            | F::Lte(c, v) => {
+                out.push(c.clone());
+                Self::literal_columns(v, out);
+            }
+            F::Like(c, _) | F::IsNull(c) | F::IsNotNull(c) => out.push(c.clone()),
+            F::Between(c, lo, hi) => {
+                out.push(c.clone());
+                Self::literal_columns(lo, out);
+                Self::literal_columns(hi, out);
+            }
+            F::In(c, vals) => {
+                out.push(c.clone());
+                for v in vals {
+                    Self::literal_columns(v, out);
+                }
+            }
+            F::InSubquery(c, _) => out.push(c.clone()),
+            F::Exists(_) | F::NotExists(_) => {}
+            F::Not(inner) => Self::filter_columns(inner, out),
+            F::And(a, b) | F::Or(a, b) => {
+                Self::filter_columns(a, out);
+                Self::filter_columns(b, out);
+            }
+        }
+    }
+
+    /// Column names referenced as literal column references
+    /// (`SET a = b`, `WHERE a = b`).
+    fn literal_columns(lv: &LiteralValue, out: &mut Vec<String>) {
+        match lv {
+            LiteralValue::Column(c) => out.push(c.clone()),
+            LiteralValue::Array(items) => {
+                for i in items {
+                    Self::literal_columns(i, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Audit + build the error for a column-level denial.
+    fn prop_deny_error(
+        &self,
+        actor: &QueryActor,
+        action: onto_core::policy::Action,
+        ns: &str,
+        class: &str,
+        prop: &str,
+    ) -> CoreError {
+        use onto_core::policy::ObjectRef;
+        let obj = ObjectRef::Property {
+            ns: ns.to_string(),
+            class: class.to_string(),
+            prop: prop.to_string(),
+        };
+        self.audit(
+            Some(actor),
+            "denied",
+            &[format!("{class}.{prop}")],
+            &format!("RBAC deny: {} on {}", action.as_str(), obj.display()),
+        );
+        CoreError::InvalidArgument(format!(
+            "permission denied: {} on {}",
+            action.as_str(),
+            obj.display()
+        ))
+    }
+
+    /// RBAC property-level PEP (design §7.2/§10): column checks on the
+    /// statement's primary object class. Reads prune the projection
+    /// (unauthorized columns never enter the result schema); writes check
+    /// column binding (unauthorized columns → 403).
+    ///
+    /// Returns `(handled, star_rewrite)`:
+    /// - `handled` — the class gate is satisfied column-wise and must be
+    ///   skipped for this class;
+    /// - `star_rewrite` — `SELECT *` must project exactly these columns;
+    /// - `handled=false` — this pass does not apply (unknown class or a
+    ///   shape without columns): the class gate decides as before.
+    fn pep_property_columns(
+        &self,
+        svc: &onto_ontology::policy_store::PolicyService,
+        pid: &str,
+        action: onto_core::policy::Action,
+        ast: &QueryAst,
+        ns: &str,
+        class: &str,
+        actor: &QueryActor,
+    ) -> Result<(bool, Option<Vec<String>>)> {
+        use onto_core::policy::Action;
+        use std::collections::HashSet;
+
+        let declared = self.class_property_names(class);
+        if declared.is_empty() {
+            return Ok((false, None));
+        }
+        let class_mode = svc.check_class(pid, action, ns, class);
+        let prop_obj = |p: &str| onto_core::policy::ObjectRef::Property {
+            ns: ns.to_string(),
+            class: class.to_string(),
+            prop: p.to_string(),
+        };
+        // Columns this principal may touch for the statement's action.
+        let allowed: HashSet<String> = declared
+            .iter()
+            .filter(|c| svc.engine.check(pid, action, &prop_obj(c)))
+            .cloned()
+            .collect();
+        if !class_mode && allowed.is_empty() {
+            return Ok((false, None)); // nothing column-wise — class gate denies
+        }
+        let declared_set: HashSet<&str> = declared.iter().map(|s| s.as_str()).collect();
+
+        // HARD ref: must hold. Unknown names pass under a class-level grant
+        // (aliases/computed columns) and fail closed without one. All column
+        // references of a statement are checked against the statement's own
+        // action — the model is per-statement (M1), so a WRITE statement's
+        // filters/sources need WRITE, not READ.
+        let check_hard =
+            |set: &HashSet<String>, mode: bool, a: Action, base: &str| -> Result<()> {
+                if set.contains(base) {
+                    return Ok(());
+                }
+                if mode && !declared_set.contains(base) {
+                    return Ok(());
+                }
+                Err(self.prop_deny_error(actor, a, ns, class, base))
+            };
+        // SOFT ref (ORDER BY / GROUP BY may name aliases or ordinals):
+        // only declared-but-denied names are rejected.
+        let check_soft = |set: &HashSet<String>, a: Action, base: &str| -> Result<()> {
+            if set.contains(base) || !declared_set.contains(base) {
+                return Ok(());
+            }
+            Err(self.prop_deny_error(actor, a, ns, class, base))
+        };
+
+        match ast {
+            QueryAst::Select {
+                columns,
+                from,
+                from_alias,
+                joins,
+                filter,
+                group_by,
+                having,
+                order_by,
+                ..
+            } => {
+                // References enforced here are bare or qualified by the
+                // FROM name/alias; anything else belongs to a joined class
+                // (already gated at class level above).
+                let mut quals = vec![from.clone()];
+                if let Some(a) = from_alias {
+                    quals.push(a.clone());
+                }
+                let base_of = |raw: &str| -> Option<String> {
+                    let s = match raw.find(" as ") {
+                        Some(pos) => &raw[..pos],
+                        None => raw,
+                    };
+                    let s = s.trim();
+                    match s.rsplit_once('.') {
+                        Some((q, base)) => {
+                            if quals.iter().any(|x| x == q) {
+                                Some(base.trim().to_string())
+                            } else {
+                                None
+                            }
+                        }
+                        None => Some(s.to_string()),
+                    }
+                };
+
+                let mut hard: Vec<String> = Vec::new();
+                let mut soft: Vec<String> = Vec::new();
+                match columns {
+                    SelectColumns::All => {}
+                    SelectColumns::Columns(items) => {
+                        for item in items {
+                            match item {
+                                SelectItem::Column(c) => hard.push(c.clone()),
+                                SelectItem::Aggregate(a) => {
+                                    if a.arg != "*" {
+                                        hard.push(a.arg.clone());
+                                    }
+                                }
+                                SelectItem::WindowFunction(w) => {
+                                    if let Some(arg) = &w.arg {
+                                        if arg != "*" {
+                                            hard.push(arg.clone());
+                                        }
+                                    }
+                                    hard.extend(w.over.partition_by.iter().cloned());
+                                    soft.extend(w.over.order_by.iter().map(|o| o.column.clone()));
+                                }
+                                SelectItem::Expression(e) => {
+                                    Self::value_expr_columns(e, &mut hard)
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(f) = filter {
+                    Self::filter_columns(f, &mut hard);
+                }
+                if let Some(h) = having {
+                    Self::filter_columns(h, &mut hard);
+                }
+                if let Some(g) = group_by {
+                    soft.extend(g.columns.iter().cloned());
+                }
+                soft.extend(order_by.iter().map(|o| o.column.clone()));
+
+                for raw in &hard {
+                    if let Some(base) = base_of(raw) {
+                        check_hard(&allowed, class_mode, action, &base)?;
+                    }
+                }
+                for raw in &soft {
+                    if let Some(base) = base_of(raw) {
+                        check_soft(&allowed, action, &base)?;
+                    }
+                }
+
+                // `*` may not expose denied columns: rewrite to the readable
+                // set unless every declared column is readable. Joins build a
+                // merged row, so a partial `*` cannot be pruned safely.
+                let star_rewrite = match columns {
+                    SelectColumns::All => {
+                        if allowed.len() == declared.len() {
+                            None
+                        } else if !joins.is_empty() {
+                            return Err(CoreError::InvalidArgument(
+                                "property-scoped SELECT * with joins requires an explicit column list"
+                                    .to_string(),
+                            ));
+                        } else {
+                            Some(
+                                declared
+                                    .iter()
+                                    .filter(|c| allowed.contains(c.as_str()))
+                                    .cloned()
+                                    .collect(),
+                            )
+                        }
+                    }
+                    SelectColumns::Columns(_) => None,
+                };
+                Ok((true, star_rewrite))
+            }
+            QueryAst::Insert { columns: cols, .. }
+            | QueryAst::BatchInsert { columns: cols, .. } => {
+                for raw in cols {
+                    let base = Self::column_base_name(raw);
+                    check_hard(&allowed, class_mode, action, base)?;
+                }
+                Ok((true, None))
+            }
+            QueryAst::Upsert {
+                columns: cols,
+                assignments,
+                conflict_column,
+                ..
+            }
+            | QueryAst::BatchUpsert {
+                columns: cols,
+                assignments,
+                conflict_column,
+                ..
+            } => {
+                for raw in cols.iter().map(String::as_str).chain(std::iter::once(
+                    conflict_column.as_str(),
+                )) {
+                    let base = Self::column_base_name(raw);
+                    check_hard(&allowed, class_mode, action, base)?;
+                }
+                for (col, _) in assignments {
+                    let base = Self::column_base_name(col);
+                    check_hard(&allowed, class_mode, action, base)?;
+                }
+                Ok((true, None))
+            }
+            QueryAst::Update {
+                assignments, filter, ..
+            } => {
+                for (col, val) in assignments {
+                    let base = Self::column_base_name(col);
+                    check_hard(&allowed, class_mode, action, base)?;
+                    let mut refs = Vec::new();
+                    Self::literal_columns(val, &mut refs);
+                    for r in refs {
+                        let b = Self::column_base_name(&r).to_string();
+                        check_hard(&allowed, class_mode, action, &b)?;
+                    }
+                }
+                if let Some(f) = filter {
+                    let mut refs = Vec::new();
+                    Self::filter_columns(f, &mut refs);
+                    for r in refs {
+                        let b = Self::column_base_name(&r).to_string();
+                        check_hard(&allowed, class_mode, action, &b)?;
+                    }
+                }
+                Ok((true, None))
+            }
+            _ => Ok((false, None)),
+        }
+    }
+
     /// Executes a statement on behalf of `actor` (API-key identity).
     ///
     /// Namespace-scoped keys get their bare class names stamped with the key's
@@ -1349,6 +1721,7 @@ impl QueryExecutor {
         // touched object must hold the statement's action. Legacy callers
         // (no principal, or no policy configured) keep the namespace-ACL
         // behavior above untouched.
+        let mut star_rewrite: Option<Vec<String>> = None;
         if let (Some(svc), Some(pid)) = (&self.policy, &actor.principal_id) {
             if let Some(action) = ast.required_action() {
                 use onto_core::policy::ObjectRef;
@@ -1372,7 +1745,35 @@ impl QueryExecutor {
                         )));
                     }
                 }
+                // Property-level PEP (design §7.2/§10) runs on the primary
+                // object class first: a column-scoped grant can stand in for
+                // the class-level one, and property denies carve columns out
+                // of the projection / write set.
+                let primary_raw = match ast {
+                    A::Select { from, .. } => Some(from.as_str()),
+                    A::Insert { class, .. }
+                    | A::BatchInsert { class, .. }
+                    | A::Upsert { class, .. }
+                    | A::BatchUpsert { class, .. }
+                    | A::Update { class, .. } => Some(class.as_str()),
+                    _ => None,
+                };
+                let mut primary_handled = false;
+                if let Some(raw) = primary_raw {
+                    let resolved_p = self.resolve_class_name_in(raw, scope);
+                    let (pns, pclass) = match resolved_p.split_once('.') {
+                        Some((n, c)) => (n.to_string(), c.to_string()),
+                        None => ("_default".to_string(), resolved_p.clone()),
+                    };
+                    let (handled, rewrite) =
+                        self.pep_property_columns(svc, pid, action, ast, &pns, &pclass, actor)?;
+                    primary_handled = handled;
+                    star_rewrite = rewrite;
+                }
                 for n in &names {
+                    if primary_handled && Some(n.as_str()) == primary_raw {
+                        continue;
+                    }
                     let resolved = self.resolve_class_name_in(n, scope);
                     let (ns, class) = match resolved.split_once('.') {
                         Some((ns, class)) => (ns.to_string(), class.to_string()),
@@ -1400,6 +1801,14 @@ impl QueryExecutor {
         // unscoped). Subsequent passes on the resolved AST are no-ops.
         let mut a = ast.clone();
         let mut changed = false;
+        if let Some(cols) = star_rewrite {
+            if let A::Select { columns, .. } = &mut a {
+                *columns = SelectColumns::Columns(
+                    cols.into_iter().map(SelectItem::Column).collect(),
+                );
+                changed = true;
+            }
+        }
         a.map_class_names(&mut |c| {
             let r = self.resolve_class_name_in(c, scope);
             if r != c {
@@ -1449,10 +1858,16 @@ impl QueryExecutor {
                 object,
                 role,
                 only,
+                props,
             } => format!(
-                "GRANT {} ON {}{} TO {role}",
+                "GRANT {} ON {}{}{} TO {role}",
                 action.as_str(),
                 object.display(),
+                if props.is_empty() {
+                    String::new()
+                } else {
+                    format!("({})", props.join(", "))
+                },
                 if *only { " ONLY" } else { "" }
             ),
             A::RevokePrivilege {
@@ -1460,10 +1875,16 @@ impl QueryExecutor {
                 object,
                 role,
                 only,
+                props,
             } => format!(
-                "REVOKE {} ON {}{} FROM {role}",
+                "REVOKE {} ON {}{}{} FROM {role}",
                 action.as_str(),
                 object.display(),
+                if props.is_empty() {
+                    String::new()
+                } else {
+                    format!("({})", props.join(", "))
+                },
                 if *only { " ONLY" } else { "" }
             ),
             other => format!("{other:?}"),
@@ -1698,25 +2119,54 @@ impl QueryExecutor {
                 object,
                 role,
                 only,
+                props,
             } => {
                 if !svc.engine.role_exists(role) {
                     return Err(CoreError::InvalidArgument(format!(
                         "no such role '{role}' (CREATE ROLE first)"
                     )));
                 }
-                svc.grant(Grant {
-                    role: role.clone(),
-                    action: *action,
-                    object: object.clone(),
-                    options: onto_core::policy::GrantOptions {
-                        only: *only,
-                        ..Default::default()
-                    },
-                })?;
+                let options = onto_core::policy::GrantOptions {
+                    only: *only,
+                    ..Default::default()
+                };
+                if props.is_empty() {
+                    svc.grant(Grant {
+                        role: role.clone(),
+                        action: *action,
+                        object: object.clone(),
+                        options,
+                    })?;
+                } else {
+                    // Property list (design §7.2): one column grant per name —
+                    // the PDP already evaluates Property objects per column.
+                    let onto_core::policy::ObjectRef::Class { ns, class } = object else {
+                        return Err(CoreError::InvalidArgument(
+                            "property lists are only valid on CLASS grants".to_string(),
+                        ));
+                    };
+                    for p in props {
+                        svc.grant(Grant {
+                            role: role.clone(),
+                            action: *action,
+                            object: onto_core::policy::ObjectRef::Property {
+                                ns: ns.clone(),
+                                class: class.clone(),
+                                prop: p.clone(),
+                            },
+                            options: options.clone(),
+                        })?;
+                    }
+                }
                 format!(
-                    "granted {} on {} to '{}'{}",
+                    "granted {} on {}{} to '{}'{}",
                     action.as_str(),
                     object.display(),
+                    if props.is_empty() {
+                        String::new()
+                    } else {
+                        format!("({})", props.join(", "))
+                    },
                     role,
                     if *only { " ONLY" } else { "" }
                 )
@@ -1726,20 +2176,52 @@ impl QueryExecutor {
                 object,
                 role,
                 only,
+                props,
             } => {
-                let removed = svc.revoke(&Grant {
-                    role: role.clone(),
-                    action: *action,
-                    object: object.clone(),
-                    options: onto_core::policy::GrantOptions {
-                        only: *only,
-                        ..Default::default()
-                    },
-                })?;
+                let options = onto_core::policy::GrantOptions {
+                    only: *only,
+                    ..Default::default()
+                };
+                let removed = if props.is_empty() {
+                    svc.revoke(&Grant {
+                        role: role.clone(),
+                        action: *action,
+                        object: object.clone(),
+                        options,
+                    })?
+                } else {
+                    // Per-column carve-out (design §7.2): each revoke plants a
+                    // deny; "revoked from" only when every column had an allow.
+                    let onto_core::policy::ObjectRef::Class { ns, class } = object else {
+                        return Err(CoreError::InvalidArgument(
+                            "property lists are only valid on CLASS grants".to_string(),
+                        ));
+                    };
+                    let mut all_removed = true;
+                    for p in props {
+                        let removed = svc.revoke(&Grant {
+                            role: role.clone(),
+                            action: *action,
+                            object: onto_core::policy::ObjectRef::Property {
+                                ns: ns.clone(),
+                                class: class.clone(),
+                                prop: p.clone(),
+                            },
+                            options: options.clone(),
+                        })?;
+                        all_removed &= removed;
+                    }
+                    all_removed
+                };
                 format!(
-                    "{} on {} {} role '{}'{}",
+                    "{} on {}{} {} role '{}'{}",
                     action.as_str(),
                     object.display(),
+                    if props.is_empty() {
+                        String::new()
+                    } else {
+                        format!("({})", props.join(", "))
+                    },
                     if removed {
                         "revoked from"
                     } else {
@@ -20422,6 +20904,161 @@ mod tests {
         // The PDP agrees with the PEP (check_class facade).
         assert!(svc.check_class("alice", Action::Read, "erp", "orders"));
         assert!(!svc.check_class("bob", Action::Read, "erp", "orders"));
+    }
+
+    /// RBAC M2 T4.2: property-level PEP (design §7.2/§10). A column-scoped
+    /// grant narrows the projection / write set; property denies carve columns
+    /// out of a class-level grant; `SELECT *` is rewritten to the readable set.
+    #[test]
+    fn policy_property_level_pep() {
+        let (executor, _dir) = setup();
+        let pdir = tempdir().unwrap();
+        let svc = onto_ontology::policy_store::PolicyService::open(
+            onto_ontology::policy_store::PolicyStore::new(Arc::new(
+                LsmEngine::open(StorageOptions {
+                    data_dir: pdir.path().to_path_buf(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )),
+        )
+        .unwrap();
+        let adir = tempdir().unwrap();
+        let audit_path = adir.path().join("audit.log");
+        let executor = executor
+            .with_policy_service(svc.clone())
+            .with_audit_log(&audit_path);
+        let admin = QueryActor {
+            label: "root".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: true,
+            principal_id: None,
+        };
+        let parse_stmt = |sql: &str| {
+            crate::ontoql::OntoQLParser::parse(sql)
+                .ok()
+                .and_then(|oa| oa.to_query_ast().ok())
+                .unwrap_or_else(|| QueryParser::parse(sql).unwrap())
+        };
+        let run = |sql: &str| executor.execute_as(&parse_stmt(sql), &admin);
+        let run_for = |sql: &str, actor: &QueryActor| executor.execute_as(&parse_stmt(sql), actor);
+
+        // Ontology: Product with name / price / secret.
+        run("CREATE ONTOLOGY shop (CLASS Product, PROPERTY name DOMAIN Product RANGE STRING, PROPERTY price DOMAIN Product RANGE INT64, PROPERTY secret DOMAIN Product RANGE STRING)").unwrap();
+        // Seed a row outside the PEP (admin inserts are ungoverned).
+        run("INSERT INTO Product (name, price, secret) VALUES ('iPhone', 999, 'classified')").unwrap();
+
+        // --- Scenario 1: property-scoped READ grant ---
+        run("CREATE ROLE viewer").unwrap();
+        run("CREATE USER alice WITH PASSWORD 'pw'").unwrap();
+        run("GRANT ROLE viewer TO alice").unwrap();
+        run("GRANT READ ON CLASS Product(name, price) TO viewer").unwrap();
+        let alice = QueryActor {
+            label: "alice".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+            principal_id: Some("alice".to_string()),
+        };
+
+        // SELECT * is rewritten to the readable set: name + price, no secret.
+        let result = run_for("SELECT * FROM Product", &alice).unwrap();
+        let QueryResult::Rows(rows) = &result else {
+            panic!("expected Rows, got {result:?}");
+        };
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains_key("name"), "name must survive: {:?}", rows[0]);
+        assert!(rows[0].contains_key("price"), "price must survive: {:?}", rows[0]);
+        assert!(!rows[0].contains_key("secret"), "secret must be pruned: {:?}", rows[0]);
+
+        // Explicit projection of an allowed column passes.
+        assert!(run_for("SELECT name FROM Product", &alice).is_ok());
+        assert!(run_for("SELECT name, price FROM Product", &alice).is_ok());
+        // Explicit projection of a denied column is 403.
+        assert!(
+            run_for("SELECT secret FROM Product", &alice).is_err(),
+            "secret is not in the grant"
+        );
+        // Filter on a denied column is also denied (HARD ref).
+        assert!(
+            run_for("SELECT name FROM Product WHERE secret = 'classified'", &alice).is_err(),
+            "filter references secret"
+        );
+
+        // --- Scenario 2: class grant + property REVOKE carve-out ---
+        run("CREATE ROLE analyst").unwrap();
+        run("CREATE USER bob WITH PASSWORD 'pw'").unwrap();
+        run("GRANT ROLE analyst TO bob").unwrap();
+        run("GRANT READ ON CLASS Product TO analyst").unwrap();
+        run("REVOKE READ ON CLASS Product(secret) FROM analyst").unwrap();
+        let bob = QueryActor {
+            label: "bob".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+            principal_id: Some("bob".to_string()),
+        };
+
+        // * is pruned: class grant covers name+price, carve-out removes secret.
+        let result = run_for("SELECT * FROM Product", &bob).unwrap();
+        let QueryResult::Rows(rows) = &result else {
+            panic!("expected Rows, got {result:?}");
+        };
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains_key("name"), "name must survive: {:?}", rows[0]);
+        assert!(rows[0].contains_key("price"), "price must survive: {:?}", rows[0]);
+        assert!(!rows[0].contains_key("secret"), "secret must be carved out: {:?}", rows[0]);
+        // Explicit secret projection is denied.
+        assert!(
+            run_for("SELECT secret FROM Product", &bob).is_err(),
+            "secret was revoked"
+        );
+
+        // --- Scenario 3: property-scoped WRITE grant ---
+        run("CREATE ROLE writer").unwrap();
+        run("CREATE USER carol WITH PASSWORD 'pw'").unwrap();
+        run("GRANT ROLE writer TO carol").unwrap();
+        run("GRANT WRITE ON CLASS Product(name, price) TO writer").unwrap();
+        let carol = QueryActor {
+            label: "carol".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+            principal_id: Some("carol".to_string()),
+        };
+
+        // INSERT with only allowed columns passes.
+        assert!(
+            run_for("INSERT INTO Product (name, price) VALUES ('iPad', 799)", &carol).is_ok(),
+            "carol holds WRITE on name+price"
+        );
+        // INSERT touching a denied column is 403.
+        assert!(
+            run_for("INSERT INTO Product (name, price, secret) VALUES ('x', 1, 'leak')", &carol).is_err(),
+            "carol lacks WRITE on secret"
+        );
+        // UPDATE SET on an allowed column passes.
+        assert!(
+            run_for("UPDATE Product SET price = 899 WHERE name = 'iPad'", &carol).is_ok(),
+            "carol holds WRITE on price"
+        );
+        // UPDATE SET on a denied column is 403.
+        assert!(
+            run_for("UPDATE Product SET secret = 'hacked' WHERE name = 'iPad'", &carol).is_err(),
+            "carol lacks WRITE on secret"
+        );
+
+        // Audit trail records the property-level denials.
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(
+            audit.contains("RBAC deny: READ on PROPERTY"),
+            "audit must record property denials: {audit}"
+        );
+        assert!(
+            audit.contains("RBAC deny: WRITE on PROPERTY"),
+            "audit must record write denials: {audit}"
+        );
     }
 
     /// ROTATE TOKEN (design §10/§12): the epoch bump retires in-flight
