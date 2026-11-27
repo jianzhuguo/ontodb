@@ -93,12 +93,19 @@ impl MigrationOutcome {
 /// Returns how many roles were newly created.
 fn ensure_builtin_roles(svc: &PolicyService) -> Result<usize> {
     let mut created = 0usize;
+    // INFER on every tier: before T4.3a `required_action(Infer{})` mapped to
+    // Read, so migrated api_keys users could run INFER statements at every
+    // level. Actions match exactly in the PDP, so dropping INFER here would
+    // silently strip that capability on migration.
     for (role, actions) in [
-        (BUILTIN_ROLE_READONLY, vec![Action::Read]),
-        (BUILTIN_ROLE_READWRITE, vec![Action::Read, Action::Write]),
+        (BUILTIN_ROLE_READONLY, vec![Action::Read, Action::Infer]),
+        (
+            BUILTIN_ROLE_READWRITE,
+            vec![Action::Read, Action::Infer, Action::Write],
+        ),
         (
             BUILTIN_ROLE_ADMIN,
-            vec![Action::Read, Action::Write, Action::Ddl],
+            vec![Action::Read, Action::Infer, Action::Write, Action::Ddl],
         ),
     ] {
         if svc.create_role(role)? {
@@ -228,9 +235,9 @@ mod tests {
         for role in [BUILTIN_ROLE_READONLY, BUILTIN_ROLE_READWRITE, BUILTIN_ROLE_ADMIN] {
             assert!(eng.role_exists(role), "role {role} must exist");
         }
-        assert_eq!(eng.grants_for_role(BUILTIN_ROLE_READONLY).len(), 1);
-        assert_eq!(eng.grants_for_role(BUILTIN_ROLE_READWRITE).len(), 2);
-        assert_eq!(eng.grants_for_role(BUILTIN_ROLE_ADMIN).len(), 3);
+        assert_eq!(eng.grants_for_role(BUILTIN_ROLE_READONLY).len(), 2);
+        assert_eq!(eng.grants_for_role(BUILTIN_ROLE_READWRITE).len(), 3);
+        assert_eq!(eng.grants_for_role(BUILTIN_ROLE_ADMIN).len(), 4);
 
         // Each key resolves to its own ServiceAccount with the right tier.
         let ro = eng.authenticate_token("sec-ro").unwrap();
@@ -243,13 +250,17 @@ mod tests {
         assert!(ad.roles.contains(BUILTIN_ROLE_ADMIN));
 
         // Tier behavior matrix (design §9.2): no ride-along between levels.
+        // INFER rides on every tier (see `ensure_builtin_roles`).
         let (ns, cls) = ("any", "thing");
         assert!(eng.check_class(&ro.id, Action::Read, ns, cls));
+        assert!(eng.check_class(&ro.id, Action::Infer, ns, cls));
         assert!(!eng.check_class(&ro.id, Action::Write, ns, cls));
         assert!(!eng.check_class(&ro.id, Action::Ddl, ns, cls));
         assert!(eng.check_class(&rw.id, Action::Read, ns, cls));
+        assert!(eng.check_class(&rw.id, Action::Infer, ns, cls));
         assert!(eng.check_class(&rw.id, Action::Write, ns, cls));
         assert!(!eng.check_class(&rw.id, Action::Ddl, ns, cls));
+        assert!(eng.check_class(&ad.id, Action::Infer, ns, cls));
         assert!(eng.check_class(&ad.id, Action::Ddl, ns, cls));
 
         // Unknown keys resolve to nothing.

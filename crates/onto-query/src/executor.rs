@@ -12,7 +12,7 @@ use crate::parser::{
 };
 use onto_core::binary_row::BinaryRow;
 use onto_core::{CoreError, Result};
-use onto_ontology::{DataType, OntologyStore, Reasoner};
+use onto_ontology::{DataType, Ontology, OntologyStore, Reasoner};
 #[cfg(feature = "sharding")]
 use onto_sharding::{ShardManager, ShardMap, ShardRouter};
 use onto_storage::LsmEngine;
@@ -546,6 +546,141 @@ impl QueryActor {
             client_ip: "unknown".to_string(),
             is_admin: true,
             principal_id: None,
+        }
+    }
+}
+
+/// Actor of the statement executing on this thread (M2 T4.3): the derived-read
+/// gate runs deep inside `execute_infer*`, far below the `run_as` entry that
+/// owns the actor. Thread-local because a statement executes on one thread and
+/// `QueryExecutor` is shared across concurrent callers.
+thread_local! {
+    static EXEC_ACTOR: std::cell::RefCell<Option<QueryActor>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII restore of the previous [`EXEC_ACTOR`] value.
+struct ActorScope {
+    prev: Option<QueryActor>,
+}
+
+impl ActorScope {
+    fn enter(actor: Option<&QueryActor>) -> Self {
+        let prev = EXEC_ACTOR.with(|c| std::mem::replace(&mut *c.borrow_mut(), actor.cloned()));
+        ActorScope { prev }
+    }
+}
+
+impl Drop for ActorScope {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        EXEC_ACTOR.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// Recursion-index node for one derived triple.
+struct DerivedNode {
+    rule: String,
+    premises: Vec<onto_ontology::Triple>,
+}
+
+/// Per-statement derived-read gate (M2 T4.3, design §7.3): adjudicates each
+/// inferred fact against the caller's principal — strategy A (premise union,
+/// default) / B (conclusion class) / C (per-rule `GRANT INFER ON RULE`
+/// exemption). Built by [`QueryExecutor::derived_gate`].
+pub struct DerivedGate {
+    svc: Arc<onto_ontology::policy_store::PolicyService>,
+    actor: QueryActor,
+    pid: String,
+    /// Derived triple → its rule + witness premises (recursive adjudication).
+    /// Interior-mutability because the streaming path builds the recursion
+    /// index incrementally as facts are emitted.
+    derived: std::cell::RefCell<std::collections::HashMap<onto_ontology::Triple, DerivedNode>>,
+    /// Entity → rdf:type classes from the collected fact set.
+    types: std::collections::HashMap<String, Vec<String>>,
+    ontology: Option<Ontology>,
+}
+
+impl DerivedGate {
+    /// Records a derived fact in the recursion index.
+    fn note_derived(&self, fact: &onto_ontology::InferredFact) {
+        self.note_parts(&fact.triple, &format!("{:?}", fact.rule), &fact.premises);
+    }
+
+    /// [`Self::note_derived`] with a string rule name (non-`RuleId` sources).
+    fn note_parts(
+        &self,
+        triple: &onto_ontology::Triple,
+        rule: &str,
+        premises: &[onto_ontology::Triple],
+    ) {
+        self.derived.borrow_mut().insert(
+            triple.clone(),
+            DerivedNode {
+                rule: rule.to_string(),
+                premises: premises.to_vec(),
+            },
+        );
+    }
+
+    /// String-rule adjudication (REST explain steps / graph reasoner rules).
+    pub fn allows_parts(
+        &self,
+        triple: &onto_ontology::Triple,
+        rule: &str,
+        premises: &[onto_ontology::Triple],
+    ) -> bool {
+        let conclusion = QueryExecutor::fact_class_ref(triple, self.ontology.as_ref());
+        let mut seen = std::collections::HashSet::new();
+        let mut refs = Vec::new();
+        let derived = self.derived.borrow();
+        QueryExecutor::deep_premise_refs(
+            premises,
+            &derived,
+            &self.types,
+            self.ontology.as_ref(),
+            &mut seen,
+            &mut refs,
+        );
+        self.svc
+            .engine
+            .check_derived_read(&self.pid, rule, &conclusion, &refs)
+    }
+
+    fn allows(&self, fact: &onto_ontology::InferredFact) -> bool {
+        self.allows_parts(&fact.triple, &format!("{:?}", fact.rule), &fact.premises)
+    }
+
+    /// Readability of one fact (premise display in explain chains — design
+    /// §7.3 "与派生读同规则校验"): derived facts walk the derived-read gate,
+    /// stated facts need READ on every object they expose.
+    pub fn fact_allows(&self, triple: &onto_ontology::Triple) -> bool {
+        let derived = self.derived.borrow();
+        if let Some(node) = derived.get(triple) {
+            let mut seen = std::collections::HashSet::new();
+            let mut refs = Vec::new();
+            QueryExecutor::deep_premise_refs(
+                &node.premises,
+                &derived,
+                &self.types,
+                self.ontology.as_ref(),
+                &mut seen,
+                &mut refs,
+            );
+            self.svc.engine.check_derived_read(
+                &self.pid,
+                &node.rule,
+                &QueryExecutor::fact_class_ref(triple, self.ontology.as_ref()),
+                &refs,
+            )
+        } else {
+            QueryExecutor::premise_object_refs(triple, &self.types, self.ontology.as_ref())
+                .iter()
+                .all(|o| {
+                    self.svc
+                        .engine
+                        .check(&self.pid, onto_core::policy::Action::Read, o)
+                })
         }
     }
 }
@@ -1369,6 +1504,225 @@ impl QueryExecutor {
             action.as_str(),
             obj.display()
         ))
+    }
+
+    // ---- RBAC derived-read gate (M2 T4.3, design §7.3) ----------------------
+    //
+    // Derived facts are adjudicated per output object ("按输出对象逐条判定，
+    // 含派生递归"): bulk outputs (INFER rows / annotations / infer·chain·path
+    // endpoints) drop denied facts and audit the denial; a single-target
+    // explain of a denied derived fact is a hard 403.
+
+    /// `ns.cls` → `Class{ns, cls}`; bare `cls` → `Class{_default, cls}` —
+    /// same convention as [`Self::resolve_class_name_in`] / the class PEP.
+    fn policy_class_ref(name: &str) -> onto_core::policy::ObjectRef {
+        use onto_core::policy::ObjectRef;
+        match name.split_once('.') {
+            Some((ns, class)) if !ns.is_empty() && !class.is_empty() => ObjectRef::Class {
+                ns: ns.to_string(),
+                class: class.to_string(),
+            },
+            _ => ObjectRef::Class {
+                ns: "_default".to_string(),
+                class: name.to_string(),
+            },
+        }
+    }
+
+    /// Sentinel for facts whose class cannot be resolved: no role grant covers
+    /// it (except the `NAMESPACE *` built-in wildcard), so strategy A fails
+    /// closed on unverifiable premises.
+    fn unresolvable_ref() -> onto_core::policy::ObjectRef {
+        onto_core::policy::ObjectRef::Class {
+            ns: "_unresolvable".to_string(),
+            class: "_premise".to_string(),
+        }
+    }
+
+    /// Entity → rdf:type class names, indexed from the collected fact set.
+    fn fact_type_index(
+        facts: &[onto_ontology::Triple],
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        let mut idx: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for f in facts {
+            if f.predicate == "rdf:type" {
+                idx.entry(f.subject.clone()).or_default().push(f.object.clone());
+            }
+        }
+        idx
+    }
+
+    /// The class a fact is "about" (its conclusion / container class):
+    /// asserted class for `rdf:type`; relation class or property domain
+    /// otherwise (design §7.3 "结论谓词所属类").
+    fn fact_class_ref(
+        triple: &onto_ontology::Triple,
+        ontology: Option<&Ontology>,
+    ) -> onto_core::policy::ObjectRef {
+        if triple.predicate == "rdf:type" {
+            return Self::policy_class_ref(&triple.object);
+        }
+        if let Some(o) = ontology {
+            if o.classes.contains_key(&triple.predicate) {
+                return Self::policy_class_ref(&triple.predicate);
+            }
+            if let Some(p) = o.properties.get(&triple.predicate) {
+                return Self::policy_class_ref(&p.domain);
+            }
+        }
+        Self::unresolvable_ref()
+    }
+
+    /// The class refs a premise exposes (design §7.3 "premise objects"): the
+    /// asserted class of a type fact; otherwise the fact's container class
+    /// plus the typed classes of both endpoints.
+    fn premise_object_refs(
+        premise: &onto_ontology::Triple,
+        types: &std::collections::HashMap<String, Vec<String>>,
+        ontology: Option<&Ontology>,
+    ) -> Vec<onto_core::policy::ObjectRef> {
+        if premise.predicate == "rdf:type" {
+            return vec![Self::policy_class_ref(&premise.object)];
+        }
+        let mut out = vec![Self::fact_class_ref(premise, ontology)];
+        for ent in [&premise.subject, &premise.object] {
+            if let Some(cs) = types.get(ent.as_str()) {
+                out.extend(cs.iter().map(|c| Self::policy_class_ref(c)));
+            }
+        }
+        out
+    }
+
+    /// Transitive premise refs (含派生递归): flattens the witness-premise tree,
+    /// recursing through `derived` (triple → its rule + witness premises).
+    fn deep_premise_refs(
+        premises: &[onto_ontology::Triple],
+        derived: &std::collections::HashMap<onto_ontology::Triple, DerivedNode>,
+        types: &std::collections::HashMap<String, Vec<String>>,
+        ontology: Option<&Ontology>,
+        seen: &mut std::collections::HashSet<onto_ontology::Triple>,
+        out: &mut Vec<onto_core::policy::ObjectRef>,
+    ) {
+        for p in premises {
+            if !seen.insert(p.clone()) {
+                continue;
+            }
+            if let Some(node) = derived.get(p) {
+                Self::deep_premise_refs(&node.premises, derived, types, ontology, seen, out);
+            }
+            out.extend(Self::premise_object_refs(p, types, ontology));
+        }
+    }
+
+    /// Builds the per-statement derived-read gate: `None` when RBAC is
+    /// inactive (legacy caller or no policy attached) — nothing is gated.
+    pub fn derived_gate(
+        &self,
+        actor: Option<&QueryActor>,
+        facts: &[onto_ontology::Triple],
+        inferred: &[onto_ontology::InferredFact],
+        ontology: Option<Ontology>,
+    ) -> Option<DerivedGate> {
+        self.derived_gate_from(
+            actor,
+            facts,
+            inferred
+                .iter()
+                .map(|f| (f.triple.clone(), format!("{:?}", f.rule), f.premises.clone())),
+            ontology,
+        )
+    }
+
+    /// [`Self::derived_gate`] for sources without `InferredFact`s (REST
+    /// explain steps, graph reasoner rules): `(triple, rule, premises)` rows.
+    pub fn derived_gate_from(
+        &self,
+        actor: Option<&QueryActor>,
+        facts: &[onto_ontology::Triple],
+        derived: impl IntoIterator<Item = (onto_ontology::Triple, String, Vec<onto_ontology::Triple>)>,
+        ontology: Option<Ontology>,
+    ) -> Option<DerivedGate> {
+        let actor = actor.cloned()?;
+        let pid = actor.principal_id.clone()?;
+        let svc = self.policy.clone()?;
+        let derived = derived
+            .into_iter()
+            .map(|(triple, rule, premises)| {
+                (
+                    triple,
+                    DerivedNode {
+                        rule,
+                        premises,
+                    },
+                )
+            })
+            .collect();
+        Some(DerivedGate {
+            svc,
+            actor,
+            pid,
+            derived: std::cell::RefCell::new(derived),
+            types: Self::fact_type_index(facts),
+            ontology,
+        })
+    }
+
+    /// Per-fact adjudication; audits `RBAC deny: INFER on …` on denial.
+    fn gate_allows(&self, gate: Option<&DerivedGate>, fact: &onto_ontology::InferredFact) -> bool {
+        self.gate_allows_parts(gate, &fact.triple, &format!("{:?}", fact.rule), &fact.premises)
+    }
+
+    /// [`Self::gate_allows`] with a string rule name (non-`RuleId` sources).
+    pub fn gate_allows_parts(
+        &self,
+        gate: Option<&DerivedGate>,
+        triple: &onto_ontology::Triple,
+        rule: &str,
+        premises: &[onto_ontology::Triple],
+    ) -> bool {
+        let Some(g) = gate else {
+            return true;
+        };
+        if g.allows_parts(triple, rule, premises) {
+            return true;
+        }
+        self.audit(
+            Some(&g.actor),
+            "denied",
+            &[triple.subject.clone()],
+            &format!(
+                "RBAC deny: INFER on {}",
+                Self::fact_class_ref(triple, g.ontology.as_ref()).display()
+            ),
+        );
+        false
+    }
+
+    /// Single-target explain gate (T4.3d, design §10 ②): a target derived
+    /// fact that fails the derived-read gate is a hard error — the caller
+    /// maps the message to 403. `Ok(())` = render the chain with premise
+    /// redaction. Audits the denial like [`Self::gate_allows`].
+    pub fn deny_explain_target(
+        &self,
+        gate: Option<&DerivedGate>,
+        target: &onto_ontology::Triple,
+        rule: &str,
+        premises: &[onto_ontology::Triple],
+    ) -> std::result::Result<(), String> {
+        let Some(g) = gate else {
+            return Ok(());
+        };
+        if g.allows_parts(target, rule, premises) {
+            return Ok(());
+        }
+        let obj = Self::fact_class_ref(target, g.ontology.as_ref());
+        self.audit(
+            Some(&g.actor),
+            "denied",
+            &[target.subject.clone()],
+            &format!("RBAC deny: INFER on {}", obj.display()),
+        );
+        Err(format!("permission denied: INFER on {}", obj.display()))
     }
 
     /// RBAC property-level PEP (design §7.2/§10): column checks on the
@@ -2264,6 +2618,9 @@ impl QueryExecutor {
             return self.execute_policy_admin(ast, actor);
         }
 
+        // The derived-read gate reads the actor from EXEC_ACTOR deep inside
+        // inference execution (see ActorScope).
+        let _actor_scope = ActorScope::enter(Some(actor));
         let result = if read {
             self.execute_read(&resolved)
         } else {
@@ -7519,7 +7876,7 @@ impl QueryExecutor {
 
     /// Returns the cached merged ontology, or builds and caches it.
     /// This avoids repeated scan_prefix("__ontology__") calls across the codebase.
-    fn get_merged_ontology(&self, _engine: &LsmEngine) -> onto_ontology::Ontology {
+    pub fn get_merged_ontology(&self, _engine: &LsmEngine) -> onto_ontology::Ontology {
         // Check cache first
         {
             let cache = self
@@ -8026,8 +8383,17 @@ impl QueryExecutor {
         summary.insert("rule_counts".to_string(), Value::Object(rule_counts));
         rows.push(summary);
 
+        // Per-fact derived-read gate (design §7.3): denied conclusions are
+        // filtered out of this bulk listing and audited; unreadable premises
+        // in kept rows render as `[redacted]`.
+        let actor = EXEC_ACTOR.with(|c| c.borrow().clone());
+        let gate = self.derived_gate(actor.as_ref(), &facts, &result.inferred, Some(ontology));
+
         // Each inferred fact as a row
         for fact in &result.inferred {
+            if !self.gate_allows(gate.as_ref(), fact) {
+                continue;
+            }
             let mut row = Map::new();
             row.insert("type".to_string(), Value::String("inferred".to_string()));
             row.insert(
@@ -8046,8 +8412,9 @@ impl QueryExecutor {
             let premises: Vec<Value> = fact
                 .premises
                 .iter()
-                .map(|p| {
-                    Value::String(format!("({}, {}, {})", p.subject, p.predicate, p.object))
+                .map(|p| match gate.as_ref() {
+                    Some(g) if !g.fact_allows(p) => Value::String("[redacted]".to_string()),
+                    _ => Value::String(format!("({}, {}, {})", p.subject, p.predicate, p.object)),
                 })
                 .collect();
             row.insert("premises".to_string(), Value::Array(premises));
@@ -8094,8 +8461,13 @@ impl QueryExecutor {
             },
         };
 
-        let reasoner = onto_ontology::Reasoner::new(ontology);
+        let reasoner = onto_ontology::Reasoner::new(ontology.clone());
         let result = reasoner.reason(&facts);
+
+        // Per-fact derived-read gate (design §7.3). Legacy callers without a
+        // principal (or without a policy) see every fact, pre-RBAC behavior.
+        let actor = EXEC_ACTOR.with(|c| c.borrow().clone());
+        let gate = self.derived_gate(actor.as_ref(), &facts, &result.inferred, Some(ontology));
 
         let wanted: Option<std::collections::HashSet<String>> = if rules.is_empty() {
             None
@@ -8118,6 +8490,9 @@ impl QueryExecutor {
             let mut rows = Vec::new();
             for fact in &result.inferred {
                 if !matches_rules(fact) {
+                    continue;
+                }
+                if !self.gate_allows(gate.as_ref(), fact) {
                     continue;
                 }
                 let mut row = Map::new();
@@ -8161,6 +8536,9 @@ impl QueryExecutor {
                 if fact.triple.subject != pk || !matches_rules(fact) {
                     continue;
                 }
+                if !self.gate_allows(gate.as_ref(), fact) {
+                    continue;
+                }
                 if fact.triple.predicate == "rdf:type" {
                     if add_types {
                         types.push(Value::String(fact.triple.object.clone()));
@@ -8202,6 +8580,7 @@ impl QueryExecutor {
         rules: &[String],
         limit: Option<usize>,
         engine: &LsmEngine,
+        actor: Option<&QueryActor>,
         mut sink: impl FnMut(Vec<Map<String, Value>>) -> bool,
     ) -> Result<usize> {
         self.arm_timeout();
@@ -8221,7 +8600,10 @@ impl QueryExecutor {
             },
         };
 
-        let reasoner = onto_ontology::Reasoner::new(ontology);
+        let reasoner = onto_ontology::Reasoner::new(ontology.clone());
+        // Per-fact derived-read gate (design §7.3); the recursion index is
+        // filled incrementally as facts stream out.
+        let gate = self.derived_gate(actor, &facts, &[], Some(ontology));
         let wanted: Option<std::collections::HashSet<String>> = if rules.is_empty() {
             None
         } else {
@@ -8243,6 +8625,12 @@ impl QueryExecutor {
                     if !w.contains(&Self::normalize_rule_name(&format!("{:?}", inf.rule))) {
                         return true;
                     }
+                }
+                if let Some(g) = gate.as_ref() {
+                    g.note_derived(inf);
+                }
+                if !self.gate_allows(gate.as_ref(), inf) {
+                    return true;
                 }
                 let mut row = Map::new();
                 row.insert(
@@ -21254,6 +21642,173 @@ mod tests {
             }),
             "SHOW GRANTS should list the Dog carve-out: {rows:?}"
         );
+    }
+
+    /// M2 T4.3 derived-read amplification (design §7.3 A/B/C). Reading a
+    /// derived fact requires clearance for its premises under A (default) —
+    /// a dark premise must not amplify through inference. B reads on the
+    /// conclusion class alone; C is the per-rule `GRANT INFER ON RULE`
+    /// exemption that walks B for that one rule. Bulk outputs filter denied
+    /// facts (per output object) and audit the denial; explain chains keep
+    /// the rule but render unreadable premises as `[redacted]`.
+    #[test]
+    fn policy_derived_read_amplification() {
+        use onto_core::policy::InferStrategy;
+        let (executor, _dir) = setup();
+        let pdir = tempdir().unwrap();
+        let svc = onto_ontology::policy_store::PolicyService::open(
+            onto_ontology::policy_store::PolicyStore::new(Arc::new(
+                LsmEngine::open(StorageOptions {
+                    data_dir: pdir.path().to_path_buf(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )),
+        )
+        .unwrap();
+        let adir = tempdir().unwrap();
+        let audit_path = adir.path().join("audit.log");
+        let executor = executor
+            .with_policy_service(svc.clone())
+            .with_audit_log(&audit_path);
+        let admin = QueryActor {
+            label: "root".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: true,
+            principal_id: None,
+        };
+        let parse_stmt = |sql: &str| {
+            crate::ontoql::OntoQLParser::parse(sql)
+                .ok()
+                .and_then(|oa| oa.to_query_ast().ok())
+                .unwrap_or_else(|| QueryParser::parse(sql).unwrap())
+        };
+        let run = |sql: &str| executor.execute_as(&parse_stmt(sql), &admin);
+        let run_for = |sql: &str, actor: &QueryActor| executor.execute_as(&parse_stmt(sql), actor);
+
+        // Animal ← Dog ← Puppy, Animal ← Cat. Every derived fact is Cax-sco:
+        // `d1 type Animal` (premise `d1 type Dog`), `p1 type Dog` /
+        // `p1 type Animal` (premise `p1 type Puppy`), `c1 type Animal`
+        // (premise `c1 type Cat`).
+        run("CREATE ONTOLOGY zoo (CLASS Animal, CLASS Dog SUBCLASS OF Animal, CLASS Puppy SUBCLASS OF Dog, CLASS Cat SUBCLASS OF Animal, PROPERTY name DOMAIN Animal RANGE STRING)").unwrap();
+        insert_row(&executor, "Animal", "a1", 1);
+        insert_row(&executor, "Dog", "d1", 1);
+        insert_row(&executor, "Puppy", "p1", 1);
+        insert_row(&executor, "Cat", "c1", 1);
+
+        run("CREATE ROLE analyst").unwrap();
+        run("CREATE USER alice WITH PASSWORD 'pw'").unwrap();
+        run("GRANT ROLE analyst TO alice").unwrap();
+        // INFER + READ on Animal (covers the subclass line by is_a) — then
+        // REVOKE carves Dog (and its Puppy subtree) out: those premise
+        // classes are dark, Cat stays readable.
+        run("GRANT INFER ON CLASS Animal TO analyst").unwrap();
+        run("GRANT READ ON CLASS Animal TO analyst").unwrap();
+        run("REVOKE READ ON CLASS Dog FROM analyst").unwrap();
+
+        let alice = QueryActor {
+            label: "alice".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+            principal_id: Some("alice".to_string()),
+        };
+        let infer_rows = |actor: &QueryActor| -> Vec<Map<String, Value>> {
+            match run_for("INFER SELECT * FROM Animal", actor).unwrap() {
+                QueryResult::Rows(r) => r,
+                other => panic!("expected rows, got {other:?}"),
+            }
+        };
+        let explain_rows = |actor: &QueryActor| -> Vec<Map<String, Value>> {
+            match run_for("EXPLAIN REASONING SELECT * FROM Animal", actor).unwrap() {
+                QueryResult::Rows(r) => r,
+                other => panic!("expected rows, got {other:?}"),
+            }
+        };
+        let subject_of = |r: &Map<String, Value>, cls: &str| {
+            r.get("subject")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains(cls))
+        };
+
+        // --- A (default): premise union. Dark premises ⇒ no derived read. ---
+        // Only the Cat-premise derivation survives (Cat is readable).
+        let rows = infer_rows(&alice);
+        assert_eq!(rows.len(), 1, "A: only the readable-premise derivation: {rows:?}");
+        assert!(subject_of(&rows[0], "Cat::"), "the Cat line: {rows:?}");
+        // Bulk explain listings filter the same way (no dark-premise leak).
+        let erows = explain_rows(&alice);
+        assert_eq!(
+            erows.iter().filter(|r| r.get("type").and_then(|v| v.as_str()) == Some("inferred")).count(),
+            1,
+            "explain filters identically: {erows:?}"
+        );
+        // The denials left an audit trail.
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(audit.contains("RBAC deny: INFER on CLASS"), "audit: {audit}");
+
+        // --- B: conclusion class only — premises may be dark. ---
+        svc.engine.set_infer_strategy(InferStrategy::ConclusionClass);
+        let rows = infer_rows(&alice);
+        // d1/p1/c1 type Animal (conclusion Animal); `p1 type Dog` stays
+        // denied — the conclusion class itself is carved out (REVOKE).
+        assert_eq!(rows.len(), 3, "B: conclusion-class reads: {rows:?}");
+        assert!(rows.iter().any(|r| subject_of(r, "Dog::")), "d1 line: {rows:?}");
+        assert!(rows.iter().any(|r| subject_of(r, "Puppy::")), "p1 line: {rows:?}");
+        assert!(rows.iter().all(|r| r.get("object").and_then(|v| v.as_str()) == Some("Animal")));
+
+        // --- C: `GRANT INFER ON RULE <r>` exempts that rule to B. ---
+        svc.engine.set_infer_strategy(InferStrategy::PremiseUnion);
+        let rows = infer_rows(&alice);
+        assert_eq!(rows.len(), 1, "back under A the dark lines vanish: {rows:?}");
+        run("GRANT INFER ON RULE CaxSco TO analyst").unwrap();
+        let rows = infer_rows(&alice);
+        assert_eq!(rows.len(), 3, "C: the rule exemption walks B: {rows:?}");
+        assert!(rows.iter().any(|r| subject_of(r, "Dog::")), "incl. the Dog line: {rows:?}");
+
+        // Explain chains keep the rule but redact unreadable premises
+        // (Dog/Puppy premises are dark; Cat is readable).
+        let rows = explain_rows(&alice);
+        let inferred: Vec<_> = rows
+            .iter()
+            .filter(|r| r.get("type").and_then(|v| v.as_str()) == Some("inferred"))
+            .collect();
+        assert_eq!(inferred.len(), 3, "explain shows the same gated facts: {inferred:?}");
+        let redacted: Vec<_> = inferred
+            .iter()
+            .filter(|r| {
+                r.get("premises")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|ps| ps.iter().all(|p| p.as_str() == Some("[redacted]")))
+            })
+            .collect();
+        assert_eq!(redacted.len(), 2, "Dog/Puppy premises redacted: {inferred:?}");
+        let named: Vec<_> = inferred
+            .iter()
+            .filter(|r| {
+                r.get("premises")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|ps| ps.iter().any(|p| p.as_str().is_some_and(|s| s.contains("Cat"))))
+            })
+            .collect();
+        assert_eq!(named.len(), 1, "readable Cat premise stays named: {inferred:?}");
+
+        // Calling the infer surface at all needs the INFER capability —
+        // a plain reader gets a hard deny at the statement gate.
+        run("CREATE ROLE reader").unwrap();
+        run("CREATE USER bob WITH PASSWORD 'pw'").unwrap();
+        run("GRANT ROLE reader TO bob").unwrap();
+        run("GRANT READ ON CLASS Animal TO reader").unwrap();
+        let bob = QueryActor {
+            label: "bob".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+            principal_id: Some("bob".to_string()),
+        };
+        let err = run_for("INFER SELECT * FROM Animal", &bob).unwrap_err();
+        assert!(err.to_string().contains("permission denied"), "err: {err}");
     }
 
     /// Every policy mutation attempt — success or failure — leaves exactly

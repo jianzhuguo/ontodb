@@ -237,6 +237,15 @@ impl ApiErr {
             msg: sanitize_error(&msg.into()),
         }
     }
+
+    /// Derived-read gate denial (T4.3d): a targeted explain of a derived
+    /// fact the principal may not read.
+    fn forbidden(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            msg: msg.into(),
+        }
+    }
 }
 
 type Res<T> = Result<T, ApiErr>;
@@ -461,6 +470,7 @@ fn run_infer_paged(
             &rules,
             cap,
             &executor.engine().default_engine(),
+            Some(actor),
             &mut sink,
         )
         .map_err(|e| ApiErr::internal(format!("{e}")))?;
@@ -1713,7 +1723,7 @@ pub struct SemanticExplainRequest {
     pub rules: Vec<String>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 pub struct ExplainTriple {
     pub subject: String,
     pub predicate: String,
@@ -1727,7 +1737,7 @@ pub struct DerivationStepInfo {
     pub premises: Vec<ExplainTriple>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct ExplainResponse {
     pub target: ExplainTriple,
     /// True if the target can be explained (either stated or inferred).
@@ -1767,66 +1777,15 @@ pub async fn semantic_explain(
     let rules = req.rules.clone();
 
     let result = tokio::task::spawn_blocking(move || -> Res<ExplainResponse> {
-        let target = onto_ontology::Triple {
-            subject: subject.clone(),
-            predicate: predicate.clone(),
-            object: object.clone(),
-        };
-
-        // Collect facts: use scope query or default to relation edges
-        let facts = collect_facts_for_explain(&executor, &actor, scope.as_deref())?;
-
-        // Get ontology for reasoning
-        let ontology = get_merged_ontology_for_explain(&executor, &actor)?;
-
-        // Run reasoner
-        let reasoner = onto_ontology::Reasoner::new(ontology);
-        let steps = reasoner.explain(&facts, &target);
-
-        // Check if target is a directly stated fact
-        let is_stated = facts.iter().any(|f| f.subject == target.subject && f.predicate == target.predicate && f.object == target.object);
-
-        // Filter by rules if specified
-        let wanted: Option<std::collections::HashSet<String>> = if rules.is_empty() {
-            None
-        } else {
-            Some(rules.iter().map(|r| normalize_rule_name_local(r)).collect())
-        };
-
-        let mut derivations: Vec<DerivationStepInfo> = Vec::new();
-        let mut rule_summary: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-
-        for step in &steps {
-            let rule_name = format!("{:?}", step.rule);
-            let norm = normalize_rule_name_local(&rule_name);
-            if let Some(w) = &wanted {
-                if !w.contains(&norm) {
-                    continue;
-                }
-            }
-            *rule_summary.entry(rule_name.clone()).or_insert(0) += 1;
-            derivations.push(DerivationStepInfo {
-                rule: rule_name,
-                conclusion: ExplainTriple {
-                    subject: step.conclusion.subject.clone(),
-                    predicate: step.conclusion.predicate.clone(),
-                    object: step.conclusion.object.clone(),
-                },
-                premises: step.premises.iter().map(|p| ExplainTriple {
-                    subject: p.subject.clone(),
-                    predicate: p.predicate.clone(),
-                    object: p.object.clone(),
-                }).collect(),
-            });
-        }
-
-        Ok(ExplainResponse {
-            target: ExplainTriple { subject, predicate, object },
-            explained: !derivations.is_empty() || is_stated,
-            stated: is_stated,
-            derivations,
-            rule_summary,
-        })
+        explain_target(
+            &executor,
+            &actor,
+            &subject,
+            &predicate,
+            &object,
+            scope.as_deref(),
+            &rules,
+        )
     })
     .await
     .unwrap_or_else(|e| Err(ApiErr::internal(format!("task join: {e}"))));
@@ -1843,6 +1802,137 @@ pub async fn semantic_explain(
             (e.status, Json(ApiResponse::<Value>::error(e.msg)))
         }
     }
+}
+
+/// Explains one target triple with the derived-read gate applied (T4.3d,
+/// design §10 ②③): a derived target the principal may not read is a hard
+/// 403 (zero leak — `deny_explain_target` audits the denial); unreadable
+/// premises and intermediate conclusions render as `[redacted]`, keeping
+/// the rule name visible ("只留规则名+深度").
+fn explain_target(
+    executor: &Arc<QueryExecutor>,
+    actor: &onto_query::QueryActor,
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    scope: Option<&str>,
+    rules: &[String],
+) -> Res<ExplainResponse> {
+    let target = onto_ontology::Triple {
+        subject: subject.to_string(),
+        predicate: predicate.to_string(),
+        object: object.to_string(),
+    };
+
+    // Collect facts: use scope query or default to relation edges
+    let facts = collect_facts_for_explain(executor, actor, scope)?;
+
+    // Get ontology for reasoning
+    let ontology = get_merged_ontology_for_explain(executor, actor)?;
+
+    // Run reasoner
+    let reasoner = onto_ontology::Reasoner::new(ontology.clone());
+    let steps = reasoner.explain(&facts, &target);
+
+    // Check if target is a directly stated fact
+    let is_stated = facts
+        .iter()
+        .any(|f| f.subject == target.subject && f.predicate == target.predicate && f.object == target.object);
+
+    // Derived-read gate (design §10 ②③). `None` = pre-RBAC, nothing gated.
+    let gate = executor.derived_gate(
+        Some(actor),
+        &facts,
+        &steps
+            .iter()
+            .map(|s| onto_ontology::InferredFact {
+                triple: s.conclusion.clone(),
+                rule: s.rule,
+                premises: s.premises.clone(),
+            })
+            .collect::<Vec<_>>(),
+        Some(ontology),
+    );
+
+    // ② A targeted explain of a denied derived target is a hard 403 — the
+    // chain (rule names, premises) must not leak at all. A stated target is
+    // not a derived read; its derivations render under ③ like any chain.
+    if !is_stated {
+        if let Some(step) = steps.iter().find(|s| s.conclusion == target) {
+            executor
+                .deny_explain_target(
+                    gate.as_ref(),
+                    &target,
+                    &format!("{:?}", step.rule),
+                    &step.premises,
+                )
+                .map_err(ApiErr::forbidden)?;
+        }
+    }
+
+    // Filter by rules if specified
+    let wanted: Option<std::collections::HashSet<String>> = if rules.is_empty() {
+        None
+    } else {
+        Some(rules.iter().map(|r| normalize_rule_name_local(r)).collect())
+    };
+
+    let redacted = ExplainTriple {
+        subject: "[redacted]".to_string(),
+        predicate: "[redacted]".to_string(),
+        object: "[redacted]".to_string(),
+    };
+    let visible = |t: &onto_ontology::Triple| -> ExplainTriple {
+        match gate.as_ref() {
+            Some(g) if !g.fact_allows(t) => redacted.clone(),
+            _ => ExplainTriple {
+                subject: t.subject.clone(),
+                predicate: t.predicate.clone(),
+                object: t.object.clone(),
+            },
+        }
+    };
+
+    let mut derivations: Vec<DerivationStepInfo> = Vec::new();
+    let mut rule_summary: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for step in &steps {
+        let rule_name = format!("{:?}", step.rule);
+        let norm = normalize_rule_name_local(&rule_name);
+        if let Some(w) = &wanted {
+            if !w.contains(&norm) {
+                continue;
+            }
+        }
+        *rule_summary.entry(rule_name.clone()).or_insert(0) += 1;
+        derivations.push(DerivationStepInfo {
+            rule: rule_name,
+            // ③ The target itself is already adjudicated (②); intermediate
+            // conclusions follow the same readability rule as premises.
+            conclusion: if step.conclusion == target {
+                ExplainTriple {
+                    subject: step.conclusion.subject.clone(),
+                    predicate: step.conclusion.predicate.clone(),
+                    object: step.conclusion.object.clone(),
+                }
+            } else {
+                visible(&step.conclusion)
+            },
+            premises: step.premises.iter().map(&visible).collect(),
+        });
+    }
+
+    Ok(ExplainResponse {
+        target: ExplainTriple {
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+        },
+        explained: !derivations.is_empty() || is_stated,
+        stated: is_stated,
+        derivations,
+        rule_summary,
+    })
 }
 
 /// Collects facts for explain reasoning. If scope is provided, uses it as
@@ -1906,15 +1996,14 @@ fn collect_facts_for_explain(
     Ok(facts)
 }
 
-/// Gets merged ontology for explain reasoning.
+/// Gets merged ontology for explain reasoning (T4.3d: the full merged view
+/// — same class hierarchy the SQL explain gate runs on — so Cax-sco chains
+/// derive and the derived-read gate maps premises to real classes).
 fn get_merged_ontology_for_explain(
-    _executor: &Arc<QueryExecutor>,
+    executor: &Arc<QueryExecutor>,
     _actor: &onto_query::QueryActor,
 ) -> Res<onto_ontology::Ontology> {
-    // Return a minimal ontology — the reasoner works on facts alone for
-    // Prp-trp / Prp-inv / Prp-symp etc. Full ontology-aware reasoning
-    // (Cax-sco etc.) would need executor.get_merged_ontology().
-    Ok(onto_ontology::Ontology::new("explain"))
+    Ok(executor.get_merged_ontology(&executor.engine().default_engine()))
 }
 
 /// Local copy of rule name normalization (mirrors executor's version).
@@ -2050,5 +2139,128 @@ mod tests {
             }
             _ => panic!("expected Infer"),
         }
+    }
+
+    /// T4.3d (design §10 ②③): a targeted explain of a derived fact is gated
+    /// like any derived read. A denied target is a hard 403 with zero chain
+    /// leak; a readable target renders its chain with unreadable premises —
+    /// and intermediate conclusions — as `[redacted]`, keeping rule names.
+    /// A/B/C mirrors the executor amplification matrix (T4.3c).
+    #[test]
+    fn explain_target_derived_read_gate() {
+        use onto_core::policy::InferStrategy;
+        use onto_ontology::policy_store::{PolicyService, PolicyStore};
+        use onto_storage::{EngineSet, LsmEngine, StorageOptions};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(EngineSet::new(Arc::new(
+            LsmEngine::open(StorageOptions {
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        )));
+        let ontology_store = onto_ontology::OntologyStore::new(engine.default_engine());
+        let svc = PolicyService::open(PolicyStore::new(engine.default_engine())).unwrap();
+        let adir = tempfile::tempdir().unwrap();
+        let audit_path = adir.path().join("audit.log");
+        let executor = Arc::new(
+            QueryExecutor::new(Arc::clone(&engine), ontology_store)
+                .with_policy_service(svc.clone())
+                .with_audit_log(&audit_path),
+        );
+
+        let admin = onto_query::QueryActor {
+            label: "root".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: true,
+            principal_id: None,
+        };
+        let parse_stmt = |sql: &str| {
+            OntoQLParser::parse(sql)
+                .ok()
+                .and_then(|oa| oa.to_query_ast().ok())
+                .unwrap_or_else(|| QueryParser::parse(sql).unwrap())
+        };
+        let run = |sql: &str| executor.execute_as(&parse_stmt(sql), &admin);
+
+        // Animal ← Dog ← Puppy, Animal ← Cat. Stated rdf:type facts are
+        // rows of `Fact` (fed to the reasoner through the explain scope).
+        run("CREATE ONTOLOGY zoo (CLASS Animal, CLASS Dog SUBCLASS OF Animal, CLASS Puppy SUBCLASS OF Dog, CLASS Cat SUBCLASS OF Animal, PROPERTY name DOMAIN Animal RANGE STRING)").unwrap();
+        run("CREATE ONTOLOGY facts (CLASS Fact, PROPERTY subject DOMAIN Fact RANGE STRING, PROPERTY predicate DOMAIN Fact RANGE STRING, PROPERTY object DOMAIN Fact RANGE STRING)").unwrap();
+        run("INSERT INTO Fact (subject, predicate, object) VALUES ('d1', 'rdf:type', 'Dog')").unwrap();
+        run("INSERT INTO Fact (subject, predicate, object) VALUES ('p1', 'rdf:type', 'Puppy')").unwrap();
+        run("INSERT INTO Fact (subject, predicate, object) VALUES ('c1', 'rdf:type', 'Cat')").unwrap();
+
+        run("CREATE ROLE analyst").unwrap();
+        run("CREATE USER alice WITH PASSWORD 'pw'").unwrap();
+        run("GRANT ROLE analyst TO alice").unwrap();
+        run("GRANT INFER ON CLASS Animal TO analyst").unwrap();
+        run("GRANT READ ON CLASS Animal TO analyst").unwrap();
+        run("GRANT READ ON CLASS Fact TO analyst").unwrap();
+        // Dog (and its Puppy subtree) dark — the premise-union amplifier.
+        run("REVOKE READ ON CLASS Dog FROM analyst").unwrap();
+
+        let alice = onto_query::QueryActor {
+            label: "alice".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+            principal_id: Some("alice".to_string()),
+        };
+        let scope = "SELECT subject, predicate, object FROM Fact";
+        let explain = |actor: &onto_query::QueryActor, s: &str, o: &str| {
+            explain_target(&executor, actor, s, "rdf:type", o, Some(scope), &[])
+        };
+
+        // --- A (default, premise union): dark premises ⇒ no derived read. ---
+        let err = explain(&alice, "p1", "Animal").unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{err:?}");
+        assert!(err.msg.contains("permission denied"), "{err:?}");
+        // The denial is audited; the 403 body carries no chain at all.
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        assert!(audit.contains("RBAC deny: INFER on CLASS"), "audit: {audit}");
+
+        // The readable-premise derivation still explains (Cat line, named).
+        let ok = explain(&alice, "c1", "Animal").unwrap();
+        assert!(ok.explained, "{ok:?}");
+        assert!(!ok.derivations.is_empty(), "{ok:?}");
+        let text = serde_json::to_string(&ok).unwrap();
+        assert!(text.contains("Cat"), "readable premise stays named: {text}");
+        assert!(!text.contains("[redacted]"), "{text}");
+
+        // --- B: conclusion class only — target reads, chain redacts. ---
+        svc.engine.set_infer_strategy(InferStrategy::ConclusionClass);
+        let ok = explain(&alice, "p1", "Animal").unwrap();
+        assert!(!ok.derivations.is_empty(), "{ok:?}");
+        let text = serde_json::to_string(&ok).unwrap();
+        assert!(text.contains("CaxSco"), "rule name stays: {text}");
+        assert!(text.contains("[redacted]"), "dark premises redacted: {text}");
+        assert!(!text.contains("Dog"), "no dark class leak: {text}");
+        assert!(!text.contains("Puppy"), "no dark class leak: {text}");
+
+        // --- C: `GRANT INFER ON RULE` exempts the rule (walks B) even
+        // back under A — target reads, dark premises stay redacted. ---
+        svc.engine.set_infer_strategy(InferStrategy::PremiseUnion);
+        run("GRANT INFER ON RULE CaxSco TO analyst").unwrap();
+        let ok = explain(&alice, "p1", "Animal").unwrap();
+        assert!(!ok.derivations.is_empty(), "{ok:?}");
+        let text = serde_json::to_string(&ok).unwrap();
+        assert!(text.contains("CaxSco"), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
+        assert!(!text.contains("Dog"), "{text}");
+        assert!(!text.contains("Puppy"), "{text}");
+
+        // Clearance restores the chain: READ Dog clears the carve-out
+        // (downward, so the Puppy premise reads too) — nothing left to
+        // redact. The Cax-sco witness is the asserted root (`p1 type
+        // Puppy`), so the chain names Puppy directly.
+        run("GRANT READ ON CLASS Dog TO analyst").unwrap();
+        let ok = explain(&alice, "p1", "Animal").unwrap();
+        let text = serde_json::to_string(&ok).unwrap();
+        assert!(text.contains("Puppy"), "named premise: {text}");
+        assert!(!text.contains("[redacted]"), "{text}");
     }
 }

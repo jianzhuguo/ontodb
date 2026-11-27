@@ -1838,6 +1838,7 @@ async fn execute_query(
                         rules,
                         Some(1_000_000usize),
                         &executor.engine().default_engine(),
+                        Some(&actor_for_stream),
                         &mut sink,
                     )
                 }
@@ -3927,12 +3928,84 @@ async fn graph_enterprise_stub() -> impl IntoResponse {
     )
 }
 
+/// T4.3d derived-read gate support for the graph-reasoning exits (design
+/// §7.3/§10 — same treatment as the SQL INFER / semantic exits).
+fn graph_triple(t: &onto_graph::reasoning::Triple) -> onto_ontology::Triple {
+    onto_ontology::Triple {
+        subject: t.subject.clone(),
+        predicate: t.predicate.clone(),
+        object: t.object.clone(),
+    }
+}
+
+/// Grounds one triple pattern against a proof's bindings.
+fn graph_ground(
+    p: &onto_graph::reasoning::TriplePattern,
+    b: &onto_graph::reasoning::Bindings,
+) -> Option<onto_ontology::Triple> {
+    use onto_graph::reasoning::PatternTerm;
+    let resolve = |t: &PatternTerm| -> Option<String> {
+        match t {
+            PatternTerm::Constant(c) => Some(c.clone()),
+            PatternTerm::Variable(v) => b.get(v).cloned(),
+        }
+    };
+    Some(onto_ontology::Triple {
+        subject: resolve(&p.subject)?,
+        predicate: resolve(&p.predicate)?,
+        object: resolve(&p.object)?,
+    })
+}
+
+/// Premise triples behind one graph inference (rule conditions + bindings).
+fn graph_rule_premises(
+    rule: Option<&onto_graph::reasoning::Rule>,
+    bindings: &onto_graph::reasoning::Bindings,
+) -> Vec<onto_ontology::Triple> {
+    rule.map(|r| {
+        r.conditions
+            .iter()
+            .filter_map(|c| graph_ground(c, bindings))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Entity rdf:type facts from graph vertex labels (M2 T4.3): the derived-read
+/// gate maps premise entities to their typed classes — the SQL surface draws
+/// these from the fact set, the graph surface from vertex labels.
+fn graph_type_facts<'a>(
+    store: &onto_graph::GraphStore,
+    entities: impl IntoIterator<Item = &'a str>,
+) -> Vec<onto_ontology::Triple> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for id in entities {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(v) = store.get_vertex(id) {
+            for label in &v.labels {
+                out.push(onto_ontology::Triple {
+                    subject: id.to_string(),
+                    predicate: "rdf:type".to_string(),
+                    object: label.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// POST /api/graph/reasoning/infer - Run forward chain reasoning on the graph.
 async fn graph_reasoning_infer(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::auth::KeyInfo>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+    let actor = actor_of(caller.map(|e| e.0), &addr.ip().to_string());
 
     let rules_val = req.get("rules").cloned().unwrap_or(serde_json::Value::Array(vec![]));
     let mut reasoner = onto_graph::Reasoner::new();
@@ -3946,17 +4019,61 @@ async fn graph_reasoning_infer(
     }
 
     let inferred = reasoner.forward_chain(&state.graph);
+
+    // Per-fact derived-read gate (design §10 ①): denied facts are dropped
+    // from this bulk exit and audited, like the SQL INFER outputs.
+    let ontology = state
+        .executor
+        .get_merged_ontology(&state.executor.engine().default_engine());
+    let mut prov: std::collections::HashMap<
+        onto_graph::reasoning::Triple,
+        (String, Vec<onto_ontology::Triple>),
+    > = std::collections::HashMap::new();
+    for h in reasoner.history() {
+        let rule = reasoner
+            .active_rules()
+            .into_iter()
+            .find(|r| r.name == h.rule_name);
+        let premises = graph_rule_premises(rule, &h.bindings);
+        prov.insert(h.triple.clone(), (h.rule_name.clone(), premises));
+    }
+    let gate = state.executor.derived_gate_from(
+        Some(&actor),
+        &graph_type_facts(
+            &state.graph,
+            inferred
+                .iter()
+                .flat_map(|t| [t.subject.as_str(), t.object.as_str()]),
+        ),
+        prov.iter()
+            .map(|(t, (rule, premises))| (graph_triple(t), rule.clone(), premises.clone())),
+        Some(ontology),
+    );
+    let kept: Vec<serde_json::Value> = inferred
+        .iter()
+        .filter_map(|t| {
+            let (rule, premises) = prov.get(t)?;
+            if !state
+                .executor
+                .gate_allows_parts(gate.as_ref(), &graph_triple(t), rule, premises)
+            {
+                return None;
+            }
+            Some(serde_json::json!({
+                "subject": t.subject,
+                "predicate": t.predicate,
+                "object": t.object,
+            }))
+        })
+        .collect();
+    let count = kept.len();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     (
         StatusCode::OK,
         Json(ApiResponse::success(serde_json::json!({
-            "inferred_triples": inferred.iter().map(|t| serde_json::json!({
-                "subject": t.subject,
-                "predicate": t.predicate,
-                "object": t.object,
-            })).collect::<Vec<_>>(),
-            "count": inferred.len(),
+            "inferred_triples": kept,
+            "count": count,
             "stats": {
                 "triples_inferred": reasoner.stats().triples_inferred,
                 "rules_applied": reasoner.stats().rules_applied,
@@ -3968,9 +4085,12 @@ async fn graph_reasoning_infer(
 /// POST /api/graph/reasoning/explain - Backward chain reasoning to explain a goal.
 async fn graph_reasoning_explain(
     State(state): State<AppState>,
+    caller: Option<axum::Extension<crate::auth::KeyInfo>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let start = std::time::Instant::now();
+    let actor = actor_of(caller.map(|e| e.0), &addr.ip().to_string());
 
     let subject = req.get("subject").and_then(|v| v.as_str()).unwrap_or("");
     let predicate = req.get("predicate").and_then(|v| v.as_str()).unwrap_or("");
@@ -3990,17 +4110,101 @@ async fn graph_reasoning_explain(
         object: onto_graph::reasoning::PatternTerm::Constant(object.to_string()),
     };
 
-    let bindings = reasoner.backward_chain(&state.graph, &goal);
+    let proofs = reasoner.backward_chain_provenanced(&state.graph, &goal);
+    let goal_triple = onto_ontology::Triple {
+        subject: subject.to_string(),
+        predicate: predicate.to_string(),
+        object: object.to_string(),
+    };
+
+    // T4.3d (design §10 ②③): a rule-proven goal is a derived fact. When no
+    // proof clears the derived-read gate this is a hard 403 (zero leak);
+    // otherwise binding values that name entities from unreadable premises
+    // render `[redacted]`.
+    let ontology = state
+        .executor
+        .get_merged_ontology(&state.executor.engine().default_engine());
+    let gate = state.executor.derived_gate_from(
+        Some(&actor),
+        &graph_type_facts(
+            &state.graph,
+            proofs.iter().flat_map(|p| {
+                p.premises
+                    .iter()
+                    .flat_map(|t| [t.subject.as_str(), t.object.as_str()])
+                    .chain(p.bindings.values().map(|v| v.as_str()))
+            }),
+        ),
+        proofs.iter().filter_map(|p| {
+            Some((
+                goal_triple.clone(),
+                p.rule_name.clone()?,
+                p.premises.iter().map(graph_triple).collect(),
+            ))
+        }),
+        Some(ontology),
+    );
+    let rule_proofs: Vec<&onto_graph::reasoning::Proof> =
+        proofs.iter().filter(|p| p.rule_name.is_some()).collect();
+    if !rule_proofs.is_empty()
+        && !rule_proofs.iter().any(|p| {
+            let rule = p.rule_name.as_deref().unwrap_or_default();
+            let prem: Vec<onto_ontology::Triple> = p.premises.iter().map(graph_triple).collect();
+            match gate.as_ref() {
+                Some(g) => g.allows_parts(&goal_triple, rule, &prem),
+                None => true,
+            }
+        })
+    {
+        // Audit one denial and map it to 403 (message carries action+object).
+        let p = &rule_proofs[0];
+        let prem: Vec<onto_ontology::Triple> = p.premises.iter().map(graph_triple).collect();
+        let msg = state
+            .executor
+            .deny_explain_target(
+                gate.as_ref(),
+                &goal_triple,
+                p.rule_name.as_deref().unwrap_or_default(),
+                &prem,
+            )
+            .err()
+            .unwrap_or_else(|| "permission denied: INFER on derived fact".to_string());
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiResponse::<serde_json::Value>::error(msg)),
+        )
+            .into_response();
+    }
+
+    let rendered: Vec<serde_json::Map<String, serde_json::Value>> = proofs
+        .iter()
+        .map(|p| {
+            let mut m = serde_json::Map::new();
+            for (var, val) in &p.bindings {
+                let dark = p.premises.iter().any(|pre| {
+                    (pre.subject == *val || pre.object == *val)
+                        && gate.as_ref().is_some_and(|g| !g.fact_allows(&graph_triple(pre)))
+                });
+                m.insert(
+                    var.clone(),
+                    serde_json::Value::String(if dark {
+                        "[redacted]".to_string()
+                    } else {
+                        val.clone()
+                    }),
+                );
+            }
+            m
+        })
+        .collect();
     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     (
         StatusCode::OK,
         Json(ApiResponse::success(serde_json::json!({
             "goal": { "subject": subject, "predicate": predicate, "object": object },
-            "bindings": bindings.iter().map(|b| {
-                serde_json::json!(b.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect::<serde_json::Map<_, _>>())
-            }).collect::<Vec<_>>(),
-            "found": !bindings.is_empty(),
+            "bindings": rendered,
+            "found": !rendered.is_empty(),
         }), elapsed)),
     ).into_response()
 }

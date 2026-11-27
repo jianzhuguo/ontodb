@@ -42,7 +42,8 @@ impl std::error::Error for InferenceError {}
 pub struct InferredFact {
     pub triple: Triple,
     pub rule: RuleId,
-    /// Premises that produced this fact (may be empty for fast paths).
+    /// Witness premises that produced this fact (empty only when no witness
+    /// is discoverable — the derived-read gate then fails closed).
     pub premises: Vec<Triple>,
 }
 
@@ -170,9 +171,14 @@ impl Reasoner {
                 }
                 let mut visited: HashSet<String> = HashSet::new();
                 let mut queue: VecDeque<String> = VecDeque::new();
+                // BFS parent: the node each node was discovered through, so a
+                // closure edge (start→node) can carry its two-hop witness
+                // premises (start→mid, mid→node) at derivation time.
+                let mut via: HashMap<String, String> = HashMap::new();
                 for t in targets {
                     visited.insert(t.clone());
                     queue.push_back(t.clone());
+                    via.insert(t.clone(), start.clone());
                 }
                 while let Some(node) = queue.pop_front() {
                     if all_facts.len() >= self.max_facts {
@@ -181,10 +187,18 @@ impl Reasoner {
                     }
                     let t = Triple::new(start, prop_name.as_str(), &node);
                     if !all_facts.contains(&t) {
+                        let premises = match via.get(&node) {
+                            Some(mid) if *mid != *start => vec![
+                                Triple::new(start, prop_name.as_str(), mid),
+                                Triple::new(mid, prop_name.as_str(), &node),
+                            ],
+                            // Direct edge (stated): the fact is its own witness.
+                            _ => vec![Triple::new(start, prop_name.as_str(), &node)],
+                        };
                         let inf = InferredFact {
                             triple: t.clone(),
                             rule: RuleId::PrpTrp,
-                            premises: Vec::new(),
+                            premises,
                         };
                         if !sink(&inf) {
                             stopped_early = true;
@@ -197,6 +211,7 @@ impl Reasoner {
                         for n in neighbors {
                             if visited.insert(n.clone()) {
                                 queue.push_back(n.clone());
+                                via.insert(n.clone(), node.clone());
                             }
                         }
                     }
@@ -229,33 +244,45 @@ impl Reasoner {
                 if budget_exceeded || stopped_early {
                     break;
                 }
-                let mut cax_new: Vec<Triple> = Vec::new();
+                // (conclusion, producing rule); premise is the input type
+                // fact (subj, rdf:type, class_name) in both arms. The
+                // superclass closure folds equivalent classes in, so a
+                // direct equivalent target is attributed to CaxEqc (rule
+                // grants / strategy C match on the rule id).
+                let class_def = self.ontology.classes.get(class_name.as_str());
+                let mut cax_new: Vec<(Triple, RuleId)> = Vec::new();
                 if let Some(supers) = superclass_cache.get(class_name.as_str()) {
                     for sup in supers {
+                        let rule = if class_def.is_some_and(|d| d.equivalent_classes.contains(sup))
+                        {
+                            RuleId::CaxEqc
+                        } else {
+                            RuleId::CaxSco
+                        };
                         for subj in subjects {
-                            cax_new.push(Triple::type_of(subj, sup));
+                            cax_new.push((Triple::type_of(subj, sup), rule));
                         }
                     }
                 }
-                if let Some(class_def) = self.ontology.classes.get(class_name.as_str()) {
+                if let Some(class_def) = class_def {
                     for equiv in &class_def.equivalent_classes {
                         for subj in subjects {
-                            cax_new.push(Triple::type_of(subj, equiv));
+                            cax_new.push((Triple::type_of(subj, equiv), RuleId::CaxEqc));
                         }
                     }
                 }
-                for t in cax_new {
+                for (t, rule) in cax_new {
                     if all_facts.insert(t.clone()) {
                         let inf = InferredFact {
+                            premises: vec![Triple::type_of(&t.subject, class_name)],
                             triple: t,
-                            rule: RuleId::CaxSco,
-                            premises: Vec::new(),
+                            rule,
                         };
                         if !sink(&inf) {
                             stopped_early = true;
                             break;
                         }
-                        *rule_counts.entry(RuleId::CaxSco).or_insert(0) += 1;
+                        *rule_counts.entry(rule).or_insert(0) += 1;
                     }
                 }
             }
@@ -293,11 +320,15 @@ impl Reasoner {
             new_facts.clear();
             let before = all_facts.len();
             for (rule_id, t) in new_this_round {
-                if all_facts.insert(t.clone()) {
+                if !all_facts.contains(&t) {
+                    // Witness premises before insert: the conclusion itself
+                    // must not shadow its producers.
+                    let premises = find_premises(&self.ontology, rule_id, &t, &all_facts);
+                    all_facts.insert(t.clone());
                     let inf = InferredFact {
                         triple: t.clone(),
                         rule: rule_id,
-                        premises: Vec::new(),
+                        premises,
                     };
                     if !sink(&inf) {
                         stopped_early = true;
@@ -365,7 +396,7 @@ impl Reasoner {
             }
 
             // BFS from each source
-            let mut new_transitive = Vec::new();
+            let mut new_transitive: Vec<(Triple, Vec<Triple>)> = Vec::new();
             for (start, targets) in &adj {
                 // Check budget during BFS
                 if all_facts.len() + new_transitive.len() >= self.max_facts {
@@ -375,9 +406,12 @@ impl Reasoner {
 
                 let mut visited: HashSet<&str> = HashSet::new();
                 let mut queue: VecDeque<&str> = VecDeque::new();
+                // BFS parent so each closure edge carries its two-hop witness.
+                let mut via: HashMap<&str, &str> = HashMap::new();
                 for t in targets {
                     visited.insert(*t);
                     queue.push_back(t);
+                    via.insert(t, start);
                 }
                 while let Some(node) = queue.pop_front() {
                     // Check budget during BFS
@@ -388,12 +422,20 @@ impl Reasoner {
 
                     let t = Triple::new(*start, prop_name.as_str(), node);
                     if !all_facts.contains(&t) {
-                        new_transitive.push(t);
+                        let premises = match via.get(node) {
+                            Some(mid) if *mid != *start => vec![
+                                Triple::new(*start, prop_name.as_str(), *mid),
+                                Triple::new(*mid, prop_name.as_str(), node),
+                            ],
+                            _ => vec![Triple::new(*start, prop_name.as_str(), node)],
+                        };
+                        new_transitive.push((t, premises));
                     }
                     if let Some(neighbors) = adj.get(node) {
                         for n in neighbors {
                             if visited.insert(*n) {
                                 queue.push_back(n);
+                                via.insert(n, node);
                             }
                         }
                     }
@@ -408,12 +450,12 @@ impl Reasoner {
                 let count = new_transitive.len();
                 if count > 0 {
                     rule_counts.insert(RuleId::PrpTrp, count);
-                    for t in new_transitive {
+                    for (t, premises) in new_transitive {
                         all_facts.insert(t.clone());
                         all_inferred.push(InferredFact {
                             triple: t,
                             rule: RuleId::PrpTrp,
-                            premises: Vec::new(),
+                            premises,
                         });
                     }
                 }
@@ -437,38 +479,52 @@ impl Reasoner {
             }
 
             // Phase 2: generate inferred triples (no borrow of all_facts)
-            let mut cax_new: Vec<Triple> = Vec::new();
+            // (conclusion, producing rule, premise type fact). The superclass
+            // closure folds equivalent classes in, so a direct equivalent
+            // target is attributed to CaxEqc (rule grants match on rule ids).
+            let mut cax_new: Vec<(Triple, RuleId, Triple)> = Vec::new();
             for (class_name, subjects) in &class_subjects {
+                let class_def = self.ontology.classes.get(class_name.as_str());
                 if let Some(supers) = superclass_cache.get(class_name.as_str()) {
                     for sup in supers {
+                        let rule = if class_def.is_some_and(|d| d.equivalent_classes.contains(sup))
+                        {
+                            RuleId::CaxEqc
+                        } else {
+                            RuleId::CaxSco
+                        };
                         for subj in subjects {
-                            cax_new.push(Triple::type_of(subj, sup));
+                            cax_new.push((
+                                Triple::type_of(subj, sup),
+                                rule,
+                                Triple::type_of(subj, class_name),
+                            ));
                         }
                     }
                 }
-                if let Some(class_def) = self.ontology.classes.get(class_name.as_str()) {
+                if let Some(class_def) = class_def {
                     for equiv in &class_def.equivalent_classes {
                         for subj in subjects {
-                            cax_new.push(Triple::type_of(subj, equiv));
+                            cax_new.push((
+                                Triple::type_of(subj, equiv),
+                                RuleId::CaxEqc,
+                                Triple::type_of(subj, class_name),
+                            ));
                         }
                     }
                 }
             }
 
             // Phase 3: deduplicate and insert (mutable borrow of all_facts)
-            let mut count = 0;
-            for t in cax_new {
+            for (t, rule, premise) in cax_new {
                 if all_facts.insert(t.clone()) {
                     all_inferred.push(InferredFact {
                         triple: t,
-                        rule: RuleId::CaxSco,
-                        premises: Vec::new(),
+                        rule,
+                        premises: vec![premise],
                     });
-                    count += 1;
+                    *rule_counts.entry(rule).or_insert(0) += 1;
                 }
-            }
-            if count > 0 {
-                *rule_counts.entry(RuleId::CaxSco).or_insert(0) += count;
             }
         }
 
@@ -520,12 +576,16 @@ impl Reasoner {
             new_facts.clear();
             let before = all_facts.len();
             for (rule_id, t) in new_this_round {
-                if all_facts.insert(t.clone()) {
+                if !all_facts.contains(&t) {
+                    // Witness premises before insert: the conclusion itself
+                    // must not shadow its producers.
+                    let premises = find_premises(&self.ontology, rule_id, &t, &all_facts);
+                    all_facts.insert(t.clone());
                     new_facts.push(t.clone());
                     all_inferred.push(InferredFact {
                         triple: t,
                         rule: rule_id,
-                        premises: Vec::new(),
+                        premises,
                     });
                 }
             }
@@ -616,35 +676,49 @@ impl Reasoner {
         // Process type facts: Cax-sco and Cax-eqc
         if !added_type_facts.is_empty() {
             let superclass_cache = self.ontology.build_superclass_cache();
-            let mut cax_new: Vec<Triple> = Vec::new();
+            // (conclusion, producing rule, premise = the added type fact).
+            let mut cax_new: Vec<(Triple, RuleId, Triple)> = Vec::new();
 
             for fact in &added_type_facts {
                 all_facts.insert(fact.clone());
 
-                // Cax-sco: x type A, A subClassOf B => x type B
+                let class_def = self.ontology.classes.get(fact.object.as_str());
+
+                // Cax-sco: x type A, A subClassOf B => x type B (the closure
+                // folds equivalent classes in — attribute those to CaxEqc).
                 if let Some(supers) = superclass_cache.get(fact.object.as_str()) {
                     for sup in supers {
-                        cax_new.push(Triple::type_of(&fact.subject, sup));
+                        let rule = if class_def.is_some_and(|d| d.equivalent_classes.contains(sup))
+                        {
+                            RuleId::CaxEqc
+                        } else {
+                            RuleId::CaxSco
+                        };
+                        cax_new.push((Triple::type_of(&fact.subject, sup), rule, fact.clone()));
                     }
                 }
 
                 // Cax-eqc: x type A, A equiv B => x type B
-                if let Some(class_def) = self.ontology.classes.get(fact.object.as_str()) {
+                if let Some(class_def) = class_def {
                     for equiv in &class_def.equivalent_classes {
-                        cax_new.push(Triple::type_of(&fact.subject, equiv));
+                        cax_new.push((
+                            Triple::type_of(&fact.subject, equiv),
+                            RuleId::CaxEqc,
+                            fact.clone(),
+                        ));
                     }
                 }
             }
 
             // Insert new inferences
-            for t in cax_new {
+            for (t, rule, premise) in cax_new {
                 if all_facts.insert(t.clone()) {
                     all_inferred.push(InferredFact {
                         triple: t,
-                        rule: RuleId::CaxSco,
-                        premises: Vec::new(),
+                        rule,
+                        premises: vec![premise],
                     });
-                    *rule_counts.entry(RuleId::CaxSco).or_insert(0) += 1;
+                    *rule_counts.entry(rule).or_insert(0) += 1;
                 }
             }
         }
@@ -665,11 +739,13 @@ impl Reasoner {
                 let inferred = rule.apply(&self.ontology, &all_facts, new_facts_ref);
                 *rule_counts.entry(rule.id()).or_insert(0) += inferred.len();
                 for t in inferred {
-                    if all_facts.insert(t.clone()) {
+                    if !all_facts.contains(&t) {
+                        let premises = find_premises(&self.ontology, rule.id(), &t, &all_facts);
+                        all_facts.insert(t.clone());
                         all_inferred.push(InferredFact {
                             triple: t,
                             rule: rule.id(),
-                            premises: Vec::new(),
+                            premises,
                         });
                     }
                 }
@@ -684,11 +760,13 @@ impl Reasoner {
                 let inferred = rule.apply(&self.ontology, &all_facts, &inferred_clone);
                 *rule_counts.entry(rule.id()).or_insert(0) += inferred.len();
                 for t in inferred {
-                    if all_facts.insert(t.clone()) {
+                    if !all_facts.contains(&t) {
+                        let premises = find_premises(&self.ontology, rule.id(), &t, &all_facts);
+                        all_facts.insert(t.clone());
                         all_inferred.push(InferredFact {
                             triple: t,
                             rule: rule.id(),
-                            premises: Vec::new(),
+                            premises,
                         });
                     }
                 }
@@ -1378,5 +1456,106 @@ mod tests {
         // With only 1 iteration, might not get full transitive closure
         // but should not panic
         assert!(result.iterations <= 1);
+    }
+
+    /// T4.3 premise provenance: production inference paths record the
+    /// witness premises that produced each fact (the derived-read gate
+    /// needs them at emission time — design §7.3).
+    #[test]
+    fn test_inferred_facts_carry_premises() {
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto);
+
+        // Cax-sco: premise is the input type fact.
+        let result = reasoner.reason(&[Triple::type_of("alice", "Manager")]);
+        let person = result
+            .inferred
+            .iter()
+            .find(|f| f.triple == Triple::type_of("alice", "Person"))
+            .expect("alice type Person derived");
+        assert_eq!(person.rule, RuleId::CaxSco);
+        assert_eq!(person.premises, vec![Triple::type_of("alice", "Manager")]);
+
+        // Cax-eqc: equivalence derivations are attributed to CaxEqc
+        // (rule grants name rules — strategy C matches on them).
+        let result = reasoner.reason(&[Triple::type_of("bob", "Employee")]);
+        let worker = result
+            .inferred
+            .iter()
+            .find(|f| f.triple == Triple::type_of("bob", "Worker"))
+            .expect("bob type Worker derived");
+        assert_eq!(worker.rule, RuleId::CaxEqc);
+        assert_eq!(worker.premises, vec![Triple::type_of("bob", "Employee")]);
+
+        // Prp-trp BFS closure carries its two-hop witness.
+        let result = reasoner.reason(&[
+            Triple::new("alice", "ancestor", "bob"),
+            Triple::new("bob", "ancestor", "charlie"),
+        ]);
+        let closure = result
+            .inferred
+            .iter()
+            .find(|f| f.triple == Triple::new("alice", "ancestor", "charlie"))
+            .expect("transitive closure derived");
+        assert_eq!(closure.rule, RuleId::PrpTrp);
+        assert_eq!(
+            closure.premises,
+            vec![
+                Triple::new("alice", "ancestor", "bob"),
+                Triple::new("bob", "ancestor", "charlie"),
+            ]
+        );
+
+        // Rule-based path (Prp-inv) records its single premise.
+        let result = reasoner.reason(&[Triple::new("alice", "reportsTo", "bob")]);
+        let inv = result
+            .inferred
+            .iter()
+            .find(|f| f.triple == Triple::new("bob", "manages", "alice"))
+            .expect("inverse derived");
+        assert_eq!(inv.rule, RuleId::PrpInv);
+        assert_eq!(inv.premises, vec![Triple::new("alice", "reportsTo", "bob")]);
+    }
+
+    /// Streaming emission carries premises too (the RBAC gate runs per
+    /// emitted fact in `execute_infer_streaming`).
+    #[test]
+    fn test_reason_streaming_fills_premises() {
+        let onto = family_ontology();
+        let reasoner = Reasoner::new(onto);
+        let facts = vec![
+            Triple::new("alice", "ancestor", "bob"),
+            Triple::new("bob", "ancestor", "charlie"),
+            Triple::new("alice", "reportsTo", "bob"),
+            Triple::type_of("alice", "Manager"),
+        ];
+        let mut seen: Vec<InferredFact> = Vec::new();
+        let mut sink = |inf: &InferredFact| {
+            seen.push(inf.clone());
+            true
+        };
+        reasoner.reason_streaming(&facts, &mut sink);
+
+        let closure = seen
+            .iter()
+            .find(|f| f.triple == Triple::new("alice", "ancestor", "charlie"))
+            .expect("streamed closure fact");
+        assert_eq!(
+            closure.premises,
+            vec![
+                Triple::new("alice", "ancestor", "bob"),
+                Triple::new("bob", "ancestor", "charlie"),
+            ]
+        );
+        let person = seen
+            .iter()
+            .find(|f| f.triple == Triple::type_of("alice", "Person"))
+            .expect("streamed type fact");
+        assert_eq!(person.premises, vec![Triple::type_of("alice", "Manager")]);
+        let inv = seen
+            .iter()
+            .find(|f| f.triple == Triple::new("bob", "manages", "alice"))
+            .expect("streamed inverse fact");
+        assert_eq!(inv.premises, vec![Triple::new("alice", "reportsTo", "bob")]);
     }
 }

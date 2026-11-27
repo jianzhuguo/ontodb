@@ -76,12 +76,14 @@ pub const BUILTIN_ROLE_READONLY: &str = "_readonly";
 pub const BUILTIN_ROLE_READWRITE: &str = "_readwrite";
 pub const BUILTIN_ROLE_ADMIN: &str = "_admin";
 
-/// M1 action set (INFER joins in M2; ADMIN stays at the HTTP control plane).
+/// M1 action set (INFER joins in M2/T4.3; ADMIN stays at the HTTP control plane).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Action {
     Read,
     Write,
     Ddl,
+    /// Run inference / consume derived facts (design §7.3).
+    Infer,
 }
 
 impl Action {
@@ -90,8 +92,23 @@ impl Action {
             Action::Read => "READ",
             Action::Write => "WRITE",
             Action::Ddl => "DDL",
+            Action::Infer => "INFER",
         }
     }
+}
+
+/// How derived (inferred) facts are authorization-checked (design §7.3).
+/// Strategy C is not a mode: `GRANT INFER ON RULE <r>` is a per-(role, rule)
+/// exemption that switches that pair to [`InferStrategy::ConclusionClass`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InferStrategy {
+    /// A · premise union (default): derived read ⟺ READ on every premise
+    /// object ∧ INFER capability. Compliance / least privilege.
+    #[default]
+    PremiseUnion,
+    /// B · conclusion class: derived read ⟺ READ on the conclusion's class
+    /// ∧ INFER capability. Analysis-friendly, lax.
+    ConclusionClass,
 }
 
 /// Grant object: a namespace (cascades to its classes), one class (cascades
@@ -206,6 +223,9 @@ fn default_cred_scheme() -> String {
 pub struct PolicyEngine {
     state: RwLock<PolicyState>,
     epoch: AtomicU64,
+    /// Derived-read strategy (design §7.3, "三选一，默认 A"). Strategy C is
+    /// not a mode — it is the per-rule `GRANT INFER ON RULE` exemption.
+    infer_strategy: RwLock<InferStrategy>,
 }
 
 #[derive(Debug, Default)]
@@ -743,6 +763,53 @@ impl PolicyEngine {
             },
         )
     }
+
+    pub fn set_infer_strategy(&self, strategy: InferStrategy) {
+        *self.infer_strategy.write().unwrap() = strategy;
+    }
+
+    pub fn infer_strategy(&self) -> InferStrategy {
+        *self.infer_strategy.read().unwrap()
+    }
+
+    /// Derived-fact read gate (design §7.3 "推理派生事实：默认不放大").
+    ///
+    /// Strategy C exemption: `GRANT INFER ON RULE <r>` switches that
+    /// (principal, rule) pair to conclusion-class semantics (B).
+    /// Otherwise the configured strategy applies:
+    /// - A ([`InferStrategy::PremiseUnion`], default): READ on **every**
+    ///   premise class ∧ an INFER grant covering the conclusion class.
+    /// - B ([`InferStrategy::ConclusionClass`]): READ on the conclusion
+    ///   class ∧ an INFER grant covering the conclusion class.
+    ///
+    /// Fails closed: unknown conclusion class or an empty premise set under A
+    /// is a deny — an unverifiable premise union must not amplify reads.
+    pub fn check_derived_read(
+        &self,
+        principal_id: &str,
+        rule: &str,
+        conclusion_class: &ObjectRef,
+        premise_classes: &[ObjectRef],
+    ) -> bool {
+        // Strategy C: the rule grant is the derived-read exemption ("派生读豁免").
+        if self.check(principal_id, Action::Infer, &ObjectRef::Rule(rule.to_string())) {
+            return self.check(principal_id, Action::Read, conclusion_class);
+        }
+        // A/B share the base inference capability: INFER covering the
+        // conclusion class (class grant or namespace cascade).
+        if !self.check(principal_id, Action::Infer, conclusion_class) {
+            return false;
+        }
+        match self.infer_strategy() {
+            InferStrategy::ConclusionClass => self.check(principal_id, Action::Read, conclusion_class),
+            InferStrategy::PremiseUnion => {
+                !premise_classes.is_empty()
+                    && premise_classes
+                        .iter()
+                        .all(|o| self.check(principal_id, Action::Read, o))
+            }
+        }
+    }
 }
 
 /// Minimal hex helpers for token-hash persistence (no external dep).
@@ -802,10 +869,20 @@ fn covers(
             },
         ) => gn == wn && gp == wp && class_line_covers(gc, wc, opts.only, h),
         (ObjectRef::Property { .. }, _) => false,
-        (ObjectRef::Rule(g), ObjectRef::Rule(w)) => g == w,
+        (ObjectRef::Rule(g), ObjectRef::Rule(w)) => rule_key(g) == rule_key(w),
         (ObjectRef::Rule(_), _) => false,
         (_, ObjectRef::Rule(_)) => false,
     }
+}
+
+/// Rule names are IDs with inconsistent spelling (`CaxSco` / `Cax-sco` /
+/// `cax_sco` all name one rule — same normalization as the query-side rule
+/// filter), so rule grants match on the normalized key.
+fn rule_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// True when the granted class covers the wanted class: same class, or —
@@ -1497,5 +1574,146 @@ mod tests {
         assert!(!eng2.check_class("alice", Action::Read, "bio", "Cancer"));
         assert!(!eng2.check_class("alice", Action::Read, "bio", "Melanoma"));
         assert!(eng2.check_class("alice", Action::Read, "bio", "Disease"));
+    }
+
+    // ─── T4.3 derived-read gate (design §7.3 A/B/C) ─────────────────────────
+
+    fn class(ns: &str, class: &str) -> ObjectRef {
+        ObjectRef::Class {
+            ns: ns.into(),
+            class: class.into(),
+        }
+    }
+
+    /// Strategy A matrix: derived read ⟺ READ all premises ∧ INFER on the
+    /// conclusion class. "读派生但前提未授权" must be denied.
+    #[test]
+    fn derived_read_a_premise_union_denies_when_a_premise_is_unreadable() {
+        let eng = PolicyEngine::new(); // default = PremiseUnion (A)
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Infer,
+            object: class("bio", "Disease"),
+            options: GrantOptions::default(),
+        });
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: class("bio", "Drug"),
+            options: GrantOptions::default(),
+        });
+        // Premises Drug (readable) + Protein (NOT readable).
+        let premises = vec![class("bio", "Drug"), class("bio", "Protein")];
+        assert!(!eng.check_derived_read("alice", "treats", &class("bio", "Disease"), &premises));
+        // Add READ on the missing premise → the union is satisfied.
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: class("bio", "Protein"),
+            options: GrantOptions::default(),
+        });
+        assert!(eng.check_derived_read("alice", "treats", &class("bio", "Disease"), &premises));
+    }
+
+    /// Strategy B: conclusion-class read ∧ INFER is enough — premises may be
+    /// dark. Analysis-friendly / lax.
+    #[test]
+    fn derived_read_b_conclusion_class_ignores_premises() {
+        let eng = PolicyEngine::new();
+        eng.set_infer_strategy(InferStrategy::ConclusionClass);
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Infer,
+            object: class("bio", "Disease"),
+            options: GrantOptions::default(),
+        });
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: class("bio", "Disease"),
+            options: GrantOptions::default(),
+        });
+        let premises = vec![class("bio", "Drug"), class("bio", "Protein")];
+        assert!(eng.check_derived_read("alice", "treats", &class("bio", "Disease"), &premises));
+        // …but B still needs the conclusion READ (derived read is a read).
+        eng.revoke(&Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: class("bio", "Disease"),
+            options: GrantOptions::default(),
+        });
+        assert!(!eng.check_derived_read("alice", "treats", &class("bio", "Disease"), &premises));
+    }
+
+    /// Strategy C: `GRANT INFER ON RULE <r>` is the derived-read exemption —
+    /// that (principal, rule) pair walks B regardless of the configured
+    /// strategy, other rules stay on A.
+    #[test]
+    fn derived_read_c_rule_grant_is_the_per_rule_exemption() {
+        let eng = PolicyEngine::new(); // strategy A
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Infer,
+            object: class("bio", "Disease"),
+            options: GrantOptions::default(),
+        });
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: class("bio", "Disease"),
+            options: GrantOptions::default(),
+        });
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Infer,
+            object: ObjectRef::Rule("treats-inheritance".into()),
+            options: GrantOptions::default(),
+        });
+        let premises = vec![class("bio", "Drug"), class("bio", "Protein")];
+        // Exempted rule walks B: conclusion READ is enough.
+        assert!(eng.check_derived_read("alice", "treats-inheritance", &class("bio", "Disease"), &premises));
+        // A different rule has no exemption: A demands the premise union.
+        assert!(!eng.check_derived_read("alice", "targets-pathway", &class("bio", "Disease"), &premises));
+    }
+
+    /// A fails closed: an empty/unknown premise set must not vacuously allow.
+    #[test]
+    fn derived_read_a_fails_closed_without_premises() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Infer,
+            object: class("bio", "Disease"),
+            options: GrantOptions::default(),
+        });
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: class("bio", "Disease"),
+            options: GrantOptions::default(),
+        });
+        assert!(!eng.check_derived_read("alice", "treats", &class("bio", "Disease"), &[]));
+    }
+
+    /// No INFER capability (rule or conclusion class) → no derived read,
+    /// even when every premise is readable.
+    #[test]
+    fn derived_read_needs_an_infer_grant() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        for c in ["Drug", "Protein", "Disease"] {
+            eng.grant(Grant {
+                role: "analyst".into(),
+                action: Action::Read,
+                object: class("bio", c),
+                options: GrantOptions::default(),
+            });
+        }
+        let premises = vec![class("bio", "Drug"), class("bio", "Protein")];
+        assert!(!eng.check_derived_read("alice", "treats", &class("bio", "Disease"), &premises));
     }
 }

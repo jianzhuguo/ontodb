@@ -80,6 +80,17 @@ impl PatternTerm {
 /// Variable binding: variable name -> value.
 pub type Bindings = HashMap<String, String>;
 
+/// A grounded proof of a goal pattern (M2 T4.3 provenance for redaction).
+#[derive(Debug, Clone)]
+pub struct Proof {
+    /// Variable bindings that satisfy the proof.
+    pub bindings: Bindings,
+    /// Rule that proved the goal; `None` = direct stated match.
+    pub rule_name: Option<String>,
+    /// Grounded premise triples behind the proof (the matched facts).
+    pub premises: Vec<Triple>,
+}
+
 /// Inference result with provenance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceResult {
@@ -553,11 +564,31 @@ impl Reasoner {
 
     /// Backward chaining: find all triples matching a goal pattern.
     pub fn backward_chain(&self, store: &GraphStore, goal: &TriplePattern) -> Vec<Bindings> {
-        // First, try direct matching
+        self.backward_chain_provenanced(store, goal)
+            .into_iter()
+            .map(|p| p.bindings)
+            .collect()
+    }
+
+    /// Backward chaining with provenance (M2 T4.3 redaction surface): each
+    /// proof carries its rule and the grounded premises behind it so callers
+    /// can apply the derived-read gate (hard 403 / `[redacted]` values).
+    pub fn backward_chain_provenanced(&self, store: &GraphStore, goal: &TriplePattern) -> Vec<Proof> {
+        // First, try direct matching — the goal itself is the premise.
         let direct_matches = self.match_pattern(store, goal);
 
         if !direct_matches.is_empty() {
-            return direct_matches;
+            return direct_matches
+                .into_iter()
+                .map(|b| {
+                    let grounded = self.pattern_to_triple(&self.expand_pattern(goal, &b));
+                    Proof {
+                        premises: grounded.into_iter().collect(),
+                        bindings: b,
+                        rule_name: None,
+                    }
+                })
+                .collect();
         }
 
         // Try to prove the goal using rules
@@ -578,9 +609,18 @@ impl Reasoner {
 
                 // Check if expanded conclusion matches goal
                 if let Some(goal_bindings) = self.match_patterns(&expanded_conclusion, goal) {
-                    let mut merged = bindings;
+                    let mut merged = bindings.clone();
                     merged.extend(goal_bindings);
-                    results.push(merged);
+                    let premises = rule
+                        .conditions
+                        .iter()
+                        .filter_map(|c| self.pattern_to_triple(&self.expand_pattern(c, &bindings)))
+                        .collect();
+                    results.push(Proof {
+                        bindings: merged,
+                        rule_name: Some(rule.name.clone()),
+                        premises,
+                    });
                 }
             }
         }

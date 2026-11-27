@@ -610,12 +610,13 @@ pub struct GraphEdge {
     pub direction: GraphDirection,
 }
 
-/// READ < WRITE < DDL, for compound statements whose branches disagree.
+/// READ < INFER < WRITE < DDL, for compound statements whose branches disagree.
 fn action_max(a: onto_core::policy::Action, b: onto_core::policy::Action) -> onto_core::policy::Action {
     use onto_core::policy::Action;
     match (a, b) {
         (Action::Ddl, _) | (_, Action::Ddl) => Action::Ddl,
         (Action::Write, _) | (_, Action::Write) => Action::Write,
+        (Action::Infer, _) | (_, Action::Infer) => Action::Infer,
         _ => Action::Read,
     }
 }
@@ -713,7 +714,6 @@ impl QueryAst {
             | A::VectorSearch { .. }
             | A::Explain { .. }
             | A::ExplainReasoning { .. }
-            | A::Infer { .. }
             | A::ShowTableStats { .. }
             | A::ShowClasses
             | A::ShowSchemas
@@ -722,6 +722,10 @@ impl QueryAst {
             | A::GraphMatch { .. }
             | A::GraphShortestPath { .. }
             | A::GraphAnalyze { .. } => Some(Action::Read),
+            // Inference: consuming derived facts / running the infer surface
+            // is its own capability (design §7.3); premise clearance is
+            // adjudicated per output fact by `check_derived_read`.
+            A::Infer { .. } => Some(Action::Infer),
             // Writes (DML + stats/matview refresh)
             A::Insert { .. }
             | A::BatchInsert { .. }
@@ -1573,8 +1577,9 @@ impl QueryParser {
             "READ" => Ok(Action::Read),
             "WRITE" => Ok(Action::Write),
             "DDL" => Ok(Action::Ddl),
+            "INFER" => Ok(Action::Infer),
             _ => Err(CoreError::InvalidArgument(format!(
-                "unknown action {word:?} (use READ|WRITE|DDL)"
+                "unknown action {word:?} (use READ|WRITE|DDL|INFER)"
             ))),
         }
     }
@@ -1730,21 +1735,22 @@ impl QueryParser {
         }
         // GRANT <action> ON NAMESPACE <ns> TO <role>
         // GRANT <action> ON CLASS <ns.cls> TO <role>
+        // GRANT INFER ON RULE <rule> TO <role>  (derived-read exemption, design §7.3 C)
         let (action, r) = Self::split_word(rest).ok_or_else(|| {
             CoreError::InvalidArgument(
-                "usage: GRANT <READ|WRITE|DDL> ON NAMESPACE <ns> | ON CLASS <cls> TO <role>"
+                "usage: GRANT <READ|WRITE|DDL|INFER> ON NAMESPACE <ns> | ON CLASS <cls> | ON RULE <rule> TO <role>"
                     .to_string(),
             )
         })?;
         let action = Self::parse_action(action)?;
         let (on, r) = Self::split_word(r).ok_or_else(|| {
-            CoreError::InvalidArgument("expected ON NAMESPACE|CLASS".to_string())
+            CoreError::InvalidArgument("expected ON NAMESPACE|CLASS|RULE".to_string())
         })?;
         if !on.eq_ignore_ascii_case("ON") {
             return Err(CoreError::InvalidArgument(format!("expected ON, got {on:?}")));
         }
         let (kind, r) = Self::split_word(r)
-            .ok_or_else(|| CoreError::InvalidArgument("expected NAMESPACE|CLASS".to_string()))?;
+            .ok_or_else(|| CoreError::InvalidArgument("expected NAMESPACE|CLASS|RULE".to_string()))?;
         let (target, props, r) = Self::parse_target_with_props(r)?;
         let object = match kind.to_ascii_uppercase().as_str() {
             "NAMESPACE" => {
@@ -1756,9 +1762,17 @@ impl QueryParser {
                 onto_core::policy::ObjectRef::Namespace(target)
             }
             "CLASS" => Self::parse_class_ref(&target)?,
+            "RULE" => {
+                if !props.is_empty() {
+                    return Err(CoreError::InvalidArgument(
+                        "property lists are only valid on CLASS grants".to_string(),
+                    ));
+                }
+                onto_core::policy::ObjectRef::Rule(target)
+            }
             _ => {
                 return Err(CoreError::InvalidArgument(format!(
-                    "expected NAMESPACE|CLASS, got {kind:?}"
+                    "expected NAMESPACE|CLASS|RULE, got {kind:?}"
                 )))
             }
         };
@@ -1862,21 +1876,22 @@ impl QueryParser {
             });
         }
         // REVOKE <action> ON NAMESPACE <ns> FROM <role> / … ON CLASS <cls> …
+        // / REVOKE INFER ON RULE <rule> FROM <role>
         let (action, r) = Self::split_word(rest).ok_or_else(|| {
             CoreError::InvalidArgument(
-                "usage: REVOKE <READ|WRITE|DDL> ON NAMESPACE <ns> | ON CLASS <cls> FROM <role>"
+                "usage: REVOKE <READ|WRITE|DDL|INFER> ON NAMESPACE <ns> | ON CLASS <cls> | ON RULE <rule> FROM <role>"
                     .to_string(),
             )
         })?;
         let action = Self::parse_action(action)?;
         let (on, r) = Self::split_word(r).ok_or_else(|| {
-            CoreError::InvalidArgument("expected ON NAMESPACE|CLASS".to_string())
+            CoreError::InvalidArgument("expected ON NAMESPACE|CLASS|RULE".to_string())
         })?;
         if !on.eq_ignore_ascii_case("ON") {
             return Err(CoreError::InvalidArgument(format!("expected ON, got {on:?}")));
         }
         let (kind, r) = Self::split_word(r)
-            .ok_or_else(|| CoreError::InvalidArgument("expected NAMESPACE|CLASS".to_string()))?;
+            .ok_or_else(|| CoreError::InvalidArgument("expected NAMESPACE|CLASS|RULE".to_string()))?;
         let (target, props, r) = Self::parse_target_with_props(r)?;
         let object = match kind.to_ascii_uppercase().as_str() {
             "NAMESPACE" => {
@@ -1888,9 +1903,17 @@ impl QueryParser {
                 onto_core::policy::ObjectRef::Namespace(target)
             }
             "CLASS" => Self::parse_class_ref(&target)?,
+            "RULE" => {
+                if !props.is_empty() {
+                    return Err(CoreError::InvalidArgument(
+                        "property lists are only valid on CLASS grants".to_string(),
+                    ));
+                }
+                onto_core::policy::ObjectRef::Rule(target)
+            }
             _ => {
                 return Err(CoreError::InvalidArgument(format!(
-                    "expected NAMESPACE|CLASS, got {kind:?}"
+                    "expected NAMESPACE|CLASS|RULE, got {kind:?}"
                 )))
             }
         };
@@ -6965,5 +6988,77 @@ mod tests {
         assert!(QueryParser::parse("GRANT READ ON CLASS C( TO r").is_err());
         assert!(QueryParser::parse("GRANT READ ON CLASS C() TO r").is_err());
         assert!(QueryParser::parse("GRANT READ ON CLASS C(a b) TO r").is_err());
+    }
+
+    /// M2 T4.3: `INFER` action + `ON RULE <r>` target (design §7.3 C —
+    /// the per-rule derived-read exemption). Hyphenated rule names survive.
+    #[test]
+    fn test_parse_grant_infer_on_rule() {
+        use onto_core::policy::{Action, ObjectRef};
+
+        match QueryParser::parse("GRANT INFER ON RULE treats-inheritance TO analyst").unwrap() {
+            QueryAst::GrantPrivilege {
+                action,
+                object,
+                role,
+                only,
+                props,
+            } => {
+                assert_eq!(action, Action::Infer);
+                assert_eq!(object, ObjectRef::Rule("treats-inheritance".into()));
+                assert_eq!(role, "analyst");
+                assert!(!only);
+                assert!(props.is_empty());
+            }
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        // INFER also works on CLASS/NAMESPACE targets (strategy A/B capability).
+        match QueryParser::parse("GRANT INFER ON CLASS bio.Disease TO analyst").unwrap() {
+            QueryAst::GrantPrivilege { action, object, .. } => {
+                assert_eq!(action, Action::Infer);
+                assert_eq!(
+                    object,
+                    ObjectRef::Class { ns: "bio".into(), class: "Disease".into() }
+                );
+            }
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        match QueryParser::parse("GRANT INFER ON NAMESPACE bio TO analyst").unwrap() {
+            QueryAst::GrantPrivilege { action, object, .. } => {
+                assert_eq!(action, Action::Infer);
+                assert_eq!(object, ObjectRef::Namespace("bio".into()));
+            }
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        // REVOKE is symmetric.
+        match QueryParser::parse("REVOKE INFER ON RULE treats-inheritance FROM analyst").unwrap() {
+            QueryAst::RevokePrivilege {
+                action,
+                object,
+                role,
+                ..
+            } => {
+                assert_eq!(action, Action::Infer);
+                assert_eq!(object, ObjectRef::Rule("treats-inheritance".into()));
+                assert_eq!(role, "analyst");
+            }
+            other => panic!("expected RevokePrivilege, got {other:?}"),
+        }
+        // RULE target: property lists and ONLY are hard errors.
+        let err =
+            QueryParser::parse("GRANT INFER ON RULE r(a) TO analyst").unwrap_err();
+        assert!(
+            err.to_string().contains("property lists are only valid on CLASS grants"),
+            "err: {err}"
+        );
+        let err =
+            QueryParser::parse("GRANT INFER ON RULE r ONLY TO analyst").unwrap_err();
+        assert!(
+            err.to_string().contains("ONLY is only valid on CLASS grants"),
+            "err: {err}"
+        );
+        // INFER is a known action (READ|WRITE|DDL|INFER error string).
+        let err = QueryParser::parse("GRANT FOO ON RULE r TO analyst").unwrap_err();
+        assert!(err.to_string().contains("READ|WRITE|DDL|INFER"), "err: {err}");
     }
 }
