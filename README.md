@@ -1,80 +1,80 @@
-# OntoDB — 本体内核嵌入的多模态语义数据库
+# OntoDB — Ontology-Kernel Embedded Multi-Modal Semantic Database
 
-**[English](README.en.md)** | 中文
+English | **[中文](README.zh.md)**
 
-**全球首个将 OWL 推理引擎嵌入数据库内核的多模态语义数据库**
+**The world's first multi-modal semantic database embedding an OWL reasoning engine in the database kernel.**
 
-支持 12 种数据类型统一存储，一次 INSERT 自动完成 7 步写入联动，嵌入式增量推理性能较外置方案提升 100 倍。
-
----
-
-## 为什么选择 OntoDB
-
-**大多数团队的现状**：关系型数据在 MySQL/PostgreSQL等、图谱在 Neo4j、向量在 Milvus、时序在 InfluxDB、推理在 Jena——查一个问题要跨 5 个系统，写入后还要 ETL 同步，分类知识硬编码在应用里。**数据很多，知识很少。**
-
-OntoDB 用一个引擎解决这件事：
-
-| 维度 | 传统方案 | OntoDB |
-|------|----------|--------|
-| **架构** | MySQL + Neo4j + Milvus + InfluxDB + PostGIS + Jena，6 个系统 | **1 个系统**，12 种数据类型统一存储 |
-| **语义** | 数据写入后需要 ETL 流程生成语义，延迟秒级到分钟级 | **写入即语义就绪**，7 步联动管线原子完成，延迟微秒级 |
-| **推理** | 推理引擎外置，跨系统数据搬运 | **OWL 推理内嵌数据库**，与存储引擎同进程、零搬运 |
-| **查询** | SQL + Cypher + SPARQL + 专用 API，4 种语言 | **OntoQL**，单一语法融合关系+图+向量+推理 |
-| **语义元数据** | 元数据只描述表结构（`pg_catalog`），分类知识在应用代码里 | **本体即元数据**：类继承/等价/互斥可推理，`subClassOf` 查询自动展开子类 |
-| **部署** | 6 套独立系统，运维复杂 | **边缘三级部署**，从 ESP32 到云服务器统一架构 |
-| **多租户** | 应用层加 tenant_id，容易遗漏 | **命名空间作用域隔离**，类名前缀路由零开销 |
-| **数据生命** | TTL 固定过期，不懂数据价值 | **活数据衰减**，数据越用越活，不用自动降级 |
-| **可靠性** | 依赖运气和重启 | **块级 CRC + 哨兵校验**，损坏数据确定性拒绝，堆损坏根因闭合 |
-| **成本** | 6 套系统 × 6 份运维 × 6 份许可 | **1 套系统**，运维成本降低 80%+ |
-
-**生产实测**（生物医药知识图谱，12 核 / 32GB / NVMe）：
-
-- **2,800 万+ 条知识记录**（105 张实体/关系表）+ 245 万分子结构，7×24 在线零崩溃
-- 607k 行 GROUP BY **123ms**（90×）；大表扫描 **2,546 rps**（238×）
-- 查"EGFR 抑制剂"**自动命中所有子类药物**，新增子类零代码
-
-> **一句话**：别的数据库存数据，OntoDB 让数据可理解、可推理、可校验。
+Unified storage of 12 data types, 7-step write-on-insert pipeline, embedded incremental reasoning 100x faster than external solutions.
 
 ---
 
-## 语义元数据 vs 传统元数据
+## Why OntoDB
 
-传统数据库的元数据（如 PostgreSQL 的 `pg_catalog` / `information_schema`）只描述**表结构**——表名、列类型、索引、约束。分类知识、关系语义、蕴含规则都在应用代码里，数据库本身"看不懂"数据。
+**The reality for most teams**: drugs in MySQL, graphs in Neo4j, vectors in Milvus, time series in InfluxDB, reasoning in Jena — one question spans 5 systems, ETL after every write, taxonomy hard-coded in application logic. **Lots of data, little knowledge.**
 
-OntoDB 把**本体（Ontology）** 内嵌进存储内核——它不只是 schema，而是**可推理的领域知识**。
+OntoDB solves this in one engine:
 
-### 逐项对比（以 PostgreSQL 为基线）
+| Dimension | Traditional | OntoDB |
+|-----------|------------|--------|
+| **Architecture** | MySQL + Neo4j + Milvus + InfluxDB + PostGIS + Jena (6 systems) | **1 system**, 12 data types unified |
+| **Semantics** | ETL after write, seconds to minutes | **Semantic-on-Insert**, 7-step atomic pipeline, microseconds |
+| **Reasoning** | External engine, data shuffling | **OWL reasoning embedded in the database**, zero data movement |
+| **Query** | SQL + Cypher + SPARQL + proprietary API (4 languages) | **OntoQL**, one syntax for relational + graph + vector + reasoning |
+| **Semantic Metadata** | Metadata only describes table structure (`pg_catalog`); taxonomy lives in application code | **Ontology IS the metadata**: class inheritance / equivalence / disjointness are inferable; `subClassOf` queries auto-expand subclasses |
+| **Deployment** | 6 independent systems, complex ops | **3-tier edge**, ESP32 to cloud server, unified architecture |
+| **Multi-tenant** | App-layer tenant_id, easy to miss | **Namespace scoped isolation**, class-prefix routing, zero overhead |
+| **Data Lifetime** | TTL fixed expiry, no value awareness | **Living Data decay**, data lives or dies based on access |
+| **Reliability** | Luck and restarts | **Block-level CRC + guard canary**; corrupted data deterministically rejected; heap-corruption root cause closed |
+| **Cost** | 6 systems x 6 ops x 6 licenses | **1 system**, 80%+ ops cost reduction |
 
-| 维度 | PostgreSQL 元数据 | OntoDB 语义元数据 | 差距本质 |
-|------|------------------|------------------|---------|
-| **存储位置** | `pg_catalog` 系统表（独立命名空间） | 与数据同库、同事务 | PG 是"档案柜"，OntoDB 是"活知识" |
-| **描述对象** | 表/列/索引/约束/权限 | 概念/属性/关系/继承/等价 | 结构 vs 语义 |
-| **继承查询** | 表继承（`INHERITS`）**不参与查询展开**，需手动 UNION ALL | `subClassOf` 查询**自动展开子类** | PG 靠应用层硬编码 |
-| **约束类型** | NOT NULL / UNIQUE / CHECK / FK | 上述全部 + **OWL：disjoint / inverseOf / transitive / equivalentClass** | PG 管单表，OWL 管跨表语义 |
-| **推理能力** | 无 | **写入即推理**（增量不动点，50.8µs） | PG 存事实，OntoDB 推新事实 |
-| **关系语义** | 外键只保证引用完整性 | `inverseOf` 自动对称、`transitive` 自动传递 | PG 知道"引用了"，不知道"意味着什么" |
-| **跨模态查询** | 需外挂 pgvector/pgRouting 等扩展 | **12 种模态原生统一查询** | PG 是拼装，OntoDB 是一体 |
-| **标准兼容** | SQL 标准 | SQL + OntoQL + **SPARQL / RDF** | 语义网生态直接对接 |
-| **数据质量门** | 写入时类型检查 | 必填 + 类型 + OWL 限制 + **逻辑一致性** | PG 拦截格式错误，OntoDB 拦截语义矛盾 |
-| **元数据消费方** | 优化器、DDL、BI 工具 | 优化器 + **推理引擎 + 校验器 + 图谱 + AI** | 服务工具 vs 驱动智能 |
+**Production-verified** (a biomedical knowledge graph, 12 cores / 32GB / NVMe):
 
-### 一个具体例子
+- **28M+ knowledge records** (105 entity/relation tables) + 2.45M molecular structures, 7×24 online with zero crashes
+- GROUP BY over 607K rows **123ms** (90×); large-table scan **2,546 rps** (238×)
+- Querying "EGFR inhibitor" **automatically hits all subclass drugs** — new subclasses need zero code
 
-查"所有 EGFR 抑制剂"：
+> **In one line**: other databases store data; OntoDB makes data understandable, inferable, and verifiable.
+
+---
+
+## Semantic Metadata vs Traditional Metadata
+
+Traditional database metadata (PostgreSQL's `pg_catalog` / `information_schema`) only describes **table structure** — table names, column types, indexes, constraints. Taxonomy, relationship semantics, and inference rules live in application code; the database itself cannot "understand" its data.
+
+OntoDB embeds the **Ontology** into the database kernel — it is not just a schema, but **inferable domain knowledge**.
+
+### Point-by-point comparison (PostgreSQL as baseline)
+
+| Dimension | PostgreSQL Metadata | OntoDB Semantic Metadata | Gap |
+|-----------|-------------------|--------------------------|-----|
+| **Storage location** | `pg_catalog` system tables (separate namespace) | Same database, same transaction | PG is an "archive cabinet"; OntoDB is "living knowledge" |
+| **Describes** | Tables / columns / indexes / constraints / privileges | Concepts / properties / relations / inheritance / equivalence | Structure vs semantics |
+| **Inheritance queries** | Table inheritance (`INHERITS`) **does not participate in query expansion** — manual UNION ALL | `subClassOf` queries **auto-expand subclasses** | PG relies on app-layer hardcoding |
+| **Constraint types** | NOT NULL / UNIQUE / CHECK / FK | All of the above + **OWL: disjoint / inverseOf / transitive / equivalentClass** | PG constrains single tables; OWL governs cross-table semantics |
+| **Reasoning** | None | **Reason-on-Insert** (incremental fixpoint, 50.8µs) | PG stores facts; OntoDB derives new ones |
+| **Relationship semantics** | Foreign keys only guarantee referential integrity | `inverseOf` auto-symmetric, `transitive` auto-propagating | PG knows "references"; not "means" |
+| **Cross-modal queries** | Needs pgvector / pgRouting extensions | **12 modalities natively unified** | PG is assembled; OntoDB is integrated |
+| **Standards** | SQL only | SQL + OntoQL + **SPARQL / RDF** | Direct semantic-web ecosystem access |
+| **Data quality gates** | Type checks on write | Required + type + OWL + **logical consistency** | PG blocks format errors; OntoDB blocks semantic contradictions |
+| **Metadata consumers** | Optimizer, DDL, BI tools | Optimizer + **reasoner + validator + graph + AI** | Serves tools vs drives intelligence |
+
+### A concrete example
+
+Querying "all EGFR inhibitors":
 
 ```sql
--- PostgreSQL：必须自己维护子类列表，新药上市要改代码发版
+-- PostgreSQL: you must maintain the subclass list yourself; new drugs mean code changes
 SELECT * FROM drug
 WHERE class IN ('EGFRInhibitor', 'FirstGenEGFR', 'SecondGenEGFR', 'ThirdGenEGFR');
 
--- OntoDB：本体声明 subClassOf，查询自动展开
+-- OntoDB: the ontology declares subClassOf; the query auto-expands
 SELECT * FROM kb.Drug WHERE class = 'EGFRInhibitor';
--- 吉非替尼、厄洛替尼、奥希替尼、阿美替尼……全部命中，新增子类零改动
+-- Gefitinib, erlotinib, osimertinib, almonertinib ... all hit, zero code changes for new subclasses
 ```
 
-**为什么 PG 做不到**：`pg_catalog` 记录的是"drug 表有 class 列"，不记录"EGFRInhibitor 是 KinaseInhibitor 的子类"。这个知识存在应用代码里，不在元数据里。
+**Why PG cannot do this**: `pg_catalog` records "the drug table has a class column" — it does not record "EGFRInhibitor is a subclass of KinaseInhibitor." That knowledge lives in application code, not in the metadata.
 
-### 本体定义包含什么
+### What an ontology definition contains
 
 ```sql
 CREATE ONTOLOGY kb (
@@ -87,392 +87,409 @@ CREATE ONTOLOGY kb (
 )
 ```
 
-这不只是建表——它是**可推理的知识定义**：类可 `SUBCLASS OF` 父类形成分类体系，属性可声明 `inverseOf`（抑制↔被抑制）、`transitive`（传递性），类可声明 `disjointWith`（Drug 与 Disease 互斥）。
+This is not just table creation — it is **inferable knowledge definition**: classes can `SUBCLASS OF` parents forming taxonomies, properties can declare `inverseOf` (inhibits ↔ is-inhibited) and `transitive`, classes can declare `disjointWith` (Drug vs Disease are mutually exclusive).
 
-### 四项核心价值
+### Four core values
 
-1. **查询语义自动展开**——`subClassOf` 推理，查父类自动含子类，分类体系越深收益越大
-2. **写入即数据质量门**——注册本体后，每次 INSERT 自动校验必填/类型/OWL 约束，语义矛盾进不了库
-3. **跨模态语义锚点**——图、向量、文档、时序共享同一套本体，关系语义可推理、可演进，不硬编码在查询里
-4. **对接语义网与 AI 生态**——SPARQL/RDF 兼容，可导入 ChEBI/HPO/GO 等标准本体，是 RAG/知识图谱/AI 的标准输入
+1. **Semantic query auto-expansion** — `subClassOf` reasoning: query a parent class, get all subclasses automatically; deeper taxonomies mean bigger wins
+2. **Write-time data-quality gates** — once registered, every INSERT is validated for required fields / types / OWL constraints; semantic contradictions cannot enter the database
+3. **Cross-modal semantic anchor** — graph, vector, document, and time series share one ontology; relationship semantics are inferable and evolvable, not hardcoded in queries
+4. **Semantic-web & AI ecosystem** — SPARQL/RDF compatible; imports standard ontologies (ChEBI/HPO/GO); standard input for RAG / knowledge graphs / AI
 
-> **一句话**：普通元数据回答"表长什么样"，OntoDB 的语义元数据回答"数据是什么意思、彼此有什么关系、推得出什么新知识"。
+> **In one line**: ordinary metadata answers "what does the table look like"; OntoDB's semantic metadata answers "what does the data mean, how does it relate, and what new knowledge can be derived."
 
 ---
 
-## 向量检索 vs 传统向量库
+## Vector Search vs Traditional Vector Databases
 
-传统方案把向量当孤立的浮点数组：Milvus / pgvector 存 embedding，做 Top-K，和业务表、知识图谱是两套世界——查完相似还要回业务库 join，元数据过滤要么提前跑 SQL 圈 ID，要么向量库自己做粗糙标量过滤。**向量在，知识不在。**
+Traditional stacks treat vectors as isolated float arrays: Milvus / pgvector store embeddings and return Top-K, while business tables and knowledge graphs live in another world. After search you still join back to the business DB; metadata filters either pre-select IDs in SQL or rely on coarse scalar filtering inside the vector DB. **Vectors without knowledge.**
 
-OntoDB 把向量索引**内核级**嵌进存储引擎：向量和文档、图、本体同库同事务，检索时 SQL 谓词、图关系、本体推理原生参与，不是外挂扩展。
+OntoDB embeds vector indexing **in the storage kernel**: vectors share the same database and transactions with documents, graph, and ontology. SQL predicates, graph relations, and ontology reasoning participate natively in search — not bolted on.
 
-### 逐项对比（以 Milvus / pgvector 为基线）
+### Point-by-point comparison (Milvus / pgvector as baseline)
 
-| 维度 | Milvus / pgvector | OntoDB 向量能力 | 差距本质 |
-|------|-------------------|-----------------|----------|
-| **架构** | 独立向量库 + 业务库，写后 ETL 同步 | **与文档/图/本体同库同事务** | 拼装 vs 一体 |
-| **二进制指纹** | 多按 float32 存，1024 维占 4KB | **1024-bit 打包 128B**（8× 省空间），位运算加速 | 通用 embedding vs 为化学/二值特征特化 |
-| **距离度量** | L2 / IP / Cosine 常见 | L2 / Cosine / IP / **Tanimoto / Hamming** | 化学相似、汉明距原生支持 |
-| **过滤检索** | 先 SQL 圈 ID 再向量，或标量过滤近似 | **VECTOR SEARCH ... WHERE** 谓词与相似度同计划下推 | 两次查询 vs 一次融合 |
-| **知识推理** | 无 | 向量命中后可沿本体关系外推（子类/传递/等价） | 相似止于相似 |
-| **增量维护** | 全量重建或第三方索引工具 | **增量 delta + 全量快照**，bulk 与在线更新分路 | 运维脚本 vs 引擎内建 |
-| **元数据一致性** | 两套系统，标量过滤视版本而异 | 向量节点与文档主键 `{Class}::PK` 同锚点 | 映射表风险 vs 零映射 |
+| Dimension | Milvus / pgvector | OntoDB Vector Capability | Essence of the Gap |
+|-----------|-------------------|--------------------------|--------------------|
+| **Architecture** | Separate vector DB + business DB, post-write ETL | **Same DB, same transactions** as documents / graph / ontology | Assembled vs integrated |
+| **Binary fingerprints** | Usually float32; 1024-d takes 4KB | **1024-bit packed into 128B** (8× smaller), bit-op fast path | Generic embeddings vs specialized for chemistry / binary features |
+| **Distance metrics** | L2 / IP / Cosine typical | L2 / Cosine / IP / **Tanimoto / Hamming** | Native chemical similarity & Hamming |
+| **Filtered search** | Pre-select IDs in SQL then vector, or approximate scalar filter | **VECTOR SEARCH ... WHERE** pushed down in one plan | Two queries vs one fusion |
+| **Knowledge reasoning** | None | Ontology walk after hit (subclass / transitive / equivalence) | Similarity ends at similarity |
+| **Incremental maintenance** | Full rebuild or third-party index tools | **Incremental delta + full snapshot**; bulk vs online split | Ops scripts vs built into engine |
+| **Metadata consistency** | Two systems; scalar filter depends on version | Vector nodes share `{Class}::PK` anchor with documents | Mapping-table risk vs zero mapping |
 
-### 一个具体例子：分子相似性检索
+### A concrete example: molecular similarity search
 
 ```sql
--- 用 1024 位 Morgan 指纹查与阿司匹林最相似的分子
+-- Find molecules most similar to aspirin using a 1024-bit Morgan fingerprint
 VECTOR SEARCH ON sembio.Compound (fp)
-QUERY [1.0, 0.0, 1.0, ... ]   -- 0/1 位向量
+QUERY [1.0, 0.0, 1.0, ... ]   -- 0/1 bit vector
 TOP 10
-WHERE mol_weight < 500;        -- 可选：SQL 谓词同计划下推
+WHERE mol_weight < 500;        -- optional: SQL predicate pushed down
 ```
 
-**245 万分子生产实测**：
+**Production-verified at 2.45M molecules**:
 
-| 查询分子 | 指纹位点 | 耗时 | 命中（节选） |
-|----------|----------|------|--------------|
-| 阿司匹林 | 24 bits | **21ms** | 卡巴匹林、双水杨酯、苯阿司匹林 |
-| 氯吡格雷 | 45 bits | **41ms** | 硫酸氢盐、维卡格雷（同靶点类似物） |
-| 紫杉醇 | 86 bits | **39ms** | 紫杉烷侧链修饰、氯代类似物 |
+| Query molecule | Fingerprint bits | Latency | Top hits (excerpt) |
+|----------------|------------------|---------|---------------------|
+| Aspirin | 24 bits | **21ms** | Carbaspirin, salsalate, phenylaspirinate |
+| Clopidogrel | 45 bits | **41ms** | Bisulfate salt, vicagrel (same-target analog) |
+| Paclitaxel | 86 bits | **39ms** | Taxane side-chain / chloro analogs |
 
-检索 **< 50ms**，自匹配距离为 0；盐型、立体异构体、同骨架类似物一并召回。
+Full-library search in **< 50ms**; self-match distance 0; salts, stereoisomers, and same-scaffold analogs are recalled together.
 
-### 能力清单
+### Capability list
 
-1. **HNSW 图索引**——层级可导航小世界图，亿级扩展路径；支持 ef_search 查询期调节
-2. **二进制指纹特化**——bit-packed 存储与 Tanimoto/Hamming 位运算快路径，避免 1024 维 float 展开
-3. **增量持久化**——小批量写增量 delta，bulk 导入自动切全量快照，重启不丢、不全量重建
-4. **结构自愈**——过期节点剪枝（`COMPACT VECTOR INDEX`）、墓碑过滤、stale 重复 id 折叠
-5. **跨模态融合**——向量 + SQL 过滤 + 图遍历 + 本体推理一条查询（OntoQL / 混合 API）
-6. **语义锚点统一**——向量文档键、图顶点、三元组主语、存储主键同一 `{Class}::PK`，零映射表
+1. **HNSW graph index** — hierarchical navigable small-world graph; `ef_search` tunable at query time
+2. **Binary fingerprint specialization** — bit-packed storage and Tanimoto/Hamming bit-op fast paths; no 1024-dim float expansion
+3. **Incremental persistence** — small writes as incremental deltas; bulk import automatically switches to full snapshot; restart-safe without full rebuild
+4. **Self-healing structure** — stale-node prune (`COMPACT VECTOR INDEX`), tombstone filtering, duplicate-id collapse
+5. **Cross-modal fusion** — vector + SQL filter + graph traversal + ontology reasoning in one query (OntoQL / hybrid API)
+6. **Unified semantic anchor** — vector doc key, graph vertex, triple subject, and storage PK are the same `{Class}::PK`; zero mapping tables
 
-### 四项核心价值
+### Four core values
 
-1. **检索即知识**——向量命中不是终点，可沿本体关系继续推到靶点、通路、不良反应
-2. **为领域特征设计**——化学指纹、Hamming、Tanimoto 原生支持，不只服务文本 embedding
-3. **写入后不迁移**——向量与业务数据同事务提交，无 ETL 窗口、无双写一致性问题
-4. **生产级可运维**——增量持久化、批量导入路径、监控指标、快照恢复一体化
+1. **Search becomes knowledge** — a vector hit is not the end; follow ontology relations to targets, pathways, adverse events
+2. **Designed for domain features** — native fingerprints, Hamming, Tanimoto; not just text embeddings
+3. **No post-write migration** — vectors commit with business data in one transaction; no ETL window, no dual-write drift
+4. **Production-ops ready** — incremental persistence, bulk import path, metrics, snapshot restore in one place
 
-> **一句话**：别的向量库告诉你"哪些向量像"，OntoDB 告诉你"哪些**东西**像，以及它们在知识网络里意味着什么"。
+> **In one line**: other vector DBs tell you "which vectors look alike"; OntoDB tells you **which things** look alike — and what that means in a knowledge network.
 
 ---
 
-## 语义 API —— 「问知识」的接口
+## Semantic API — an interface for asking knowledge
 
-传统方案里「找相似、追溯机制、推理归因」要在应用层写一堆胶水代码，跨图库/向量库/推理器拼结果。OntoDB 把这些能力封装为 **9 个语义端点**：语义判定全部在数据层（`__ontology__` + 推理内核）完成，API 只是薄编排——**换领域只需换本体定义，内核与 API 零改动**。
+In traditional stacks, "find similar, trace mechanism, infer attribution" means glue code across a graph DB, a vector DB, and a separate reasoner. OntoDB wraps these into **9 semantic endpoints**: all semantic decisions happen in the data layer (`__ontology__` + the reasoning kernel) — the API is thin orchestration. **Switching domains means switching the ontology definition; the kernel and API don't change.**
 
-| 端点 | 能力 | 一句话 |
-|------|------|--------|
-| `POST /api/semantic/similar` | 向量相似检索 | 带**本体类型域**的 Top-K——搜「类似药物的化合物」自动包含全部子类，免硬编码 IN 列表 |
-| `POST /api/semantic/trace` | 多跳关系链追溯 | 沿关系链逐跳展开（药→不良反应→表型→疾病→靶点），链尾可选 INFER 推理增强 |
-| `POST /api/semantic/infer` | 显式规则推理 | 对事实集运行推理规则（Cax-sco/eqc、Prp-spo/eqp/inv/trp/symp + StateReach），流式分页返回 |
-| `POST /api/semantic/expand` | 分类体系展开 | GO/疾病等层级沿 `subClassOf` 自动扇出，查询父类即含全部后代 |
-| `POST /api/semantic/path` | 路径发现 | 图遍历找出「两个实体之间怎么连上」的路径 |
-| `POST /api/semantic/gap` | 引用完备性评估 | 量化知识缺口：哪些引用/字段缺失，100% 全量校验口径 |
-| `POST /api/semantic/bridge` | 跨本体链接 | 不同 ID 空间/本体之间自动搭桥（如疾病名 ↔ MONDO/OMIM） |
-| `POST /api/semantic/subgraph` | 子图抽取 | 圈定实体邻域导出知识子图，供可视化/RAG 上下文 |
-| `POST /api/semantic/explain` | 推导链溯源 | 每条结论区分 `stated`/`inferred`，返回完整推导链（规则 + 前提事实） |
+| Endpoint | Capability | In one line |
+|----------|------------|-------------|
+| `POST /api/semantic/similar` | Vector similarity search | Top-K with an **ontology type domain** — "compounds like a drug" automatically includes all subclasses, no hardcoded IN lists |
+| `POST /api/semantic/trace` | Multi-hop relation chain tracing | Walk relation chains hop by hop (drug → adverse reaction → phenotype → disease → target), with optional INFER enhancement at the chain tail |
+| `POST /api/semantic/infer` | Explicit rule reasoning | Run inference rules (Cax-sco/eqc, Prp-spo/eqp/inv/trp/symp + StateReach) over a fact set, streamed with pagination |
+| `POST /api/semantic/expand` | Taxonomy expansion | Fan out GO/disease hierarchies along `subClassOf` — querying a parent class includes all descendants |
+| `POST /api/semantic/path` | Path discovery | Graph traversal to find how two entities are connected |
+| `POST /api/semantic/gap` | Reference completeness assessment | Quantify knowledge gaps: which references/fields are missing, under 100% full-audit semantics |
+| `POST /api/semantic/bridge` | Cross-ontology linking | Bridge between ID spaces / ontologies (e.g. disease names ↔ MONDO/OMIM) |
+| `POST /api/semantic/subgraph` | Subgraph extraction | Extract a knowledge subgraph around an entity, for visualization / RAG context |
+| `POST /api/semantic/explain` | Derivation-chain traceability | Every conclusion is tagged `stated`/`inferred` with its full derivation chain (rule + premise facts) |
 
-**融合查询三模式**（生产实测，证据件见模式库文档）：
+**Three fusion-query patterns** (production-verified; evidence in the pattern-library doc):
 
-1. **M1 向量锚点 → 关系反查 → 交集收敛**——「与 DIACEREIN 相似且同机制」，2000 候选收敛到 1
-2. **M2 锚点扇出 → 功能定位 → 机制归因**——DISULFIRAM → ALDH2 机制路径一条链讲清
-3. **M3 表型锚 → 五跳链 → 验证分离**——Antley-Bixler 综合征五跳链 5 条 VERIFIED + 靶点归因
+1. **M1 vector anchor → relation backtrace → intersection convergence** — "similar to DIACEREIN with the same mechanism", 2000 candidates converged to 1
+2. **M2 anchor fan-out → functional localization → mechanism attribution** — DISULFIRAM → ALDH2 mechanism path in one chain
+3. **M3 phenotype anchor → five-hop chain → verification separation** — Antley-Bixler syndrome five-hop chain, 5 VERIFIED + target attribution
 
-**设计哲学**：新端点 = 新 OntoQL 查询组合，不改执行器；端点只做编排（约 1000 行），语义逻辑全部沉淀在数据层与推理内核。
+**Design philosophy**: a new endpoint = a new OntoQL query composition, no executor changes; endpoints only orchestrate (~1,000 lines), all semantic logic lives in the data layer and reasoning kernel.
 
-> **一句话**：别的 API 帮你查数据，OntoDB 语义 API 帮你**问知识**——相似、追溯、归因、查漏、溯源，一个接口家族。
+> **In one line**: other APIs help you query data; the OntoDB Semantic API helps you **ask knowledge** — similarity, tracing, attribution, gap-finding, provenance, one endpoint family.
 >
-> 详见 [语义 API 能力矩阵](docs/OntoDB语义API能力矩阵.md) · [语义融合查询模式库](docs/语义融合查询模式库.md)
+> See [Semantic API capability matrix](docs/OntoDB语义API能力矩阵.md) · [Semantic fusion query pattern library](docs/语义融合查询模式库.md)
 
 ---
 
-## 12 种数据类型
+## 12 Data Types
 
-OntoDB 在单一存储引擎中融合 12 种数据类型：
+OntoDB unifies 12 data types in a single storage engine:
 
-| 类别 | 数据类型 | 说明 |
-|------|----------|------|
-| **基础** | 键值对 | 高性能读写 |
-| | 文档 | JSON/BSON，嵌套结构 |
-| | 文本 | 倒排索引+中英文分词+BM25排序 |
-| | 多媒体 | 元数据注册+SHA256内容哈希+类型/属性检索 |
-| **高级** | 结构化记录 | 关系型数据+事务语义 |
-| | 图结构 | 实体关系网络+遍历 |
-| | 向量索引 | HNSW 语义相似性检索 |
-| | 时序数据 | 传感器/监控/日志 |
-| | 空间数据 | R-Tree+GeoHash 地理信息 |
-| | 语义三元组 | 知识图谱 SPO |
-| **实时** | 流数据 | CDC 变更捕获+连续查询 |
-| | 事件数据 | 复杂事件处理 |
+| Category | Data Type | Description |
+|----------|-----------|-------------|
+| **Basic** | Key-Value | High-performance read/write |
+| | Document | JSON/BSON, nested structures |
+| | Text | Inverted index + Chinese/English tokenizer + BM25 ranking |
+| | Multimedia | Metadata registry + SHA256 content hash + type/attribute search |
+| **Advanced** | Structured Records | Relational data + transactional semantics |
+| | Graph | Entity-relationship network + traversal |
+| | Vector Index | HNSW semantic similarity search |
+| | Time Series | Sensor/monitoring/log data |
+| | Spatial | R-Tree + GeoHash geographic data |
+| | Semantic Triples | Knowledge graph SPO |
+| **Real-time** | Stream | CDC change capture + continuous queries |
+| | Event | Complex event processing |
 
-所有数据通过**统一语义锚点**（`{Class}::{PrimaryKey}`）关联，零映射表。
+All data linked via **unified semantic anchor** (`{Class}::{PrimaryKey}`), zero mapping tables.
 
 ---
 
-## 34 项核心技术
+## 34 Core Technologies
 
-### 存储引擎
+### Storage Engine
 
-| # | 创新 | 一句话 |
-|---|------|--------|
-| 1 | **统一语义锚点** | `{Class}::PK` 同时作为存储键、图顶点、向量文档键、三元组主体，零映射表关联 |
-| 2 | **七步写入联动** | 一次 INSERT 原子完成文档→图→三元组→推理→向量→索引，写入即语义就绪 |
-| 3 | **全模态统一存储** | LSM-Tree + 键前缀路由，12 种数据类型在同一引擎中共存 |
-| 4 | **二进制行零拷贝过滤** | 在二进制数据上直接执行过滤，无需反序列化，解析时间减少 60% |
-| 5 | **三阶段锁提交** | 准备→预提交→提交，避免写锁与索引锁的嵌套死锁 |
-| 6 | **四级缓存内核嵌入** | 块缓存+查询缓存+语义缓存+自适应内存管理，零网络开销，缓存与内核共享内存空间 |
+| # | Innovation | One-liner |
+|---|-----------|-----------|
+| 1 | **Unified Semantic Anchor** | `{Class}::PK` serves as storage key, graph vertex, vector doc key, and triple subject simultaneously |
+| 2 | **7-Step Write Pipeline** | Single INSERT atomically completes document -> graph -> triple -> reasoning -> vector -> index |
+| 3 | **Full-Modal Unified Storage** | LSM-Tree + key-prefix routing, 12 data types coexist in one engine |
+| 4 | **Binary Row Zero-Copy Filtering** | Filter on binary data without deserialization, 60% parse time reduction |
+| 5 | **3-Phase Lock Commit** | Prepare -> pre-commit -> commit, avoids write/index lock deadlock |
+| 6 | **4-Layer Cache Kernel Embedding** | Block cache + query cache + semantic cache + adaptive memory, zero network overhead, shared memory |
 
-### 推理引擎
+### Reasoning Engine
 
-| # | 创新 | 一句话 |
-|---|------|--------|
-| 7 | **嵌入式增量推理** | OWL 2 RL 推理内嵌数据库（与存储引擎同进程），增量不动点算法，性能提升 10-100 倍 |
-| 8 | **推理安全机制** | 事实数预算控制防推理爆炸、并行推理线程池、循环继承检测 |
-| 9 | **推导链路追溯** | 每条推导结果记录来源规则和输入事实，支持完整推理链查询 |
-| 10 | **执行态推理（ExecOnt）** | 状态机迁移闭包（StateReach）+ 迁移守卫写入时求值拒写，过程/状态/事件/意图成为一等本体，执行语义可推理可审计 |
+| # | Innovation | One-liner |
+|---|-----------|-----------|
+| 7 | **Embedded Incremental Reasoning** | OWL 2 RL embedded in the database (same process as the storage engine), incremental fixpoint, 10-100x speedup |
+| 8 | **Reasoning Safety** | Fact budget control, parallel thread pool, cycle detection |
+| 9 | **Derivation Chain Tracing** | Every derived fact records source rule and input facts |
+| 10 | **Execution-State Reasoning (ExecOnt)** | State-machine reachability closure (StateReach) + transition guards evaluated and enforced at write time; process / state / event / intent become first-class ontology citizens |
 
-### 本体内核：OWL 2 RL 推理引擎
+### Ontology Kernel: OWL 2 RL Reasoning Engine
 
-OntoDB 将 OWL 2 RL 推理引擎**内嵌数据库**（与存储引擎同进程、共享内存空间），而非外挂组件。写入路径完成约束闸门校验与事实三元组化，推理在查询面随取随算：查询自动展开子类，INFER 可物化闭包并保留推导链。
+OntoDB embeds the OWL 2 RL reasoning engine **inside the database** (same process as the storage engine, shared memory space), not as an external component. The write path performs constraint-gate validation and fact reification; reasoning runs on demand at query time — subclasses expand automatically, INFER can materialize closures, and every derived fact keeps its derivation chain.
 
 ```
-传统方案：数据库 → ETL → 外挂推理引擎 → 推理结果写回数据库（延迟分钟级）
-OntoDB：  数据写入 → 闸门校验 + 事实化 → 查询面随取随算推理（INFER / 类闭包，带推导链）
+Traditional: DB -> ETL -> external reasoning engine -> write back (minutes)
+OntoDB:      Write -> gate validation + reification -> on-demand reasoning at query time (INFER / class closure, with derivation chains)
 ```
 
-**支持的 OWL 2 RL 推理规则：**
+**Supported OWL 2 RL Rules:**
 
-| 规则 | 含义 | 示例 |
-|------|------|------|
-| **子类传播** | 子类实例自动属于父类 | 温度传感器 IS_A 传感器 → 查询"设备"自动包含 |
-| **等价类** | 等价类实例互相包含 | 职工 = 员工 → 查询任一类自动包含另一类 |
-| **传递性** | 传递关系自动推导 | A 包含 B，B 包含 C → A 包含 C |
-| **对称性** | 对称关系双向推导 | A 互联 B → B 互联 A |
-| **逆属性** | 逆关系自动推导 | A 是 B 的父类 → B 是 A 的子类 |
-| **子属性** | 子属性自动继承父属性 | "管理"是"认识"的子属性 → 管理某人必认识某人 |
-| **等价属性** | 等价属性互相替代 | "父亲" = "爸爸" → 查询任一自动包含另一类 |
+| Rule | Meaning | Example |
+|------|---------|---------|
+| **Subclass Propagation** | Subclass instances belong to parent class | TemperatureSensor IS_A Sensor -> query "Device" includes all |
+| **Equivalent Class** | Equivalent classes include each other | Employee = Worker -> query either includes both |
+| **Transitivity** | Transitive relations auto-derive | A contains B, B contains C -> A contains C |
+| **Symmetry** | Symmetric relations derive both ways | A interconnected B -> B interconnected A |
+| **Inverse Property** | Inverse relations auto-derive | A is parent of B -> B is child of A |
+| **Sub-property** | Sub-property inherits parent | "manages" is sub-property of "knows" |
+| **Equivalent Property** | Equivalent properties interchange | "father" = "dad" |
 
-**安全机制：** 推理预算控制（最大事实数防爆炸）、并行推理线程池、本体循环继承检测、推导链路完整追溯。
+**Safety:** Budget control (max facts), parallel thread pool, cycle detection, full derivation tracing.
 
-### 执行态本体（ExecOnt）：让世界说得清自己在怎么跑
+### Execution-State Ontology (ExecOnt): letting the world say how it runs
 
-前两层刻画的是**世界的静态**：T-Box 是世界的**词**（类、属性、约束），A-Box 是世界的**账**（谁在何时干了什么）。但有一类语义悬在框架之外——**世界在怎么跑**：一个任务处在哪一步、三个工序谁先谁后、一次迁移该不该发生。这些今天散落在工作流流程图、机器人行为树、业务状态字段里，数据库读不懂、推理引擎够不着。
+The first two layers capture the **static world**: the T-Box is the world's **vocabulary** (classes, properties, constraints), the A-Box is the world's **ledger** (who did what, when). But one kind of semantics sits outside that frame — **how the world runs**: which step a task is on, which of three operations came first, whether a transition should have happened. Today that lives in workflow diagrams, robot behavior trees, and application status fields — unreadable by the database, unreachable by the reasoner.
 
-**执行态本体（ExecOnt）** 把过程、状态、迁移、事件、意图、主体做成一等本体公民，补上第三层 **Exec-Box——世界的行**：
+**Execution-State Ontology (ExecOnt)** makes process, state, transition, event, intent and agent first-class ontology citizens, completing the third layer — **Exec-Box, the world's behavior**:
 
-| 层 | 管什么 | 一句话 |
-|------|--------|--------|
-| T-Box | 世界的**词** | 什么东西、什么规矩 |
-| A-Box | 世界的**账** | 谁在何时、干了什么（静态事实） |
-| **Exec-Box** | 世界的**行** | 正在干什么、干到哪了、该不该干、干得对不对 |
+| Layer | Governs | One-liner |
+|------|---------|-----------|
+| T-Box | The world's **vocabulary** | What things are, what the rules are |
+| A-Box | The world's **ledger** | Who did what, when (static facts) |
+| **Exec-Box** | The world's **behavior** | What is happening now, how far it got, whether it should happen, whether it was done right |
 
-**推理 = 规矩 × 账 × 行**：静态推理（子类传播/传递/逆/对称）之上，叠加执行推理（工序传递、状态可达、守卫前置、符合性对账）。
+**Reasoning = rules × ledger × behavior**: on top of static reasoning (subclass / transitive / inverse / symmetric) sits execution reasoning (process ordering, state reachability, guard preconditions, compliance reconciliation).
 
-**六面元模型**：主体面（Agent / Capability）、过程面（Process / Activity / Action）、状态面（StateMachine / State / Transition / Guard）、事件面（ExecEvent / Causality）、意图面（Goal / Intent / Constraint）、资源面（Resource / ExecutionContext）。
+**Six-face metamodel**: Agent face (Agent / Capability), Process face (Process / Activity / Action), State face (StateMachine / State / Transition / Guard), Event face (ExecEvent / Causality), Intent face (Goal / Intent / Constraint), Resource face (Resource / ExecutionContext).
 
-**状态可达推理（StateReach）**：扫 `from_state` / `to_state` 迁移事实建状态邻接图，BFS 求传递闭包，推出 `A reachable B`——与 7 条 OWL 2 RL 规则**同宿主、同归因机制**，推导链可查。迁移守卫（`guard`）是数据不是代码：DDL 约束（必填 / 值域 / OWL 限制 / 不相交 / 唯一）、同文档比较（`字段 op 字面量`）、跨主体前置（`EXISTS(类 WHERE ...)`）、时序前置（`BEFORE(类 WHERE ...)`，按 `ts` 判「更早」）、紧邻前驱（`PREV(类 WHERE ...)`，最近一条更早行须满足条件，中间插行即失败）——都在写入闸门**当场拒写**，且类指向自动展开类层级（父类守卫看得到子类实例）。
+**State reachability (StateReach)**: scans `from_state` / `to_state` transition facts to build a state adjacency graph, computes the BFS transitive closure, and derives `A reachable B` — hosted and attributed by the **same mechanism as the 7 OWL 2 RL rules**, so every derivation is inspectable. Transition guards (`guard`) are data, not code: DDL constraints (required / range / OWL restriction / disjointness / unique), same-document comparisons (`field op literal`), cross-subject preconditions (`EXISTS(Class WHERE ...)`), temporal preconditions (`BEFORE(Class WHERE ...)`, ordering on `ts`), and immediate-predecessor preconditions (`PREV(Class WHERE ...)`, the most recent earlier row must match — an intervening row breaks it) are all **rejected at the write gate**, with class references expanding over the class hierarchy so a guard on a parent also sees subclass instances.
 
-**边界**：ExecOnt 是执行语义的**建模与记账层**——不调度、不驱动执行，不是工作流引擎；控制环留在机器人 / PLC。高频原始传感流不进本体推理路径，进本体面的是**事件化后的语义事实**。
+**Boundary**: ExecOnt is the **modeling and bookkeeping layer of execution semantics** — it does not schedule or drive execution and is not a workflow engine; control loops stay in the robot / PLC. High-frequency raw sensor streams never enter the ontology reasoning path; what enters the ontology layer is **semantized, event-level facts**.
 
-**落地状态**：M1–M6 已实现并验收（`examples/execont/`，覆盖机器人任务 / 数字孪生运行态 / 测量工序 / 生物医药 / 生物制药五场景，含执行符合性对账与金标问答）；M7（执行词表入 SemDNS、SemBIW 真实数据试点）规划中。
+**Status**: M1–M6 implemented and accepted (`examples/execont/`, covering robot tasks / digital-twin runtime / measurement processes / biomedical / biopharma, with execution-compliance reconciliation and golden Q&A); M7 (execution vocabulary into SemDNS, SemBIW real-data pilot) is planned.
 
-> 本体常被诟病只能刻画世界的名词；ExecOnt 把世界的动词——过程、状态、迁移、事件——纳入同一套推理底座。
+> Ontologies are often criticized for only describing the world's nouns; ExecOnt brings the world's verbs — process, state, transition, event — into the same reasoning substrate.
 
-### 查询引擎
+### Query Engine
 
-| # | 创新 | 一句话 |
-|---|------|--------|
-| 11 | **统一查询语言 OntoQL** | 单一语法融合 SQL + 图遍历 + 向量搜索 + 本体推理 + 时序 + 空间 |
-| 12 | **SPARQL 支持** | 标准 SPARQL 1.1 查询，FILTER/OPTIONAL/UNION/EXISTS 全支持 |
-| 13 | **推理子句** | 查询时实时推理，`SELECT * FROM Device` 自动包含所有子类实例 |
-| 14 | **语义缓存** | 语义相似度查询自动命中缓存，不同文本相同语义视为同一查询 |
-| 15 | **多模态融合查询优化** | 向量+关系/空间+时序/全文+向量跨模态查询自动选择最优执行计划 |
-| 16 | **数据血缘追溯** | 内核级数据来源追踪，追溯到原始写入+每一步推理+规则触发 |
-| 17 | **联邦查询** | 外部数据源（PG/MySQL/REST/CSV/JSON）映射为命名空间，统一查询 |
+| # | Innovation | One-liner |
+|---|-----------|-----------|
+| 11 | **OntoQL Unified Query** | One syntax for SQL + graph traversal + vector search + ontology reasoning + temporal + spatial |
+| 12 | **SPARQL Support** | Standard SPARQL 1.1, FILTER/OPTIONAL/UNION/EXISTS |
+| 13 | **Inference Clause** | Real-time reasoning in queries, `SELECT * FROM Device` auto-includes all subclasses |
+| 14 | **Semantic Cache** | Queries with same semantic meaning hit same cache, regardless of text differences |
+| 15 | **Multi-Modal Fusion Optimizer** | Vector+relational, spatial+temporal, text+vector auto-select optimal execution plan |
+| 16 | **Data Lineage** | Kernel-level provenance tracking, traces to original write + every reasoning step |
+| 17 | **Federated Query** | External sources (PG/MySQL/REST/CSV/JSON) mapped as namespaces, unified query |
 
-### 图引擎
+### OntoQL: Unified Query Language
 
-OntoDB 内嵌完整的属性图引擎，不是外挂图数据库。图数据与关系数据共享同一存储引擎，写入即图就绪，无需 ETL 同步。
-
-### OntoQL：统一查询语言
-
-开发者只需学一种语言，就能操作所有数据模态。传统方案需要 SQL + Cypher + 专用向量 API + SPARQL 四种语言。
+One language for all data modalities. Traditional: SQL + Cypher + vector API + SPARQL (4 languages).
 
 ```sql
--- 关系查询
+-- Relational
 SELECT * FROM users WHERE age > 25;
 
--- 图遍历
+-- Graph traversal
 GRAPH TRAVERSE FROM 'Person::1' OUT LABEL 'knows' DEPTH 3;
 
--- 向量搜索
+-- Vector search
 VECTOR SEARCH ON documents (embedding) QUERY [0.1, 0.2] TOP 10;
 
--- 本体推理（自动展开子类）
-SELECT * FROM Device;  -- 自动包含 Sensor, TemperatureSensor 等所有子类
+-- Ontology reasoning (auto-expand subclasses)
+SELECT * FROM Device;  -- auto-includes Sensor, TemperatureSensor, etc.
 
--- 时空查询
+-- Spatio-temporal query
 SELECT * FROM pois WHERE ST_Distance(location, ST_Point(116.4, 39.9)) < 1000;
-
--- 上述模态可在同一查询中组合使用
 ```
 
-### 活数据管理
+### Living Data Management
 
-| # | 创新 | 一句话 |
-|---|------|--------|
-| 18 | **活数据生命周期** | 指数/线性/对数三种衰减模型，三级半衰期(7h/70d/2yr)，访问自动激活 |
-| 19 | **价值驱动查询** | 查询条件中使用价值得分过滤排序，高频数据自动提升优先级 |
+| # | Innovation | One-liner |
+|---|-----------|-----------|
+| 18 | **Living Data Lifecycle** | Exponential/linear/logarithmic decay, 3-tier half-life (7h/70d/2yr), auto-activate on access |
+| 19 | **Value-Driven Query** | Filter and sort by value score, high-frequency data auto-promotes |
 
-### 活数据：数据价值自动衰减
+Traditional TTL: fixed expiry, no value awareness. Living Data: **data lives like a living thing** — unused data slowly "dies", accessed data "revives".
 
-传统数据库用 TTL 固定过期，OntoDB 的活数据让**数据像生物一样有生命**：不用就慢慢"死掉"，用一下就"复活"。
+| Feature | Description |
+|---------|-------------|
+| **3-Tier Half-Life** | 7 hours (hot) -> 70 days (warm) -> 2 years (cold) |
+| **3 Decay Models** | Exponential (default), linear, logarithmic |
+| **Auto-Activate** | Every access resets decay clock, accumulates value score |
+| **Kernel Integration** | Value metadata stored with data in same record, atomic |
+| **Vector Index Integration** | High-value data vectors loaded into memory first |
+
+### Temporal & Spatial
+
+| # | Innovation | One-liner |
+|---|-----------|-----------|
+| 20 | **TSM Columnar Storage** | Timestamp Delta encoding + float Gorilla encoding, 60%+ storage reduction |
+| 21 | **Spatio-Temporal Joint Index** | Quadtree spatial partition + timeline sort in single data structure |
+| 22 | **Embedded STTRL Engine** | 10+ spatio-temporal rules (geofence/speed/proximity/anomaly) at database level |
+| 23 | **3-Tier Storage** | Hot(memory) -> Warm(SSD) -> Cold(HDD), auto-migration by data temperature |
+| 24 | **Advanced Time Series** | DTW distance, streaming anomaly detection, tumbling/hopping/session windows |
+
+### Distributed & Scaling
+
+| # | Innovation | One-liner |
+|---|-----------|-----------|
+| 25 | **Data Sharding** | Class/Range/Hash strategies, runtime scaling and rebalancing |
+| 26 | **Raft Replication** | Cluster deployment (Raft replication + sharding) / high availability: persistent log, cluster whitelist, config sync |
+| 27 | **Multi-Protocol Access** | PostgreSQL + MySQL + HTTP REST simultaneously |
+| 28 | **Embedded API Gateway** | Load balancing, rate limiting, circuit breaking, auth |
+| 29 | **3-Tier Edge Deployment** | MCU(<100KB) -> Embedded Linux -> Edge server, unified model and API |
+
+### Security & Operations
+
+| # | Innovation | One-liner |
+|---|-----------|-----------|
+| 30 | **CDC Change Capture** | Kernel-integrated, WAL real-time extraction, Flink/Spark compatible |
+| 31 | **Namespace Scoped Isolation** | bare class names stamped per namespace, `ns.Class` cross-namespace addressing, no WHERE needed |
+| 32 | **GB/T 22239 Separation of Duties** | System/Security/Audit admins mutually exclusive, meets China gov/finance compliance |
+| 33 | **Data Masking Engine** | Kernel-level dynamic + static masking, auto-detect ID card/phone/bank card patterns |
+| 34 | **CRC Validation & Guard Canary** | SSTable page-level CRC validation; corrupted data deterministically rejected, heap-corruption root cause closable |
+
+### Authentication & Authorization (RBAC)
+
+OntoDB ships built-in authentication and role-based access control in three shapes (full DDL, audit and design details in `docs/RBAC权限模型详细设计.md`):
+
+| Shape | How to start | For |
+|-------|-------------|-----|
+| **A. No auth** | omit `--auth` | intranet demos, dev/debug (anonymous, everything open) |
+| **B. API Key, 3 tiers** | `--auth --api-keys-file config/api_keys.json` | Community quick start, existing configs keep working (ReadOnly/ReadWrite/Admin) |
+| **C. Full RBAC** | `--auth` (policy store takes over) | Enterprise: users/roles, object-level GRANT/REVOKE, auditing |
+
+B and C compose: if an api_keys.json exists it is migrated into the policy store automatically, then refine from there on the RBAC plane.
+
+**Minimal path** (shape C):
+
+```powershell
+# 1. first start mints an admin token, printed to stdout exactly once — store it now
+ontodb-server --data-dir <dir> --http 127.0.0.1:7912 --listen 127.0.0.1:7913 --auth
+
+# 2. create a role, a user, grant
+CREATE ROLE analyst;
+CREATE USER alice WITH PASSWORD 'pw';
+GRANT ROLE analyst TO alice;
+GRANT READ ON NAMESPACE _default TO analyst;
+
+# 3. business clients connect as alice; out-of-scope access gets 403 and is audited
+```
+
+For production, inject your own managed secret (re-registered on every start, never printed): `--bootstrap-admin-token <secret>`, or env `AUTH_BOOTSTRAP_ADMIN_TOKEN`.
+
+**Decision semantics (shorthand)**: `_admin` passes everything → explicit REVOKE deny → is_a inheritance (a CLASS grant covers subclasses unless narrowed with `ONLY`) → otherwise deny. Derived (reasoned) reads additionally require premises readable ∧ `INFER`, with explain chains redacted accordingly. Day-to-day operations go through the HTTP admin plane (`/api/admin/*`: users/roles/grants/rotation) plus DDL (`ALTER USER` / `ROTATE TOKEN` / `SHOW GRANTS`).
+
+### Namespace: Scoped Isolation
+
+OntoDB namespaces live at the storage-key layer as a **dot-prefix on class names**: under `USE NAMESPACE Bioet`, a bare class `Drug` is stored as `Bioet.Drug::{pk}` — a different key domain from `Drug` in the default namespace, so collisions and misreads cannot happen. Dotted names (the shared global catalog, e.g. `Bioet.Compound`) are treated as qualified and stay as-is from any namespace.
 
 ```
-传统 TTL：创建时设 30 天过期 → 第 29 天还在用也删掉 → 被动等死
-活数据：  频繁访问 → 价值上升 → 自动保留           → 主动续命
-         长期不访问 → 价值衰减 → 自动降级/清理
+Traditional: App adds tenant_id -> WHERE tenant_id = ? -> easy to miss
+OntoDB:      bare class names auto-scope to the session namespace -> key prefix is the scope, no WHERE needed
 ```
 
-| 特性 | 说明 |
-|------|------|
-| **三级半衰期** | 7 小时（高频热点）→ 70 天（中频温数据）→ 2 年（低频冷数据） |
-| **三种衰减模型** | 指数衰减（默认）、线性衰减、对数衰减 |
-| **自动激活** | 每次访问自动重置衰减时钟，累加价值得分 |
-| **内核级集成** | 价值元数据与数据存储在同一记录中，原子性保证 |
-| **向量索引集成** | 高价值数据的向量优先加载到内存，查询更快 |
+| Isolation Layer   | Description                                                                                                                                 |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Data**          | Bare class names are stamped with the namespace (`Bioet.rug::…`); same class name in another namespace is a separate key domain             |
+| **Query**         | Bare names scope to the current namespace; qualified `ns.Class` gives explicit cross-namespace access (how the shared catalog is addressed) |
+| **Introspection** | SHOW CLASSES hides other tenants' classes inside a namespace; `default` is the admin view and sees everything                               |
+| **Ontology**      | Ontology records may declare their owning namespace                                                                                         |
+| **Index**         | B-Tree/vector indexes are isolated per (prefixed) class name, built independently per namespace                                             |
 
-### 时序与空间
+**Isolation semantics**: prevents accidents, not explicit access — bare names never collide or leak across namespaces; qualified cross-namespace **reads** are by design (shared catalogs, cross-project references), while writes to the shared catalog require an unscoped key. `default` / `_default` is the default namespace and is always reachable via `USE NAMESPACE default`.
 
-| # | 创新 | 一句话 |
-|---|------|--------|
-| 20 | **TSM 列式存储** | 时间戳 Delta 编码 + 浮点值 Gorilla 编码，存储空间减少 60%+ |
-| 21 | **时空联合索引** | 四叉树空间分区 + 时间线排序融合在单一数据结构中 |
-| 22 | **嵌入式时空规则引擎** | STTRL 语言，地理围栏/超速/接近/异常位置等 10+ 种规则数据库层执行 |
-| 23 | **三级分层存储** | 热层(内存)→温层(SSD)→冷层(HDD)，按数据温度自动迁移，查询透明 |
-| 24 | **高级时序分析** | DTW 距离、流式异常检测、滚动/跳跃/会话窗口函数 |
-
-### 分布式与扩展
-
-| # | 创新 | 一句话 |
-|---|------|--------|
-| 25 | **数据分片** | 类/范围/哈希三种分片策略，运行时动态扩缩容和数据重平衡 |
-| 26 | **Raft 复制** | 支持集群部署（Raft 复制 + 分片扩展）/高可用：持久化日志、集群白名单、配置同步 |
-| 27 | **多协议接入** | PostgreSQL + MySQL + HTTP REST 三协议并存，现有应用无缝迁移 |
-| 28 | **API 网关内嵌** | 负载均衡、限流、熔断、认证授权，无需独立部署 |
-| 29 | **边缘三级部署** | MCU(<100KB) → 嵌入式 Linux → 边缘服务器，统一数据模型和 API |
-
-### 安全与运维
-
-| # | 创新 | 一句话 |
-|---|------|--------|
-| 30 | **CDC 变更捕获** | 内核级集成，WAL 实时提取变更事件，支持 Flink/Spark 消费 |
-| 31 | **命名空间作用域隔离** | 裸类名按空间打点前缀、`ns.Class` 限定名跨空间寻址，查询免 WHERE |
-| 32 | **等保2.0三权分立** | 系统管理员/安全管理员/审计管理员互斥，满足中国政务金融合规 |
-| 33 | **数据脱敏引擎** | 内核级动态+静态脱敏，身份证号/手机号/银行卡号自动识别脱敏 |
-| 34 | **CRC 校验与哨兵** | SSTable 页级 CRC 校验，损坏数据确定性拒绝，堆损坏根因可闭合 |
-
-### 命名空间：作用域隔离
-
-OntoDB 的命名空间在存储键层以**类名点前缀**承载：`USE NAMESPACE Bioet` 下写入的裸类名 `Drug` 落盘为 `Bioet.Drug::{pk}`，与默认空间的 `Drug` 分属不同键域——防碰撞、防误读。带点的类名（如共享目录 `Bioet.Compound`）视为全局限定名，在任何命名空间下保持原样。
-
-```
-传统方案：应用层加 tenant_id → 查询时 WHERE tenant_id = ? → 容易遗漏
-OntoDB：  裸类名自动限定到会话命名空间 → 键前缀即作用域，无需 WHERE 过滤
-```
-
-| 隔离层级    | 说明                                            |
-| ------- | --------------------------------------------- |
-| **数据层** | 裸类名按命名空间打点前缀（`Bioet.Drug::…`），不同空间的同名类物理不同键域  |
-| **查询层** | 裸类名自动限定到当前空间；`ns.Class` 限定名可显式跨空间访问（共享目录用此形式） |
-| **自省层** | SHOW CLASSES 在租户内隐藏其他租户的类；default 为管理视图，可见全部  |
-| **本体层** | 本体记录可声明所属命名空间                                 |
-| **索引层** | 索引/向量索引按（前缀化后的）类名隔离，各空间独立构建                   |
-
-**隔离语义**：防意外，不防显式——裸名互不可见、互不碰撞；限定名跨空间**读取**是设计内的显式访问（供共享目录与跨项目引用），共享目录（全局限定名）的写入需要无作用域密钥。`default` / `_default` 为默认命名空间，随时可用 `USE NAMESPACE default` 切回。
-
-一个 OntoDB 实例可服务 N 个租户/项目：命名作用域隔离 + 显式共享，运维成本低。
+One OntoDB instance serves N tenants/projects: scoped isolation plus explicit sharing, at low ops cost.
 
 ---
 
-## 性能基准
+## Performance Benchmarks
 
-> **百万级吞吐，微秒级推理，100% 向量召回率。单一系统统一 12 种数据类型，替代 6 个独立数据库。**
+> **1M+ throughput, microsecond reasoning, 100% vector recall. One system unifies 12 data types, replacing 6 independent databases.**
 
-### 生产环境实测（生物医药知识图谱）
+### Production-Verified (a biomedical knowledge graph)
 
-> 12 核 / 32GB RAM / NVMe SSD / **2,800 万+ 条知识记录**（105 张实体/关系表）/ 32GB / 980 SSTable
+> 12 cores / 32GB RAM / NVMe SSD / **28M+ knowledge records** (105 entity/relation tables) / 32GB / 980 SSTables
 
-| 指标 | 数值 |
-|------|------|
-| 总记录数 | **2,800 万+**（105 张实体/关系表，层级展开计数 2,844 万） |
-| 分子结构（SMILES/InChI） | **245 万条**（ChEMBL 35） |
-| **分子指纹相似检索（Tanimoto）** | **21–41ms / 245 万** |
-| 607k 行 GROUP BY 聚合 | **123ms**（索引下推前 11s，90×） |
-| 大表 LIMIT 扫描（16 并发） | **2,546 rps**（优化前 10.7 rps，238×） |
-| 64 并发 P50 延迟 | **25.8ms**（优化前 8.9s） |
-| 混合负载长稳 | **180 秒 69,610 查询 / 0 错误** |
-| 损坏数据注入测试 | **全部确定性拒绝，无崩溃** |
+| Metric | Value |
+|--------|-------|
+| Total records | **28M+** (105 entity/relation tables; 28.4M hierarchy-expanded) |
+| Molecular structures (SMILES/InChI) | **2.45M** (ChEMBL 35) |
+| **Molecular fingerprint similarity (Tanimoto)** | **21–41ms / 2.45M** |
+| GROUP BY over 607K rows | **123ms** (11s before index pushdown, 90×) |
+| Large-table LIMIT scan (16 concurrent) | **2,546 rps** (10.7 rps before, 238×) |
+| P50 latency at 64 concurrent | **25.8ms** (8.9s before) |
+| Mixed-workload soak | **180s / 69,610 queries / 0 errors** |
+| Corrupted-data injection test | **All deterministically rejected, zero crashes** |
 
-### 存储引擎
+### Storage Engine
 
-| 指标 | OntoDB | SQLite | PostgreSQL | Redis |
-|------|--------|--------|-----------|-------|
-| 写入 | **1,126,486 ops/s** | ~50K | ~30K | ~100K |
-| 读取 | **1,306,438 ops/s** | ~200K | ~100K | ~100K |
+| Metric | OntoDB | SQLite | PostgreSQL | Redis |
+|--------|--------|--------|-----------|-------|
+| Write | **1,126,486 ops/s** | ~50K | ~30K | ~100K |
+| Read | **1,306,438 ops/s** | ~200K | ~100K | ~100K |
 
-### 向量搜索
+### Vector Search
 
-| 数据规模 | 召回率 | 延迟 |
-|----------|--------|------|
+| Scale | Recall | Latency |
+|-------|--------|---------|
 | 10K | **100%** | **403µs** |
 | 50K | **100%** | **1.03ms** |
 | 200K | **99.7%** | **4.06ms** |
-| **245 万（分子指纹 Tanimoto）** | — | **21–41ms** |
+| **2.45M (molecular fingerprints, Tanimoto)** | — | **21–41ms** |
 
-### OWL 推理（全球首创内嵌引擎）
+### OWL Reasoning (World's First Embedded Engine)
 
-| 操作 | OntoDB | 外挂引擎 |
-|------|--------|---------|
+| Operation | OntoDB | External Engine |
+|-----------|--------|----------------|
 | is_subclass_of | **390ns** | ~10ms |
-| 单事实推理 | **50.8µs** | ~100ms |
-| 批量推理（10K实体） | **22ms** | ~5s |
+| Single fact reasoning | **50.8µs** | ~100ms |
+| Batch reasoning (10K entities) | **22ms** | ~5s |
 
-### 规则引擎
+### Rule Engine
 
-| 规模 | 耗时 |
-|------|------|
-| 10 条规则 | **34.5µs** |
-| 1000 条规则 | **1.79ms** |
+| Scale | Latency |
+|-------|---------|
+| 10 rules | **34.5µs** |
+| 1000 rules | **1.79ms** |
 
-### 性能对标：OntoDB vs 各领域专用数据库
+### Performance vs Domain-Specific Databases
 
-| 功能 | 专用数据库 | 专用数据库性能 | OntoDB | 说明 |
-|------|-----------|--------------|--------|------|
-| 关系存储 | PostgreSQL | ~30K ops/s | **1,126K ops/s** | 写入吞吐 |
-| 向量搜索 | Milvus | ~1ms / 95-99% | **403µs / 100%** | 10K规模 |
-| 图查询 | Neo4j | ~10ms | **<1ms** | BFS/DFS |
-| OWL推理 | Apache Jena | ~100ms | **50.8µs** | 增量不动点 |
-| 时序存储 | InfluxDB | ~200K ops/s | **1,126K ops/s** | TSM列式 |
-| 规则引擎 | Drools | ~500µs/10条 | **34.5µs/10条** | DSL语法 |
+| Function | Specialist DB | Specialist Perf | OntoDB | Note |
+|----------|--------------|----------------|--------|------|
+| Relational | PostgreSQL | ~30K ops/s | **1,126K ops/s** | Write throughput |
+| Vector search | Milvus | ~1ms / 95-99% | **403µs / 100%** | 10K scale |
+| Graph query | Neo4j | ~10ms | **<1ms** | BFS/DFS |
+| OWL reasoning | Apache Jena | ~100ms | **50.8µs** | Incremental fixpoint |
+| Time series | InfluxDB | ~200K ops/s | **1,126K ops/s** | TSM columnar |
+| Rule engine | Drools | ~500µs/10 rules | **34.5µs/10 rules** | DSL syntax |
 
-> 详见 [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md) · [语义元数据深度解析](docs/marketing/SEMANTIC_METADATA.md)
+> See [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md) · [Semantic Metadata Deep Dive](docs/marketing/SEMANTIC_METADATA.md)
 
 ---
 
-## 快速开始
+## Quick Start
 
-### 从源码编译
+### Build from Source
 
 ```bash
-# 前置要求：Rust 1.77+
+# Prerequisites: Rust 1.77+
 git clone https://gitee.com/ontovalue/ontodb.git
 cd ontodb
 cargo build --release
 
-# 启动服务器（PostgreSQL 协议 5432 + MySQL 协议 3306 + HTTP 7912）
+# Start server (PostgreSQL on 5432 + MySQL on 3306 + HTTP on 7912)
 ./target/release/ontodb-server --data-dir ./data --http 0.0.0.0:7912
 ```
 
@@ -482,111 +499,111 @@ cargo build --release
 docker compose up -d
 ```
 
-### 用 OntoQL 创建第一个表
+### Create Your First Table with OntoQL
 
 ```sql
--- 定义本体
+-- Define ontology
 CREATE CLASS Device;
 CREATE CLASS Sensor SUBCLASS OF Device;
 
--- 插入数据（自动完成 7 步联动）
-INSERT INTO Sensor (id, location, temperature) 
+-- Insert data (auto-completes 7-step pipeline)
+INSERT INTO Sensor (id, location, temperature)
 VALUES ('T1', 'Factory_A', 36.5);
 
--- 查询时自动推理展开（Device 自动包含 Sensor 子类数据）
+-- Query auto-expands subclasses
 SELECT * FROM Device;
 
--- 图遍历
+-- Graph traversal
 GRAPH TRAVERSE FROM 'Sensor::T1' OUT LABEL 'connects_to' DEPTH 3;
 
--- 向量搜索
+-- Vector search
 VECTOR SEARCH ON documents (embedding) QUERY [0.1, 0.2] TOP 10;
 
--- 空间查询
+-- Spatial query
 SELECT * FROM devices WHERE ST_Distance(location, ST_Point(116.4, 39.9)) < 1000;
 
--- 时序查询
+-- Time series query
 SELECT * FROM sensor_data WHERE time > '2024-01-01' LIMIT 100;
 ```
 
 ---
 
-## 适用场景
+## Use Cases
 
-> **市场定位：大数据栈的语义服务层。** 大数据管道（湖仓/Spark/Flink）管冷数据和批量分析，OntoDB 管语义查询与在线服务——本体推理、多模态统一查询、写入即数据质量门、知识图谱，两边通过 CDC/导入管道衔接。
+> **Market positioning: the semantic service layer of the big-data stack.** Big-data pipelines (lakehouse / Spark / Flink) handle cold data and batch analytics; OntoDB handles semantic queries and online services — ontology reasoning, unified multi-modal queries, write-time data-quality gates, and knowledge graphs — connected via CDC / import pipelines.
 
 
 
-| 场景 | 为什么用 OntoDB |
-|------|----------------|
-| **大模型 / AI 公司** | 向量+知识图谱+推理融合，RAG 检索增强+本体内置，不用外挂向量库+图库+推理引擎 |
-| **生物医药 / AI4S** | 分子结构+图+向量+本体统一，结构相似→靶点通路→不良反应一条查询闭环（已实证） |
-| **互联网公司** | 12 种数据类型统一存储，一个系统替代 MySQL+Redis+Milvus+Elasticsearch+Neo4j |
-| **SaaS 平台** | 命名空间作用域隔离，一个实例服务 N 个租户，零开销 |
-| **知识图谱** | OWL 推理内嵌，写入即推理，推导链路可追溯，不用外挂推理引擎 |
-| **智能搜索** | 向量+全文+语义推理融合查询，一个查询同时做语义搜索+知识推理 |
-| **IoT / 工业互联网** | 时序+空间+图+本体推理统一，STTRL 时空规则引擎内置 |
-| **数字孪生** | 12 种数据类型 + 活数据衰减 + 时空规则引擎 + CDC 实时事件；ExecOnt 把孪生体运行态从内存镜像升格为可推理事实 |
-| **自动驾驶** | 边缘三级部署 + STTRL 时空规则 + CDC 实时事件 |
-| **机器人** | 边缘低功耗 + 实时推理 + 时空感知 + 本体规则引擎；ExecOnt 让任务执行语义（状态/工序/意图）可推理、可审计 |
-| **质量追溯 / 合规审计** | ExecOnt 执行符合性对账（计划序列 vs 实际序列）+ 执行证据链可回放，IATF 16949 / GxP / PPAP 类追溯的执行态硬通货 |
-| **智慧医疗** | 命名空间多租户作用域隔离+本体推理+时序数据（生命体征）+空间数据（病区定位） |
-| **金融风控** | 本体规则引擎自动触发风控规则+实时流数据+CDC+审计链 |
-| **电商推荐** | 向量相似性+图关系+活数据衰减（热度自动降级）+实时事件 |
-| **智慧城市** | 空间+时序+图+本体推理，地理围栏+轨迹+设备关系统一管理 |
-| **多项目数据中台** | 一个 OntoDB 实例跑 N 个项目，命名空间作用域隔离互不干扰 |
-| **边缘计算** | MCU < 100KB 内存到完整服务器，统一数据模型和 API |
-| **具身智能** | 边缘推理 + 时空规则 + 本体驱动规则引擎 + 多体协同 |
+| Scenario | Why OntoDB |
+|----------|-----------|
+| **LLM / AI Companies** | Vector + knowledge graph + reasoning fused, RAG + built-in ontology |
+| **Biopharma / AI4S** | Molecular structure + graph + vector + ontology unified; structure-similarity → target-pathway → adverse-event in one query (delivered) |
+| **Internet Companies** | 12 data types in 1 system, replace MySQL+Redis+Milvus+ES+Neo4j |
+| **SaaS Platforms** | Namespace scoped isolation, one instance for N tenants, zero overhead |
+| **Knowledge Graphs** | OWL reasoning embedded, write-on-reason, traceable derivation chains |
+| **Intelligent Search** | Vector + full-text + semantic reasoning fused query |
+| **IoT / Industrial** | Time series + spatial + graph + ontology unified, STTRL engine built-in |
+| **Digital Twin** | 12 data types + living data + STTRL + CDC real-time events; ExecOnt lifts twin runtime state from in-memory mirror to inferable facts |
+| **Autonomous Driving** | 3-tier edge deployment + STTRL + CDC |
+| **Robotics** | Edge low-power + real-time reasoning + spatial awareness + ontology rules; ExecOnt makes task-execution semantics (state / process / intent) inferable and auditable |
+| **Quality Traceability / Compliance** | ExecOnt reconciles plan-vs-actual execution and replays execution evidence chains — the execution-state currency for IATF 16949 / GxP / PPAP-style traceability |
+| **Smart Healthcare** | Namespace multi-tenant + ontology + time series (vitals) + spatial (ward) |
+| **Financial Risk** | Ontology rules auto-trigger risk controls + stream + CDC + audit chain |
+| **E-Commerce** | Vector similarity + graph relations + living data decay + real-time events |
+| **Smart City** | Spatial + temporal + graph + ontology, geofence + trajectory + device relations |
+| **Multi-Project Data Hub** | One OntoDB instance for N projects, namespace scoped isolation |
+| **Edge Computing** | MCU < 100KB to full server, unified data model and API |
+| **Embodied Intelligence** | Edge reasoning + spatio-temporal rules + ontology-driven rule engine |
 
-### 典型行业案例
+### Industry Case Studies
 
-| 案例 | 痛点 | OntoDB 方案 | 收益 |
-|------|------|------------|------|
-| **生物医药知识图谱**（已交付） | 药物-靶点-通路-不良反应分散 5 系统，查"EGFR 抑制剂"漏子类 | 12 模态同库 + `subClassOf` 推理自动展开 | 607k 行聚合 **11s→123ms**；大表扫描 **238×** |
-| **临床试验智能匹配** | 入排标准散在文档，人工筛选患者数周 | 入排标准本体化 + 推理匹配队列 | 筛选 **周级→分钟级**，新试验零代码 |
-| **反洗钱关联图谱** | 资金链路分散 3 库，关联挖掘靠人工 | 资金关系图 + 分类本体 + 传递风险推理 | 关联挖掘 **×3**，集团风险无遗漏 |
-| **设备故障知识图谱** | 故障案例无语义，排障靠老师傅经验 | 故障分类本体 + 因果图 + 时序传感器同库 | 排障时间 **-50%**，告警准确率 **+30%** |
-| **商品类目智能管理** | 类目树 5-8 层，查"手机"要递归 UNION | `subClassOf` 自动展开 + 同义扩展 | **1 条 SQL** 替代递归，召回率 **+35%** |
+| Case | Pain Point | OntoDB Solution | Impact |
+|------|-----------|----------------|--------|
+| **Biomedical knowledge graph** (delivered) | Drug / target / pathway / adverse-event data split across 5 systems; "EGFR inhibitor" queries miss subclasses | 12 modalities in one engine + `subClassOf` auto-expansion | 607K-row aggregate **11s→123ms**; table scan **238×** |
+| **Clinical trial matching** | Eligibility criteria buried in documents; patient screening takes weeks | Ontologized eligibility + reasoning-based matching | Screening **weeks→minutes**, new trials need zero code |
+| **AML transaction graph** | Fund flows split across 3 databases; link mining is manual | Transaction graph + class ontology + transitive risk reasoning | Link mining **×3**, full group-risk coverage |
+| **Equipment fault knowledge graph** | Fault cases unstructured; troubleshooting relies on expert experience | Fault taxonomy ontology + causal graph + sensor time series | Troubleshooting time **-50%**, alert accuracy **+30%** |
+| **Product catalog management** | 5–8-level category trees; "phone" queries need recursive UNION | `subClassOf` auto-expansion + synonym equivalence | **1 SQL** replaces recursive UNION, recall **+35%** |
 
-> 案例一为生产环境实测交付；其余为典型方案设计，收益为行业基准估算。详见 [语义元数据深度解析](docs/marketing/SEMANTIC_METADATA.md)。
+> Case 1 is a production-verified delivery; cases 2–5 are reference designs with industry-baseline estimates. See [Semantic Metadata Deep Dive](docs/marketing/SEMANTIC_METADATA.md) (Chinese) for details.
 
-### 场景适配度
+### Scenario Fit
 
-分类层级越深、跨表关联越密、数据质量要求越高的场景，语义元数据收益越大：
+Semantic metadata delivers the most value where taxonomies are deep, cross-table joins are dense, and data quality matters:
 
-| 场景 | 分类复杂度 | 跨表关联 | 质量要求 | 适配度 |
-|------|-----------|---------|---------|--------|
-| 生物医药 / 化学材料 | ★★★★★ | ★★★★ | ★★★★ | **最高**（已实证） |
-| 医疗健康 / 金融科技 | ★★★★ | ★★★★★ | ★★★★ | **高** |
-| 智能制造 / 电商内容 | ★★★★ | ★★★ | ★★★ | **中高** |
-| 智慧城市 / 政务 | ★★★★ | ★★★★ | ★★★★ | **中** |
+| Scenario | Taxonomy Depth | Cross-table Links | Quality Bar | Fit |
+|----------|---------------|-------------------|-------------|-----|
+| Biopharma / Chemistry & Materials | ★★★★★ | ★★★★ | ★★★★ | **Highest** (verified) |
+| Healthcare / FinTech | ★★★★ | ★★★★★ | ★★★★ | **High** |
+| Manufacturing / E-Commerce | ★★★★ | ★★★ | ★★★ | **Medium-High** |
+| Smart City / Government | ★★★★ | ★★★★ | ★★★★ | **Medium** |
 
 ---
 
-## 项目结构
+## Project Structure
 
 ```
 ontodb/
 ├── crates/
-│   ├── onto-core/          # 核心类型（EntityId/BinaryRow/R-Tree/GeoHash/DTW）
-│   ├── onto-storage/       # LSM-Tree 引擎（WAL/MVCC/HNSW/TSM/分层存储/Bloom）
-│   ├── onto-ontology/      # OWL 2 RL 推理引擎（7 条规则/增量不动点/推导追溯）
-│   ├── onto-query/         # 查询引擎（OntoQL/SPARQL/优化器/执行器/缓存）
-│   ├── onto-graph/         # 图引擎（属性图/BFS/DFS/最短路径/PageRank/缓存管理）
-│   ├── onto-server/        # 多协议服务器（PG/MySQL/HTTP/TLS/审计/CDC/限流）
-│   ├── onto-cli/           # 命令行 REPL + dump/restore
-│   ├── onto-plugin/        # 插件钩子管线（INSERT/UPDATE/DELETE 生命周期）
-│   ├── onto-edge/          # 边缘设备 SDK（采集/地理围栏/上报）
-│   ├── onto-sharding/      # 数据分片（类/范围/哈希策略）
-│   ├── onto-raft/          # Raft 共识（持久化/集群白名单/配置同步）
-│   └── ontodb-rules/       # 基本规则 API 服务（DSL 解析/CRUD/热更新）
-├── sdk/                    # 多语言 SDK（Go/Python/TypeScript）
-├── examples/               # 示例应用 + 规则模板（金融/工业/医疗）
-├── frontend/               # 规则编辑器 Web UI
-└── docs/                   # 文档
+│   ├── onto-core/          # Core types (EntityId/BinaryRow/R-Tree/GeoHash/DTW)
+│   ├── onto-storage/       # LSM-Tree engine (WAL/MVCC/HNSW/TSM/Tiered/Bloom)
+│   ├── onto-ontology/      # OWL 2 RL reasoning (7 rules/incremental fixpoint)
+│   ├── onto-query/         # Query engine (OntoQL/SPARQL/optimizer/executor/cache)
+│   ├── onto-graph/         # Graph model (adjacency list/BFS/DFS)
+│   ├── onto-server/        # Multi-protocol server (PG/MySQL/HTTP/TLS/Audit/CDC)
+│   ├── onto-cli/           # CLI REPL + dump/restore
+│   ├── onto-plugin/        # Plugin hook pipeline (INSERT/UPDATE/DELETE lifecycle)
+│   ├── onto-edge/          # Edge device SDK (collector/geofence/reporter)
+│   ├── onto-sharding/      # Data sharding (class/range/hash strategies)
+│   ├── onto-raft/          # Raft consensus (persistent/whitelist/config sync)
+│   └── ontodb-rules/       # Basic rules API server (DSL/CRUD/hot reload)
+├── sdk/                    # Multi-language SDK (Go/Python/TypeScript)
+├── examples/               # Example apps + rule templates
+├── frontend/               # Rules editor Web UI
+└── docs/                   # Documentation
 ```
 
 ---
-## 贡献
+## Contributing
 
-欢迎贡献！请查看 [CONTRIBUTING.md](CONTRIBUTING.md)。
+Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md).
