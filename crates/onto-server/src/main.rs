@@ -813,7 +813,7 @@ fn main() -> Result<()> {
                 match &res {
                     Ok(()) => tracing::info!("Server {} exited gracefully", failed_name),
                     Err(e) => tracing::error!(
-                        "Server {} failed: {} 鈥?initiating shutdown",
+                        "Server {} failed: {} — initiating shutdown",
                         failed_name,
                         e
                     ),
@@ -948,6 +948,9 @@ async fn run_http_server(
 ) -> Result<()> {
     let audit = Arc::new(audit::AuditLogger::new(audit_config));
     let alert_manager = alerts::spawn_alert_loop(metrics.clone(), alert_config);
+    // RBAC policy service for the admin policy-plane endpoints (T4.4) —
+    // captured before `executor` moves into AppState.
+    let policy_svc = executor.policy_service();
     let state = http::AppState {
         executor,
         metrics,
@@ -1024,6 +1027,7 @@ async fn run_http_server(
         #[cfg(feature = "raft")]
         cluster_manager: None,
         audit: Some(state.audit.clone()),
+        policy: policy_svc,
     };
 
     let app = http::build_router_with_auth(
