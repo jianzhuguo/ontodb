@@ -193,6 +193,13 @@ struct Args {
     #[arg(long, env = "AUTH_API_KEYS_FILE")]
     api_keys_file: Option<PathBuf>,
 
+    /// Bootstrap admin token (design §11): registered for the 'admin'
+    /// principal at every start (operator-managed secret). Without it, a
+    /// first start with an empty policy store mints one and prints it to
+    /// stdout exactly once.
+    #[arg(long, env = "AUTH_BOOTSTRAP_ADMIN_TOKEN")]
+    bootstrap_admin_token: Option<String>,
+
     /// Default rate limit (requests per minute)
     #[arg(long, default_value = "600", env = "RATE_LIMIT_RPM")]
     rate_limit: u32,
@@ -616,6 +623,29 @@ fn main() -> Result<()> {
                 Err(e) => {
                     return Err(onto_core::CoreError::Custom(format!(
                         "RBAC api_keys migration failed: {e}"
+                    )));
+                }
+            }
+            // RBAC bootstrap (design §11): a first start with an empty policy
+            // store mints the admin token and prints it once; the flag
+            // injects an operator-managed secret instead (re-asserted at
+            // every start). Neither path echoes the secret into logs/audit.
+            match rbac::bootstrap_admin(&policy_svc, args.bootstrap_admin_token.as_deref()) {
+                Ok(outcome) => {
+                    if !outcome.audit_detail.is_empty() {
+                        executor.audit_system("grant_change", &outcome.audit_detail);
+                        println!("RBAC: {}", outcome.audit_detail);
+                    }
+                    if let Some(token) = outcome.minted_token {
+                        println!("================================================");
+                        println!("Bootstrap admin token (printed once - store it now):");
+                        println!("  {token}");
+                        println!("================================================");
+                    }
+                }
+                Err(e) => {
+                    return Err(onto_core::CoreError::Custom(format!(
+                        "RBAC bootstrap admin failed: {e}"
                     )));
                 }
             }

@@ -870,23 +870,9 @@ pub fn build_router_with_auth(
 ) -> Router {
     use axum::middleware;
 
-    // Admin sub-router with its own state
-    let admin_routes = Router::new()
-        .route(
-            "/api/admin/keys",
-            get(crate::admin::list_keys).post(crate::admin::add_key),
-        )
-        .route(
-            "/api/admin/keys/:key",
-            put(crate::admin::update_key).delete(crate::admin::delete_key),
-        )
-        .route(
-            "/api/admin/keys/:key/ips",
-            get(crate::admin::list_ips).post(crate::admin::add_ips),
-        )
-        .route("/api/admin/keys/:key/ips", delete(crate::admin::remove_ip))
-        .route("/api/admin/reload", post(crate::admin::force_reload))
-        .with_state(admin_state);
+    // Admin sub-router with its own state (keys plane + RBAC policy plane,
+    // design §13) — single builder in `admin::admin_router`.
+    let admin_routes = crate::admin::admin_router().with_state(admin_state);
 
     let router = Router::new()
         // Health check and metrics (no auth required)

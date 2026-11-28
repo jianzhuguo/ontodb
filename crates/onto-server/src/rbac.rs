@@ -180,6 +180,100 @@ fn principal_id_for(key: &ApiKeyConfig) -> String {
     }
 }
 
+/// Bootstrap admin principal id (design §11).
+pub const BOOTSTRAP_ADMIN_ID: &str = "admin";
+
+/// What a bootstrap run did (design §11 Bootstrap). The minted token is
+/// returned only to the caller for the one-time stdout print — it never
+/// reaches logs or audit records.
+pub struct BootstrapOutcome {
+    /// Secret-free detail for the startup log / one `grant_change` record.
+    pub audit_detail: String,
+    /// Freshly minted token to print exactly once (`None` = nothing to print:
+    /// injected tokens are operator-known, later starts are silent).
+    pub minted_token: Option<String>,
+}
+
+/// Bootstrap the admin identity (design §11: 「首次启动生成 admin token 打到
+/// stdout 一次（或 `--bootstrap-admin-token` 注入）」).
+///
+/// - **First run** (policy store holds no principal at all): create `admin`
+///   in the built-in `_admin` tier and mint a 256-bit token. The token is
+///   epoch-gated — `ALTER USER ... PASSWORD` / `ROTATE TOKEN` kill it like
+///   any session credential.
+/// - **Injected** (`--bootstrap-admin-token`): ensure-style like the
+///   api_keys migration — the admin principal is created when missing and
+///   the token is registered unbound (config-managed lifetime, survives
+///   epoch bumps, re-asserted at every start).
+/// - Any later start without the flag is a no-op; the token is never
+///   re-printed.
+pub fn bootstrap_admin(svc: &PolicyService, injected_token: Option<&str>) -> Result<BootstrapOutcome> {
+    let first_run = svc.engine.principals().is_empty();
+    let token = match injected_token {
+        Some(t) if !t.trim().is_empty() => Some((t.to_string(), false)),
+        _ if first_run => {
+            let mut raw = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut raw);
+            let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+            Some((token, true))
+        }
+        _ => None,
+    };
+    if token.is_none() && !first_run {
+        return Ok(BootstrapOutcome {
+            audit_detail: String::new(),
+            minted_token: None,
+        });
+    }
+
+    let mut principal_created = false;
+    if svc.engine.principal(BOOTSTRAP_ADMIN_ID).is_none() {
+        svc.upsert_principal(Principal {
+            id: BOOTSTRAP_ADMIN_ID.to_string(),
+            kind: PrincipalKind::User,
+            roles: std::iter::once(BUILTIN_ROLE_ADMIN.to_string()).collect(),
+            token_epoch: 0,
+            disabled: false,
+            cred_scheme: CRED_SCHEME_BLAKE3.to_string(),
+        })?;
+        principal_created = true;
+    }
+
+    let (tok, minted) = token.expect("token decided above");
+    if minted {
+        // Session-style credential: dies with the principal's epoch.
+        let epoch = svc
+            .engine
+            .principal(BOOTSTRAP_ADMIN_ID)
+            .map(|p| p.token_epoch)
+            .unwrap_or(0);
+        svc.put_token(&tok, BOOTSTRAP_ADMIN_ID, Some(epoch))?;
+    } else {
+        // Operator-managed secret: config-key semantics (design §9.2) —
+        // lifetime follows the flag/env, not the token epoch.
+        svc.put_token(&tok, BOOTSTRAP_ADMIN_ID, None)?;
+    }
+
+    let audit_detail = format!(
+        "bootstrap: admin principal '{}'{}; token {}",
+        BOOTSTRAP_ADMIN_ID,
+        if principal_created {
+            " created in tier _admin"
+        } else {
+            " ensured"
+        },
+        if minted {
+            "minted (printed once to stdout)"
+        } else {
+            "registered (operator-injected)"
+        }
+    );
+    Ok(BootstrapOutcome {
+        audit_detail,
+        minted_token: minted.then_some(tok),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +460,74 @@ mod tests {
         assert!(alice.roles.contains(BUILTIN_ROLE_READWRITE));
         assert!(!alice.roles.contains(BUILTIN_ROLE_ADMIN));
         assert!(!alice.roles.contains(BUILTIN_ROLE_READONLY));
+    }
+
+    // ── design §11 Bootstrap ────────────────────────────────────────────
+
+    #[test]
+    fn bootstrap_first_run_mints_admin_token_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service(dir.path());
+        let out = bootstrap_admin(&svc, None).unwrap();
+        assert!(out.audit_detail.contains("created"), "{}", out.audit_detail);
+        let token = out.minted_token.expect("first run must mint");
+        let admin = svc.engine.principal(BOOTSTRAP_ADMIN_ID).unwrap();
+        assert!(admin.roles.contains(BUILTIN_ROLE_ADMIN));
+        // The minted token authenticates and is epoch-gated: a credential
+        // change (epoch bump) kills it like any session token.
+        assert_eq!(
+            svc.engine.authenticate_token(&token).unwrap().id,
+            BOOTSTRAP_ADMIN_ID
+        );
+        let mut p = admin;
+        p.token_epoch += 1;
+        svc.upsert_principal(p).unwrap();
+        assert!(svc.engine.authenticate_token(&token).is_none());
+
+        // Later starts are silent no-ops: nothing re-printed, nothing minted.
+        let out = bootstrap_admin(&svc, None).unwrap();
+        assert!(out.audit_detail.is_empty());
+        assert!(out.minted_token.is_none());
+    }
+
+    #[test]
+    fn bootstrap_injected_token_is_ensure_style_and_unbound() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service(dir.path());
+        // Injected on a fresh store: creates the admin, registers the
+        // operator secret, prints nothing.
+        let out = bootstrap_admin(&svc, Some("op-secret")).unwrap();
+        assert!(out.audit_detail.contains("created"), "{}", out.audit_detail);
+        assert!(out.minted_token.is_none());
+        assert_eq!(
+            svc.engine.authenticate_token("op-secret").unwrap().id,
+            BOOTSTRAP_ADMIN_ID
+        );
+        // Re-asserted at every start (config-as-code), and the secret is not
+        // epoch-gated: credential rotation must not orphan the operator's key.
+        let out = bootstrap_admin(&svc, Some("op-secret")).unwrap();
+        assert!(out.audit_detail.contains("ensured"), "{}", out.audit_detail);
+        let mut p = svc.engine.principal(BOOTSTRAP_ADMIN_ID).unwrap();
+        p.token_epoch += 1;
+        svc.upsert_principal(p).unwrap();
+        assert!(svc.engine.authenticate_token("op-secret").is_some());
+        // A name collision with an existing principal only adds the token.
+        let out = bootstrap_admin(&svc, Some("op-secret-2")).unwrap();
+        assert!(out.audit_detail.contains("ensured"), "{}", out.audit_detail);
+        assert!(svc.engine.authenticate_token("op-secret-2").is_some());
+        assert!(svc.engine.authenticate_token("op-secret").is_some());
+    }
+
+    #[test]
+    fn bootstrap_skips_when_principals_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service(dir.path());
+        // A migrated key means this is not a fresh store — no auto admin.
+        let cfg = config(vec![key("sec-ro", Permission::ReadOnly, None)]);
+        migrate_api_keys(&cfg, &svc).unwrap();
+        let out = bootstrap_admin(&svc, None).unwrap();
+        assert!(out.audit_detail.is_empty());
+        assert!(out.minted_token.is_none());
+        assert!(svc.engine.principal(BOOTSTRAP_ADMIN_ID).is_none());
     }
 }

@@ -382,7 +382,28 @@ impl AuthState {
                 return Some(value.clone());
             }
         }
-        None
+        drop(keys);
+        // Policy-store bearer token (design §10/§11): LOGIN/ROTATE TOKEN
+        // session tokens and the bootstrap admin token live in `__sys__.users`,
+        // not api_keys.json. Synthesize a key record whose tier follows the
+        // principal's built-in role so `actor_of` derives `is_admin` and the
+        // coarse endpoint gate applies.
+        let p = self.policy.as_ref()?.engine.authenticate_token(key)?;
+        let permission = if p.roles.contains(onto_core::policy::BUILTIN_ROLE_ADMIN) {
+            Permission::Admin
+        } else if p.roles.contains(onto_core::policy::BUILTIN_ROLE_READWRITE) {
+            Permission::ReadWrite
+        } else {
+            Permission::ReadOnly
+        };
+        Some(KeyRecord {
+            description: format!("policy token ({})", p.id),
+            permission,
+            rate_limit: None,
+            allowed_ips: None,
+            namespace: None,
+            principal: Some(p.id),
+        })
     }
 
     /// Validate a PostgreSQL MD5 password hash.
@@ -830,6 +851,58 @@ mod tests {
         let auth = AuthState::new(&cfg);
         assert!(auth.principal_for("sec-mapped", &record(None)).is_none());
         assert!(auth.principal_for("unknown", &record(None)).is_none());
+    }
+
+    /// design §11: policy-store bearer tokens (bootstrap admin / session
+    /// tokens) validate on the HTTP auth path with a tier synthesized from
+    /// the principal's built-in role, so `actor_of` derives `is_admin`.
+    #[test]
+    fn validate_accepts_policy_tokens_with_synthesized_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            LsmEngine::open(StorageOptions {
+                data_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let svc = onto_ontology::policy_store::PolicyService::open(
+            onto_ontology::policy_store::PolicyStore::new(engine),
+        )
+        .unwrap();
+        let token = crate::rbac::bootstrap_admin(&svc, None)
+            .unwrap()
+            .minted_token
+            .unwrap();
+        // A plain analyst with no built-in tier gets the ReadOnly gate.
+        svc.upsert_principal(onto_core::policy::Principal {
+            id: "analyst".to_string(),
+            kind: onto_core::policy::PrincipalKind::User,
+            roles: ["analyst-role".to_string()].into_iter().collect(),
+            token_epoch: 0,
+            disabled: false,
+            cred_scheme: onto_core::policy::CRED_SCHEME_BLAKE3.to_string(),
+        })
+        .unwrap();
+        svc.put_token("analyst-tok", "analyst", Some(0)).unwrap();
+
+        let cfg = AuthConfig {
+            enabled: true,
+            keys: vec![],
+            default_permission: Permission::ReadOnly,
+        };
+        let auth = AuthState::new(&cfg).with_policy(Some(svc));
+
+        let rec = auth.validate(&token).expect("bootstrap token validates");
+        assert_eq!(rec.permission, Permission::Admin);
+        assert_eq!(rec.principal.as_deref(), Some(crate::rbac::BOOTSTRAP_ADMIN_ID));
+
+        let rec = auth.validate("analyst-tok").expect("session token validates");
+        assert_eq!(rec.permission, Permission::ReadOnly);
+        assert_eq!(rec.principal.as_deref(), Some("analyst"));
+
+        // Unknown keys still fail closed.
+        assert!(auth.validate("nope").is_none());
     }
 
     /// Rejected requests leave an `authn_fail` / `authz_deny` record in the

@@ -88,8 +88,10 @@ pub struct KeyInfo {
     pub principal: Option<String>,
 }
 
-/// Build the admin API router.
-pub fn admin_router(state: AdminState) -> Router {
+/// Build the admin API router (keys plane + RBAC policy plane, design §13).
+/// Returns an un-stated router; the caller applies `.with_state(...)` so the
+/// surrounding router's state type can be inferred (e.g. `AppState`).
+pub fn admin_router() -> Router<AdminState> {
     let router = Router::new()
         .route("/api/admin/keys", get(list_keys).post(add_key))
         .route("/api/admin/keys/{key}", put(update_key).delete(delete_key))
@@ -112,7 +114,7 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/api/admin/cluster/sync", post(sync_cluster))
         .route("/api/admin/cluster/nodes", get(list_cluster_nodes));
 
-    router.with_state(state)
+    router
 }
 
 /// GET /api/admin/keys — List all API keys (key value masked).
