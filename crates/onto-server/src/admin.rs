@@ -776,6 +776,10 @@ pub struct AdminCreateGrantRequest {
     /// subclasses.
     #[serde(default)]
     pub only: Option<bool>,
+    /// `GRANT ... WITH GRANT OPTION` (design §5, T4.5): the grantee may
+    /// delegate this grant.
+    #[serde(default)]
+    pub with_grant_option: Option<bool>,
 }
 
 /// Query for `GET /api/admin/grants?role=analyst`.
@@ -1021,6 +1025,7 @@ fn grant_row_json(g: &onto_core::policy::Grant, effect: &str) -> serde_json::Val
         "object": g.object.display(),
         "effect": effect,
         "only": g.options.only,
+        "with_grant_option": g.options.with_grant_option,
     })
 }
 
@@ -1103,6 +1108,7 @@ fn op_create_grant(
     action: &str,
     object: &str,
     only: bool,
+    with_grant_option: bool,
 ) -> Result<serde_json::Value, PolicyOpErr> {
     let role = role.trim();
     if role.is_empty() {
@@ -1117,7 +1123,7 @@ fn op_create_grant(
     let object = parse_object_ref(object).map_err(op_bad)?;
     let options = onto_core::policy::GrantOptions {
         only,
-        ..Default::default()
+        with_grant_option,
     };
     svc.grant(Grant {
         role: role.to_string(),
@@ -1134,12 +1140,14 @@ fn op_create_grant(
         "object": object.display(),
         "effect": "ALLOW",
         "only": only,
+        "with_grant_option": with_grant_option,
         "message": format!(
-            "granted {} on {} to '{}'{}",
+            "granted {} on {} to '{}'{}{}",
             action.as_str(),
             object.display(),
             role,
-            if only { " ONLY" } else { "" }
+            if only { " ONLY" } else { "" },
+            if with_grant_option { " WITH GRANT OPTION" } else { "" }
         ),
     }))
 }
@@ -1330,14 +1338,27 @@ pub async fn admin_create_grant(
         Err((st, v)) => return (st, Json(v)),
     };
     let only = req.only.unwrap_or(false);
+    let with_grant_option = req.with_grant_option.unwrap_or(false);
     let op_detail = format!(
-        "GRANT {} ON {}{} TO {}",
+        "GRANT {} ON {}{}{} TO {}",
         req.action.trim().to_ascii_uppercase(),
         req.object.trim(),
         if only { " ONLY" } else { "" },
+        if with_grant_option {
+            " WITH GRANT OPTION"
+        } else {
+            ""
+        },
         req.role
     );
-    match op_create_grant(svc, &req.role, &req.action, &req.object, only) {
+    match op_create_grant(
+        svc,
+        &req.role,
+        &req.action,
+        &req.object,
+        only,
+        with_grant_option,
+    ) {
         Ok(v) => {
             policy_audit(&state, "grant_change", &format!("{op_detail} -> {}", v["message"]), true, None);
             (StatusCode::CREATED, Json(v))
@@ -1545,15 +1566,17 @@ mod policy_tests {
         ));
 
         // Grants: unknown role fails, then a real grant lands and lists.
-        assert!(op_create_grant(&svc, "ghost", "READ", "CLASS zoo.Dog", false).is_err());
-        let g = op_create_grant(&svc, "analyst", "read", "CLASS zoo.Dog", true).unwrap();
+        assert!(op_create_grant(&svc, "ghost", "READ", "CLASS zoo.Dog", false, false).is_err());
+        let g = op_create_grant(&svc, "analyst", "read", "CLASS zoo.Dog", true, true).unwrap();
         assert_eq!(g["effect"], "ALLOW");
+        assert_eq!(g["with_grant_option"], true);
         let id = g["id"].as_str().unwrap().to_string();
         assert_eq!(id, "analyst:READ:CLASS:zoo.Dog");
         let list = op_list_grants(&svc, Some("analyst")).unwrap();
         assert_eq!(list["count"], 1);
         assert_eq!(list["grants"][0]["id"], id.as_str());
         assert_eq!(list["grants"][0]["only"], true);
+        assert_eq!(list["grants"][0]["with_grant_option"], true);
         // The grant actually authorizes once the principal holds the role
         // (ONLY semantics: the class itself is covered).
         svc.grant_role("alice", "analyst").unwrap();

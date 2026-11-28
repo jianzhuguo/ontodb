@@ -455,17 +455,20 @@ pub enum QueryAst {
     /// REVOKE ROLE <role> FROM <principal>
     RevokeRole { role: String, principal: String },
 
-    /// GRANT <READ|WRITE|DDL> ON NAMESPACE <ns> [ONLY] TO <role>
-    /// GRANT <READ|WRITE|DDL> ON CLASS <ns.cls>[(p1, p2)] [ONLY] TO <role>
+    /// GRANT <READ|WRITE|DDL> ON NAMESPACE <ns> [ONLY] TO <role> [WITH GRANT OPTION]
+    /// GRANT <READ|WRITE|DDL> ON CLASS <ns.cls>[(p1, p2)] [ONLY] TO <role> [WITH GRANT OPTION]
     /// `ONLY` stops `is_a` downward inheritance (design §7.1, M2).
     /// A property list narrows the grant to those columns (design §7.2);
     /// empty = whole object.
+    /// `WITH GRANT OPTION` lets the grantee delegate this grant (design §5,
+    /// T4.5).
     GrantPrivilege {
         action: onto_core::policy::Action,
         object: onto_core::policy::ObjectRef,
         role: String,
         only: bool,
         props: Vec<String>,
+        with_grant_option: bool,
     },
 
     /// REVOKE <READ|WRITE|DDL> ON NAMESPACE <ns> [ONLY] FROM <role>
@@ -1779,18 +1782,25 @@ impl QueryParser {
         // Optional `ONLY` — stops `is_a` subclass expansion (design §7.1).
         // Only meaningful on CLASS grants.
         let (r, only) = Self::parse_only(r, &object)?;
-        let (kw, role) = Self::split_word(r).ok_or_else(|| {
+        let (kw, r) = Self::split_word(r).ok_or_else(|| {
             CoreError::InvalidArgument("usage: … TO <role>".to_string())
         })?;
         if !kw.eq_ignore_ascii_case("TO") {
             return Err(CoreError::InvalidArgument(format!("expected TO, got {kw:?}")));
         }
+        let (role, r) = Self::split_word(r).ok_or_else(|| {
+            CoreError::InvalidArgument("usage: … TO <role>".to_string())
+        })?;
+        // Optional trailing `WITH GRANT OPTION` (design §5/§18.3, T4.5) —
+        // the grantee may delegate this grant. Nothing else may follow.
+        let with_grant_option = Self::parse_with_grant_option(r)?;
         Ok(QueryAst::GrantPrivilege {
             action,
             object,
             role: role.to_string(),
             only,
             props,
+            with_grant_option,
         })
     }
 
@@ -1814,6 +1824,44 @@ impl QueryParser {
             ));
         }
         Ok((rest, true))
+    }
+
+    /// Parse the optional trailing `WITH GRANT OPTION` after a GRANT
+    /// statement's role name (design §5/§18.3, T4.5). Any other trailing
+    /// input is a hard error — the statement ends at the role name unless
+    /// the delegation flag follows.
+    fn parse_with_grant_option(r: &str) -> Result<bool> {
+        let r = r.trim();
+        if r.is_empty() {
+            return Ok(false);
+        }
+        let (kw, rest) = Self::split_word(r)
+            .ok_or_else(|| CoreError::InvalidArgument("expected WITH GRANT OPTION".to_string()))?;
+        if !kw.eq_ignore_ascii_case("WITH") {
+            return Err(CoreError::InvalidArgument(format!(
+                "expected WITH GRANT OPTION, got {kw:?}"
+            )));
+        }
+        let (kw, rest) = Self::split_word(rest)
+            .ok_or_else(|| CoreError::InvalidArgument("expected WITH GRANT OPTION".to_string()))?;
+        if !kw.eq_ignore_ascii_case("GRANT") {
+            return Err(CoreError::InvalidArgument(format!(
+                "expected WITH GRANT OPTION, got WITH {kw:?}"
+            )));
+        }
+        let (kw, rest) = Self::split_word(rest)
+            .ok_or_else(|| CoreError::InvalidArgument("expected WITH GRANT OPTION".to_string()))?;
+        if !kw.eq_ignore_ascii_case("OPTION") {
+            return Err(CoreError::InvalidArgument(format!(
+                "expected WITH GRANT OPTION, got WITH GRANT {kw:?}"
+            )));
+        }
+        if !rest.trim().is_empty() {
+            return Err(CoreError::InvalidArgument(format!(
+                "trailing input after WITH GRANT OPTION: {rest}"
+            )));
+        }
+        Ok(true)
     }
 
     /// Parse `<name>` or `<name>(<prop>, <prop>, …)` after NAMESPACE|CLASS.
@@ -1919,12 +1967,22 @@ impl QueryParser {
         };
         // Optional `ONLY` — limits the carve-out to the class itself.
         let (r, only) = Self::parse_only(r, &object)?;
-        let (kw, role) = Self::split_word(r).ok_or_else(|| {
+        let (kw, r) = Self::split_word(r).ok_or_else(|| {
             CoreError::InvalidArgument("usage: … FROM <role>".to_string())
         })?;
         if !kw.eq_ignore_ascii_case("FROM") {
             return Err(CoreError::InvalidArgument(format!(
                 "expected FROM, got {kw:?}"
+            )));
+        }
+        let (role, r) = Self::split_word(r).ok_or_else(|| {
+            CoreError::InvalidArgument("usage: … FROM <role>".to_string())
+        })?;
+        // No delegation flag on REVOKE — `WITH GRANT OPTION` is a GRANT
+        // tail (design §5). Anything trailing the role is a hard error.
+        if !r.trim().is_empty() {
+            return Err(CoreError::InvalidArgument(format!(
+                "trailing input in REVOKE: {r}"
             )));
         }
         Ok(QueryAst::RevokePrivilege {
@@ -6873,7 +6931,14 @@ mod tests {
 
         // CLASS target + ONLY → flag set; bare class name lands in _default.
         match QueryParser::parse("GRANT READ ON CLASS ns.C ONLY TO r").unwrap() {
-            QueryAst::GrantPrivilege { action, object, role, only, props } => {
+            QueryAst::GrantPrivilege {
+                action,
+                object,
+                role,
+                only,
+                props,
+                with_grant_option,
+            } => {
                 assert_eq!(action, Action::Read);
                 assert_eq!(
                     object,
@@ -6882,6 +6947,7 @@ mod tests {
                 assert_eq!(role, "r");
                 assert!(only);
                 assert!(props.is_empty());
+                assert!(!with_grant_option);
             }
             other => panic!("expected GrantPrivilege, got {other:?}"),
         }
@@ -6922,6 +6988,76 @@ mod tests {
         );
     }
 
+    /// M2 T4.5: `WITH GRANT OPTION` (design §5/§18.3) is a trailing GRANT
+    /// flag on any object kind — it marks the grant as delegable.
+    #[test]
+    fn test_parse_grant_with_grant_option() {
+        // Trailing flag sets the bit on every object kind.
+        match QueryParser::parse("GRANT READ ON CLASS ns.C TO r WITH GRANT OPTION").unwrap() {
+            QueryAst::GrantPrivilege {
+                role,
+                with_grant_option,
+                ..
+            } => {
+                assert_eq!(role, "r");
+                assert!(with_grant_option);
+            }
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        match QueryParser::parse("GRANT READ ON NAMESPACE x TO r WITH GRANT OPTION").unwrap() {
+            QueryAst::GrantPrivilege {
+                with_grant_option, ..
+            } => assert!(with_grant_option),
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        match QueryParser::parse("GRANT INFER ON RULE treats-inheritance TO r WITH GRANT OPTION")
+            .unwrap()
+        {
+            QueryAst::GrantPrivilege {
+                with_grant_option, ..
+            } => assert!(with_grant_option),
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        // Case-insensitive tail; composes with ONLY and property lists.
+        match QueryParser::parse(
+            "GRANT WRITE ON CLASS C(a, b) ONLY TO r with grant option",
+        )
+        .unwrap()
+        {
+            QueryAst::GrantPrivilege {
+                only,
+                props,
+                with_grant_option,
+                ..
+            } => {
+                assert!(only);
+                assert_eq!(props, vec!["a".to_string(), "b".to_string()]);
+                assert!(with_grant_option);
+            }
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        // Absent tail keeps the M1 parse shape.
+        match QueryParser::parse("GRANT READ ON CLASS ns.C TO r").unwrap() {
+            QueryAst::GrantPrivilege {
+                with_grant_option, ..
+            } => assert!(!with_grant_option),
+            other => panic!("expected GrantPrivilege, got {other:?}"),
+        }
+        // Malformed tails are hard errors — no silent role-name absorption.
+        for bad in [
+            "GRANT READ ON CLASS C TO r WITH",
+            "GRANT READ ON CLASS C TO r WITH GRANT",
+            "GRANT READ ON CLASS C TO r WITH ADMIN OPTION",
+            "GRANT READ ON CLASS C TO r WITH GRANT OPTION EXTRA",
+            "GRANT READ ON CLASS C TO r garbage",
+        ] {
+            assert!(QueryParser::parse(bad).is_err(), "should reject: {bad}");
+        }
+        // REVOKE has no delegation tail — trailing input is rejected too.
+        assert!(QueryParser::parse("REVOKE READ ON CLASS C FROM r WITH GRANT OPTION").is_err());
+        assert!(QueryParser::parse("REVOKE READ ON CLASS C FROM r garbage").is_err());
+    }
+
     /// M2 T4.2: property lists (design §7.2) narrow a CLASS grant to the
     /// named columns — `GRANT READ ON CLASS X(a, b)`; NAMESPACE rejects them.
     #[test]
@@ -6935,6 +7071,7 @@ mod tests {
                 role,
                 only,
                 props,
+                with_grant_option,
             } => {
                 assert_eq!(action, Action::Read);
                 assert_eq!(
@@ -6944,6 +7081,7 @@ mod tests {
                 assert_eq!(role, "r");
                 assert!(!only);
                 assert_eq!(props, vec!["a".to_string(), "b".to_string()]);
+                assert!(!with_grant_option);
             }
             other => panic!("expected GrantPrivilege, got {other:?}"),
         }
@@ -7003,12 +7141,14 @@ mod tests {
                 role,
                 only,
                 props,
+                with_grant_option,
             } => {
                 assert_eq!(action, Action::Infer);
                 assert_eq!(object, ObjectRef::Rule("treats-inheritance".into()));
                 assert_eq!(role, "analyst");
                 assert!(!only);
                 assert!(props.is_empty());
+                assert!(!with_grant_option);
             }
             other => panic!("expected GrantPrivilege, got {other:?}"),
         }

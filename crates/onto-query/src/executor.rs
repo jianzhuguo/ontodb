@@ -1315,18 +1315,23 @@ impl QueryExecutor {
 
     /// Appends one audit record (cross-namespace access or scoped-key denial).
     fn audit(&self, actor: Option<&QueryActor>, action: &str, classes: &[String], detail: &str) {
-        let (label, ns, ip) = match actor {
-            Some(a) => (a.label.as_str(), a.namespace.as_deref(), a.client_ip.as_str()),
-            None => ("local", None, "local"),
+        let (label, ns, ip, principal) = match actor {
+            Some(a) => (
+                a.label.as_str(),
+                a.namespace.as_deref(),
+                a.client_ip.as_str(),
+                a.principal_id.as_deref(),
+            ),
+            None => ("local", None, "local", None),
         };
-        self.write_audit(label, ns, ip, action, classes, detail);
+        self.write_audit(label, ns, ip, principal, action, classes, detail);
     }
 
     /// Append one audit record with an explicit identity — wire-surface
     /// `login` / `authn_fail` events (design §12), whose actor is only known
     /// at the connection handler.
     pub fn audit_event(&self, label: &str, ip: &str, action: &str, detail: &str) {
-        self.write_audit(label, None, ip, action, &[], detail);
+        self.write_audit(label, None, ip, None, action, &[], detail);
     }
 
     fn write_audit(
@@ -1334,6 +1339,7 @@ impl QueryExecutor {
         label: &str,
         ns: Option<&str>,
         ip: &str,
+        principal: Option<&str>,
         action: &str,
         classes: &[String],
         detail: &str,
@@ -1346,6 +1352,9 @@ impl QueryExecutor {
         let line = serde_json::json!({
             "ts_unix_ms": ts_ms,
             "actor": label,
+            // Authenticated principal when present (design §12) — answers
+            // "who delegated this grant" for T4.5 delegated mutations.
+            "principal": principal,
             "namespace": ns,
             "ip": ip,
             "action": action,
@@ -2213,8 +2222,9 @@ impl QueryExecutor {
                 role,
                 only,
                 props,
+                with_grant_option,
             } => format!(
-                "GRANT {} ON {}{}{} TO {role}",
+                "GRANT {} ON {}{}{} TO {role}{}",
                 action.as_str(),
                 object.display(),
                 if props.is_empty() {
@@ -2222,7 +2232,12 @@ impl QueryExecutor {
                 } else {
                     format!("({})", props.join(", "))
                 },
-                if *only { " ONLY" } else { "" }
+                if *only { " ONLY" } else { "" },
+                if *with_grant_option {
+                    " WITH GRANT OPTION"
+                } else {
+                    ""
+                }
             ),
             A::RevokePrivilege {
                 action,
@@ -2302,6 +2317,10 @@ impl QueryExecutor {
                     }
                     m.insert("object".to_string(), Value::String(obj));
                     m.insert("effect".to_string(), Value::String(effect.to_string()));
+                    m.insert(
+                        "with_grant_option".to_string(),
+                        Value::Bool(g.options.with_grant_option),
+                    );
                     m
                 };
                 let mut rows = match role {
@@ -2327,11 +2346,20 @@ impl QueryExecutor {
             _ => {}
         }
 
-        // ── mutations: control-plane admin only ──
-        if !actor.is_admin {
-            self.audit(Some(actor), "denied", &[], "policy DDL requires Admin");
+        // ── mutations: control-plane admin, or a T4.5 delegate ──
+        // GRANT/REVOKE privilege DDL may run within the reach of a held
+        // `WITH GRANT OPTION` grant (design §5/§18.3); every other policy
+        // DDL stays admin-only.
+        if !actor.is_admin && !Self::policy_mutation_delegable(ast, actor, svc) {
+            self.audit(
+                Some(actor),
+                "denied",
+                &[],
+                "policy DDL requires Admin or a covering WITH GRANT OPTION",
+            );
             return Err(CoreError::InvalidArgument(
-                "policy DDL requires an Admin API key (or auth disabled)".to_string(),
+                "policy DDL requires an Admin API key (or auth disabled), or a covering GRANT ... WITH GRANT OPTION"
+                    .to_string(),
             ));
         }
 
@@ -2351,6 +2379,61 @@ impl QueryExecutor {
                 Err(e)
             }
         }
+    }
+
+    /// T4.5 (design §5/§18.3): a non-admin may run GRANT/REVOKE privilege
+    /// DDL only within the reach of a held `WITH GRANT OPTION` grant. Every
+    /// row the statement writes must pass — a property list expands to one
+    /// row per column. User/role/role-assignment DDL is never delegable.
+    fn policy_mutation_delegable(
+        ast: &QueryAst,
+        actor: &QueryActor,
+        svc: &onto_ontology::policy_store::PolicyService,
+    ) -> bool {
+        use QueryAst as A;
+        let Some(pid) = &actor.principal_id else {
+            return false;
+        };
+        let (action, object, only, props, with_grant_option) = match ast {
+            A::GrantPrivilege {
+                action,
+                object,
+                only,
+                props,
+                with_grant_option,
+                ..
+            } => (*action, object, *only, props, *with_grant_option),
+            A::RevokePrivilege {
+                action,
+                object,
+                only,
+                props,
+                ..
+            } => (*action, object, *only, props, false),
+            _ => return false,
+        };
+        let opts = onto_core::policy::GrantOptions {
+            only,
+            with_grant_option,
+        };
+        if props.is_empty() {
+            return svc.engine.can_delegate(pid, action, object, opts);
+        }
+        let onto_core::policy::ObjectRef::Class { ns, class } = object else {
+            return false;
+        };
+        props.iter().all(|p| {
+            svc.engine.can_delegate(
+                pid,
+                action,
+                &onto_core::policy::ObjectRef::Property {
+                    ns: ns.clone(),
+                    class: class.clone(),
+                    prop: p.clone(),
+                },
+                opts,
+            )
+        })
     }
 
     /// One policy-plane mutation's secret-free success message. Rejections
@@ -2474,6 +2557,7 @@ impl QueryExecutor {
                 role,
                 only,
                 props,
+                with_grant_option,
             } => {
                 if !svc.engine.role_exists(role) {
                     return Err(CoreError::InvalidArgument(format!(
@@ -2482,7 +2566,7 @@ impl QueryExecutor {
                 }
                 let options = onto_core::policy::GrantOptions {
                     only: *only,
-                    ..Default::default()
+                    with_grant_option: *with_grant_option,
                 };
                 if props.is_empty() {
                     svc.grant(Grant {
@@ -2513,7 +2597,7 @@ impl QueryExecutor {
                     }
                 }
                 format!(
-                    "granted {} on {}{} to '{}'{}",
+                    "granted {} on {}{} to '{}'{}{}",
                     action.as_str(),
                     object.display(),
                     if props.is_empty() {
@@ -2522,7 +2606,12 @@ impl QueryExecutor {
                         format!("({})", props.join(", "))
                     },
                     role,
-                    if *only { " ONLY" } else { "" }
+                    if *only { " ONLY" } else { "" },
+                    if *with_grant_option {
+                        " WITH GRANT OPTION"
+                    } else {
+                        ""
+                    }
                 )
             }
             A::RevokePrivilege {
@@ -21156,6 +21245,98 @@ mod tests {
         run("DROP ROLE analyst").unwrap();
         assert!(!svc.engine.role_exists("analyst"));
         assert!(!svc.engine.check_class("alice", Action::Write, "erp", "orders"));
+    }
+
+    /// RBAC M2 T4.5: `WITH GRANT OPTION` delegation (design §5/§18.3). A
+    /// non-admin holder delegates within reach; the option bit transmits
+    /// only when held; user/role DDL stays admin-only; no amplification.
+    #[test]
+    fn policy_delegation_with_grant_option() {
+        let (executor, _dir) = setup();
+        let pdir = tempdir().unwrap();
+        let svc = onto_ontology::policy_store::PolicyService::open(
+            onto_ontology::policy_store::PolicyStore::new(Arc::new(
+                LsmEngine::open(StorageOptions {
+                    data_dir: pdir.path().to_path_buf(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )),
+        )
+        .unwrap();
+        let executor = executor.with_policy_service(svc.clone());
+        let admin = QueryActor {
+            label: "root".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: true,
+            principal_id: None,
+        };
+        let run = |sql: &str| {
+            let ast = QueryParser::parse(sql).unwrap();
+            executor.execute_as(&ast, &admin)
+        };
+        let delegate = QueryActor {
+            label: "dave".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+            principal_id: Some("dave".to_string()),
+        };
+        let plain_holder = QueryActor {
+            label: "eve".to_string(),
+            namespace: None,
+            client_ip: "127.0.0.1".to_string(),
+            is_admin: false,
+            principal_id: Some("eve".to_string()),
+        };
+        let run_as = |actor: &QueryActor, sql: &str| {
+            let ast = QueryParser::parse(sql).unwrap();
+            executor.execute_as(&ast, actor)
+        };
+
+        // Setup: holder carries the delegation bit, plain does not.
+        for sql in [
+            "CREATE ROLE holder",
+            "CREATE ROLE plain",
+            "CREATE ROLE intern",
+            "CREATE USER dave WITH PASSWORD 'pw'",
+            "CREATE USER eve WITH PASSWORD 'pw'",
+            "GRANT ROLE holder TO dave",
+            "GRANT ROLE plain TO eve",
+            "GRANT READ ON CLASS erp.orders TO holder WITH GRANT OPTION",
+            "GRANT READ ON CLASS erp.orders TO plain",
+        ] {
+            run(sql).unwrap();
+        }
+
+        // The delegate grants within reach; the row lands on the target role.
+        assert!(run_as(&delegate, "GRANT READ ON CLASS erp.orders TO intern").is_ok());
+        let rows = svc.engine.grants_for_role("intern");
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].options.with_grant_option);
+        // …and may pass the bit on (SQL delegation chain).
+        assert!(
+            run_as(&delegate, "GRANT READ ON CLASS erp.orders TO intern WITH GRANT OPTION").is_ok()
+        );
+        assert!(svc.engine.grants_for_role("intern")[0].options.with_grant_option);
+        // The delegate may revoke (carve-out) too.
+        assert!(run_as(&delegate, "REVOKE READ ON CLASS erp.orders FROM intern").is_ok());
+
+        // A plain holder cannot delegate, cannot conjure the bit, and
+        // cannot amplify a class grant into a namespace grant.
+        assert!(run_as(&plain_holder, "GRANT READ ON CLASS erp.orders TO intern").is_err());
+        assert!(
+            run_as(&plain_holder, "GRANT READ ON CLASS erp.orders TO intern WITH GRANT OPTION")
+                .is_err()
+        );
+        assert!(run_as(&delegate, "GRANT READ ON NAMESPACE erp TO intern").is_err());
+        assert!(run_as(&delegate, "GRANT WRITE ON CLASS erp.orders TO intern").is_err());
+
+        // User/role DDL stays admin-only even for a delegate.
+        assert!(run_as(&delegate, "CREATE ROLE sneaky").is_err());
+        assert!(run_as(&delegate, "CREATE USER mallory WITH PASSWORD 'x'").is_err());
+        assert!(!svc.engine.role_exists("sneaky"));
     }
 
     /// RBAC M1 PEP: class-level checks in `prepare_as`

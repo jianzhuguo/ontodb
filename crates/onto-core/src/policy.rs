@@ -764,6 +764,53 @@ impl PolicyEngine {
         )
     }
 
+    /// T4.5 delegation gate (design §5/§18.3): may `principal_id` hand
+    /// `action` on `object` with `opts` to another role? True when some
+    /// role held by the principal carries an allow that covers the target
+    /// **with `WITH GRANT OPTION`**, and no explicit deny carves the target
+    /// out of that reach. No amplification: a delegated grant never reaches
+    /// past the held one — see [`delegation_reaches`].
+    pub fn can_delegate(
+        &self,
+        principal_id: &str,
+        action: Action,
+        object: &ObjectRef,
+        opts: GrantOptions,
+    ) -> bool {
+        let st = self.state.read().unwrap();
+        let Some(p) = st.principals.get(principal_id) else {
+            return false;
+        };
+        if p.disabled {
+            return false;
+        }
+        if p.roles.contains(BUILTIN_ROLE_ADMIN) {
+            return true;
+        }
+        let h = st.hierarchy.as_deref();
+        // An explicit deny carves the object out of the delegator's reach
+        // (design §7.1 — deny beats inherited allow).
+        let denied = p.roles.iter().any(|role| {
+            st.denies.get(role).is_some_and(|list| {
+                list.iter()
+                    .any(|(a, o, dopts)| *a == action && covers(o, *dopts, object, h))
+            })
+        });
+        if denied {
+            return false;
+        }
+        p.roles.iter().any(|role| {
+            st.grants.get(role).is_some_and(|list| {
+                list.iter().any(|(a, o, gopts)| {
+                    *a == action
+                        && gopts.with_grant_option
+                        && covers(o, *gopts, object, h)
+                        && delegation_reaches(*gopts, opts, object)
+                })
+            })
+        })
+    }
+
     pub fn set_infer_strategy(&self, strategy: InferStrategy) {
         *self.infer_strategy.write().unwrap() = strategy;
     }
@@ -883,6 +930,21 @@ fn rule_key(name: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
         .collect()
+}
+
+/// No-amplification between a held grant's options and the options of a
+/// grant delegated under it (design §5/§18.3, T4.5): `ONLY` pins the held
+/// grant to the class itself, so a non-`ONLY` class grant beneath it would
+/// re-expand to `is_a` subclasses; the `WITH GRANT OPTION` bit transmits
+/// only when the held grant carries it (SQL delegation chain).
+fn delegation_reaches(held: GrantOptions, wanted: GrantOptions, wanted_obj: &ObjectRef) -> bool {
+    if wanted.with_grant_option && !held.with_grant_option {
+        return false;
+    }
+    if held.only && !wanted.only && matches!(wanted_obj, ObjectRef::Class { .. }) {
+        return false;
+    }
+    true
 }
 
 /// True when the granted class covers the wanted class: same class, or —
@@ -1715,5 +1777,180 @@ mod tests {
         }
         let premises = vec![class("bio", "Drug"), class("bio", "Protein")];
         assert!(!eng.check_derived_read("alice", "treats", &class("bio", "Disease"), &premises));
+    }
+
+    // ── T4.5 WITH GRANT OPTION delegation (design §5/§18.3) ──────────────
+
+    #[test]
+    fn can_delegate_requires_the_option_bit() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.upsert_principal(principal("bob", &["holder"]));
+        eng.upsert_principal(principal("carol", &["plain"]));
+        let delegable = GrantOptions {
+            with_grant_option: true,
+            ..Default::default()
+        };
+        let plain = GrantOptions::default();
+        let obj = class("bio", "Disease");
+        eng.grant(Grant {
+            role: "holder".into(),
+            action: Action::Read,
+            object: obj.clone(),
+            options: delegable,
+        });
+        eng.grant(Grant {
+            role: "plain".into(),
+            action: Action::Read,
+            object: obj.clone(),
+            options: plain,
+        });
+        // Holder delegates; a plain holder does not; wrong action does not.
+        assert!(eng.can_delegate("bob", Action::Read, &obj, plain));
+        assert!(!eng.can_delegate("carol", Action::Read, &obj, plain));
+        assert!(!eng.can_delegate("bob", Action::Write, &obj, plain));
+        // Unknown principal fails closed; _admin short-circuits.
+        assert!(!eng.can_delegate("mallory", Action::Read, &obj, plain));
+        let mut admin = principal("root", &["x"]);
+        admin.roles.insert(BUILTIN_ROLE_ADMIN.to_string());
+        eng.upsert_principal(admin);
+        assert!(eng.can_delegate("root", Action::Read, &obj, delegable));
+    }
+
+    #[test]
+    fn can_delegate_transmits_the_option_only_when_held() {
+        let eng = PolicyEngine::new();
+        eng.upsert_principal(principal("alice", &["holder"]));
+        let obj = class("bio", "Disease");
+        eng.grant(Grant {
+            role: "holder".into(),
+            action: Action::Read,
+            object: obj.clone(),
+            options: GrantOptions {
+                with_grant_option: true,
+                ..Default::default()
+            },
+        });
+        // May pass the bit on; a plain re-grant is fine too.
+        assert!(eng.can_delegate(
+            "alice",
+            Action::Read,
+            &obj,
+            GrantOptions {
+                with_grant_option: true,
+                ..Default::default()
+            }
+        ));
+        assert!(eng.can_delegate("alice", Action::Read, &obj, GrantOptions::default()));
+        // Without the held bit the chain stops (checked in the companion
+        // test via a plain grant) — here a narrowed ONLY delegation also
+        // stays inside reach.
+        assert!(eng.can_delegate(
+            "alice",
+            Action::Read,
+            &obj,
+            GrantOptions {
+                only: true,
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn can_delegate_is_no_amplification() {
+        let eng = PolicyEngine::new();
+        eng.set_hierarchy(disease_line());
+        eng.upsert_principal(principal("only_h", &["only_holder"]));
+        eng.upsert_principal(principal("wide_h", &["wide"]));
+        eng.upsert_principal(principal("ns_h", &["ns_holder"]));
+        eng.grant(Grant {
+            role: "only_holder".into(),
+            action: Action::Read,
+            object: class("bio", "Disease"),
+            options: GrantOptions {
+                only: true,
+                with_grant_option: true,
+                ..Default::default()
+            },
+        });
+        eng.grant(Grant {
+            role: "wide".into(),
+            action: Action::Read,
+            object: class("bio", "Disease"),
+            options: GrantOptions {
+                with_grant_option: true,
+                ..Default::default()
+            },
+        });
+        eng.grant(Grant {
+            role: "ns_holder".into(),
+            action: Action::Read,
+            object: ObjectRef::Namespace("erp".into()),
+            options: GrantOptions {
+                with_grant_option: true,
+                ..Default::default()
+            },
+        });
+        // ONLY holder: may delegate ONLY + the class's own property, but a
+        // plain class grant would re-expand to subclasses — rejected.
+        assert!(eng.can_delegate(
+            "only_h",
+            Action::Read,
+            &class("bio", "Disease"),
+            GrantOptions {
+                only: true,
+                ..Default::default()
+            }
+        ));
+        assert!(eng.can_delegate(
+            "only_h",
+            Action::Read,
+            &ObjectRef::Property {
+                ns: "bio".into(),
+                class: "Disease".into(),
+                prop: "name".into()
+            },
+            GrantOptions::default()
+        ));
+        assert!(!eng.can_delegate(
+            "only_h",
+            Action::Read,
+            &class("bio", "Disease"),
+            GrantOptions::default()
+        ));
+        // Wide holder reaches the subclass line; namespace holder reaches
+        // classes inside the namespace (narrowing is always allowed).
+        assert!(eng.can_delegate("wide_h", Action::Read, &class("bio", "Melanoma"), GrantOptions::default()));
+        assert!(eng.can_delegate("ns_h", Action::Read, &class("erp", "orders"), GrantOptions::default()));
+        // A class grant never delegates a namespace (widening).
+        assert!(!eng.can_delegate("wide_h", Action::Read, &ObjectRef::Namespace("bio".into()), GrantOptions::default()));
+    }
+
+    #[test]
+    fn can_delegate_deny_carve_out_blocks_delegation() {
+        let eng = PolicyEngine::new();
+        eng.set_hierarchy(disease_line());
+        eng.upsert_principal(principal("alice", &["analyst"]));
+        eng.grant(Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: class("bio", "Disease"),
+            options: GrantOptions {
+                with_grant_option: true,
+                ..Default::default()
+            },
+        });
+        assert!(eng.can_delegate("alice", Action::Read, &class("bio", "Cancer"), GrantOptions::default()));
+        // REVOKE carve-out on Cancer: the delegator can no longer hand it out.
+        eng.revoke(&Grant {
+            role: "analyst".into(),
+            action: Action::Read,
+            object: class("bio", "Cancer"),
+            options: GrantOptions::default(),
+        });
+        assert!(!eng.can_delegate("alice", Action::Read, &class("bio", "Cancer"), GrantOptions::default()));
+        assert!(!eng.can_delegate("alice", Action::Read, &class("bio", "Melanoma"), GrantOptions::default()));
+        // The parent class itself is untouched.
+        assert!(eng.can_delegate("alice", Action::Read, &class("bio", "Disease"), GrantOptions::default()));
     }
 }
